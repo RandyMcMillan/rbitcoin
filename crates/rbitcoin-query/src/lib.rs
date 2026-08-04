@@ -1082,7 +1082,9 @@ impl Query {
     /// Brief mutex locks only (header plans / SH / heads). Call from the ~5s
     /// status tick — not the hot path.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
-        let conf_plans = self.confirm_parents.plan_count();
+        // Header + tx_fks plans (not the unused scan-watermark `plans` BTreeMap).
+        // Wire path always put_header_plan; conf_plans=0 was a metering bug.
+        let conf_plans = self.confirm_parents.header_plan_count();
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),

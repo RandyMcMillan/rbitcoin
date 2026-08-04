@@ -95,6 +95,9 @@ impl PrepAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
+        // Prefer unique Arc (in-place insert). Callers must drop any stamp-time
+        // `pipeline_for` clone before this — otherwise make_mut deep-clones the
+        // full HashMap every plan (see plan-thread stamp scope + unit test).
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
         // Prefer plan-time Arc pin (layout denserels). Fall back only if lengths
@@ -1577,8 +1580,6 @@ pub(crate) fn spawn_confirm_engine(
                     None => 0u32,
                     Some(t) => t.saturating_add(1),
                 };
-                let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
-                let use_pipe = pipe.path_lo >= store_path_lo;
                 let mut wire_batch = wire_batch;
                 let t_clone = Instant::now();
                 let plan_items: Vec<(
@@ -1590,53 +1591,67 @@ pub(crate) fn spawn_confirm_engine(
                     .collect();
                 confirm_thr_stats::add_plan_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
-                let plan_res = hub.confirm_wire_plan_phase(
-                    &plan_items,
-                    if use_pipe { Some(&pipe) } else { None },
-                );
-                // stamp wall continues through multi-block split retry below.
-                let plan_res = match plan_res {
-                    Err(e) if wire_batch.len() > 1 => {
-                        let msg = e.to_string();
-                        if feed.stopped()
-                            || hub.query.confirm_cancelled()
-                            || msg.contains("confirm cancelled")
-                        {
-                            Err(e)
-                        } else if msg.contains("confirm without archive")
-                            || msg.contains("NotFound")
-                            || msg.contains("not found")
-                            || is_confirm_load_retryable(&msg)
-                        {
-                            Err(e)
-                        } else {
-                            warn!(
-                                "ibd: confirm plan multi-block fail @ {expect_h} n={} — \
-                                 retry first alone, re-queue tail: {msg}",
-                                wire_batch.len()
-                            );
-                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
-                                .iter()
-                                .skip(1)
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&tail);
-                            // Only the first height remains for this plan attempt.
-                            wire_batch.truncate(1);
-                            let one_in = block_input_count(wire_batch[0].2.as_ref());
-                            loop_stats.confirm_begin(expect_h, 1, one_in);
-                            let one = [(
-                                rbitcoin_primitives::Height(expect_h),
-                                std::sync::Arc::clone(&wire_batch[0].2),
-                            )];
-                            hub.confirm_wire_plan_phase(
-                                &one,
-                                if use_pipe { Some(&pipe) } else { None },
-                            )
+                // Stamp with a **short-lived** pipeline Arc. Holding it across
+                // `note_plan_ok` forced `Arc::make_mut` to deep-clone the full
+                // in_flight HashMap on every plan (multi-MB + sticky snapshots
+                // under planq). Drop before note so inserts mutate in place
+                // when no prep handoff still shares the map.
+                let plan_res = {
+                    let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
+                    let use_pipe = pipe.path_lo >= store_path_lo;
+                    let plan_res = hub.confirm_wire_plan_phase(
+                        &plan_items,
+                        if use_pipe { Some(&pipe) } else { None },
+                    );
+                    // stamp wall continues through multi-block split retry below.
+                    match plan_res {
+                        Err(e) if wire_batch.len() > 1 => {
+                            let msg = e.to_string();
+                            if feed.stopped()
+                                || hub.query.confirm_cancelled()
+                                || msg.contains("confirm cancelled")
+                            {
+                                Err(e)
+                            } else if msg.contains("confirm without archive")
+                                || msg.contains("NotFound")
+                                || msg.contains("not found")
+                                || is_confirm_load_retryable(&msg)
+                            {
+                                Err(e)
+                            } else {
+                                warn!(
+                                    "ibd: confirm plan multi-block fail @ {expect_h} n={} — \
+                                     retry first alone, re-queue tail: {msg}",
+                                    wire_batch.len()
+                                );
+                                let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
+                                    wire_batch
+                                        .iter()
+                                        .skip(1)
+                                        .filter(|(_, ha, _)| !hub.has_block(ha))
+                                        .map(|(h, ha, _)| (*h, *ha, None))
+                                        .collect();
+                                feed.requeue_wire(&tail);
+                                // Only the first height remains for this plan attempt.
+                                wire_batch.truncate(1);
+                                let one_in = block_input_count(wire_batch[0].2.as_ref());
+                                loop_stats.confirm_begin(expect_h, 1, one_in);
+                                let one = [(
+                                    rbitcoin_primitives::Height(expect_h),
+                                    std::sync::Arc::clone(&wire_batch[0].2),
+                                )];
+                                // Fresh short-lived pipe for the single-block retry.
+                                let pipe2 =
+                                    plan_ahead.pipeline_for(expect_h, store_path_lo);
+                                let use2 = pipe2.path_lo >= store_path_lo;
+                                hub.confirm_wire_plan_phase(
+                                    &one,
+                                    if use2 { Some(&pipe2) } else { None },
+                                )
+                            }
                         }
+                        other => other,
                     }
-                    other => other,
                 };
                 confirm_thr_stats::add_plan_stamp(t_stamp.elapsed());
                 drop(_live_guard);
@@ -2048,6 +2063,44 @@ mod tests {
             txdata: vec![mk_tx(1), mk_tx(3), mk_tx(2)],
         };
         assert_eq!(super::block_input_count(&block), 6);
+    }
+
+    /// Stamp-time `pipeline_for` Arc must not outlive `note_plan_ok`.
+    ///
+    /// `Arc::make_mut` clones the full in_flight HashMap when strong_count > 1.
+    /// Holding the stamp pipe across note forced a multi-MB clone every plan
+    /// (and sticky old snapshots under planq) — residual RSS creep without BQ.
+    #[test]
+    fn inflight_map_make_mut_clones_only_when_shared() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut outs: Arc<HashMap<u64, u32>> = Arc::new(HashMap::new());
+        Arc::make_mut(&mut outs).insert(1, 10);
+
+        // Simulate stamp pipeline Arc still held (the bug).
+        let stamp_pipe = Arc::clone(&outs);
+        let ptr_before = Arc::as_ptr(&outs);
+        Arc::make_mut(&mut outs).insert(2, 20);
+        assert_ne!(
+            Arc::as_ptr(&outs),
+            ptr_before,
+            "shared Arc must clone on make_mut"
+        );
+        // Old snapshot still has only key 1 (sticky pre-note view).
+        assert_eq!(stamp_pipe.get(&1), Some(&10));
+        assert!(stamp_pipe.get(&2).is_none());
+        drop(stamp_pipe);
+
+        // After drop (the fix): make_mut mutates in place.
+        let ptr_before = Arc::as_ptr(&outs);
+        Arc::make_mut(&mut outs).insert(3, 30);
+        assert_eq!(
+            Arc::as_ptr(&outs),
+            ptr_before,
+            "unique Arc must not clone on make_mut"
+        );
+        assert_eq!(outs.get(&3), Some(&30));
     }
 
     /// Contiguous claim + skip already-confirmed (pure claim helper).

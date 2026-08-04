@@ -128,7 +128,21 @@ impl ConfirmParentCache {
         prev_hash: [u8; 32],
     ) {
         let mut g = self.inner.lock().unwrap();
+        // Tip-GCed window only — never re-insert at/below tip (would stick until
+        // a later advance and inflate conf_plans / RSS with full tx_fks vectors).
+        if height <= g.tip {
+            return;
+        }
         let hash = header_rec.hash;
+        // Replace supersedes prior hash at this height — drop stale reverse key.
+        let stale_hash = g
+            .headers
+            .get(&height)
+            .map(|old| old.header_rec.hash)
+            .filter(|old_hash| *old_hash != hash);
+        if let Some(old_hash) = stale_hash {
+            g.hash_to_height.remove(&old_hash);
+        }
         g.hash_to_height.insert(hash, height);
         g.headers.insert(
             height,
@@ -235,7 +249,10 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().plans.len()
     }
 
-    /// Number of cached header + tx_fks plans (prewarm / load occupancy).
+    /// Number of cached header + tx_fks plans (IBD `conf_plans=` occupancy).
+    ///
+    /// Wire path uses [`Self::put_header_plan`]; the scan-watermark [`Self::plan_count`]
+    /// map is often empty on that path — do not use it for process-owned sizes.
     pub fn header_plan_count(&self) -> usize {
         self.inner.lock().unwrap().headers.len()
     }
@@ -323,6 +340,31 @@ mod tests {
         c.put_header_plan(1, Fk(1), header_rec([9u8; 32]), vec![Fk(1)], [0u8; 32]);
         let p = c.get_header_plan(1).expect("header plan required for multi-block MTP");
         assert_eq!(p.header_rec.hash, [9u8; 32]);
+        assert_eq!(c.header_plan_count(), 1);
+    }
+
+    /// At/below tip must not re-enter the header map (process-owned RSS).
+    #[test]
+    fn put_header_plan_skips_at_or_below_tip() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(10);
+        c.put_header_plan(10, Fk(10), header_rec([10u8; 32]), vec![Fk(1); 100], [0u8; 32]);
+        c.put_header_plan(5, Fk(5), header_rec([5u8; 32]), vec![Fk(1); 100], [0u8; 32]);
+        assert_eq!(c.header_plan_count(), 0);
+        c.put_header_plan(11, Fk(11), header_rec([11u8; 32]), vec![Fk(1)], [0u8; 32]);
+        assert_eq!(c.header_plan_count(), 1);
+        c.advance_tip(11);
+        assert_eq!(c.header_plan_count(), 0);
+    }
+
+    /// Replacing a height drops the stale hash reverse index (no hash_to_height leak).
+    #[test]
+    fn put_header_plan_replaces_stale_hash_reverse() {
+        let c = ConfirmParentCache::new();
+        c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(1)], [0u8; 32]);
+        c.put_header_plan(1, Fk(1), header_rec([2u8; 32]), vec![Fk(2)], [0u8; 32]);
+        assert!(c.get_header_by_hash(&[1u8; 32]).is_none());
+        assert!(c.get_header_by_hash(&[2u8; 32]).is_some());
         assert_eq!(c.header_plan_count(), 1);
     }
 }

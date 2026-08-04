@@ -7,7 +7,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_consensus::{PlanStampOutcome, WirePrepPipeline};
 use rbitcoin_log::{debug, info, warn};
-use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,21 +14,13 @@ use std::time::{Duration, Instant};
 
 /// Prep-thread state so prep(N+1) can plan while commit(N) has not advanced tip.
 ///
-/// In-flight maps are `Arc` so each claim only bumps refcounts (no deep clone).
+/// In-flight creates are an **immutable layer log** ([`rbitcoin_query::InFlightLog`]):
+/// each successful plan pack publishes a frozen layer; prep receives
+/// [`InFlightLog::snapshot`] (Arc bumps only — no `Arc::make_mut` of a shared map).
 struct PrepAheadState {
     next_tx_start: u64,
-    in_flight_creates: std::sync::Arc<HashMap<[u8; 32], Fk>>,
-    /// Pin values are Arc so `note_plan_ok` only bumps refcounts (no deep clone).
-    in_flight_outs: std::sync::Arc<
-        HashMap<
-            u64,
-            std::sync::Arc<(
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Vec<u32>,
-            )>,
-        >,
-    >,
+    /// Append-only published packs (plan thread only mutates via note/prune/clear).
+    in_flight: rbitcoin_query::InFlightLog,
     /// Shared sparse parent pins for concurrent prep/scripts/write batches.
     parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
     /// Last height successfully prepped (still in pipeline or already committed).
@@ -41,8 +32,7 @@ impl PrepAheadState {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
-            in_flight_creates: std::sync::Arc::new(HashMap::new()),
-            in_flight_outs: std::sync::Arc::new(HashMap::new()),
+            in_flight: rbitcoin_query::InFlightLog::new(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             last_prepped: None,
         }
@@ -63,9 +53,10 @@ impl PrepAheadState {
         // Head-occupied ≈ highest create_fk published into the segmented head
         // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
         let head_n = hub.query.tx_head_occupied();
-        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
-        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        prune_inflight_maps(head_n, body_n, creates, outs, &mut self.next_tx_start);
+        self.in_flight.prune(head_n);
+        self.next_tx_start = self
+            .next_tx_start
+            .max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_prepped {
             let tip = hub.tip_height().unwrap_or(0);
             if h <= tip {
@@ -86,8 +77,7 @@ impl PrepAheadState {
             path_lo,
             parent_hash,
             next_tx_start: self.next_tx_start,
-            in_flight_creates: std::sync::Arc::clone(&self.in_flight_creates),
-            in_flight_outs: std::sync::Arc::clone(&self.in_flight_outs),
+            in_flight: self.in_flight.snapshot(),
             parent_store: std::sync::Arc::clone(&self.parent_store),
         }
     }
@@ -99,26 +89,24 @@ impl PrepAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
-        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        // Prefer plan-time Arc pin (layout denserels). Fall back only if lengths
-        // mismatch (tests constructing partial ArchiveWritePlan).
-        if plan.batch_pin.len() == plan.planned_fks.len() {
-            for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
-                creates.insert(pin.0.txid, *fk);
-                if let Some(id) = fk.get() {
-                    outs.insert(id, std::sync::Arc::clone(pin));
-                }
-            }
+        // Publish an immutable layer — never mutates prior layers (prep may hold them).
+        let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
+            rbitcoin_query::InFlightLayer::from_plan_pins(
+                plan.planned_fks
+                    .iter()
+                    .zip(plan.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            )
         } else {
             // Partial plans: pin half is already CreatePin Arc on packed.
-            for ((pin, _ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-                creates.insert(pin.0.txid, *fk);
-                if let Some(id) = fk.get() {
-                    outs.insert(id, std::sync::Arc::clone(pin));
-                }
-            }
-        }
+            rbitcoin_query::InFlightLayer::from_plan_pins(
+                plan.packed
+                    .iter()
+                    .zip(plan.planned_fks.iter())
+                    .map(|((pin, _), fk)| (*fk, pin)),
+            )
+        };
+        self.in_flight.note_layer(layer);
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
@@ -126,36 +114,12 @@ impl PrepAheadState {
     }
 
     fn clear_all(&mut self, hub: &ChainHub) {
-        self.in_flight_creates = std::sync::Arc::new(HashMap::new());
-        self.in_flight_outs = std::sync::Arc::new(HashMap::new());
+        self.in_flight.clear();
         // Arc-swap store so in-flight prep/write batches keep their Arcs.
         self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
-}
-
-/// Prune pipeline in-flight maps after commits.
-///
-/// Keep creates/outs with id **> head_occupied** (not yet head-findable).
-/// Advance `next_tx_start` from **body_count** (next free Class A fk).
-fn prune_inflight_maps(
-    head_occupied: u64,
-    body_count: u64,
-    creates: &mut HashMap<[u8; 32], Fk>,
-    outs: &mut HashMap<
-        u64,
-        std::sync::Arc<(
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<u32>,
-        )>,
-    >,
-    next_tx_start: &mut u64,
-) {
-    creates.retain(|_, fk| fk.get().map(|id| id > head_occupied).unwrap_or(false));
-    outs.retain(|id, _| *id > head_occupied);
-    *next_tx_start = (*next_tx_start).max(body_count.saturating_add(1).max(1));
 }
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
@@ -1978,13 +1942,33 @@ pub(crate) fn offer_confirm_ready(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_conf_q, format_queue_depth, is_confirm_load_retryable, prune_inflight_maps,
-        ConfirmFeed, ConfirmQueueDepths,
+        format_conf_q, format_queue_depth, is_confirm_load_retryable, ConfirmFeed,
+        ConfirmQueueDepths,
     };
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
     use rbitcoin_primitives::Fk;
-    use std::collections::HashMap;
+    use rbitcoin_query::{InFlightLayer, InFlightLog};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    use std::sync::Arc;
+
+    fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&id.to_le_bytes());
+        Arc::new((
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+            Vec::new(),
+        ))
+    }
 
     /// Body-ahead-of-head (seal window): keep in-flight fks head cannot resolve yet.
     ///
@@ -1993,50 +1977,44 @@ mod tests {
     /// dropped parents and plan failed with `parent create_fk unresolved`.
     #[test]
     fn prune_inflight_keeps_body_ahead_of_head() {
-        let mut creates = HashMap::new();
+        let mut log = InFlightLog::new();
         // head has 1..90; body already wrote 91..100 (seal mid head_insert_many).
-        for id in 85u64..=100 {
-            let mut txid = [0u8; 32];
-            txid[0] = id as u8;
-            creates.insert(txid, Fk(id));
-        }
-        let mut outs = HashMap::new();
-        for id in 85u64..=100 {
-            outs.insert(
-                id,
-                std::sync::Arc::new((
-                    rbitcoin_store::TxRecord {
-                        txid: {
-                            let mut t = [0u8; 32];
-                            t[0] = id as u8;
-                            t
-                        },
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 0,
-                        output_start_fk: Fk::NULL,
-                        output_count: 0,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                )),
-            );
-        }
-        let mut next = 50u64;
-        prune_inflight_maps(90, 100, &mut creates, &mut outs, &mut next);
+        let pins: Vec<_> = (85u64..=100)
+            .map(|id| (Fk(id), test_pin(id)))
+            .collect();
+        log.note_layer(InFlightLayer::from_plan_pins(
+            pins.iter().map(|(f, p)| (*f, p)),
+        ));
+        log.prune(90);
+        let v = log.snapshot();
         // Head-findable (≤90) dropped; body-ahead (91..100) retained.
-        assert_eq!(creates.len(), 10);
-        assert_eq!(outs.len(), 10);
+        assert_eq!(log.entry_count(), 10);
         for id in 91u64..=100 {
-            assert!(creates.values().any(|f| f.get() == Some(id)), "keep {id}");
-            assert!(outs.contains_key(&id), "keep outs {id}");
+            assert!(v.get_out(id).is_some(), "keep {id}");
+            assert_eq!(v.get_create_fk(&test_pin(id).0.txid), Some(Fk(id)));
         }
         for id in 85u64..=90 {
-            assert!(!creates.values().any(|f| f.get() == Some(id)), "drop {id}");
+            assert!(v.get_out(id).is_none(), "drop {id}");
         }
-        // next_tx_start advances from body, not head.
-        assert_eq!(next, 101);
+    }
+
+    /// Plan may note new packs while prep holds a prior snapshot — prior Arc
+    /// layers must stay frozen (no whole-map make_mut).
+    #[test]
+    fn note_while_prep_holds_snapshot_does_not_clone_prior_layers() {
+        let mut log = InFlightLog::new();
+        let p1 = test_pin(1);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
+        let held = log.snapshot();
+        for i in 2u64..=30 {
+            let p = test_pin(i);
+            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
+        }
+        assert_eq!(held.layer_count(), 1);
+        assert!(held.get_out(1).is_some());
+        assert!(held.get_out(30).is_none());
+        assert_eq!(log.layer_count(), 30);
+        assert!(log.snapshot().get_out(30).is_some());
     }
 
     fn bh(b: u8) -> BlockHash {

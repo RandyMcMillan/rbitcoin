@@ -2420,8 +2420,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         path_lo: ha,
         parent_hash: None,
         next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-        in_flight_creates: std::sync::Arc::new(HashMap::new()),
-        in_flight_outs: std::sync::Arc::new(HashMap::new()),
+        in_flight: rbitcoin_query::InFlightView::empty(),
         parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
     };
     let mat_a = confirm_wire_prep_phase_pipelined(
@@ -2451,23 +2450,26 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         );
     }
     {
-        let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
-        let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
-        if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
-            for (fk, pin) in plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()) {
-                creates.insert(pin.0.txid, *fk);
-                if let Some(id) = fk.get() {
-                    outs.insert(id, std::sync::Arc::clone(pin));
-                }
-            }
+        let mut log = rbitcoin_query::InFlightLog::new();
+        let layer = if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
+            rbitcoin_query::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            )
         } else {
-            for ((pin, _ins), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
-                creates.insert(pin.0.txid, *fk);
-                if let Some(id) = fk.get() {
-                    outs.insert(id, std::sync::Arc::clone(pin));
-                }
-            }
-        }
+            rbitcoin_query::InFlightLayer::from_plan_pins(
+                plan_a
+                    .packed
+                    .iter()
+                    .zip(plan_a.planned_fks.iter())
+                    .map(|((pin, _), fk)| (*fk, pin)),
+            )
+        };
+        log.note_layer(layer);
+        pipe.in_flight = log.snapshot();
     }
     if let Some(last) = plan_a.planned_fks.last().and_then(|f| f.get()) {
         pipe.next_tx_start = last.saturating_add(1).max(1);
@@ -2475,7 +2477,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     pipe.path_lo = hb;
     pipe.parent_hash = Some(ha_hash.to_byte_array());
 
-    // Prep B while A is still uncommitted — parent pin uses in_flight_outs
+    // Prep B while A is still uncommitted — parent pin uses in_flight view
     // (no denserels). This is the IBD prep∥write pipeline shape.
     let mat_b = confirm_wire_prep_phase_pipelined(
         &q,

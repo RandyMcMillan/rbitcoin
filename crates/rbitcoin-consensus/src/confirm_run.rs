@@ -97,21 +97,11 @@ pub struct WirePrepPipeline {
     pub parent_hash: Option<[u8; 32]>,
     /// Inclusive create-fk start for [`Query::archive_plan_mega_from`].
     pub next_tx_start: u64,
-    /// Prior uncommitted plans: create txid → fk (shared; clone is Arc bump only).
-    pub in_flight_creates: std::sync::Arc<HashMap<[u8; 32], rbitcoin_primitives::Fk>>,
-    /// Prior uncommitted plans: create fk id → Arc pin material
-    /// `(tx meta, outs, denserels)`.
+    /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
     ///
-    /// `denserels` is offline-packed (same as disk) so prep(N+1) can pin abs
-    /// layout without waiting for commit(N) body IO; body_range is filled at write.
-    /// Values are `Arc` so plan-thread `note_plan_ok` only bumps refcounts.
-    pub in_flight_outs: std::sync::Arc<
-        HashMap<u64, std::sync::Arc<(
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<u32>,
-        )>>,
-    >,
+    /// Prep looks up create fk / full CreatePin for parents still only in the
+    /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
+    pub in_flight: rbitcoin_query::InFlightView,
     /// Pipeline-wide sparse parent pin store (Weak map; prep get-or-insert only).
     /// Batches hold `Arc` handles so concurrent stages share one payload per create.
     pub parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
@@ -478,7 +468,7 @@ pub fn confirm_wire_prep_phase_pipelined(
                 .archive_plan_mega_from(
                     &mut need,
                     p.next_tx_start.max(1),
-                    p.in_flight_creates.as_ref(),
+                    &p.in_flight,
                 )
                 .map_err(ConsensusError::Store)?,
             None => query
@@ -527,14 +517,14 @@ pub fn confirm_wire_prep_phase_pipelined(
     };
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
-    let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let inflight = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &metas,
         &wire_blocks,
-        inflight_outs,
+        inflight,
         parent_store,
         cold_mode,
     )?;
@@ -650,16 +640,7 @@ pub struct DenserelsWarmStats {
 pub fn ensure_external_parent_denserels_from_plan(
     query: &Query,
     plan: Option<&mut rbitcoin_query::ArchiveWritePlan>,
-    in_flight_outs: Option<
-        &HashMap<
-            u64,
-            std::sync::Arc<(
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Vec<u32>,
-            )>,
-        >,
-    >,
+    in_flight: Option<&rbitcoin_query::InFlightView>,
 ) -> Result<DenserelsWarmStats, ConsensusError> {
     use rbitcoin_query::confirm_load_stats;
     use rbitcoin_store::IdxBodyMode;
@@ -717,8 +698,8 @@ pub fn ensure_external_parent_denserels_from_plan(
             continue;
         }
         // In-flight offline denserels already available for pin.
-        if let Some(ifo) = in_flight_outs {
-            if ifo.get(id).is_some_and(|pin| !pin.2.is_empty()) {
+        if let Some(ifo) = in_flight {
+            if ifo.get_out(*id).is_some_and(|pin| !pin.2.is_empty()) {
                 st.already = st.already.saturating_add(1);
                 continue;
             }
@@ -946,7 +927,7 @@ pub fn confirm_wire_prep_from_plan(
         ..
     } = stamped;
 
-    let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
@@ -1007,7 +988,7 @@ pub fn confirm_wire_plan_and_ensure_denserels(
     plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
 
-    let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let ifo = pipeline.map(|p| &p.in_flight);
     let warm = ensure_external_parent_denserels_from_plan(query, plan.as_mut(), ifo)?;
     let work_ns = t0.elapsed().as_nanos() as u64;
     plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
@@ -1171,7 +1152,7 @@ fn wire_plan_phase(
                 .archive_plan_mega_from(
                     &mut need,
                     p.next_tx_start.max(1),
-                    p.in_flight_creates.as_ref(),
+                    &p.in_flight,
                 )
                 .map_err(ConsensusError::Store)?,
             None => query
@@ -1393,16 +1374,7 @@ fn pin_for_wire_batch(
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
-    in_flight_outs: Option<
-        &HashMap<
-            u64,
-            std::sync::Arc<(
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Vec<u32>,
-            )>,
-        >,
-    >,
+    in_flight: Option<&rbitcoin_query::InFlightView>,
     pipeline_parent_store: Option<&std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
     cold_mode: ColdPinMode,
 ) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin, DenserelsWarmStats), ConsensusError>
@@ -1527,12 +1499,12 @@ fn pin_for_wire_batch(
 
     // Build plan/in-flight pin sources only for spent parents (not every create).
     // 1) Prior uncommitted plans (Arc pin — no deep clone).
-    if let Some(ifo) = in_flight_outs {
+    if let Some(ifo) = in_flight {
         for (id, need) in &parent_vouts {
             if plan_by_id.contains_key(id) {
                 continue;
             }
-            if let Some(pin) = ifo.get(id) {
+            if let Some(pin) = ifo.get_out(*id) {
                 let _ = need;
                 plan_by_id.insert(*id, std::sync::Arc::clone(pin));
             }
@@ -3462,7 +3434,6 @@ mod write_idempotent_tests {
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::{ArchiveWritePlan, Query};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-        use std::collections::HashMap;
         use std::sync::Once;
 
         static ONCE: Once = Once::new();
@@ -3525,7 +3496,6 @@ mod write_idempotent_tests {
         };
         // In-flight "parent" with **empty** outs → live.len() != need → cold path;
         // no Class A body either → end pin contract fails.
-        let mut ifo = HashMap::new();
         let parent_tx = TxRecord {
             txid: [0xDDu8; 32],
             version: 1,
@@ -3535,10 +3505,13 @@ mod write_idempotent_tests {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        ifo.insert(
-            parent_id,
-            std::sync::Arc::new((parent_tx, Vec::new(), Vec::new())),
-        );
+        let pin = std::sync::Arc::new((parent_tx, Vec::new(), Vec::new()));
+        let mut log = rbitcoin_query::InFlightLog::new();
+        log.note_layer(rbitcoin_query::InFlightLayer::from_plan_pins([(
+            Fk(parent_id),
+            &pin,
+        )]));
+        let ifo = log.snapshot();
 
         let err = pin_for_wire_batch(
             &q,

@@ -248,10 +248,8 @@ impl Query {
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
-        use std::collections::HashMap;
         let start = self.store.txs.count().saturating_add(1);
-        let empty = HashMap::new();
-        self.archive_plan_mega_from(need, start, &empty)
+        self.archive_plan_mega_from(need, start, &crate::InFlightView::empty())
     }
 
     /// Like [`Self::archive_plan_mega_owned`], but assign create fks from
@@ -268,7 +266,7 @@ impl Query {
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
-        in_flight: &std::collections::HashMap<[u8; 32], Fk>,
+        in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -349,7 +347,7 @@ impl Query {
                 if resolved.contains_key(t) {
                     continue;
                 }
-                if let Some(&fk) = in_flight.get(t) {
+                if let Some(fk) = in_flight.get_create_fk(t) {
                     resolved.insert(*t, fk);
                 }
             }
@@ -665,7 +663,7 @@ mod tests {
         let (dir, q) = temp_query("batch-pin-arc");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.batch_pin.len(), plan.planned_fks.len());
         assert_eq!(plan.batch_pin.len(), plan.packed.len());
@@ -702,13 +700,12 @@ mod tests {
 
     #[test]
     fn archive_phase_stats_cover_plan_and_commit_wall() {
-        use std::collections::HashMap;
         // Drain any prior noise.
         let _ = crate::archive_phase_stats::sample_and_reset();
         let (dir, q) = temp_query("arch-phases");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.planned_fks.len(), 2);
         q.archive_commit_plan(plan).unwrap();
@@ -735,7 +732,6 @@ mod tests {
 
     #[test]
     fn plan_from_reserves_fks_for_overlap_then_commit_in_order() {
-        use std::collections::HashMap;
         let (dir, q) = temp_query("plan-from");
         // Seed one body so count starts at 1.
         let seed = vec![(Fk(1), vec![coinbase_apply(1)])];
@@ -746,7 +742,7 @@ mod tests {
         assert_eq!(q.tx_body_count(), 1);
 
         // Reserve two plans as prep would with write queue depth 2.
-        let empty = HashMap::new();
+        let empty = crate::InFlightView::empty();
         let mut next = q.tx_body_count() + 1;
         let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
         let plan_a = q.archive_plan_mega_from(&mut need_a, next, &empty).unwrap();
@@ -772,10 +768,9 @@ mod tests {
     /// Without `in_flight`, this is the "parent create_fk unresolved" corruption.
     #[test]
     fn overlap_plan_resolves_parent_via_inflight_creates() {
-        use std::collections::HashMap;
         let (dir, q) = temp_query("inflight-parent");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = HashMap::new();
+        let empty = crate::InFlightView::empty();
         let plan_a = q.archive_plan_mega_from(&mut need_a, 1, &empty).unwrap();
         assert_eq!(plan_a.planned_fks, vec![Fk(1)]);
         let parent_txid = plan_a.batch_creates[0].0;
@@ -837,7 +832,15 @@ mod tests {
             outputs: vec![OutputRecord::unspent(1, vec![0x51])],
         };
         let mut need_b = vec![(Fk(2), vec![child])];
-        let inflight: HashMap<_, _> = plan_a.batch_creates.iter().copied().collect();
+        let mut inflight_log = crate::InFlightLog::new();
+        inflight_log.note_layer(crate::InFlightLayer::from_plan_pins(
+            plan_a
+                .planned_fks
+                .iter()
+                .zip(plan_a.batch_pin.iter())
+                .map(|(fk, pin)| (*fk, pin)),
+        ));
+        let inflight = inflight_log.snapshot();
         let plan_b = q
             .archive_plan_mega_from(&mut need_b, 2, &inflight)
             .expect("inflight parent resolve");
@@ -892,7 +895,6 @@ mod tests {
     /// commit does not process-seed parents or creates into a pin FIFO.
     #[test]
     fn plan_head_resolved_parents_plan_local_only() {
-        use std::collections::HashMap;
         let (dir, q) = temp_query("plan-creates-only");
         // Parent on disk + head.
         let parent = coinbase_apply(1);
@@ -930,7 +932,7 @@ mod tests {
         };
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 2, &HashMap::new())
+            .archive_plan_mega_from(&mut need, 2, &crate::InFlightView::empty())
             .expect("parent via head");
         assert_eq!(plan.planned_fks, vec![Fk(2)]);
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
@@ -963,12 +965,11 @@ mod tests {
     /// packed pin half and batch_pin share one CreatePin Arc (no outs double-store).
     #[test]
     fn plan_packed_and_batch_pin_share_create_pin_arc() {
-        use std::collections::HashMap;
         use std::sync::Arc;
         let (dir, q) = temp_query("shared-create-pin");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.packed.len(), 1);
         assert_eq!(plan.batch_pin.len(), 1);

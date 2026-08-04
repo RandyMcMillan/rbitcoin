@@ -978,7 +978,6 @@ mod tests {
     #[test]
     fn wire_prep_ahead_of_store_tip_with_pipeline() {
         use rbitcoin_consensus::WirePrepPipeline;
-        use std::collections::HashMap;
 
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -998,8 +997,7 @@ mod tests {
             path_lo: 1,
             parent_hash: None,
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
-            in_flight_creates: std::sync::Arc::new(HashMap::new()),
-            in_flight_outs: std::sync::Arc::new(HashMap::new()),
+            in_flight: rbitcoin_query::InFlightView::empty(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
         };
         let mat1 = hub
@@ -1013,23 +1011,24 @@ mod tests {
         // Update pipeline caches from plan (prep-thread note_plan_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
         {
-            let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
-            let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
-            if plan.batch_pin.len() == plan.planned_fks.len() {
-                for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
-                    creates.insert(pin.0.txid, *fk);
-                    if let Some(id) = fk.get() {
-                        outs.insert(id, std::sync::Arc::clone(pin));
-                    }
-                }
+            let mut log = rbitcoin_query::InFlightLog::new();
+            let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
+                rbitcoin_query::InFlightLayer::from_plan_pins(
+                    plan.planned_fks
+                        .iter()
+                        .zip(plan.batch_pin.iter())
+                        .map(|(fk, pin)| (*fk, pin)),
+                )
             } else {
-                for ((pin, _ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-                    creates.insert(pin.0.txid, *fk);
-                    if let Some(id) = fk.get() {
-                        outs.insert(id, std::sync::Arc::clone(pin));
-                    }
-                }
-            }
+                rbitcoin_query::InFlightLayer::from_plan_pins(
+                    plan.packed
+                        .iter()
+                        .zip(plan.planned_fks.iter())
+                        .map(|((pin, _), fk)| (*fk, pin)),
+                )
+            };
+            log.note_layer(layer);
+            pipe.in_flight = log.snapshot();
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             pipe.next_tx_start = last.saturating_add(1).max(1);

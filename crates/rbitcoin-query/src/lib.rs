@@ -3,6 +3,7 @@
 mod archive;
 mod batch_full_bodies;
 mod batch_parents;
+mod in_flight;
 mod catchup;
 mod chain_view;
 mod combined_stage;
@@ -141,6 +142,7 @@ pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
 pub use archive::{ArchiveWritePlan, CreatePin};
+pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };

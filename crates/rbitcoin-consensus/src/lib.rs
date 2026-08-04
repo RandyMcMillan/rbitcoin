@@ -517,7 +517,7 @@ pub use confirm_run::{
     plan_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_prep_channel,
     ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
     PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
-    WirePrepPipeline,
+    InFlightCreatesMap, InFlightOutsMap, WirePrepPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

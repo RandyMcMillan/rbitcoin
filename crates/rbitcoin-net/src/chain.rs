@@ -998,8 +998,8 @@ mod tests {
             path_lo: 1,
             parent_hash: None,
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
-            in_flight_creates: std::sync::Arc::new(HashMap::new()),
-            in_flight_outs: std::sync::Arc::new(HashMap::new()),
+            in_flight_creates: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            in_flight_outs: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let mat1 = hub
             .confirm_wire_prep_phase_pipelined(&batch1, Some(&pipe))
@@ -1012,8 +1012,14 @@ mod tests {
         // Update pipeline caches from plan (prep-thread note_plan_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
         {
-            let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
-            let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
+            let mut creates = pipe
+                .in_flight_creates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut outs = pipe
+                .in_flight_outs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if plan.batch_pin.len() == plan.planned_fks.len() {
                 for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
                     creates.insert(pin.0.txid, *fk);

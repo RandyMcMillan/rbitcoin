@@ -95,9 +95,6 @@ impl PrepAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        // Prefer unique Arc (in-place insert). Callers must drop any stamp-time
-        // `pipeline_for` clone before this — otherwise make_mut deep-clones the
-        // full HashMap every plan (see plan-thread stamp scope + unit test).
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
         // Prefer plan-time Arc pin (layout denserels). Fall back only if lengths
@@ -348,6 +345,15 @@ pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 1;
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 10;
 /// Hard clamp per stage (env abuse / OOM guard).
 pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
+/// Max sum of `BatchParents` entries allowed in scripts→write at once.
+///
+/// Batch-count caps alone (`WRITE_QUEUE=50`) still allow multi-GiB peaks: each
+/// modern batch carries thousands of sparse parent pins. Mainnet logs showed
+/// `writeq parents≈500k` with residual RSS ~2–3 GiB beyond BQ. Soft budget
+/// backpressures scripts→write so pin graphs drain with the writer.
+///
+/// Env: `RBITCOIN_CONFIRM_WRITE_PARENTS` (0 = disable). Default **80_000**.
+pub(crate) const WRITE_PARENTS_BUDGET_DEFAULT: usize = 80_000;
 
 /// Resolved plan / prep / write queue capacities (OnceLock; process-lifetime).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,15 +406,18 @@ pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
             legacy_n.unwrap_or(WRITE_QUEUE_CAP_DEFAULT),
         );
         let caps = ConfirmQueueCaps { plan, load, write };
+        let parents_budget = write_parents_budget();
         let non_default = plan != PLAN_QUEUE_CAP_DEFAULT
             || load != LOAD_QUEUE_CAP_DEFAULT
             || write != WRITE_QUEUE_CAP_DEFAULT
+            || parents_budget != WRITE_PARENTS_BUDGET_DEFAULT
             || legacy.is_some();
         if non_default {
             rbitcoin_log::info!(
                 "ibd: confirm pipeline queues planq cap={plan} prepq cap={load} \
-                 writeq cap={write} (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / \
-                 _WRITE_QUEUE; legacy RBITCOIN_CONFIRM_QUEUE={})",
+                 writeq cap={write} write_parents_budget={parents_budget} \
+                 (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / _WRITE_QUEUE / \
+                 _WRITE_PARENTS; legacy RBITCOIN_CONFIRM_QUEUE={})",
                 legacy.as_deref().unwrap_or("unset"),
             );
         }
@@ -427,6 +436,33 @@ pub(crate) fn load_queue_cap() -> usize {
 /// Scripts→write capacity.
 pub(crate) fn write_queue_cap() -> usize {
     confirm_queue_caps().write
+}
+
+/// Soft cap on total parent pins sitting in scripts→write (0 = unlimited).
+pub(crate) fn write_parents_budget() -> usize {
+    use std::sync::OnceLock;
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("RBITCOIN_CONFIRM_WRITE_PARENTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(WRITE_PARENTS_BUDGET_DEFAULT)
+    })
+}
+
+/// True when `extra` parents may enter writeq without exceeding the soft budget.
+///
+/// Always allows the first batch into an empty writeq (cannot deadlock on a
+/// single batch larger than the budget).
+#[inline]
+pub(crate) fn write_parents_may_send(current: usize, extra: usize, budget: usize) -> bool {
+    if budget == 0 {
+        return true;
+    }
+    if current == 0 {
+        return true;
+    }
+    current.saturating_add(extra) <= budget
 }
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).
@@ -1148,6 +1184,20 @@ pub(crate) fn spawn_confirm_engine(
                         let ww = outcome.batch.approx_wire_bytes();
                         let wp = outcome.batch.parent_count();
                         let t_send = Instant::now();
+                        // Soft parent budget: do not pile multi-GiB pin graphs in
+                        // writeq when write is the long pole (batch-count caps alone
+                        // still allow parents≈500k under WRITE_QUEUE=50).
+                        let parents_budget = write_parents_budget();
+                        while !write_parents_may_send(
+                            q_sc.content_snap().write_parents,
+                            wp,
+                            parents_budget,
+                        ) {
+                            if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                         if write_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm write channel closed");
                             if let Some(la) = lookahead.take() {
@@ -1580,6 +1630,8 @@ pub(crate) fn spawn_confirm_engine(
                     None => 0u32,
                     Some(t) => t.saturating_add(1),
                 };
+                let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
+                let use_pipe = pipe.path_lo >= store_path_lo;
                 let mut wire_batch = wire_batch;
                 let t_clone = Instant::now();
                 let plan_items: Vec<(
@@ -1591,67 +1643,53 @@ pub(crate) fn spawn_confirm_engine(
                     .collect();
                 confirm_thr_stats::add_plan_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
-                // Stamp with a **short-lived** pipeline Arc. Holding it across
-                // `note_plan_ok` forced `Arc::make_mut` to deep-clone the full
-                // in_flight HashMap on every plan (multi-MB + sticky snapshots
-                // under planq). Drop before note so inserts mutate in place
-                // when no prep handoff still shares the map.
-                let plan_res = {
-                    let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
-                    let use_pipe = pipe.path_lo >= store_path_lo;
-                    let plan_res = hub.confirm_wire_plan_phase(
-                        &plan_items,
-                        if use_pipe { Some(&pipe) } else { None },
-                    );
-                    // stamp wall continues through multi-block split retry below.
-                    match plan_res {
-                        Err(e) if wire_batch.len() > 1 => {
-                            let msg = e.to_string();
-                            if feed.stopped()
-                                || hub.query.confirm_cancelled()
-                                || msg.contains("confirm cancelled")
-                            {
-                                Err(e)
-                            } else if msg.contains("confirm without archive")
-                                || msg.contains("NotFound")
-                                || msg.contains("not found")
-                                || is_confirm_load_retryable(&msg)
-                            {
-                                Err(e)
-                            } else {
-                                warn!(
-                                    "ibd: confirm plan multi-block fail @ {expect_h} n={} — \
-                                     retry first alone, re-queue tail: {msg}",
-                                    wire_batch.len()
-                                );
-                                let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
-                                    wire_batch
-                                        .iter()
-                                        .skip(1)
-                                        .filter(|(_, ha, _)| !hub.has_block(ha))
-                                        .map(|(h, ha, _)| (*h, *ha, None))
-                                        .collect();
-                                feed.requeue_wire(&tail);
-                                // Only the first height remains for this plan attempt.
-                                wire_batch.truncate(1);
-                                let one_in = block_input_count(wire_batch[0].2.as_ref());
-                                loop_stats.confirm_begin(expect_h, 1, one_in);
-                                let one = [(
-                                    rbitcoin_primitives::Height(expect_h),
-                                    std::sync::Arc::clone(&wire_batch[0].2),
-                                )];
-                                // Fresh short-lived pipe for the single-block retry.
-                                let pipe2 =
-                                    plan_ahead.pipeline_for(expect_h, store_path_lo);
-                                let use2 = pipe2.path_lo >= store_path_lo;
-                                hub.confirm_wire_plan_phase(
-                                    &one,
-                                    if use2 { Some(&pipe2) } else { None },
-                                )
-                            }
+                let plan_res = hub.confirm_wire_plan_phase(
+                    &plan_items,
+                    if use_pipe { Some(&pipe) } else { None },
+                );
+                // stamp wall continues through multi-block split retry below.
+                let plan_res = match plan_res {
+                    Err(e) if wire_batch.len() > 1 => {
+                        let msg = e.to_string();
+                        if feed.stopped()
+                            || hub.query.confirm_cancelled()
+                            || msg.contains("confirm cancelled")
+                        {
+                            Err(e)
+                        } else if msg.contains("confirm without archive")
+                            || msg.contains("NotFound")
+                            || msg.contains("not found")
+                            || is_confirm_load_retryable(&msg)
+                        {
+                            Err(e)
+                        } else {
+                            warn!(
+                                "ibd: confirm plan multi-block fail @ {expect_h} n={} — \
+                                 retry first alone, re-queue tail: {msg}",
+                                wire_batch.len()
+                            );
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
+                                .iter()
+                                .skip(1)
+                                .filter(|(_, ha, _)| !hub.has_block(ha))
+                                .map(|(h, ha, _)| (*h, *ha, None))
+                                .collect();
+                            feed.requeue_wire(&tail);
+                            // Only the first height remains for this plan attempt.
+                            wire_batch.truncate(1);
+                            let one_in = block_input_count(wire_batch[0].2.as_ref());
+                            loop_stats.confirm_begin(expect_h, 1, one_in);
+                            let one = [(
+                                rbitcoin_primitives::Height(expect_h),
+                                std::sync::Arc::clone(&wire_batch[0].2),
+                            )];
+                            hub.confirm_wire_plan_phase(
+                                &one,
+                                if use_pipe { Some(&pipe) } else { None },
+                            )
                         }
-                        other => other,
                     }
+                    other => other,
                 };
                 confirm_thr_stats::add_plan_stamp(t_stamp.elapsed());
                 drop(_live_guard);
@@ -2065,42 +2103,43 @@ mod tests {
         assert_eq!(super::block_input_count(&block), 6);
     }
 
-    /// Stamp-time `pipeline_for` Arc must not outlive `note_plan_ok`.
-    ///
-    /// `Arc::make_mut` clones the full in_flight HashMap when strong_count > 1.
-    /// Holding the stamp pipe across note forced a multi-MB clone every plan
-    /// (and sticky old snapshots under planq) — residual RSS creep without BQ.
+    /// Writeq parent soft budget bounds pin-graph pile-up (RSS residual).
     #[test]
-    fn inflight_map_make_mut_clones_only_when_shared() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+    fn write_parents_budget_allows_empty_and_blocks_overfill() {
+        let budget = 1000usize;
+        assert!(super::write_parents_may_send(0, 5000, budget));
+        assert!(super::write_parents_may_send(0, 1, budget));
+        assert!(super::write_parents_may_send(500, 400, budget));
+        assert!(!super::write_parents_may_send(500, 600, budget));
+        assert!(!super::write_parents_may_send(1000, 1, budget));
+        // budget 0 = unlimited
+        assert!(super::write_parents_may_send(1_000_000, 1_000_000, 0));
+    }
 
-        let mut outs: Arc<HashMap<u64, u32>> = Arc::new(HashMap::new());
-        Arc::make_mut(&mut outs).insert(1, 10);
-
-        // Simulate stamp pipeline Arc still held (the bug).
-        let stamp_pipe = Arc::clone(&outs);
-        let ptr_before = Arc::as_ptr(&outs);
-        Arc::make_mut(&mut outs).insert(2, 20);
-        assert_ne!(
-            Arc::as_ptr(&outs),
-            ptr_before,
-            "shared Arc must clone on make_mut"
-        );
-        // Old snapshot still has only key 1 (sticky pre-note view).
-        assert_eq!(stamp_pipe.get(&1), Some(&10));
-        assert!(stamp_pipe.get(&2).is_none());
-        drop(stamp_pipe);
-
-        // After drop (the fix): make_mut mutates in place.
-        let ptr_before = Arc::as_ptr(&outs);
-        Arc::make_mut(&mut outs).insert(3, 30);
-        assert_eq!(
-            Arc::as_ptr(&outs),
-            ptr_before,
-            "unique Arc must not clone on make_mut"
-        );
-        assert_eq!(outs.get(&3), Some(&30));
+    /// Queue accounting + budget gate: after filling writeq parents past budget,
+    /// further sends are refused until recv drains (real ConfirmQueueDepths path).
+    #[test]
+    fn write_parents_budget_gates_on_live_queue_depth() {
+        let budget = 10_000usize;
+        let q = ConfirmQueueDepths::new();
+        // Simulate three script→write sends totaling 9k parents.
+        q.note_write_send(2, 1_000_000, 3_000);
+        q.note_write_send(2, 1_000_000, 3_000);
+        q.note_write_send(2, 1_000_000, 3_000);
+        let cur = q.content_snap().write_parents;
+        assert_eq!(cur, 9_000);
+        // Next 2k batch would exceed 10k — gate closed.
+        assert!(!super::write_parents_may_send(cur, 2_000, budget));
+        // Drain one batch (3k parents) — now 6k; 2k fits.
+        q.note_write_recv(2, 1_000_000, 3_000);
+        let cur = q.content_snap().write_parents;
+        assert_eq!(cur, 6_000);
+        assert!(super::write_parents_may_send(cur, 2_000, budget));
+        // Empty writeq always allows even oversize batch.
+        q.note_write_recv(2, 1_000_000, 3_000);
+        q.note_write_recv(2, 1_000_000, 3_000);
+        assert_eq!(q.content_snap().write_parents, 0);
+        assert!(super::write_parents_may_send(0, 50_000, budget));
     }
 
     /// Contiguous claim + skip already-confirmed (pure claim helper).

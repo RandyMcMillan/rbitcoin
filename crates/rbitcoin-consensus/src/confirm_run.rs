@@ -16,7 +16,9 @@
 //! [`confirm_archived_run`] remains for already-archived Class A only.
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
-//! [`LoadedBatch`] → [`ScriptOkBatch`].
+//! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD uses
+//! [`confirm_scripts_phase_async`] / [`confirm_scripts_feed_ahead`] so the
+//! rayon pool stays fed across batch boundaries (one-batch lookahead).
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
@@ -1866,6 +1868,70 @@ pub fn confirm_scripts_phase(
     })
 }
 
+/// Handle for a scripts stage running on the rayon global pool (non-blocking start).
+///
+/// IBD scripts OS thread starts the next batch with [`confirm_scripts_phase_async`]
+/// before joining the prior, so rayon stays fed across batch boundaries.
+pub struct ScriptsPhaseHandle {
+    rx: std::sync::mpsc::Receiver<Result<ConfirmScriptOutcome, ConsensusError>>,
+}
+
+impl ScriptsPhaseHandle {
+    /// Block until the spawned wave finishes (ordered join).
+    pub fn join(self) -> Result<ConfirmScriptOutcome, ConsensusError> {
+        self.rx.recv().unwrap_or_else(|_| {
+            Err(ConsensusError::BadBlock(
+                "scripts phase: rayon worker disconnected before result",
+            ))
+        })
+    }
+}
+
+/// Submit [`confirm_scripts_phase`] onto the **rayon global pool** without
+/// blocking the caller.
+///
+/// The OS scripts thread can claim/start batch N+1 while N’s jobs still run.
+pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    rayon::spawn(move || {
+        let r = confirm_scripts_phase(batch);
+        let _ = tx.send(r);
+    });
+    ScriptsPhaseHandle { rx }
+}
+
+/// Run script verify for a sequence of loaded batches with **one-batch feed-ahead**.
+///
+/// While batch *i* is verifying on rayon, batch *i+1* (if present) is already
+/// submitted so the pool is not idle solely between sequential claim walls.
+/// Results are returned **in input order** (height-ordered write handoff).
+///
+/// Single-batch input is fine (no second submit). Production IBD uses the same
+/// async+join pattern on the scripts OS thread with channel `try_recv`.
+pub fn confirm_scripts_feed_ahead(
+    batches: impl IntoIterator<Item = LoadedBatch>,
+) -> Result<Vec<ConfirmScriptOutcome>, ConsensusError> {
+    let mut iter = batches.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(Vec::new());
+    };
+    let mut current = confirm_scripts_phase_async(first);
+    let mut out = Vec::new();
+    let mut next = iter.next().map(confirm_scripts_phase_async);
+    loop {
+        // Start the following batch (if any) before joining current — keeps rayon fed.
+        if next.is_none() {
+            next = iter.next().map(confirm_scripts_phase_async);
+        }
+        out.push(current.join()?);
+        match next.take() {
+            Some(h) => current = h,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
 /// LOAD + SCRIPTS in one call (tests / tip path / ChainHub compat).
 ///
 /// Work is full load (Class A + parents) + pure scripts.
@@ -2492,6 +2558,59 @@ mod write_idempotent_tests {
         let ok = confirm_scripts_phase(batch).expect("empty scripts ok");
         assert!(ok.batch.prepared.is_empty());
         assert!(ok.batch.wire_blocks.is_empty());
+    }
+
+    fn empty_loaded_batch() -> super::LoadedBatch {
+        super::LoadedBatch {
+            prepared: Vec::new(),
+            wire_blocks: Vec::new(),
+            batch_parents: rbitcoin_query::BatchParents::new(),
+            script_preverified: super::ScriptPreverified::new(),
+            archive_plan: None,
+        }
+    }
+
+    /// One-batch feed-ahead path (no lookahead) still succeeds on the real entry.
+    #[test]
+    fn scripts_feed_ahead_single_batch() {
+        use super::confirm_scripts_feed_ahead;
+        let outs = confirm_scripts_feed_ahead([empty_loaded_batch()]).expect("single");
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].batch.is_empty());
+    }
+
+    /// Two ready batches: both verify on the real async path; write order preserved.
+    ///
+    /// Uses [`confirm_scripts_feed_ahead`] (same submit/join helper production
+    /// scripts OS thread uses via [`confirm_scripts_phase_async`]).
+    #[test]
+    fn scripts_feed_ahead_two_batches_ordered() {
+        use super::{confirm_scripts_feed_ahead, confirm_scripts_phase_async};
+        // Async handles: start both before joining either (overlap submit).
+        let h0 = confirm_scripts_phase_async(empty_loaded_batch());
+        let h1 = confirm_scripts_phase_async(empty_loaded_batch());
+        let o0 = h0.join().expect("batch0");
+        let o1 = h1.join().expect("batch1");
+        assert!(o0.batch.is_empty());
+        assert!(o1.batch.is_empty());
+
+        // Ordered helper: two batches both ok, returned in input order.
+        let outs = confirm_scripts_feed_ahead([
+            empty_loaded_batch(),
+            empty_loaded_batch(),
+        ])
+        .expect("feed-ahead two");
+        assert_eq!(outs.len(), 2);
+        assert!(outs[0].batch.is_empty());
+        assert!(outs[1].batch.is_empty());
+    }
+
+    /// Empty iterator is a no-op (pipeline edge).
+    #[test]
+    fn scripts_feed_ahead_zero_batches() {
+        use super::confirm_scripts_feed_ahead;
+        let outs = confirm_scripts_feed_ahead(std::iter::empty()).expect("empty");
+        assert!(outs.is_empty());
     }
 
     #[test]

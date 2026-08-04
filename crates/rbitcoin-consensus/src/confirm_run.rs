@@ -1203,7 +1203,13 @@ fn wire_plan_phase(
     let mega_ns = t_mega.elapsed().as_nanos() as u64;
     // plan_ns for HEAD_NS: filter + mega (legacy “plan wall” without struct/prepare).
     let plan_ns = filter_ns.saturating_add(mega_ns);
-    plan_stamp_sub_stats::note(struct_ns, prepare_ns, filter_ns, mega_ns);
+    plan_stamp_sub_stats::note_last(
+        blocks.len() as u64,
+        struct_ns,
+        prepare_ns,
+        filter_ns,
+        mega_ns,
+    );
     Ok((plan, metas, wire_blocks, plan_ns))
 }
 
@@ -1212,6 +1218,9 @@ fn wire_plan_phase(
 /// Mega is the archive plan_mega wall (assign+collect+res+head_fk+head_dens+stamp+finish
 /// already timed in `archive_phase_stats`). `head_fk` = get_fk_by_txid_batch;
 /// `head_dens` = plan-time external-parent denserels load; `head` = sum.
+///
+/// Last-batch fields (overwrite) power slow-plan logs; window sum is still
+/// [`sample_and_reset`].
 pub mod plan_stamp_sub_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1219,6 +1228,11 @@ pub mod plan_stamp_sub_stats {
     static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
     static FILTER_NS: AtomicU64 = AtomicU64::new(0);
     static MEGA_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_FILTER_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_MEGA_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_N_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, mega_ns: u64) {
         if struct_ns > 0 {
@@ -1235,6 +1249,16 @@ pub mod plan_stamp_sub_stats {
         }
     }
 
+    /// Record last stamp sub-walls for one plan batch (slow-plan logs).
+    pub fn note_last(n_blocks: u64, struct_ns: u64, prepare_ns: u64, filter_ns: u64, mega_ns: u64) {
+        note(struct_ns, prepare_ns, filter_ns, mega_ns);
+        LAST_N_BLOCKS.store(n_blocks, Ordering::Relaxed);
+        LAST_STRUCT_NS.store(struct_ns, Ordering::Relaxed);
+        LAST_PREPARE_NS.store(prepare_ns, Ordering::Relaxed);
+        LAST_FILTER_NS.store(filter_ns, Ordering::Relaxed);
+        LAST_MEGA_NS.store(mega_ns, Ordering::Relaxed);
+    }
+
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub struct_ns: u64,
@@ -1249,6 +1273,33 @@ pub mod plan_stamp_sub_stats {
             prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
             filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
             mega_ns: MEGA_NS.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Last stamp batch (not consumed by sample_and_reset).
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct LastStamp {
+        pub n_blocks: u32,
+        pub struct_ns: u64,
+        pub prepare_ns: u64,
+        pub filter_ns: u64,
+        pub mega_ns: u64,
+    }
+
+    impl LastStamp {
+        #[inline]
+        pub fn ms(ns: u64) -> u64 {
+            ns / 1_000_000
+        }
+    }
+
+    pub fn last_stamp() -> LastStamp {
+        LastStamp {
+            n_blocks: LAST_N_BLOCKS.load(Ordering::Relaxed) as u32,
+            struct_ns: LAST_STRUCT_NS.load(Ordering::Relaxed),
+            prepare_ns: LAST_PREPARE_NS.load(Ordering::Relaxed),
+            filter_ns: LAST_FILTER_NS.load(Ordering::Relaxed),
+            mega_ns: LAST_MEGA_NS.load(Ordering::Relaxed),
         }
     }
 }
@@ -1684,6 +1735,9 @@ fn pin_for_wire_batch(
         }
     }
     let plan_pin_ns = t_plan.elapsed().as_nanos() as u64;
+    // Batch-local cold walls/counts for last-pin / slow-prep logs.
+    let mut cold_range_batch_ns = 0u64;
+    let mut n_range_new = 0u64;
 
     // 2b) Cold range denserels for still_need with plan body_range (sparse need_vouts).
     if let Some(plan) = plan {
@@ -1706,6 +1760,7 @@ fn pin_for_wire_batch(
                 .get_outs_denserels_by_range_batch(&range_jobs)
                 .map_err(ConsensusError::Store)?;
             let rng_ns = body_ns.saturating_add(dec_ns);
+            cold_range_batch_ns = cold_range_batch_ns.saturating_add(rng_ns);
             if rng_ns > 0 {
                 confirm_load_stats::COLD_IO_NS.fetch_add(rng_ns, Ordering::Relaxed);
                 confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
@@ -1719,6 +1774,7 @@ fn pin_for_wire_batch(
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
+            n_range_new = n_range_new.saturating_add(n_range);
             let t_range_fill = Instant::now();
             for ((fk, range, _tid, need), row) in
                 range_jobs.into_iter().zip(decoded.into_iter())
@@ -1911,6 +1967,19 @@ fn pin_for_wire_batch(
     if publish_ns > 0 {
         confirm_load_stats::PIN_PUBLISH_NS.fetch_add(publish_ns, Ordering::Relaxed);
     }
+    // Last-batch pin residual for slow-prep logs (overwrite; not window-summed).
+    let cold_batch_ns = cold_range_batch_ns
+        .saturating_add(cold_io_ns)
+        .saturating_add(cold_decode_ns);
+    confirm_load_stats::note_last_pin(
+        adopt_ns,
+        plan_pin_ns,
+        cold_batch_ns,
+        contract_ns,
+        publish_ns,
+        n_plan_pin,
+        n_cold.saturating_add(n_range_new),
+    );
     if cold_io_ns > 0 {
         confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
         confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);

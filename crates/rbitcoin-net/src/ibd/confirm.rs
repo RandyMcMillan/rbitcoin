@@ -1366,10 +1366,23 @@ pub(crate) fn spawn_confirm_engine(
                         confirm_thr_stats::add_prep_send_wait(t_send.elapsed());
                         queues_prep.note_load_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
+                            let pin = rbitcoin_query::confirm_load_stats::last_pin_phases();
+                            let pms = rbitcoin_query::confirm_load_stats::LastPinPhases::ms;
                             info!(
-                                "ibd: confirm prep slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms} plan_ms={}",
+                                "ibd: confirm prep slow batch={prepared_n} claim={} first={expect_h} \
+                                 work_ms={work_ms} plan_stamp_ms={} \
+                                 pin(adopt={}ms plan={}ms/n={} cold={}ms/n={} contract={}ms publish={}ms) \
+                                 parents={}",
                                 heights_hashes.len(),
                                 plan_ns / 1_000_000,
+                                pms(pin.adopt_ns),
+                                pms(pin.plan_pin_ns),
+                                pin.pin_plan_n,
+                                pms(pin.cold_ns),
+                                pin.pin_new_n,
+                                pms(pin.contract_ns),
+                                pms(pin.publish_ns),
+                                parents,
                             );
                         }
                     }
@@ -1736,14 +1749,7 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     Ok(Some(stamped)) => {
                         let work_ns = stamped.work_ns;
-                        let ms = work_ns / 1_000_000;
-                        if ms > 500 {
-                            info!(
-                                "ibd: confirm plan first={expect_h} n={} stamp_ms={}",
-                                wire_batch.len(),
-                                ms,
-                            );
-                        }
+                        let stamp_ms = work_ns / 1_000_000;
                         // Reserve create fks for plan(N+1) while this batch is still
                         // in prep/scripts/write (prep-ahead in-flight).
                         let t_note = Instant::now();
@@ -1779,8 +1785,53 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = prep_join.join();
                             return;
                         }
+                        let send_ms = t_send.elapsed().as_millis() as u64;
                         confirm_thr_stats::add_plan_send_wait(t_send.elapsed());
                         queues_plan.note_plan_send(n);
+                        // Slow plan: stamp wall >2s gets full mega/head_fk breakdown.
+                        // Mild: >500ms still logs a one-liner (legacy).
+                        if stamp_ms > 2_000 {
+                            let st = rbitcoin_consensus::plan_stamp_sub_stats::last_stamp();
+                            let mega = rbitcoin_query::archive_phase_stats::last_plan_mega();
+                            let ms = rbitcoin_query::archive_phase_stats::LastPlanMega::ms;
+                            let sms = rbitcoin_consensus::plan_stamp_sub_stats::LastStamp::ms;
+                            let head_hit_pct = if mega.head_need > 0 {
+                                (100 * mega.head_hit) / mega.head_need
+                            } else {
+                                0
+                            };
+                            info!(
+                                "ibd: confirm plan slow batch={n} first={expect_h} stamp_ms={stamp_ms} \
+                                 send_w={send_ms}ms \
+                                 stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms) \
+                                 mega(assign={}ms collect={}ms sticky={}ms inflight={}ms \
+                                 head_fk={}ms head_dens={}ms stamp={}ms finish={}ms) \
+                                 resolve(ext_need={} head_need={} head_hit={} hit%={} \
+                                 batch_stamp={} resolved_stamp={})",
+                                sms(st.struct_ns),
+                                sms(st.prepare_ns),
+                                sms(st.filter_ns),
+                                sms(st.mega_ns),
+                                ms(mega.assign_ns),
+                                ms(mega.collect_ns),
+                                ms(mega.sticky_ns),
+                                ms(mega.inflight_ns),
+                                ms(mega.head_fk_ns),
+                                ms(mega.head_dens_ns),
+                                ms(mega.stamp_ns),
+                                ms(mega.finish_ns),
+                                mega.ext_need,
+                                mega.head_need,
+                                mega.head_hit,
+                                head_hit_pct,
+                                mega.batch_stamp,
+                                mega.resolved_stamp,
+                            );
+                        } else if stamp_ms > 500 {
+                            info!(
+                                "ibd: confirm plan first={expect_h} n={n} stamp_ms={stamp_ms}"
+                            );
+                        }
                     }
                     Err(e) => {
                         let msg = e.to_string();

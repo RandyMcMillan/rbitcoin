@@ -250,6 +250,64 @@ pub mod confirm_load_stats {
         pub edge_coinbase: u64,
     }
 
+    // ── Last completed pin batch (slow-prep logs; not window-summed) ───────
+    static LAST_PIN_ADOPT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_PLAN_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_COLD_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_PUBLISH_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_PLAN_N: AtomicU64 = AtomicU64::new(0);
+    static LAST_PIN_NEW_N: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct LastPinPhases {
+        pub adopt_ns: u64,
+        pub plan_pin_ns: u64,
+        pub cold_ns: u64,
+        pub contract_ns: u64,
+        pub publish_ns: u64,
+        pub pin_plan_n: u64,
+        pub pin_new_n: u64,
+    }
+
+    impl LastPinPhases {
+        #[inline]
+        pub fn ms(ns: u64) -> u64 {
+            ns / 1_000_000
+        }
+    }
+
+    /// Overwrite last pin residual (one prep pin_for_wire_batch).
+    pub fn note_last_pin(
+        adopt_ns: u64,
+        plan_pin_ns: u64,
+        cold_ns: u64,
+        contract_ns: u64,
+        publish_ns: u64,
+        pin_plan_n: u64,
+        pin_new_n: u64,
+    ) {
+        LAST_PIN_ADOPT_NS.store(adopt_ns, Ordering::Relaxed);
+        LAST_PIN_PLAN_NS.store(plan_pin_ns, Ordering::Relaxed);
+        LAST_PIN_COLD_NS.store(cold_ns, Ordering::Relaxed);
+        LAST_PIN_CONTRACT_NS.store(contract_ns, Ordering::Relaxed);
+        LAST_PIN_PUBLISH_NS.store(publish_ns, Ordering::Relaxed);
+        LAST_PIN_PLAN_N.store(pin_plan_n, Ordering::Relaxed);
+        LAST_PIN_NEW_N.store(pin_new_n, Ordering::Relaxed);
+    }
+
+    pub fn last_pin_phases() -> LastPinPhases {
+        LastPinPhases {
+            adopt_ns: LAST_PIN_ADOPT_NS.load(Ordering::Relaxed),
+            plan_pin_ns: LAST_PIN_PLAN_NS.load(Ordering::Relaxed),
+            cold_ns: LAST_PIN_COLD_NS.load(Ordering::Relaxed),
+            contract_ns: LAST_PIN_CONTRACT_NS.load(Ordering::Relaxed),
+            publish_ns: LAST_PIN_PUBLISH_NS.load(Ordering::Relaxed),
+            pin_plan_n: LAST_PIN_PLAN_N.load(Ordering::Relaxed),
+            pin_new_n: LAST_PIN_NEW_N.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn sample_and_reset() -> Sample {
         Sample {
             ns: NS.swap(0, Ordering::Relaxed),
@@ -532,6 +590,12 @@ pub mod archive_phase_stats {
         add(&HEAD_HIT, head_hit);
         add(&BATCH_STAMP, batch_stamp);
         add(&RESOLVED_STAMP, resolved_stamp);
+        LAST_BLOCKS.store(blocks, Ordering::Relaxed);
+        LAST_EXT_NEED.store(ext_need, Ordering::Relaxed);
+        LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
+        LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
+        LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
+        LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
     }
 
     /// Plan denserels wave size (fks + optional body bytes read).
@@ -546,6 +610,9 @@ pub mod archive_phase_stats {
     /// `head_fk_ns`: pure `get_fk_by_txid_batch`.  
     /// `head_dens_ns`: plan-time external-parent denserels load.  
     /// `head` total = head_fk + head_dens (also stored on `PREP_HEAD_NS`).
+    ///
+    /// Also overwrites **last-batch** mega snapshot for slow-plan logs (not
+    /// window-summed; see [`last_plan_mega`]).
     #[inline]
     pub fn note_prep_plan(
         assign_ns: u64,
@@ -569,6 +636,76 @@ pub mod archive_phase_stats {
         );
         add(&PREP_STAMP_NS, stamp_ns);
         add(&PREP_FINISH_NS, finish_ns);
+        // Last-batch (overwrite; for slow-plan diagnosis).
+        LAST_ASSIGN_NS.store(assign_ns, Ordering::Relaxed);
+        LAST_COLLECT_NS.store(collect_ns, Ordering::Relaxed);
+        LAST_STICKY_NS.store(sticky_ns, Ordering::Relaxed);
+        LAST_INFLIGHT_NS.store(inflight_ns, Ordering::Relaxed);
+        LAST_HEAD_FK_NS.store(head_fk_ns, Ordering::Relaxed);
+        LAST_HEAD_DENS_NS.store(head_dens_ns, Ordering::Relaxed);
+        LAST_STAMP_NS.store(stamp_ns, Ordering::Relaxed);
+        LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
+    }
+
+    // ── Last completed plan_mega (slow-plan logs; not window-summed) ────────
+    static LAST_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_STICKY_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_FINISH_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_HEAD_NEED: AtomicU64 = AtomicU64::new(0);
+    static LAST_HEAD_HIT: AtomicU64 = AtomicU64::new(0);
+    static LAST_EXT_NEED: AtomicU64 = AtomicU64::new(0);
+    static LAST_BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
+    static LAST_RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
+    static LAST_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Snapshot of the most recent [`note_prep_plan`] + resolve mix (one plan batch).
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct LastPlanMega {
+        pub blocks: u64,
+        pub ext_need: u64,
+        pub head_need: u64,
+        pub head_hit: u64,
+        pub batch_stamp: u64,
+        pub resolved_stamp: u64,
+        pub assign_ns: u64,
+        pub collect_ns: u64,
+        pub sticky_ns: u64,
+        pub inflight_ns: u64,
+        pub head_fk_ns: u64,
+        pub head_dens_ns: u64,
+        pub stamp_ns: u64,
+        pub finish_ns: u64,
+    }
+
+    impl LastPlanMega {
+        #[inline]
+        pub fn ms(ns: u64) -> u64 {
+            ns / 1_000_000
+        }
+    }
+
+    pub fn last_plan_mega() -> LastPlanMega {
+        LastPlanMega {
+            blocks: LAST_BLOCKS.load(Ordering::Relaxed),
+            ext_need: LAST_EXT_NEED.load(Ordering::Relaxed),
+            head_need: LAST_HEAD_NEED.load(Ordering::Relaxed),
+            head_hit: LAST_HEAD_HIT.load(Ordering::Relaxed),
+            batch_stamp: LAST_BATCH_STAMP.load(Ordering::Relaxed),
+            resolved_stamp: LAST_RESOLVED_STAMP.load(Ordering::Relaxed),
+            assign_ns: LAST_ASSIGN_NS.load(Ordering::Relaxed),
+            collect_ns: LAST_COLLECT_NS.load(Ordering::Relaxed),
+            sticky_ns: LAST_STICKY_NS.load(Ordering::Relaxed),
+            inflight_ns: LAST_INFLIGHT_NS.load(Ordering::Relaxed),
+            head_fk_ns: LAST_HEAD_FK_NS.load(Ordering::Relaxed),
+            head_dens_ns: LAST_HEAD_DENS_NS.load(Ordering::Relaxed),
+            stamp_ns: LAST_STAMP_NS.load(Ordering::Relaxed),
+            finish_ns: LAST_FINISH_NS.load(Ordering::Relaxed),
+        }
     }
 
     /// Outer prep batch (structure + filter + publish + queue wait).
@@ -1666,6 +1803,13 @@ mod tests {
         let _ = archive_phase_stats::sample_and_reset();
         archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
         archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
+        let last = archive_phase_stats::last_plan_mega();
+        assert_eq!(last.head_fk_ns, 10);
+        assert_eq!(last.head_dens_ns, 20);
+        assert_eq!(last.head_need, 4);
+        assert_eq!(last.head_hit, 5);
+        assert_eq!(last.assign_ns, 1);
+        assert_eq!(archive_phase_stats::LastPlanMega::ms(10_000_000), 10);
         archive_phase_stats::note_head_dens_wave(9, 1024);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);
@@ -1679,6 +1823,17 @@ mod tests {
         assert_eq!(a.prep_head_ns, 30);
         assert_eq!(a.head_dens_fks, 9);
         assert_eq!(a.head_dens_bytes, 1024);
+
+        confirm_load_stats::note_last_pin(11, 22, 33, 44, 55, 100, 9);
+        let lp = confirm_load_stats::last_pin_phases();
+        assert_eq!(lp.adopt_ns, 11);
+        assert_eq!(lp.plan_pin_ns, 22);
+        assert_eq!(lp.cold_ns, 33);
+        assert_eq!(lp.contract_ns, 44);
+        assert_eq!(lp.publish_ns, 55);
+        assert_eq!(lp.pin_plan_n, 100);
+        assert_eq!(lp.pin_new_n, 9);
+        assert_eq!(confirm_load_stats::LastPinPhases::ms(2_000_000), 2);
 
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
         class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);

@@ -16,6 +16,11 @@
 //! Assemble/write read pin data through the batch's `Arc`s — **no** global map
 //! lock on the hot path.
 //!
+//! **Immutable publish:** outs + layout live in an immutable [`PinBody`] snapshot
+//! (`Arc` under a short RwLock). Widening need-vouts or layout **composes a new
+//! body and swaps the Arc** — never `push`/mutate shared vectors in place
+//! (AGENTS: prefer immutable data + composition).
+//!
 //! **Sparse:** only spent need-vouts + layout fields write/assemble need (not
 //! full parent output sets). Vout merge when a later batch spends more outs.
 //!
@@ -41,16 +46,113 @@ struct ParentLayout {
     spender_rels: Vec<(u32, u32)>,
 }
 
+/// Immutable sparse outs + layout snapshot (compose → publish, never mutate).
+#[derive(Debug, Clone)]
+struct PinBody {
+    outs: Vec<(u32, OutputRecord)>,
+    checked: Vec<u32>,
+    layout: ParentLayout,
+}
+
+impl PinBody {
+    fn with_outs_layout(
+        live: Vec<(u32, OutputRecord)>,
+        checked: Vec<u32>,
+        body_range: Option<(u64, u64)>,
+        spender_rels: Vec<(u32, u32)>,
+    ) -> Self {
+        Self {
+            outs: ensure_outs_sorted(live),
+            checked: ensure_checked_sorted(checked),
+            layout: ParentLayout {
+                body_range,
+                spender_rels,
+            },
+        }
+    }
+
+    fn covers_need(&self, need: &[u32]) -> bool {
+        if need.is_empty() {
+            return true;
+        }
+        if self.checked.is_empty() {
+            return false;
+        }
+        need.iter().all(|v| checked_contains(&self.checked, *v))
+    }
+
+    fn has_all_live(&self, live: &[(u32, OutputRecord)]) -> bool {
+        live.iter()
+            .all(|(v, _)| self.outs.iter().any(|(dv, _)| dv == v))
+    }
+
+    /// Compose wider need coverage (new body; does not mutate `self`).
+    fn compose_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) -> Self {
+        let mut outs = self.outs.clone();
+        for (v, o) in live {
+            if !outs.iter().any(|(dv, _)| *dv == v) {
+                outs.push((v, o));
+            }
+        }
+        outs.sort_unstable_by_key(|(v, _)| *v);
+        let mut ch = self.checked.clone();
+        ch.extend_from_slice(checked);
+        ch.sort_unstable();
+        ch.dedup();
+        Self {
+            outs,
+            checked: ch,
+            layout: self.layout.clone(),
+        }
+    }
+
+    /// Compose layout overlay (new body; does not mutate `self`).
+    fn compose_layout(
+        &self,
+        body_range: Option<(u64, u64)>,
+        spender_rels: &[(u32, u32)],
+    ) -> Self {
+        let mut layout = self.layout.clone();
+        if layout.body_range.is_none() {
+            layout.body_range = body_range;
+        }
+        merge_spender_rels_into(&mut layout.spender_rels, spender_rels);
+        Self {
+            outs: self.outs.clone(),
+            checked: self.checked.clone(),
+            layout,
+        }
+    }
+
+    fn layout_already_covers(
+        &self,
+        body_range: Option<(u64, u64)>,
+        spender_rels: &[(u32, u32)],
+    ) -> bool {
+        let range_done = body_range.is_none() || self.layout.body_range.is_some();
+        let rels_done = spender_rels.is_empty()
+            || spender_rels.iter().all(|(v, r)| {
+                self.layout
+                    .spender_rels
+                    .binary_search_by_key(v, |(dv, _)| *dv)
+                    .ok()
+                    .is_some_and(|i| self.layout.spender_rels[i].1 == *r)
+            });
+        range_done && rels_done
+    }
+}
+
 /// One create's sparse pin payload, shared across concurrent pipeline batches.
+///
+/// Identity (`Arc` of this type) stays stable for writeq unique-parent metering.
+/// Payload fields are published as immutable [`PinBody`] snapshots.
 #[derive(Debug)]
 pub struct SharedParentPin {
     tx: TxRecord,
     /// 0 unknown, 1 not coinbase, 2 coinbase.
     coinbase: AtomicU8,
-    /// Sparse need outs + checked vouts (prep merge under write lock).
-    outs_checked: RwLock<(Vec<(u32, OutputRecord)>, Vec<u32>)>,
-    /// Abs layout for spentness/annotate (write thread fill).
-    layout: RwLock<ParentLayout>,
+    /// Published immutable snapshot. Compose + Arc-swap under short write lock.
+    body: RwLock<Arc<PinBody>>,
 }
 
 impl SharedParentPin {
@@ -62,10 +164,6 @@ impl SharedParentPin {
         body_range: Option<(u64, u64)>,
         spender_rels: Vec<(u32, u32)>,
     ) -> Self {
-        // Pin path already sorts/dedups need and builds live in need order.
-        // Only re-sort when a caller hands unsorted data (tests / merge).
-        let outs = ensure_outs_sorted(live);
-        let checked = ensure_checked_sorted(checked);
         let cb = match coinbase {
             Some(true) => CB_TRUE,
             Some(false) => CB_FALSE,
@@ -74,59 +172,55 @@ impl SharedParentPin {
         Self {
             tx,
             coinbase: AtomicU8::new(cb),
-            outs_checked: RwLock::new((outs, checked)),
-            layout: RwLock::new(ParentLayout {
+            body: RwLock::new(Arc::new(PinBody::with_outs_layout(
+                live,
+                checked,
                 body_range,
                 spender_rels,
-            }),
+            ))),
         }
+    }
+
+    /// Snapshot clone (cheap Arc bump under read lock).
+    #[inline]
+    fn load_body(&self) -> Arc<PinBody> {
+        Arc::clone(
+            &self
+                .body
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// Compose from current body under write lock; publish new Arc (never mutate body in place).
+    fn publish_compose(&self, f: impl FnOnce(&PinBody) -> PinBody) {
+        let mut g = self.body.write().unwrap_or_else(|e| e.into_inner());
+        let next = f(g.as_ref());
+        *g = Arc::new(next);
     }
 
     /// True when all `need` vouts are already in checked.
     #[inline]
     fn covers_need(&self, need: &[u32]) -> bool {
-        if need.is_empty() {
-            return true;
-        }
-        let g = self.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-        if g.1.is_empty() {
-            return false;
-        }
-        need.iter().all(|v| checked_contains(&g.1, *v))
+        self.load_body().covers_need(need)
     }
 
     fn merge_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) {
         // Shared-hit fast path: peer batch already pinned these vouts — no write lock.
-        if self.covers_need(checked)
-            && (live.is_empty()
-                || {
-                    let g = self.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-                    live.iter()
-                        .all(|(v, _)| g.0.iter().any(|(dv, _)| dv == v))
-                })
-        {
+        let snap = self.load_body();
+        if snap.covers_need(checked) && (live.is_empty() || snap.has_all_live(&live)) {
             return;
         }
-        let mut g = self.outs_checked.write().unwrap_or_else(|e| e.into_inner());
-        // Re-check under write lock (concurrent merge may have filled need).
-        if !checked.is_empty()
-            && !g.1.is_empty()
-            && checked.iter().all(|v| checked_contains(&g.1, *v))
-            && live
-                .iter()
-                .all(|(v, _)| g.0.iter().any(|(dv, _)| dv == v))
-        {
-            return;
-        }
-        for (v, o) in live {
-            if !g.0.iter().any(|(dv, _)| *dv == v) {
-                g.0.push((v, o));
+        self.publish_compose(|cur| {
+            // Re-check under write lock (concurrent compose may have filled need).
+            if !checked.is_empty()
+                && cur.covers_need(checked)
+                && (live.is_empty() || cur.has_all_live(&live))
+            {
+                return cur.clone();
             }
-        }
-        g.0.sort_unstable_by_key(|(v, _)| *v);
-        g.1.extend_from_slice(checked);
-        g.1.sort_unstable();
-        g.1.dedup();
+            cur.compose_outs(live, checked)
+        });
     }
 
     fn set_coinbase_if_known(&self, coinbase: Option<bool>) {
@@ -154,26 +248,16 @@ impl SharedParentPin {
         if body_range.is_none() && spender_rels.is_empty() {
             return;
         }
-        // Read-first: skip write when body_range already set and no denserels to merge.
-        {
-            let lay = self.layout.read().unwrap_or_else(|e| e.into_inner());
-            let range_done = body_range.is_none() || lay.body_range.is_some();
-            let rels_done = spender_rels.is_empty()
-                || spender_rels.iter().all(|(v, r)| {
-                    lay.spender_rels
-                        .binary_search_by_key(v, |(dv, _)| *dv)
-                        .ok()
-                        .is_some_and(|i| lay.spender_rels[i].1 == *r)
-                });
-            if range_done && rels_done {
-                return;
+        let snap = self.load_body();
+        if snap.layout_already_covers(body_range, spender_rels) {
+            return;
+        }
+        self.publish_compose(|cur| {
+            if cur.layout_already_covers(body_range, spender_rels) {
+                return cur.clone();
             }
-        }
-        let mut lay = self.layout.write().unwrap_or_else(|e| e.into_inner());
-        if lay.body_range.is_none() {
-            lay.body_range = body_range;
-        }
-        merge_spender_rels_into(&mut lay.spender_rels, spender_rels);
+            cur.compose_layout(body_range, spender_rels)
+        });
     }
 }
 
@@ -235,16 +319,12 @@ impl PipelineParentStore {
                 g.retain(|_, w| w.strong_count() > 0);
             }
         }
-        // Phase 2 outside lock: merge local → existing, swap batch handle.
+        // Phase 2 outside lock: compose local → existing body, swap batch handle.
         for (id, existing, local) in conflicts {
-            let (live, checked) = {
-                let og = local.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-                (og.0.clone(), og.1.clone())
-            };
-            existing.merge_outs(live, &checked);
+            let src = local.load_body();
+            existing.merge_outs(src.outs.clone(), &src.checked);
             existing.set_coinbase_if_known(local.coinbase_opt());
-            let src_lay = local.layout.read().unwrap_or_else(|e| e.into_inner());
-            existing.maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
+            existing.maybe_merge_layout(src.layout.body_range, &src.layout.spender_rels);
             pins.insert(id, existing);
         }
     }
@@ -407,19 +487,19 @@ impl BatchParents {
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-        let o = g.0.iter().find(|(v, _)| *v == vout)?;
+        let body = e.load_body();
+        let o = body.outs.iter().find(|(v, _)| *v == vout)?;
         Some((e.tx.clone(), o.1.clone()))
     }
 
-    /// Assemble hot path: value + script bytes + parent txid (script owned — pin
-    /// may be under RwLock).
+    /// Assemble hot path: value + script bytes + parent txid (script owned from
+    /// immutable pin body snapshot).
     #[inline]
     pub fn get_parent_txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, Vec<u8>, [u8; 32])> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-        let (_, o) = g.0.iter().find(|(v, _)| *v == vout)?;
+        let body = e.load_body();
+        let (_, o) = body.outs.iter().find(|(v, _)| *v == vout)?;
         Some((o.value, o.script.clone(), e.tx.txid))
     }
 
@@ -436,10 +516,7 @@ impl BatchParents {
     pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        e.layout
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .body_range
+        e.load_body().layout.body_range
     }
 
     pub fn set_layout(&mut self, fk: Fk, body_range: (u64, u64), dense_rels: &[u32]) {
@@ -459,25 +536,22 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        // Monotonic under write lock: re-read checked, extend with extra_need
-        // (never replace with a stale snapshot — concurrent prep merge_outs can
-        // add peer-batch need-vouts between a read lock and a later write).
-        let need = {
-            let mut g = e.outs_checked.write().unwrap_or_else(|e| e.into_inner());
-            if g.1.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
-                g.1 = (0..dense_rels.len() as u32).collect();
+        // Compose new body under publish lock: extend checked with extra_need
+        // and merge denserels (never replace with a stale full-vector snapshot —
+        // concurrent prep compose_outs can add peer need-vouts).
+        e.publish_compose(|cur| {
+            let mut next = cur.clone();
+            if next.checked.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
+                next.checked = (0..dense_rels.len() as u32).collect();
             }
-            g.1.extend_from_slice(extra_need);
-            g.1.sort_unstable();
-            g.1.dedup();
-            g.1.clone()
-        };
-        let sparse = sparse_spender_rels(dense_rels, &need);
-        // Monotonic layout publish: set body_range, merge denserels by vout
-        // (do not full-replace — peer prep may have already merged denserels).
-        let mut lay = e.layout.write().unwrap_or_else(|e| e.into_inner());
-        lay.body_range = Some(body_range);
-        merge_spender_rels_into(&mut lay.spender_rels, &sparse);
+            next.checked.extend_from_slice(extra_need);
+            next.checked.sort_unstable();
+            next.checked.dedup();
+            let sparse = sparse_spender_rels(dense_rels, &next.checked);
+            next.layout.body_range = Some(body_range);
+            merge_spender_rels_into(&mut next.layout.spender_rels, &sparse);
+            next
+        });
     }
 
     pub fn set_body_range_only(&mut self, fk: Fk, body_range: (u64, u64)) {
@@ -485,8 +559,11 @@ impl BatchParents {
             return;
         };
         if let Some(e) = self.pins.get(&id) {
-            let mut lay = e.layout.write().unwrap_or_else(|e| e.into_inner());
-            lay.body_range = Some(body_range);
+            e.publish_compose(|cur| {
+                let mut next = cur.clone();
+                next.layout.body_range = Some(body_range);
+                next
+            });
         }
     }
 
@@ -503,15 +580,17 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        if !extra_need.is_empty() {
-            let mut g = e.outs_checked.write().unwrap_or_else(|e| e.into_inner());
-            g.1.extend_from_slice(extra_need);
-            g.1.sort_unstable();
-            g.1.dedup();
-        }
-        let mut lay = e.layout.write().unwrap_or_else(|e| e.into_inner());
-        lay.body_range = Some(body_range);
-        merge_spender_rels_into(&mut lay.spender_rels, &sparse_rels);
+        e.publish_compose(|cur| {
+            let mut next = cur.clone();
+            if !extra_need.is_empty() {
+                next.checked.extend_from_slice(extra_need);
+                next.checked.sort_unstable();
+                next.checked.dedup();
+            }
+            next.layout.body_range = Some(body_range);
+            merge_spender_rels_into(&mut next.layout.spender_rels, &sparse_rels);
+            next
+        });
     }
 
     #[inline]
@@ -522,7 +601,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        let lay = e.layout.read().unwrap_or_else(|e| e.into_inner());
+        let lay = &e.load_body().layout;
         lay.body_range.is_some() && !lay.spender_rels.is_empty()
     }
 
@@ -534,18 +613,14 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        !e.layout
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .spender_rels
-            .is_empty()
+        !e.load_body().layout.spender_rels.is_empty()
     }
 
     pub fn fks_missing_layout(&self) -> Vec<Fk> {
         self.pins
             .iter()
             .filter(|(_, e)| {
-                let lay = e.layout.read().unwrap_or_else(|e| e.into_inner());
+                let lay = &e.load_body().layout;
                 lay.body_range.is_none() || lay.spender_rels.is_empty()
             })
             .map(|(&id, _)| Fk(id))
@@ -560,7 +635,7 @@ impl BatchParents {
     pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let lay = e.layout.read().unwrap_or_else(|e| e.into_inner());
+        let lay = &e.load_body().layout;
         let (off, _) = lay.body_range?;
         let i = lay
             .spender_rels
@@ -580,8 +655,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-        g.0.iter().any(|(v, _)| *v == vout)
+        e.load_body().outs.iter().any(|(v, _)| *v == vout)
     }
 
     pub fn pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
@@ -614,17 +688,15 @@ impl BatchParents {
                     v.insert(src);
                 }
                 std::collections::hash_map::Entry::Occupied(o) => {
-                    // Same Arc or two Arcs for same fk (no store) — merge data.
+                    // Same Arc or two Arcs for same fk (no store) — compose into one.
                     if !Arc::ptr_eq(o.get(), &src) {
-                        let (live, checked) = {
-                            let g = src.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-                            (g.0.clone(), g.1.clone())
-                        };
-                        o.get().merge_outs(live, &checked);
+                        let body = src.load_body();
+                        o.get().merge_outs(body.outs.clone(), &body.checked);
                         o.get().set_coinbase_if_known(src.coinbase_opt());
-                        let src_lay = src.layout.read().unwrap_or_else(|e| e.into_inner());
-                        o.get()
-                            .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
+                        o.get().maybe_merge_layout(
+                            body.layout.body_range,
+                            &body.layout.spender_rels,
+                        );
                     }
                 }
             }
@@ -638,22 +710,22 @@ impl BatchParents {
     ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>, bool)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
+        let body = e.load_body();
         let covered =
-            !g.1.is_empty() && vouts.iter().all(|v| checked_contains(&g.1, *v));
+            !body.checked.is_empty() && vouts.iter().all(|v| checked_contains(&body.checked, *v));
         if covered {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some((_, o)) = g.0.iter().find(|(ov, _)| *ov == v) {
+                if let Some((_, o)) = body.outs.iter().find(|(ov, _)| *ov == v) {
                     live.push((v, o.clone()));
                 }
             }
             return Some((e.tx.clone(), live, true));
         }
-        if !g.0.is_empty() && vouts.iter().all(|v| g.0.iter().any(|(ov, _)| ov == v)) {
+        if !body.outs.is_empty() && vouts.iter().all(|v| body.outs.iter().any(|(ov, _)| ov == v)) {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some((_, o)) = g.0.iter().find(|(ov, _)| *ov == v) {
+                if let Some((_, o)) = body.outs.iter().find(|(ov, _)| *ov == v) {
                     live.push((v, o.clone()));
                 }
             }
@@ -988,10 +1060,10 @@ mod tests {
     }
 
     /// Prep∥write on one SharedParentPin: write set_layout_for_need must not
-    /// clobber checked need-vouts or denserels merged by concurrent prep.
+    /// clobber checked need-vouts or denserels composed by concurrent prep.
     ///
-    /// Failure mode (pre-fix): set_layout read-locked a stale checked snapshot,
-    /// then write-replaced checked/spender_rels and dropped peer batch vouts.
+    /// Bodies are immutable snapshots; concurrent compose publishes new Arcs
+    /// under the pin lock so peer need-vouts and denserels survive.
     #[test]
     fn set_layout_merges_not_clobbers_under_concurrent_prep() {
         use std::sync::Barrier;
@@ -1019,9 +1091,7 @@ mod tests {
             // Concurrent prep batch spends vout 1 of the same create.
             for _ in 0..200 {
                 pin_prep.merge_outs(vec![(1, out(20))], &[1]);
-                // Peer denserels for vout 1 (as get_or_insert_merge would).
-                let mut lay = pin_prep.layout.write().unwrap_or_else(|e| e.into_inner());
-                merge_spender_rels_into(&mut lay.spender_rels, &[(1, 20)]);
+                pin_prep.maybe_merge_layout(None, &[(1, 20)]);
             }
         });
 
@@ -1045,5 +1115,89 @@ mod tests {
             Some(120),
             "spender_rels must merge, not replace, peer denserels"
         );
+    }
+
+    /// Timed synthetic: multi-pack insert + layout compose at few-block scale.
+    /// Prints ns/op so IBD regressions are visible without a criterion harness.
+    #[test]
+    fn pin_compose_multi_pack_timed() {
+        let n_parents = 8_000usize; // ~input budget scale
+        let store = Arc::new(PipelineParentStore::new());
+        let t0 = std::time::Instant::now();
+        let mut a = BatchParents::with_store(Arc::clone(&store), n_parents);
+        for i in 1..=n_parents as u64 {
+            a.insert_owned(
+                Fk(i),
+                tx((i % 200) as u8),
+                vec![(0, out(i as i64))],
+                vec![0],
+                Some(false),
+                None,
+                vec![(0, 10)],
+            );
+        }
+        a.publish_to_store();
+        let insert_ns = t0.elapsed().as_nanos();
+
+        let t1 = std::time::Instant::now();
+        let mut b = BatchParents::with_store(Arc::clone(&store), n_parents);
+        b.adopt_from_store(1..=n_parents as u64);
+        for i in 1..=n_parents as u64 {
+            // Widen need + layout (compose publish on shared pins).
+            b.insert_owned(
+                Fk(i),
+                tx((i % 200) as u8),
+                vec![(1, out(i as i64 + 1))],
+                vec![1],
+                None,
+                Some((i * 100, 50)),
+                vec![(1, 20)],
+            );
+        }
+        b.publish_to_store();
+        let widen_ns = t1.elapsed().as_nanos();
+
+        assert_eq!(a.len(), n_parents);
+        assert_eq!(b.len(), n_parents);
+        assert!(a.pin_covered(Fk(1), &[0, 1]));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(120));
+        eprintln!(
+            "pin_compose_multi_pack n={n_parents} insert_ns={insert_ns} ({:.1} ns/op) widen_ns={widen_ns} ({:.1} ns/op)",
+            insert_ns as f64 / n_parents as f64,
+            widen_ns as f64 / n_parents as f64,
+        );
+        // Sanity bound: free-plan insert should stay well under 50µs/op even in debug.
+        assert!(
+            insert_ns / (n_parents as u128) < 50_000,
+            "insert ns/op too high: {}",
+            insert_ns / n_parents as u128
+        );
+    }
+
+    /// Pure compose helpers: widening need and layout builds a new body without
+    /// mutating the source snapshot (AGENTS prefer-immutable).
+    #[test]
+    fn pin_body_compose_does_not_mutate_source() {
+        let pin = SharedParentPin::new(
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            Some((100, 50)),
+            vec![(0, 10)],
+        );
+        let before = pin.load_body();
+        pin.merge_outs(vec![(1, out(20))], &[1]);
+        pin.maybe_merge_layout(None, &[(1, 20)]);
+        let after = pin.load_body();
+        // Source snapshot unchanged.
+        assert_eq!(before.outs.len(), 1);
+        assert_eq!(before.checked, vec![0]);
+        assert_eq!(before.layout.spender_rels, vec![(0, 10)]);
+        // Published body has the union.
+        assert_eq!(after.outs.len(), 2);
+        assert!(after.covers_need(&[0, 1]));
+        assert_eq!(after.layout.spender_rels, vec![(0, 10), (1, 20)]);
+        assert!(!Arc::ptr_eq(&before, &after), "compose must publish new Arc");
     }
 }

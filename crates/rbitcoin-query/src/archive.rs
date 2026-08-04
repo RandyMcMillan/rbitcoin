@@ -21,6 +21,14 @@ use super::*;
 /// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
 pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>;
 
+/// Sparse external parent denserels for pin (need-vouts only).
+///
+/// `(tx, live need outs, sparse denserels as (vout, rel))` — **not** a full
+/// `output_count`-sized outs/denserels expand. Transient on the plan until pin;
+/// sparse need then lives in [`crate::BatchParents`].
+pub type SparseExternalPin =
+    std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>;
+
 /// Write-ready mega-batch from plan (prep) to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
@@ -35,12 +43,12 @@ pub struct ArchiveWritePlan {
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
-    /// Pipeline-local full pins for external parents (outs+denserels).
+    /// Pipeline-local **sparse** external parent pins (need-vouts only).
     ///
     /// Filled by ensure/prep denserels (often from
     /// [`Self::external_parent_ranges`]). **Dropped after pin**
     /// ([`Self::clear_external_parent_outs`]).
-    pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
+    pub external_parent_outs: std::collections::HashMap<u64, SparseExternalPin>,
     /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
     ///
     /// Filled at plan stamp (fk+range short-circuit). Prep denserels-loads by
@@ -88,7 +96,7 @@ impl ArchiveWritePlan {
         self.external_parent_txids.get(&create_fk_id).copied()
     }
 
-    /// Drop pipeline-local external full-outs after denserels pin.
+    /// Drop pipeline-local external sparse outs after denserels pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
     /// reads this map. Ranges + txid reverse may be cleared with outs (prep done).
@@ -101,15 +109,36 @@ impl ArchiveWritePlan {
         self.external_parent_txids.shrink_to_fit();
     }
 
-    /// Append another plan for write megabatch (height-ordered Class A).
+    /// Freeze plan for write megabatch: drop all pin-staging maps.
+    ///
+    /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
+    /// / headers / spends / `batch_pin`). Prep must call this (or
+    /// [`Self::clear_external_parent_outs`]) before enqueue to scripts/write so
+    /// mega-merge never mutates growing external HashMaps.
+    pub fn freeze_after_pin(&mut self) {
+        self.clear_external_parent_outs();
+    }
+
+    /// Append another **frozen** plan for write megabatch (height-ordered Class A).
     ///
     /// Callers must drain scripts→write in height order so `planned_fks` stay
-    /// contiguous and match the sole Class A appender sequence. External-parent
-    /// maps are usually empty by write time (cleared after prep pin).
+    /// contiguous and match the sole Class A appender sequence.
+    ///
+    /// External staging maps are **discarded** (not union-merged): they are
+    /// pin-time only and must already be empty after [`Self::freeze_after_pin`].
+    /// Commit composition is pure vector concat of the frozen halves.
     pub fn append(&mut self, mut other: Self) {
         if other.is_empty() && other.per_header_ranges.is_empty() {
             return;
         }
+        // Drop residual staging (should be empty after freeze_after_pin).
+        other.external_parent_outs.clear();
+        other.external_parent_ranges.clear();
+        other.external_parent_txids.clear();
+        self.external_parent_outs.clear();
+        self.external_parent_ranges.clear();
+        self.external_parent_txids.clear();
+
         self.packed.append(&mut other.packed);
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
@@ -118,16 +147,6 @@ impl ArchiveWritePlan {
         self.batch_pin.append(&mut other.batch_pin);
         self.index_tx |= other.index_tx;
         self.body_est = self.body_est.saturating_add(other.body_est);
-        // External maps: rare residual; union by create id (first wins).
-        for (k, v) in other.external_parent_outs {
-            self.external_parent_outs.entry(k).or_insert(v);
-        }
-        for (k, v) in other.external_parent_ranges {
-            self.external_parent_ranges.entry(k).or_insert(v);
-        }
-        for (k, v) in other.external_parent_txids {
-            self.external_parent_txids.entry(k).or_insert(v);
-        }
     }
 }
 
@@ -367,7 +386,7 @@ impl Query {
         // (probe + idx + identity; no denserels body). Prep loads denserels by
         // known body_range (skip tx.idx). Identity for pin is the lookup key
         // already in RAM (`resolved`) — never re-read txid.body at prep.
-        let external_parent_outs: std::collections::HashMap<u64, CreatePin> =
+        let external_parent_outs: std::collections::HashMap<u64, SparseExternalPin> =
             std::collections::HashMap::new();
         let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
@@ -982,6 +1001,67 @@ mod tests {
         assert!(Arc::ptr_eq(&ifo_pin, &plan.batch_pin[0]));
         assert_eq!(Arc::strong_count(&plan.batch_pin[0]), 3);
         q.archive_commit_plan(plan).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Freeze + append: mega-merge is vector concat of frozen commit halves;
+    /// external staging maps are dropped (not union-mutated).
+    #[test]
+    fn freeze_after_pin_then_append_preserves_fk_order() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("freeze-append");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let mut plan_a = q
+            .archive_plan_mega_from(&mut need_a, 1, &crate::InFlightView::empty())
+            .unwrap();
+        // Simulate residual staging (must not survive freeze/append).
+        plan_a.external_parent_outs.insert(
+            99,
+            Arc::new((
+                coinbase_apply(99).tx,
+                vec![(0, OutputRecord::unspent(1, vec![0x51]))],
+                vec![(0, 10)],
+            )),
+        );
+        plan_a.external_parent_ranges.insert(99, (0, 1));
+        plan_a.external_parent_txids.insert(99, [9u8; 32]);
+        plan_a.freeze_after_pin();
+        assert!(plan_a.external_parent_outs.is_empty());
+        assert!(plan_a.external_parent_ranges.is_empty());
+        assert!(plan_a.external_parent_txids.is_empty());
+
+        let mut need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
+        let mut plan_b = q
+            .archive_plan_mega_from(&mut need_b, 2, &crate::InFlightView::empty())
+            .unwrap();
+        plan_b.external_parent_outs.insert(
+            88,
+            Arc::new((
+                coinbase_apply(88).tx,
+                vec![(0, OutputRecord::unspent(1, vec![0x51]))],
+                vec![(0, 5)],
+            )),
+        );
+        plan_b.freeze_after_pin();
+
+        let fks_a = plan_a.planned_fks.clone();
+        let fks_b = plan_b.planned_fks.clone();
+        assert_eq!(fks_a.len(), 1);
+        assert_eq!(fks_b.len(), 2);
+
+        plan_a.append(plan_b);
+        assert!(
+            plan_a.external_parent_outs.is_empty(),
+            "append must not keep external staging maps"
+        );
+        assert_eq!(plan_a.planned_fks.len(), 3);
+        assert_eq!(&plan_a.planned_fks[..1], &fks_a[..]);
+        assert_eq!(&plan_a.planned_fks[1..], &fks_b[..]);
+        assert_eq!(plan_a.packed.len(), 3);
+        assert_eq!(plan_a.batch_pin.len(), 3);
+        // Contiguous Class A commit of the merged frozen plan.
+        q.archive_commit_plan(plan_a).unwrap();
+        assert_eq!(q.tx_body_count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

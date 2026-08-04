@@ -2382,7 +2382,6 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         accept_and_connect_block, confirm_scripts_phase, confirm_wire_prep_phase_pipelined,
         confirm_write_phase, ChainParams, Milestone, ScriptPreverified, WirePrepPipeline,
     };
-    use std::collections::HashMap;
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
@@ -2436,10 +2435,10 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
 
     let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
-    // Prep drops external full-outs after pin; only sparse BatchParents remains.
+    // Prep freezes plan after pin; only sparse BatchParents remains.
     assert!(
         plan_a.external_parent_outs.is_empty(),
-        "post-pin plan must not retain external full-outs on prep→scripts→write handoff"
+        "post-pin plan must not retain external sparse outs on prep→scripts→write handoff"
     );
     // packed pin half and batch_pin share CreatePin Arc (no outs double-store).
     assert_eq!(plan_a.batch_pin.len(), plan_a.packed.len());

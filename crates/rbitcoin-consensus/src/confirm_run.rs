@@ -528,9 +528,9 @@ pub fn confirm_wire_prep_phase_pipelined(
         parent_store,
         cold_mode,
     )?;
-    // Drop pipeline-local external full-outs after pin (sparse BatchParents remains).
+    // Freeze plan for write: drop external staging maps (sparse BatchParents remains).
     if let Some(ref mut p) = plan {
-        p.clear_external_parent_outs();
+        p.freeze_after_pin();
     }
 
     confirm_phase_stats::LOAD_NS.fetch_add(
@@ -688,11 +688,11 @@ pub fn ensure_external_parent_denserels_from_plan(
         }
         st.parents = st.parents.saturating_add(1);
         let fk = rbitcoin_primitives::Fk(*id);
-        // Plan-local external parent already loaded at Shape A.
+        // Plan-local external parent already loaded (sparse need denserels).
         if plan
             .external_parent_outs
             .get(id)
-            .is_some_and(|pin| !pin.2.is_empty())
+            .is_some_and(|pin| !pin.1.is_empty() || !pin.2.is_empty())
         {
             st.already = st.already.saturating_add(1);
             continue;
@@ -748,8 +748,8 @@ pub fn ensure_external_parent_denserels_from_plan(
                 confirm_load_stats::COLD_RANGE_DECODE_NS.fetch_add(dec_ns, Ordering::Relaxed);
             }
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            // Expand sparse live into dense outs for plan.external_parent_outs CreatePin
-            // shape (ensure/in-flight still use full CreatePin). Only need vouts filled.
+            // Keep sparse need-vouts only — no full output_count dense expand
+            // (AGENTS prefer-immutable / avoid wasteful mutable bag growth).
             for ((_fk, _range, _tid, need), row) in by_range.into_iter().zip(decoded.into_iter()) {
                 let Some(id) = _fk.get() else {
                     continue;
@@ -757,25 +757,9 @@ pub fn ensure_external_parent_denserels_from_plan(
                 let Some((tx, live, sparse)) = row else {
                     continue;
                 };
-                let n_out = tx.output_count as usize;
-                let mut outs = vec![
-                    rbitcoin_store::OutputRecord::unspent(0, Vec::new());
-                    n_out
-                ];
-                let mut dens = vec![0u32; n_out];
-                for &(v, ref o) in &live {
-                    if (v as usize) < n_out {
-                        outs[v as usize] = o.clone();
-                    }
-                }
-                for &(v, rel) in &sparse {
-                    if (v as usize) < n_out {
-                        dens[v as usize] = rel;
-                    }
-                }
                 let _ = need;
                 plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, outs, dens)));
+                    .insert(id, std::sync::Arc::new((tx, live, sparse)));
             }
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
@@ -818,8 +802,26 @@ pub fn ensure_external_parent_denserels_from_plan(
                     })?
                 };
                 fill_create_txid_from_ram(&mut tx, id, Some(plan));
+                // Sparse need only — drop full dense outs after selecting need vouts.
+                let need = parent_vouts.get(&id).cloned().unwrap_or_default();
+                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = if need.is_empty() {
+                    outs.into_iter().enumerate().map(|(i, o)| (i as u32, o)).collect()
+                } else {
+                    need.iter()
+                        .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+                        .collect()
+                };
+                let sparse = if need.is_empty() {
+                    dens.into_iter()
+                        .enumerate()
+                        .filter(|(_, r)| *r != rbitcoin_query::SPENDER_REL_UNKNOWN)
+                        .map(|(i, r)| (i as u32, r))
+                        .collect()
+                } else {
+                    rbitcoin_query::sparse_spender_rels(&dens, &need)
+                };
                 plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, outs, dens)));
+                    .insert(id, std::sync::Arc::new((tx, live, sparse)));
             }
         }
         cold_io_ns = t_io.elapsed().as_nanos() as u64;
@@ -827,13 +829,13 @@ pub fn ensure_external_parent_denserels_from_plan(
             confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
         }
-        // Completeness: every cold parent must be plan-local (not residency).
+        // Completeness: every cold parent must be plan-local sparse pin.
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if plan
                 .external_parent_outs
                 .get(&id)
-                .is_none_or(|pin| pin.2.is_empty())
+                .is_none_or(|pin| pin.1.is_empty() && pin.2.is_empty())
             {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: plan stage failed to load external parent denserels",
@@ -938,10 +940,9 @@ pub fn confirm_wire_prep_from_plan(
         parent_store,
         ColdPinMode::Allow,
     )?;
-    // External full-outs were only for pin; sparse BatchParents holds need-vouts.
-    // Drop so prep→scripts→write does not retain head-miss denserels material.
+    // Freeze plan for write: drop external staging; sparse BatchParents remains.
     if let Some(ref mut p) = plan {
-        p.clear_external_parent_outs();
+        p.freeze_after_pin();
     }
 
     confirm_phase_stats::LOAD_NS.fetch_add(
@@ -1510,19 +1511,8 @@ fn pin_for_wire_batch(
             }
         }
     }
-    // 2) This plan's head-miss external parents (shared CreatePin Arc — no deep clone).
-    if let Some(plan) = plan {
-        for (id, need) in &parent_vouts {
-            if plan_by_id.contains_key(id) {
-                continue;
-            }
-            if let Some(pin) = plan.external_parent_outs.get(id) {
-                let _ = need;
-                plan_by_id.insert(*id, std::sync::Arc::clone(pin));
-            }
-        }
-        // 2b deferred: range denserels after free pins are in batch_parents (sparse API).
-    }
+    // 2) External sparse pins are applied after adopt (not dense CreatePin).
+    // 2b deferred: range denserels after free pins are in batch_parents (sparse API).
     // 3) Same-batch creates: shared batch_pin / packed CreatePin Arc.
     for (id, _need) in &parent_vouts {
         if plan_by_id.contains_key(id) {
@@ -1570,9 +1560,82 @@ fn pin_for_wire_batch(
                 };
                 // Layout / coinbase only — no outs/tx clone.
                 batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+            } else if let Some(plan) = plan {
+                // Sparse external: layout/coinbase only from plan-local pin.
+                if let Some(ext) = plan.external_parent_outs.get(id) {
+                    let (tx, _live, sparse_all) = ext.as_ref();
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    let plan_range = plan.external_parent_ranges.get(id).copied();
+                    let sparse: Vec<(u32, u32)> = sparse_all
+                        .iter()
+                        .copied()
+                        .filter(|(v, _)| need.binary_search(v).is_ok())
+                        .collect();
+                    batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                }
             }
             n_plan_pin = n_plan_pin.saturating_add(1);
             continue;
+        }
+        // Sparse external parent pin (need-vouts only — no dense CreatePin).
+        if let Some(plan) = plan {
+            if let Some(ext) = plan.external_parent_outs.get(id) {
+                let (tx, live_all, sparse_all) = ext.as_ref();
+                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
+                    .iter()
+                    .filter_map(|&v| {
+                        live_all
+                            .iter()
+                            .find(|(ov, _)| *ov == v)
+                            .map(|(_, o)| (v, o.clone()))
+                    })
+                    .collect();
+                if live.len() == need.len() || (need.is_empty() && !live_all.is_empty()) {
+                    let live = if need.is_empty() {
+                        live_all.clone()
+                    } else {
+                        live
+                    };
+                    let checked = if need.is_empty() {
+                        live_all.iter().map(|(v, _)| *v).collect()
+                    } else {
+                        need.clone()
+                    };
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    let plan_range = plan.external_parent_ranges.get(id).copied();
+                    let sparse: Vec<(u32, u32)> = if need.is_empty() {
+                        sparse_all.clone()
+                    } else {
+                        sparse_all
+                            .iter()
+                            .copied()
+                            .filter(|(v, _)| need.binary_search(v).is_ok())
+                            .collect()
+                    };
+                    batch_parents.insert_owned(
+                        fk,
+                        tx.clone(),
+                        live,
+                        checked,
+                        cb,
+                        plan_range,
+                        sparse,
+                    );
+                    n_plan_pin = n_plan_pin.saturating_add(1);
+                    continue;
+                }
+                // Incomplete sparse pin — fall through to range / cold.
+                still_need.insert(*id, need.clone());
+                continue;
+            }
         }
         if let Some(pin) = plan_by_id.get(id) {
             let (tx, outs, denserels) = pin.as_ref();
@@ -3317,9 +3380,18 @@ mod write_idempotent_tests {
         assert!(
             plan.external_parent_outs
                 .get(&pfk.get().unwrap())
-                .is_some_and(|p| !p.2.is_empty()),
-            "ensure must put denserels in plan-local external_parent_outs"
+                .is_some_and(|p| !p.1.is_empty() || !p.2.is_empty()),
+            "ensure must put sparse denserels in plan-local external_parent_outs"
         );
+        // Sparse only — no full output_count expand (parent has 1 out here; multi-out
+        // sparse regression covers high output_count without n_out alloc).
+        if let Some(p) = plan.external_parent_outs.get(&pfk.get().unwrap()) {
+            assert_eq!(p.1.len(), 1, "sparse live must be need-vouts only");
+            assert!(
+                p.1.iter().all(|(v, _)| *v == 0),
+                "sparse live keyed by vout, not dense index"
+            );
+        }
         let reads_after = rbitcoin_query::body_ok_reads();
 
         // Second ensure: plan-local already present → no more body IO.
@@ -3531,13 +3603,13 @@ mod write_idempotent_tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// After wire pin, external full-outs are cleared; sparse BatchParents remain.
-    /// Pin uses Arc::clone of CreatePin (no deep outs clone into plan_by_id).
+    /// After wire pin, external sparse outs are cleared; sparse BatchParents remain.
+    /// Pin uses Arc::clone of SparseExternalPin (no deep outs clone).
     #[test]
     fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         use super::pin_for_wire_batch;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
+        use rbitcoin_query::{ArchiveWritePlan, CreatePin, SparseExternalPin, Query};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
         use std::sync::{Arc, Once};
 
@@ -3569,13 +3641,15 @@ mod write_idempotent_tests {
             output_start_fk: Fk::NULL,
             output_count: 1,
         };
-        let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
+        let parent_out = OutputRecord::unspent(50_0000_0000, vec![0x51]);
         let dens = rbitcoin_store::denserels_from_packed_records(
             &parent_tx,
             &[InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-            &parent_outs,
+            &[parent_out.clone()],
         );
-        let external: CreatePin = Arc::new((parent_tx.clone(), parent_outs, dens));
+        let sparse_rel = dens.first().copied().unwrap_or(0);
+        let external: SparseExternalPin =
+            Arc::new((parent_tx.clone(), vec![(0, parent_out)], vec![(0, sparse_rel)]));
 
         let spend_tx = TxRecord {
             txid: [0x22u8; 32],
@@ -3631,7 +3705,7 @@ mod write_idempotent_tests {
             None,
             super::ColdPinMode::Forbid,
         )
-        .expect("pin external via CreatePin Arc (Forbid — no cold denserels)");
+        .expect("pin external via SparseExternalPin Arc (Forbid — no cold denserels)");
         assert!(parents.contains(Fk(parent_id)));
         assert!(
             parents.get_parent_out(Fk(parent_id), 0).is_some(),
@@ -3643,14 +3717,114 @@ mod write_idempotent_tests {
             &external
         ));
 
-        // Production prep drops external after pin so write queue is lean.
-        plan.clear_external_parent_outs();
+        // Production prep freezes plan after pin so write queue is lean.
+        plan.freeze_after_pin();
         assert!(
             plan.external_parent_outs.is_empty(),
-            "post-pin plan must not carry external full-outs to scripts/write"
+            "post-pin plan must not carry external sparse outs to scripts/write"
         );
         // Sparse pin still holds the need-vout independently of the plan map.
         assert!(parents.get_parent_out(Fk(parent_id), 0).is_some());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Multi-out parent: ensure/pin keep only spent need-vouts (no n_out expand).
+    #[test]
+    fn ensure_external_sparse_need_not_full_output_count() {
+        use super::{ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode};
+        use rbitcoin_primitives::Fk;
+        use rbitcoin_query::Query;
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-ensure-sparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        // Parent with many outs; spend only vout 3.
+        let n_out = 64u32;
+        let parent_tx = TxRecord {
+            txid: [0xab; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: n_out,
+        };
+        let parent_outs: Vec<_> = (0..n_out)
+            .map(|i| OutputRecord::unspent(1000 + i as i64, vec![0x51, i as u8]))
+            .collect();
+        let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let pfk = q
+            .store()
+            .txs
+            .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
+            .unwrap()[0];
+
+        let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
+        let spend_tx = TxRecord {
+            txid: [0xcd; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        plan.packed = vec![(
+            std::sync::Arc::new((spend_tx, spend_outs, Vec::new())),
+            vec![InputRecord {
+                prev_txid: parent_tx.txid,
+                create_fk: pfk,
+                prev_index: 3,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        )];
+        plan.planned_fks = vec![Fk(2)];
+
+        let st = ensure_external_parent_denserels_from_plan(&q, Some(&mut plan), None).unwrap();
+        assert!(st.cold >= 1, "must cold-load multi-out parent: {st:?}");
+        let pin = plan
+            .external_parent_outs
+            .get(&pfk.get().unwrap())
+            .expect("sparse external pin");
+        assert_eq!(
+            pin.1.len(),
+            1,
+            "must not expand to full output_count={}",
+            n_out
+        );
+        assert_eq!(pin.1[0].0, 3, "only spent need-vout");
+        assert_eq!(pin.1[0].1.value, 1003);
+        assert!(
+            pin.2.iter().all(|(v, _)| *v == 3),
+            "sparse denserels only for need"
+        );
+
+        let (parents, _, _) =
+            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid)
+                .unwrap();
+        assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 3).is_some());
+        assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 0).is_none());
+
         let _ = std::fs::remove_dir_all(&path);
     }
 

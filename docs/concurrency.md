@@ -23,7 +23,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Body queue:** process-local **in-RAM** payload FIFO (same shape as the former on-disk queue: id / height / hash / header_fk / payload). **Why RAM:** avoid **double disk write** of every block (queue then Class A); accept **redownload on restart** and peak RAM of soft depth. **Primary capacity is soft densify assign** (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). Height horizon (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) caps densify/receive walk. **Offer** on peer Block → RAM; prep **reads** by height; **dequeue** after confirm-commit. Restart starts empty (legacy `store/block_queue/` is best-effort removed).
 
-**Pipeline pins:** plan `batch_pin` / `BatchParents` / plan-local `external_parent_outs` only (no process create FIFO). ConfirmParentCache holds tip-ahead header plans only.
+**Pipeline pins:** plan `batch_pin` / `BatchParents` / plan-local **sparse** `external_parent_outs` only (no process create FIFO). External staging maps are **frozen/cleared after pin** (`ArchiveWritePlan::freeze_after_pin`) so write megabatch only concatenates commit halves. `SharedParentPin` publishes immutable `PinBody` snapshots (compose + Arc-swap; no in-place outs/layout mutation). ConfirmParentCache holds tip-ahead **Arc** header plans only (insert/replace/drop under tip GC).
 
 **tx.head (segmented):** fixed **25-bit** open-address head per segment with
 **4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,

@@ -14,7 +14,7 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeaderRecord;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Cached header + body fk list for one cache height (avoids header.head/body
 /// and header_txs page faults on confirm resolve).
@@ -50,8 +50,8 @@ struct Inner {
     ready_through: u32,
     /// height → plan
     plans: BTreeMap<u32, HeightPlan>,
-    /// height → header + tx list.
-    headers: HashMap<u32, HeaderPlanCache>,
+    /// height → immutable header + tx list (Arc-publish; tip GC drops Arc).
+    headers: HashMap<u32, Arc<HeaderPlanCache>>,
     /// hash → height for O(1) header resolve on confirm.
     hash_to_height: HashMap<[u8; 32], u32>,
 }
@@ -144,14 +144,15 @@ impl ConfirmParentCache {
             g.hash_to_height.remove(&old_hash);
         }
         g.hash_to_height.insert(hash, height);
+        // Publish immutable plan Arc (no rewrite-in-place of tx_fks).
         g.headers.insert(
             height,
-            HeaderPlanCache {
+            Arc::new(HeaderPlanCache {
                 header_fk,
                 header_rec,
                 tx_fks,
                 prev_hash,
-            },
+            }),
         );
     }
 
@@ -166,7 +167,22 @@ impl ConfirmParentCache {
     }
 
     pub fn get_header_plan(&self, height: u32) -> Option<HeaderPlanCache> {
-        self.inner.lock().unwrap().headers.get(&height).cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .headers
+            .get(&height)
+            .map(|a| (**a).clone())
+    }
+
+    /// Arc-publish get (refcount only — prefer when callers can hold Arc).
+    pub fn get_header_plan_arc(&self, height: u32) -> Option<Arc<HeaderPlanCache>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .headers
+            .get(&height)
+            .map(Arc::clone)
     }
 
     pub fn get_tx_fks_for_hash(&self, hash: &[u8; 32]) -> Option<Vec<Fk>> {
@@ -313,6 +329,27 @@ mod tests {
         assert!(c.get_header_plan(1).is_none());
         assert_eq!(c.plan_count(), 0);
         assert_eq!(c.ready_through(), 1);
+    }
+
+    /// Header plans are Arc-published: replace installs a new Arc; tip GC drops it.
+    #[test]
+    fn header_plan_arc_publish_and_tip_gc() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(0);
+        c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(10)], [0u8; 32]);
+        let a1 = c.get_header_plan_arc(1).expect("plan");
+        assert_eq!(a1.tx_fks, vec![Fk(10)]);
+        // Replace publishes a new Arc (not rewrite-in-place of the old body).
+        c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(11), Fk(12)], [0u8; 32]);
+        let a2 = c.get_header_plan_arc(1).expect("replaced");
+        assert_eq!(a2.tx_fks, vec![Fk(11), Fk(12)]);
+        assert!(!std::sync::Arc::ptr_eq(&a1, &a2));
+        // Old Arc still valid for holder; cache holds only a2.
+        assert_eq!(a1.tx_fks, vec![Fk(10)]);
+        assert_eq!(c.header_plan_count(), 1);
+        c.advance_tip(1);
+        assert!(c.get_header_plan_arc(1).is_none());
+        assert_eq!(c.header_plan_count(), 0);
     }
 
     #[test]

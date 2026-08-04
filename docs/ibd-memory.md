@@ -66,7 +66,8 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 | Observation | Interpretation |
 |-------------|----------------|
 | `bq RAM=` climbs while tip lags, falls as confirm dequeues | Working in-RAM queue (counts toward RSS/anon) |
-| `conf_plans=` grows with tip-ahead headers | Intentional ConfirmParentCache header plans |
+| `conf_plans=` grows with tip-ahead headers | Intentional ConfirmParentCache Arc header plans (tip GC) |
+| `writeq … parents=` unique Arc payloads | SharedParentPin identity; refcount map is metering only |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
 

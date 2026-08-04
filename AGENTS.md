@@ -61,7 +61,7 @@ land the simplification as a drive-by cleanup.
 
 | Rule | Detail |
 |------|--------|
-| Pin material | **Plan / batch only** — `batch_pin`, `BatchParents`, plan-local `external_parent_outs` (CreatePin Arc). No process create pin FIFO |
+| Pin material | **Plan / batch only** — `batch_pin`, `BatchParents`, plan-local **sparse** `external_parent_outs` (`SparseExternalPin`). SharedParentPin = immutable body compose. No process create pin FIFO |
 | IBD confirm intake | **body queue wire only** → plan → prep (no hash-only / Class-A-only confirm) |
 | Ancient parents | Cold Class A denserels into plan-local / BatchParents only |
 | Header plans | **ConfirmParentCache** always on (MTP / tip-ahead headers) |

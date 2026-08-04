@@ -136,12 +136,13 @@ pub struct ProcessOwnedSizes {
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
+    SPENDER_REL_UNKNOWN,
 };
 pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
-pub use archive::{ArchiveWritePlan, CreatePin};
+pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,

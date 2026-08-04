@@ -496,7 +496,8 @@ pub(crate) struct ConfirmQueueDepths {
     write_wire_bytes: AtomicUsize,
     /// Unique shared-pin payloads in writeq (`Arc` payload ptr occupancy).
     write_parents: AtomicUsize,
-    /// ptr → # of writeq batches holding that SharedParentPin Arc.
+    /// Metering only: ptr → # of writeq batches holding that SharedParentPin Arc.
+    /// Not pin payload mutation — budgets unique parents without deep graph walks.
     write_parent_refs: std::sync::Mutex<HashMap<usize, u32>>,
 }
 

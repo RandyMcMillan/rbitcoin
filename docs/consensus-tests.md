@@ -39,9 +39,9 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 ### Allowlist policy
 
 - Soft majority pass rates are **not** success criteria.
-- Skips must be **explicit**: `ALLOWLIST` in `core_vectors.rs` / `TX_ALLOWLIST` in `core_tx_vectors.rs` with `(index, reason)` or `(file, index, reason)`.
+- Skips must be **explicit per row**: `ALLOWLIST` in `core_vectors.rs` (`(json_row_index, reason)`) and `TX_ALLOWLIST` in `core_tx_vectors.rs` (`(file, index, reason)`).
+- **No open-ended flag-category soft-skips.** Every mismatch that is not a hard fail is inventoried by id; the harness asserts `allow_skip ≤ ALLOWLIST.len()` and every used skip id is in the inventory.
 - Unknown failures fail the test. Grow coverage by **removing** allowlist entries and fixing the engine.
-- Flag-category gaps (MINIMALDATA, STRICTENC soft checks, BADTX structural, CONST_SCRIPTCODE, etc.) may be allowlisted by flag with a one-line reason when the engine does not yet implement that verify flag.
 
 ### Origin / update
 

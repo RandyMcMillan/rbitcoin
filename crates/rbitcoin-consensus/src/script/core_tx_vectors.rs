@@ -545,6 +545,11 @@ fn core_tx_valid_all_rows() {
     }
     assert!(total > 50, "expected many valid rows, total={total}");
     assert_eq!(fail, 0, "tx_valid non-allowlisted failures: {fail}");
+    let inv: usize = TX_ALLOWLIST.iter().filter(|(f, _, _)| *f == "tx_valid.json").count();
+    assert!(
+        allow_skip as usize <= inv,
+        "tx_valid allow_skip={allow_skip} exceeds inventory={inv}"
+    );
 }
 
 #[test]
@@ -558,6 +563,11 @@ fn core_tx_invalid_all_rows() {
     }
     assert!(total > 50, "expected many invalid rows, total={total}");
     assert_eq!(fail, 0, "tx_invalid non-allowlisted failures: {fail}");
+    let inv: usize = TX_ALLOWLIST.iter().filter(|(f, _, _)| *f == "tx_invalid.json").count();
+    assert!(
+        allow_skip as usize <= inv,
+        "tx_invalid allow_skip={allow_skip} exceeds inventory={inv}"
+    );
 }
 
 /// Spot-check: fixtures load and at least one valid row accepts via shipped path.

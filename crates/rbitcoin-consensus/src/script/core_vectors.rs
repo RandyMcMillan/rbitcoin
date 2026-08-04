@@ -694,95 +694,161 @@ fn is_p2sh_script(spk: &[u8]) -> bool {
 /// Keep reasons concrete. Grow by fixing the engine, not by adding skips.
 /// Indices are into Core `script_tests.json` (refreshed from bitcoin/bitcoin master).
 const ALLOWLIST: &[(usize, &str)] = &[
-    // P2SH redeem / scriptSig edge cases (minimal pushes, nested witness redeem parse).
     (458, "P2SH redeem with OP_1 minimal push parse edge"),
     (459, "P2SH redeem with OP_PUSHDATA1 empty then OP_1 parse edge"),
     (830, "OP_COUNT in unexecuted branch: long NOP run boundary"),
+    (924, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (925, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (926, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (927, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (928, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (929, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (930, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (931, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (932, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (933, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (934, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (935, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (936, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (937, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (938, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (939, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (940, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (941, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (942, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (943, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (944, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
+    (946, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (947, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (948, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (949, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (950, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (951, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (952, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (953, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (954, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (955, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (956, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (957, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (959, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (960, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (961, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (962, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (963, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (964, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (965, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (966, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (967, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (968, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (969, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (970, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (971, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (972, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (973, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (974, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (975, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (976, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (977, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (978, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (979, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (980, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (981, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (982, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (983, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (984, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (985, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (986, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (987, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (988, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (989, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (990, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (991, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (992, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (993, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (994, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (995, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (996, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (997, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (998, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (999, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (1000, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
+    (1004, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
+    (1005, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_DER)"),
+    (1006, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1010, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1011, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1012, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1013, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1014, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1015, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1016, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1017, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1023, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
+    (1024, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
+    (1025, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
+    (1026, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
     (1034, "P2SH-P2PK redeem: instruction parse of compressed-key CHECKSIG redeem"),
     (1035, "P2SH-P2PK wrong redeem: expect EVAL_FALSE, soft-ok path"),
     (1036, "P2SH-P2PKH redeem parse of legacy scriptPubKey redeem body"),
+    (1039, "CHECKMULTISIG 3-of-3 sighash template mismatch on credit/spend"),
     (1041, "P2SH multisig redeem via PUSHDATA1 body parse"),
+    (1050, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1052, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1056, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1063, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
+    (1067, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1068, "CHECKMULTISIG 2-of-2 sighash template mismatch"),
+    (1070, "CHECKMULTISIG NOT expect EVAL_FALSE soft-ok vs hard false"),
+    (1071, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1075, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
+    (1083, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=LOW_S expect=SIG_HIGH_S)"),
+    (1085, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
+    (1091, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
+    (1092, "CHECKMULTISIG hybrid compressed/uncompressed sighash"),
+    (1093, "CHECKMULTISIG hybrid + STRICTENC sighash"),
+    (1096, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
+    (1098, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
+    (1099, "CHECKMULTISIG 3-of-3 with OP_1 dummy sighash"),
+    (1102, "NULLDUMMY (BIP147) not fully enforced on all paths (flags=NULLDUMMY expect=SIG_NULLDUMMY)"),
+    (1103, "CHECKMULTISIG with DUP in scriptSig sighash"),
+    (1108, "SIGPUSHONLY is policy-adjacent; not fully enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
+    (1109, "CHECKMULTISIG + SIGPUSHONLY sighash"),
     (1112, "P2SH-P2PK redeem with OP_1 prefix stack item parse"),
     (1114, "P2SH-P2PK + CLEANSTACK redeem parse"),
     (1126, "P2SH-P2WSH redeem (witness program as redeem) without WITNESS flag"),
     (1127, "P2SH-P2WPKH redeem without WITNESS flag"),
-    // CHECKSIG/CHECKMULTISIG credit-spend sighash vs Core precomputed vectors.
-    (1039, "CHECKMULTISIG 3-of-3 sighash template mismatch on credit/spend"),
-    (1068, "CHECKMULTISIG 2-of-2 sighash template mismatch"),
-    (1070, "CHECKMULTISIG NOT expect EVAL_FALSE soft-ok vs hard false"),
-    (1092, "CHECKMULTISIG hybrid compressed/uncompressed sighash"),
-    (1093, "CHECKMULTISIG hybrid + STRICTENC sighash"),
-    (1099, "CHECKMULTISIG 3-of-3 with OP_1 dummy sighash"),
-    (1103, "CHECKMULTISIG with DUP in scriptSig sighash"),
-    (1109, "CHECKMULTISIG + SIGPUSHONLY sighash"),
-    // Witness program / malleation flags incomplete.
     (1132, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM not enforced"),
     (1133, "WITNESS_PROGRAM_WRONG_LENGTH not enforced as hard fail"),
+    (1137, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
     (1138, "WITNESS_MALLEATED_P2SH not enforced"),
-    // CSV locktime edges.
+    (1139, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
+    (1146, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1147, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1148, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1149, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1159, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1160, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1163, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1164, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1171, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
+    (1172, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
     (1189, "CSV NEGATIVE_LOCKTIME not hard-failed"),
     (1193, "CSV UNSATISFIED_LOCKTIME 5-byte scriptnum edge"),
-    // Tapscript witness form uses Core #SCRIPT# / JSON witness extensions.
+    (1227, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
+    (1228, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
+    (1243, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
+    (1253, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
+    (1254, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
+    (1269, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
     (1273, "tapscript witness #SCRIPT# token not assembled"),
     (1274, "tapscript witness non-hex stack element"),
     (1275, "tapscript witness non-hex stack element"),
     (1276, "tapscript witness #SCRIPT# token not assembled"),
     (1277, "tapscript witness #SCRIPT# token not assembled"),
+    (1282, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL,NULLDUMMY expect=SIG_NULLDUMMY)"),
+    (1284, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
+    (1286, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
 ];
-
-/// Flag-driven gap categories (any row whose failure is solely due to these).
-fn flag_gap_reason(flags: &CoreFlags, expect: &str) -> Option<&'static str> {
-    if flags.extra.iter().any(|e| e == "MINIMALDATA")
-        && matches!(
-            expect,
-            "MINIMALDATA" | "SCRIPTNUM" | "UNKNOWN_ERROR" | "OK"
-        )
-    {
-        return Some("MINIMALDATA/SCRIPTNUM not fully enforced in interpreter");
-    }
-    if flags.extra.iter().any(|e| e == "MINIMALIF")
-        && (expect.contains("MINIMALIF") || expect == "OK")
-    {
-        return Some("MINIMALIF only fully on TapScript path");
-    }
-    if flags.extra.iter().any(|e| e == "NULLFAIL") {
-        return Some("NULLFAIL not fully enforced");
-    }
-    if flags.extra.iter().any(|e| e == "NULLDUMMY")
-        && matches!(expect, "SIG_NULLDUMMY" | "NULLDUMMY" | "OK")
-    {
-        return Some("NULLDUMMY (BIP147) not fully enforced on all paths");
-    }
-    if flags.extra.iter().any(|e| e == "SIGPUSHONLY") {
-        return Some("SIGPUSHONLY is policy-adjacent; not fully enforced");
-    }
-    if flags.extra.iter().any(|e| e == "WITNESS_PUBKEYTYPE") {
-        return Some("WITNESS_PUBKEYTYPE compressed-only check incomplete");
-    }
-    if flags.extra.iter().any(|e| e == "LOW_S" || e == "STRICTENC")
-        && matches!(
-            expect,
-            "SIG_HIGH_S" | "SIG_HASHTYPE" | "PUBKEYTYPE" | "SIG_DER" | "OK"
-        )
-    {
-        return Some("STRICTENC/LOW_S pubkey/sighashtype checks incomplete");
-    }
-    if flags.dersig && matches!(expect, "SIG_DER" | "OK") {
-        // Soft-false vs hard SIG_DER error on invalid DER when CHECKSIG returns false.
-        return Some("DERSIG hard-fail vs soft-false gap on invalid DER");
-    }
-    if matches!(
-        expect,
-        "WITNESS_UNEXPECTED" | "WITNESS_MALLEATED" | "WITNESS_PUBKEYTYPE"
-    ) {
-        return Some("witness malleation/unexpected flags not fully enforced");
-    }
-    None
-}
-
-fn expect_accept(expect: &str) -> bool {
-    expect == "OK"
-}
 
 /// Map our error / Ok to whether it matches Core's expected result code.
 fn outcome_matches(expect: &str, got: &Result<(), String>) -> bool {
@@ -933,20 +999,11 @@ fn run_all_script_rows() -> RowStats {
             continue;
         }
 
-        // Soft allow: flag-gap categories or explicit index allowlist.
+        // Explicit allowlist only — every skip id must be inventoried (AC2).
         if allow_idx.contains(&idx) {
             st.allow_skip += 1;
             st.used_allow.insert(idx);
             continue;
-        }
-        if let Some(reason) = flag_gap_reason(&flags, expect_s) {
-            // Only allow flag-gap when expect is a named soft-fail code we don't implement,
-            // or when we incorrectly accept a DISCOURAGE/MINIMAL row.
-            let _ = reason;
-            if !expect_accept(expect_s) || got.is_ok() {
-                st.allow_skip += 1;
-                continue;
-            }
         }
 
         st.fail += 1;
@@ -974,19 +1031,39 @@ fn core_script_tests_all_rows() {
     for f in &st.failures {
         eprintln!("  FAIL {f}");
     }
-    // Unknown allowlist entries must not silently pile up.
-    for (idx, reason) in ALLOWLIST {
-        if !st.used_allow.contains(idx) {
-            // Allow unused entries (fixture refresh may renumber) but log.
-            eprintln!("  allowlist unused #{idx}: {reason}");
-        }
-    }
-    assert!(st.total > 500, "expected hundreds of Core rows, total={}", st.total);
+    // Every allow_skip must be inventoried; no silent category soft-skips.
     assert!(
         st.fail == 0,
         "core script_tests non-allowlisted failures: {} (see FAIL lines)",
         st.fail
     );
+    assert!(st.total > 500, "expected hundreds of Core rows, total={}", st.total);
+    assert_eq!(
+        st.allow_skip as usize,
+        st.used_allow.len(),
+        "allow_skip count must equal distinct inventoried skip ids used"
+    );
+    assert!(
+        st.allow_skip as usize <= ALLOWLIST.len(),
+        "allow_skip={} exceeds ALLOWLIST size={}",
+        st.allow_skip,
+        ALLOWLIST.len()
+    );
+    // Fail if any used skip is not in ALLOWLIST (defensive; allow_idx already gates).
+    let inventory: std::collections::HashSet<usize> = ALLOWLIST.iter().map(|(i, _)| *i).collect();
+    for id in &st.used_allow {
+        assert!(
+            inventory.contains(id),
+            "skip id #{id} used but not in ALLOWLIST inventory"
+        );
+    }
+    // Report unused inventory entries (fixture refresh may leave stale ids) — not a hard fail
+    // only if count is small; stale entries are still explicit inventory.
+    for (idx, reason) in ALLOWLIST {
+        if !st.used_allow.contains(idx) {
+            eprintln!("  allowlist unused #{idx}: {reason}");
+        }
+    }
 }
 
 /// Spot-check: known-valid empty scriptSig + DEPTH 0 EQUAL must accept.

@@ -69,12 +69,20 @@ pub fn soft_depth_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
     (stop, resume)
 }
 
-/// Soft densify hysteresis: time-depth **and** byte floors (greater of).
+/// Soft densify hysteresis for **frontier getdata assign only**.
 ///
-/// - **Enter** pressure when `depth_n > stop_n` **and** `depth_bytes >`
-///   [`BQ_SOFT_STOP_BYTES`] — both meters full (early chain may overshoot
-///   count while under 150 MiB; late chain may overshoot 150 MiB while under
-///   the time-count target).
+/// **Never** gates peer TCP reads or [`Query::block_queue_offer`]: already-
+/// requested bodies always enqueue (request-limited soft budgets). Assign
+/// uses the latch to stop **new** densify getdata; gap fill + in-flight
+/// receives continue.
+///
+/// - **Enter** pressure when payload is already over [`BQ_SOFT_STOP_BYTES`]
+///   **and** block count has reached the upper time-count stop:
+///   - `stop_n > 0`: `depth_n >= stop_n` (do **not** assign densify past the
+///     count stop while bytes are already over — limits overshoot of fat blocks).
+///   - `stop_n == 0` (rate cold): any `depth_n > 0` with bytes over stop.
+/// - Under the byte stop, count may still overshoot `stop_n` (early tiny
+///   blocks) without entering pressure.
 /// - **Exit** when `depth_n < resume_n` **or** `depth_bytes <`
 ///   [`BQ_SOFT_RESUME_BYTES`].
 /// - Mid-band keeps `was`.
@@ -85,7 +93,19 @@ pub fn soft_pressure(
     resume_n: u32,
     was: bool,
 ) -> bool {
-    if depth_n > stop_n && depth_bytes > BQ_SOFT_STOP_BYTES {
+    let enter = if depth_bytes > BQ_SOFT_STOP_BYTES {
+        if stop_n == 0 {
+            // Rate unknown: byte floor alone (any queued block).
+            depth_n > 0
+        } else {
+            // Bytes already at/over upper stop — stop frontier densify once
+            // count hits the upper count stop (not only after overshooting it).
+            depth_n >= stop_n
+        }
+    } else {
+        false
+    };
+    if enter {
         true
     } else if depth_n < resume_n || depth_bytes < BQ_SOFT_RESUME_BYTES {
         false
@@ -971,13 +991,11 @@ impl Query {
         self.block_queue.lock().unwrap().max_height()
     }
 
-    /// Soft densify pressure from tip rate, in-RAM count, and payload bytes.
+    /// Soft densify pressure latch for **assign** (frontier getdata only).
     ///
-    /// Stop frontier densify when **both** count &gt; ~1.5 min of tip-rate
-    /// blocks **and** payload &gt; ~150 MiB; resume when count &lt; ~1 min **or**
-    /// payload &lt; ~100 MiB (see [`soft_pressure`]). Early tiny blocks can
-    /// therefore queue far past the time-count target until the byte floor.
-    /// Gap fill inside the queued height span always densifies under pressure.
+    /// See [`soft_pressure`]. Does **not** affect peer reads or
+    /// [`Self::block_queue_offer`]. Gap fill inside the queued height span
+    /// still densifies under pressure.
     ///
     /// `rate_blocks_per_s` should match IBD `TipRateTracker::eta_rate` (ETA EWMA).
     pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
@@ -1005,11 +1023,11 @@ impl Query {
 
     /// Enqueue a raw block payload in the process-local RAM queue.
     ///
-    /// Always accepts for the live process when the optional absolute byte
-    /// ceiling allows. Soft time-depth only stops **new densify getdata** —
-    /// never refuse in-flight peer wire here (except rare absolute-ceiling
-    /// `BudgetFull`). Restart drops the queue (redownload); sole durable write
-    /// is Class A on confirm — no double disk write of every block.
+    /// **Always accepts** peer wire when the optional absolute byte ceiling
+    /// allows — independent of [`Self::block_queue_soft_pressure`]. Soft
+    /// densify only stops **new getdata assign**; never refuse in-flight
+    /// bodies here (except rare absolute-ceiling `BudgetFull`). Restart drops
+    /// the queue (redownload); sole durable write is Class A on confirm.
     pub fn block_queue_offer(
         &self,
         height: u32,
@@ -1017,6 +1035,7 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        // Intentionally ignores soft_pressure — request-limited only.
         let mut g = self.block_queue.lock().unwrap();
         // Idempotent: already queued for this height (re-offer after race).
         if let Some(id) = g.id_for_height(height) {

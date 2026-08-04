@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(stop_lo, 180);
         assert_eq!(resume_lo, 120);
 
-        // Pure latch: need both count and bytes over stop to enter.
+        // Latch: enter when bytes over stop and count has reached count stop.
         let over_b = BQ_SOFT_STOP_BYTES + 1;
         let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
         let under_b = BQ_SOFT_RESUME_BYTES - 1;
@@ -293,11 +293,19 @@ mod tests {
         );
         assert!(
             !soft_pressure(100, over_b, 450, 300, false),
-            "large blocks under time-count → free densify"
+            "large blocks under time-count stop → free densify until count stop"
+        );
+        assert!(
+            !soft_pressure(449, over_b, 450, 300, false),
+            "bytes over but count still below stop → free densify"
+        );
+        assert!(
+            soft_pressure(450, over_b, 450, 300, false),
+            "bytes already over stop and count at stop → enter (no count overshoot)"
         );
         assert!(
             soft_pressure(451, over_b, 450, 300, false),
-            "both over stop → enter"
+            "bytes over and count past stop → enter"
         );
         assert!(
             soft_pressure(400, mid_b, 450, 300, true),
@@ -346,6 +354,21 @@ mod tests {
             !q.block_queue_update_soft_pressure(None),
             "bytes under resume → clear pressure"
         );
+
+        // Soft pressure must never block peer offer / enqueue (request-limited only).
+        let chunk2 = vec![0u8; 80 * 1024 * 1024];
+        q.block_queue_enqueue(3, [3u8; 32], 3, &chunk2).unwrap();
+        q.block_queue_enqueue(4, [4u8; 32], 4, &chunk2).unwrap();
+        assert!(
+            q.block_queue_update_soft_pressure(None),
+            "re-enter pressure for offer regression"
+        );
+        assert!(q.block_queue_soft_pressure());
+        let offered = q
+            .block_queue_offer(5, [5u8; 32], 5, b"already-requested-body")
+            .expect("offer must succeed while soft densify pressure is latched");
+        assert!(offered.queue_id > 0);
+        assert!(q.block_queue_has_height(5));
         let _ = std::fs::remove_dir_all(dir);
     }
 

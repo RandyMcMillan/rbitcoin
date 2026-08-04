@@ -498,10 +498,10 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Soft BQ depth (max ~1.5 min tip-rate count / ~150 MiB) stops frontier
-        // densify; gaps inside queued max height always fill. Archive soft RAM
-        // still gates densify. Tip-hole race always runs. In-flight bodies
-        // always accepted into the RAM queue. Saturated pipeline → Critical only.
+        // Soft BQ latch stops **frontier densify assign** only (bytes over ~150 MiB
+        // and count at ~1.5 min tip-rate stop). Gaps inside queued max height always
+        // fill. Peer reads / block_queue_offer never consult soft pressure. Archive
+        // soft RAM still gates densify. Tip-hole race always runs. Saturated → Critical.
         let far_scale = archive_queued.far_admission_scale();
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let bq_soft_pressure = hub.query.block_queue_update_soft_pressure(tip_rate_opt);

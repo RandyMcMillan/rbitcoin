@@ -90,8 +90,9 @@ pub(crate) fn archive_pipeline_saturated(
 /// Assign getdata for the body-queue pipeline.
 ///
 /// `archive_can_assign`: soft archive RAM headroom for densify.
-/// `bq_soft_pressure`: in-RAM depth over max(~1.5 min tip-rate count, ~150 MiB)
-/// — stop frontier densify only; **gap fill** within queued max height still runs.
+/// `bq_soft_pressure`: soft BQ latch (payload &gt; ~150 MiB and count at the
+/// ~1.5 min tip-rate stop; see [`rbitcoin_query::soft_pressure`]) — stop
+/// **frontier** densify only; **gap fill** within queued max height still runs.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,

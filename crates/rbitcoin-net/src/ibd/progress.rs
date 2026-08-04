@@ -389,10 +389,15 @@ mod tests {
         let over_b = BQ_SOFT_STOP_BYTES + 1;
         let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
         let under_b = BQ_SOFT_RESUME_BYTES - 1;
-        // Enter only when both count and bytes over stop.
+        // Enter when bytes already over stop and count has reached count stop.
         assert!(!soft_pressure(100, over_b, 450, 300, false));
         assert!(!soft_pressure(451, under_b, 450, 300, false));
-        assert!(soft_pressure(451, over_b, 450, 300, false), "both over stop");
+        assert!(!soft_pressure(449, over_b, 450, 300, false));
+        assert!(
+            soft_pressure(450, over_b, 450, 300, false),
+            "bytes over + count at stop → enter (assign-only latch)"
+        );
+        assert!(soft_pressure(451, over_b, 450, 300, false), "past stop");
         assert!(
             soft_pressure(400, mid_b, 450, 300, true),
             "stay latched mid-band"
@@ -404,10 +409,6 @@ mod tests {
         assert!(
             !soft_pressure(400, under_b, 450, 300, true),
             "exit when bytes < resume floor"
-        );
-        assert!(
-            !soft_pressure(450, over_b, 450, 300, false),
-            "exactly count stop does not enter"
         );
     }
 

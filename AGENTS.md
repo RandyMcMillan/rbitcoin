@@ -180,13 +180,14 @@ that shows a clear change after.
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
    Body queue is **RAM-only** (redownload on restart) to avoid double disk write
-   of every block; soft depth = max(~1.5 min tip-rate count, ~150 MiB) with
-   resume under ~1 min **or** ~100 MiB (early tiny blocks may run far ahead).
+   of every block; soft densify latches when payload &gt; ~150 MiB **and** count
+   is at the ~1.5 min tip-rate stop (resume under ~1 min **or** ~100 MiB; early
+   tiny blocks may still run past the count stop while under 150 MiB).
 3. **Soft budgets are request-limited only.** Always accept already-requested
-   block bytes into the body queue, even if that overshoots soft depth.
-   Bound memory by stopping new densify **getdata** (`block_queue` soft
-   time-depth / `can_assign`) — never by stalling TCP reads or Full-dropping
-   bodies already on the wire.
+   block bytes into the body queue (`block_queue_offer` ignores soft pressure),
+   even if that overshoots soft depth. Bound memory by stopping new densify
+   **getdata assign** — never by stalling TCP reads or Full-dropping bodies
+   already on the wire.
 4. **Tests** must tear down intentional caches with **production** APIs (table
    below) — not a secret free-all that masks production leaks.
 5. **Regression filters:** body-queue soft depth / presence lifecycle / confirm

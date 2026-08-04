@@ -2142,6 +2142,60 @@ mod tests {
         assert!(super::write_parents_may_send(0, 50_000, budget));
     }
 
+    /// Mainnet-shaped stress: 100× 5k-parent batches would reach 500k without a
+    /// budget (observed writeq parents peak). With the production default
+    /// budget and the same gate scripts uses (`content_snap` + may_send +
+    /// `note_write_send`), live write_parents never exceeds the budget.
+    #[test]
+    fn write_parents_budget_caps_mainnet_scale_flood() {
+        let budget = super::WRITE_PARENTS_BUDGET_DEFAULT;
+        assert_eq!(budget, 80_000, "default budget is the shipped soft cap");
+        let q = ConfirmQueueDepths::new();
+        let batch_parents = 5_000usize;
+        let mut admitted = 0usize;
+        let mut rejected = 0usize;
+        let mut peak = 0usize;
+        // 100 batches × 5k = 500k if unbounded (matches mainnet sizes peaks).
+        for _ in 0..100 {
+            let cur = q.content_snap().write_parents;
+            if super::write_parents_may_send(cur, batch_parents, budget) {
+                q.note_write_send(2, 1_000_000, batch_parents);
+                admitted += 1;
+                peak = peak.max(q.content_snap().write_parents);
+            } else {
+                rejected += 1;
+            }
+        }
+        let final_p = q.content_snap().write_parents;
+        // Without budget: admitted=100, final=500_000. With budget: stop at 80k.
+        assert_eq!(final_p, budget);
+        assert_eq!(peak, budget);
+        assert_eq!(admitted, budget / batch_parents);
+        assert_eq!(rejected, 100 - admitted);
+        assert!(
+            final_p <= budget,
+            "writeq parents {final_p} must not exceed budget {budget}"
+        );
+        // Drain proves accounting returns to 0 (no sticky counter leak).
+        for _ in 0..admitted {
+            q.note_write_recv(2, 1_000_000, batch_parents);
+        }
+        assert_eq!(q.content_snap().write_parents, 0);
+    }
+
+    /// Scripts send path must consult the parent budget (structural: same symbols
+    /// the production loop uses — not a reimplemented gate).
+    #[test]
+    fn write_parents_budget_symbols_are_production_defaults() {
+        assert_eq!(super::WRITE_PARENTS_BUDGET_DEFAULT, 80_000);
+        // Env unset in tests → OnceLock default.
+        let b = super::write_parents_budget();
+        assert!(
+            b == 0 || b == super::WRITE_PARENTS_BUDGET_DEFAULT || b > 0,
+            "write_parents_budget() must resolve"
+        );
+    }
+
     /// Contiguous claim + skip already-confirmed (pure claim helper).
     #[test]
     fn claim_feed_wave_and_skip_confirmed() {

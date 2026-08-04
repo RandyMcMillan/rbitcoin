@@ -34,19 +34,17 @@ user**.
 If a change seems to require collapsing a machine, **stop and ask** — do not
 land the simplification as a drive-by cleanup.
 
-## Create caches: residency sole map, FIFO only
+## Create pins: pipeline-local only (no process FIFO)
 
 | Rule | Detail |
 |------|--------|
-| Hot pin map | **`CreateResidency`** only — **complete** pipeline creates (fk+outs+denserels Arc); external parents are batch-local only |
+| Pin material | **Plan / batch only** — `batch_pin`, `BatchParents`, plan-local `external_parent_outs` (CreatePin Arc). No process create pin FIFO |
 | IBD confirm intake | **body queue wire only** → plan → prep (no hash-only / Class-A-only confirm) |
-| Eviction | **Insert-order FIFO by byte budget** — never read-touch / LRU reorder |
-| Budget | Default **2 GiB** (`RBITCOIN_RESIDENCY_BYTES`; `0` = off). No `RBITCOIN_CONFIRM_CACHE` |
-| denserels_hit% | Ancient UTXO spends miss residency (expected). Do not chase high hit% by caching external parents |
-| Removed | **OutFifo**, **archive sticky**, half-row / out-slim, **`RBITCOIN_CONFIRM_CACHE`** |
-| IBD sizes | **`residency creates= bytes=MiB/MiB outs=`** is the pin occupancy meter |
+| Ancient parents | Cold Class A denserels into plan-local / BatchParents only |
+| Header plans | **ConfirmParentCache** always on (MTP / tip-ahead headers) |
+| Removed | **CreateResidency**, **OutFifo**, **archive sticky**, half-row / out-slim, **`RBITCOIN_CONFIRM_CACHE`**, **`RBITCOIN_RESIDENCY_BYTES`** |
+| IBD sizes | **`conf_plans=`** + body-queue / pipeline meters (no `residency creates=`) |
 
-See `crates/rbitcoin-query/src/create_residency.rs` module docs.
 
 ## Commit + static musl release after code changes
 
@@ -153,7 +151,7 @@ that shows a clear change after.
 
 1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire,
    in-RAM body queue) from **kernel page cache** under store mmaps (`RssFile`).
-   Do not “fix” RSS by gutting intentional caches (CreateResidency, body queue).
+   Do not “fix” RSS by gutting intentional caches (body queue, ConfirmParentCache header plans).
 2. **Unified path only:** peer → in-RAM **body queue** → confirm plan/prep/
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
@@ -176,6 +174,6 @@ that shows a clear change after.
 |-----------|----------------|
 | Soft densify depth | Bound **only** via body-queue soft pressure / densify stop — never receive-side Full-drop |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
-| CreateResidency | FIFO on **`CreateResidency::put_*` / `insert_fk_txid_range`** (create/out caps); sole pin map |
+| Pipeline pins | Drop with plan/batch; **no** process pin FIFO. Tests tear down via production plan drop / batch drop |
 | Ordered maps | **`IbdWorkState::hygiene`** |
 | Body presence | **`BodyPresence::hygiene_retain`** (rejected retained by design) |

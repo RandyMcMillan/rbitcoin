@@ -50,16 +50,16 @@ Default: **info**. CLI wins over env.
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `planq`/`prepq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/stop RAM=`** (in-RAM body queue; soft densify = max(~1.5 min tip-rate count, ~150 MiB), resume ~1 min or ~100 MiB) |
 | `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **load / script / write** walls; live confirm `h= n= in=` (blocks + inputs in current pack); pin/write detail |
-| `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **residency** + confirm pipe |
-| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega res_txid** + **class_a res_seed**, contig park |
+| `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
+| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega head resolve** + **class_a commit**, contig park |
 
 At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-mega / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
-**Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=` on sizes; `res_txid_hit` / `res_seed` on perf_dbg). OutFifo and archive sticky maps are removed.
+**Create pins:** pipeline-local only (`batch_pin` / `BatchParents` / plan-local external parents). No process pin FIFO. Header plans via ConfirmParentCache.
 
 **Archive `tx.head` split (perf_dbg):** `plan_mega … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
-`class_a_commit … head=` is create **insert** (`head_insert_many`). `res_seed` is CreateResidency denserels seed for this batch’s creates.
+`class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 
 **Archive head resolve:** streaming — **FdOnly** page-coalesced head probe +
 **FdOnly** `tx.idx` + body prefix via **io_uring or pread** (deepest-cand-first).
@@ -102,7 +102,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Live IBD peers | **16** | `--max-outbound` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
-| CreateResidency (complete pin FIFO) | **2 GiB** | `RBITCOIN_RESIDENCY_BYTES` (default 2147483648; `0` = off). Pipeline creates only (fk+outs+denserels); external parents are not cached. Startup tip prewarm when on. **Header plans always on** (multi-block MTP) |
+| ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP. No create pin FIFO / `RBITCOIN_RESIDENCY_BYTES` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |

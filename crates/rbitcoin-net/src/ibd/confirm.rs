@@ -49,7 +49,7 @@ impl PrepAheadState {
     /// without the pipeline map).
     ///
     /// **Must not use body count alone.** Class A commit is body → head →
-    /// residency; during `tx.head` seal/roll the body count jumps while head
+    /// head; during `tx.head` seal/roll the body count jumps while head
     /// insert is blocked for seconds. Pruning on body count drops in-flight
     /// parents that head cannot resolve yet → `parent create_fk unresolved`
     /// and a permanent tip blacklist (mainnet ~269050 first segment seal).
@@ -878,7 +878,7 @@ pub(crate) mod confirm_thr_stats {
 /// Plan (claim + structure + stamp create_fk) → depth-5 →
 /// prep (pin denserels + assemble) → scripts → write.
 /// Overlap: plan(N+1) head-stamp ∥ prep(N) denserels ∥ scripts ∥ write.
-/// Handoff is owned [`PlanStampOutcome`] (not residency FIFO).
+/// Handoff is owned [`PlanStampOutcome`] (pipeline pins only).
 /// Returns the plan-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,

@@ -13,7 +13,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (not residency FIFO seed → Forbid). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
+**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → Forbid cold denserels on prep). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire prep path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
 
@@ -21,11 +21,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Body queue:** process-local **in-RAM** payload FIFO (same shape as the former on-disk queue: id / height / hash / header_fk / payload). **Why RAM:** avoid **double disk write** of every block (queue then Class A); accept **redownload on restart** and peak RAM of soft depth. **Primary capacity is soft depth = max(time-count, byte floor)**: stop frontier densify when count &gt; ~1.5 min of tip-rate blocks **and** payload &gt; ~150 MiB; resume when count &lt; ~1 min **or** payload &lt; ~100 MiB. Early tiny blocks may far exceed the time-count until the byte floor so confirm stays busy; later large blocks hit the time target first. Gaps inside the queued height span always densify (overshoot OK). Optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). Height horizon (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) caps densify/receive walk. **Offer** on peer Block → RAM; prep **reads** by height; **dequeue** after confirm-commit. Restart starts empty (legacy `store/block_queue/` is best-effort removed).
 
-**CreateResidency:** sole process-local map of **complete pipeline creates**
-(txid→fk, optional body_range, outs+denserels as one `CreatePin` Arc; pure
-insert-order FIFO by `RBITCOIN_RESIDENCY_BYTES`, default 2 GiB). Class A commit
-seeds denserels offline so prep(N+1) can hit without body re-read. **External
-parents are not inserted** (batch-local only).
+**Pipeline pins:** plan `batch_pin` / `BatchParents` / plan-local `external_parent_outs` only (no process create FIFO). ConfirmParentCache holds tip-ahead header plans only.
 
 **tx.head (segmented):** fixed **25-bit** open-address head per segment with
 **4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,

@@ -196,7 +196,7 @@ impl BatchParents {
         }
     }
 
-    /// Set layout from precomputed sparse denserels (one residency probe, no dense re-walk).
+    /// Set layout from precomputed sparse denserels (no dense re-walk).
     pub fn set_layout_sparse(
         &mut self,
         fk: Fk,

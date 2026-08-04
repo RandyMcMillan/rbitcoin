@@ -150,12 +150,12 @@ pub mod confirm_phase_stats {
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage Class A append (`archive_commit_plan`) wall.
     ///
-    /// Body/head/header_txs + residency denserels seed. Also mirrored in
+    /// Body/head/header_txs. Also mirrored in
     /// [`rbitcoin_query::archive_phase_stats`] write_* subtimers.
     pub static CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage denserels/abs ensure after Class A (fill planned + ensure spends).
     pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Ensure path: creates filled from residency / pin layout (no Class A body IO).
+    /// Ensure path: creates filled from pin layout (no Class A body IO).
     pub static ENSURE_RES_HIT: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: cold denserels body loads.
     pub static ENSURE_COLD_N: AtomicU64 = AtomicU64::new(0);
@@ -180,9 +180,9 @@ pub mod confirm_phase_stats {
     // ── N1: why assemble took cold Class A after pin ─────────────────
     /// Cold success with **no** `prev_fk_hint` (thin + pending + head miss at assemble).
     pub static ASM_PREV_COLD_NULL_FK_N: AtomicU64 = AtomicU64::new(0);
-    /// Cold success: had fk, batch+residency miss (pin did not cover parent/vout).
+    /// Cold success: had fk, batch pin miss (pin did not cover parent/vout).
     pub static ASM_PREV_COLD_NOT_PIN_N: AtomicU64 = AtomicU64::new(0);
-    /// Cold success: batch/residency had a row but **parent txid ≠ wire prev_txid**.
+    /// Cold success: batch pin had a row but **parent txid ≠ wire prev_txid**.
     pub static ASM_PREV_COLD_TXID_MISMATCH_N: AtomicU64 = AtomicU64::new(0);
     /// Cold success: parent create is in BatchParents but **needed vout** missing.
     pub static ASM_PREV_COLD_VOUT_MISS_N: AtomicU64 = AtomicU64::new(0);

@@ -1010,10 +1010,9 @@ fn assemble_block_prevouts_mode(
                             .ok()
                             .flatten()
                     });
-                // A2: batch pin first — do not touch residency when pin already has out.
+                // Batch pin first (pipeline-local BatchParents only).
                 let pin_live = match prev_fk {
-                    Some(fk) if batch_parents.has_parent_out(fk, op.vout) => true,
-                    Some(fk) => query.create_residency().has_parent_out(fk, op.vout),
+                    Some(fk) => batch_parents.has_parent_out(fk, op.vout),
                     None => false,
                 };
                 // Durable spentness: Full mode only. Optimistic defers to structural
@@ -1755,7 +1754,7 @@ fn resolve_prevout(
         });
     }
 
-    // Batch pin first (no TxRecord clone — A3), then CreateResidency only on miss (A2).
+    // Batch pin first (no TxRecord clone — A3). Cold Class A on miss.
     // Wire prev_txid is authoritative — reject wrong create_fk hits.
     // N1: classify warm-path miss so cold_n is explainable on `ibd: perf`.
     #[derive(Clone, Copy)]
@@ -1770,7 +1769,7 @@ fn resolve_prevout(
     if let Some(prev_fk) = prev_fk_hint {
         cold_why = ColdWhy::NotPin;
         // Batch first. On txid mismatch: soft-miss (do not accept wrong out);
-        // still try residency under the same fk, then cold Class A.
+        // then cold Class A.
         match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
             Some((value, script, parent_txid)) if parent_txid == prev_txid => {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
@@ -1814,40 +1813,6 @@ fn resolve_prevout(
                 cold_why = ColdWhy::VoutMiss;
             }
             None => {}
-        }
-        // Residency after batch miss / soft-miss (not gated on batch None only).
-        if let Some((prev_rec, out)) =
-            query.create_residency().get_parent_out(prev_fk, op.vout)
-        {
-            if prev_rec.txid == prev_txid {
-                connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
-                let (cb_h, create_height) = if resolve_create_heights {
-                    let cb_h = coinbase_height_for_maturity(
-                        query,
-                        prev_fk,
-                        &prev_rec,
-                        batch_parents,
-                        coinbase_height_cache,
-                    )?;
-                    (cb_h, create_height_for_fk(query, prev_fk, cb_h)?)
-                } else {
-                    (None, 0)
-                };
-                note_path(
-                    &confirm_phase_stats::ASM_PREV_RES_NS,
-                    &confirm_phase_stats::ASM_PREV_RES_N,
-                    t0,
-                );
-                return Ok(ResolvedPrevout {
-                    txout: TxOut {
-                        value: Amount::from_sat(out.value as u64),
-                        script_pubkey: ScriptBuf::from_bytes(out.script),
-                    },
-                    coinbase_height: cb_h,
-                    create_height,
-                });
-            }
-            cold_why = ColdWhy::TxidMismatch;
         }
         // else: NotPin / mismatch / vout_miss → cold Class A below
     }
@@ -2904,12 +2869,6 @@ mod structure_rule_tests {
                 std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
             }
         });
-        // Residency must be off so not_pin / null_fk exercise Class A cold, not RES hits.
-        let _res_env = rbitcoin_query::TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_res = std::env::var("RBITCOIN_RESIDENCY_BYTES").ok();
-        std::env::set_var("RBITCOIN_RESIDENCY_BYTES", "0");
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-n1-cold-why-{}-{}",
             std::process::id(),
@@ -2920,10 +2879,6 @@ mod structure_rule_tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         let q = Query::open_or_create(&path).unwrap();
-        assert!(
-            !q.create_residency().enabled(),
-            "test requires residency off"
-        );
         let params = ChainParams::regtest();
         let ms = Milestone::NONE;
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -3106,11 +3061,6 @@ mod structure_rule_tests {
         }
 
         let _ = std::fs::remove_dir_all(&path);
-        match prev_res {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
-        drop(_res_env);
     }
 
     #[test]

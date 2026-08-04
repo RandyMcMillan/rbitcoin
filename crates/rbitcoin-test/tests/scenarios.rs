@@ -2213,16 +2213,14 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     }
 }
 
-/// Wire pin must hit CreateResidency denserels for a parent already pinned by a
-/// prior batch (no second Class A denserels body fetch). Steady-state IBD prep
-/// residual was almost all cold denserels IO.
+/// Wire prep pins external parent denserels from Class A (pipeline-local plan /
+/// BatchParents) and confirms two sequential spends of the same create.
 #[test]
-fn wire_prep_residency_pin_avoids_second_denserels_io() {
+fn wire_prep_external_parent_denserels_cold_class_a() {
     use rbitcoin_consensus::{
         accept_and_connect_block, confirm_scripts_phase, confirm_wire_prep_phase,
         confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
-    use rbitcoin_query::{body_ok_reads, reset_body_ok_reads};
     use rbitcoin_test::mine::split_anyone_can_spend;
 
     let td = TestDatadir::new().unwrap();
@@ -2274,19 +2272,14 @@ fn wire_prep_residency_pin_avoids_second_denserels_io() {
     let spend_b = spend_anyone_can_spend(parent_txid, 1, Amount::from_sat(23_0000_0000));
     let bb = mine_regtest_block(ba.block_hash(), tip_time + 1200, h_b, vec![spend_b]);
 
-    // After split commit, Class A denserels are seeded into residency (Phase 2c).
     let parent_fk = q
         .store()
         .get_fk_by_txid(parent_txid.as_byte_array())
         .unwrap()
         .expect("parent head");
-    assert!(
-        q.create_residency().get_outs(parent_fk).is_some(),
-        "commit must seed denserels for new creates"
-    );
+    let _ = parent_fk;
 
-    // Prep A/B: both vouts of the same parent — zero denserels body IO.
-    reset_body_ok_reads();
+    // Prep A/B: external parent denserels from Class A (plan-local / cold).
     let mat_a = confirm_wire_prep_phase(
         &q,
         &params,
@@ -2295,15 +2288,9 @@ fn wire_prep_residency_pin_avoids_second_denserels_io() {
         &ScriptPreverified::new(),
     )
     .expect("prep A");
-    assert_eq!(
-        body_ok_reads(),
-        0,
-        "prep A must hit residency denserels (no body IO)"
-    );
     let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
     confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
 
-    reset_body_ok_reads();
     let mat_b = confirm_wire_prep_phase(
         &q,
         &params,
@@ -2312,11 +2299,6 @@ fn wire_prep_residency_pin_avoids_second_denserels_io() {
         &ScriptPreverified::new(),
     )
     .expect("prep B");
-    let reads_b = body_ok_reads();
-    assert_eq!(
-        reads_b, 0,
-        "prep B must pin parent from residency (no denserels body IO), got body_ok_reads={reads_b}"
-    );
     let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
     confirm_write_phase(&q, &params, ms, ok_b.batch).expect("write B");
     assert_eq!(q.tip_height(), Some(Height(h_b)));

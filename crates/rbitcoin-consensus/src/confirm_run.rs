@@ -224,8 +224,6 @@ pub fn confirm_load_phase_preverified(
     let t_work = Instant::now();
 
     // Decode bodies once, pin parents + thin edges (batch-local).
-    // Residency after this returns / after wire:
-    //   • pin denserels live in CreateResidency (not on the batch)
     //   • BatchParents holds need-vouts only (rides load→scripts→write queues)
     //   • BatchFullBodies (creates) is used for wire then dropped — not queued
     let t_load = Instant::now();
@@ -608,12 +606,12 @@ pub fn confirm_wire_run_preverified(
 /// Whether wire pin may cold-load denserels from Class A body.
 ///
 /// IBD **plan** stage ensures external-parent denserels into **plan-local**
-/// state (and residency **hits** for prior pipeline creates). Prep then uses
-/// [`ColdPinMode::Forbid`] so cold denserels is never duplicated on the prep
-/// thread. Tests / one-shot [`confirm_wire_prep_phase`] use [`ColdPinMode::Allow`].
+/// state. Prep then uses [`ColdPinMode::Forbid`] so cold denserels is never
+/// duplicated on the prep thread. Tests / one-shot [`confirm_wire_prep_phase`]
+/// use [`ColdPinMode::Allow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdPinMode {
-    /// Plan-local / residency miss → `load_creates_once` cold denserels (tests / Allow pin).
+    /// Plan-local miss → `load_creates_once` cold denserels (tests / Allow pin).
     Allow,
     /// Miss after plan ensure → hard `invariant: denserels stage miss` (prep after plan).
     Forbid,
@@ -624,25 +622,24 @@ pub enum ColdPinMode {
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already had denserels in CreateResidency, plan.external_parent_outs, or in-flight.
+    /// Already had denserels in plan.external_parent_outs or in-flight.
     pub already: u32,
-    /// Cold denserels body loads (into plan-local only — **not** residency).
+    /// Cold denserels body loads (into plan-local only).
     pub cold: u32,
-    /// Same-batch plan creates (offline denserels at pin — no residency load).
+    /// Same-batch plan creates (offline denserels at pin).
     pub same_batch: u32,
     pub work_ns: u64,
 }
 
-/// External parents only: residency **read** (prior pipeline creates) or one
-/// `OutsDenserels` cold load into **`plan.external_parent_outs`** (never residency).
+/// External parents only: one `OutsDenserels` cold load into
+/// **`plan.external_parent_outs`** (pipeline-local).
 ///
 /// Parent create_fks come from **plan-stamped** inputs (and in-flight). No head
-/// resolve here — plan already stamped via batch head + residency caches.
-/// Same-batch creates are skipped (pin uses offline denserels).
+/// resolve here — plan already stamped via batch + head. Same-batch creates are
+/// skipped (pin uses offline denserels).
 ///
 /// Prep pin with [`ColdPinMode::Forbid`] must see every external parent covered
-/// via plan-local map, residency hit, in-flight, or same-batch — **not** via
-/// residency seed of cold parents.
+/// via plan-local map, in-flight, or same-batch.
 pub fn ensure_external_parent_denserels_from_plan(
     query: &Query,
     plan: Option<&mut rbitcoin_query::ArchiveWritePlan>,
@@ -696,7 +693,7 @@ pub fn ensure_external_parent_denserels_from_plan(
     let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
     let mut cold_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    for (id, need) in &parent_vouts {
+    for (id, _need) in &parent_vouts {
         if batch_create_ids.contains_key(id) {
             st.same_batch = st.same_batch.saturating_add(1);
             continue;
@@ -715,19 +712,6 @@ pub fn ensure_external_parent_denserels_from_plan(
         // In-flight offline denserels already available for pin.
         if let Some(ifo) = in_flight_outs {
             if ifo.get(id).is_some_and(|pin| !pin.2.is_empty()) {
-                st.already = st.already.saturating_add(1);
-                continue;
-            }
-        }
-        // Prior pipeline create still in residency — Arc-share into plan-local.
-        if let Some((pin, _range)) = query.create_residency().get_pin(fk) {
-            if !pin.2.is_empty()
-                && need
-                    .iter()
-                    .all(|&v| (v as usize) < pin.1.len())
-            {
-                plan.external_parent_outs
-                    .insert(*id, std::sync::Arc::clone(&pin));
                 st.already = st.already.saturating_add(1);
                 continue;
             }
@@ -752,8 +736,7 @@ pub fn ensure_external_parent_denserels_from_plan(
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if let Some(&range) = plan.external_parent_ranges.get(&id) {
-                let tid =
-                    known_create_txid_ram(id, Some(plan), query.create_residency());
+                let tid = known_create_txid_ram(id, Some(plan));
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 by_range.push((*fk, range, tid, need));
             } else {
@@ -812,12 +795,10 @@ pub fn ensure_external_parent_denserels_from_plan(
         // Fallback: idx→body denserels (no plan range).
         if !need_idx.is_empty() {
             let t_idx = Instant::now();
-            let loaded = rbitcoin_query::load_creates_once_seed(
+            let loaded = rbitcoin_query::load_creates_once(
                 query.store(),
-                query.create_residency(),
                 &need_idx,
                 IdxBodyMode::OutsDenserels,
-                false,
             )
             .map_err(ConsensusError::Store)?;
             let idx_ns = t_idx.elapsed().as_nanos() as u64;
@@ -848,12 +829,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                         ))
                     })?
                 };
-                fill_create_txid_from_ram(
-                    &mut tx,
-                    id,
-                    Some(plan),
-                    query.create_residency(),
-                );
+                fill_create_txid_from_ram(&mut tx, id, Some(plan));
                 plan.external_parent_outs
                     .insert(id, std::sync::Arc::new((tx, outs, dens)));
             }
@@ -899,7 +875,6 @@ pub fn ensure_external_parent_denserels_from_plan(
         confirm_load_stats::PARENT_UNIQUE.fetch_add(st.parents as u64, Ordering::Relaxed);
     }
     if st.already > 0 {
-        confirm_load_stats::PIN_RESIDENCY.fetch_add(st.already as u64, Ordering::Relaxed);
         confirm_load_stats::PIN_CACHE_BODY.fetch_add(st.already as u64, Ordering::Relaxed);
     }
     Ok(st)
@@ -909,7 +884,7 @@ pub fn ensure_external_parent_denserels_from_plan(
 ///
 /// Denserels pin + assemble stay on **prep** so the pipeline stays balanced:
 /// plan(N+1) head-stamp overlaps prep(N) denserels IO. Handoff is the owned
-/// [`ArchiveWritePlan`] + wire/metas — **not** CreateResidency (FIFO race).
+/// [`ArchiveWritePlan`] + wire/metas (pipeline pins only).
 pub struct PlanStampOutcome {
     pub plan: Option<rbitcoin_query::ArchiveWritePlan>,
     /// Wall ns for structure + plan_mega (head stamp).
@@ -1369,22 +1344,19 @@ pub mod plan_stage_stats {
     }
 }
 
-/// Create identity already known in RAM (plan stamp reverse map, then residency).
+/// Create identity already known in RAM (plan stamp reverse map only).
 /// Never reads `txid.body`.
 #[inline]
 fn known_create_txid_ram(
     create_fk_id: u64,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-    residency: &rbitcoin_query::CreateResidency,
 ) -> [u8; 32] {
     if let Some(p) = plan {
         if let Some(tid) = p.external_parent_txid(create_fk_id) {
             return tid;
         }
     }
-    residency
-        .get_txid(rbitcoin_primitives::Fk(create_fk_id))
-        .unwrap_or([0u8; 32])
+    [0u8; 32]
 }
 
 /// Idx denserels path: body decode has no schema-13 identity — set from RAM.
@@ -1393,12 +1365,11 @@ fn fill_create_txid_from_ram(
     tx: &mut rbitcoin_store::TxRecord,
     create_fk_id: u64,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-    residency: &rbitcoin_query::CreateResidency,
 ) {
     if tx.txid != [0u8; 32] {
         return;
     }
-    let tid = known_create_txid_ram(create_fk_id, plan, residency);
+    let tid = known_create_txid_ram(create_fk_id, plan);
     if tid != [0u8; 32] {
         tx.txid = tid;
     }
@@ -1406,9 +1377,8 @@ fn fill_create_txid_from_ram(
 
 /// Pin parents for wire prep: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight packed outs (+ offline denserels) → CreateResidency
-/// sparse hit → cold denserels (when [`ColdPinMode::Allow`]). Does not pin every
-/// batch create.
+/// Sources: plan/in-flight packed outs (+ offline denserels) → cold denserels
+/// (when [`ColdPinMode::Allow`]). Does not pin every batch create.
 fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -1516,15 +1486,10 @@ fn pin_for_wire_batch(
                     let prev_txid = inp.previous_output.txid.to_byte_array();
                     let vout = inp.previous_output.vout;
                     let cfk = query
-                        .create_residency()
-                        .lookup_fk_by_txid(&prev_txid)
-                        .or_else(|| {
-                            query
-                                .store()
-                                .get_fk_by_txid(&prev_txid)
-                                .ok()
-                                .flatten()
-                        });
+                        .store()
+                        .get_fk_by_txid(&prev_txid)
+                        .ok()
+                        .flatten();
                     if let Some(fk) = cfk {
                         if let Some(pid) = fk.get() {
                             edges.push(ThinInput {
@@ -1601,7 +1566,7 @@ fn pin_for_wire_batch(
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
                 .collect();
             if live.len() != need.len() {
-                // Incomplete plan outs — fall through to range / residency / cold.
+                // Incomplete plan outs — fall through to range / cold.
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -1612,24 +1577,14 @@ fn pin_for_wire_batch(
             };
             let fk = rbitcoin_primitives::Fk(*id);
             let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
-            let (body_range, sparse) =
-                if let Some((_rtx, _live, res_sparse, range)) =
-                    query.create_residency().get_parent_needed(fk, need)
-                {
-                    if denserels.is_empty() {
-                        (plan_range.or(range), res_sparse)
-                    } else {
-                        let sp = rbitcoin_query::sparse_spender_rels(denserels, need);
-                        (plan_range.or(range), sp)
-                    }
-                } else if !denserels.is_empty() {
-                    (
-                        plan_range,
-                        rbitcoin_query::sparse_spender_rels(denserels, need),
-                    )
-                } else {
-                    (plan_range, Vec::new())
-                };
+            let (body_range, sparse) = if !denserels.is_empty() {
+                (
+                    plan_range,
+                    rbitcoin_query::sparse_spender_rels(denserels, need),
+                )
+            } else {
+                (plan_range, Vec::new())
+            };
             batch_parents.insert_owned(
                 fk,
                 tx.clone(),
@@ -1656,8 +1611,7 @@ fn pin_for_wire_batch(
         )> = Vec::new();
         for (id, need) in &still_need {
             if let Some(&range) = plan.external_parent_ranges.get(id) {
-                let tid =
-                    known_create_txid_ram(*id, Some(plan), query.create_residency());
+                let tid = known_create_txid_ram(*id, Some(plan));
                 range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
             }
         }
@@ -1691,7 +1645,7 @@ fn pin_for_wire_batch(
                     continue;
                 };
                 if live.len() != need.len() {
-                    continue; // leave in still_need for residency/idx
+                    continue; // leave in still_need for idx cold
                 }
                 let cb = if tx.input_count != 1 {
                     Some(false)
@@ -1713,33 +1667,12 @@ fn pin_for_wire_batch(
         }
     }
 
-    // CreateResidency sparse denserels hit, then cold denserels once.
-    let mut n_res_hit = 0u64;
+    // Cold denserels once for still_need parents.
     let mut n_cold = 0u64;
-    let mut res_hit_ns = 0u64;
     let mut cold_io_ns = 0u64;
     let mut cold_decode_ns = 0u64;
     if !still_need.is_empty() {
-        let mut cold: HashMap<u64, Vec<u32>> = HashMap::new();
-        let t_res = Instant::now();
-        for (id, need) in &still_need {
-            let fk = rbitcoin_primitives::Fk(*id);
-            if let Some((tx, live, sparse, body_range)) =
-                query.create_residency().get_parent_needed(fk, need)
-            {
-                let cb = if tx.input_count != 1 {
-                    Some(false)
-                } else {
-                    None
-                };
-                batch_parents.insert_owned(fk, tx, live, need.clone(), cb, body_range, sparse);
-                n_res_hit = n_res_hit.saturating_add(1);
-            } else {
-                cold.insert(*id, need.clone());
-            }
-        }
-        res_hit_ns = t_res.elapsed().as_nanos() as u64;
-
+        let cold = still_need.clone();
         if !cold.is_empty() {
             if cold_mode == ColdPinMode::Forbid {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
@@ -1752,13 +1685,10 @@ fn pin_for_wire_batch(
                 .map(|id| rbitcoin_primitives::Fk(*id))
                 .collect();
             n_cold = fks.len() as u64;
-            // External parents: never seed residency (batch-local pin only).
-            let loaded = rbitcoin_query::load_creates_once_seed(
+            let loaded = rbitcoin_query::load_creates_once(
                 query.store(),
-                query.create_residency(),
                 &fks,
                 IdxBodyMode::OutsDenserels,
-                false,
             )
             .map_err(ConsensusError::Store)?;
             cold_io_ns = t_io.elapsed().as_nanos() as u64;
@@ -1791,13 +1721,8 @@ fn pin_for_wire_batch(
                         ))
                     })?
                 };
-                // RAM identity only (plan stamp reverse map / residency) — no sidefile.
-                fill_create_txid_from_ram(
-                    &mut tx,
-                    id,
-                    plan,
-                    query.create_residency(),
-                );
+                // RAM identity only (plan stamp reverse map) — no sidefile.
+                fill_create_txid_from_ram(&mut tx, id, plan);
                 let mut need = need;
                 need.sort_unstable();
                 need.dedup();
@@ -1874,19 +1799,11 @@ fn pin_for_wire_batch(
         confirm_load_stats::PIN_PLAN.fetch_add(n_plan_pin, Ordering::Relaxed);
         confirm_load_stats::PIN_CACHE_BODY.fetch_add(n_plan_pin, Ordering::Relaxed);
     }
-    if n_res_hit > 0 {
-        confirm_load_stats::PIN_RESIDENCY.fetch_add(n_res_hit, Ordering::Relaxed);
-        confirm_load_stats::PIN_CACHE_BODY.fetch_add(n_res_hit, Ordering::Relaxed);
-        confirm_load_stats::PARENT_CACHE_HITS.fetch_add(n_res_hit, Ordering::Relaxed);
-    }
     if n_cold > 0 {
         confirm_load_stats::PIN_NEW.fetch_add(n_cold, Ordering::Relaxed);
     }
     if plan_pin_ns > 0 {
         confirm_load_stats::PLAN_PIN_NS.fetch_add(plan_pin_ns, Ordering::Relaxed);
-    }
-    if res_hit_ns > 0 {
-        confirm_load_stats::RES_HIT_NS.fetch_add(res_hit_ns, Ordering::Relaxed);
     }
     if cold_io_ns > 0 {
         confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
@@ -1912,7 +1829,7 @@ fn pin_for_wire_batch(
         parents: parent_vouts
             .len()
             .saturating_sub(n_same_batch as usize) as u32,
-        already: n_res_hit.saturating_add(n_plan_pin.saturating_sub(n_same_batch as u64)) as u32,
+        already: n_plan_pin.saturating_sub(n_same_batch as u64) as u32,
         cold: n_cold as u32,
         same_batch: n_same_batch,
         work_ns: pin_ns,
@@ -2185,9 +2102,9 @@ fn fill_planned_create_layout_after_commit(
 /// 2. Already-archived Class A same-batch creates never pinned
 /// 3. Retry after partial write
 ///
-/// **Residency first** (commit denserels seed) — Class A denserels body load only
-/// when residency misses. After this function returns, every non-null spend edge
-/// **must** have abs layout — no silent leave-for-later / structural cold paper.
+/// Prefer pin denserels already on BatchParents; Class A denserels body load only
+/// on miss. After this function returns, every non-null spend edge **must** have
+/// abs layout — no silent leave-for-later / structural cold paper.
 fn ensure_spend_abs_layouts(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -2225,31 +2142,10 @@ fn ensure_spend_abs_layouts(
         vouts.dedup();
     }
 
-    // 1) Residency denserels + body_range (commit seed / prior cold pin) — no body IO.
-    // 1a) Batch residency range lookup for pins that already have denserels (range-only gap).
+    // 1) Pin denserels + body_range already on BatchParents — no body IO.
     let mut ensure_res = 0u64;
-    let range_gap_fks: Vec<rbitcoin_primitives::Fk> = need
-        .keys()
-        .filter_map(|&id| {
-            let fk = rbitcoin_primitives::Fk(id);
-            if batch_parents.has_spender_rels(fk) && !batch_parents.has_abs_layout(fk) {
-                Some(fk)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !range_gap_fks.is_empty() {
-        let res_ranges = query.create_residency().body_ranges_by_fk(&range_gap_fks);
-        for (fk, opt) in range_gap_fks.iter().zip(res_ranges.into_iter()) {
-            if let Some(range) = opt.or_else(|| batch_parents.get_body_range(*fk)) {
-                batch_parents.set_body_range_only(*fk, range);
-            }
-        }
-    }
-
     let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
-    // Pin has denserels but still no body_range after residency — idx only (not denserels IO).
+    // Pin has denserels but still no body_range — idx only (not denserels IO).
     let mut range_only: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need_v) in &need {
         let fk = rbitcoin_primitives::Fk(*id);
@@ -2276,33 +2172,6 @@ fn ensure_spend_abs_layouts(
             }
             range_only.push(fk);
             continue;
-        }
-        if let Some((tx, live, sparse, body_range)) =
-            query.create_residency().get_parent_needed(fk, need_v)
-        {
-            if let Some(range) = body_range {
-                if batch_parents.contains(fk) {
-                    // One residency probe: sparse denserels already in hand.
-                    batch_parents.set_layout_sparse(fk, range, sparse, need_v);
-                } else {
-                    let cb = if tx.input_count != 1 {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    batch_parents.insert_owned(
-                        fk,
-                        tx,
-                        live,
-                        need_v.clone(),
-                        cb,
-                        Some(range),
-                        sparse,
-                    );
-                }
-                ensure_res = ensure_res.saturating_add(1);
-                continue;
-            }
         }
         still.insert(*id, need_v.clone());
     }
@@ -2347,13 +2216,11 @@ fn ensure_spend_abs_layouts(
             .map(|id| rbitcoin_primitives::Fk(*id))
             .collect();
         confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
-        // Structural denserels fill for pin gaps — do not seed residency (parents).
-        let loaded = rbitcoin_query::load_creates_once_seed(
+        // Structural denserels fill for pin gaps (cold Class A).
+        let loaded = rbitcoin_query::load_creates_once(
             query.store(),
-            query.create_residency(),
             &fks,
             IdxBodyMode::OutsDenserels,
-            false,
         )
         .map_err(ConsensusError::Store)?;
         let secret = query.store().txs.store_secret();
@@ -2378,8 +2245,8 @@ fn ensure_spend_abs_layouts(
                     ))
                 })?
             };
-            // Ensure path: residency may already hold identity from Class A seed.
-            fill_create_txid_from_ram(&mut tx, id, None, query.create_residency());
+            // Ensure path: identity from plan RAM only (no sidefile required for layout).
+            fill_create_txid_from_ram(&mut tx, id, None);
             if batch_parents.contains(c.fk) {
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
                 continue;
@@ -2956,7 +2823,7 @@ mod write_idempotent_tests {
     }
 
     /// Plan-stage denserels ensure + Forbid pin: cold path must not re-run on prep.
-    /// External parents land in plan-local map only (not CreateResidency).
+    /// External parents land in plan-local map only.
     #[test]
     fn plan_ensure_denserels_then_forbid_skips_cold_io() {
         use super::{
@@ -3000,7 +2867,7 @@ mod write_idempotent_tests {
             .txs
             .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
             .unwrap()[0];
-        // Parent on disk only — not in residency (ancient / cold external parent).
+        // Parent on disk only (ancient / cold external parent).
 
         // Plan with stamped parent create_fk (plan stage already did batch head).
         let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
@@ -3028,7 +2895,6 @@ mod write_idempotent_tests {
         plan.planned_fks = vec![Fk(2)];
 
         rbitcoin_query::reset_body_ok_reads();
-        let res_len_before = q.create_residency().len();
         let st = ensure_external_parent_denserels_from_plan(&q, Some(&mut plan), None).unwrap();
         assert!(st.cold >= 1, "parent missing denserels must cold-load: {st:?}");
         assert!(
@@ -3036,11 +2902,6 @@ mod write_idempotent_tests {
                 .get(&pfk.get().unwrap())
                 .is_some_and(|p| !p.2.is_empty()),
             "ensure must put denserels in plan-local external_parent_outs"
-        );
-        assert_eq!(
-            q.create_residency().len(),
-            res_len_before,
-            "external parents must not enter CreateResidency"
         );
         let reads_after = rbitcoin_query::body_ok_reads();
 

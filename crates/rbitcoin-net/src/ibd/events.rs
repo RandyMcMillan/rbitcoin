@@ -569,7 +569,7 @@ mod confirm_reject_tests {
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
 
-        // Internal denserels invariant → permanent (fix pin/res_seed, not soft).
+        // Internal denserels invariant → permanent (fix pin layout, not soft).
         let mut st = IbdWorkState::new(Vec::new(), None, Some(219_561));
         let hash = h(0x5b);
         st.body.mark_archived(hash);

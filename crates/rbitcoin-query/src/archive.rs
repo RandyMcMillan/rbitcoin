@@ -3,48 +3,17 @@
 //! Split for IBD dual-thread (prep/write may overlap with a small plan queue):
 //! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
-//!   **CreateResidency** + in-flight planned creates + `tx.head` resolve, stamp inputs.
+//!   in-flight planned creates + `tx.head` resolve, stamp inputs.
 //!   Head-miss parents use **fk-only** head resolve (no denserels on plan stamp);
 //!   denserels for pin load at prep/ensure into plan-local maps only.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
-//!   head index, header_txs, residency denserels seed.
-//! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup fill of complete
-//!   tip creates into CreateResidency + tip-ahead header plans (no range-only
-//!   half-rows).
+//!   head index, header_txs. Pipeline pins stay on the plan (`batch_pin`); no
+//!   process create FIFO seed.
 //!
 //! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
-//! prior plan that is still queued/committing (not yet in residency/head).
+//! prior plan that is still queued/committing (not yet in head).
 
 use super::*;
-
-/// Max tip-ahead header plans seeded at startup (MTP / header_txs cache).
-pub const PREWARM_HEADER_PLANS_MAX: usize = 4_096;
-
-/// Floor for estimating how many Class A creates to *walk* when filling to the
-/// byte budget (actual stop is still [`CreateResidency`] total_bytes).
-/// Keeps prewarm on a tip-suffix of Class A so oldest-first insert does not
-/// fill the FIFO with ancient creates before reaching tip.
-const PREWARM_MIN_ROW_BYTES: u64 = 256;
-
-/// Stats from [`Query::archive_residency_prewarm`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ResidencyPrewarmStats {
-    /// Legacy field (range-only prewarm removed); always 0.
-    pub ranges: usize,
-    /// Creates that received complete denserels pins this prewarm.
-    pub denserels_creates: usize,
-    /// Residency `total_outs` after denserels phase.
-    pub denserels_outs: u64,
-    /// Residency estimated bytes after prewarm.
-    pub denserels_bytes: u64,
-    /// Confirm header plans cached (tip-ahead Class A prefix).
-    pub header_plans: usize,
-    pub range_ms: u64,
-    pub denserels_ms: u64,
-    pub headers_ms: u64,
-    /// End-to-end wall.
-    pub ms: u64,
-}
 
 /// Shared immutable create pin: tx meta + full outs + layout denserels.
 ///
@@ -64,15 +33,13 @@ pub struct ArchiveWritePlan {
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
-    /// Creates from **this** batch only — seeded into CreateResidency after head.
-    /// Parents resolved via durable `tx.head` are **not** published (they thrash
-    /// the FIFO with long-tail keys and evict recent creates).
+    /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
     /// Pipeline-local full pins for external parents (outs+denserels).
     ///
     /// Filled by ensure/prep denserels (often from
-    /// [`Self::external_parent_ranges`]). Never written into CreateResidency.
-    /// **Dropped after pin** ([`Self::clear_external_parent_outs`]).
+    /// [`Self::external_parent_ranges`]). **Dropped after pin**
+    /// ([`Self::clear_external_parent_outs`]).
     pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
     /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
     ///
@@ -82,7 +49,7 @@ pub struct ArchiveWritePlan {
     pub external_parent_ranges: std::collections::HashMap<u64, (u64, u64)>,
     /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
     ///
-    /// Built when residency / in-flight / head resolve binds `prev_txid → fk`.
+    /// Built when in-flight / head resolve binds `prev_txid → fk`.
     /// Prep pin fills schema-13 zero body `TxRecord.txid` from this map — **never**
     /// re-pread `txid.body` on the pin path.
     pub external_parent_txids: std::collections::HashMap<u64, [u8; 32]>,
@@ -369,21 +336,13 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        let t_sticky = Instant::now();
-        // CreateResidency txid→fk (sole hot map). Counter/timer still named sticky_*
-        // in archive_phase_stats; IBD logs label them res_txid / res_txid_hit.
+        // sticky_* slots kept at 0 (process pin FIFO removed; head + in-flight only).
+        let sticky_ns = 0u64;
+        let sticky_hit_n = 0u64;
         let mut resolved: HashMap<[u8; 32], Fk> =
             HashMap::with_capacity(need_vec.len() / 2);
-        let mut sticky_hit_n = 0u64;
-        for t in &need_vec {
-            if let Some(fk) = self.create_residency.lookup_fk_by_txid(t) {
-                resolved.insert(*t, fk);
-                sticky_hit_n = sticky_hit_n.saturating_add(1);
-            }
-        }
-        let sticky_ns = t_sticky.elapsed().as_nanos() as u64;
 
-        // Prior mega-batch(es) still in the write queue: not sticky/head yet.
+        // Prior mega-batch(es) still in the write queue: not head yet.
         let t_inflight = Instant::now();
         if !in_flight.is_empty() {
             for t in &need_vec {
@@ -406,17 +365,17 @@ impl Query {
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
-        // External parents that miss CreateResidency: Shape A **fk+range**
-        // short-circuit (probe + idx + identity; no denserels body). Prep loads
-        // denserels by known body_range (skip tx.idx). Identity for pin is the
-        // lookup key already in RAM (`resolved`) — never re-read txid.body at prep.
+        // External parents missing in-flight: Shape A **fk+range** short-circuit
+        // (probe + idx + identity; no denserels body). Prep loads denserels by
+        // known body_range (skip tx.idx). Identity for pin is the lookup key
+        // already in RAM (`resolved`) — never re-read txid.body at prep.
         let external_parent_outs: std::collections::HashMap<u64, CreatePin> =
             std::collections::HashMap::new();
         let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
         let mut external_parent_txids: std::collections::HashMap<u64, [u8; 32]> =
             std::collections::HashMap::with_capacity(resolved.len().saturating_add(need_head.len()));
-        // Reverse map for residency / in-flight binds already in `resolved`.
+        // Reverse map for in-flight / head binds already in `resolved`.
         for (txid, fk) in &resolved {
             if let Some(id) = fk.get() {
                 external_parent_txids.insert(id, *txid);
@@ -541,168 +500,8 @@ impl Query {
         })
     }
 
-    /// Startup cache prewarm: complete tip creates + tip-ahead header plans.
+    /// **Writer / write path:** durable Class A put (body / head / spends / htxs).
     ///
-    /// Call once before IBD so the first confirm batches are not fully cold.
-    ///
-    /// Phases (all process-local; no durable writes):
-    /// 1. **Header plans** — tip+1..tip+N into [`ConfirmParentCache`].
-    /// 2. **Complete denserels** — tip-window creates first, then a tip-suffix of
-    ///    Class A as **complete** residency rows. Stops only at ~⅞ of the
-    ///    residency byte budget (room for commit seed). No create-count cap.
-    pub fn archive_residency_prewarm(&self) -> Result<ResidencyPrewarmStats, QueryError> {
-        use std::time::Instant;
-        let t0 = Instant::now();
-        let mut st = ResidencyPrewarmStats::default();
-
-        if !self.create_residency.enabled() {
-            st.ms = t0.elapsed().as_millis() as u64;
-            return Ok(st);
-        }
-
-        st.range_ms = 0; // range-only phase removed
-        let n = self.store.txs.count();
-
-        // ── 1. Tip-ahead header plans ─────────────────────────────────────
-        let t_hdr = Instant::now();
-        let mut tip_window_fks: Vec<Fk> = Vec::new();
-        if let Some(tip_h) = self.tip_height().map(|h| h.0) {
-            if let Some(tip_fk) = self.tip_header_fk()? {
-                let tip_rec = self.store.get_header(tip_fk)?;
-                let path = self.resume_work_path_after_tip(
-                    tip_rec.hash,
-                    tip_h,
-                    PREWARM_HEADER_PLANS_MAX,
-                )?;
-                self.confirm_parents.advance_tip(tip_h);
-                for e in &path {
-                    if !e.has_body {
-                        break;
-                    }
-                    if !self.store.header_txs.has_body(e.header_fk)? {
-                        break;
-                    }
-                    let Some(tx_fks) = self.store.header_txs.get_list(e.header_fk)? else {
-                        break;
-                    };
-                    if tx_fks.is_empty() {
-                        break;
-                    }
-                    let header_rec = self.store.get_header(e.header_fk)?;
-                    let prev_hash = if header_rec.prev_fk.is_null() {
-                        [0u8; 32]
-                    } else {
-                        match self.store.get_header(header_rec.prev_fk) {
-                            Ok(prev) => prev.hash,
-                            Err(_) => break,
-                        }
-                    };
-                    self.confirm_parents.put_header_plan(
-                        e.height,
-                        e.header_fk,
-                        header_rec,
-                        tx_fks.clone(),
-                        prev_hash,
-                    );
-                    self.confirm_parents.ensure_plan(e.height, e.hash);
-                    tip_window_fks.extend(tx_fks.into_iter().filter(|f| f.get().is_some()));
-                    st.header_plans = st.header_plans.saturating_add(1);
-                }
-            }
-        }
-        st.headers_ms = t_hdr.elapsed().as_millis() as u64;
-
-        // ── 2. Complete denserels until byte budget ───────────────────────
-        let t_den = Instant::now();
-        let byte_stop = {
-            let (_, _, byte_cap, _) = self.create_residency.size_stats();
-            // Leave ~⅛ of byte budget for commit seed.
-            byte_cap.saturating_mul(7) / 8
-        };
-
-        tip_window_fks.sort_unstable_by_key(|f| f.0);
-        tip_window_fks.dedup();
-        self.prewarm_denserels_fks(&tip_window_fks, byte_stop, &mut st)?;
-
-        // Tip-suffix of Class A, oldest→newest so newer rows sit at FIFO back.
-        // Window size from min-row estimate only bounds the *walk*; load stops
-        // when total_bytes hits byte_stop (often sooner for real pin sizes).
-        if n > 0 {
-            let (_, total_bytes, _, _) = self.create_residency.size_stats();
-            if total_bytes < byte_stop {
-                let max_walk = (byte_stop / PREWARM_MIN_ROW_BYTES)
-                    .max(1)
-                    .min(n);
-                let start = n.saturating_sub(max_walk).saturating_add(1).max(1);
-                const CHUNK: u64 = 4096;
-                let mut cur = start;
-                while cur <= n {
-                    let (_, total_bytes, _, _) = self.create_residency.size_stats();
-                    if total_bytes >= byte_stop {
-                        break;
-                    }
-                    let end = (cur + CHUNK - 1).min(n);
-                    let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
-                    self.prewarm_denserels_fks(&fks, byte_stop, &mut st)?;
-                    cur = end + 1;
-                }
-            }
-        }
-        st.denserels_ms = t_den.elapsed().as_millis() as u64;
-        let (_, total_bytes, _, total_outs) = self.create_residency.size_stats();
-        st.denserels_outs = total_outs;
-        st.denserels_bytes = total_bytes;
-        st.ms = t0.elapsed().as_millis() as u64;
-        Ok(st)
-    }
-
-    /// Load complete denserels into residency until `byte_stop`.
-    /// Returns how many creates successfully received denserels this call.
-    fn prewarm_denserels_fks(
-        &self,
-        fks: &[Fk],
-        byte_stop: u64,
-        st: &mut ResidencyPrewarmStats,
-    ) -> Result<usize, QueryError> {
-        if fks.is_empty() {
-            return Ok(0);
-        }
-        let (_, total_bytes, _, _) = self.create_residency.size_stats();
-        if total_bytes >= byte_stop {
-            return Ok(0);
-        }
-        let need: Vec<Fk> = fks
-            .iter()
-            .copied()
-            .filter(|fk| fk.get().is_some() && !self.create_residency.has_outs(*fk))
-            .collect();
-        if need.is_empty() {
-            return Ok(0);
-        }
-        const CHUNK: usize = 4096;
-        let mut loaded = 0usize;
-        for chunk in need.chunks(CHUNK) {
-            let (_, total_bytes, _, _) = self.create_residency.size_stats();
-            if total_bytes >= byte_stop {
-                break;
-            }
-            // Prewarm tip creates = pipeline history seed (seed_residency true).
-            let creates = crate::combined_stage::load_creates_once_seed(
-                &self.store,
-                &self.create_residency,
-                chunk,
-                rbitcoin_store::IdxBodyMode::OutsDenserels,
-                true,
-            )?;
-            loaded = loaded.saturating_add(creates.len());
-            st.denserels_creates = st.denserels_creates.saturating_add(creates.len());
-        }
-        Ok(loaded)
-    }
-
-    /// **Writer / write path:** durable Class A put + residency denserels seed.
-    ///
-    /// No residency/head **lookups** — only appends and residency inserts.
     /// Phase walls go to [`crate::archive_phase_stats`] (body vs head split).
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<(), QueryError> {
         use std::time::Instant;
@@ -761,60 +560,8 @@ impl Query {
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
-        // Publish **this batch's creates only** into CreateResidency after head is
-        // durable. Seed denserels offline so prep(N+1) pin hits without Class A
-        // body re-read. Timer logged as res_seed (write_sticky_ns atom).
-        //
-        // Prefer plan-time `batch_pin` Arc (layout denserels) — Arc::clone into
-        // residency (no deep outs copy). External parents are never seeded here.
-        let t = Instant::now();
-        let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
-        let use_pin = plan.batch_pin.len() == plan.packed.len()
-            && plan.batch_pin.len() == got_tx_fks.len();
-        // One residency lock + single pre-evict when all creates are new (usual).
-        let mut seed: Vec<(
-            rbitcoin_primitives::Fk,
-            CreatePin,
-            Option<(u64, u64)>,
-        )> = Vec::with_capacity(got_tx_fks.len());
-        if use_pin {
-            for ((pin, fk), range) in plan
-                .batch_pin
-                .iter()
-                .zip(got_tx_fks.iter())
-                .zip(ranges.into_iter())
-            {
-                let body_range = match range {
-                    Some((off, len)) if len > 0 => Some((off, len)),
-                    _ => None,
-                };
-                seed.push((*fk, std::sync::Arc::clone(pin), body_range));
-            }
-        } else {
-            // Fallback when batch_pin length mismatched: denserels from pin+inputs.
-            for (((pin, ins), fk), range) in plan
-                .packed
-                .iter()
-                .zip(got_tx_fks.iter())
-                .zip(ranges.into_iter())
-            {
-                let body_range = match range {
-                    Some((off, len)) if len > 0 => Some((off, len)),
-                    _ => None,
-                };
-                let (tx, outs, dens) = pin.as_ref();
-                let denserels = if dens.is_empty() {
-                    rbitcoin_store::denserels_from_packed_records(tx, ins, outs)
-                } else {
-                    dens.clone()
-                };
-                let complete: CreatePin =
-                    std::sync::Arc::new((tx.clone(), outs.clone(), denserels));
-                seed.push((*fk, complete, body_range));
-            }
-        }
-        self.create_residency.put_complete_batch(&seed);
-        let sticky_ns = t.elapsed().as_nanos() as u64;
+        // write_sticky_ns stays 0 (legacy slot; process pin FIFO removed).
+        let sticky_ns = 0u64;
 
         // No body DONTNEED after Class A commit: Class A never leads tip, so
         // just-written pages may still be tip-hot for confirm/cache.
@@ -873,12 +620,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
-        // Serialize env so parallel zero-budget tests cannot open with RESIDENCY_BYTES=0.
-        let _g = crate::create_residency::TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
-        std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"); // default 2 GiB
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -887,43 +628,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(&dir).unwrap();
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
         (dir, q)
-    }
-
-    /// Open with residency enabled (default budget); holds env lock for prewarm suite.
-    fn temp_query_full_history(
-        label: &str,
-    ) -> (
-        std::path::PathBuf,
-        Query,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let g = crate::create_residency::TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
-        std::env::remove_var("RBITCOIN_RESIDENCY_BYTES");
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-arch-{label}-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
-        assert!(
-            q.create_residency().enabled(),
-            "full-history query must enable residency"
-        );
-        (dir, q, g)
     }
 
     fn coinbase_apply(i: u64) -> TxApply {
@@ -992,37 +697,6 @@ mod tests {
             assert_eq!(*dens, decode_rels);
         }
         assert_eq!(ifo.len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// W1: commit res_seed from batch_pin denserels lands in CreateResidency
-    /// (no encode+decode path required for pin hit).
-    #[test]
-    fn commit_res_seed_from_batch_pin_hits_residency() {
-        use std::collections::HashMap;
-        let (dir, q) = temp_query("res-seed-pin");
-        let mut need = vec![(Fk(1), vec![coinbase_apply(7), coinbase_apply(8)])];
-        let plan = q
-            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
-            .unwrap();
-        assert_eq!(plan.batch_pin.len(), 2);
-        let pin0 = plan.batch_pin[0].clone();
-        let fk0 = plan.planned_fks[0];
-        q.archive_commit_plan(plan).unwrap();
-        let need_v = vec![0u32];
-        let got = q
-            .create_residency()
-            .get_parent_needed(fk0, &need_v)
-            .expect("residency should have denserels after res_seed");
-        let (tx, live, sparse, _range) = got;
-        assert_eq!(tx.txid, pin0.0.txid);
-        assert_eq!(live.len(), 1);
-        assert!(!sparse.is_empty() || pin0.2.is_empty());
-        // Dense rel for vout 0 matches plan pin.
-        if !pin0.2.is_empty() {
-            let expected = crate::sparse_spender_rels(&pin0.2, &need_v);
-            assert_eq!(sparse, expected);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1107,7 +781,7 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
 
-        // Child spends parent — not in residency/head until plan_a commits.
+        // Child spends parent — not in head until plan_a commits.
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xee;
         let child = TxApply {
@@ -1214,13 +888,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Commit denserels seed is for this batch's creates only.
-    /// Plan head path stamps create_fk only — no denserels into plan or residency.
+    /// Plan head path stamps create_fk only — denserels stay plan-local at prep;
+    /// commit does not process-seed parents or creates into a pin FIFO.
     #[test]
-    fn residency_publish_creates_only_not_head_resolved_parents() {
+    fn plan_head_resolved_parents_plan_local_only() {
         use std::collections::HashMap;
-        let (dir, q) = temp_query("residency-creates-only");
-        // Parent on disk + head, but **not** in residency (direct store put).
+        let (dir, q) = temp_query("plan-creates-only");
+        // Parent on disk + head.
         let parent = coinbase_apply(1);
         let parent_txid = parent.tx.txid;
         q.store
@@ -1231,7 +905,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(q.tx_body_count(), 1);
-        assert_eq!(q.create_residency().len(), 0);
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xcd;
@@ -1277,29 +950,12 @@ mod tests {
             Some(parent_txid),
             "plan reverse map: create_fk → prev_txid from stamp resolve (RAM)"
         );
-        // Must not thrash CreateResidency with long-tail head parents.
-        assert!(
-            q.create_residency().lookup_fk_by_txid(&parent_txid).is_none(),
-            "head path must not FIFO-seed parent into residency"
-        );
-        assert!(
-            q.create_residency().get_outs(Fk(1)).is_none(),
-            "head path must not denserels-seed parents into residency"
-        );
 
+        // Commit succeeds; batch_pin retained on plan path only (dropped with plan).
+        let batch_pin_len = plan.batch_pin.len();
         q.archive_commit_plan(plan).unwrap();
-        assert_eq!(
-            q.create_residency().lookup_fk_by_txid(&child_txid),
-            Some(Fk(2))
-        );
-        assert!(
-            q.create_residency().get_outs(Fk(2)).is_some(),
-            "commit must seed denserels into residency for pin hits"
-        );
-        assert!(
-            q.create_residency().get_outs(Fk(1)).is_none(),
-            "head-resolved parent must not be denserels-published as a new create"
-        );
+        assert_eq!(batch_pin_len, 1);
+        assert_eq!(q.tx_body_count(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1325,205 +981,6 @@ mod tests {
         assert!(Arc::ptr_eq(&ifo_pin, &plan.batch_pin[0]));
         assert_eq!(Arc::strong_count(&plan.batch_pin[0]), 3);
         q.archive_commit_plan(plan).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn zero_budget_skips_residency_prewarm() {
-        // RESIDENCY_BYTES=0 disables residency + prewarm (open under env lock).
-        let _g = crate::create_residency::TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
-        std::env::set_var("RBITCOIN_RESIDENCY_BYTES", "0");
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-arch-zero-budget-skip-prewarm-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
-        assert!(!q.create_residency().enabled());
-        let mut packed = Vec::new();
-        for i in 1u64..=10 {
-            let ta = coinbase_apply(i);
-            packed.push((ta.tx, ta.inputs, ta.outputs));
-        }
-        q.store
-            .txs
-            .put_full_batch_indexed(&packed, true)
-            .unwrap();
-        let st = q.archive_residency_prewarm().unwrap();
-        assert_eq!(st.ranges, 0);
-        assert_eq!(st.denserels_creates, 0);
-        assert_eq!(q.create_residency().len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn residency_prewarm_loads_last_n_via_idx_order() {
-        let (dir, q, _env) = temp_query_full_history("residency-prewarm");
-        let mut packed = Vec::new();
-        for i in 1u64..=50 {
-            let ta = coinbase_apply(i);
-            packed.push((ta.tx, ta.inputs, ta.outputs));
-        }
-        q.store
-            .txs
-            .put_full_batch_indexed(&packed, true)
-            .unwrap();
-        assert_eq!(q.tx_body_count(), 50);
-        assert_eq!(q.create_residency().len(), 0);
-
-        let st = q.archive_residency_prewarm().unwrap();
-        assert_eq!(st.ranges, 0, "range-only prewarm removed");
-        assert_eq!(q.create_residency().len(), 50);
-        // No tip → no header plans; denserels still fill recent creates.
-        assert_eq!(st.header_plans, 0);
-        assert!(
-            st.denserels_creates > 0 && st.denserels_outs > 0,
-            "prewarm must load complete denserels: denserels_creates={} outs={}",
-            st.denserels_creates,
-            st.denserels_outs
-        );
-        assert!(
-            q.create_residency().has_outs(Fk(50)),
-            "newest create should hold denserels after prewarm"
-        );
-
-        let mut last_txid = [0u8; 32];
-        last_txid[0..8].copy_from_slice(&50u64.to_le_bytes());
-        last_txid[8] = 0xcb;
-        assert_eq!(
-            q.create_residency().lookup_fk_by_txid(&last_txid),
-            Some(Fk(50))
-        );
-        let range = q.create_residency().body_ranges_by_fk(&[Fk(50)]);
-        assert!(
-            range[0].is_some(),
-            "complete prewarm should cache body range with pin"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn residency_prewarm_keeps_tail_when_under_cap() {
-        let (dir, q, _env) = temp_query_full_history("residency-tail");
-        let mut packed = Vec::new();
-        for i in 1u64..=5 {
-            let ta = coinbase_apply(i);
-            packed.push((ta.tx, ta.inputs, ta.outputs));
-        }
-        q.store
-            .txs
-            .put_full_batch_indexed(&packed, false)
-            .unwrap();
-        let st = q.archive_residency_prewarm().unwrap();
-        assert_eq!(st.ranges, 0);
-        let t1 = coinbase_apply(1).tx.txid;
-        let t5 = coinbase_apply(5).tx.txid;
-        assert_eq!(q.create_residency().lookup_fk_by_txid(&t1), Some(Fk(1)));
-        assert_eq!(q.create_residency().lookup_fk_by_txid(&t5), Some(Fk(5)));
-        assert!(q.create_residency().body_ranges_by_fk(&[Fk(1)])[0].is_some());
-        assert!(q.create_residency().body_ranges_by_fk(&[Fk(5)])[0].is_some());
-        assert!(q.create_residency().has_outs(Fk(1)));
-        assert!(q.create_residency().has_outs(Fk(5)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Tip-ahead Class A path must seed ConfirmParentCache header plans.
-    #[test]
-    fn residency_prewarm_seeds_tip_ahead_header_plans() {
-        use crate::Height;
-        use rbitcoin_store::HeaderRecord;
-
-        let (dir, q, _env) = temp_query_full_history("prewarm-hdr-plans");
-        // Confirm genesis.
-        let mut hash0 = [0u8; 32];
-        hash0[0] = 0xa0;
-        let h0 = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 0x207f_ffff,
-            nonce: 0,
-            merkle_root: hash0,
-            hash: hash0,
-        };
-        q.connect_block(Height(0), &h0, &[coinbase_apply(1)])
-            .expect("connect genesis");
-        assert_eq!(q.tip_height(), Some(Height(0)));
-        let mut prev = q.tip_header_fk().unwrap().unwrap();
-
-        // Archive tip+1 and tip+2 without confirming (Class A ahead of tip).
-        for h in 1..=2u32 {
-            let mut hash = [0u8; 32];
-            hash[0] = 0xa0 + h as u8;
-            let header = HeaderRecord {
-                prev_fk: prev,
-                version: 1,
-                timestamp: 1 + h,
-                bits: 0x207f_ffff,
-                nonce: h,
-                merkle_root: hash,
-                hash,
-            };
-            prev = q
-                .archive_block(&header, &[coinbase_apply((h as u64) + 10)])
-                .expect("archive ahead");
-        }
-
-        let st = q.archive_residency_prewarm().unwrap();
-        assert!(
-            st.header_plans >= 2,
-            "expected tip-ahead header plans, got {}",
-            st.header_plans
-        );
-        assert!(
-            q.confirm_parent_cache().get_header_plan(1).is_some(),
-            "height 1 plan missing"
-        );
-        assert!(
-            q.confirm_parent_cache().get_header_plan(2).is_some(),
-            "height 2 plan missing"
-        );
-        // Archive commit already denserels-seeds its creates; prewarm may load 0
-        // additional denserels but residency outs must be non-zero either way.
-        assert!(
-            st.denserels_outs > 0 || q.create_residency().total_outs() > 0,
-            "residency outs after prewarm must be >0 (got denserels_creates={} outs={})",
-            st.denserels_creates,
-            st.denserels_outs
-        );
-        assert_eq!(st.ranges, 0, "range-only prewarm removed");
-        assert!(q.create_residency().len() > 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// res_seed Arc-shares batch_pin (no deep outs clone into residency).
-    #[test]
-    fn commit_res_seed_arc_shares_batch_pin() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        let (dir, q) = temp_query("res-seed-arc");
-        let mut need = vec![(Fk(1), vec![coinbase_apply(3)])];
-        let plan = q
-            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
-            .unwrap();
-        let pin0 = Arc::clone(&plan.batch_pin[0]);
-        let fk0 = plan.planned_fks[0];
-        q.archive_commit_plan(plan).unwrap();
-        let (got, _range) = q.create_residency().get_pin(fk0).expect("res_seed pin");
-        assert!(
-            Arc::ptr_eq(&got, &pin0),
-            "residency must Arc-share pipeline create pin"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,10 +2,9 @@
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache** header + `header_txs` (process-local, tip-GCed).
-//! 2. **Full Class A decode once** into [`BatchFullBodies`] (wire) + outs FIFO
-//!    (pin hits; inputs dropped there).
-//! 3. **Thin edges** + **sparse parent pin** as **batch-local** maps.
-//! Body ranges from `tx.idx` on demand.
+//! 2. **Full Class A decode once** into [`BatchFullBodies`] (wire).
+//! 3. **Thin edges** + **sparse parent pin** as **batch-local** maps
+//!    (same-batch bodies, then cold denserels). Body ranges from `tx.idx`.
 
 use super::*;
 use crate::batch_full_bodies::BatchFullBodies;
@@ -24,11 +23,9 @@ pub struct ConfirmLoadStats {
     pub creates_registered: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
-    /// Of `parent_unique`: filled without store denserels IO (FIFO / same-batch / residency).
+    /// Of `parent_unique`: filled without store denserels IO (same-batch / plan-local).
     pub pin_cache_body: u32,
-    /// Subset of no-IO pins that came from CreateResidency (schema 12).
-    pub pin_residency: u32,
-    /// Of `parent_unique`: missed FIFO/same-batch (may still hit residency before store).
+    /// Of `parent_unique`: missed same-batch (cold denserels).
     pub pin_new: u32,
     /// Historical: spent-filter during pin (now always 0 — structural owns spentness).
     pub pin_spent_ns: u64,
@@ -73,7 +70,7 @@ impl Query {
             through,
             ahead,
             0,
-            self.create_residency.len(),
+            0, // legacy bodies slot (process pin FIFO removed)
             self.confirm_parents.plan_count(),
         )
     }
@@ -91,11 +88,10 @@ impl Query {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Load Class A for heights: outs FIFO + **per-batch** parent pin + thin edges.
+    /// Load Class A for heights: **per-batch** parent pin + thin edges.
     ///
     /// Returns `(stats, batch_parents, batch_thin, batch_bodies)`. Thin edges and
-    /// full bodies are assemble/wire-only and must not be stored on the process
-    /// parent cache long-term (FIFO keeps outs only).
+    /// full bodies are assemble/wire-only (pipeline pins; no process pin FIFO).
     pub fn load_confirm_parents(
         &self,
         items: &[(u32, [u8; 32])],
@@ -207,8 +203,6 @@ impl Query {
                 std::borrow::Cow::Owned(v)
             };
 
-            // Combined path: residency ranges + one idx→body wave seeds residency
-            // (archive prep + confirm pin share the same map — no dual thrash).
             let range_fks: Vec<Fk> = fks_work
                 .iter()
                 .copied()
@@ -217,7 +211,6 @@ impl Query {
             // Idx→body + one full decode (in load_creates_once); no re-decode of raw.
             let creates = crate::combined_stage::load_creates_once(
                 &self.store,
-                &self.create_residency,
                 &range_fks,
                 rbitcoin_store::IdxBodyMode::Full,
             )?;
@@ -272,7 +265,6 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // Residency outs already seeded by load_creates_once (no second map).
         st.cache_put_ns = 0;
 
         // ── Thin edges: stamped create_fk only (schema v10) ────────────────
@@ -326,11 +318,7 @@ impl Query {
 
         // ── Pin parents into per-batch BatchParents ───────────────────────
         // Sparse spent-filtered outs live on the batch object (not tip-GCed).
-        // Outs FIFO supplies pin_cache hits; body ranges from store tx.idx.
-        //
-        // Ownership path: FIFO hits move once into BatchParents (no
-        // intermediate sparse_parents + re-clone). Vec-backed ParentEntry
-        // avoids HashMap/HashSet allocs per parent at pin volume.
+        // Same-batch bodies first; cold denserels for external parents.
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
@@ -347,10 +335,9 @@ impl Query {
         }
         batch_parents = BatchParents::with_capacity(pin_jobs.len());
 
-        // ── Residency / same-batch hits (pin_cache) ────────────────────────
+        // ── Same-batch hits (pin_cache) ────────────────────────────────────
         // Coinbase height: free hints when known. Store resolve is deferred to
         // structural write (maturity). Unset (`None`) means write must look up.
-        // Same-batch creates are in batch_bodies (and residency) with denserels.
         let t_body = Instant::now();
         let mut pin_new_pending: Vec<(u64, Vec<u32>)> = Vec::new();
         for (pid, need_vouts) in pin_jobs {
@@ -360,28 +347,6 @@ impl Query {
             }
             let fk = Fk(pid);
             if need_vouts.is_empty() {
-                continue;
-            }
-            if let Some((tx, live, sparse_rels, body_range)) =
-                self.create_residency.get_parent_needed(fk, &need_vouts)
-            {
-                st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                st.pin_residency = st.pin_residency.saturating_add(1);
-                let cb = if tx.input_count != 1 {
-                    Some(false)
-                } else {
-                    None
-                };
-                batch_parents.insert_owned(
-                    fk,
-                    tx,
-                    live,
-                    need_vouts,
-                    cb,
-                    body_range,
-                    sparse_rels,
-                );
-                st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
             // Same-batch create: pin from batch_bodies (no idx / body re-read).
@@ -419,61 +384,23 @@ impl Query {
 
         // ── pin_new: idx→body pipeline in **chunks** ─────────────────────
         // Holding ~90k full packed bodies + dense outs at once blew RSS.
-        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Prefer CreateResidency; cold
-        // path is one denserels load that seeds residency.
+        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Cold denserels only.
         const PIN_NEW_CHUNK: usize = 4096;
         let t_new = Instant::now();
         if self.confirm_cancelled() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        // pin_new via combined residency: one denserels load seeds residency.
-        // Prefer already-resident outs (same creates archive just published).
-        let mut still_need: Vec<(u64, Vec<u32>)> = Vec::new();
-        for (pid, need_vouts) in &pin_new_pending {
-            let fk = Fk(*pid);
-            if let Some((tx, outs, dense_rels, range)) = self.create_residency.get_outs(fk) {
-                let live = slim_dense_outs_to_need(&outs, need_vouts);
-                let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, need_vouts);
-                if crate::batch_parents::layout_covers_need(range, &sparse, need_vouts) {
-                    let cb = if tx.input_count != 1 {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    batch_parents.insert_owned(
-                        fk,
-                        tx,
-                        live,
-                        need_vouts.clone(),
-                        cb,
-                        range,
-                        sparse,
-                    );
-                    st.utxo_parents = st.utxo_parents.saturating_add(1);
-                    // No store denserels IO: count as cache + residency hit.
-                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    st.pin_residency = st.pin_residency.saturating_add(1);
-                    // Was classified pin_new before residency check — undo that.
-                    st.pin_new = st.pin_new.saturating_sub(1);
-                    continue;
-                }
-            }
-            still_need.push((*pid, need_vouts.clone()));
-        }
-        for chunk in still_need.chunks(PIN_NEW_CHUNK) {
+        for chunk in pin_new_pending.chunks(PIN_NEW_CHUNK) {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
-            // pin_new = external parents: load denserels without residency seed.
-            let loaded = crate::combined_stage::load_creates_once_seed(
+            let loaded = crate::combined_stage::load_creates_once(
                 &self.store,
-                &self.create_residency,
                 &fks,
                 rbitcoin_store::IdxBodyMode::OutsDenserels,
-                false,
             )?;
             let mut by_id: HashMap<u64, crate::combined_stage::CombinedCreate> =
                 HashMap::with_capacity(loaded.len());
@@ -573,8 +500,7 @@ fn tx_fks_is_sorted_ascending(fks: &[Fk]) -> bool {
 
 /// Dense `outs[vout]` → sparse need list (clone of need only).
 ///
-/// Residual batch-local copies of scripts are the need-vouts in [`BatchParents`];
-/// full denserels/outs live in CreateResidency when seeded.
+/// Residual batch-local copies of scripts are the need-vouts in [`BatchParents`].
 fn slim_dense_outs_to_need(
     outs: &[rbitcoin_store::OutputRecord],
     need: &[u32],
@@ -599,7 +525,7 @@ fn is_coinbase_inputs(tx: &rbitcoin_store::TxRecord, inputs: &[rbitcoin_store::I
 }
 
 #[cfg(test)]
-mod pin_new_residency_tests {
+mod pin_new_slim_tests {
     use super::slim_dense_outs_to_need;
     use rbitcoin_store::OutputRecord;
 

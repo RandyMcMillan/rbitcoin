@@ -9,7 +9,6 @@ mod combined_stage;
 mod confirm_parent_cache;
 mod connect;
 mod confirm_load;
-mod create_residency;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -17,10 +16,7 @@ mod sh_builder;
 mod wave_prevout;
 
 pub use combined_stage::{
-    body_ok_reads, load_creates_once, load_creates_once_seed, reset_body_ok_reads, CombinedCreate,
-};
-pub use create_residency::{
-    estimate_pin_bytes, CreateResidency, DEFAULT_RESIDENCY_BYTES, TEST_RESIDENCY_ENV_LOCK,
+    body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate,
 };
 
 use bitcoin::absolute::LockTime;
@@ -100,19 +96,12 @@ pub fn soft_pressure(
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 ///
-/// Sole pin map is `residency_*` (CreateResidency FIFO). `conf_plans` is header
-/// plan occupancy in ConfirmParentCache.
+/// `conf_plans` is header plan occupancy in ConfirmParentCache. Pins are
+/// pipeline-local (plan `batch_pin` / `BatchParents` / plan-local external
+/// parents) — no process create FIFO.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
     pub conf_plans: usize,
-    /// Sole hot create map: complete creates + byte budget (FIFO).
-    pub residency_creates: usize,
-    /// Estimated residency payload bytes.
-    pub residency_bytes: u64,
-    /// Byte budget (0 = disabled).
-    pub residency_byte_cap: u64,
-    /// Total outs held (metrics).
-    pub residency_outs: u64,
     pub sh_runs: usize,
     pub sh_memtable: usize,
     pub sh_heads: usize,
@@ -126,9 +115,7 @@ pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
-pub use archive::{
-    ArchiveWritePlan, CreatePin, ResidencyPrewarmStats, PREWARM_HEADER_PLANS_MAX,
-};
+pub use archive::{ArchiveWritePlan, CreatePin};
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
@@ -147,20 +134,17 @@ pub mod confirm_load_stats {
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin filled from outs FIFO or same-batch (no Class A re-decode).
+    /// Pin filled from same-batch / plan-local (no Class A re-decode).
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
-    /// Of no-IO pins: filled from CreateResidency (schema 12 shared map).
-    pub static PIN_RESIDENCY: AtomicU64 = AtomicU64::new(0);
     /// Wire plan / in-flight parent pins (subset of pin_cache; not denserels hits).
     pub static PIN_PLAN: AtomicU64 = AtomicU64::new(0);
-    /// Pin candidates that missed FIFO/same-batch (may still hit residency before store).
+    /// Pin candidates that missed same-batch / plan-local (cold denserels).
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
     /// Wire pin sub-walls (ns).
     pub static PLAN_PIN_NS: AtomicU64 = AtomicU64::new(0);
-    pub static RES_HIT_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels wall (range + idx). Prefer split fields when diagnosing.
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels via plan stamp body range (`get_outs_denserels_by_range_batch`).
@@ -170,7 +154,7 @@ pub mod confirm_load_stats {
     pub static COLD_RANGE_BODY_NS: AtomicU64 = AtomicU64::new(0);
     /// Sub-wall of cold range: sparse denserels decode (N2.0).
     pub static COLD_RANGE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Cold denserels via idx→body (`load_creates_once_seed`).
+    /// Cold denserels via idx→body (`load_creates_once`).
     pub static COLD_IDX_NS: AtomicU64 = AtomicU64::new(0);
     pub static COLD_IDX_N: AtomicU64 = AtomicU64::new(0);
     pub static COLD_DECODE_NS: AtomicU64 = AtomicU64::new(0);
@@ -198,14 +182,12 @@ pub mod confirm_load_stats {
         pub creates: u64,
         pub parent_unique: u64,
         pub pin_cache_body: u64,
-        pub pin_residency: u64,
         pub pin_plan: u64,
         pub pin_new: u64,
         pub pin_spent_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
         pub plan_pin_ns: u64,
-        pub res_hit_ns: u64,
         pub cold_io_ns: u64,
         pub cold_range_ns: u64,
         pub cold_range_n: u64,
@@ -236,14 +218,12 @@ pub mod confirm_load_stats {
             creates: CREATES.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
-            pin_residency: PIN_RESIDENCY.swap(0, Ordering::Relaxed),
             pin_plan: PIN_PLAN.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
             plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
-            res_hit_ns: RES_HIT_NS.swap(0, Ordering::Relaxed),
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
             cold_range_ns: COLD_RANGE_NS.swap(0, Ordering::Relaxed),
             cold_range_n: COLD_RANGE_N.swap(0, Ordering::Relaxed),
@@ -284,7 +264,6 @@ pub mod confirm_load_stats {
         add!(creates_registered, CREATES);
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_cache_body, PIN_CACHE_BODY);
-        add!(pin_residency, PIN_RESIDENCY);
         add!(pin_new, PIN_NEW);
         add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_body_ns, PIN_BODY_NS);
@@ -629,10 +608,8 @@ pub mod class_c_phase_stats {
     /// SH: `scripthash.head` insert_many (tip append path).
     pub static SH_HEAD_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// SH collect source: write-batch CreatePin outs (no residency / store).
+    /// SH collect source: write-batch CreatePin outs (no store re-read).
     pub static SH_COLLECT_PIN: AtomicU64 = AtomicU64::new(0);
-    /// SH collect source: CreateResidency outs.
-    pub static SH_COLLECT_RES: AtomicU64 = AtomicU64::new(0);
     /// SH collect source: cold Class A body load.
     pub static SH_COLLECT_COLD: AtomicU64 = AtomicU64::new(0);
 
@@ -661,11 +638,10 @@ pub mod class_c_phase_stats {
         )
     }
 
-    /// `(pin, residency, cold)` create counts for SH collect sources, then reset.
-    pub fn sample_sh_collect_src_and_reset() -> (u64, u64, u64) {
+    /// `(pin, cold)` create counts for SH collect sources, then reset.
+    pub fn sample_sh_collect_src_and_reset() -> (u64, u64) {
         (
             SH_COLLECT_PIN.swap(0, Ordering::Relaxed),
-            SH_COLLECT_RES.swap(0, Ordering::Relaxed),
             SH_COLLECT_COLD.swap(0, Ordering::Relaxed),
         )
     }
@@ -698,39 +674,6 @@ pub mod connect_prevout_stats {
             WAVE_HIT.swap(0, Ordering::Relaxed),
             CLASS_A_HIT.swap(0, Ordering::Relaxed),
             STORE_MISS.swap(0, Ordering::Relaxed),
-        )
-    }
-}
-
-/// CreateResidency `RwLock` wait/hold (IBD sampler).
-///
-/// **Not** channel wait (`thr prep=busy/wait`). `r_wait` large under seed write
-/// contention means prep is blocked on residency write; `r_wait≈0` with prep still
-/// slow means look elsewhere (cold denserels / prevout).
-pub mod residency_lock_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Time from `write()` call until exclusive lock acquired.
-    pub static W_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Exclusive write-guard hold time (bookkeeping only; Arc drop is after unlock).
-    pub static W_HOLD_NS: AtomicU64 = AtomicU64::new(0);
-    pub static W_N: AtomicU64 = AtomicU64::new(0);
-    /// Time from `read()` call until shared lock acquired.
-    pub static R_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Shared read-guard hold time (sum across readers).
-    pub static R_HOLD_NS: AtomicU64 = AtomicU64::new(0);
-    pub static R_N: AtomicU64 = AtomicU64::new(0);
-
-    /// `(w_wait, w_hold, w_n, r_wait, r_hold, r_n)` then reset.
-    #[inline]
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
-        (
-            W_WAIT_NS.swap(0, Ordering::Relaxed),
-            W_HOLD_NS.swap(0, Ordering::Relaxed),
-            W_N.swap(0, Ordering::Relaxed),
-            R_WAIT_NS.swap(0, Ordering::Relaxed),
-            R_HOLD_NS.swap(0, Ordering::Relaxed),
-            R_N.swap(0, Ordering::Relaxed),
         )
     }
 }
@@ -801,8 +744,6 @@ pub struct Query {
     sh_indexed_through: AtomicU64,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
-    /// Sole hot create map (fk/range/outs) for archive prep + confirm pin.
-    create_residency: create_residency::CreateResidency,
     /// In-RAM block payload queue (FIFO until confirm-write; empty after restart).
     ///
     /// RAM-only by design: avoids double-writing every block (queue + Class A).
@@ -844,7 +785,6 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
-            create_residency: create_residency::CreateResidency::from_env(),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
                 &store_path,
             )?),
@@ -1012,11 +952,6 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Sole hot create map (archive prep + confirm pin).
-    pub fn create_residency(&self) -> &create_residency::CreateResidency {
-        &self.create_residency
-    }
-
     /// In-RAM block queue stats: `(absolute_budget_or_max, bytes, count)`.
     ///
     /// Bytes are process heap (wire payloads). Absolute budget is `u64::MAX`
@@ -1144,17 +1079,12 @@ impl Query {
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
-    /// Brief mutex locks only (residency / header plans / SH / heads). Call from
-    /// the ~5s status tick — not the hot path.
+    /// Brief mutex locks only (header plans / SH / heads). Call from the ~5s
+    /// status tick — not the hot path.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
-        let (res_creates, res_bytes, res_byte_cap, res_outs) = self.create_residency.size_stats();
         let conf_plans = self.confirm_parents.plan_count();
         ProcessOwnedSizes {
             conf_plans,
-            residency_creates: res_creates,
-            residency_bytes: res_bytes,
-            residency_byte_cap: res_byte_cap,
-            residency_outs: res_outs,
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),
@@ -1323,11 +1253,8 @@ impl Query {
         self.get_tx_class_a(fk)
     }
 
-    /// Load tx row: CreateResidency → store (no generic Class A cache).
+    /// Load tx row from Class A store (no process pin FIFO).
     pub fn get_tx_class_a(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        if let Some(tx) = self.create_residency.get_tx(fk) {
-            return Ok(tx);
-        }
         self.store.get_tx(fk)
     }
 
@@ -1415,12 +1342,6 @@ impl Query {
         use std::sync::atomic::Ordering;
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
-        }
-        if let Some((_, o)) = self.create_residency.get_parent_out(create_fk, vout) {
-            if count_connect {
-                connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(o);
         }
         // Packed Class A — one body IO.
         let (_, _, outs) = self.store.get_tx_full(create_fk)?;
@@ -1746,47 +1667,6 @@ mod tests {
         assert_eq!(s.cold_idx_ns, 2_000_000);
         assert_eq!(s.cold_idx_n, 5);
 
-        // I4 residency lock sample.
-        let _ = residency_lock_stats::sample_and_reset();
-        residency_lock_stats::W_WAIT_NS.store(10, AtomicOrdering::Relaxed);
-        residency_lock_stats::W_HOLD_NS.store(20, AtomicOrdering::Relaxed);
-        residency_lock_stats::W_N.store(2, AtomicOrdering::Relaxed);
-        residency_lock_stats::R_WAIT_NS.store(30, AtomicOrdering::Relaxed);
-        residency_lock_stats::R_HOLD_NS.store(40, AtomicOrdering::Relaxed);
-        residency_lock_stats::R_N.store(4, AtomicOrdering::Relaxed);
-        assert_eq!(
-            residency_lock_stats::sample_and_reset(),
-            (10, 20, 2, 30, 40, 4)
-        );
-    }
-
-    #[test]
-    fn residency_lock_stats_accrue_on_read_write() {
-        let _ = residency_lock_stats::sample_and_reset();
-        let r = crate::create_residency::CreateResidency::new(64 * 1024);
-        // Read path.
-        assert_eq!(r.len(), 0);
-        // Write path.
-        let pin = std::sync::Arc::new((
-            rbitcoin_store::TxRecord {
-                txid: [9u8; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: rbitcoin_primitives::Fk::NULL,
-                input_count: 1,
-                output_start_fk: rbitcoin_primitives::Fk::NULL,
-                output_count: 1,
-            },
-            vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
-            vec![0u32],
-        ));
-        r.put_complete(rbitcoin_primitives::Fk(1), pin, Some((0, 8)));
-        assert!(r.has_outs(rbitcoin_primitives::Fk(1)));
-        let (w_wait, w_hold, w_n, r_wait, r_hold, r_n) = residency_lock_stats::sample_and_reset();
-        assert!(w_n >= 1, "write n={w_n}");
-        assert!(r_n >= 1, "read n={r_n}");
-        // Hold times are wall-clock; allow zero only if Instant resolution is coarse.
-        let _ = (w_wait, w_hold, r_wait, r_hold);
     }
 
     #[test]
@@ -1886,9 +1766,9 @@ mod tests {
         q.enter_tip_index_mode();
         assert!(q.index_mode().is_tip());
 
-        // Size snapshot (residency occupancy).
+        // Size snapshot (header plans / SH / heads).
         let sizes = q.process_owned_size_snapshot();
-        let _ = sizes.residency_byte_cap;
+        let _ = sizes.conf_plans;
         assert!(q.tx_body_count() >= 4);
         let _ = q.tx_head_occupied();
         let _ = q.scripthash_entry_count();
@@ -2491,26 +2371,12 @@ mod tests {
     }
 
     /// W-SH.A: write-batch CreatePin supplies outs for SH collect without Class A
-    /// body re-read (RES=0 / empty residency / missing store row still succeeds).
+    /// body re-read (missing store row still succeeds via pin).
     #[test]
-    fn sh_collect_write_pin_skips_store_and_residency() {
+    fn sh_collect_write_pin_skips_store() {
         use std::sync::Arc;
 
-        let _g = TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
-        std::env::set_var("RBITCOIN_RESIDENCY_BYTES", "0");
         let (dir, q) = temp_query("sh-collect-pin");
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
-        assert!(
-            !q.create_residency().enabled(),
-            "RES=0 must disable residency"
-        );
-
         let _ = class_c_phase_stats::sample_sh_collect_src_and_reset();
 
         let script = vec![0x51, 0xaa, 0xbb];
@@ -2537,9 +2403,8 @@ mod tests {
         assert_eq!(recs[0].create_tx_fk, fk);
         assert_eq!(recs[0].scripthash, expected_sh);
 
-        let (pin_n, res_n, cold_n) = class_c_phase_stats::sample_sh_collect_src_and_reset();
+        let (pin_n, cold_n) = class_c_phase_stats::sample_sh_collect_src_and_reset();
         assert_eq!(pin_n, 1, "pin hit");
-        assert_eq!(res_n, 0);
         assert_eq!(cold_n, 0);
 
         // Without pin and without store row → cold path errors (NotFound).

@@ -27,8 +27,8 @@ do not hold both a decoded `Block` and the wire bytes.
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
 | **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft densify / far-scale meter only; **no** job charge/release on the unified path (without a charger it stays empty — in-RAM BQ soft depth is the primary densify gate) |
-| **CreateResidency (sole pin map)** | Default **2 GiB** complete pipeline-create rows (`RBITCOIN_RESIDENCY_BYTES`; `0` = off). **External parents never cached** (batch-local only) | **Insert-order FIFO by bytes** only (no read-LRU). Complete rows only (fk+outs+denserels Arc). Cold denserels for ancient parents use Class A |
-| **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP; not controlled by residency budget |
+| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` / plan-local external parents only | Drop with batch. Cold denserels for ancient parents use Class A into plan-local maps |
+| **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
@@ -66,7 +66,7 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 | Observation | Interpretation |
 |-------------|----------------|
 | `bq RAM=` climbs while tip lags, falls as confirm dequeues | Working in-RAM queue (counts toward RSS/anon) |
-| `residency creates=` / `bytes=` near budget, oscillates | Intentional CreateResidency FIFO fill |
+| `conf_plans=` grows with tip-ahead headers | Intentional ConfirmParentCache header plans |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
 
@@ -80,7 +80,7 @@ known retain structures:
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
 | `bq soft=n/stop RAM=` | In-RAM body-queue count vs soft densify stop target + heap MiB |
-| `residency` | **Sole** pin map: creates + bytes/cap + outs + conf_plans |
+| `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |

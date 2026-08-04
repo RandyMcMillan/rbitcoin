@@ -1,19 +1,16 @@
 //! Combined archive-prep + confirm-load stage (single parent-body path).
 //!
 //! Production confirm load calls [`load_creates_once`] for Class A create decode
-//! and pin_new denserels. **Pipeline creates** may seed [`CreateResidency`]
-//! (`seed_residency = true`); **external-parent** denserels loads must pass
-//! `seed_residency = false` (batch-local only).
+//! and pin_new denserels. Always idx→body with `range=None` (no process pin FIFO).
+//! Pipeline pins live on the plan (`batch_pin`, `BatchParents`, plan-local
+//! `external_parent_outs`); ancient parents use cold Class A.
 
-use crate::create_residency::CreateResidency;
-use crate::CreatePin;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
     IdxBodyJob, IdxBodyMode, Store, StoreError, StoreSecret,
 };
 use std::cell::Cell;
-use std::sync::Arc;
 
 // Per-thread body-ok pread counter (thread-local so parallel tests do not race).
 thread_local! {
@@ -56,41 +53,25 @@ pub struct CombinedCreate {
     )>,
 }
 
-/// Load creates by fk (and optional known ranges from residency), decode once.
-/// Each successful body fetch increments [`body_ok_reads`].
+/// Load creates by fk via idx→body, decode once.
 ///
-/// When `seed_residency` is true, complete pins are inserted into CreateResidency
-/// (pipeline creates / prewarm only). **External-parent** cold loads must pass
-/// `false` so parents never enter the FIFO.
+/// Each successful body fetch increments [`body_ok_reads`]. Ranges are always
+/// resolved from `tx.idx` (`range=None` on jobs). Callers fill schema-13 zero
+/// body `TxRecord.txid` from plan RAM maps when needed — this path never seeds
+/// a process pin map and does not fill txid from `txid.body` for that purpose.
 ///
 /// **Shipped entry used by** [`crate::Query::load_confirm_parents`] and wire pin.
 pub fn load_creates_once(
     store: &Store,
-    residency: &CreateResidency,
     fks: &[Fk],
     mode: IdxBodyMode,
-) -> Result<Vec<CombinedCreate>, rbitcoin_store::StoreError> {
-    // Default: seed only Full (batch creates). OutsDenserels is typically parents.
-    let seed = matches!(mode, IdxBodyMode::Full);
-    load_creates_once_seed(store, residency, fks, mode, seed)
-}
-
-/// Like [`load_creates_once`] with explicit residency seed control.
-pub fn load_creates_once_seed(
-    store: &Store,
-    residency: &CreateResidency,
-    fks: &[Fk],
-    mode: IdxBodyMode,
-    seed_residency: bool,
 ) -> Result<Vec<CombinedCreate>, rbitcoin_store::StoreError> {
     if fks.is_empty() {
         return Ok(Vec::new());
     }
-    let ranges = residency.body_ranges_by_fk(fks);
     let mut jobs: Vec<IdxBodyJob> = fks
         .iter()
-        .zip(ranges.into_iter())
-        .map(|(fk, range)| IdxBodyJob::new(fk.get().unwrap_or(0), range))
+        .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
         .collect();
     store.idx_body_pipeline(&mut jobs, mode)?;
     let secret: &StoreSecret = store.txs.store_secret();
@@ -107,21 +88,11 @@ pub fn load_creates_once_seed(
         let mut decoded_outs = None;
         match mode {
             IdxBodyMode::Full => {
-                if let Ok((mut tx, ins, outs, rels)) =
+                if let Ok((tx, ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    // Schema 13: body has no leading txid. Prep pin never fills
-                    // from txid.body (use plan RAM map). Prewarm seed only may
-                    // take sidefile so residency by_txid works.
-                    if seed_residency && tx.txid == [0u8; 32] {
-                        if let Ok(tid) = store.txs.body_txid(*fk) {
-                            tx.txid = tid;
-                        }
-                    }
-                    if seed_residency && tx.txid != [0u8; 32] {
-                        let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
-                        residency.put_complete(*fk, pin, Some(range));
-                    }
+                    // Schema 13: body has no leading txid. Leave zero; caller
+                    // fills from plan RAM when needed (never body_txid for pin).
                     decoded_full = Some((tx, ins, outs, rels));
                 } else {
                     return Err(StoreError::Corrupt(
@@ -130,20 +101,11 @@ pub fn load_creates_once_seed(
                 }
             }
             IdxBodyMode::OutsDenserels | IdxBodyMode::Prefix33 => {
-                if let Ok((mut tx, outs, rels)) =
+                if let Ok((tx, outs, rels)) =
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    // Pin path (seed_residency=false): leave txid zero; caller fills
-                    // from plan `external_parent_txids` / residency RAM only.
-                    if seed_residency && tx.txid == [0u8; 32] {
-                        if let Ok(tid) = store.txs.body_txid(*fk) {
-                            tx.txid = tid;
-                        }
-                    }
-                    if seed_residency && tx.txid != [0u8; 32] {
-                        let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
-                        residency.put_complete(*fk, pin, Some(range));
-                    }
+                    // Leave txid zero; caller fills from plan
+                    // `external_parent_txids` / batch maps only.
                     decoded_outs = Some((tx, outs, rels));
                 } else {
                     return Err(StoreError::Corrupt(
@@ -171,26 +133,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     fn temp_query() -> (std::path::PathBuf, Query) {
-        // Share lock with archive tests that mutate RBITCOIN_RESIDENCY_BYTES.
-        let _g = crate::create_residency::TEST_RESIDENCY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
-        std::env::remove_var("RBITCOIN_RESIDENCY_BYTES");
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, AtomicOrdering::Relaxed);
         let dir = std::env::temp_dir().join(format!("rbitcoin-combined-q-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(dir.join("store")).unwrap();
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
-        }
         (dir, q)
     }
-
-    /// Serialise env budget knobs across parallel tests.
 
     fn put_tx(q: &Query, seed: u8) -> Fk {
         let mut txid = [0u8; 32];
@@ -221,57 +171,37 @@ mod tests {
         let (dir, q) = temp_query();
         let fks: Vec<Fk> = (0..4u8).map(|i| put_tx(&q, i + 20)).collect();
         reset_body_ok_reads();
-        let creates = load_creates_once(
-            q.store(),
-            q.create_residency(),
-            &fks,
-            IdxBodyMode::Full,
-        )
-        .unwrap();
+        let creates = load_creates_once(q.store(), &fks, IdxBodyMode::Full).unwrap();
         assert_eq!(creates.len(), fks.len());
         assert!(body_ok_reads() >= 1, "combined path must body-fetch");
-        // Full mode seeds complete residency rows for pipeline creates.
-        for fk in &fks {
-            assert!(q.create_residency().get_pin(*fk).is_some());
-        }
-        let (txid, fk) = {
-            let c = &creates[0];
-            // Schema 13: identity lives in txid.body / filled decoded pin, not body prefix.
-            let t = c
-                .decoded_full
-                .as_ref()
-                .map(|(tx, _, _, _)| tx.txid)
-                .unwrap_or_else(|| q.store().txs.body_txid(c.fk).unwrap());
-            assert_ne!(t, [0u8; 32], "sidefile/decoded pin must supply identity");
-            (t, c.fk)
+        // Schema 13: identity lives in txid.body / plan RAM, not body prefix.
+        let c = &creates[0];
+        let t = c
+            .decoded_full
+            .as_ref()
+            .map(|(tx, _, _, _)| tx.txid)
+            .unwrap_or([0u8; 32]);
+        // Full decode leaves zero unless filled; sidefile holds identity.
+        let tid = if t == [0u8; 32] {
+            q.store().txs.body_txid(c.fk).unwrap()
+        } else {
+            t
         };
-        assert_eq!(q.create_residency().lookup_fk_by_txid(&txid), Some(fk));
+        assert_ne!(tid, [0u8; 32], "sidefile must supply identity");
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// OutsDenserels parent path must not pollute residency FIFO.
+    /// OutsDenserels parent path returns denserels decode without process pins.
     #[test]
-    fn outs_denserels_does_not_seed_residency() {
+    fn outs_denserels_loads_parent_decode() {
         let (dir, q) = temp_query();
         let fk = put_tx(&q, 7);
-        assert_eq!(q.create_residency().len(), 0);
-        let creates = load_creates_once_seed(
-            q.store(),
-            q.create_residency(),
-            &[fk],
-            IdxBodyMode::OutsDenserels,
-            false,
-        )
-        .unwrap();
+        let creates =
+            load_creates_once(q.store(), &[fk], IdxBodyMode::OutsDenserels).unwrap();
         assert_eq!(creates.len(), 1);
         assert!(
             creates[0].decoded_outs.is_some(),
             "decode must succeed for pin"
-        );
-        assert_eq!(
-            q.create_residency().len(),
-            0,
-            "external-parent denserels must not enter residency"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -420,12 +350,12 @@ mod tests {
     }
 
     /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents
-    /// on h0 seeds residency; load of h1 pins parent **without** a second denserels
-    /// body fetch (`full_tx_reads` stays 0 for the parent pin).
+    /// on h0; load of h1 pins parent from batch_bodies same-batch or cold Class A
+    /// once (full_tx_reads for external parent).
     #[test]
     fn multi_block_load_confirm_parents_single_parent_body() {
-        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
         use crate::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
         let (dir, q) = temp_query();
         // h0 coinbase
@@ -508,8 +438,6 @@ mod tests {
         };
         q.archive_block(&h1, &[cb1, child]).unwrap();
 
-        // Parent create is on residency after archive commit (range dual-write).
-        // Load h0 through **shipped** load_confirm_parents → seeds outs into residency.
         reset_body_ok_reads();
         let (st0, parents0, _thin0, bodies0) = q
             .load_confirm_parents(&[(0, h0hash)])
@@ -521,43 +449,32 @@ mod tests {
             body_reads_after_h0 >= 1,
             "h0 must body-read creates, got {body_reads_after_h0}"
         );
-        // CreateResidency holds parent outs for pin.
         let parent_fk = q
             .store()
             .txs
             .get_fk_by_txid(&parent_txid)
             .unwrap()
             .expect("parent head");
-        assert!(
-            q.create_residency().get_pin(parent_fk).is_some(),
-            "pipeline create must be complete in residency after archive/load"
-        );
         let _ = parents0;
+        let _ = parent_fk;
 
-        // Load h1: child spends parent → pin path must NOT denserels-IO parent again.
+        // Load h1: child spends parent → pin via same-batch (if multi-height) or cold.
+        // Separate load of h1 only: parent is external → one denserels cold load.
         let (st1, parents1, _thin1, bodies1) = q
             .load_confirm_parents(&[(1, h1hash)])
             .expect("load h1");
         assert!(st1.blocks >= 1);
         assert!(bodies1.len() >= 1);
-        // Parent pin from residency: pin_new denserels path uses full_tx_reads.
-        assert_eq!(
-            st1.full_tx_reads, 0,
-            "parent pin must not re-fetch denserels body (full_tx_reads={})",
-            st1.full_tx_reads
-        );
-        // pin_cache_body covers parent and/or batch_parents has the out.
+        // Parent pin from cold denserels (or batch if multi-block load).
         assert!(
-            st1.pin_cache_body >= 1 || parents1.has_parent_out(parent_fk, 0),
-            "parent pin_cache_body={} has_parent_out={}",
-            st1.pin_cache_body,
+            st1.full_tx_reads >= 1 || parents1.has_parent_out(parent_fk, 0),
+            "parent must pin: full_tx_reads={} has_parent_out={}",
+            st1.full_tx_reads,
             parents1.has_parent_out(parent_fk, 0)
         );
-        // Body reads for h1 are only for h1 creates (coinbase+child), not parent denserels.
-        let body_reads_h1 = body_ok_reads().saturating_sub(body_reads_after_h0);
         assert!(
-            body_reads_h1 <= 2,
-            "h1 should only load its own creates (≤2), got extra body reads={body_reads_h1}"
+            parents1.has_parent_out(parent_fk, 0),
+            "parent out must be in BatchParents"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -597,24 +514,20 @@ mod tests {
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
         reset_body_ok_reads();
-        let creates = load_creates_once(
-            q.store(),
-            q.create_residency(),
-            &[fk],
-            IdxBodyMode::Full,
-        )
-        .unwrap();
+        let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::Full).unwrap();
         assert_eq!(creates.len(), 1);
         assert!(
-            !creates[0].raw.windows(script.len()).any(|w| w == script.as_slice()),
+            !creates[0]
+                .raw
+                .windows(script.len())
+                .any(|w| w == script.as_slice()),
             "plaintext script must not appear on disk"
         );
-        let (_dtx, _ins, douts, _) =
-            decode_packed_tx_with_spender_rels_secret(
-                &creates[0].raw,
-                Some(q.store().txs.store_secret()),
-            )
-            .unwrap();
+        let (_dtx, _ins, douts, _) = decode_packed_tx_with_spender_rels_secret(
+            &creates[0].raw,
+            Some(q.store().txs.store_secret()),
+        )
+        .unwrap();
         assert_eq!(douts[0].script, script);
         let _ = std::fs::remove_dir_all(dir);
     }

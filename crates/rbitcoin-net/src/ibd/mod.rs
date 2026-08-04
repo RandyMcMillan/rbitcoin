@@ -372,44 +372,7 @@ pub async fn ibd_cancellable(
     } else {
         0
     }));
-    // Startup: complete tip-create denserels + tip-ahead header plans into
-    // CreateResidency (default 2 GiB FIFO). Skipped when RBITCOIN_RESIDENCY_BYTES=0.
-    let (_len0, bytes0, byte_cap0, _outs0) = hub.query.create_residency().size_stats();
-    if !hub.query.create_residency().enabled() {
-        info!(
-            "ibd: residency off (RBITCOIN_RESIDENCY_BYTES=0) \
-             — skip prewarm; header plans on; no cross-batch create pin cache \
-             (default is 2GiB complete-row FIFO)"
-        );
-    } else {
-        info!(
-            "ibd: residency on bytes={}/{}MiB — running complete-create prewarm",
-            bytes0 / (1024 * 1024),
-            byte_cap0 / (1024 * 1024)
-        );
-        match hub.query.archive_residency_prewarm() {
-            Ok(st) => {
-                let (len, bytes, byte_cap, outs) = hub.query.create_residency().size_stats();
-                info!(
-                    "ibd: residency prewarm denserels={den_c} outs={outs} bytes={bytes_mib}/{cap_mib}MiB \
-                     header_plans={hdr} creates={len} in {ms}ms \
-                     (denserels={dms}ms headers={hms}ms)",
-                    den_c = st.denserels_creates,
-                    outs = outs,
-                    bytes_mib = bytes / (1024 * 1024),
-                    cap_mib = byte_cap / (1024 * 1024),
-                    hdr = st.header_plans,
-                    len = len,
-                    ms = st.ms,
-                    dms = st.denserels_ms,
-                    hms = st.headers_ms,
-                );
-            }
-            Err(e) => {
-                warn!("ibd: residency prewarm failed (continuing cold): {e}");
-            }
-        }
-    }
+    // Pipeline pins are plan-local / BatchParents only (no process create FIFO).
     // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
     // RAM body queue starts empty after restart (no durable rehydrate). Call is

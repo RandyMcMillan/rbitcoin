@@ -70,9 +70,8 @@ impl Query {
     /// Like [`Self::confirm_blocks_run`], with optional write-batch create pins.
     ///
     /// `create_pins` is `create_fk → CreatePin` for creates committed on this write
-    /// path. SH collect prefers pin outs (no residency / Class A body re-read) —
-    /// critical for RES=0 IBD where residency is empty but pins already rode the
-    /// plan through Class A.
+    /// path. SH collect prefers pin outs (no Class A body re-read) — critical for
+    /// IBD where pins already rode the plan through Class A.
     pub fn confirm_blocks_run_with_create_pins(
         &self,
         items: &[ConfirmPrepared],
@@ -201,8 +200,8 @@ impl Query {
                 let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
                 // Rough upper bound: a few outputs per new tx (grows as needed).
                 sh_creates.reserve(sh_new_txs.len().saturating_mul(2));
-                // Prefer write-batch CreatePin outs (same Class A commit) → residency
-                // → cold store. Never resolve via txid — catch-up has no durable head
+                // Prefer write-batch CreatePin outs (same Class A commit) → cold
+                // store. Never resolve via txid — catch-up has no durable head
                 // and tx_run.lookup walks sorted runs per tx.
                 for &tx_id in &sh_new_txs {
                     let pin = create_pins.and_then(|m| m.get(&Fk(tx_id)));
@@ -342,11 +341,10 @@ impl Query {
     ///
     /// Source order (first hit wins):
     /// 1. **Write-batch CreatePin** — outs already on the confirm write path
-    /// 2. **CreateResidency** — sole hot map (residency budget on)
-    /// 3. **Cold store** — Class A body pread/decode (last resort)
+    /// 2. **Cold store** — Class A body pread/decode
     ///
-    /// RES=0 IBD must hit (1) for same-batch creates or SH collect re-reads every
-    /// body. `write_pin` is the pin Arc for this `tx_fk` when the write path has it.
+    /// Same-batch creates must hit (1) or SH collect re-reads every body.
+    /// `write_pin` is the pin Arc for this `tx_fk` when the write path has it.
     pub(crate) fn collect_scripthash_creates(
         &self,
         tx_fk: Fk,
@@ -360,14 +358,6 @@ impl Query {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
             }
             crate::class_c_phase_stats::SH_COLLECT_PIN.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        // Prefer CreateResidency outs (sole hot map).
-        if let Some((_tx, outputs, _rels, _range)) = self.create_residency.get_outs(tx_fk) {
-            for o in outputs.iter() {
-                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
-            }
-            crate::class_c_phase_stats::SH_COLLECT_RES.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // Cold store: create_fk → tx.idx → body.

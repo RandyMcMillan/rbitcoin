@@ -6,11 +6,11 @@
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
-//! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **prep_budget** + pin cold_range/idx us/new + assemble us/in path splits + **res_lk**; queues |
-//! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + **residency** + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed |
+//! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **prep_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
+//! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega head resolve; class_a commit |
 //!
-//! **Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=`).
+//! **Pins:** pipeline-local (plan batch_pin / BatchParents / external_parent_outs).
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
@@ -186,7 +186,6 @@ pub(crate) struct IbdPerfSample {
     pub sh_head_ms: u64,
     /// SH collect create sources: write-pin / residency / cold Class A body.
     pub sh_collect_pin: u64,
-    pub sh_collect_res: u64,
     pub sh_collect_cold: u64,
 
     // Parent cache / confirm-load
@@ -196,8 +195,7 @@ pub(crate) struct IbdPerfSample {
     pub load_creates: u64,
     pub load_parent_unique: u64,
     pub load_pin_cache_body: u64,
-    /// Pin hits from CreateResidency (subset of pin_cache when residency filled).
-    pub load_pin_residency: u64,
+    /// Pin hits from pipeline pins (subset of pin_cache when residency filled).
     /// Wire plan / in-flight parent pins (not denserels hits).
     pub load_pin_plan: u64,
     pub load_pin_new: u64,
@@ -205,7 +203,6 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
     pub load_plan_pin_ms: u64,
-    pub load_res_hit_ms: u64,
     pub load_cold_io_ms: u64,
     /// Cold denserels by plan body range (ms / create count).
     pub load_cold_range_ms: u64,
@@ -217,11 +214,11 @@ pub(crate) struct IbdPerfSample {
     pub load_cold_idx_ms: u64,
     pub load_cold_idx_n: u64,
     pub load_cold_decode_ms: u64,
-    /// CreateResidency lock: write wait/hold ms, write count.
+    /// pipeline pins lock: write wait/hold ms, write count.
     pub res_w_wait_ms: u64,
     pub res_w_hold_ms: u64,
     pub res_w_n: u64,
-    /// CreateResidency lock: read wait/hold ms, read count.
+    /// pipeline pins lock: read wait/hold ms, read count.
     pub res_r_wait_ms: u64,
     pub res_r_hold_ms: u64,
     pub res_r_n: u64,
@@ -298,7 +295,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_head_need: u64,
     pub arch_head_hit: u64,
     pub arch_batch_stamp: u64,
-    pub arch_resolved_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
     pub arch_prep_assign_ms: u64,
@@ -329,7 +325,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_write_head_ms: u64,
     pub arch_write_spend_ms: u64,
     pub arch_write_htxs_ms: u64,
-    pub arch_write_sticky_ms: u64,
     pub arch_write_dontneed_ms: u64,
     pub arch_write_flush_ms: u64,
     pub arch_write_blocks: u64,
@@ -456,7 +451,6 @@ impl Default for IbdPerfSample {
             sh_body_ms: 0,
             sh_head_ms: 0,
             sh_collect_pin: 0,
-            sh_collect_res: 0,
             sh_collect_cold: 0,
             load_win_ms: 0,
             load_blocks: 0,
@@ -464,14 +458,12 @@ impl Default for IbdPerfSample {
             load_creates: 0,
             load_parent_unique: 0,
             load_pin_cache_body: 0,
-            load_pin_residency: 0,
             load_pin_plan: 0,
             load_pin_new: 0,
             load_pin_spent_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
             load_plan_pin_ms: 0,
-            load_res_hit_ms: 0,
             load_cold_io_ms: 0,
             load_cold_range_ms: 0,
             load_cold_range_n: 0,
@@ -549,7 +541,6 @@ impl Default for IbdPerfSample {
             arch_head_need: 0,
             arch_head_hit: 0,
             arch_batch_stamp: 0,
-            arch_resolved_stamp: 0,
             arch_resolve_ns: 0,
             arch_resolve_blocks: 0,
             arch_prep_assign_ms: 0,
@@ -578,7 +569,6 @@ impl Default for IbdPerfSample {
             arch_write_head_ms: 0,
             arch_write_spend_ms: 0,
             arch_write_htxs_ms: 0,
-            arch_write_sticky_ms: 0,
             arch_write_dontneed_ms: 0,
             arch_write_flush_ms: 0,
             arch_write_blocks: 0,
@@ -769,20 +759,14 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
-    let (sh_collect_pin, sh_collect_res, sh_collect_cold) =
+    let (sh_collect_pin, sh_collect_cold) =
         rbitcoin_query::class_c_phase_stats::sample_sh_collect_src_and_reset();
     let (wf_body_store, wf_store_body_ns) =
         rbitcoin_query::wave_fill_stats::sample_store_and_reset();
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
-    let (
-        res_w_wait_ns,
-        res_w_hold_ns,
-        res_w_n,
-        res_r_wait_ns,
-        res_r_hold_ns,
-        res_r_n,
-    ) = rbitcoin_query::residency_lock_stats::sample_and_reset();
+    let (res_w_wait_ns, res_w_hold_ns, res_w_n, res_r_wait_ns, res_r_hold_ns, res_r_n) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
@@ -894,7 +878,6 @@ pub(crate) fn sample(
         sh_body_ms: ns_ms(sh_body),
         sh_head_ms: ns_ms(sh_head),
         sh_collect_pin,
-        sh_collect_res,
         sh_collect_cold,
         load_win_ms: ns_ms(pw.ns),
         load_blocks: pw.blocks,
@@ -902,14 +885,12 @@ pub(crate) fn sample(
         load_creates: pw.creates,
         load_parent_unique: pw.parent_unique,
         load_pin_cache_body: pw.pin_cache_body,
-        load_pin_residency: pw.pin_residency,
         load_pin_plan: pw.pin_plan,
         load_pin_new: pw.pin_new,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
         load_plan_pin_ms: ns_ms(pw.plan_pin_ns),
-        load_res_hit_ms: ns_ms(pw.res_hit_ns),
         load_cold_io_ms: ns_ms(pw.cold_io_ns),
         load_cold_range_ms: ns_ms(pw.cold_range_ns),
         load_cold_range_n: pw.cold_range_n,
@@ -991,7 +972,6 @@ pub(crate) fn sample(
         arch_head_need: arch_res.head_need,
         arch_head_hit: arch_res.head_hit,
         arch_batch_stamp: arch_res.batch_stamp,
-        arch_resolved_stamp: arch_res.resolved_stamp,
         arch_resolve_ns: arch_res.resolve_ns,
         arch_resolve_blocks: arch_res.blocks,
         arch_prep_assign_ms: ns_ms(arch_res.prep_assign_ns),
@@ -1021,7 +1001,6 @@ pub(crate) fn sample(
         arch_write_head_ms: ns_ms(arch_res.write_head_ns),
         arch_write_spend_ms: ns_ms(arch_res.write_spend_ns),
         arch_write_htxs_ms: ns_ms(arch_res.write_htxs_ns),
-        arch_write_sticky_ms: ns_ms(arch_res.write_sticky_ns),
         arch_write_dontneed_ms: ns_ms(arch_res.write_dontneed_ns),
         arch_write_flush_ms: ns_ms(arch_res.write_flush_ns),
         arch_write_blocks: arch_res.write_blocks,
@@ -1056,7 +1035,7 @@ fn prep_stage_ms(s: &IbdPerfSample) -> u64 {
     s.load_ms.saturating_add(s.connect_ms)
 }
 
-/// Plan-mega sub-wall sum (assign/collect/res_txid/head/stamp/finish) when present.
+/// Plan-mega sub-wall sum (assign/collect/head/stamp/finish) when present.
 fn plan_mega_ms(s: &IbdPerfSample) -> u64 {
     s.arch_prep_assign_ms
         .saturating_add(s.arch_prep_collect_ms)
@@ -1198,22 +1177,13 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
-    let denserels_hit_pct = {
-        let hits = s.load_pin_residency;
-        let tot = hits.saturating_add(s.load_pin_new);
-        if tot > 0 {
-            (100 * hits) / tot
-        } else {
-            0
-        }
-    };
+    let denserels_hit_pct = 0u64;
     // Prefer wire pin sub-timers when present; fall back to aggregate pin body/new_io.
     let plan_pin_ms = if s.load_plan_pin_ms > 0 {
         s.load_plan_pin_ms
     } else {
         s.load_pin_body_ms
     };
-    let res_ms = s.load_res_hit_ms;
     let cold_io_ms = if s.load_cold_io_ms > 0 {
         s.load_cold_io_ms
     } else {
@@ -1255,11 +1225,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
          filter_plan={}ms plan_mega={}ms pin={}ms) \
-         assemble={}ms(prevout={} us/in={} batch={}/n={} res={}/n={} same={}/n={} cold={}/n={} \
+         assemble={}ms(prevout={} us/in={} batch={}/n={} same={}/n={} cold={}/n={} \
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
-         pin(plan={}ms/n={} res={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
-         pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
+         pin(plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
+         pin_hit%={} denserels_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         prep_ms,
         pre_assemble,
@@ -1275,8 +1245,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         asm_prev_us_per_in,
         s.asm_prev_batch_ms,
         s.asm_prev_batch_n,
-        s.asm_prev_res_ms,
-        s.asm_prev_res_n,
         s.asm_prev_same_ms,
         s.asm_prev_same_n,
         s.asm_prev_cold_ms,
@@ -1291,8 +1259,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.asm_job_ms,
         plan_pin_ms,
         s.load_pin_plan,
-        res_ms,
-        s.load_pin_residency,
         cold_range_ms,
         s.load_cold_range_body_ms,
         s.load_cold_range_decode_ms,
@@ -1305,25 +1271,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         pin_hit_pct,
         denserels_hit_pct,
         s.load_pin_plan,
-        s.load_pin_residency,
         s.load_pin_new,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
     ));
     if s.load_win_ms > 0 {
         out.push_str(&format!(" pin_win={}ms", s.load_win_ms));
-    }
-    // I4 residency lock (not thr channel wait).
-    if s.res_w_n > 0 || s.res_r_n > 0 || s.res_r_wait_ms > 0 || s.res_w_hold_ms > 0 {
-        out.push_str(&format!(
-            " res_lk w_wait={}ms w_hold={}ms/n={} r_wait={}ms r_hold={}ms/n={}",
-            s.res_w_wait_ms,
-            s.res_w_hold_ms,
-            s.res_w_n,
-            s.res_r_wait_ms,
-            s.res_r_hold_ms,
-            s.res_r_n,
-        ));
     }
     if s.load_edge_same > 0 || s.load_edge_fk > 0 || s.load_edge_cb > 0 {
         out.push_str(&format!(
@@ -1337,7 +1290,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
 
     // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tip GC.
     out.push_str(&format!(
-        " | write class_a={}ms ensure={}ms(res={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
+        " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
          class_c={}ms sh={}ms spend={}ms tip_gc={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
@@ -1365,18 +1318,13 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.meta_ms,
         s.meta_n,
     ));
-    // Class A body/head/residency-seed detail when present (from archive commit).
-    if s.arch_write_body_ms > 0
-        || s.arch_write_head_ms > 0
-        || s.arch_write_sticky_ms > 0
-        || s.arch_write_htxs_ms > 0
-    {
+    // Class A body/head detail when present (from archive commit).
+    if s.arch_write_body_ms > 0 || s.arch_write_head_ms > 0 || s.arch_write_htxs_ms > 0 {
         out.push_str(&format!(
-            " class_a_sub(body={} head={} htxs={} res_seed={} reserve={})",
+            " class_a_sub(body={} head={} htxs={} reserve={})",
             s.arch_write_body_ms,
             s.arch_write_head_ms,
             s.arch_write_htxs_ms,
-            s.arch_write_sticky_ms,
             s.arch_write_reserve_ms,
         ));
     }
@@ -1475,10 +1423,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "seed", s.sh_seed_ms);
     append_nz(&mut out, "body", s.sh_body_ms);
     append_nz(&mut out, "head", s.sh_head_ms);
-    if s.sh_collect_pin > 0 || s.sh_collect_res > 0 || s.sh_collect_cold > 0 {
+    if s.sh_collect_pin > 0 || s.sh_collect_cold > 0 {
         out.push_str(&format!(
-            " sh_src pin={} res={} cold={}",
-            s.sh_collect_pin, s.sh_collect_res, s.sh_collect_cold
+            " sh_src pin={} cold={}",
+            s.sh_collect_pin, s.sh_collect_cold
         ));
     }
 
@@ -1492,7 +1440,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     );
     let bq_mib = s.bq_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | bq soft={}/{} RAM={}MiB | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        " | bq soft={}/{} RAM={}MiB | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={}",
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
@@ -1505,7 +1453,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_creates,
         s.load_parent_unique,
         s.load_pin_cache_body,
-        s.load_pin_residency,
         s.load_pin_new,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
@@ -1528,25 +1475,19 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    // Plan-mega resolve mix: res_txid = CreateResidency txid→fk (sole hot map).
+    // Plan-mega resolve mix (head / in-flight / stamp — no process pin FIFO).
     if s.arch_ext_need > 0 || s.arch_prep_assign_ms > 0 {
-        let res_txid_pct = if s.arch_ext_need > 0 {
-            (100 * s.arch_sticky_hit) / s.arch_ext_need
-        } else {
-            0
-        };
         let resolve_us_blk = if s.arch_resolve_blocks > 0 {
             (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
         } else {
             0
         };
         out.push_str(&format!(
-            " | plan_mega assign={} collect={} res_txid={} inflight={} head_fk={} head_dens={} head={} \
-             stamp={} finish={} resolve_us/blk={} ext={} res_txid_hit={}/{} ({}%) head_hit={}/{} \
-             stamp_n batch={} res={} residency={}/{}",
+            " | plan_mega assign={} collect={} inflight={} head_fk={} head_dens={} head={} \
+             stamp={} finish={} resolve_us/blk={} ext={} head_hit={}/{} \
+             stamp_n batch={}",
             s.arch_prep_assign_ms,
             s.arch_prep_collect_ms,
-            s.arch_prep_sticky_ms,
             s.arch_prep_inflight_ms,
             s.arch_prep_head_fk_ms,
             s.arch_prep_head_dens_ms,
@@ -1555,15 +1496,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_prep_finish_ms,
             resolve_us_blk,
             s.arch_ext_need,
-            s.arch_sticky_hit,
-            s.arch_ext_need,
-            res_txid_pct,
             s.arch_head_hit,
             s.arch_head_need,
             s.arch_batch_stamp,
-            s.arch_resolved_stamp,
-            s.owned.residency_creates,
-            s.owned.residency_bytes / (1024 * 1024),
         ));
         // Head resolve probe detail when cold head lookups ran.
         if s.arch_prep_probe_ms > 0
@@ -1627,7 +1562,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             ));
         }
     }
-    // Class A commit: res_seed = CreateResidency denserels seed.
+    // Class A commit walls (no process pin seed).
     // ca_head_us/blk: first-class demap metric for page-RMW insert cost.
     if s.arch_write_blocks > 0 || s.arch_write_total_ms > 0 {
         let ca_head_us_blk = if s.arch_write_blocks > 0 {
@@ -1641,12 +1576,11 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | class_a_commit total={} body={} head={} res_seed={} htxs={} reserve={} spend={} dontneed={} flush={} blks={} \
+            " | class_a_commit total={} body={} head={} htxs={} reserve={} spend={} dontneed={} flush={} blks={} \
              ca_head_us/blk={} ca_body_us/blk={}",
             s.arch_write_total_ms,
             s.arch_write_body_ms,
             s.arch_write_head_ms,
-            s.arch_write_sticky_ms,
             s.arch_write_htxs_ms,
             s.arch_write_reserve_ms,
             s.arch_write_spend_ms,
@@ -1673,7 +1607,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// `tx.head.*` + fuse8). `locked=` is mlock only (usually 0) — **not** a
 /// filter on what enters RSS.
 ///
-/// Create pin occupancy is **`residency creates=/bytes=`** only (complete rows).
+/// Process-owned occupancy: body queue + confirm pipeline + header plans + SH + head.
 pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let w = &s.work;
     let b = &w.body;
@@ -1690,14 +1624,12 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         0
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
-    let res_mib = o.residency_bytes / (1024 * 1024);
-    let res_cap_mib = o.residency_byte_cap / (1024 * 1024);
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} rej={} \
          | bq soft={}/{} RAM={}MiB \
-         | residency creates={} bytes={}MiB/{}MiB outs={} conf_plans={} \
+         | conf_plans={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
@@ -1724,10 +1656,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
-        o.residency_creates,
-        res_mib,
-        res_cap_mib,
-        o.residency_outs,
         o.conf_plans,
         cp.plan_batches,
         s.conf_plan_q_cap,
@@ -1875,7 +1803,6 @@ mod tests {
         s.load_ready_through = 200;
         s.load_blocks = 32;
         s.load_pin_cache_body = 8;
-        s.load_pin_residency = 3;
         s.load_pin_new = 12;
         s.load_body_tx_reads = 400;
         s.load_parent_tx_reads = 12;
@@ -1896,7 +1823,8 @@ mod tests {
         let line = format_info(&s);
         assert!(line.contains("planq<0/2 prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("pin_res=3"), "{line}");
+        // pin_residency slot always 0 (process pin FIFO removed); pin_plan_cache label retired.
+        assert!(!line.contains("pin_res="), "{line}");
         assert!(line.contains("pin_new=12"), "{line}");
         assert!(line.contains("body_io=400 parent_io=12"), "{line}");
         s.spent_abs_ms = 20;
@@ -1920,9 +1848,9 @@ mod tests {
         assert!(line.contains("wire_arc="), "{line}");
         assert!(line.contains("prepare="), "{line}");
         assert!(line.contains("pin_win=40ms"), "{line}");
-        // pin_hit% = 8/(8+12) = 40; denserels_hit% = 3/(3+12) = 20
+        // pin_hit% = 8/(8+12) = 40; denserels_hit% always 0 (no process pin FIFO).
         assert!(line.contains("pin_hit%=40"), "{line}");
-        assert!(line.contains("denserels_hit%=20"), "{line}");
+        assert!(line.contains("denserels_hit%=0"), "{line}");
         assert!(line.contains("cold_io=14ms"), "{line}");
         // I1–I4 fields present with zero path counts when unset.
         assert!(line.contains("prep_budget total="), "{line}");
@@ -1962,8 +1890,6 @@ mod tests {
         s.asm_job_ms = 40;
         s.load_plan_pin_ms = 100;
         s.load_pin_plan = 20_000;
-        s.load_res_hit_ms = 50;
-        s.load_pin_residency = 10_000;
         s.load_cold_range_ms = 1200;
         s.load_cold_range_n = 4_000;
         s.load_cold_idx_ms = 400;
@@ -1984,7 +1910,8 @@ mod tests {
         // I3: us/in = 2500*1000/50000 = 50
         assert!(line.contains("us/in=50"), "{line}");
         assert!(line.contains("batch=2000/n=40000"), "{line}");
-        assert!(line.contains("res=200/n=5000"), "{line}");
+        assert!(!line.contains("res=/n="), "{line}");
+        assert!(!line.contains("res_lk"), "{line}");
         assert!(line.contains("same=50/n=2000"), "{line}");
         assert!(line.contains("cold=250/n=3000"), "{line}");
         assert!(line.contains("cold_why(null_fk="), "{line}");
@@ -2010,11 +1937,8 @@ mod tests {
         );
         assert!(line.contains("cold_idx=400ms/n=2000"), "{line}");
         assert!(line.contains("us/new=266"), "{line}");
-        // I4
-        assert!(
-            line.contains("res_lk w_wait=1ms w_hold=40ms/n=12 r_wait=5ms r_hold=80ms/n=1000"),
-            "{line}"
-        );
+        assert!(!line.contains("res_lk"), "{line}");
+        assert!(!line.contains("pin_res="), "{line}");
     }
 
     #[test]
@@ -2040,7 +1964,6 @@ mod tests {
         s.load_body_tx_reads = 200;
         s.load_parent_tx_reads = 50;
         s.load_pin_cache_body = 0;
-        s.load_pin_residency = 2;
         s.load_pin_new = 38;
         s.load_edge_same = 10;
         s.load_edge_fk = 5;
@@ -2083,15 +2006,15 @@ mod tests {
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
         assert!(line.contains("pin_cache=0"), "{line}");
-        assert!(line.contains("pin_res=2"), "{line}");
+        assert!(!line.contains("pin_res="), "{line}");
         assert!(line.contains("pin_new=38"), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
-        // Plan mega resolve mix: residency txid→fk (not legacy sticky map).
         assert!(line.contains("plan_mega "), "{line}");
-        assert!(line.contains("res_txid_hit=80/100"), "{line}");
-        assert!(!line.contains("sticky_hit="), "{line}");
+        assert!(!line.contains("res_txid"), "{line}");
+        assert!(!line.contains("res_seed"), "{line}");
+        assert!(!line.contains("sticky="), "{line}");
         assert!(!line.contains("dual_pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
@@ -2130,10 +2053,7 @@ mod tests {
         s.work.ordered = 100;
         s.work.ordered_set = 90;
         s.work.body.pending = 5;
-        s.owned.residency_creates = 80;
-        s.owned.residency_bytes = 400 * 1024 * 1024;
-        s.owned.residency_byte_cap = 2 * 1024 * 1024 * 1024;
-        s.owned.residency_outs = 900;
+        s.owned.conf_plans = 80;
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;
@@ -2174,7 +2094,7 @@ mod tests {
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         assert!(
-            line.contains("residency creates=80 bytes=400MiB/2048MiB outs=900"),
+            line.contains("conf_plans=80"),
             "{line}"
         );
         assert!(!line.contains("cache="), "{line}");
@@ -2191,16 +2111,13 @@ mod tests {
     }
 
     #[test]
-    fn format_sizes_residency_only_no_legacy_maps() {
+    fn format_sizes_no_residency_token() {
         let mut s = IbdPerfSample::default();
         s.rss_kb = 1024;
-        s.owned.residency_creates = 10;
-        s.owned.residency_bytes = 50 * 1024 * 1024;
-        s.owned.residency_byte_cap = 2 * 1024 * 1024 * 1024;
-        s.owned.residency_outs = 20;
+        s.owned.conf_plans = 10;
         let line = format_sizes(&s);
         assert!(
-            line.contains("residency creates=10 bytes=50MiB/2048MiB outs=20"),
+            !line.contains("residency creates=") && line.contains("conf_plans=10"),
             "{line}"
         );
         assert!(!line.contains("cache="), "{line}");

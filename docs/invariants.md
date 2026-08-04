@@ -37,7 +37,7 @@ wire / body-queue
   → pin (BatchParents: outs for need_vouts; denserels when available)
   → scripts (pure CPU)
   → Class A commit (if plan)
-  → ensure abs (residency → Class A denserels body; post-condition: every spend has abs)
+  → ensure abs (pin layout → Class A denserels body; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread; multi-list protocol cold only)
   → Class C tip
   → abs spend annotate (put_spend_batch_by_abs_meta only)
@@ -61,7 +61,7 @@ structural cold spentness).
 
 - Confirm write annotate / ensure: `rbitcoin-consensus` `confirm_run::{post_commit,ensure_spend_abs_layouts,pin_for_wire_batch}`
 - Structural: `rbitcoin-consensus` `block::structural_validate_spends`
-- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `CreateResidency`
+- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, plan-local `external_parent_outs`
 - Abs annotate: `rbitcoin-store` `put_spend_batch_by_abs_meta`
 
 ## Regression tests (shipped)

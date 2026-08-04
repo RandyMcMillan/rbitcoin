@@ -3,12 +3,12 @@
 //! - **Header plans** (`headers` / `hash_to_height`): tip-GCed header + tx_fks.
 //! - **Plans / ready_through**: load-scanned watermark for diagnostics.
 //!
-//! Create outs / denserels / body_range live in [`crate::CreateResidency`] (sole
-//! hot pin map). Thin edges and sparse parent pins are **batch-local**
-//! ([`crate::confirm_load::BatchThin`], [`crate::BatchParents`]).
+//! Create outs / denserels / body_range are **pipeline-local** (plan `batch_pin`,
+//! [`crate::BatchParents`], plan-local external parents). Thin edges and sparse
+//! parent pins are **batch-local** ([`crate::confirm_load::BatchThin`],
+//! [`crate::BatchParents`]).
 //!
-//! Header plans stay **always on** (independent of CreateResidency byte budget).
-//! Scan watermarks (`plans`) track load readiness.
+//! Header plans stay **always on**. Scan watermarks (`plans`) track load readiness.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeaderRecord;
@@ -59,9 +59,7 @@ struct Inner {
 /// Process-local confirm parent cache (headers + scan watermarks only).
 ///
 /// **Always active** — multi-block wire prep needs tip-ahead header plans for
-/// MTP / bits. Independent of CreateResidency (`RBITCOIN_RESIDENCY_BYTES`).
-/// Disabling residency must not disable this map (mainnet tip freeze:
-/// `parent header plan missing above tip`).
+/// MTP / bits (mainnet tip freeze: `parent header plan missing above tip`).
 pub struct ConfirmParentCache {
     inner: Mutex<Inner>,
     /// Mirror of `Inner::ready_through` for lock-free reads.
@@ -93,8 +91,7 @@ impl ConfirmParentCache {
 
     /// Advance tip: drop plans/headers at/below tip.
     ///
-    /// Create outs live in CreateResidency (FIFO there). Thin edges / sparse
-    /// pins are batch-local. Called from write `post_commit`.
+    /// Thin edges / sparse pins are batch-local. Called from write `post_commit`.
     pub fn advance_tip(&self, tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;

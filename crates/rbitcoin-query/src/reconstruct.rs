@@ -8,7 +8,7 @@ impl Query {
     /// Body for wire rebuild / RPC.
     ///
     /// Prefer batch-local full decode from confirm load ([`BatchFullBodies`]);
-    /// CreateResidency holds outs when warm; store via `tx.idx` is the fallback.
+    /// store via `tx.idx` is the fallback.
     fn load_body_for_wire(
         &self,
         fk: Fk,
@@ -186,8 +186,6 @@ impl Query {
                 continue;
             }
             let txid = if let Some(t) = batch.and_then(|b| b.txid(Fk(id))) {
-                t
-            } else if let Some(t) = self.create_residency.get_txid(Fk(id)) {
                 t
             } else {
                 self.store.txs.body_txid(Fk(id))?

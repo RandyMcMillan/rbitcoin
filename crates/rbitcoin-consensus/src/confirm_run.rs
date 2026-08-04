@@ -1850,6 +1850,9 @@ fn pin_for_wire_batch(
 pub fn confirm_scripts_phase(
     mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
+    // Test-only: hold the first in-flight wave until a second async submit is
+    // observed (proves production feed-ahead claims during join).
+    scripts_feed_test_sync::on_phase_enter();
     let t_work = Instant::now();
     script_wave(&batch.prepared, &batch.script_preverified)?;
     for p in &mut batch.prepared {
@@ -1871,7 +1874,8 @@ pub fn confirm_scripts_phase(
 /// Handle for a scripts stage running on the rayon global pool (non-blocking start).
 ///
 /// IBD scripts OS thread starts the next batch with [`confirm_scripts_phase_async`]
-/// before joining the prior, so rayon stays fed across batch boundaries.
+/// **while** joining the prior (poll claim + short timeouts), so rayon stays fed
+/// even when prep→scripts depth is 1.
 pub struct ScriptsPhaseHandle {
     rx: std::sync::mpsc::Receiver<Result<ConfirmScriptOutcome, ConsensusError>>,
 }
@@ -1885,13 +1889,25 @@ impl ScriptsPhaseHandle {
             ))
         })
     }
+
+    /// Wait up to `timeout` for the wave result (production feed-ahead polls
+    /// prep→scripts `try_recv` between timeouts so N+1 can start mid-join).
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Result<ConfirmScriptOutcome, ConsensusError>, std::sync::mpsc::RecvTimeoutError>
+    {
+        self.rx.recv_timeout(timeout)
+    }
 }
 
 /// Submit [`confirm_scripts_phase`] onto the **rayon global pool** without
 /// blocking the caller.
 ///
-/// The OS scripts thread can claim/start batch N+1 while N’s jobs still run.
+/// The OS scripts thread must keep claiming N+1 **while** waiting on N’s
+/// [`ScriptsPhaseHandle::recv_timeout`] (not only once before a blocking join).
 pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
+    scripts_feed_test_sync::on_async_submit();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     rayon::spawn(move || {
         let r = confirm_scripts_phase(batch);
@@ -1900,14 +1916,39 @@ pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     ScriptsPhaseHandle { rx }
 }
 
+/// Join `handle`, repeatedly invoking `on_poll` (e.g. prep `try_recv` + async
+/// submit) so a second ready batch reaches rayon **before** this join returns.
+///
+/// This is the production feed-ahead primitive used under depth-1 channels.
+pub fn join_scripts_polling<F>(
+    handle: &ScriptsPhaseHandle,
+    poll: std::time::Duration,
+    mut on_poll: F,
+) -> Result<ConfirmScriptOutcome, ConsensusError>
+where
+    F: FnMut(),
+{
+    loop {
+        on_poll();
+        match handle.recv_timeout(poll) {
+            Ok(r) => return r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ConsensusError::BadBlock(
+                    "scripts phase: rayon worker disconnected before result",
+                ));
+            }
+        }
+    }
+}
+
 /// Run script verify for a sequence of loaded batches with **one-batch feed-ahead**.
 ///
 /// While batch *i* is verifying on rayon, batch *i+1* (if present) is already
 /// submitted so the pool is not idle solely between sequential claim walls.
 /// Results are returned **in input order** (height-ordered write handoff).
 ///
-/// Single-batch input is fine (no second submit). Production IBD uses the same
-/// async+join pattern on the scripts OS thread with channel `try_recv`.
+/// Single-batch input is fine (no second submit).
 pub fn confirm_scripts_feed_ahead(
     batches: impl IntoIterator<Item = LoadedBatch>,
 ) -> Result<Vec<ConfirmScriptOutcome>, ConsensusError> {
@@ -1919,17 +1960,179 @@ pub fn confirm_scripts_feed_ahead(
     let mut out = Vec::new();
     let mut next = iter.next().map(confirm_scripts_phase_async);
     loop {
-        // Start the following batch (if any) before joining current — keeps rayon fed.
-        if next.is_none() {
-            next = iter.next().map(confirm_scripts_phase_async);
-        }
-        out.push(current.join()?);
+        // Keep offering the following batch while joining current.
+        let outcome = join_scripts_polling(
+            &current,
+            std::time::Duration::from_micros(200),
+            || {
+                if next.is_none() {
+                    next = iter.next().map(confirm_scripts_phase_async);
+                }
+            },
+        )?;
+        out.push(outcome);
         match next.take() {
             Some(h) => current = h,
             None => break,
         }
     }
     Ok(out)
+}
+
+/// Drive the **production** scripts claim/feed-ahead pattern from a prep→scripts
+/// channel (including depth 1): blocking claim for current, then
+/// [`join_scripts_polling`] with `try_recv` to start N+1 mid-join.
+///
+/// Used by the IBD scripts OS thread and unit tests that exercise real
+/// `sync_channel(1)` timing.
+pub fn scripts_stage_from_prep_channel(
+    mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
+    mut on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
+    mut on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
+    mut should_stop: impl FnMut() -> bool,
+) {
+    let mut current: Option<(ScriptsPhaseHandle, ScriptsBatchMeta)> = None;
+    let mut lookahead: Option<(ScriptsPhaseHandle, ScriptsBatchMeta)> = None;
+
+    let start = |batch: LoadedBatch, mat_ns: u64| -> (ScriptsPhaseHandle, ScriptsBatchMeta) {
+        let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
+        let handle = confirm_scripts_phase_async(batch);
+        (handle, meta)
+    };
+
+    loop {
+        if should_stop() {
+            break;
+        }
+        if current.is_none() {
+            let (batch, mat_ns) = match mat_rx.recv() {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            if should_stop() {
+                break;
+            }
+            current = Some(start(batch, mat_ns));
+        }
+        let (handle, meta) = match current.take() {
+            Some(c) => c,
+            None => break,
+        };
+        let result = join_scripts_polling(
+            &handle,
+            std::time::Duration::from_micros(200),
+            || {
+                if lookahead.is_none() {
+                    if let Ok((batch, mat_ns)) = mat_rx.try_recv() {
+                        if !should_stop() {
+                            lookahead = Some(start(batch, mat_ns));
+                        }
+                    }
+                }
+            },
+        );
+        match result {
+            Ok(outcome) => {
+                let cont = on_ok(outcome, meta);
+                if !cont {
+                    break;
+                }
+                current = lookahead.take();
+            }
+            Err(e) => {
+                let cont = on_err(e, meta);
+                // Drop later batch without treating it as write-ready.
+                if let Some((h, m)) = lookahead.take() {
+                    let _ = h.join();
+                    let _ = m; // caller finishes heights via on_err if needed
+                }
+                if !cont {
+                    break;
+                }
+                current = None;
+            }
+        }
+    }
+    if let Some((h, _)) = current.take() {
+        let _ = h.join();
+    }
+    if let Some((h, _)) = lookahead.take() {
+        let _ = h.join();
+    }
+}
+
+/// Metadata retained across async scripts submit → ordered write handoff.
+#[derive(Clone, Debug)]
+pub struct ScriptsBatchMeta {
+    pub n: usize,
+    pub first_h: u32,
+    pub heights_hashes: Vec<(u32, [u8; 32])>,
+    pub mat_ns: u64,
+    pub t0: Instant,
+}
+
+impl ScriptsBatchMeta {
+    pub fn from_batch(batch: &LoadedBatch, mat_ns: u64) -> Self {
+        let heights_hashes = batch.heights_hashes();
+        let first_h = heights_hashes.first().map(|(h, _)| *h).unwrap_or(0);
+        Self {
+            n: batch.len(),
+            first_h,
+            heights_hashes,
+            mat_ns,
+            t0: Instant::now(),
+        }
+    }
+}
+
+/// Test-only sync so unit tests can prove N+1 was submitted while N’s wave is still open.
+pub mod scripts_feed_test_sync {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
+    static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
+
+    /// Reset counters (call at start of each feed-ahead timing test).
+    pub fn reset() {
+        SUBMIT_COUNT.store(0, Ordering::SeqCst);
+        HOLD_FIRST.store(false, Ordering::SeqCst);
+        FIRST_ENTERED.store(false, Ordering::SeqCst);
+    }
+
+    /// When true, the first [`super::confirm_scripts_phase`] waits until
+    /// [`submit_count`] ≥ 2 (second async submit happened mid-wave).
+    pub fn set_hold_first_until_second_submit(hold: bool) {
+        HOLD_FIRST.store(hold, Ordering::SeqCst);
+        FIRST_ENTERED.store(false, Ordering::SeqCst);
+    }
+
+    pub fn submit_count() -> u64 {
+        SUBMIT_COUNT.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn on_async_submit() {
+        SUBMIT_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn on_phase_enter() {
+        if !HOLD_FIRST.load(Ordering::SeqCst) {
+            return;
+        }
+        // Only the first wave holds.
+        if FIRST_ENTERED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while submit_count() < 2 {
+            if Instant::now() > deadline {
+                // Avoid hanging the suite if feed-ahead is broken.
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// LOAD + SCRIPTS in one call (tests / tip path / ChainHub compat).
@@ -2611,6 +2814,76 @@ mod write_idempotent_tests {
         use super::confirm_scripts_feed_ahead;
         let outs = confirm_scripts_feed_ahead(std::iter::empty()).expect("empty");
         assert!(outs.is_empty());
+    }
+
+    /// **Production claim timing under depth-1:** batch B is submitted to rayon
+    /// while A’s wave is still open (not only after A’s join returns).
+    ///
+    /// Drives [`scripts_stage_from_prep_channel`] (same `try_recv` +
+    /// [`join_scripts_polling`] pattern as the IBD scripts OS thread) on a
+    /// `sync_channel(1)`. First wave holds in [`confirm_scripts_phase`] until
+    /// a second async submit is observed — deadlocks if feed-ahead only
+    /// try_recv once before a blocking join.
+    #[test]
+    fn scripts_stage_depth1_submits_second_before_first_finishes() {
+        use super::{
+            scripts_feed_test_sync, scripts_stage_from_prep_channel, ConfirmScriptOutcome,
+            ScriptsBatchMeta,
+        };
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        scripts_feed_test_sync::reset();
+        scripts_feed_test_sync::set_hold_first_until_second_submit(true);
+
+        // Depth 1 — same default prep→scripts capacity class.
+        let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
+        let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcomes_w = Arc::clone(&outcomes);
+
+        let stage = thread::spawn(move || {
+            scripts_stage_from_prep_channel(
+                &mat_rx,
+                |ok, _meta: ScriptsBatchMeta| {
+                    outcomes_w.lock().unwrap().push(ok);
+                    true
+                },
+                |_e, _meta| false,
+                || false,
+            );
+        });
+
+        // Enqueue A; stage claims it (channel free). Hold keeps A's phase open.
+        mat_tx
+            .send((empty_loaded_batch(), 0))
+            .expect("send A");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while scripts_feed_test_sync::submit_count() < 1 {
+            assert!(Instant::now() < deadline, "A never submitted to rayon");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Enqueue B while A is held mid-wave; feed-ahead must try_recv+submit B.
+        mat_tx
+            .send((empty_loaded_batch(), 0))
+            .expect("send B while A verifying");
+        while scripts_feed_test_sync::submit_count() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "B not submitted before A finished (feed-ahead dead under depth-1)"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // A can finish (hold released by submit_count>=2); both outcomes ordered.
+        drop(mat_tx);
+        stage.join().expect("stage thread");
+        let outs = outcomes.lock().unwrap();
+        assert_eq!(outs.len(), 2, "both batches script-ok");
+        assert!(outs[0].batch.is_empty());
+        assert!(outs[1].batch.is_empty());
+        scripts_feed_test_sync::set_hold_first_until_second_submit(false);
+        scripts_feed_test_sync::reset();
     }
 
     #[test]

@@ -513,10 +513,11 @@ pub use confirm_run::{
     confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_plan_and_ensure_denserels,
     confirm_wire_plan_stamp, confirm_wire_prep_from_plan, confirm_wire_prep_phase,
     confirm_wire_prep_phase_pipelined, confirm_wire_run, confirm_wire_run_preverified,
-    confirm_write_phase, ensure_external_parent_denserels_from_plan, plan_stage_stats,
-    plan_stamp_sub_stats, ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome,
-    DenserelsWarmStats, LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified,
-    ScriptsPhaseHandle, WirePrepPipeline,
+    confirm_write_phase, ensure_external_parent_denserels_from_plan, join_scripts_polling,
+    plan_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_prep_channel,
+    ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
+    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
+    WirePrepPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

@@ -1052,8 +1052,9 @@ pub(crate) fn spawn_confirm_engine(
         .expect("spawn ibd-confirm-write");
 
     // Scripts: loaded batch → script verify (rayon) → write queue.
-    // **Feed-ahead:** while batch N verifies on rayon, claim N+1 (try_recv) and
-    // submit it to the pool so workers are not idle between sequential joins.
+    // **Feed-ahead (depth-1 safe):** while joining batch N, poll prep `try_recv`
+    // and submit N+1 to rayon *during* the wait — not only once before a blocking
+    // join (that left the pool idle under default PREP_QUEUE=1).
     // Write handoff stays height-ordered (join N then N+1).
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
@@ -1069,11 +1070,7 @@ pub(crate) fn spawn_confirm_engine(
             /// One scripts wave started on rayon (not yet joined / written).
             struct Inflight {
                 handle: rbitcoin_consensus::ScriptsPhaseHandle,
-                n: usize,
-                first_h: u32,
-                heights_hashes: Vec<(u32, [u8; 32])>,
-                mat_ns: u64,
-                t0: Instant,
+                meta: rbitcoin_consensus::ScriptsBatchMeta,
             }
             fn start_inflight(
                 mat_batch: rbitcoin_consensus::LoadedBatch,
@@ -1084,23 +1081,11 @@ pub(crate) fn spawn_confirm_engine(
                 let load_wire = mat_batch.approx_wire_bytes();
                 let load_parents = mat_batch.parent_count();
                 q_sc.note_load_recv(n, load_wire, load_parents);
-                let first_h = mat_batch
-                    .heights_hashes()
-                    .first()
-                    .map(|(h, _)| *h)
-                    .unwrap_or(0);
-                let heights_hashes = mat_batch.heights_hashes();
-                let t0 = Instant::now();
+                let meta =
+                    rbitcoin_consensus::ScriptsBatchMeta::from_batch(&mat_batch, mat_ns);
                 // Non-blocking submit onto rayon global pool.
                 let handle = rbitcoin_consensus::confirm_scripts_phase_async(mat_batch);
-                Inflight {
-                    handle,
-                    n,
-                    first_h,
-                    heights_hashes,
-                    mat_ns,
-                    t0,
-                }
+                Inflight { handle, meta }
             }
 
             let mut current: Option<Inflight> = None;
@@ -1109,7 +1094,7 @@ pub(crate) fn spawn_confirm_engine(
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
                     break;
                 }
-                // Fill current (blocking) then optional lookahead (try_recv).
+                // Fill current (blocking claim).
                 if current.is_none() {
                     let t_recv = Instant::now();
                     let (mat_batch, mat_ns) = match mat_rx.recv() {
@@ -1122,47 +1107,49 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     current = Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
                 }
-                if lookahead.is_none() {
-                    let t_try = Instant::now();
-                    match mat_rx.try_recv() {
-                        Ok((mat_batch, mat_ns)) => {
-                            confirm_thr_stats::add_script_recv_wait(t_try.elapsed());
-                            if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
-                                break;
-                            }
-                            // Second wave on rayon while first still in-flight.
-                            lookahead = Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            // No more prep batches; drain current then exit.
-                        }
-                    }
-                }
-
                 let inflight = match current.take() {
                     Some(i) => i,
                     None => break,
                 };
-                // Pure join: LoadedBatch → ScriptOkBatch (already on rayon).
-                match inflight.handle.join() {
+                // Poll claim while waiting on N — start N+1 mid-join.
+                let result = rbitcoin_consensus::join_scripts_polling(
+                    &inflight.handle,
+                    std::time::Duration::from_micros(200),
+                    || {
+                        if lookahead.is_none()
+                            && !feed_sc.stopped()
+                            && !hub_sc.query.confirm_cancelled()
+                        {
+                            let t_try = Instant::now();
+                            match mat_rx.try_recv() {
+                                Ok((mat_batch, mat_ns)) => {
+                                    confirm_thr_stats::add_script_recv_wait(t_try.elapsed());
+                                    lookahead =
+                                        Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                            }
+                        }
+                    },
+                );
+                match result {
                     Ok(outcome) => {
                         loop_stats_sc
                             .confirm_ns
                             .fetch_add(outcome.work_ns, Ordering::Relaxed);
-                        confirm_thr_stats::add_script_work(inflight.t0.elapsed());
+                        confirm_thr_stats::add_script_work(inflight.meta.t0.elapsed());
                         let script_ms = outcome.work_ns / 1_000_000;
-                        let mat_ms = inflight.mat_ns / 1_000_000;
+                        let mat_ms = inflight.meta.mat_ns / 1_000_000;
                         let wb = outcome.batch.len();
                         let ww = outcome.batch.approx_wire_bytes();
                         let wp = outcome.batch.parent_count();
                         let t_send = Instant::now();
                         if write_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm write channel closed");
-                            // Drop lookahead without write (channel closed).
                             if let Some(la) = lookahead.take() {
                                 let _ = la.handle.join();
-                                feed_sc.finish(la.heights_hashes.iter().map(|(h, _)| *h));
+                                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
                             }
                             break;
                         }
@@ -1171,39 +1158,37 @@ pub(crate) fn spawn_confirm_engine(
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
                                 "ibd: confirm scripts slow batch={} first={} prep_ms={mat_ms} script_ms={script_ms} wall_ms={}",
-                                inflight.n,
-                                inflight.first_h,
-                                inflight.t0.elapsed().as_millis()
+                                inflight.meta.n,
+                                inflight.meta.first_h,
+                                inflight.meta.t0.elapsed().as_millis()
                             );
                         }
-                        // Promote lookahead (already verifying) to current.
                         current = lookahead.take();
                     }
                     Err(e) => {
-                        confirm_thr_stats::add_script_work(inflight.t0.elapsed());
+                        confirm_thr_stats::add_script_work(inflight.meta.t0.elapsed());
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed_sc.stopped() {
                             info!("ibd: confirm scripts aborted: {msg}");
                             if let Some(la) = lookahead.take() {
                                 let _ = la.handle.join();
-                                feed_sc.finish(la.heights_hashes.iter().map(|(h, _)| *h));
+                                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
                             }
                             break;
                         }
                         let (height, hash) = inflight
+                            .meta
                             .heights_hashes
                             .first()
                             .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                             .unwrap_or((
-                                inflight.first_h,
+                                inflight.meta.first_h,
                                 BlockHash::from_byte_array([0u8; 32]),
                             ));
-                        // Clear inflight so we do not pin tip forever after a script fail.
-                        feed_sc.finish(inflight.heights_hashes.iter().map(|(h, _)| *h));
-                        // Do not write a later batch after a reject; join and drop.
+                        feed_sc.finish(inflight.meta.heights_hashes.iter().map(|(h, _)| *h));
                         if let Some(la) = lookahead.take() {
                             let _ = la.handle.join();
-                            feed_sc.finish(la.heights_hashes.iter().map(|(h, _)| *h));
+                            feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
                         }
                         loop_stats_sc
                             .confirm_reject_stops
@@ -1216,19 +1201,17 @@ pub(crate) fn spawn_confirm_engine(
                             hash,
                             err: msg,
                         });
-                        // Resume claiming from the channel (no promote after reject).
                         current = None;
                     }
                 }
             }
-            // Drain any leftover in-flight (shutdown) without write.
             if let Some(i) = current.take() {
                 let _ = i.handle.join();
-                feed_sc.finish(i.heights_hashes.iter().map(|(h, _)| *h));
+                feed_sc.finish(i.meta.heights_hashes.iter().map(|(h, _)| *h));
             }
             if let Some(la) = lookahead.take() {
                 let _ = la.handle.join();
-                feed_sc.finish(la.heights_hashes.iter().map(|(h, _)| *h));
+                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
             }
             drop(write_tx);
             let _ = write_thr.join();

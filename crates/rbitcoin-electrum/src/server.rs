@@ -14,14 +14,26 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
 const SERVER_VERSION: &str = concat!("rbitcoin ", env!("CARGO_PKG_VERSION"));
+
+/// Max simultaneous Electrum TCP clients (DoS).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// Max JSON-RPC request line bytes including trailing `\n` (DoS / OOM).
+pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576; // 1 MiB
+/// Max scripthash subscriptions per connection (notify fan-out).
+pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 1_000;
+/// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
+pub const DEFAULT_MAX_BROADCAST_HEX: usize = 8_388_608;
 
 #[derive(Clone, Debug)]
 pub struct ElectrumConfig {
@@ -30,6 +42,16 @@ pub struct ElectrumConfig {
     pub donation_address: String,
     /// Genesis hash (display order hex) for features.
     pub genesis_hash_hex: String,
+    /// Max concurrent client connections.
+    pub max_connections: usize,
+    /// Max request line size (bytes).
+    pub max_line_bytes: usize,
+    /// Max `blockchain.scripthash.subscribe` entries per connection.
+    pub max_scripthash_subs: usize,
+    /// Disconnect if no complete request line within this many seconds.
+    pub idle_timeout: Duration,
+    /// Max hex length accepted by `blockchain.transaction.broadcast`.
+    pub max_broadcast_hex: usize,
 }
 
 impl ElectrumConfig {
@@ -44,6 +66,11 @@ impl ElectrumConfig {
                 .into(),
             donation_address: String::new(),
             genesis_hash_hex: rbitcoin_primitives::hex_encode(rev),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
         }
     }
 }
@@ -78,6 +105,9 @@ pub struct TipNotify {
 ///
 /// TLS is intentionally not built in — terminate TLS at nginx/caddy/haproxy
 /// (or similar) and proxy to this TCP port.
+///
+/// **DoS limits** (see [`ElectrumConfig`]): max connections, max request line
+/// size, max scripthash subscriptions per client, idle timeout, broadcast hex cap.
 pub async fn run_electrum(
     config: ElectrumConfig,
     query: Arc<Query>,
@@ -89,6 +119,8 @@ pub async fn run_electrum(
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_c = shutdown.clone();
+    let max_conn = config.max_connections.max(1);
+    let conn_sem = Arc::new(Semaphore::new(max_conn));
     let config = Arc::new(config);
     let params = Arc::new(params);
 
@@ -98,18 +130,27 @@ pub async fn run_electrum(
                 break;
             }
             let accept = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
+                Duration::from_millis(200),
                 listener.accept(),
             )
             .await;
             match accept {
-                Ok(Ok((stream, _))) => {
+                Ok(Ok((stream, peer))) => {
+                    // Cap concurrent clients — refuse when saturated (DoS).
+                    let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                        rbitcoin_log::warn!(
+                            "electrum: reject {peer} (at max_connections={max_conn})"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     let q = query.clone();
                     let cfg = config.clone();
                     let p = params.clone();
                     let tip_rx = tip_tx.subscribe();
                     let mp = mempool.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // held until client task ends
                         let _ = handle_client(stream, q, cfg, p, tip_rx, mp).await;
                     });
                 }
@@ -126,6 +167,64 @@ pub async fn run_electrum(
     })
 }
 
+/// Read one `\n`-terminated line with a hard byte cap (prevents OOM without newline).
+pub async fn read_line_capped<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, std::io::Error>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let max_bytes = max_bytes.max(1);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                // EOF mid-line — treat as complete if under cap.
+                if buf.len() > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "electrum request line too long",
+                    ));
+                }
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len().saturating_add(take) > max_bytes {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "electrum request line too long",
+                ));
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            // Strip trailing \n / \r\n
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        // No newline in this chunk.
+        if buf.len().saturating_add(available.len()) > max_bytes {
+            let n = available.len();
+            reader.consume(n);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "electrum request line too long",
+            ));
+        }
+        buf.extend_from_slice(available);
+        let n = available.len();
+        reader.consume(n);
+    }
+}
+
 async fn handle_client<S>(
     stream: S,
     query: Arc<Query>,
@@ -138,11 +237,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     let mut header_sub = false;
     let mut sh_subs: HashSet<[u8; 32]> = HashSet::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
+    let idle = config.idle_timeout;
+    let max_line = config.max_line_bytes;
 
     loop {
         tokio::select! {
@@ -186,8 +287,26 @@ where
                     }
                 }
             }
-            line = lines.next_line() => {
-                let Some(line) = line? else { break; };
+            line = tokio::time::timeout(idle, read_line_capped(&mut reader, max_line)) => {
+                let line = match line {
+                    Ok(Ok(Some(l))) => l,
+                    Ok(Ok(None)) => break, // EOF
+                    Ok(Err(e)) => {
+                        // Oversize line: best-effort error then drop client.
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            let resp = json!({
+                                "jsonrpc":"2.0","id": null,
+                                "error": {"code": -32600, "message": "request line too long"}
+                            });
+                            let _ = write_line(&mut writer, &resp).await;
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        // Idle timeout.
+                        break;
+                    }
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -366,6 +485,12 @@ fn dispatch(
         }
         "blockchain.scripthash.subscribe" => {
             let sh = param_scripthash(params, 0)?;
+            if !sh_subs.contains(&sh) && sh_subs.len() >= config.max_scripthash_subs {
+                return Err(format!(
+                    "too many scripthash subscriptions (max {})",
+                    config.max_scripthash_subs
+                ));
+            }
             sh_subs.insert(sh);
             let status = if let Some(mp) = mempool {
                 scripthash_status_full(query, mp, &sh)?
@@ -442,7 +567,17 @@ fn dispatch(
         }
         "blockchain.transaction.broadcast" => {
             let raw_hex = param_str(params, 0)?;
+            if raw_hex.len() > config.max_broadcast_hex {
+                return Err(format!(
+                    "transaction hex too large (max {} chars)",
+                    config.max_broadcast_hex
+                ));
+            }
             let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
+            // Consensus max block weight is 4M; reject absurd raw sizes early.
+            if raw.len() > 4_000_000 {
+                return Err("transaction too large".into());
+            }
             let tx: bitcoin::Transaction =
                 bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
             let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
@@ -1764,6 +1899,155 @@ mod tests {
         let st = scripthash_status_full(&q_arc, &mp, &sh_bytes).unwrap();
         assert!(!st.is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DoS: line without newline beyond max must fail without allocating forever.
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversize() {
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+        let mut r = BufReader::new(Cursor::new(vec![b'A'; 64]));
+        let err = read_line_capped(&mut r, 32).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_accepts_under_limit() {
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+        let mut r = BufReader::new(Cursor::new(b"{\"id\":1}\nnext\n".as_slice()));
+        let line = read_line_capped(&mut r, 1024).await.unwrap().unwrap();
+        assert_eq!(line, "{\"id\":1}");
+        let line2 = read_line_capped(&mut r, 1024).await.unwrap().unwrap();
+        assert_eq!(line2, "next");
+    }
+
+    #[test]
+    fn scripthash_sub_cap_enforced() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        cfg.max_scripthash_subs = 2;
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        // Two unique scripthashes.
+        let h1 = "11".repeat(32);
+        let h2 = "22".repeat(32);
+        let h3 = "33".repeat(32);
+        dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([h1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([h2]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let err = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([h3]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap_err();
+        assert!(err.contains("too many"), "{err}");
+        // Re-subscribe existing is ok.
+        dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([h1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_hex_cap_enforced() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        cfg.max_broadcast_hex = 16;
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let err = dispatch(
+            "blockchain.transaction.broadcast",
+            &json!(["aa".repeat(20)]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DoS: when at max_connections, further accepts are dropped immediately.
+    #[tokio::test]
+    async fn max_connections_rejects_extra_client() {
+        use tokio::io::AsyncReadExt;
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let q = Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        cfg.max_connections = 1;
+        cfg.idle_timeout = Duration::from_secs(30);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+
+        // Hold the only slot open.
+        let held = TcpStream::connect(handle.local_addr).await.unwrap();
+        // Give accept loop time to take the permit.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Second client: TCP may still accept then drop the stream when no permit.
+        let mut second = TcpStream::connect(handle.local_addr).await.unwrap();
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"server.ping","params":[]});
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        let _ = second.write_all(line.as_bytes()).await;
+        let mut buf = [0u8; 256];
+        let read = tokio::time::timeout(Duration::from_millis(400), second.read(&mut buf)).await;
+        // Dropped connection: EOF / error / timeout — not a successful JSON-RPC pong.
+        match read {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {}
+            Ok(Ok(n)) => {
+                let s = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                assert!(
+                    !s.contains("\"result\""),
+                    "second client must not get RPC result at cap: {s}"
+                );
+            }
+        }
+        drop(held);
+        handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

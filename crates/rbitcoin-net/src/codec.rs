@@ -71,6 +71,11 @@ impl FramedMessage {
     }
 
     #[inline]
+    /// Framed application payload length (for per-peer byte rate accounting).
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
     pub fn is_ping(&self) -> bool {
         self.command == *b"ping\0\0\0\0\0\0\0\0"
     }

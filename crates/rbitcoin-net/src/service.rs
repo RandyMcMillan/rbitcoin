@@ -5,6 +5,7 @@ use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
 use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
+use crate::peer_dos::{inbound_semaphore, max_inbound_from_env};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -76,6 +77,8 @@ impl P2PNode {
         let hub_c = hub.clone();
         let shutdown_c = shutdown.clone();
         let magic_c = magic;
+        let max_inbound = max_inbound_from_env();
+        let inbound_sem = inbound_semaphore(max_inbound);
         let accept_task = tokio::spawn(async move {
             loop {
                 if shutdown_c.load(Ordering::SeqCst) {
@@ -85,11 +88,20 @@ impl P2PNode {
                     tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
                 match accept {
                     Ok(Ok((stream, peer_addr))) => {
+                        // Cap concurrent inbound sessions (handshake + serve).
+                        let Ok(permit) = inbound_sem.clone().try_acquire_owned() else {
+                            rbitcoin_log::warn!(
+                                "p2p: reject inbound {peer_addr} (at max_inbound={max_inbound})"
+                            );
+                            drop(stream);
+                            continue;
+                        };
                         let our = local_addr;
                         let hub = hub_c.clone();
                         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
                         let tip_rx = hub.subscribe_tips();
                         tokio::spawn(async move {
+                            let _permit = permit; // held for full session lifetime
                             let (_ver, reader, writer) = match connect_and_handshake(
                                 stream,
                                 magic_c,

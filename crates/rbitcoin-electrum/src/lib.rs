@@ -3,7 +3,9 @@
 mod server;
 
 pub use server::{
-    electrum_scripthash_hex, run_electrum, ElectrumConfig, ElectrumHandle, TipNotify,
+    electrum_scripthash_hex, read_line_capped, run_electrum, ElectrumConfig, ElectrumHandle,
+    TipNotify, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_BROADCAST_HEX, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_SCRIPTHASH_SUBS,
 };
 
 pub fn crate_name() -> &'static str {

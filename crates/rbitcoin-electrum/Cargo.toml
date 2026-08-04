@@ -8,6 +8,7 @@ description = "Electrum protocol server (scripthash JSON-RPC over TCP)"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
+rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-consensus = { workspace = true }

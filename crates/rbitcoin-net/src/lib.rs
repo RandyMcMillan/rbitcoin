@@ -8,6 +8,7 @@ mod error;
 mod ibd;
 mod msg_decode;
 mod peer;
+mod peer_dos;
 mod seeds;
 mod service;
 mod tx_relay;
@@ -21,6 +22,10 @@ pub use ibd::{
     DEFAULT_IBD_WINDOW,
 };
 pub use peer::local_service_flags;
+pub use peer_dos::{
+    inbound_semaphore, max_inbound_from_env, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC,
+    DEFAULT_MAX_INBOUND, DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
+};
 pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
     resolve_fixed_seeds, AddrMan, PeerEntry, PeerFlags,

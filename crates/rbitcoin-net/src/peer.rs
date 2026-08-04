@@ -5,6 +5,9 @@ use crate::chain::{AcceptOutcome, ChainHub};
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
+use crate::peer_dos::{
+    PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
+};
 use crate::v2::{
     open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer,
 };
@@ -35,7 +38,7 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 const HEADERS_POLL_SECS: u64 = 120;
 
 /// Per-session misbehavior score that triggers disconnect (Core-like order).
-const BAN_SCORE_THRESHOLD: u32 = 100;
+pub const BAN_SCORE_THRESHOLD: u32 = 100;
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
 const MAX_PENDING_CMPCT: usize = 8;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
@@ -247,6 +250,7 @@ pub async fn peer_session_with(
     let mut from_this_peer: HashMap<bitcoin::Txid, ()> = HashMap::new();
     // Session misbehavior score (disconnect at BAN_SCORE_THRESHOLD).
     let mut ban_score: u32 = 0;
+    let mut rate = PeerRateLimiter::default_limits();
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
     // First tick completes immediately — skip so we don't double the bootstrap send.
@@ -335,8 +339,31 @@ pub async fn peer_session_with(
                         Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                             return Ok(());
                         }
+                        Err(NetError::MessageTooLarge(n)) => {
+                            ban_score = ban_score.saturating_add(OVERSIZE_BAN_SCORE);
+                            rbitcoin_log::warn!(
+                                "p2p: {peer_s} oversize frame ({n}) ban_score={ban_score}"
+                            );
+                            if ban_score >= BAN_SCORE_THRESHOLD {
+                                return Err(NetError::Protocol("peer ban score threshold"));
+                            }
+                            return Err(NetError::MessageTooLarge(n));
+                        }
                         Err(e) => return Err(e),
                     };
+                    // Per-peer rate limit (msg + byte window) — disconnect when abused.
+                    let frame_len = frame.payload_len();
+                    if !rate.note(frame_len) {
+                        ban_score = ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
+                        rbitcoin_log::warn!(
+                            "p2p: {peer_s} rate limit exceeded ban_score={ban_score}"
+                        );
+                        if ban_score >= BAN_SCORE_THRESHOLD {
+                            return Err(NetError::Protocol("peer ban score threshold"));
+                        }
+                        // Soft: drop this message but keep session for first offense.
+                        continue;
+                    }
                     // Ping: cheap 8-byte path — never leave the I/O task for decode.
                     if frame.is_ping() {
                         if let Some(n) = frame.ping_nonce() {

@@ -408,6 +408,7 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "rbitcoin-consensus",
+ "rbitcoin-log",
  "rbitcoin-net",
  "rbitcoin-primitives",
  "rbitcoin-query",

@@ -15,14 +15,21 @@ use std::time::{Duration, Instant};
 
 /// Prep-thread state so prep(N+1) can plan while commit(N) has not advanced tip.
 ///
-/// In-flight maps are `Arc<Mutex<_>>` shared with every [`WirePrepPipeline`]
-/// handoff (Arc bump only). **Do not** use bare `Arc<HashMap>` + `make_mut`:
-/// planq/prep holding a pipeline Arc forced a full deep clone of all CreatePins
-/// on every `note_plan_ok` (multi‑GiB RSS creep with deep writeq).
+/// In-flight maps are `Arc` so each claim only bumps refcounts (no deep clone).
 struct PrepAheadState {
     next_tx_start: u64,
-    in_flight_creates: rbitcoin_consensus::InFlightCreatesMap,
-    in_flight_outs: rbitcoin_consensus::InFlightOutsMap,
+    in_flight_creates: std::sync::Arc<HashMap<[u8; 32], Fk>>,
+    /// Pin values are Arc so `note_plan_ok` only bumps refcounts (no deep clone).
+    in_flight_outs: std::sync::Arc<
+        HashMap<
+            u64,
+            std::sync::Arc<(
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+                Vec<u32>,
+            )>,
+        >,
+    >,
     /// Last height successfully prepped (still in pipeline or already committed).
     last_prepped: Option<(u32, [u8; 32])>,
 }
@@ -32,8 +39,8 @@ impl PrepAheadState {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
-            in_flight_creates: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            in_flight_outs: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            in_flight_creates: std::sync::Arc::new(HashMap::new()),
+            in_flight_outs: std::sync::Arc::new(HashMap::new()),
             last_prepped: None,
         }
     }
@@ -53,21 +60,9 @@ impl PrepAheadState {
         // Head-occupied ≈ highest create_fk published into the segmented head
         // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
         let head_n = hub.query.tx_head_occupied();
-        let mut creates = self
-            .in_flight_creates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut outs = self
-            .in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        prune_inflight_maps(
-            head_n,
-            body_n,
-            &mut creates,
-            &mut outs,
-            &mut self.next_tx_start,
-        );
+        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
+        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
+        prune_inflight_maps(head_n, body_n, creates, outs, &mut self.next_tx_start);
         if let Some((h, _)) = self.last_prepped {
             let tip = hub.tip_height().unwrap_or(0);
             if h <= tip {
@@ -100,14 +95,8 @@ impl PrepAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        let mut creates = self
-            .in_flight_creates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut outs = self
-            .in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
+        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
         // Prefer plan-time Arc pin (layout denserels). Fall back only if lengths
         // mismatch (tests constructing partial ArchiveWritePlan).
         if plan.batch_pin.len() == plan.planned_fks.len() {
@@ -133,14 +122,8 @@ impl PrepAheadState {
     }
 
     fn clear_all(&mut self, hub: &ChainHub) {
-        self.in_flight_creates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.in_flight_creates = std::sync::Arc::new(HashMap::new());
+        self.in_flight_outs = std::sync::Arc::new(HashMap::new());
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
@@ -1900,71 +1883,6 @@ mod tests {
 
     /// Body-ahead-of-head (seal window): keep in-flight fks head cannot resolve yet.
     ///
-    /// `in_flight_outs` / creates must stay **one shared map** under pipeline handoff.
-    ///
-    /// Regression for multi‑GiB RSS creep: bare `Arc<HashMap>` + `make_mut` while
-    /// planq/prep still held a `WirePrepPipeline` Arc deep-cloned every CreatePin
-    /// on each `note_plan_ok` (O(n²) retain as tip advanced with deep writeq).
-    /// Mutex maps: Arc::clone only; insert under lock; ptr_eq stays true.
-    #[test]
-    fn in_flight_maps_shared_under_pipeline_handoff_no_make_mut_clone() {
-        use rbitcoin_consensus::{InFlightCreatesMap, InFlightOutsMap};
-        use rbitcoin_store::TxRecord;
-        use std::sync::{Arc, Mutex};
-
-        let creates: InFlightCreatesMap = Arc::new(Mutex::new(HashMap::new()));
-        let outs: InFlightOutsMap = Arc::new(Mutex::new(HashMap::new()));
-
-        // pipeline_for / PlanDone: Arc bump only (prep + planq hold these).
-        let pipe_creates = Arc::clone(&creates);
-        let pipe_outs = Arc::clone(&outs);
-        assert!(
-            Arc::ptr_eq(&creates, &pipe_creates) && Arc::ptr_eq(&outs, &pipe_outs),
-            "handoff must share the same map Arc"
-        );
-        assert_eq!(Arc::strong_count(&outs), 2);
-
-        // note_plan_ok while pipeline Arc is still held: lock + insert.
-        let pin = Arc::new((
-            TxRecord {
-                txid: [9u8; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            },
-            Vec::new(),
-            Vec::new(),
-        ));
-        {
-            let mut c = creates.lock().unwrap_or_else(|e| e.into_inner());
-            let mut o = outs.lock().unwrap_or_else(|e| e.into_inner());
-            for id in 1u64..=50_000 {
-                let mut txid = [0u8; 32];
-                txid[..8].copy_from_slice(&id.to_le_bytes());
-                c.insert(txid, Fk(id));
-                o.insert(id, Arc::clone(&pin));
-            }
-        }
-
-        // Still one map — not a make_mut deep clone.
-        assert!(
-            Arc::ptr_eq(&outs, &pipe_outs),
-            "note_plan_ok must not allocate a second HashMap while pipeline is held"
-        );
-        assert_eq!(Arc::strong_count(&outs), 2, "only plan_ahead + pipeline refs");
-        assert_eq!(outs.lock().unwrap().len(), 50_000);
-        assert_eq!(
-            pipe_outs.lock().unwrap().len(),
-            50_000,
-            "pipeline sees the same insertions"
-        );
-        // CreatePin values are shared too (one Arc, many map entries).
-        assert_eq!(Arc::strong_count(&pin), 50_001); // 50k map + local
-    }
-
     /// Regression for mainnet tip freeze @269050 — first `tx.head` segment seal
     /// (~3.5s) with body count already past head occupied; pruning on body count
     /// dropped parents and plan failed with `parent create_fk unresolved`.

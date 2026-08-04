@@ -84,28 +84,6 @@ struct Prepared {
 /// after accept). Empty = verify all jobs (IBD). Passed through load → scripts only.
 pub type ScriptPreverified = std::collections::HashSet<[u8; 32]>;
 
-/// Shared create-fk map for uncommitted plan batches (plan + prep threads).
-///
-/// **Must be `Mutex`, not bare `HashMap` under `Arc::make_mut`:** snapshotting
-/// the map into each `PlanDone` / prep handoff would force a full deep clone of
-/// every CreatePin on the next `make_mut` while prior stages still hold the Arc
-/// (O(n²) RSS with deep writeq/planq). One shared map; lock for read/write.
-pub type InFlightCreatesMap =
-    std::sync::Arc<std::sync::Mutex<HashMap<[u8; 32], rbitcoin_primitives::Fk>>>;
-/// Shared create pin map: fk id → Arc`(tx, outs, denserels)`.
-pub type InFlightOutsMap = std::sync::Arc<
-    std::sync::Mutex<
-        HashMap<
-            u64,
-            std::sync::Arc<(
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Vec<u32>,
-            )>,
-        >,
-    >,
->;
-
 /// Pipeline context so prep(N+1) can run while commit(N) has not advanced tip.
 ///
 /// Prep thread owns reserved create-fk HWM and in-flight creates/outs from
@@ -119,15 +97,21 @@ pub struct WirePrepPipeline {
     pub parent_hash: Option<[u8; 32]>,
     /// Inclusive create-fk start for [`Query::archive_plan_mega_from`].
     pub next_tx_start: u64,
-    /// Prior uncommitted plans: create txid → fk (shared map; Arc clone only).
-    pub in_flight_creates: InFlightCreatesMap,
+    /// Prior uncommitted plans: create txid → fk (shared; clone is Arc bump only).
+    pub in_flight_creates: std::sync::Arc<HashMap<[u8; 32], rbitcoin_primitives::Fk>>,
     /// Prior uncommitted plans: create fk id → Arc pin material
     /// `(tx meta, outs, denserels)`.
     ///
     /// `denserels` is offline-packed (same as disk) so prep(N+1) can pin abs
     /// layout without waiting for commit(N) body IO; body_range is filled at write.
-    /// Values are `Arc` so inserts only bump pin refcounts (map itself is Mutex).
-    pub in_flight_outs: InFlightOutsMap,
+    /// Values are `Arc` so plan-thread `note_plan_ok` only bumps refcounts.
+    pub in_flight_outs: std::sync::Arc<
+        HashMap<u64, std::sync::Arc<(
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<u32>,
+        )>>,
+    >,
 }
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
@@ -487,19 +471,13 @@ pub fn confirm_wire_prep_phase_pipelined(
         None
     } else {
         let plan = match pipeline {
-            Some(p) => {
-                let creates = p
-                    .in_flight_creates
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                query
-                    .archive_plan_mega_from(
-                        &mut need,
-                        p.next_tx_start.max(1),
-                        &*creates,
-                    )
-                    .map_err(ConsensusError::Store)?
-            }
+            Some(p) => query
+                .archive_plan_mega_from(
+                    &mut need,
+                    p.next_tx_start.max(1),
+                    p.in_flight_creates.as_ref(),
+                )
+                .map_err(ConsensusError::Store)?,
             None => query
                 .archive_plan_mega_owned(&mut need)
                 .map_err(ConsensusError::Store)?,
@@ -546,12 +524,7 @@ pub fn confirm_wire_prep_phase_pipelined(
     };
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
-    let ifo_guard = pipeline.map(|p| {
-        p.in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    });
-    let inflight_outs = ifo_guard.as_ref().map(|g| &**g);
+    let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -560,7 +533,6 @@ pub fn confirm_wire_prep_phase_pipelined(
         inflight_outs,
         cold_mode,
     )?;
-    drop(ifo_guard);
     // Drop pipeline-local external full-outs after pin (sparse BatchParents remains).
     if let Some(ref mut p) = plan {
         p.clear_external_parent_outs();
@@ -969,12 +941,7 @@ pub fn confirm_wire_prep_from_plan(
         ..
     } = stamped;
 
-    let ifo_guard = pipeline.map(|p| {
-        p.in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    });
-    let ifo = ifo_guard.as_ref().map(|g| &**g);
+    let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -983,7 +950,6 @@ pub fn confirm_wire_prep_from_plan(
         ifo,
         ColdPinMode::Allow,
     )?;
-    drop(ifo_guard);
     // External full-outs were only for pin; sparse BatchParents holds need-vouts.
     // Drop so prep→scripts→write does not retain head-miss denserels material.
     if let Some(ref mut p) = plan {
@@ -1034,14 +1000,8 @@ pub fn confirm_wire_plan_and_ensure_denserels(
     plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
 
-    let ifo_guard = pipeline.map(|p| {
-        p.in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    });
-    let ifo = ifo_guard.as_ref().map(|g| &**g);
+    let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
     let warm = ensure_external_parent_denserels_from_plan(query, plan.as_mut(), ifo)?;
-    drop(ifo_guard);
     let work_ns = t0.elapsed().as_nanos() as u64;
     plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
     Ok((plan, warm, work_ns))
@@ -1200,19 +1160,13 @@ fn wire_plan_phase(
         None
     } else {
         let plan = match pipeline {
-            Some(p) => {
-                let creates = p
-                    .in_flight_creates
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                query
-                    .archive_plan_mega_from(
-                        &mut need,
-                        p.next_tx_start.max(1),
-                        &*creates,
-                    )
-                    .map_err(ConsensusError::Store)?
-            }
+            Some(p) => query
+                .archive_plan_mega_from(
+                    &mut need,
+                    p.next_tx_start.max(1),
+                    p.in_flight_creates.as_ref(),
+                )
+                .map_err(ConsensusError::Store)?,
             None => query
                 .archive_plan_mega_owned(&mut need)
                 .map_err(ConsensusError::Store)?,

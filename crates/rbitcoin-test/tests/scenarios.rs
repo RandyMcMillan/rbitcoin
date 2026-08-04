@@ -2420,8 +2420,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         path_lo: ha,
         parent_hash: None,
         next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-        in_flight_creates: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-        in_flight_outs: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        in_flight_creates: std::sync::Arc::new(HashMap::new()),
+        in_flight_outs: std::sync::Arc::new(HashMap::new()),
     };
     let mat_a = confirm_wire_prep_phase_pipelined(
         &q,
@@ -2450,14 +2450,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         );
     }
     {
-        let mut creates = pipe
-            .in_flight_creates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut outs = pipe
-            .in_flight_outs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
+        let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
         if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
             for (fk, pin) in plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()) {
                 creates.insert(pin.0.txid, *fk);

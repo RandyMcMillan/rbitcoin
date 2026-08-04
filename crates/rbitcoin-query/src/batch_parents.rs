@@ -4,9 +4,17 @@
 //! any in-flight batch needs it. Batches hold a cheap handle map
 //! ([`BatchParents`]) of `Arc`s — no deep-copy of outs between stages/batches.
 //!
-//! **Registry:** [`PipelineParentStore`] keeps `Weak` entries under a brief Mutex
-//! for prep get-or-insert only. Assemble/write read pin data through the batch's
-//! `Arc`s — **no** global map lock on the hot path.
+//! **Registry:** [`PipelineParentStore`] keeps `Weak` entries. Prep **does not**
+//! take the store mutex on every parent insert (that made free-plan pin ~9×
+//! slower). Instead:
+//! 1. [`BatchParents::adopt_from_store`] — one lock, upgrade live pins for the
+//!    batch's parent set (cross-batch RAM share)
+//! 2. Local [`BatchParents::insert_owned`] — lock-free HashMap insert (same cost
+//!    class as the pre-share `ParentEntry` path)
+//! 3. [`BatchParents::publish_to_store`] — one lock, publish Weaks / merge races
+//!
+//! Assemble/write read pin data through the batch's `Arc`s — **no** global map
+//! lock on the hot path.
 //!
 //! **Sparse:** only spent need-vouts + layout fields write/assemble need (not
 //! full parent output sets). Vout merge when a later batch spends more outs.
@@ -54,11 +62,10 @@ impl SharedParentPin {
         body_range: Option<(u64, u64)>,
         spender_rels: Vec<(u32, u32)>,
     ) -> Self {
-        let mut outs = live;
-        outs.sort_unstable_by_key(|(v, _)| *v);
-        let mut checked = checked;
-        checked.sort_unstable();
-        checked.dedup();
+        // Pin path already sorts/dedups need and builds live in need order.
+        // Only re-sort when a caller hands unsorted data (tests / merge).
+        let outs = ensure_outs_sorted(live);
+        let checked = ensure_checked_sorted(checked);
         let cb = match coinbase {
             Some(true) => CB_TRUE,
             Some(false) => CB_FALSE,
@@ -75,8 +82,42 @@ impl SharedParentPin {
         }
     }
 
+    /// True when all `need` vouts are already in checked.
+    #[inline]
+    fn covers_need(&self, need: &[u32]) -> bool {
+        if need.is_empty() {
+            return true;
+        }
+        let g = self.outs_checked.read().unwrap_or_else(|e| e.into_inner());
+        if g.1.is_empty() {
+            return false;
+        }
+        need.iter().all(|v| checked_contains(&g.1, *v))
+    }
+
     fn merge_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) {
+        // Shared-hit fast path: peer batch already pinned these vouts — no write lock.
+        if self.covers_need(checked)
+            && (live.is_empty()
+                || {
+                    let g = self.outs_checked.read().unwrap_or_else(|e| e.into_inner());
+                    live.iter()
+                        .all(|(v, _)| g.0.iter().any(|(dv, _)| dv == v))
+                })
+        {
+            return;
+        }
         let mut g = self.outs_checked.write().unwrap_or_else(|e| e.into_inner());
+        // Re-check under write lock (concurrent merge may have filled need).
+        if !checked.is_empty()
+            && !g.1.is_empty()
+            && checked.iter().all(|v| checked_contains(&g.1, *v))
+            && live
+                .iter()
+                .all(|(v, _)| g.0.iter().any(|(dv, _)| dv == v))
+        {
+            return;
+        }
         for (v, o) in live {
             if !g.0.iter().any(|(dv, _)| *dv == v) {
                 g.0.push((v, o));
@@ -107,12 +148,40 @@ impl SharedParentPin {
             _ => None,
         }
     }
+
+    /// Publish layout only when something new is present (skip write lock on hits).
+    fn maybe_merge_layout(&self, body_range: Option<(u64, u64)>, spender_rels: &[(u32, u32)]) {
+        if body_range.is_none() && spender_rels.is_empty() {
+            return;
+        }
+        // Read-first: skip write when body_range already set and no denserels to merge.
+        {
+            let lay = self.layout.read().unwrap_or_else(|e| e.into_inner());
+            let range_done = body_range.is_none() || lay.body_range.is_some();
+            let rels_done = spender_rels.is_empty()
+                || spender_rels.iter().all(|(v, r)| {
+                    lay.spender_rels
+                        .binary_search_by_key(v, |(dv, _)| *dv)
+                        .ok()
+                        .is_some_and(|i| lay.spender_rels[i].1 == *r)
+                });
+            if range_done && rels_done {
+                return;
+            }
+        }
+        let mut lay = self.layout.write().unwrap_or_else(|e| e.into_inner());
+        if lay.body_range.is_none() {
+            lay.body_range = body_range;
+        }
+        merge_spender_rels_into(&mut lay.spender_rels, spender_rels);
+    }
 }
 
 /// Prep-time registry: Weak map so dead pins free when last batch Arc drops.
 ///
-/// Mutex is only for get-or-insert of the `Arc` handle — never held while
-/// assemble walks inputs or write fills layout data.
+/// Mutex is only for bulk adopt / publish of Arc handles — never held while
+/// assemble walks inputs or write fills layout data, and **not** on the
+/// per-parent insert hot path.
 #[derive(Debug, Default)]
 pub struct PipelineParentStore {
     by_fk: Mutex<HashMap<u64, Weak<SharedParentPin>>>,
@@ -131,48 +200,53 @@ impl PipelineParentStore {
         g.values().filter(|w| w.strong_count() > 0).count()
     }
 
-    /// Get existing pin or create; merge sparse outs into the shared pin.
-    fn get_or_insert_merge(
-        &self,
-        id: u64,
-        tx: TxRecord,
-        live: Vec<(u32, OutputRecord)>,
-        checked: Vec<u32>,
-        coinbase: Option<bool>,
-        body_range: Option<(u64, u64)>,
-        spender_rels: Vec<(u32, u32)>,
-    ) -> Arc<SharedParentPin> {
-        let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-        // Opportunistic GC of dead weaks (cheap vs full scan each time: only this slot).
-        if let Some(w) = g.get(&id) {
-            if let Some(existing) = w.upgrade() {
-                drop(g);
-                existing.merge_outs(live, &checked);
-                existing.set_coinbase_if_known(coinbase);
-                if body_range.is_some() || !spender_rels.is_empty() {
-                    let mut lay = existing.layout.write().unwrap_or_else(|e| e.into_inner());
-                    if lay.body_range.is_none() {
-                        lay.body_range = body_range;
-                    }
-                    merge_spender_rels_into(&mut lay.spender_rels, &spender_rels);
-                }
-                return existing;
+    /// One lock: upgrade live pins for `ids` into a map (prep batch start).
+    pub fn bulk_upgrade(&self, ids: impl IntoIterator<Item = u64>) -> HashMap<u64, Arc<SharedParentPin>> {
+        let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = HashMap::new();
+        for id in ids {
+            if let Some(p) = g.get(&id).and_then(|w| w.upgrade()) {
+                out.insert(id, p);
             }
         }
-        let pin = Arc::new(SharedParentPin::new(
-            tx,
-            live,
-            checked,
-            coinbase,
-            body_range,
-            spender_rels,
-        ));
-        g.insert(id, Arc::downgrade(&pin));
-        // Light GC: drop a few dead entries if map is large.
-        if g.len() > 64 {
-            g.retain(|_, w| w.strong_count() > 0);
+        out
+    }
+
+    /// One lock: publish batch pins as Weaks. On Arc identity conflict (peer
+    /// batch won the slot), merge local sparse fields into the existing Arc and
+    /// replace the batch handle so both batches share one payload.
+    pub fn bulk_publish(&self, pins: &mut HashMap<u64, Arc<SharedParentPin>>) {
+        // Phase 1 under lock: insert vacant Weaks; collect conflicts to merge outside.
+        let mut conflicts: Vec<(u64, Arc<SharedParentPin>, Arc<SharedParentPin>)> = Vec::new();
+        {
+            let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+            for (&id, pin) in pins.iter() {
+                match g.get(&id).and_then(|w| w.upgrade()) {
+                    Some(existing) if !Arc::ptr_eq(&existing, pin) => {
+                        conflicts.push((id, existing, Arc::clone(pin)));
+                    }
+                    Some(_) => {}
+                    None => {
+                        g.insert(id, Arc::downgrade(pin));
+                    }
+                }
+            }
+            if g.len() > 4096 {
+                g.retain(|_, w| w.strong_count() > 0);
+            }
         }
-        pin
+        // Phase 2 outside lock: merge local → existing, swap batch handle.
+        for (id, existing, local) in conflicts {
+            let (live, checked) = {
+                let og = local.outs_checked.read().unwrap_or_else(|e| e.into_inner());
+                (og.0.clone(), og.1.clone())
+            };
+            existing.merge_outs(live, &checked);
+            existing.set_coinbase_if_known(local.coinbase_opt());
+            let src_lay = local.layout.read().unwrap_or_else(|e| e.into_inner());
+            existing.maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
+            pins.insert(id, existing);
+        }
     }
 }
 
@@ -200,6 +274,10 @@ impl BatchParents {
     }
 
     /// Prep/IBD: share pins with other batches via `store`.
+    ///
+    /// Inserts stay local; call [`adopt_from_store`] before pin fill and
+    /// [`publish_to_store`] after so the Weak registry stays current without a
+    /// per-parent mutex on the free-plan path.
     pub fn with_store(store: Arc<PipelineParentStore>, capacity: usize) -> Self {
         Self {
             store: Some(store),
@@ -223,7 +301,53 @@ impl BatchParents {
             .map(|a| Arc::as_ptr(a) as usize)
     }
 
+    /// Bulk-adopt live shared pins for `ids` (one store lock). Call before pin fill.
+    pub fn adopt_from_store(&mut self, ids: impl IntoIterator<Item = u64>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let upgraded = store.bulk_upgrade(ids);
+        if upgraded.is_empty() {
+            return;
+        }
+        self.pins.reserve(upgraded.len());
+        for (id, pin) in upgraded {
+            self.pins.entry(id).or_insert(pin);
+        }
+    }
+
+    /// Bulk-publish local pins into the pipeline store (one store lock). Call after pin fill.
+    pub fn publish_to_store(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        store.bulk_publish(&mut self.pins);
+    }
+
+    /// Layout / coinbase only when outs already cover need (cross-batch share hit).
+    #[inline]
+    pub fn refresh_pin_meta(
+        &mut self,
+        fk: Fk,
+        coinbase: Option<bool>,
+        body_range: Option<(u64, u64)>,
+        spender_rels: Vec<(u32, u32)>,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let Some(p) = self.pins.get(&id) else {
+            return;
+        };
+        p.set_coinbase_if_known(coinbase);
+        p.maybe_merge_layout(body_range, &spender_rels);
+    }
+
     /// Insert / merge one parent (prep pin hot path).
+    ///
+    /// **No store mutex** — pure batch HashMap. First insert for an id is the
+    /// pre-share cost class (`ParentEntry` put). Merge only if the same batch
+    /// already holds a partial pin (or after adopt left an incomplete cover).
     #[inline]
     pub fn insert_owned(
         &mut self,
@@ -238,41 +362,26 @@ impl BatchParents {
         let Some(id) = fk.get() else {
             return;
         };
-        let pin = if let Some(store) = &self.store {
-            store.get_or_insert_merge(
-                id,
-                tx,
-                live,
-                checked,
-                coinbase,
-                body_range,
-                spender_rels,
-            )
-        } else if let Some(existing) = self.pins.get(&id) {
-            let p = Arc::clone(existing);
-            p.merge_outs(live, &checked);
-            p.set_coinbase_if_known(coinbase);
-            if body_range.is_some() || !spender_rels.is_empty() {
-                let mut lay = p.layout.write().unwrap_or_else(|e| e.into_inner());
-                if lay.body_range.is_none() {
-                    lay.body_range = body_range;
+        match self.pins.entry(id) {
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let p = o.get();
+                if !p.covers_need(&checked) {
+                    p.merge_outs(live, &checked);
                 }
-                if lay.spender_rels.is_empty() && !spender_rels.is_empty() {
-                    lay.spender_rels = spender_rels;
-                }
+                p.set_coinbase_if_known(coinbase);
+                p.maybe_merge_layout(body_range, &spender_rels);
             }
-            p
-        } else {
-            Arc::new(SharedParentPin::new(
-                tx,
-                live,
-                checked,
-                coinbase,
-                body_range,
-                spender_rels,
-            ))
-        };
-        self.pins.insert(id, pin);
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(Arc::new(SharedParentPin::new(
+                    tx,
+                    live,
+                    checked,
+                    coinbase,
+                    body_range,
+                    spender_rels,
+                )));
+            }
+        }
     }
 
     /// Test / convenience: clone from slices into the map.
@@ -485,11 +594,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-        if g.1.is_empty() {
-            return false;
-        }
-        vouts.iter().all(|v| checked_contains(&g.1, *v))
+        e.covers_need(vouts)
     }
 
     /// Absorb another batch's handles (write megabatch). Same create → keep one Arc
@@ -518,24 +623,8 @@ impl BatchParents {
                         o.get().merge_outs(live, &checked);
                         o.get().set_coinbase_if_known(src.coinbase_opt());
                         let src_lay = src.layout.read().unwrap_or_else(|e| e.into_inner());
-                        if src_lay.body_range.is_some() || !src_lay.spender_rels.is_empty() {
-                            let mut dst = o.get().layout.write().unwrap_or_else(|e| e.into_inner());
-                            if dst.body_range.is_none() {
-                                dst.body_range = src_lay.body_range;
-                            }
-                            if dst.spender_rels.is_empty() {
-                                dst.spender_rels = src_lay.spender_rels.clone();
-                            } else if !src_lay.spender_rels.is_empty() {
-                                let mut m: HashMap<u32, u32> =
-                                    dst.spender_rels.iter().copied().collect();
-                                for (v, r) in src_lay.spender_rels.iter().copied() {
-                                    m.insert(v, r);
-                                }
-                                let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
-                                merged.sort_unstable_by_key(|(v, _)| *v);
-                                dst.spender_rels = merged;
-                            }
-                        }
+                        o.get()
+                            .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
                     }
                 }
             }
@@ -577,6 +666,26 @@ impl BatchParents {
 #[inline]
 fn checked_contains(checked: &[u32], v: u32) -> bool {
     checked.binary_search(&v).is_ok()
+}
+
+#[inline]
+fn ensure_outs_sorted(mut outs: Vec<(u32, OutputRecord)>) -> Vec<(u32, OutputRecord)> {
+    if outs.windows(2).any(|w| w[0].0 > w[1].0) {
+        outs.sort_unstable_by_key(|(v, _)| *v);
+    }
+    outs
+}
+
+#[inline]
+fn ensure_checked_sorted(mut checked: Vec<u32>) -> Vec<u32> {
+    if checked.windows(2).any(|w| w[0] > w[1]) {
+        checked.sort_unstable();
+    }
+    // Dedup only when needed (sorted unique from pin path is the common case).
+    if checked.windows(2).any(|w| w[0] == w[1]) {
+        checked.dedup();
+    }
+    checked
 }
 
 /// Merge sparse denserels by vout (prefer `src` rel when both present).
@@ -774,7 +883,7 @@ mod tests {
         assert!(bp.get_spender_abs(Fk(1), 0).is_none());
     }
 
-    /// Two batches with the same store share one SharedParentPin payload.
+    /// Two batches with the same store share one SharedParentPin after publish/adopt.
     #[test]
     fn pipeline_store_shares_one_arc_across_batches() {
         let store = Arc::new(PipelineParentStore::new());
@@ -789,6 +898,8 @@ mod tests {
             None,
             vec![(0, 5)],
         );
+        a.publish_to_store();
+        b.adopt_from_store([7]);
         b.insert_owned(
             Fk(7),
             tx(7),
@@ -798,11 +909,12 @@ mod tests {
             None,
             Vec::new(),
         );
+        b.publish_to_store();
         let pa = a.pins.get(&7).expect("a has pin");
         let pb = b.pins.get(&7).expect("b has pin");
         assert!(
             Arc::ptr_eq(pa, pb),
-            "batches must share one SharedParentPin Arc"
+            "batches must share one SharedParentPin Arc after adopt"
         );
         assert!(a.has_parent_out(Fk(7), 0));
         assert!(a.has_parent_out(Fk(7), 1), "merged vout 1 visible via a");
@@ -815,17 +927,64 @@ mod tests {
         assert_eq!(store.live_count(), 0, "last batch drop releases pin");
     }
 
+    /// Concurrent local inserts then publish: loser merges into winner Arc.
+    #[test]
+    fn bulk_publish_merges_race_to_one_arc() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut a = BatchParents::with_store(Arc::clone(&store), 2);
+        let mut b = BatchParents::with_store(Arc::clone(&store), 2);
+        a.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![(0, 1)]);
+        b.insert_owned(Fk(1), tx(1), vec![(1, out(2))], vec![1], None, None, vec![(1, 2)]);
+        // a publishes first (wins Weak slot).
+        a.publish_to_store();
+        // b publishes: must merge into a's Arc and swap handle.
+        b.publish_to_store();
+        let pa = a.pins.get(&1).unwrap();
+        let pb = b.pins.get(&1).unwrap();
+        assert!(Arc::ptr_eq(pa, pb));
+        assert!(a.has_parent_out(Fk(1), 0));
+        assert!(a.has_parent_out(Fk(1), 1));
+        assert!(b.has_parent_out(Fk(1), 0));
+        assert!(b.has_parent_out(Fk(1), 1));
+        assert_eq!(store.live_count(), 1);
+    }
+
     #[test]
     fn parent_payload_ptrs_stable_for_unique_metering() {
         let store = Arc::new(PipelineParentStore::new());
         let mut a = BatchParents::with_store(Arc::clone(&store), 2);
         let mut b = BatchParents::with_store(Arc::clone(&store), 2);
         a.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
+        a.publish_to_store();
+        b.adopt_from_store([1]);
         b.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
+        b.publish_to_store();
         let pa: Vec<_> = a.parent_payload_ptrs().collect();
         let pb: Vec<_> = b.parent_payload_ptrs().collect();
         assert_eq!(pa, pb);
         assert_eq!(pa.len(), 1);
+    }
+
+    /// Free-plan insert must not require a store hit — vacant path is local only.
+    #[test]
+    fn insert_owned_local_without_publish_leaves_store_empty() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 8);
+        for i in 1..=100u64 {
+            bp.insert_owned(
+                Fk(i),
+                tx((i % 200) as u8),
+                vec![(0, out(i as i64))],
+                vec![0],
+                Some(false),
+                None,
+                Vec::new(),
+            );
+        }
+        assert_eq!(bp.len(), 100);
+        assert_eq!(store.live_count(), 0, "insert must not touch store");
+        bp.publish_to_store();
+        assert_eq!(store.live_count(), 100);
     }
 
     /// Prep∥write on one SharedParentPin: write set_layout_for_need must not
@@ -849,6 +1008,7 @@ mod tests {
             None,
             vec![(0, 10)],
         );
+        writer.publish_to_store();
         let pin = Arc::clone(writer.pins.get(&1).expect("shared pin"));
 
         let barrier = Arc::new(Barrier::new(2));

@@ -1568,12 +1568,40 @@ fn pin_for_wire_batch(
         }
         None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
     };
+    // One store lock: adopt live shared pins (writeq / peer prep overlap) so free
+    // path can skip OutputRecord clones when need is already covered.
+    if pipeline_parent_store.is_some() {
+        batch_parents.adopt_from_store(parent_vouts.keys().copied());
+    }
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_plan_pin = 0u64;
 
-    // Plan / in-flight / same-batch free pins → BatchParents (shared Arc pins).
+    // Plan / in-flight / same-batch free pins → BatchParents (local HashMap put;
+    // store mutex only at adopt/publish — not per parent).
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
+        let fk = rbitcoin_primitives::Fk(*id);
+        // Cross-batch share hit: pin already covers need after adopt.
+        if !need.is_empty() && batch_parents.pin_covered(fk, need) {
+            if let Some(pin) = plan_by_id.get(id) {
+                let (tx, _outs, denserels) = pin.as_ref();
+                let cb = if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                };
+                let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
+                let sparse = if !denserels.is_empty() {
+                    rbitcoin_query::sparse_spender_rels(denserels, need)
+                } else {
+                    Vec::new()
+                };
+                // Layout / coinbase only — no outs/tx clone.
+                batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+            }
+            n_plan_pin = n_plan_pin.saturating_add(1);
+            continue;
+        }
         if let Some(pin) = plan_by_id.get(id) {
             let (tx, outs, denserels) = pin.as_ref();
             let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
@@ -1590,7 +1618,6 @@ fn pin_for_wire_batch(
             } else {
                 None
             };
-            let fk = rbitcoin_primitives::Fk(*id);
             let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
             let (body_range, sparse) = if !denserels.is_empty() {
                 (
@@ -1804,6 +1831,9 @@ fn pin_for_wire_batch(
             )));
         }
     }
+
+    // One store lock: publish Weaks so peer prep/writeq can adopt the same Arc.
+    batch_parents.publish_to_store();
 
     let n_unique = parent_vouts.len() as u64;
     if n_unique > 0 {

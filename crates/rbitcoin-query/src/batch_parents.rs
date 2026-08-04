@@ -154,18 +154,7 @@ impl PipelineParentStore {
                     if lay.body_range.is_none() {
                         lay.body_range = body_range;
                     }
-                    if lay.spender_rels.is_empty() {
-                        lay.spender_rels = spender_rels;
-                    } else if !spender_rels.is_empty() {
-                        let mut m: HashMap<u32, u32> =
-                            lay.spender_rels.iter().copied().collect();
-                        for (v, r) in spender_rels {
-                            m.insert(v, r);
-                        }
-                        let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
-                        merged.sort_unstable_by_key(|(v, _)| *v);
-                        lay.spender_rels = merged;
-                    }
+                    merge_spender_rels_into(&mut lay.spender_rels, &spender_rels);
                 }
                 return existing;
             }
@@ -361,25 +350,25 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        let mut need = {
-            let g = e.outs_checked.read().unwrap_or_else(|e| e.into_inner());
-            if g.1.is_empty() && extra_need.is_empty() {
-                (0..dense_rels.len() as u32).collect::<Vec<_>>()
-            } else {
-                g.1.clone()
-            }
-        };
-        need.extend_from_slice(extra_need);
-        need.sort_unstable();
-        need.dedup();
-        {
+        // Monotonic under write lock: re-read checked, extend with extra_need
+        // (never replace with a stale snapshot — concurrent prep merge_outs can
+        // add peer-batch need-vouts between a read lock and a later write).
+        let need = {
             let mut g = e.outs_checked.write().unwrap_or_else(|e| e.into_inner());
-            g.1 = need.clone();
-        }
+            if g.1.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
+                g.1 = (0..dense_rels.len() as u32).collect();
+            }
+            g.1.extend_from_slice(extra_need);
+            g.1.sort_unstable();
+            g.1.dedup();
+            g.1.clone()
+        };
         let sparse = sparse_spender_rels(dense_rels, &need);
+        // Monotonic layout publish: set body_range, merge denserels by vout
+        // (do not full-replace — peer prep may have already merged denserels).
         let mut lay = e.layout.write().unwrap_or_else(|e| e.into_inner());
         lay.body_range = Some(body_range);
-        lay.spender_rels = sparse;
+        merge_spender_rels_into(&mut lay.spender_rels, &sparse);
     }
 
     pub fn set_body_range_only(&mut self, fk: Fk, body_range: (u64, u64)) {
@@ -413,17 +402,7 @@ impl BatchParents {
         }
         let mut lay = e.layout.write().unwrap_or_else(|e| e.into_inner());
         lay.body_range = Some(body_range);
-        if lay.spender_rels.is_empty() {
-            lay.spender_rels = sparse_rels;
-        } else if !sparse_rels.is_empty() {
-            let mut m: HashMap<u32, u32> = lay.spender_rels.iter().copied().collect();
-            for (v, r) in sparse_rels {
-                m.insert(v, r);
-            }
-            let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
-            merged.sort_unstable_by_key(|(v, _)| *v);
-            lay.spender_rels = merged;
-        }
+        merge_spender_rels_into(&mut lay.spender_rels, &sparse_rels);
     }
 
     #[inline]
@@ -598,6 +577,24 @@ impl BatchParents {
 #[inline]
 fn checked_contains(checked: &[u32], v: u32) -> bool {
     checked.binary_search(&v).is_ok()
+}
+
+/// Merge sparse denserels by vout (prefer `src` rel when both present).
+fn merge_spender_rels_into(dst: &mut Vec<(u32, u32)>, src: &[(u32, u32)]) {
+    if src.is_empty() {
+        return;
+    }
+    if dst.is_empty() {
+        *dst = src.to_vec();
+        return;
+    }
+    let mut m: HashMap<u32, u32> = dst.iter().copied().collect();
+    for &(v, r) in src {
+        m.insert(v, r);
+    }
+    let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
+    merged.sort_unstable_by_key(|(v, _)| *v);
+    *dst = merged;
 }
 
 /// Build sorted `(vout, rel)` for requested vouts from dense pin rels.
@@ -829,5 +826,64 @@ mod tests {
         let pb: Vec<_> = b.parent_payload_ptrs().collect();
         assert_eq!(pa, pb);
         assert_eq!(pa.len(), 1);
+    }
+
+    /// Prep∥write on one SharedParentPin: write set_layout_for_need must not
+    /// clobber checked need-vouts or denserels merged by concurrent prep.
+    ///
+    /// Failure mode (pre-fix): set_layout read-locked a stale checked snapshot,
+    /// then write-replaced checked/spender_rels and dropped peer batch vouts.
+    #[test]
+    fn set_layout_merges_not_clobbers_under_concurrent_prep() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let store = Arc::new(PipelineParentStore::new());
+        let mut writer = BatchParents::with_store(Arc::clone(&store), 1);
+        writer.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            None,
+            vec![(0, 10)],
+        );
+        let pin = Arc::clone(writer.pins.get(&1).expect("shared pin"));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let pin_prep = Arc::clone(&pin);
+        let barrier_prep = Arc::clone(&barrier);
+        let prep = thread::spawn(move || {
+            barrier_prep.wait();
+            // Concurrent prep batch spends vout 1 of the same create.
+            for _ in 0..200 {
+                pin_prep.merge_outs(vec![(1, out(20))], &[1]);
+                // Peer denserels for vout 1 (as get_or_insert_merge would).
+                let mut lay = pin_prep.layout.write().unwrap_or_else(|e| e.into_inner());
+                merge_spender_rels_into(&mut lay.spender_rels, &[(1, 20)]);
+            }
+        });
+
+        barrier.wait();
+        // Write-side layout fill for this batch's need (vout 0); dense has both outs.
+        for _ in 0..200 {
+            writer.set_layout_for_need(Fk(1), (100, 80), &[10, 20], &[0]);
+        }
+        prep.join().expect("prep thread");
+
+        // Peer need-vout must still be covered (not wiped by stale checked replace).
+        assert!(
+            writer.pin_covered(Fk(1), &[0, 1]),
+            "checked must keep prep-merged vout 1 after write set_layout"
+        );
+        assert!(writer.has_parent_out(Fk(1), 1));
+        assert_eq!(writer.get_spender_abs(Fk(1), 0), Some(110));
+        // Peer denserels for vout 1 must survive (not full-replaced away).
+        assert_eq!(
+            writer.get_spender_abs(Fk(1), 1),
+            Some(120),
+            "spender_rels must merge, not replace, peer denserels"
+        );
     }
 }

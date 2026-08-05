@@ -41,6 +41,8 @@ const HARD_MEMTABLE_MUL: usize = 2;
 const DEFAULT_TARGET_RUN_BYTES: u64 = 256 * 1024 * 1024;
 /// Max open runs in any k-way pass (tip + L0 coalesce).
 const DEFAULT_MERGE_FANIN: usize = 32;
+/// Wall interval for cold bulk-materialize INFO heartbeats (time-based only).
+const MATERIALIZE_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 #[inline]
 fn run_body_bytes(run: &SortedRunPath) -> u64 {
@@ -508,8 +510,7 @@ impl ShRunBuilder {
         let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
         let mut long_seen: Option<HashSet<u64>> = None;
         let mut unique_in = 0u64;
-        let mut last_log_keys = 0u64;
-        let mut last_shards = 0u32;
+        let mut last_log: Option<Instant> = None;
         let mut max_fk_seen = 0u64;
 
         let t_stream = Instant::now();
@@ -531,7 +532,6 @@ impl ShRunBuilder {
                         session.put_chain(prev, &chain)?;
                         chain.clear();
                         long_seen = None;
-                        let keys = session.keys_written();
                         // SIGINT mid-stream: READY already committed — restart re-streams.
                         if cancel
                             .map(|c| c.load(Ordering::Relaxed))
@@ -539,21 +539,30 @@ impl ShRunBuilder {
                         {
                             return Err(StoreError::Cancelled("scripthash materialize stream"));
                         }
-                        let shards = session.shards_flushed();
-                        if keys == 1
-                            || keys.saturating_sub(last_log_keys) >= 100_000
-                            || shards > last_shards
-                        {
-                            last_log_keys = keys;
-                            last_shards = shards;
+                        let due = match last_log {
+                            None => true,
+                            Some(t) => t.elapsed() >= MATERIALIZE_STATUS_INTERVAL,
+                        };
+                        if due {
+                            last_log = Some(Instant::now());
+                            let keys = session.keys_written();
+                            let creates = session.creates_written();
+                            let shards = session.shards_flushed();
+                            let elapsed = t0.elapsed();
+                            let secs = elapsed.as_secs_f64().max(1e-3);
+                            let keys_per_s = keys as f64 / secs;
+                            // creates vs input rec estimate (dedup makes this an upper-bound %).
+                            let pct = if total_recs > 0 {
+                                (100.0 * creates as f64 / total_recs as f64).clamp(0.0, 99.9)
+                            } else {
+                                0.0
+                            };
                             info!(
-                                "node: scripthash materialize progress keys≈{} creates≈{} shards={shards}/{n_shards} \
-                                 body_flush={:?} head_fill={:?} elapsed={:?}",
-                                keys,
-                                session.creates_written(),
+                                "node: scripthash materialize status keys≈{keys} creates≈{creates} \
+                                 pct≈{pct:.1}% shards={shards}/{n_shards} rate≈{keys_per_s:.0}keys/s \
+                                 body_flush={:?} head_fill={:?} elapsed={elapsed:?}",
                                 Duration::from_nanos(session.body_flush_ns),
                                 Duration::from_nanos(session.head_fill_ns),
-                                t0.elapsed()
                             );
                         }
                     }

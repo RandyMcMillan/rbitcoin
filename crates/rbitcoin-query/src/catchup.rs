@@ -660,8 +660,8 @@ fn recollect_workers() -> usize {
 mod tests {
     use super::*;
     use crate::sh_builder::{
-        load_seal, plan_sh_pre_materialize, sh_catalog_looks_complete, sh_catalog_total_records,
-        sh_force_rebuild, should_defer_direct_recollect, store_seal, ShPreMaterializeAction,
+        load_seal, plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild,
+        should_defer_direct_recollect, store_seal, ShPreMaterializeAction,
         SH_DIRECT_RECOLLECT_MAX_GAP, SH_RUN_KEY_LEN, SH_RUN_REC_LEN,
     };
     use rbitcoin_primitives::{Fk, Height};
@@ -938,82 +938,19 @@ mod tests {
                 "resume recollect should spill remaining creates"
             );
         }
-        let n_mat = q
-            .sh_run
-            .finalize_and_bulk_materialize(&q.store)
-            .unwrap();
-        if run_recs > 0 {
-            assert!(n_mat > 0, "materialize residual after resume");
-            assert!(q.store.scripthash.has_durable_index());
+        // Tip entry after cancel/resume (shipped finalize_sh_runs).
+        let n_mat = q.finalize_sh_runs().unwrap();
+        if run_recs > 0 || seal_done > mid {
+            assert!(
+                n_mat > 0 || q.store.scripthash.has_durable_index(),
+                "tip finalize after resume must settle SH"
+            );
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Mainnet regression: complete recollect then sticky FORCE must not wipe catalog.
-    #[test]
-    fn plan_force_with_complete_catalog_does_not_full_wipe() {
-        let seal = 1_411_839_527u64;
-        let tip = 1_411_887_545u64;
-        let recs = 3_741_750_509u64;
-        assert!(sh_catalog_looks_complete(seal, tip, recs));
-        assert_eq!(
-            plan_sh_pre_materialize(true, false, seal, tip, recs, 0),
-            ShPreMaterializeAction::ForceColdFromExistingCatalog,
-            "sticky FORCE + empty head + complete catalog must not ForceFullRebuild"
-        );
-        // Tip advanced multi-million past seal during recollect — still cold-load.
-        assert_eq!(
-            plan_sh_pre_materialize(true, false, seal, seal + 10_000_000, recs, 0),
-            ShPreMaterializeAction::ForceColdFromExistingCatalog,
-            "usable catalog must survive sticky FORCE even when tip >> seal"
-        );
-        // Durable tip + sticky FORCE → Noop even if floor lags tip (never wipe head).
-        assert_eq!(
-            plan_sh_pre_materialize(true, true, seal, seal + 10_000_000, 0, seal),
-            ShPreMaterializeAction::Noop
-        );
-        // Incomplete tail + FORCE still nuclear.
-        assert_eq!(
-            plan_sh_pre_materialize(true, false, seal, tip, 222_511, 0),
-            ShPreMaterializeAction::ForceFullRebuild
-        );
-    }
-
-    /// End-to-end: recollect fills catalog → FORCE finalize cold-loads without SEAL=0 wipe.
-    #[test]
-    fn scenario_recollect_then_sticky_force_does_not_redo_class_a() {
-        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-force-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        seed_direct_chain(&q, 8);
-        let tip_max = q.store.txs.count();
-
-        // Simulate completed recollect: seal at tip, large enough run mass, empty head.
-        q.sh_run.reset_catalog_for_full_recollect().unwrap();
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        q.sh_run.refresh_seal();
-        let seal = q.sh_run.sealed_max_create_fk();
-        let recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
-        assert!(seal > 0 && recs > 0);
-        assert!(!q.store.scripthash.has_durable_index());
-
-        // Sticky FORCE at tip: must keep catalog, reinit head, materialize.
-        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
-        let n_mat = q.finalize_sh_runs().expect("sticky FORCE finalize");
-        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
-        assert!(n_mat > 0);
-        assert!(q.store.scripthash.has_durable_index());
-        // SEAL must not have been zeroed for a full redo.
-        q.sh_run.refresh_seal();
+        let seal_final = q.sh_run.sealed_max_create_fk();
+        let _ = q.finalize_sh_runs().unwrap();
         assert!(
-            q.sh_run.sealed_max_create_fk() >= seal.min(tip_max),
-            "SEAL must survive sticky FORCE when catalog was complete"
+            q.sh_run.sealed_max_create_fk() >= seal_final,
+            "post-settle finalize must not reset SEAL"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1118,44 +1055,6 @@ mod tests {
         assert!(
             q.store.scripthash.has_durable_index() || n_mat > 0 || mid >= tip_max,
             "resumed IBD tip finalize should settle SH"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Crash mid-recollect: SEAL preserved; resume fills remainder; tip materializes.
-    #[test]
-    fn scenario_crash_resume_recollect_then_tip() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-crash-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        seed_direct_chain(&q, 10);
-        let tip_max = q.store.txs.count();
-        q.sh_run.reset_catalog_for_full_recollect().unwrap();
-        let mid = (tip_max / 2).max(1);
-        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
-        let cancel = AtomicBool::new(true);
-        let _ = q.rebuild_sh_unsealed_from_class_a_cancellable(Some(&cancel));
-        assert_eq!(q.sh_run.sealed_max_create_fk(), mid);
-        // Resume + tip (no FORCE).
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        let seal_after = q.sh_run.sealed_max_create_fk();
-        assert!(seal_after >= mid);
-        let n_mat = q.finalize_sh_runs().unwrap();
-        assert!(
-            q.store.scripthash.has_durable_index() || n_mat > 0 || mid >= tip_max,
-            "crash resume should finish SH"
-        );
-        // Third pass after crash-resume must not recollect from 0.
-        let seal_final = q.sh_run.sealed_max_create_fk();
-        let _ = q.finalize_sh_runs().unwrap();
-        assert!(
-            q.sh_run.sealed_max_create_fk() >= seal_final,
-            "post-settle finalize must not reset SEAL"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

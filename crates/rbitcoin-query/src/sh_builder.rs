@@ -42,22 +42,16 @@ pub enum ShTipMaterializeMode {
 
 /// Select materialize mode. **Never** returns FullCold when head already holds durable data.
 ///
-/// Sticky `RBITCOIN_SH_FORCE_REBUILD` must not wipe a live head here either — intentional
-/// full cold runs after prep has already reinit'd the head empty
-/// ([`ShRunBuilder::prepare_force_full_rebuild`] / [`ShRunBuilder::prepare_force_cold_from_catalog`]).
-/// Incomplete catalog is fixed *before* this (Class A recollect); `catalog_complete` is
-/// logged/diagnostic for empty-head FullCold.
+/// Intentional full cold (FORCE / empty-head recollect) runs only after prep has
+/// reinit'd the head empty. Incomplete catalogs are fixed *before* this (Class A
+/// recollect). Sticky FORCE alone never overrides a live durable head.
 pub fn select_sh_tip_materialize_mode(
     head_empty: bool,
     entry_count: u64,
     progress_next_shard: Option<u32>,
     n_shards: u32,
     stream_run_count: usize,
-    force_rebuild: bool,
-    catalog_complete: bool,
 ) -> ShTipMaterializeMode {
-    let _ = catalog_complete; // caller recollects incomplete catalogs before selecting
-    let _ = force_rebuild; // prep reinit's head before materialize; never override durable head
     let n_shards = n_shards.max(1);
     // Mid multi-shard cold resume (prior shards may already have entry_count > 0).
     if let Some(ns) = progress_next_shard {
@@ -599,60 +593,66 @@ impl ShRunBuilder {
         self.sealed_fk.store(s, Ordering::Release);
     }
 
-    /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
-    ///
-    /// Used by `RBITCOIN_SH_FORCE_REBUILD=1` so tip materialize recollects **all**
-    /// Class A creates (SEAL=0) instead of a catch-up tail only.
-    ///
-    /// **Re-enables** the run builder after wipe so Class A recollect can enqueue
-    /// (finalize_wait_join had disabled it). Materialize will join the worker again.
-    pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
-        info!(
-            "node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head"
-        );
+    /// Stop worker + clear RAM memtable/L0 (shared by FORCE prep paths).
+    fn stop_and_clear_memtable(&self) -> Result<(), StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.pending.clear();
-            g.l0.clear();
-            g.l0_bytes = 0;
-        }
+        let mut g = self.inner.lock().unwrap();
+        g.pending.clear();
+        g.l0.clear();
+        g.l0_bytes = 0;
+        Ok(())
+    }
+
+    /// Wipe on-disk catalog runs + SEAL=0 (does not touch durable SH head).
+    fn wipe_catalog_and_seal(&self) -> Result<(), StoreError> {
         clear_runs_dir(&self.runs_dir);
         let _ = std::fs::create_dir_all(&self.runs_dir);
         store_seal(&self.runs_dir, 0)?;
         self.sealed_fk.store(0, Ordering::Release);
-        ColdProgress::clear(store.path());
-        let hwm_path = store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
-        let _ = std::fs::remove_file(&hwm_path);
-        store.scripthash.reinit_empty_for_cold_materialize()?;
-        // Critical: recollect enqueues into the SH run pipeline. Leaving `enabled`
-        // false (after finalize_wait_join) made rebuild_sh a silent no-op and tip
-        // finished FullCold with creates≈0 on a zeroed head.
-        self.enable();
-        // Parallel recollect will write catalog; keep compact off until Direct IBD.
-        self.set_ibd_catalog_compact(false);
         Ok(())
     }
 
-    /// FORCE with complete catalog: wipe head only — keep runs/SEAL for FullCold.
-    pub fn prepare_force_cold_from_catalog(&self, store: &Store) -> Result<(), StoreError> {
-        info!(
-            "node: scripthash FORCE_REBUILD — catalog already complete; reinit head only \
-             (not wiping runs/SEAL)"
-        );
-        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.pending.clear();
-            g.l0.clear();
-            g.l0_bytes = 0;
-        }
+    fn clear_cold_progress_and_hwm(store: &Store) {
         ColdProgress::clear(store.path());
         let hwm_path = store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
         let _ = std::fs::remove_file(&hwm_path);
-        store.scripthash.reinit_empty_for_cold_materialize()?;
+    }
+
+    /// Re-enable builder after finalize_wait_join; compact off until Direct IBD.
+    ///
+    /// Leaving `enabled` false made Class A recollect a silent no-op and tip
+    /// finished FullCold with creates≈0 on a zeroed head.
+    fn rearm_for_recollect(&self) {
         self.ensure_enabled();
         self.set_ibd_catalog_compact(false);
+    }
+
+    /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
+    ///
+    /// Used by `RBITCOIN_SH_FORCE_REBUILD=1` when catalog is unusable so tip
+    /// recollects **all** Class A creates (SEAL=0).
+    pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
+        info!(
+            "node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head"
+        );
+        self.stop_and_clear_memtable()?;
+        self.wipe_catalog_and_seal()?;
+        Self::clear_cold_progress_and_hwm(store);
+        store.scripthash.reinit_empty_for_cold_materialize()?;
+        self.rearm_for_recollect();
+        Ok(())
+    }
+
+    /// FORCE with usable catalog: reinit head only — keep runs/SEAL for FullCold.
+    pub fn prepare_force_cold_from_catalog(&self, store: &Store) -> Result<(), StoreError> {
+        info!(
+            "node: scripthash FORCE_REBUILD — catalog usable; reinit head only \
+             (not wiping runs/SEAL)"
+        );
+        self.stop_and_clear_memtable()?;
+        Self::clear_cold_progress_and_hwm(store);
+        store.scripthash.reinit_empty_for_cold_materialize()?;
+        self.rearm_for_recollect();
         Ok(())
     }
 
@@ -755,7 +755,7 @@ impl ShRunBuilder {
     /// Drop incomplete/stale run catalog and SEAL so Class A recollect starts at 0.
     ///
     /// Does **not** wipe a durable SH head (use [`Self::prepare_force_full_rebuild`] for that).
-    /// Re-enables the run builder so recollect can spill (same footgun as FORCE prep).
+    /// Does **not** join the worker (safe mid-IBD); re-enables so recollect can spill.
     pub fn reset_catalog_for_full_recollect(&self) -> Result<(), StoreError> {
         info!(
             "node: scripthash catalog incomplete/stale — resetting SEAL=0 and clearing runs for full Class A recollect"
@@ -766,12 +766,8 @@ impl ShRunBuilder {
             g.l0.clear();
             g.l0_bytes = 0;
         }
-        clear_runs_dir(&self.runs_dir);
-        let _ = std::fs::create_dir_all(&self.runs_dir);
-        store_seal(&self.runs_dir, 0)?;
-        self.sealed_fk.store(0, Ordering::Release);
-        self.ensure_enabled();
-        self.set_ibd_catalog_compact(false);
+        self.wipe_catalog_and_seal()?;
+        self.rearm_for_recollect();
         Ok(())
     }
 
@@ -814,27 +810,6 @@ impl ShRunBuilder {
             }
         }
         self.refresh_seal();
-        Ok(())
-    }
-
-    /// Test-only: single-thread crumb compact under `runs_io` (production: IBD worker).
-    #[cfg(test)]
-    pub fn compact_undersized_catalog_for_test(&self) -> Result<(), StoreError> {
-        let (runs_dir, runs_io) = {
-            let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
-        };
-        let mut next_seq = {
-            let g = self.inner.lock().unwrap();
-            g.ctrl.next_seq
-        };
-        {
-            let _io = runs_io.lock().unwrap();
-            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
-            compact_catalog_undersized(&runs_dir, &mut next_seq, &self.sealed_fk)?;
-        }
-        let mut g = self.inner.lock().unwrap();
-        g.ctrl.next_seq = next_seq.max(g.ctrl.next_seq);
         Ok(())
     }
 
@@ -924,7 +899,7 @@ impl ShRunBuilder {
 
         if !resumed_from_ready && claimed.is_empty() && !resume_checkpoint {
             if pending_after.is_empty() {
-                info!("node: scripthash bulk materialize: no runs");
+                debug!("node: scripthash bulk materialize: no runs");
                 clear_runs_dir(&runs_dir);
                 return Ok(0);
             }
@@ -1015,7 +990,6 @@ impl ShRunBuilder {
         let n_shards = store.scripthash.head_shard_count();
         let store_dir = store.path();
         let progress = ColdProgress::load(store_dir).ok().flatten();
-        let force = sh_force_rebuild();
         let tip_max = store.txs.count();
         let seal_now = self.sealed_max_create_fk();
         let cat_recs = stream_inputs.iter().map(|r| r.count).sum::<u64>();
@@ -1033,14 +1007,11 @@ impl ShRunBuilder {
             progress.as_ref().map(|p| p.next_shard),
             n_shards as u32,
             stream_inputs.len(),
-            force,
-            catalog_ok,
         );
         info!(
             "node: scripthash tip materialize path={mode:?} entry_count={n_existing} \
              head_empty={head_empty} stream_runs={} records≈{total_recs} direct_kway={direct_kway} \
-             force_rebuild={force} catalog_complete={catalog_ok} seal={seal_now} tip_max_fk={tip_max} \
-             progress={:?}",
+             catalog_complete={catalog_ok} seal={seal_now} tip_max_fk={tip_max} progress={:?}",
             stream_inputs.len(),
             progress.as_ref().map(|p| p.next_shard),
         );
@@ -1122,7 +1093,7 @@ impl ShRunBuilder {
                 info!(
                     "node: scripthash reinit empty for cold rematerialize \
                      stream_runs={} entry_count={n_existing} head_empty={head_empty} \
-                     n_shards={n_shards} (full cold authorized: empty head or force_rebuild)",
+                     n_shards={n_shards}",
                     stream_inputs.len()
                 );
                 store.scripthash.reinit_empty_for_cold_materialize()?;
@@ -1452,7 +1423,9 @@ fn coalesce_l0_to_catalog(
             let out = next_run_path(runs_dir, *next_seq);
             *next_seq += 1;
             let merged = merge_runs(&chunk, &out)?;
-            info!(
+            // Promote is steady IBD traffic — debug only; ~10s recollect/materialize
+            // status lines cover long work. Compact (rare) stays at info.
+            debug!(
                 "ibd: SH catalog promote runs_in={} body≈{:.1}MiB path={}",
                 chunk.len(),
                 run_body_bytes(&merged) as f64 / (1024.0 * 1024.0),
@@ -1784,8 +1757,7 @@ mod tests {
 
     #[test]
     fn materialize_warm_merges_residual_into_nonempty_table() {
-        // Formerly expected full reinit (wipe to 40). Policy now: warm-merge into
-        // durable head so prior creates (30) are preserved.
+        // Durable head + residual runs → warm merge; never FullCold wipe.
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1799,9 +1771,13 @@ mod tests {
         std::fs::create_dir_all(&runs_dir).unwrap();
 
         let mut body = Vec::new();
+        let mut first_sh = [0u8; 32];
         for i in 0..30u32 {
             let mut sh = [0u8; 32];
             sh[0] = i as u8;
+            if i == 0 {
+                first_sh = sh;
+            }
             body.extend_from_slice(&encode_rec(&sh, Fk(i as u64 + 1)));
         }
         let path = next_run_path(&runs_dir, 1);
@@ -1809,8 +1785,11 @@ mod tests {
         let n1 = b.finalize_and_bulk_materialize(&store).unwrap();
         assert!(n1 >= 30);
         assert!(store.scripthash.entry_count() >= 30);
+        assert_eq!(store.scripthash.entries(&first_sh).unwrap().len(), 1);
 
         let mut body2 = Vec::new();
+        let mut residual_sh = [0u8; 32];
+        residual_sh[0] = 100;
         for i in 0..40u32 {
             let mut sh = [0u8; 32];
             sh[0] = (i + 100) as u8;
@@ -1823,8 +1802,14 @@ mod tests {
 
         let n2 = b.finalize_and_bulk_materialize(&store).unwrap();
         assert!(n2 >= 40, "warm inserted={n2}");
-        // 30 prior + 40 residual (disjoint keys/fks).
+        // 30 prior + 40 residual (disjoint keys/fks); prior key still present.
         assert_eq!(store.scripthash.entry_count(), 70);
+        assert_eq!(
+            store.scripthash.entries(&first_sh).unwrap().len(),
+            1,
+            "warm residual must not wipe durable head"
+        );
+        assert_eq!(store.scripthash.entries(&residual_sh).unwrap().len(), 1);
         assert!(list_materialize_claims(&runs_dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1917,40 +1902,34 @@ mod tests {
     fn select_mode_never_full_cold_when_head_has_data() {
         // Regression: residual run after finished cold must not FullCold.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1, false, true),
+            select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1),
             ShTipMaterializeMode::WarmOnly
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(true, 100, None, 64, 1, false, true),
+            select_sh_tip_materialize_mode(true, 100, None, 64, 1),
             ShTipMaterializeMode::WarmOnly
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(true, 0, None, 64, 10, false, true),
+            select_sh_tip_materialize_mode(true, 0, None, 64, 10),
             ShTipMaterializeMode::FullCold
         );
         // Mid multi-shard cold: progress wins even with partial entry_count.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32, false, true),
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32),
             ShTipMaterializeMode::ColdResume { next_shard: 40 }
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1, false, true),
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1),
             ShTipMaterializeMode::WarmOnly
         );
-        // Sticky FORCE on durable head (no mid-cold progress) → warm, not wipe.
+        // Empty head + streams → FullCold (FORCE prep reinit's before this).
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, None, 64, 1, true, true),
-            ShTipMaterializeMode::WarmOnly,
-            "sticky FORCE must not FullCold a live durable head"
-        );
-        // FORCE + empty head + streams → FullCold (after prep reinit).
-        assert_eq!(
-            select_sh_tip_materialize_mode(true, 0, None, 64, 1, true, true),
+            select_sh_tip_materialize_mode(true, 0, None, 64, 1),
             ShTipMaterializeMode::FullCold
         );
         // Complete progress (next == n_shards) + residual → warm, not resume past end.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1, false, true),
+            select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1),
             ShTipMaterializeMode::WarmOnly
         );
     }
@@ -2041,8 +2020,9 @@ mod tests {
         }
         let before = list_runs(&runs_dir).unwrap().len();
         assert_eq!(before, 3);
-        // Tiny runs (1000*40 ≈ 40KiB) are compact candidates — IBD compact only.
-        b.compact_undersized_catalog_for_test().unwrap();
+        // Drive production compact helper (same fn IBD worker calls) under runs_io.
+        let mut next_seq = 4u64;
+        compact_catalog_undersized(&runs_dir, &mut next_seq, &b.sealed_fk).unwrap();
         let after = list_runs(&runs_dir).unwrap();
         // Crumbs should coalesce to fewer catalog files (or one).
         assert!(
@@ -2182,113 +2162,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn residual_run_on_full_head_warm_only_no_reinit() {
-        // Ship path: durable head + leftover catalog run → warm apply, preserve head.
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-warm-guard-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::open_or_create(&dir).unwrap();
-        let b = ShRunBuilder::new(&dir);
-        b.enable();
-        let mut sh0 = [0u8; 32];
-        sh0[0] = 0x11;
-        b.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(1))]);
-        let n0 = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert!(n0 >= 1);
-        assert_eq!(store.scripthash.entries(&sh0).unwrap().len(), 1);
-        let count_before = store.scripthash.entry_count();
-        assert!(count_before >= 1);
-        assert!(!store.scripthash.head_is_empty() || count_before > 0);
-
-        // Residual run with a second key (as after cancelled deferred apply).
-        let runs_dir = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs_dir).unwrap();
-        let mut sh1 = [0u8; 32];
-        sh1[0] = 0x22;
-        let mut body = Vec::new();
-        body.extend_from_slice(&encode_rec(&sh1, Fk(2)));
-        let path = next_run_path(&runs_dir, 99);
-        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
-
-        let n1 = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert!(n1 >= 1, "warm should apply residual");
-        // Original key must still be present (reinit would wipe).
-        assert_eq!(
-            store.scripthash.entries(&sh0).unwrap().len(),
-            1,
-            "durable head must not be wiped for residual run"
-        );
-        assert_eq!(store.scripthash.entries(&sh1).unwrap().len(), 1);
-        assert!(store.scripthash.entry_count() >= count_before);
-        assert!(store.scripthash.include_hwm() >= 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Catchup pre-step + finalize: durable head, high SEAL, empty runs, no HWM
-    /// file must not zero SEAL or wipe the head (skeptic finding 1).
-    #[test]
-    fn durable_head_high_seal_missing_hwm_preserves_seal_on_prep() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-hwm-boot-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::open_or_create(&dir).unwrap();
-        let b = ShRunBuilder::new(&dir);
-        b.enable();
-        let mut sh0 = [0u8; 32];
-        sh0[0] = 0x33;
-        b.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(7))]);
-        let n0 = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert!(n0 >= 1);
-        assert!(store.scripthash.has_durable_index());
-
-        // Simulate legacy success: high SEAL, runs cleared, include_hwm deleted.
-        let runs_dir = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs_dir).unwrap();
-        let high_seal = 1_411_000_000u64;
-        store_seal(&runs_dir, high_seal).unwrap();
-        b.refresh_seal();
-        let hwm_path = dir.join(rbitcoin_store::INCLUDE_HWM_NAME);
-        let _ = std::fs::remove_file(&hwm_path);
-        assert_eq!(store.scripthash.include_hwm(), 0);
-        assert_eq!(b.sealed_max_create_fk(), high_seal);
-        // Mass check would say incomplete — durable plan must bootstrap, not clamp.
-        assert!(sh_catalog_is_stale_tail(high_seal, 0));
-        let action = plan_sh_pre_materialize(
-            false,
-            true,
-            high_seal,
-            high_seal,
-            0,
-            0,
-        );
-        assert_eq!(
-            action,
-            ShPreMaterializeAction::BootstrapIncludeHwm { seal: high_seal }
-        );
-        // Apply the action the way catchup does.
-        match action {
-            ShPreMaterializeAction::BootstrapIncludeHwm { seal: s } => {
-                store.scripthash.note_include_hwm(s).unwrap();
-            }
-            other => panic!("unexpected action {other:?}"),
-        }
-        assert_eq!(store.scripthash.include_hwm(), high_seal);
-        assert_eq!(b.sealed_max_create_fk(), high_seal, "SEAL must not be zeroed");
-        assert_eq!(store.scripthash.entries(&sh0).unwrap().len(), 1);
-        // Second prep with HWM present → Noop.
-        assert_eq!(
-            plan_sh_pre_materialize(false, true, high_seal, high_seal, 0, high_seal),
-            ShPreMaterializeAction::Noop
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

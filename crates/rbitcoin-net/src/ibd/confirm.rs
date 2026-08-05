@@ -332,15 +332,6 @@ pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 1;
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 10;
 /// Hard clamp per stage (env abuse / OOM guard).
 pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
-/// Max sum of `BatchParents` entries allowed in scripts→write at once.
-///
-/// Batch-count caps alone (`WRITE_QUEUE=50`) still allow multi-GiB peaks: each
-/// modern batch carries thousands of sparse parent pins. Mainnet logs showed
-/// `writeq parents≈500k` with residual RSS ~2–3 GiB beyond BQ. Soft budget
-/// backpressures scripts→write so pin graphs drain with the writer.
-///
-/// Env: `RBITCOIN_CONFIRM_WRITE_PARENTS` (0 = disable). Default **80_000**.
-pub(crate) const WRITE_PARENTS_BUDGET_DEFAULT: usize = 80_000;
 
 /// Resolved plan / prep / write queue capacities (OnceLock; process-lifetime).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,18 +384,16 @@ pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
             legacy_n.unwrap_or(WRITE_QUEUE_CAP_DEFAULT),
         );
         let caps = ConfirmQueueCaps { plan, load, write };
-        let parents_budget = write_parents_budget();
         let non_default = plan != PLAN_QUEUE_CAP_DEFAULT
             || load != LOAD_QUEUE_CAP_DEFAULT
             || write != WRITE_QUEUE_CAP_DEFAULT
-            || parents_budget != WRITE_PARENTS_BUDGET_DEFAULT
             || legacy.is_some();
         if non_default {
             rbitcoin_log::info!(
                 "ibd: confirm pipeline queues planq cap={plan} prepq cap={load} \
-                 writeq cap={write} write_parents_budget={parents_budget} \
-                 (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / _WRITE_QUEUE / \
-                 _WRITE_PARENTS; legacy RBITCOIN_CONFIRM_QUEUE={})",
+                 writeq cap={write} \
+                 (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / _WRITE_QUEUE; \
+                 legacy RBITCOIN_CONFIRM_QUEUE={})",
                 legacy.as_deref().unwrap_or("unset"),
             );
         }
@@ -423,33 +412,6 @@ pub(crate) fn load_queue_cap() -> usize {
 /// Scripts→write capacity.
 pub(crate) fn write_queue_cap() -> usize {
     confirm_queue_caps().write
-}
-
-/// Soft cap on total parent pins sitting in scripts→write (0 = unlimited).
-pub(crate) fn write_parents_budget() -> usize {
-    use std::sync::OnceLock;
-    static B: OnceLock<usize> = OnceLock::new();
-    *B.get_or_init(|| {
-        std::env::var("RBITCOIN_CONFIRM_WRITE_PARENTS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(WRITE_PARENTS_BUDGET_DEFAULT)
-    })
-}
-
-/// True when `extra` parents may enter writeq without exceeding the soft budget.
-///
-/// Always allows the first batch into an empty writeq (cannot deadlock on a
-/// single batch larger than the budget).
-#[inline]
-pub(crate) fn write_parents_may_send(current: usize, extra: usize, budget: usize) -> bool {
-    if budget == 0 {
-        return true;
-    }
-    if current == 0 {
-        return true;
-    }
-    current.saturating_add(extra) <= budget
 }
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).
@@ -511,11 +473,8 @@ pub(crate) struct ConfirmQueueDepths {
     /// Sum of `batch.len()` sitting in scripts→write.
     write_blocks: AtomicUsize,
     write_wire_bytes: AtomicUsize,
-    /// Unique shared-pin payloads in writeq (`Arc` payload ptr occupancy).
+    /// Sum of `BatchParents` entries in scripts→write (entry count, not unique Arc).
     write_parents: AtomicUsize,
-    /// Metering only: ptr → # of writeq batches holding that SharedParentPin Arc.
-    /// Not pin payload mutation — budgets unique parents without deep graph walks.
-    write_parent_refs: std::sync::Mutex<HashMap<usize, u32>>,
 }
 
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
@@ -533,6 +492,14 @@ pub(crate) struct ConfirmPipelineSizes {
     pub write_parents: usize,
     pub feed_ready: usize,
     pub feed_inflight: usize,
+}
+
+impl ConfirmPipelineSizes {
+    /// Parent entries sitting in prepq + writeq (pipeline-wide, no budget).
+    #[inline]
+    pub fn parents_total(&self) -> usize {
+        self.load_parents.saturating_add(self.write_parents)
+    }
 }
 
 /// Format one confirm pipeline queue slot for logs.
@@ -673,16 +640,8 @@ impl ConfirmQueueDepths {
             })
             .ok();
     }
-    /// How many of `ptrs` are not yet in writeq (unique payload cost to send).
-    fn write_parent_send_cost(&self, ptrs: &[usize]) -> usize {
-        let g = self
-            .write_parent_refs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        ptrs.iter().filter(|p| !g.contains_key(p)).count()
-    }
 
-    fn note_write_send(&self, blocks: usize, wire_bytes: usize, parent_ptrs: &[usize]) {
+    fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         let d = self.scripts_to_write.fetch_add(1, Ordering::Relaxed) + 1;
         Self::note_depth_hwm(&self.write_hwm, d);
         self.write_blocks
@@ -695,27 +654,13 @@ impl ConfirmQueueDepths {
                 Some(n.saturating_add(wire_bytes))
             })
             .ok();
-        let mut g = self
-            .write_parent_refs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut newly = 0usize;
-        for &p in parent_ptrs {
-            let e = g.entry(p).or_insert(0);
-            if *e == 0 {
-                newly = newly.saturating_add(1);
-            }
-            *e = e.saturating_add(1);
-        }
-        if newly > 0 {
-            self.write_parents
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_add(newly))
-                })
-                .ok();
-        }
+        self.write_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(parents))
+            })
+            .ok();
     }
-    fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parent_ptrs: &[usize]) {
+    fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.scripts_to_write.fetch_sub(1, Ordering::Relaxed);
         self.write_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -727,28 +672,11 @@ impl ConfirmQueueDepths {
                 Some(n.saturating_sub(wire_bytes))
             })
             .ok();
-        let mut g = self
-            .write_parent_refs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut dropped = 0usize;
-        for &p in parent_ptrs {
-            match g.get_mut(&p) {
-                Some(e) if *e > 1 => *e -= 1,
-                Some(_) => {
-                    g.remove(&p);
-                    dropped = dropped.saturating_add(1);
-                }
-                None => {}
-            }
-        }
-        if dropped > 0 {
-            self.write_parents
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_sub(dropped))
-                })
-                .ok();
-        }
+        self.write_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(parents))
+            })
+            .ok();
     }
 }
 
@@ -993,8 +921,8 @@ pub(crate) fn spawn_confirm_engine(
                         Ok(b) => {
                             let n = b.len();
                             let wire = b.approx_wire_bytes();
-                            let ptrs = b.parent_payload_ptrs();
-                            q_wb.note_write_recv(n, wire, &ptrs);
+                            let parents = b.parent_count();
+                            q_wb.note_write_recv(n, wire, parents);
                             b
                         }
                         Err(_) => break,
@@ -1007,8 +935,8 @@ pub(crate) fn spawn_confirm_engine(
                     drain_script_ok_write_queue(first, &write_rx, |b| {
                         let n = b.len();
                         let wire = b.approx_wire_bytes();
-                        let ptrs = b.parent_payload_ptrs();
-                        q_wb.note_write_recv(n, wire, &ptrs);
+                        let parents = b.parent_count();
+                        q_wb.note_write_recv(n, wire, parents);
                     });
                 leftover = next_left;
                 confirm_thr_stats::add_write_recv_wait(t_recv.elapsed());
@@ -1213,25 +1141,8 @@ pub(crate) fn spawn_confirm_engine(
                         let mat_ms = inflight.meta.mat_ns / 1_000_000;
                         let wb = outcome.batch.len();
                         let ww = outcome.batch.approx_wire_bytes();
-                        let parent_ptrs = outcome.batch.parent_payload_ptrs();
+                        let parents = outcome.batch.parent_count();
                         let t_send = Instant::now();
-                        // Soft parent budget on **unique** shared-pin payloads in writeq
-                        // (shared Arc pins do not multiply occupancy by queue depth).
-                        let parents_budget = write_parents_budget();
-                        loop {
-                            let cost = q_sc.write_parent_send_cost(&parent_ptrs);
-                            if write_parents_may_send(
-                                q_sc.content_snap().write_parents,
-                                cost,
-                                parents_budget,
-                            ) {
-                                break;
-                            }
-                            if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
                         if write_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm write channel closed");
                             if let Some(la) = lookahead.take() {
@@ -1241,7 +1152,7 @@ pub(crate) fn spawn_confirm_engine(
                             break;
                         }
                         confirm_thr_stats::add_script_send_wait(t_send.elapsed());
-                        q_sc.note_write_send(wb, ww, &parent_ptrs);
+                        q_sc.note_write_send(wb, ww, parents);
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
                                 "ibd: confirm scripts slow batch={} first={} prep_ms={mat_ms} script_ms={script_ms} wall_ms={}",
@@ -2205,121 +2116,23 @@ mod tests {
         assert_eq!(super::block_input_count(&block), 6);
     }
 
-    /// Writeq parent soft budget bounds pin-graph pile-up (RSS residual).
+    /// Parent entry meters accumulate and drain with send/recv (no budget gate).
     #[test]
-    fn write_parents_budget_allows_empty_and_blocks_overfill() {
-        let budget = 1000usize;
-        assert!(super::write_parents_may_send(0, 5000, budget));
-        assert!(super::write_parents_may_send(0, 1, budget));
-        assert!(super::write_parents_may_send(500, 400, budget));
-        assert!(!super::write_parents_may_send(500, 600, budget));
-        assert!(!super::write_parents_may_send(1000, 1, budget));
-        // budget 0 = unlimited
-        assert!(super::write_parents_may_send(1_000_000, 1_000_000, 0));
-    }
-
-    /// Queue accounting + budget gate: after filling writeq parents past budget,
-    /// further sends are refused until recv drains (real ConfirmQueueDepths path).
-    #[test]
-    fn write_parents_budget_gates_on_live_queue_depth() {
-        let budget = 10usize;
+    fn pipeline_parents_meter_prep_and_write() {
         let q = ConfirmQueueDepths::new();
-        // Three batches with distinct unique parent payload ptrs (3 each).
-        let b1: Vec<usize> = (1..4).collect();
-        let b2: Vec<usize> = (4..7).collect();
-        let b3: Vec<usize> = (7..10).collect();
-        q.note_write_send(2, 1_000_000, &b1);
-        q.note_write_send(2, 1_000_000, &b2);
-        q.note_write_send(2, 1_000_000, &b3);
-        let cur = q.content_snap().write_parents;
-        assert_eq!(cur, 9);
-        let next: Vec<usize> = (10..12).collect(); // 2 new unique
-        let cost = q.write_parent_send_cost(&next);
-        assert_eq!(cost, 2);
-        assert!(!super::write_parents_may_send(cur, cost, budget));
-        q.note_write_recv(2, 1_000_000, &b1);
-        let cur = q.content_snap().write_parents;
-        assert_eq!(cur, 6);
-        assert!(super::write_parents_may_send(cur, cost, budget));
-        q.note_write_recv(2, 1_000_000, &b2);
-        q.note_write_recv(2, 1_000_000, &b3);
+        q.note_load_send(2, 1_000, 50);
+        q.note_write_send(3, 2_000, 80);
+        let c = q.content_snap();
+        assert_eq!(c.load_parents, 50);
+        assert_eq!(c.write_parents, 80);
+        assert_eq!(c.parents_total(), 130);
+        q.note_load_recv(2, 1_000, 50);
+        q.note_write_recv(3, 2_000, 80);
+        let c2 = q.content_snap();
+        assert_eq!(c2.parents_total(), 0);
+        // Over-recv saturates at 0.
+        q.note_write_recv(1, 1, 99);
         assert_eq!(q.content_snap().write_parents, 0);
-        assert!(super::write_parents_may_send(0, 50_000, budget));
-    }
-
-    /// Unique occupancy: overlapping parent ptrs across batches do not multiply.
-    #[test]
-    fn write_parents_unique_shared_ptrs_not_multiplied() {
-        let q = ConfirmQueueDepths::new();
-        // 50 batches all share the same 100 parent payload ptrs (shared Arc case).
-        let shared: Vec<usize> = (1..=100).collect();
-        for _ in 0..50 {
-            let cost = q.write_parent_send_cost(&shared);
-            q.note_write_send(2, 1_000_000, &shared);
-            // After first send, further overlapping sends cost 0 new unique.
-            let _ = cost;
-        }
-        assert_eq!(
-            q.content_snap().write_parents,
-            100,
-            "unique payloads, not 50×100"
-        );
-        for _ in 0..50 {
-            q.note_write_recv(2, 1_000_000, &shared);
-        }
-        assert_eq!(q.content_snap().write_parents, 0);
-    }
-
-    /// Mainnet-shaped stress with distinct parents hits budget; shared case stays low.
-    #[test]
-    fn write_parents_budget_caps_mainnet_scale_flood() {
-        let budget = super::WRITE_PARENTS_BUDGET_DEFAULT;
-        assert_eq!(budget, 80_000, "default budget is the shipped soft cap");
-        let q = ConfirmQueueDepths::new();
-        let batch_n = 5_000usize;
-        let mut admitted = 0usize;
-        let mut rejected = 0usize;
-        let mut peak = 0usize;
-        let mut next_id = 1usize;
-        for _ in 0..100 {
-            let ptrs: Vec<usize> = (next_id..next_id + batch_n).collect();
-            next_id += batch_n;
-            let cur = q.content_snap().write_parents;
-            let cost = q.write_parent_send_cost(&ptrs);
-            if super::write_parents_may_send(cur, cost, budget) {
-                q.note_write_send(2, 1_000_000, &ptrs);
-                admitted += 1;
-                peak = peak.max(q.content_snap().write_parents);
-            } else {
-                rejected += 1;
-            }
-        }
-        let final_p = q.content_snap().write_parents;
-        assert_eq!(final_p, budget);
-        assert_eq!(peak, budget);
-        assert_eq!(admitted, budget / batch_n);
-        assert_eq!(rejected, 100 - admitted);
-        // Drain using synthetic ptr ids matching admitted batches.
-        let mut drain_id = 1usize;
-        for _ in 0..admitted {
-            let ptrs: Vec<usize> = (drain_id..drain_id + batch_n).collect();
-            drain_id += batch_n;
-            q.note_write_recv(2, 1_000_000, &ptrs);
-        }
-        assert_eq!(q.content_snap().write_parents, 0);
-    }
-
-    /// Scripts send path must consult the parent budget (structural: same symbols
-    /// the production loop uses — not a reimplemented gate).
-    #[test]
-    fn write_parents_budget_symbols_are_production_defaults() {
-        assert_eq!(super::WRITE_PARENTS_BUDGET_DEFAULT, 80_000);
-        // Env unset in tests → OnceLock default.
-        let b = super::write_parents_budget();
-        assert!(
-            b == 0 || b == super::WRITE_PARENTS_BUDGET_DEFAULT || b > 0,
-            "write_parents_budget() must resolve"
-        );
     }
 
     /// Contiguous claim + skip already-confirmed (pure claim helper).
@@ -2606,7 +2419,7 @@ mod tests {
         assert_eq!(c0.feed_inflight, 0);
 
         q.note_load_send(3, 1000, 2);
-        q.note_write_send(2, 500, &[42]);
+        q.note_write_send(2, 500, 7);
         let c1 = q.content_snap();
         assert_eq!(c1.load_batches, 1);
         assert_eq!(c1.load_blocks, 3);
@@ -2615,11 +2428,12 @@ mod tests {
         assert_eq!(c1.write_batches, 1);
         assert_eq!(c1.write_blocks, 2);
         assert_eq!(c1.write_wire_bytes, 500);
-        assert_eq!(c1.write_parents, 1);
+        assert_eq!(c1.write_parents, 7);
+        assert_eq!(c1.parents_total(), 9);
         assert_eq!(q.snap(), (0, 1, 1));
 
         q.note_load_recv(3, 1000, 2);
-        q.note_write_recv(2, 500, &[42]);
+        q.note_write_recv(2, 500, 7);
         let c2 = q.content_snap();
         assert_eq!(c2.load_batches, 0);
         assert_eq!(c2.write_batches, 0);

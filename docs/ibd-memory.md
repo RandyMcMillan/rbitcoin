@@ -67,7 +67,7 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 |-------------|----------------|
 | `bq RAM=` climbs while tip lags, falls as confirm dequeues | Working in-RAM queue (counts toward RSS/anon) |
 | `conf_plans=` grows with tip-ahead headers | Intentional ConfirmParentCache Arc header plans (tip GC) |
-| `writeq … parents=` unique Arc payloads | SharedParentPin identity; refcount map is metering only |
+| `conf … parents=` | Sum of `BatchParents` entries in prepq + writeq (pipeline meter only; no writeq parent budget) |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
 
@@ -82,7 +82,7 @@ known retain structures:
 | `work` / `body` | IBD maps + body-presence sets |
 | `bq soft=n/win RAM=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB |
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
-| `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
+| `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
 | `heap … iflight= pstore= sh_mt= accounted= residual=` | Approx process heap: BQ + prep-ahead CreatePins + parent-store live pins + SH memtable + confirm wire; residual = anon − accounted |

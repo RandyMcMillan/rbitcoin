@@ -2774,11 +2774,6 @@ impl LoadedBatch {
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
     }
-
-    /// Stable payload pointers for unique writeq occupancy metering.
-    pub fn parent_payload_ptrs(&self) -> Vec<usize> {
-        self.batch_parents.parent_payload_ptrs().collect()
-    }
 }
 
 impl ScriptOkBatch {
@@ -2806,11 +2801,6 @@ impl ScriptOkBatch {
     /// Parent handles in this batch (may share Arc payloads with other batches).
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
-    }
-
-    /// Unique shared-pin payload pointers (honest writeq RAM metering).
-    pub fn parent_payload_ptrs(&self) -> Vec<usize> {
-        self.batch_parents.parent_payload_ptrs().collect()
     }
 
     /// Absorb another script-ok batch for write megabatch (FIFO drain).

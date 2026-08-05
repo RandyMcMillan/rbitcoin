@@ -154,19 +154,6 @@ impl SegmentedTxHead {
                 None
             };
             max_id = max_id.max(d.file_id);
-            rbitcoin_log::debug!(
-                "store: tx.head segment open file_id={} first_fk={} bits={} slots={} \
-                 entry={}B gen={} count={} sealed={} occupied≈{}",
-                d.file_id,
-                d.first_fk,
-                head.bits(),
-                head.slots(),
-                head.entry_bytes(),
-                head.generation(),
-                d.count,
-                sealed,
-                head.occupied(),
-            );
             segs.push(Arc::new(Segment {
                 first_fk: d.first_fk,
                 count: AtomicU64::new(d.count),
@@ -189,6 +176,29 @@ impl SegmentedTxHead {
                 return Err(StoreError::Corrupt("tx.head segment fk gap/overlap"));
             }
         }
+        // One summary for the whole head (not one line per segment).
+        // Per-seg detail: `file_id@first_fk:count{s|o}` (s=sealed, o=open tail).
+        let sealed_n = segs.iter().filter(|s| s.sealed).count();
+        let open_n = segs.len().saturating_sub(sealed_n);
+        let creates: u64 = segs
+            .iter()
+            .map(|s| s.count.load(Ordering::Relaxed))
+            .sum();
+        let detail: String = segs
+            .iter()
+            .map(|s| {
+                let c = s.count.load(Ordering::Relaxed);
+                let flag = if s.sealed { 's' } else { 'o' };
+                format!("{}@{}:{}{}", s.file_id, s.first_fk, c, flag)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        rbitcoin_log::info!(
+            "store: tx.head open bits={bits} entry=4B slots={} segs={} sealed={sealed_n} \
+             open={open_n} creates≈{creates} [{detail}]",
+            layout.slots(),
+            segs.len(),
+        );
         Ok(Self {
             dir,
             layout,
@@ -545,7 +555,6 @@ impl SegmentedTxHead {
         let path = segment_head_path(&self.dir, file_id);
         let _ = std::fs::remove_file(&path);
         let head = AddressHead::create_with_layout(&path, self.layout)?;
-        let access = head.table_access();
         let seg = Arc::new(Segment {
             first_fk,
             count: AtomicU64::new(0),
@@ -570,12 +579,11 @@ impl SegmentedTxHead {
             *guard = Arc::new(new_list);
         }
         ROLLS.fetch_add(1, Ordering::Relaxed);
-        rbitcoin_log::debug!(
-            "store: tx.head segment open file_id={file_id} first_fk={first_fk} \
-             bits={} slots={} max_keys={} access={access:?}",
+        // Roll opens one new empty tail — compact one-liner (startup open is multi-seg).
+        rbitcoin_log::info!(
+            "store: tx.head roll open file_id={file_id} first_fk={first_fk} bits={} slots={}",
             self.layout.bits,
             self.layout.slots(),
-            self.max_keys,
         );
         self.persist_meta_locked()?;
         Ok(())

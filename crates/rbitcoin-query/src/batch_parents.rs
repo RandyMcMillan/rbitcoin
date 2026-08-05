@@ -157,7 +157,6 @@ impl ParentLayout {
 
 /// One create's sparse pin payload, shared across concurrent pipeline batches.
 ///
-/// Identity (`Arc` of this type) stays stable for writeq unique-parent metering.
 /// Outs and layout are independent immutable Arc halves (compose only the half
 /// that changes), published via ArcSwap (lock-free load).
 #[derive(Debug)]
@@ -491,14 +490,6 @@ impl BatchParents {
 
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
-    }
-
-    /// Stable payload identity for unique writeq occupancy metering.
-    #[inline]
-    pub fn parent_payload_ptrs(&self) -> impl Iterator<Item = usize> + '_ {
-        self.pins
-            .values()
-            .map(|a| Arc::as_ptr(a) as usize)
     }
 
     /// Bulk-adopt live shared pins for `ids` (one store lock). Call before pin fill.
@@ -1254,22 +1245,6 @@ mod tests {
         assert!(b.has_parent_out(Fk(1), 0));
         assert!(b.has_parent_out(Fk(1), 1));
         assert_eq!(store.live_count(), 1);
-    }
-
-    #[test]
-    fn parent_payload_ptrs_stable_for_unique_metering() {
-        let store = Arc::new(PipelineParentStore::new());
-        let mut a = BatchParents::with_store(Arc::clone(&store), 2);
-        let mut b = BatchParents::with_store(Arc::clone(&store), 2);
-        a.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
-        a.publish_to_store();
-        b.adopt_from_store([1]);
-        b.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
-        b.publish_to_store();
-        let pa: Vec<_> = a.parent_payload_ptrs().collect();
-        let pb: Vec<_> = b.parent_payload_ptrs().collect();
-        assert_eq!(pa, pb);
-        assert_eq!(pa.len(), 1);
     }
 
     /// Free-plan insert must not require a store hit — vacant path is local only.

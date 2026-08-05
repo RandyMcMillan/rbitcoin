@@ -651,7 +651,7 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
-        // Logging: callers (segmented tx.head) emit one line per segment; keep quiet here.
+        // Logging: segmented head emits one multi-seg open summary; keep quiet here.
         Ok(Self {
             file,
             layout,

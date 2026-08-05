@@ -1139,7 +1139,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
     // Prep stage detail: plan mega + pin mix + assemble.
-    // pin_hit% = (plan+res) / (plan+res+cold). denserels_hit% = res / (res+cold).
+    // pin_hit% = plan / (plan+cold) for this window's pin path mix.
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
         let tot = hits.saturating_add(s.load_pin_new);
@@ -1149,7 +1149,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
-    let denserels_hit_pct = 0u64;
     // Prefer wire pin sub-timers when present; fall back to aggregate pin body/new_io.
     let plan_pin_ms = if s.load_plan_pin_ms > 0 {
         s.load_plan_pin_ms
@@ -1202,7 +1201,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          sigop={} final={} job={}) \
          pin(plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
          adopt={}ms range_fill={}ms contract={}ms publish={}ms) \
-         pin_hit%={} denserels_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
+         pin_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         prep_ms,
         pre_assemble,
@@ -1246,7 +1245,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_pin_contract_ms,
         s.load_pin_publish_ms,
         pin_hit_pct,
-        denserels_hit_pct,
         s.load_pin_plan,
         s.load_pin_new,
         s.load_body_tx_reads,
@@ -1620,7 +1618,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body known={} pend={} miss={} rej={} \
          | bq soft={}/{} RAM={}MiB \
          | conf_plans={} \
-         | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
            wire={}MiB accounted≈{}MiB residual≈{}MiB \
@@ -1656,12 +1654,12 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.conf_load_q_cap,
         cp.load_blocks,
         load_wire_mib,
-        cp.load_parents,
         cp.write_batches,
         s.conf_write_q_cap,
         cp.write_blocks,
         write_wire_mib,
-        cp.write_parents,
+        // Pipeline-wide parent entries in prepq + writeq (meter only; no budget).
+        cp.parents_total(),
         cp.feed_ready,
         cp.feed_inflight,
         bq_mib,
@@ -1851,9 +1849,9 @@ mod tests {
         assert!(line.contains("wire_arc="), "{line}");
         assert!(line.contains("prepare="), "{line}");
         assert!(line.contains("pin_win=40ms"), "{line}");
-        // pin_hit% = 8/(8+12) = 40; denserels_hit% always 0 (no process pin FIFO).
+        // pin_hit% = 8/(8+12) = 40.
         assert!(line.contains("pin_hit%=40"), "{line}");
-        assert!(line.contains("denserels_hit%=0"), "{line}");
+        assert!(!line.contains("denserels_hit%"), "{line}");
         assert!(line.contains("cold_io=14ms"), "{line}");
         // I1–I4 fields present with zero path counts when unset.
         assert!(line.contains("prep_budget total="), "{line}");
@@ -2110,8 +2108,9 @@ mod tests {
         assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
-        assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
-        assert!(line.contains("writeq=1/5 blks=16 wire=4MiB"), "{line}");
+        // parents= is pipeline total (prepq + writeq entry counts).
+        assert!(line.contains("prepq=2/5 blks=40 wire=12MiB"), "{line}");
+        assert!(line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"), "{line}");
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
         assert!(line.contains("txhead bits=25"), "{line}");
         assert!(line.contains("segs=3 sealed=2"), "{line}");

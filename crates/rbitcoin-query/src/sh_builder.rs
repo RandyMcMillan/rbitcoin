@@ -1390,7 +1390,17 @@ fn merge_runs_to_l0(
     Ok(merged)
 }
 
+/// Floor for catalog compact: do **not** merge intentional recollect spills (~128 MiB).
+///
+/// Tip materialize can direct k-way thousands of open run FDs; rewriting 128 MiB
+/// runs into ~600 MiB (5-way under the old half-target rule) is pure write amp.
+/// Only true crumbs (tiny IBD L0 promotions) need compact.
+pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = 96 * 1024 * 1024;
+
 /// Compact catalog runs that are well under target (except at most one small tail).
+///
+/// Runs ≥ [`CATALOG_COMPACT_FLOOR_BYTES`] are left alone so parallel Class A
+/// recollect's ~128 MiB spills stream straight into tip k-way merge.
 fn compact_catalog_undersized(
     runs_dir: &Path,
     next_seq: &mut u64,
@@ -1398,6 +1408,8 @@ fn compact_catalog_undersized(
 ) -> Result<(), StoreError> {
     let target = target_run_bytes();
     let half = target / 2;
+    // Never compact runs that are already at recollect spill scale.
+    let small_max = half.min(CATALOG_COMPACT_FLOOR_BYTES);
     let mut runs = list_runs(runs_dir)?;
     if runs.len() < 2 {
         return Ok(());
@@ -1406,7 +1418,7 @@ fn compact_catalog_undersized(
     // Count small runs; if ≤1, done.
     let small: Vec<_> = runs
         .iter()
-        .filter(|r| run_body_bytes(r) < half)
+        .filter(|r| run_body_bytes(r) < small_max)
         .cloned()
         .collect();
     if small.len() <= 1 {

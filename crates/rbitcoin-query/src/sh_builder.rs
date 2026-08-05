@@ -399,8 +399,21 @@ impl ShRunBuilder {
         }
 
         let fanin = merge_fanin();
+        let workers = rbitcoin_store::sh_merge_workers();
         let t_reduce = Instant::now();
         if !resumed_from_reduce {
+            let claimed_recs: u64 = claimed.iter().map(|r| r.count).sum();
+            let claimed_body: u64 = claimed
+                .iter()
+                .map(|r| r.count.saturating_mul(u64::from(r.rec_len)))
+                .sum();
+            let passes = rbitcoin_store::fanin_passes_total(claimed.len(), fanin);
+            info!(
+                "node: scripthash tip fanin reduce start claimed={} fanin={fanin} workers={workers} \
+                 records≈{claimed_recs} body≈{:.1}MiB passes≈{passes}",
+                claimed.len(),
+                claimed_body as f64 / (1024.0 * 1024.0),
+            );
             stream_inputs = {
                 let _io = runs_io.lock().unwrap();
                 let out = reduce_runs_to_fanin(&claimed, &merge_dir, fanin)?;
@@ -410,10 +423,16 @@ impl ShRunBuilder {
                 out
             };
             info!(
-                "node: scripthash tip fanin reduce claimed={} stream={} fanin={fanin} elapsed={:?}",
+                "node: scripthash tip fanin reduce done claimed={} stream={} fanin={fanin} \
+                 workers={workers} elapsed={:?} pct=100",
                 claimed.len(),
                 stream_inputs.len(),
                 t_reduce.elapsed()
+            );
+        } else {
+            info!(
+                "node: scripthash tip fanin reduce resumed stream={} (skip re-reduce) workers={workers}",
+                stream_inputs.len()
             );
         }
         let reduce_ns = t_reduce.elapsed().as_nanos() as u64;

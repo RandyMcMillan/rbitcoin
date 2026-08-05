@@ -75,7 +75,8 @@ pub use sharded_hashhead::{
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{
-    script_hash, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable,
+    has_sh_run_rebuild_source, script_hash, ScriptHashBulkSession, ScriptHashEntry,
+    ScriptHashRecord, ScriptHashTable,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,

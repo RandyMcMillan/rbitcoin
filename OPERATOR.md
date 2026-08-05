@@ -143,8 +143,10 @@ runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**eve
 CHECKPOINT. Catalog runs created while interrupted are **deferred** and
 warm-inserted after cold materialize. On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
-— prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` dirs need
-**reindex**.
+— prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with
+**`scripthash.runs` still present** auto-migrates on open (old head renamed
+`scripthash.head.legacy-*`, empty 64-way + tip rebuild from runs). No runs left
+⇒ reindex.
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**

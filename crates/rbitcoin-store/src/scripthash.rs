@@ -9,14 +9,20 @@ use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadRole;
 use crate::scripthash_head::{
     sh_per_shard_key_budget, sh_unique_hint_default, LiveShardTable, ShardedScriptHashHead,
+    SH_HEAD_SHARD_COUNT_MISMATCH,
 };
 use crate::scripthash_layout::{
     class_for_count, payload_start, slab_bytes, slab_cap, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
     SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_ENTRY_LEN, SH_INLINE_CAP, SH_MAX_CLASS,
 };
+use crate::sharded_hashhead::shard_count_for_role;
+use crate::sorted_run::{
+    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
+};
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Electrum scripthash = SHA256(scriptPubKey) (binary; API often reverses for hex).
@@ -105,10 +111,29 @@ impl ScriptHashTable {
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::open(dir.join("scripthash.body"), TableKind::ScriptHash)?;
-        Self::from_body_and_head(
-            body,
-            ShardedScriptHashHead::open_for_role(dir.join("scripthash.head"), HeadRole::ScriptHash)?,
-        )
+        let head_path = dir.join("scripthash.head");
+        let expected = shard_count_for_role(HeadRole::ScriptHash);
+        // Detect legacy multi-shard layouts before open (e.g. 16-way → 64-way).
+        if expected > 1 {
+            if let Some(on_disk) = count_sh_head_shards(&head_path)? {
+                if on_disk != expected {
+                    if has_sh_run_rebuild_source(dir) {
+                        return migrate_legacy_sh_head_from_runs(dir, body);
+                    }
+                    return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
+                }
+            }
+        }
+        match ShardedScriptHashHead::open_for_role(&head_path, HeadRole::ScriptHash) {
+            Ok(head) => Self::from_body_and_head(body, head),
+            Err(StoreError::Corrupt(msg)) if msg == SH_HEAD_SHARD_COUNT_MISMATCH => {
+                if !has_sh_run_rebuild_source(dir) {
+                    return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
+                }
+                migrate_legacy_sh_head_from_runs(dir, body)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn from_body_and_head(
@@ -122,6 +147,110 @@ impl ScriptHashTable {
             alloc: Mutex::new(state),
         })
     }
+}
+
+/// Number of hex-named shard files under `scripthash.head/` (`None` if missing/single-file).
+fn count_sh_head_shards(head_path: &Path) -> Result<Option<usize>, StoreError> {
+    if !head_path.is_dir() {
+        return Ok(None);
+    }
+    let mut names: Vec<String> = std::fs::read_dir(head_path)
+        .map_err(|e| StoreError::io(head_path, e))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Ok(Some(0));
+    }
+    Ok(Some(names.len()))
+}
+
+/// True when `scripthash.runs` (catalog, claims, merge CHECKPOINT/READY) can rebuild the head.
+pub fn has_sh_run_rebuild_source(store_dir: &Path) -> bool {
+    let runs = store_dir.join("scripthash.runs");
+    if list_runs(&runs).map(|r| !r.is_empty()).unwrap_or(false) {
+        return true;
+    }
+    if list_materialize_claims(&runs)
+        .map(|r| !r.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let merge = runs.join("merge");
+    if list_fanin_reduce_outputs(&merge)
+        .map(|o| o.map(|v| !v.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if load_fanin_checkpoint(&merge)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+    // MANIFEST-less leftovers (crash mid-write).
+    dir_has_run_files(&runs) || dir_has_run_files(&merge)
+}
+
+fn dir_has_run_files(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        s.ends_with(".run") || s.ends_with(".run.mat") || s.ends_with(".run.tmp")
+    })
+}
+
+/// Replace legacy SH head with empty current-layout head; clear body for cold reload from runs.
+fn migrate_legacy_sh_head_from_runs(
+    store_dir: &Path,
+    body: TableFile,
+) -> Result<ScriptHashTable, StoreError> {
+    let head_path = store_dir.join("scripthash.head");
+    let expected = shard_count_for_role(HeadRole::ScriptHash);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bak: PathBuf = store_dir.join(format!("scripthash.head.legacy-{stamp}"));
+    if head_path.exists() {
+        // Prefer rename (keep bytes for forensics); fall back to remove.
+        if let Err(e) = std::fs::rename(&head_path, &bak) {
+            rbitcoin_log::warn!(
+                "store: could not rename legacy scripthash.head to {}: {e}; removing",
+                bak.display()
+            );
+            if head_path.is_dir() {
+                std::fs::remove_dir_all(&head_path).map_err(|e| StoreError::io(&head_path, e))?;
+            } else {
+                std::fs::remove_file(&head_path).map_err(|e| StoreError::io(&head_path, e))?;
+            }
+        } else {
+            rbitcoin_log::info!(
+                "store: moved legacy scripthash.head → {} (rebuild from scripthash.runs)",
+                bak.display()
+            );
+        }
+    }
+    let head = ShardedScriptHashHead::create_for_role(&head_path, HeadRole::ScriptHash)?;
+    let table = ScriptHashTable::from_body_and_head(body, head)?;
+    // Old body slabs are orphaned once head is gone; cold materialize rewrites both.
+    table.reinit_empty_for_cold_materialize()?;
+    rbitcoin_log::info!(
+        "store: scripthash head migrated to {expected}-way empty layout; \
+         tip entry will bulk-materialize from sorted runs (direct k-way / live OA)"
+    );
+    Ok(table)
+}
+
+impl ScriptHashTable {
 
     pub fn entry_count(&self) -> u64 {
         self.alloc.lock().unwrap().live_count
@@ -1406,6 +1535,88 @@ mod tests {
         let expect = (crate::scripthash_head::sh_slots_for_keys(budget) as usize) * 32;
         assert_eq!(peak, expect);
         assert!(peak < 16 * 1024 * 1024, "peak {peak} looks like create-count sizing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_migrates_legacy_head_when_runs_present() {
+        // 16-way head + catalog run → open rewrites to current shard count, keeps runs.
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
+        let dir = tmp();
+        // Body only (empty alloc), then force 16-way head.
+        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        body.ensure_capacity(payload0).unwrap();
+        body.set_logical_len(payload0).unwrap();
+        let state = AllocState {
+            live_count: 0,
+            bump: payload0,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&body, &state).unwrap();
+        drop(body);
+        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
+
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut rec = [0u8; 40];
+        rec[0] = 0xab;
+        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let path = crate::sorted_run::next_run_path(&runs_dir, 1);
+        crate::sorted_run::write_sorted_run(&path, 32, 40, &rec).unwrap();
+        assert!(has_sh_run_rebuild_source(&dir));
+
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t.head_shard_count(), 64);
+        assert!(t.head_is_empty());
+        assert_eq!(t.entry_count(), 0);
+        let catalog = list_runs(&runs_dir).unwrap();
+        assert_eq!(catalog.len(), 1, "runs must survive migration");
+        // Cold materialize from the preserved run.
+        let mut session = t.bulk_session(16).unwrap();
+        session
+            .put_chain(
+                {
+                    let mut k = [0u8; 32];
+                    k[0] = 0xab;
+                    k
+                },
+                &[ShEntry::new(Fk(1))],
+            )
+            .unwrap();
+        let (n, _, _, _) = session.finish().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(t.entries(&[0xab; 32]).unwrap().len(), 0); // key is 0xab then zeros
+        let mut full = [0u8; 32];
+        full[0] = 0xab;
+        assert_eq!(t.entries(&full).unwrap().len(), 1);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_refuses_legacy_head_without_runs() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
+        let dir = tmp();
+        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        body.ensure_capacity(payload0).unwrap();
+        body.set_logical_len(payload0).unwrap();
+        let state = AllocState {
+            live_count: 0,
+            bump: payload0,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&body, &state).unwrap();
+        drop(body);
+        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
+        assert!(!has_sh_run_rebuild_source(&dir));
+        match ScriptHashTable::open(&dir) {
+            Err(StoreError::Corrupt(m)) if m == SH_HEAD_SHARD_COUNT_MISMATCH => {}
+            Ok(_) => panic!("expected shard mismatch error"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

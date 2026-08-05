@@ -25,6 +25,10 @@ const DEFAULT_SLOTS: u64 = 64;
 const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
 const CHUNK_CACHE_MAX: usize = 256;
 
+/// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).
+pub const SH_HEAD_SHARD_COUNT_MISMATCH: &str =
+    "scripthash head shard count mismatch (reindex; expected 64-way mainnet layout)";
+
 /// Open-address slot count for `keys` unique entries at 7/8 max load (pow2).
 #[inline]
 pub fn sh_slots_for_keys(keys: u64) -> u64 {
@@ -871,12 +875,11 @@ impl ShardedScriptHashHead {
             if names.is_empty() {
                 return Err(StoreError::Corrupt("sharded scripthash head empty"));
             }
-            // Mainnet expects 64-way; refuse legacy 16-way (reindex). Tiny is 1 (file not dir).
+            // Mainnet expects 64-way. Legacy counts are handled by
+            // [`crate::scripthash::ScriptHashTable::open`] (migrate from runs).
             let expected = shard_count_for_role(role);
             if expected > 1 && names.len() != expected {
-                return Err(StoreError::Corrupt(
-                    "scripthash head shard count mismatch (reindex; expected 64-way mainnet layout)",
-                ));
+                return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
             }
             let mut shards = Vec::with_capacity(names.len());
             for (i, name) in names.iter().enumerate() {

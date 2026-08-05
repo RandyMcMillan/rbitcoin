@@ -44,9 +44,28 @@ pub fn select_sh_tip_materialize_mode(
     stream_run_count: usize,
     force_rebuild: bool,
 ) -> ShTipMaterializeMode {
-    if stream_run_count == 0 {
-        return ShTipMaterializeMode::WarmOnly;
-    }
+    select_sh_tip_materialize_mode_ex(
+        head_empty,
+        entry_count,
+        progress_next_shard,
+        n_shards,
+        stream_run_count,
+        force_rebuild,
+        /*catalog_complete*/ true,
+    )
+}
+
+/// Extended selector: when `catalog_complete` is false and head is empty, FullCold is still
+/// chosen only after the caller has rebuilt runs from Class A (not from a tail catalog).
+pub fn select_sh_tip_materialize_mode_ex(
+    head_empty: bool,
+    entry_count: u64,
+    progress_next_shard: Option<u32>,
+    n_shards: u32,
+    stream_run_count: usize,
+    force_rebuild: bool,
+    catalog_complete: bool,
+) -> ShTipMaterializeMode {
     if force_rebuild {
         return ShTipMaterializeMode::FullCold;
     }
@@ -56,20 +75,76 @@ pub fn select_sh_tip_materialize_mode(
             return ShTipMaterializeMode::ColdResume { next_shard: ns };
         }
     }
-    // Residual runs after a finished cold load (or any non-empty head): warm only.
+    // Residual runs against a live durable head: warm only (never wipe).
     if !head_empty || entry_count > 0 {
         return ShTipMaterializeMode::WarmOnly;
+    }
+    // Empty head: need stream inputs; incomplete catalog is handled *before* this
+    // by full Class A recollect (caller). With no runs, nothing to do.
+    if stream_run_count == 0 {
+        return ShTipMaterializeMode::WarmOnly;
+    }
+    if !catalog_complete {
+        // Caller should have rebuilt; if still incomplete, refuse silent partial cold.
+        // Prefer FullCold only after recollect; if still incomplete, still FullCold
+        // (operator must fix) — log is caller's job.
+        return ShTipMaterializeMode::FullCold;
     }
     ShTipMaterializeMode::FullCold
 }
 
-fn sh_force_rebuild() -> bool {
+/// `RBITCOIN_SH_FORCE_REBUILD=1|true` — full Class A recollect + cold rematerialize.
+pub fn sh_force_rebuild() -> bool {
     matches!(
         std::env::var("RBITCOIN_SH_FORCE_REBUILD")
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .ok(),
         Some(true)
     )
+}
+
+/// True when catalog SEAL / run record mass can cover Class A through `tip_max_create_fk`.
+///
+/// Incomplete when SEAL lags tip, or SEAL is huge but on-disk run rows are a tiny tail
+/// (common after catch-up-only rebuild with a stale high SEAL).
+pub fn sh_catalog_looks_complete(
+    seal_max_fk: u64,
+    tip_max_create_fk: u64,
+    total_run_records: u64,
+) -> bool {
+    if tip_max_create_fk == 0 {
+        return true;
+    }
+    // Allow small lag for unsealed tip creates still in memtable.
+    const SEAL_LAG_OK: u64 = 50_000;
+    if seal_max_fk.saturating_add(SEAL_LAG_OK) < tip_max_create_fk {
+        return false;
+    }
+    if seal_max_fk == 0 {
+        return total_run_records == 0;
+    }
+    // SEAL claims coverage through seal_max_fk, but each create yields ≥0 SH rows.
+    // A multi‑million SEAL with only ~1e5 run rows is a tail catalog, not a full IBD spill set.
+    if seal_max_fk >= 1_000_000 && total_run_records < seal_max_fk / 50 {
+        return false;
+    }
+    true
+}
+
+/// Sum of `count` over catalog + materialize claims under `runs_dir`.
+pub fn sh_catalog_total_records(runs_dir: &Path) -> u64 {
+    let mut n = 0u64;
+    if let Ok(runs) = list_runs(runs_dir) {
+        for r in runs {
+            n = n.saturating_add(r.count);
+        }
+    }
+    if let Ok(mats) = list_materialize_claims(runs_dir) {
+        for r in mats {
+            n = n.saturating_add(r.count);
+        }
+    }
+    n
 }
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -385,6 +460,59 @@ impl ShRunBuilder {
         self.sealed_fk.store(s, Ordering::Release);
     }
 
+    /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
+    ///
+    /// Used by `RBITCOIN_SH_FORCE_REBUILD=1` so tip materialize recollects **all**
+    /// Class A creates (SEAL=0) instead of a catch-up tail only.
+    pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
+        info!(
+            "node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head"
+        );
+        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending.clear();
+            g.l0.clear();
+            g.l0_bytes = 0;
+        }
+        clear_runs_dir(&self.runs_dir);
+        let _ = std::fs::create_dir_all(&self.runs_dir);
+        store_seal(&self.runs_dir, 0)?;
+        self.sealed_fk.store(0, Ordering::Release);
+        ColdProgress::clear(store.path());
+        let hwm_path = store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+        let _ = std::fs::remove_file(&hwm_path);
+        store.scripthash.reinit_empty_for_cold_materialize()?;
+        Ok(())
+    }
+
+    /// Drop incomplete/stale run catalog and SEAL so Class A recollect starts at 0.
+    ///
+    /// Does **not** wipe a durable SH head (use [`Self::prepare_force_full_rebuild`] for that).
+    pub fn reset_catalog_for_full_recollect(&self) -> Result<(), StoreError> {
+        info!(
+            "node: scripthash catalog incomplete/stale — resetting SEAL=0 and clearing runs for full Class A recollect"
+        );
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending.clear();
+            g.l0.clear();
+            g.l0_bytes = 0;
+        }
+        clear_runs_dir(&self.runs_dir);
+        let _ = std::fs::create_dir_all(&self.runs_dir);
+        store_seal(&self.runs_dir, 0)?;
+        self.sealed_fk.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Clamp SEAL down to `max_fk` (gap recollect for durable head + warm residual).
+    pub fn set_sealed_max_for_recollect(&self, max_fk: u64) -> Result<(), StoreError> {
+        store_seal(&self.runs_dir, max_fk)?;
+        self.sealed_fk.store(max_fk, Ordering::Release);
+        Ok(())
+    }
+
     /// Force flush memtable + L0 coalesce (tests / resume / tip finalize).
     ///
     /// Promotes all L0 (including undersized tails) and compacts tiny catalog runs.
@@ -597,18 +725,24 @@ impl ShRunBuilder {
         let store_dir = store.path();
         let progress = ColdProgress::load(store_dir).ok().flatten();
         let force = sh_force_rebuild();
-        let mode = select_sh_tip_materialize_mode(
+        let tip_max = store.txs.count();
+        let seal_now = self.sealed_max_create_fk();
+        let cat_recs = stream_inputs.iter().map(|r| r.count).sum::<u64>();
+        let catalog_ok = sh_catalog_looks_complete(seal_now, tip_max, cat_recs);
+        let mode = select_sh_tip_materialize_mode_ex(
             head_empty,
             n_existing,
             progress.as_ref().map(|p| p.next_shard),
             n_shards as u32,
             stream_inputs.len(),
             force,
+            catalog_ok,
         );
         info!(
             "node: scripthash tip materialize path={mode:?} entry_count={n_existing} \
              head_empty={head_empty} stream_runs={} records≈{total_recs} direct_kway={direct_kway} \
-             force_rebuild={force} progress={:?}",
+             force_rebuild={force} catalog_complete={catalog_ok} seal={seal_now} tip_max_fk={tip_max} \
+             progress={:?}",
             stream_inputs.len(),
             progress.as_ref().map(|p| p.next_shard),
         );
@@ -1474,6 +1608,60 @@ mod tests {
             select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1, false),
             ShTipMaterializeMode::WarmOnly
         );
+    }
+
+    #[test]
+    fn catalog_complete_rejects_stale_seal_with_tiny_runs() {
+        // Real failure mode: SEAL≈1.4e9 after catch-up but only ~2e5 run rows (tail).
+        assert!(!sh_catalog_looks_complete(
+            1_411_832_114,
+            1_416_000_000,
+            222_511
+        ));
+        assert!(!sh_catalog_looks_complete(1_000_000, 2_000_000, 10_000));
+        // Full IBD-style: seal near tip, huge run mass.
+        assert!(sh_catalog_looks_complete(
+            1_410_000_000,
+            1_410_000_000,
+            3_700_000_000
+        ));
+        assert!(sh_catalog_looks_complete(0, 0, 0));
+    }
+
+    #[test]
+    fn force_rebuild_resets_seal_and_clears_runs() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-force-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        // Fake high SEAL + tiny run (incomplete catalog).
+        store_seal(&runs_dir, 1_400_000_000).unwrap();
+        b.refresh_seal();
+        assert_eq!(b.sealed_max_create_fk(), 1_400_000_000);
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&[0xab; 32], Fk(99)));
+        let path = next_run_path(&runs_dir, 1);
+        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        assert!(
+            !sh_catalog_looks_complete(1_400_000_000, 1_410_000_000, 1),
+            "tiny catalog must be incomplete"
+        );
+
+        b.prepare_force_full_rebuild(&store).unwrap();
+        assert_eq!(b.sealed_max_create_fk(), 0);
+        assert!(list_runs(&runs_dir).unwrap().is_empty());
+        assert!(store.scripthash.head_is_empty());
+        assert_eq!(store.scripthash.entry_count(), 0);
+        assert_eq!(store.scripthash.include_hwm(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

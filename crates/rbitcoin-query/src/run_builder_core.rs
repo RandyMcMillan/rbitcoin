@@ -185,7 +185,12 @@ pub fn runs_dir_io(ctrl: &RunControl) -> (PathBuf, Arc<Mutex<()>>) {
 pub fn clear_runs_dir(runs_dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(runs_dir) {
         for e in rd.flatten() {
-            let _ = std::fs::remove_file(e.path());
+            let p = e.path();
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 }

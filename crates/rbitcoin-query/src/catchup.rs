@@ -111,6 +111,9 @@ impl Query {
     /// Drain SH spills and cold bulk-load durable scripthash tables (tip entry).
     ///
     /// Direct IBD: append-only target-sized runs + SEAL. Tip: fan-in reduce + bulk load.
+    ///
+    /// **`RBITCOIN_SH_FORCE_REBUILD=1`:** wipe SH head/runs/SEAL/HWM, recollect **all**
+    /// Class A creates into runs, then full cold materialize (not a catch-up tail).
     pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
         self.finalize_sh_runs_cancellable(None)
     }
@@ -120,6 +123,45 @@ impl Query {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
+        use crate::sh_builder::{
+            sh_catalog_looks_complete, sh_catalog_total_records, sh_force_rebuild,
+        };
+
+        self.sh_run.refresh_seal();
+        let tip_max = self.store.txs.count();
+        let seal = self.sh_run.sealed_max_create_fk();
+        let run_recs = sh_catalog_total_records(&self.store.path().join("scripthash.runs"));
+        let head_durable = self.store.scripthash.has_durable_index();
+        let catalog_ok = sh_catalog_looks_complete(seal, tip_max, run_recs);
+        let force = sh_force_rebuild();
+
+        if force {
+            rbitcoin_log::info!(
+                "node: scripthash FORCE_REBUILD seal={seal} tip_max_create_fk={tip_max} \
+                 catalog_recs≈{run_recs} head_durable={head_durable}"
+            );
+            self.sh_run.prepare_force_full_rebuild(&self.store)?;
+        } else if !head_durable && !catalog_ok {
+            // Empty/wiped head + stale high SEAL + tail-only runs would cold-load a
+            // tiny incomplete index — recollect Class A from 0 instead.
+            rbitcoin_log::warn!(
+                "node: scripthash catalog incomplete for empty head \
+                 (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs}) — full Class A recollect"
+            );
+            self.sh_run.reset_catalog_for_full_recollect()?;
+        } else if head_durable && !catalog_ok {
+            // Live head: do not wipe. Align SEAL down to include_hwm so recollect
+            // only fills the gap (warm path will apply residual runs).
+            let hwm = self.store.scripthash.include_hwm();
+            if hwm < seal {
+                rbitcoin_log::info!(
+                    "node: scripthash durable head include_hwm={hwm} < seal={seal} — \
+                     clamping SEAL to HWM for gap recollect (warm residual)"
+                );
+                self.sh_run.set_sealed_max_for_recollect(hwm)?;
+            }
+        }
+
         self.sh_run.refresh_seal();
         self.rebuild_sh_unsealed_from_class_a()?;
         match cancel {

@@ -139,12 +139,17 @@ create counts — `RBITCOIN_SH_UNIQUE_HINT` optional). Fan-in reduce is **fallba
 only** when the catalog exceeds max direct. IBD promotes L0 spills only at
 ≥75% of target run size (default target **512 MiB**) and compacts tiny catalog
 runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**every
-10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly`. **Full cold reinit
-only if the SH head is empty** (or `RBITCOIN_SH_FORCE_REBUILD=1`); a nearly
-complete index with residual runs uses **warm batch apply** only. **SIGINT** mid
-cold stream keeps finished prefix shards (`scripthash.cold_progress`). Inclusion
-HWM: `scripthash.include_hwm`. Mid-reduce keeps CHECKPOINT. Deferred/residual
-runs are batch warm-applied (10s status). On enter Direct, leftover
+10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
+`catalog_complete` / `seal` / `tip_max_fk`. **Full cold reinit only if the SH
+head is empty** (or force rebuild); a nearly complete index with residual runs
+uses **warm batch apply** only. **`RBITCOIN_SH_FORCE_REBUILD=1`:** clears
+runs/SEAL/include_hwm/cold_progress, reinit head, recollect **all** Class A
+creates (SEAL=0 → full body scan), then cold materialize — not a catch-up tail.
+Incomplete catalog (high SEAL + tiny run mass, or SEAL ≪ tip) on an **empty**
+head also triggers full Class A recollect. Durable head + incomplete catalog:
+clamp SEAL to `include_hwm` and warm the gap. **SIGINT** mid cold keeps finished
+prefix shards (`scripthash.cold_progress`). Mid-reduce keeps CHECKPOINT.
+Deferred/residual runs batch warm-apply (10s status). On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
 — prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with
 **`scripthash.runs` still present** auto-migrates on open (old head renamed

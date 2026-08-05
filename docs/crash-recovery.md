@@ -73,8 +73,8 @@ Kill mid-payload before HWM publish: readers never see past previous published l
 
 - Direct IBD keeps segmented **`tx.head/`** (archive) and **spend annotations** (confirm) live; tip entry does **not** re-scan Class A to repair them. Corrupt head/spends ⇒ reindex (optional manual `backfill_tx_index` rebuilds segmented head mappings from Class A).
 - **Segmented `tx.head`:** directory `tx.head/` with `meta` + per-segment files (+ `.fuse8` when sealed). Flat `tx.head.meta` / `tx.head.NNNNNN` are **migrated into** `tx.head/` on open. Seal publishes fuse then marks sealed in meta. Kill mid-seal may require deleting incomplete segment files / meta and rebuilding from Class A (or reindex). Legacy mono `tx.head` file / `.new` / `.resize` are not opened — reindex.
-- Scripthash (Direct): thin creates → memtable → target-sized sorted spills + **SEAL** (`max_create_fk`). Memtable is not durable; on resume, re-enqueue creates with `create_fk > SEAL`. Tip materialize path is selected explicitly:
-  - **Full cold** only when head is empty (or `RBITCOIN_SH_FORCE_REBUILD=1`).
-  - **Cold resume** when `scripthash.cold_progress` has `next_shard` in range (SIGINT mid-stream).
-  - **Warm-only** when head already holds durable data and residual runs remain (**never** reinit/wipe a multi‑GiB index for leftover mats).
-  Inclusion HWM: `scripthash.include_hwm` (max create_fk in durable SH). Mid-reduce keeps `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open + rebuild; no runs ⇒ reindex.
+- Scripthash (Direct): thin creates → memtable → target-sized sorted spills + **SEAL** (`max_create_fk`). Memtable is not durable; resume re-enqueues Class A with `create_fk > SEAL`. Tip path:
+  - **Full cold** when head empty (after catalog is complete) or **`RBITCOIN_SH_FORCE_REBUILD=1`** (wipes head+runs+SEAL+HWM, recollects **all** Class A, then cold load).
+  - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
+  - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats).
+  Catalog sanity: high SEAL with tiny run mass is treated as incomplete (full Class A recollect if head empty; SEAL clamp to `include_hwm` if head live). Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.

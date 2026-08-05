@@ -18,8 +18,9 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    merge_runs, next_run_path, reduce_runs_to_fanin_cancellable, write_sorted_run, ScriptHashEntry,
-    ScriptHashRecord, Store, StoreError, SortedRunPath, FANIN_TARGET_STREAM_RUNS,
+    merge_runs, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable, write_sorted_run,
+    ColdProgress, ScriptHashEntry, ScriptHashRecord, Store, StoreError, SortedRunPath,
+    FANIN_TARGET_STREAM_RUNS,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -533,39 +534,70 @@ impl ShRunBuilder {
         let n_existing = store.scripthash.entry_count();
         let head_empty = store.scripthash.head_is_empty();
         let n_shards = store.scripthash.head_shard_count();
-        info!(
-            "node: scripthash reinit empty for cold rematerialize \
-             stream_runs={} entry_count={n_existing} head_empty={head_empty} \
-             direct_kway={direct_kway} n_shards={n_shards}",
-            stream_inputs.len()
-        );
+        let store_dir = store.path();
+        let progress = ColdProgress::load(store_dir).ok().flatten();
+        let resume_from = progress
+            .as_ref()
+            .map(|p| p.next_shard as usize)
+            .unwrap_or(0)
+            .min(n_shards);
         let t_reinit = Instant::now();
-        store.scripthash.reinit_empty_for_cold_materialize()?;
+        let mut session = if resume_from > 0 {
+            if let Some(ref p) = progress {
+                info!(
+                    "node: scripthash cold resume next_shard={}/{} keys≈{} creates≈{} bump={} \
+                     stream_runs={} direct_kway={direct_kway}",
+                    p.next_shard,
+                    n_shards,
+                    p.keys_written,
+                    p.live_count,
+                    p.body_bump,
+                    stream_inputs.len()
+                );
+                store.scripthash.prepare_cold_resume(p)?;
+                store.scripthash.bulk_session_resume(0, p)?
+            } else {
+                unreachable!()
+            }
+        } else {
+            info!(
+                "node: scripthash reinit empty for cold rematerialize \
+                 stream_runs={} entry_count={n_existing} head_empty={head_empty} \
+                 direct_kway={direct_kway} n_shards={n_shards}",
+                stream_inputs.len()
+            );
+            store.scripthash.reinit_empty_for_cold_materialize()?;
+            debug_assert_eq!(store.scripthash.entry_count(), 0);
+            debug_assert!(store.scripthash.head_is_empty());
+            // unique_hint=0 → env/default; never pass create-count (oversizes OA image).
+            store.scripthash.bulk_session(0)?
+        };
         let reinit_ns = t_reinit.elapsed().as_nanos() as u64;
-        debug_assert_eq!(store.scripthash.entry_count(), 0);
-        debug_assert!(store.scripthash.head_is_empty());
         info!(
             "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true \
-             direct_kway={direct_kway} n_shards={n_shards}",
+             direct_kway={direct_kway} n_shards={n_shards} resume_from_shard={resume_from}",
             stream_inputs.len()
         );
         let t0 = Instant::now();
-        // unique_hint=0 → env/default; never pass create-count (oversizes OA image).
-        let mut session = store.scripthash.bulk_session(0)?;
         let mut cur_key: Option<[u8; 32]> = None;
         let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
         let mut long_seen: Option<HashSet<u64>> = None;
         let mut unique_in = 0u64;
         let mut last_log: Option<Instant> = None;
         let mut max_fk_seen = 0u64;
+        let mut cancelled = false;
 
         let t_stream = Instant::now();
-        for_each_merged_rec_opts(&stream_inputs, false, |rec| {
+        let stream_result = for_each_merged_rec_opts(&stream_inputs, false, |rec| {
             if rec.len() < SH_RUN_REC_LEN as usize {
                 return Err(StoreError::Corrupt("sh run short record in merge stream"));
             }
             let (sh, tx_fk) = decode_rec_fixed(rec);
             if tx_fk.is_null() {
+                return Ok(());
+            }
+            // Resume: skip complete prefix bands (already installed head shards).
+            if prefix_shard_of(&sh, n_shards) < resume_from {
                 return Ok(());
             }
             if tx_fk.0 > max_fk_seen {
@@ -578,11 +610,11 @@ impl ShRunBuilder {
                         session.put_chain(prev, &chain)?;
                         chain.clear();
                         long_seen = None;
-                        // SIGINT mid-stream: READY already committed — restart re-streams.
                         if cancel
                             .map(|c| c.load(Ordering::Relaxed))
                             .unwrap_or(false)
                         {
+                            cancelled = true;
                             return Err(StoreError::Cancelled("scripthash materialize stream"));
                         }
                         let due = match last_log {
@@ -597,7 +629,6 @@ impl ShRunBuilder {
                             let elapsed = t0.elapsed();
                             let secs = elapsed.as_secs_f64().max(1e-3);
                             let keys_per_s = keys as f64 / secs;
-                            // creates vs input rec estimate (dedup makes this an upper-bound %).
                             let pct = if total_recs > 0 {
                                 (100.0 * creates as f64 / total_recs as f64).clamp(0.0, 99.9)
                             } else {
@@ -633,7 +664,16 @@ impl ShRunBuilder {
                 }
             }
             Ok(())
-        })?;
+        });
+        if let Err(StoreError::Cancelled(msg)) = stream_result {
+            // Keep complete shards + cold_progress; leave stream_inputs for resume.
+            session.abandon_incomplete();
+            info!(
+                "node: scripthash materialize cancelled ({msg}); complete shards kept — restart resumes"
+            );
+            return Err(StoreError::Cancelled(msg));
+        }
+        stream_result?;
         if let Some(prev) = cur_key.take() {
             if !chain.is_empty() {
                 unique_in = unique_in.saturating_add(1);
@@ -646,6 +686,7 @@ impl ShRunBuilder {
         let (n_total, n_keys, body_flush_ns, head_fill_ns) = session.finish()?;
         store.scripthash.flush()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
+        let _ = cancelled;
 
         // Success barrier: drop materialize artifacts (not deferred new runs).
         for run in &claimed {
@@ -655,6 +696,7 @@ impl ShRunBuilder {
             let _ = std::fs::remove_file(&run.path);
         }
         let _ = std::fs::remove_dir_all(&merge_dir);
+        ColdProgress::clear(store_dir);
 
         // Post-interrupt catch-up runs: warm-insert into live SH head (no reinit).
         let mut n_deferred = 0u64;

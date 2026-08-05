@@ -25,6 +25,72 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Durable cold-materialize resume marker (next to `scripthash.head`).
+pub const COLD_PROGRESS_NAME: &str = "scripthash.cold_progress";
+const COLD_PROGRESS_MAGIC: &[u8; 8] = b"SHCOLDP1";
+
+/// Progress after each fully installed prefix shard (SIGINT resume).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdProgress {
+    /// Next shard index to fill (`0..n_shards`). `n_shards` means all done.
+    pub next_shard: u32,
+    /// Body bump / logical HWM after last complete shard (orphan incomplete slabs discarded).
+    pub body_bump: u64,
+    pub live_count: u64,
+    pub keys_written: u64,
+}
+
+impl ColdProgress {
+    pub fn path(store_dir: &Path) -> PathBuf {
+        store_dir.join(COLD_PROGRESS_NAME)
+    }
+
+    pub fn load(store_dir: &Path) -> Result<Option<Self>, StoreError> {
+        let p = Self::path(store_dir);
+        let Ok(buf) = std::fs::read(&p) else {
+            return Ok(None);
+        };
+        if buf.len() < 8 + 4 + 8 + 8 + 8 || &buf[0..8] != COLD_PROGRESS_MAGIC {
+            return Ok(None);
+        }
+        let next_shard = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let body_bump = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        let live_count = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+        let keys_written = u64::from_le_bytes(buf[28..36].try_into().unwrap());
+        Ok(Some(Self {
+            next_shard,
+            body_bump,
+            live_count,
+            keys_written,
+        }))
+    }
+
+    pub fn store(&self, store_dir: &Path) -> Result<(), StoreError> {
+        let p = Self::path(store_dir);
+        let tmp = store_dir.join(format!("{COLD_PROGRESS_NAME}.tmp"));
+        let mut buf = Vec::with_capacity(36);
+        buf.extend_from_slice(COLD_PROGRESS_MAGIC);
+        buf.extend_from_slice(&self.next_shard.to_le_bytes());
+        buf.extend_from_slice(&self.body_bump.to_le_bytes());
+        buf.extend_from_slice(&self.live_count.to_le_bytes());
+        buf.extend_from_slice(&self.keys_written.to_le_bytes());
+        std::fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .map_err(|e| StoreError::io(&tmp, e))?;
+            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        }
+        std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+        Ok(())
+    }
+
+    pub fn clear(store_dir: &Path) {
+        let _ = std::fs::remove_file(Self::path(store_dir));
+    }
+}
+
 /// Electrum scripthash = SHA256(scriptPubKey) (binary; API often reverses for hex).
 pub fn script_hash(script: &[u8]) -> [u8; 32] {
     sha256::Hash::hash(script).to_byte_array()
@@ -286,6 +352,40 @@ impl ScriptHashTable {
         self.head.reinit_empty()?;
         debug_assert!(self.head.is_empty());
         Ok(())
+    }
+
+    /// Prepare resume after SIGINT: keep complete shards, zero `progress.next_shard..`,
+    /// restore body HWM to the last complete-shard checkpoint.
+    pub fn prepare_cold_resume(&self, progress: &ColdProgress) -> Result<(), StoreError> {
+        let n = self.head.shard_count();
+        let start = progress.next_shard as usize;
+        if start > n {
+            return Err(StoreError::Corrupt(
+                "scripthash cold progress next_shard out of range",
+            ));
+        }
+        self.head.reinit_shards_from(start)?;
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        let bump = progress.body_bump.max(payload0);
+        {
+            let mut alloc = self.alloc.lock().unwrap();
+            *alloc = AllocState {
+                live_count: progress.live_count,
+                bump,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&self.body, &alloc)?;
+        }
+        self.body.set_logical_len(bump)?;
+        Ok(())
+    }
+
+    /// Store directory containing `scripthash.body` / head (parent of body path).
+    pub fn store_dir(&self) -> &Path {
+        self.body
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
     }
 
     /// Head value for a key (process-cache seed / disconnect refresh).
@@ -775,8 +875,13 @@ impl ScriptHashTable {
         );
         Ok(ScriptHashBulkSession {
             table: self,
+            progress_dir: self.store_dir().to_path_buf(),
             bump,
             live_count,
+            committed_bump: bump,
+            committed_live_count: live_count,
+            committed_keys: 0,
+            resume_from_shard: 0,
             active_shard: None,
             live: None,
             key_budget,
@@ -785,6 +890,69 @@ impl ScriptHashTable {
             finished: false,
             keys_written: 0,
             shards_flushed: 0,
+            body_flush_ns: 0,
+            head_fill_ns: 0,
+            peak_table_bytes: 0,
+        })
+    }
+
+    /// Resume cold bulk after SIGINT: keep shards `[0, progress.next_shard)`, fill from there.
+    ///
+    /// Caller must [`Self::prepare_cold_resume`] first and skip stream keys with
+    /// `shard_index < progress.next_shard`.
+    pub fn bulk_session_resume(
+        &self,
+        unique_hint: u64,
+        progress: &ColdProgress,
+    ) -> Result<ScriptHashBulkSession<'_>, StoreError> {
+        let n_shards = self.head.shard_count().max(1);
+        let start = progress.next_shard as usize;
+        if start >= n_shards {
+            return Err(StoreError::Corrupt(
+                "scripthash bulk_session_resume: already complete",
+            ));
+        }
+        // Remaining shards must be empty for live install.
+        for i in start..n_shards {
+            if self.head.shard_occupied(i) != 0 {
+                return Err(StoreError::Corrupt(
+                    "scripthash bulk_session_resume: incomplete shard not empty",
+                ));
+            }
+        }
+        let hint = if unique_hint == 0 {
+            sh_unique_hint_default()
+        } else {
+            unique_hint
+        };
+        let key_budget = sh_per_shard_key_budget(hint, n_shards);
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        let bump = progress.body_bump.max(payload0);
+        rbitcoin_log::info!(
+            "store: scripthash bulk_session resume next_shard={start}/{n_shards} \
+             bump={bump} live_count={} keys≈{} table_MiB≈{:.1}",
+            progress.live_count,
+            progress.keys_written,
+            (crate::scripthash_head::sh_slots_for_keys(key_budget) as f64 * 32.0)
+                / (1024.0 * 1024.0)
+        );
+        Ok(ScriptHashBulkSession {
+            table: self,
+            progress_dir: self.store_dir().to_path_buf(),
+            bump,
+            live_count: progress.live_count,
+            committed_bump: bump,
+            committed_live_count: progress.live_count,
+            committed_keys: progress.keys_written,
+            resume_from_shard: progress.next_shard,
+            active_shard: None,
+            live: None,
+            key_budget,
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_write_off: bump,
+            finished: false,
+            keys_written: progress.keys_written,
+            shards_flushed: progress.next_shard,
             body_flush_ns: 0,
             head_fill_ns: 0,
             peak_table_bytes: 0,
@@ -806,8 +974,16 @@ impl ScriptHashTable {
 /// final-sized shard table.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
+    /// Directory for [`ColdProgress`] file.
+    progress_dir: PathBuf,
     bump: u64,
     live_count: u64,
+    /// Last durable complete-shard body HWM (SIGINT rolls back incomplete slabs here).
+    committed_bump: u64,
+    committed_live_count: u64,
+    committed_keys: u64,
+    /// Skip installing keys for shards `< resume_from_shard` (stream may still deliver them).
+    resume_from_shard: u32,
     active_shard: Option<usize>,
     live: Option<LiveShardTable>,
     /// Unique-key budget used to size each live table (final size).
@@ -853,6 +1029,10 @@ impl<'a> ScriptHashBulkSession<'a> {
             return Ok(());
         }
         let si = self.table.head.shard_index(&key);
+        if (si as u32) < self.resume_from_shard {
+            // Resume: stream still delivers earlier bands; skip without counting.
+            return Ok(());
+        }
         if self.active_shard != Some(si) {
             if let Some(prev) = self.active_shard {
                 if si < prev {
@@ -986,7 +1166,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    /// Flush body buffer, install live OA image, free head RAM.
+    /// Flush body buffer, install live OA image, free head RAM, write resume checkpoint.
     fn flush_active_shard(&mut self) -> Result<(), StoreError> {
         let Some(si) = self.active_shard else {
             return Ok(());
@@ -1000,6 +1180,28 @@ impl<'a> ScriptHashBulkSession<'a> {
             let table_mib = live.table_bytes() as f64 / (1024.0 * 1024.0);
             let occ = live.occupied();
             self.table.head.install_live_shard(si, live)?;
+            // Publish alloc so complete shards survive kill before finish().
+            let state = AllocState {
+                live_count: self.live_count,
+                bump: self.bump,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            if self.bump > self.table.body.logical_len() {
+                self.table.body.set_logical_len(self.bump)?;
+            }
+            write_alloc_header(&self.table.body, &state)?;
+            *self.table.alloc.lock().unwrap() = state;
+            self.committed_bump = self.bump;
+            self.committed_live_count = self.live_count;
+            self.committed_keys = self.keys_written;
+            let next = (si as u32).saturating_add(1);
+            ColdProgress {
+                next_shard: next,
+                body_bump: self.committed_bump,
+                live_count: self.committed_live_count,
+                keys_written: self.committed_keys,
+            }
+            .store(&self.progress_dir)?;
             let elapsed = t0.elapsed();
             self.head_fill_ns = self
                 .head_fill_ns
@@ -1007,7 +1209,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             self.shards_flushed = self.shards_flushed.saturating_add(1);
             rbitcoin_log::info!(
                 "store: scripthash live shard done id={si} keys={keys} occupied={occ} \
-                 slots={slots} table_MiB≈{table_mib:.1} write={elapsed:?}"
+                 slots={slots} table_MiB≈{table_mib:.1} write={elapsed:?} next_shard={next}"
             );
             let _ = self.table.head.shard_advise_dont_need(si);
         }
@@ -1015,7 +1217,38 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    /// Flush last shard head + alloc header.
+    /// Discard incomplete live shard (no install); roll body HWM to last checkpoint.
+    ///
+    /// Call on cooperative cancel so Drop does not install a partial shard.
+    pub fn abandon_incomplete(mut self) {
+        self.live = None;
+        self.active_shard = None;
+        self.body_buf.clear();
+        self.bump = self.committed_bump;
+        self.live_count = self.committed_live_count;
+        self.keys_written = self.committed_keys;
+        self.body_write_off = self.committed_bump;
+        let state = AllocState {
+            live_count: self.committed_live_count,
+            bump: self.committed_bump,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        let _ = self.table.body.set_logical_len(self.committed_bump);
+        let _ = write_alloc_header(&self.table.body, &state);
+        if let Ok(mut g) = self.table.alloc.lock() {
+            *g = state;
+        }
+        // Progress file already has next_shard from last complete install.
+        self.finished = true;
+        rbitcoin_log::info!(
+            "store: scripthash bulk session abandoned incomplete; \
+             committed_keys≈{} bump={}",
+            self.committed_keys,
+            self.committed_bump
+        );
+    }
+
+    /// Flush last shard head + alloc header; clear resume marker.
     ///
     /// Returns `(creates, keys, body_flush_ns, head_fill_ns)`.
     pub fn finish(mut self) -> Result<(u64, u64, u64, u64), StoreError> {
@@ -1030,6 +1263,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         write_alloc_header(&self.table.body, &state)?;
         *self.table.alloc.lock().unwrap() = state;
+        ColdProgress::clear(&self.progress_dir);
         self.finished = true;
         Ok((
             self.live_count,
@@ -1045,15 +1279,16 @@ impl Drop for ScriptHashBulkSession<'_> {
         if self.finished {
             return;
         }
-        let _ = self.flush_active_shard();
-        if self.bump > self.table.body.logical_len() {
-            let _ = self.table.body.set_logical_len(self.bump);
-        }
+        // Panic / cancel without abandon: do **not** install partial live shard.
+        self.live = None;
+        self.active_shard = None;
+        self.body_buf.clear();
         let state = AllocState {
-            live_count: self.live_count,
-            bump: self.bump,
+            live_count: self.committed_live_count,
+            bump: self.committed_bump,
             free_head: [0; SH_MAX_CLASS as usize + 1],
         };
+        let _ = self.table.body.set_logical_len(self.committed_bump);
         let _ = write_alloc_header(&self.table.body, &state);
         if let Ok(mut g) = self.table.alloc.lock() {
             *g = state;
@@ -1120,6 +1355,9 @@ fn read_alloc_header(body: &TableFile) -> Result<AllocState, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize `RBITCOIN_HEAD_SCALE` mutations (parallel tests share process env).
+    static HEAD_SCALE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tmp() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -1518,6 +1756,77 @@ mod tests {
     }
 
     #[test]
+    fn cold_progress_and_resume_skips_complete_shards() {
+        // 4-way head: fill shard 0, abandon, resume from progress, fill rest.
+        let dir = tmp();
+        let body =
+            TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        body.ensure_capacity(payload0).unwrap();
+        body.set_logical_len(payload0).unwrap();
+        let state = AllocState {
+            live_count: 0,
+            bump: payload0,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&body, &state).unwrap();
+        drop(body);
+        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 4, 256).unwrap();
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t.head_shard_count(), 4);
+
+        // Keys: shard = full[0] >> 6 for n=4 (top 2 bits).
+        let key = |shard: u8, i: u8| {
+            let mut k = [0u8; 32];
+            k[0] = shard << 6 | (i & 0x3f);
+            k
+        };
+        let mut session = t.bulk_session(64).unwrap();
+        for i in 0..8u8 {
+            session
+                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
+                .unwrap();
+        }
+        // Cross into shard 1 so shard 0 is installed + checkpointed.
+        session
+            .put_chain(key(1, 0), &[ShEntry::new(Fk(100))])
+            .unwrap();
+        assert!(ColdProgress::load(&dir).unwrap().is_some());
+        let p = ColdProgress::load(&dir).unwrap().unwrap();
+        assert_eq!(p.next_shard, 1);
+        session.abandon_incomplete();
+
+        // Resume: skip shard 0 keys, fill 1..3.
+        let p = ColdProgress::load(&dir).unwrap().unwrap();
+        t.prepare_cold_resume(&p).unwrap();
+        let mut session = t.bulk_session_resume(64, &p).unwrap();
+        // Re-deliver shard 0 keys (must be ignored).
+        for i in 0..8u8 {
+            session
+                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
+                .unwrap();
+        }
+        for shard in 1u8..4 {
+            for i in 0..4u8 {
+                session
+                    .put_chain(
+                        key(shard, i),
+                        &[ShEntry::new(Fk(u64::from(shard) * 100 + u64::from(i)))],
+                    )
+                    .unwrap();
+            }
+        }
+        let (creates, keys, _, _) = session.finish().unwrap();
+        assert!(ColdProgress::load(&dir).unwrap().is_none());
+        // Shard0 kept (8). Resume fills shards 1..3 × 4 keys (the mid-shard1 key was abandoned).
+        assert_eq!(keys, 8 + 12);
+        assert_eq!(creates, 8 + 12);
+        assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
+        assert_eq!(t.entries(&key(3, 3)).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn live_session_does_not_size_from_create_count() {
         // Regression: bulk_session(total_recs) used to allocate create-count-sized
         // OA images. unique_hint=1000 must not allocate a multi-GiB table.
@@ -1541,6 +1850,9 @@ mod tests {
     #[test]
     fn open_migrates_legacy_head_when_runs_present() {
         // 16-way head + catalog run → open rewrites to current shard count, keeps runs.
+        let _g = HEAD_SCALE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
         let dir = tmp();
         // Body only (empty alloc), then force 16-way head.
@@ -1596,6 +1908,9 @@ mod tests {
 
     #[test]
     fn open_refuses_legacy_head_without_runs() {
+        let _g = HEAD_SCALE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
         let dir = tmp();
         let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();

@@ -936,6 +936,19 @@ impl ShardedScriptHashHead {
         self.shards.iter().all(|s| s.occupied() == 0)
     }
 
+    /// Zero head shards `start..` (resume cold materialize from `start`).
+    pub fn reinit_shards_from(&self, start: usize) -> Result<(), StoreError> {
+        for s in self.shards.iter().skip(start) {
+            s.reinit_empty()?;
+        }
+        Ok(())
+    }
+
+    /// Occupied slot count for one shard (0 if OOB).
+    pub fn shard_occupied(&self, shard: usize) -> u64 {
+        self.shards.get(shard).map(|s| s.occupied()).unwrap_or(0)
+    }
+
     /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
     pub fn install_live_shard(
         &self,

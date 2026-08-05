@@ -350,8 +350,45 @@ impl Query {
 
             for _w in 0..workers {
                 scope.spawn(|| {
+                    // Hold records across many 64k-fk chunks until ~128 MiB.
+                    // Spilling at every chunk end only yields ~5–10 MiB (64k×~2–3 outs).
                     let mut local: Vec<ScriptHashRecord> =
-                        Vec::with_capacity(thread_spill_recs.min(1 << 20));
+                        Vec::with_capacity(thread_spill_recs.min(1 << 22));
+                    // Chunks fully scanned into `local` but not yet durable on disk.
+                    let mut pending_done: Vec<usize> = Vec::with_capacity(32);
+
+                    let flush_pending_done = |pending: &mut Vec<usize>| -> Result<(), StoreError> {
+                        for chunk_id in pending.drain(..) {
+                            mark_recollect_chunk_done(
+                                chunk_id,
+                                n_chunks,
+                                sealed0,
+                                tip_max,
+                                CHUNK_FKS,
+                                &done_flags,
+                                &seal_prefix,
+                                sh_run,
+                            )?;
+                        }
+                        Ok(())
+                    };
+
+                    let spill_and_commit =
+                        |local: &mut Vec<ScriptHashRecord>,
+                         pending: &mut Vec<usize>|
+                         -> Result<(), StoreError> {
+                            if !local.is_empty() {
+                                spill_local(
+                                    sh_run,
+                                    local,
+                                    &n_spills,
+                                    &n_creates,
+                                    &max_fk_seen,
+                                )?;
+                            }
+                            flush_pending_done(pending)
+                        };
+
                     loop {
                         if stop.load(AtomicOrdering::Relaxed)
                             || cancel
@@ -359,6 +396,8 @@ impl Query {
                                 .unwrap_or(false)
                         {
                             stop.store(true, AtomicOrdering::Relaxed);
+                            // Durable progress: spill + commit only fully scanned chunks.
+                            let _ = spill_and_commit(&mut local, &mut pending_done);
                             break;
                         }
                         if first_err.lock().unwrap().is_some() {
@@ -366,6 +405,11 @@ impl Query {
                         }
                         let i = next_chunk.fetch_add(1, AtomicOrdering::Relaxed);
                         if i >= n_chunks {
+                            // Worker idle: flush remaining buffer (may be <128 MiB tail).
+                            if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
+                                *first_err.lock().unwrap() = Some(e);
+                                stop.store(true, AtomicOrdering::Relaxed);
+                            }
                             break;
                         }
                         let lo =
@@ -375,18 +419,14 @@ impl Query {
                             .saturating_sub(1)
                             .min(tip_max);
                         if lo > tip_max {
-                            if let Err(e) = mark_recollect_chunk_done(
-                                i,
-                                n_chunks,
-                                sealed0,
-                                tip_max,
-                                CHUNK_FKS,
-                                &done_flags,
-                                &seal_prefix,
-                                sh_run,
-                            ) {
-                                *first_err.lock().unwrap() = Some(e);
-                                stop.store(true, AtomicOrdering::Relaxed);
+                            pending_done.push(i);
+                            if local.len() >= thread_spill_recs {
+                                if let Err(e) = spill_and_commit(&mut local, &mut pending_done)
+                                {
+                                    *first_err.lock().unwrap() = Some(e);
+                                    stop.store(true, AtomicOrdering::Relaxed);
+                                    break;
+                                }
                             }
                             continue;
                         }
@@ -394,6 +434,7 @@ impl Query {
                         let mut chunk_txs = 0u64;
                         let mut chunk_max = sealed0;
                         let mut fk = lo;
+                        let mut chunk_ok = true;
                         while fk <= hi {
                             if cancel
                                 .map(|c| c.load(AtomicOrdering::Relaxed))
@@ -401,14 +442,8 @@ impl Query {
                                 || stop.load(AtomicOrdering::Relaxed)
                             {
                                 stop.store(true, AtomicOrdering::Relaxed);
-                                if !local.is_empty() {
-                                    if let Err(e) =
-                                        spill_local(sh_run, &mut local, &n_spills, &n_creates, &max_fk_seen)
-                                    {
-                                        *first_err.lock().unwrap() = Some(e);
-                                    }
-                                }
-                                return;
+                                chunk_ok = false;
+                                break;
                             }
                             match store.get_tx_meta_and_outputs(Fk(fk)) {
                                 Ok((_tx, outputs)) => {
@@ -420,7 +455,10 @@ impl Query {
                                             Fk(fk),
                                         ));
                                     }
+                                    // Spill only at ~128 MiB — not per chunk.
                                     if local.len() >= thread_spill_recs {
+                                        // Current chunk not finished → do not put `i` in
+                                        // pending yet; only commit earlier full chunks.
                                         if let Err(e) = spill_local(
                                             sh_run,
                                             &mut local,
@@ -430,7 +468,14 @@ impl Query {
                                         ) {
                                             *first_err.lock().unwrap() = Some(e);
                                             stop.store(true, AtomicOrdering::Relaxed);
-                                            return;
+                                            chunk_ok = false;
+                                            break;
+                                        }
+                                        if let Err(e) = flush_pending_done(&mut pending_done) {
+                                            *first_err.lock().unwrap() = Some(e);
+                                            stop.store(true, AtomicOrdering::Relaxed);
+                                            chunk_ok = false;
+                                            break;
                                         }
                                     }
                                 }
@@ -438,36 +483,30 @@ impl Query {
                                 Err(e) => {
                                     *first_err.lock().unwrap() = Some(e);
                                     stop.store(true, AtomicOrdering::Relaxed);
-                                    return;
+                                    chunk_ok = false;
+                                    break;
                                 }
                             }
                             fk = fk.saturating_add(1);
                         }
 
-                        if !local.is_empty() {
-                            if let Err(e) =
-                                spill_local(sh_run, &mut local, &n_spills, &n_creates, &max_fk_seen)
-                            {
-                                *first_err.lock().unwrap() = Some(e);
-                                stop.store(true, AtomicOrdering::Relaxed);
-                                return;
-                            }
+                        if !chunk_ok {
+                            // Partial chunk: spill durable prior chunks only.
+                            let _ = spill_and_commit(&mut local, &mut pending_done);
+                            break;
                         }
+
                         n_txs.fetch_add(chunk_txs, AtomicOrdering::Relaxed);
                         max_fk_seen.fetch_max(chunk_max, AtomicOrdering::Relaxed);
-                        if let Err(e) = mark_recollect_chunk_done(
-                            i,
-                            n_chunks,
-                            sealed0,
-                            tip_max,
-                            CHUNK_FKS,
-                            &done_flags,
-                            &seal_prefix,
-                            sh_run,
-                        ) {
-                            *first_err.lock().unwrap() = Some(e);
-                            stop.store(true, AtomicOrdering::Relaxed);
-                            return;
+                        // Chunk fully scanned into `local` — commit after next spill
+                        // (or worker exit spill) so SEAL never covers RAM-only data.
+                        pending_done.push(i);
+                        if local.len() >= thread_spill_recs {
+                            if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
+                                *first_err.lock().unwrap() = Some(e);
+                                stop.store(true, AtomicOrdering::Relaxed);
+                                break;
+                            }
                         }
                     }
                 });

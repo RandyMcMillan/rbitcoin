@@ -253,6 +253,8 @@ impl ScriptHashTable {
 }
 
 /// Number of hex-named shard files under `scripthash.head/` (`None` if missing/single-file).
+///
+/// Ignores occupancy sidecars (`00.occ`) and other non-shard files.
 fn count_sh_head_shards(head_path: &Path) -> Result<Option<usize>, StoreError> {
     if !head_path.is_dir() {
         return Ok(None);
@@ -262,6 +264,7 @@ fn count_sh_head_shards(head_path: &Path) -> Result<Option<usize>, StoreError> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit()))
         .collect();
     names.sort();
     if names.is_empty() {

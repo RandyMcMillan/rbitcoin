@@ -2,6 +2,14 @@
 //!
 //! Key is the first 16 bytes of Electrum SHA256(spk). Public APIs take full 32 B
 //! hashes and truncate. Values are [`ShHeadValue`] encodings (two u64s).
+//!
+//! # Occupancy (startup)
+//!
+//! Slot occupancy is process state for load-factor / `is_empty`, **not** needed for
+//! probe lookups. Mainnet shards are multi‑GiB — a full slot scan on every open is
+//! unacceptable. Durable sidecar `{shard}.occ` holds the count (written on create,
+//! reinit, cold install, rehash, and inserts). Large shards without a sidecar skip
+//! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -15,11 +23,15 @@ use crate::scripthash_layout::{
 use crate::sharded_hashhead::{initial_slots_per_shard, shard_count_for_role};
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
+
+/// Full occupancy scan only for tiny head files (tests / early IBD).
+const OCC_SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024;
+const OCC_MAGIC: &[u8; 8] = b"SHOCC001";
 
 const DEFAULT_SLOTS: u64 = 64;
 const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
@@ -100,6 +112,75 @@ pub struct ScriptHashHead {
 struct HashState {
     slots: u64,
     occupied: u64,
+    /// When false, `occupied` is not authoritative (large open without `.occ`).
+    /// Never treat as empty / never bulk-fill from this state.
+    occ_known: bool,
+}
+
+fn occ_sidecar_path(head_path: &Path) -> PathBuf {
+    let mut p = head_path.as_os_str().to_os_string();
+    p.push(".occ");
+    PathBuf::from(p)
+}
+
+fn load_occ_sidecar(head_path: &Path) -> Option<u64> {
+    let p = occ_sidecar_path(head_path);
+    let Ok(buf) = std::fs::read(&p) else {
+        return None;
+    };
+    if buf.len() < 16 || &buf[0..8] != OCC_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[8..16].try_into().ok()?))
+}
+
+fn store_occ_sidecar(head_path: &Path, occupied: u64) -> Result<(), StoreError> {
+    let p = occ_sidecar_path(head_path);
+    let tmp = {
+        let mut t = p.as_os_str().to_os_string();
+        t.push(".tmp");
+        PathBuf::from(t)
+    };
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(OCC_MAGIC);
+    buf[8..16].copy_from_slice(&occupied.to_le_bytes());
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&tmp, buf).map_err(|e| StoreError::io(&tmp, e))?;
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+    }
+    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+    Ok(())
+}
+
+fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
+    let mut occupied = 0u64;
+    let mut buf = vec![0u8; SH_HEAD_SLOT_SIZE * 1024];
+    let mut slot = 0u64;
+    while slot < slots {
+        let n = ((slots - slot) as usize).min(1024);
+        let off = FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64;
+        let bytes = n * SH_HEAD_SLOT_SIZE;
+        file.read_at(off, &mut buf[..bytes])?;
+        for i in 0..n {
+            let base = i * SH_HEAD_SLOT_SIZE;
+            let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
+            let v: [u8; SH_HEAD_VALUE_LEN] = buf[base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
+                .try_into()
+                .unwrap();
+            if !is_empty_slot(&k, &v) {
+                occupied += 1;
+            }
+        }
+        slot += n as u64;
+    }
+    Ok(occupied)
 }
 
 impl ScriptHashHead {
@@ -111,11 +192,13 @@ impl ScriptHashHead {
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        let _ = store_occ_sidecar(file.path(), 0);
         Ok(Self {
             file,
             state: Mutex::new(HashState {
                 slots,
                 occupied: 0,
+                occ_known: true,
             }),
         })
     }
@@ -136,31 +219,45 @@ impl ScriptHashHead {
                 "scripthash head slots not power of two",
             ));
         }
-        let mut occupied = 0u64;
-        let mut buf = vec![0u8; SH_HEAD_SLOT_SIZE * 1024];
-        let mut slot = 0u64;
-        while slot < slots {
-            let n = ((slots - slot) as usize).min(1024);
-            let off = FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64;
-            let bytes = n * SH_HEAD_SLOT_SIZE;
-            file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SH_HEAD_SLOT_SIZE;
-                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] = buf
-                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
-                if !is_empty_slot(&k, &v) {
-                    occupied += 1;
-                }
-            }
-            slot += n as u64;
-        }
+        let (occupied, occ_known) = if let Some(occ) = load_occ_sidecar(file.path()) {
+            (occ, true)
+        } else if body <= OCC_SCAN_BYTE_CAP {
+            // Tiny heads (tests / early scale): scan once and seal sidecar.
+            let occ = scan_occupied(&file, slots)?;
+            let _ = store_occ_sidecar(file.path(), occ);
+            (occ, true)
+        } else {
+            // Multi‑GiB mainnet shard without sidecar: do **not** read every slot.
+            // Occupancy unknown — never empty, never bulk-fill (see insert path).
+            rbitcoin_log::info!(
+                "store: scripthash head open skip occupancy scan path={} body_MiB≈{:.0} \
+                 (no .occ sidecar; lookups ok, is_empty=false until reinit/install)",
+                file.path().display(),
+                body as f64 / (1024.0 * 1024.0)
+            );
+            (0, false)
+        };
         Ok(Self {
             file,
-            state: Mutex::new(HashState { slots, occupied }),
+            state: Mutex::new(HashState {
+                slots,
+                occupied,
+                occ_known,
+            }),
         })
+    }
+
+    fn persist_occ(&self, occupied: u64) {
+        let _ = store_occ_sidecar(self.file.path(), occupied);
+    }
+
+    fn set_occupied_known(&self, occupied: u64) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.occupied = occupied;
+            state.occ_known = true;
+        }
+        self.persist_occ(occupied);
     }
 
     fn hash_slot(key: &ShHeadKey, slots: u64) -> u64 {
@@ -193,7 +290,7 @@ impl ScriptHashHead {
                 .write_at(FILE_HEADER_LEN as u64 + off, &zero[..n])?;
             off += n as u64;
         }
-        self.state.lock().unwrap().occupied = 0;
+        self.set_occupied_known(0);
         Ok(())
     }
 
@@ -271,8 +368,14 @@ impl ScriptHashHead {
         }
         self.reserve_additional(upserts.len() as u64)?;
 
-        if self.state.lock().unwrap().occupied == 0 {
-            return self.bulk_fill_empty(&upserts);
+        // Bulk-fill only when occupancy is known empty — never when open skipped
+        // the scan (would overwrite a live multi‑GiB table).
+        {
+            let state = self.state.lock().unwrap();
+            if state.occ_known && state.occupied == 0 {
+                drop(state);
+                return self.bulk_fill_empty(&upserts);
+            }
         }
 
         let mut work = upserts;
@@ -294,7 +397,11 @@ impl ScriptHashHead {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
                             let mut state = self.state.lock().unwrap();
-                            state.occupied = state.occupied.saturating_add(1);
+                            // Only bump when known; unknown open stays unknown (is_empty
+                            // false, no bulk-fill) rather than inventing a wrong count.
+                            if state.occ_known {
+                                state.occupied = state.occupied.saturating_add(1);
+                            }
                         }
                         i += 1;
                     }
@@ -306,21 +413,35 @@ impl ScriptHashHead {
             }
             cache.flush()?;
             if need_rehash {
-                let (slots, occupied) = {
+                let (slots, occupied, occ_known) = {
                     let state = self.state.lock().unwrap();
-                    (state.slots, state.occupied)
+                    (state.slots, state.occupied, state.occ_known)
                 };
+                // NeedRehash with unknown occupancy: double slots via rehash scan.
                 let remain = (work.len() - i) as u64;
-                let need = Self::slots_for_keys(occupied.saturating_add(remain))
-                    .max(slots.saturating_mul(2));
+                let need = if occ_known {
+                    Self::slots_for_keys(occupied.saturating_add(remain))
+                        .max(slots.saturating_mul(2))
+                } else {
+                    slots.saturating_mul(2).max(Self::slots_for_keys(remain))
+                };
                 self.rehash_to(need)?;
+            }
+        }
+        // Seal sidecar after batch when count is authoritative.
+        {
+            let state = self.state.lock().unwrap();
+            if state.occ_known {
+                let occ = state.occupied;
+                drop(state);
+                self.persist_occ(occ);
             }
         }
         Ok(())
     }
 
     fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
-        debug_assert_eq!(self.state.lock().unwrap().occupied, 0);
+        debug_assert!(self.is_known_empty());
         let slots = self.state.lock().unwrap().slots;
         let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
         let mut table = vec![0u8; nbytes];
@@ -355,7 +476,7 @@ impl ScriptHashHead {
             }
         }
         self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
-        self.state.lock().unwrap().occupied = occupied;
+        self.set_occupied_known(occupied);
         Ok(())
     }
 
@@ -367,14 +488,25 @@ impl ScriptHashHead {
         self.state.lock().unwrap().occupied
     }
 
+    /// True when occupancy is known and zero (safe for cold bulk-fill / install).
+    pub fn is_known_empty(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.occ_known && state.occupied == 0
+    }
+
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
         }
-        let (occupied, slots) = {
+        let (occupied, slots, occ_known) = {
             let state = self.state.lock().unwrap();
-            (state.occupied, state.slots)
+            (state.occupied, state.slots, state.occ_known)
         };
+        // Unknown occupancy: do not grow/rehash from a fake zero count (mainnet
+        // tables are pre-sized; warm residual fits). Probe insert handles load.
+        if !occ_known {
+            return Ok(());
+        }
         let need = Self::slots_for_keys(occupied.saturating_add(additional));
         if need > slots {
             if occupied == 0 {
@@ -401,7 +533,7 @@ impl ScriptHashHead {
                 "scripthash install_cold_image: table len mismatch",
             ));
         }
-        if self.state.lock().unwrap().occupied != 0 {
+        if !self.is_known_empty() {
             return Err(StoreError::Corrupt(
                 "scripthash install_cold_image: not empty",
             ));
@@ -411,9 +543,11 @@ impl ScriptHashHead {
         self.file.ensure_capacity(need)?;
         self.file.set_logical_len(need)?;
         self.file.write_at(FILE_HEADER_LEN as u64, table)?;
-        let mut state = self.state.lock().unwrap();
-        state.slots = slots;
-        state.occupied = occupied;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.slots = slots;
+        }
+        self.set_occupied_known(occupied);
         Ok(())
     }
 
@@ -500,6 +634,8 @@ impl ScriptHashHead {
             let mut state = self.state.lock().unwrap();
             state.slots = new_slots;
             state.occupied = 0;
+            // Mid-rehash: authoritative empty of the *new* image until refill.
+            state.occ_known = true;
         }
 
         entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
@@ -515,7 +651,8 @@ impl ScriptHashHead {
             }
         }
         cache.flush()?;
-        self.state.lock().unwrap().occupied = n_entries;
+        // Rehash walks every old slot — count is authoritative even if open was unknown.
+        self.set_occupied_known(n_entries);
         rbitcoin_log::trace!(
             "store: scripthash head rehash path={} {}→{} slots occupied={} elapsed={:?}",
             self.file.path().display(),
@@ -798,7 +935,7 @@ impl LiveShardTable {
 
     /// Sequential write into an **empty** on-disk shard; frees this image.
     pub fn install_into(self, head: &ScriptHashHead) -> Result<(), StoreError> {
-        if head.occupied() != 0 {
+        if !head.is_known_empty() {
             return Err(StoreError::Corrupt(
                 "scripthash live install: shard not empty",
             ));
@@ -865,11 +1002,17 @@ impl ShardedScriptHashHead {
     pub fn open_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
+            // Shard files only (`00`..`3f`); ignore `00.occ` sidecars and temps.
             let mut names: Vec<String> = std::fs::read_dir(&path)
                 .map_err(|e| StoreError::io(&path, e))?
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| {
+                    n.len() == 2
+                        && n.chars()
+                            .all(|c| c.is_ascii_hexdigit())
+                })
                 .collect();
             names.sort();
             if names.is_empty() {
@@ -931,9 +1074,12 @@ impl ShardedScriptHashHead {
         self.shard_of(full)
     }
 
-    /// True when every shard has zero occupied slots (cold bulk fill precondition).
+    /// True when every shard is **known** empty (cold bulk fill precondition).
+    ///
+    /// Large shards opened without a `.occ` sidecar return false (occupancy
+    /// unknown) so tip materialize never treats a live multi‑GiB head as empty.
     pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| s.occupied() == 0)
+        self.shards.iter().all(|s| s.is_known_empty())
     }
 
     /// Zero head shards `start..` (resume cold materialize from `start`).
@@ -1082,6 +1228,7 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
         let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
         assert_eq!(h.table_access(), TableAccess::FdOnly);
         let mut key = [0u8; 32];
@@ -1091,7 +1238,61 @@ mod tests {
         assert_eq!(h.get(&key).unwrap().unwrap(), val);
         assert!(h.clear_key(&key).unwrap());
         assert!(h.get(&key).unwrap().is_none());
+        // Sidecar tracks occupied; reopen without full scan path for tiny files.
+        drop(h);
+        let h2 = ScriptHashHead::open(&path).unwrap();
+        assert!(h2.is_known_empty() || h2.occupied() >= 1); // soft-clear keeps slot
+        assert!(h2.get(&key).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    }
+
+    #[test]
+    fn open_large_without_occ_skips_scan_not_empty() {
+        // Simulate mainnet: body > SCAN_CAP, no sidecar → no full read, not empty.
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-large-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+        // slots so body > 16 MiB: 16MiB/32 = 524288 slots → use 1M slots (32 MiB).
+        let slots = 1u64 << 20;
+        let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+        assert!(h.is_known_empty());
+        let mut key = [0u8; 32];
+        key[0] = 0xab;
+        h.insert(&key, &ShHeadValue::inline_one(ShEntry::new(Fk(1))))
+            .unwrap();
+        assert_eq!(h.occupied(), 1);
+        drop(h);
+        // Drop sidecar only — reopen must not scan 32 MiB and must not claim empty.
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+        let t0 = Instant::now();
+        let h2 = ScriptHashHead::open(&path).unwrap();
+        let open_ms = t0.elapsed().as_millis();
+        assert!(
+            !h2.is_known_empty(),
+            "missing .occ on large head must not report empty"
+        );
+        assert!(
+            open_ms < 2_000,
+            "open without .occ must skip full scan (took {open_ms}ms)"
+        );
+        // Lookups still work (probe, not occupancy).
+        assert_eq!(
+            h2.get(&key).unwrap().unwrap().inline_fks(),
+            vec![Fk(1)]
+        );
+        // Reinit seals known empty + sidecar for cold path.
+        h2.reinit_empty().unwrap();
+        assert!(h2.is_known_empty());
+        assert!(load_occ_sidecar(&path) == Some(0));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
     }
 
     /// Rehash, live install, clear miss, for_each, open.

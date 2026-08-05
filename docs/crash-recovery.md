@@ -78,3 +78,4 @@ Kill mid-payload before HWM publish: readers never see past previous published l
   - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
   - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats).
   Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: empty/tiny residual runs are normal post-consume; missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); clamp SEAL to HWM only when `0 < hwm < SEAL`. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.
+  **SH head open:** occupancy is **not** full-scanned on multi‑GiB shards. Per-shard `{shard}.occ` sidecar (create / cold install / rehash / inserts); missing sidecar on large files → occupancy unknown (`is_empty=false`, no bulk-fill wipe). Lookups never needed the scan.

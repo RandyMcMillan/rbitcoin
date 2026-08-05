@@ -692,7 +692,19 @@ impl ShRunBuilder {
     }
 }
 
-/// Stream sorted-run records into the **live** SH table (tip-style append).
+/// Batch size for warm deferred apply (records per `put_create_batch_append`).
+///
+/// Avoids per-create `put_create` (head probe + contains walk each time) which
+/// pegs one core for hours on a multi‑GiB live head after cold materialize.
+const DEFERRED_APPLY_BATCH: usize = 64_000;
+/// Wall interval for deferred-apply INFO heartbeats.
+const DEFERRED_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Stream sorted-run records into the **live** SH table (batched tip-style append).
+///
+/// Runs are already scripthash-sorted: group into batches and
+/// [`ScriptHashTable::put_create_batch_append`] (one head seed + body merge per
+/// distinct key per batch). Not the cold live-OA path — head is already full.
 fn apply_runs_to_live_sh(
     store: &Store,
     runs: &[SortedRunPath],
@@ -701,7 +713,39 @@ fn apply_runs_to_live_sh(
     if runs.is_empty() {
         return Ok(0);
     }
+    let total_recs: u64 = runs.iter().map(|r| r.count).sum();
+    let body_mib: f64 = runs
+        .iter()
+        .map(|r| run_body_bytes(r) as f64)
+        .sum::<f64>()
+        / (1024.0 * 1024.0);
+    info!(
+        "node: scripthash deferred warm apply start runs={} records≈{total_recs} body≈{body_mib:.1}MiB \
+         batch={DEFERRED_APPLY_BATCH}",
+        runs.len()
+    );
+    let t0 = Instant::now();
     let mut n = 0u64;
+    let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(DEFERRED_APPLY_BATCH);
+    // Process-local head cache; cleared each batch (stream is key-sorted, no revisit).
+    let mut heads = std::collections::HashMap::new();
+    let mut last_log = Instant::now();
+    let mut recs_seen = 0u64;
+
+    let flush_batch = |batch: &mut Vec<ScriptHashRecord>,
+                       heads: &mut std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue>,
+                       n: &mut u64|
+     -> Result<(), StoreError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let (w, _) = store.scripthash.put_create_batch_append(batch, heads)?;
+        *n = n.saturating_add(w as u64);
+        batch.clear();
+        heads.clear();
+        Ok(())
+    };
+
     for_each_merged_rec_opts(runs, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
             return Err(StoreError::Cancelled("scripthash deferred apply"));
@@ -713,13 +757,34 @@ fn apply_runs_to_live_sh(
         if tx_fk.is_null() {
             return Ok(());
         }
-        store
-            .scripthash
-            .put_create(&ScriptHashRecord::from_fk(sh, tx_fk))?;
-        n = n.saturating_add(1);
+        recs_seen = recs_seen.saturating_add(1);
+        batch.push(ScriptHashRecord::from_fk(sh, tx_fk));
+        if batch.len() >= DEFERRED_APPLY_BATCH {
+            flush_batch(&mut batch, &mut heads, &mut n)?;
+        }
+        if last_log.elapsed() >= DEFERRED_STATUS_INTERVAL {
+            last_log = Instant::now();
+            let pct = if total_recs > 0 {
+                (100.0 * recs_seen as f64 / total_recs as f64).clamp(0.0, 99.9)
+            } else {
+                0.0
+            };
+            let secs = t0.elapsed().as_secs_f64().max(1e-3);
+            info!(
+                "node: scripthash deferred warm apply status recs≈{recs_seen}/{total_recs} \
+                 pct≈{pct:.1}% written≈{n} rate≈{:.0}rec/s elapsed={:?}",
+                recs_seen as f64 / secs,
+                t0.elapsed()
+            );
+        }
         Ok(())
     })?;
+    flush_batch(&mut batch, &mut heads, &mut n)?;
     store.scripthash.flush()?;
+    info!(
+        "node: scripthash deferred warm apply done written≈{n} recs≈{recs_seen} elapsed={:?}",
+        t0.elapsed()
+    );
     Ok(n)
 }
 

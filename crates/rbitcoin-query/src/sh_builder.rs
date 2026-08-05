@@ -505,39 +505,6 @@ impl ShRunBuilder {
         self.inner.lock().unwrap().pending.len()
     }
 
-    /// Pending memtable + L0 body bytes not yet cataloged (Class A recollect pressure).
-    pub fn unspilled_body_bytes(&self) -> u64 {
-        let g = self.inner.lock().unwrap();
-        (g.pending.len() as u64)
-            .saturating_mul(u64::from(SH_RUN_REC_LEN))
-            .saturating_add(g.l0_bytes)
-    }
-
-    /// Target body size before force-promote during Class A recollect.
-    ///
-    /// Defaults to **≥ promote_min (0.75 × target run)** so catalog runs are large
-    /// enough that `compact_catalog_undersized` does not pairwise rewrite a growing
-    /// multi‑100 MiB file after every tiny spill (was ~2.4 MiB = 64k×40 B).
-    /// Override: `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` (min 64 MiB).
-    pub fn recollect_spill_target_bytes() -> u64 {
-        const FLOOR: u64 = 64 * 1024 * 1024;
-        if let Ok(s) = std::env::var("RBITCOIN_SH_RECOLLECT_SPILL_BYTES") {
-            if let Ok(n) = s.parse::<u64>() {
-                return n.max(FLOOR);
-            }
-        }
-        promote_min_bytes(target_run_bytes()).max(FLOOR)
-    }
-
-    /// [`Self::drain_spills`] only when unspilled body ≥ `min_bytes` (0 = always).
-    pub fn drain_spills_if_at_least(&self, min_bytes: u64) -> Result<bool, StoreError> {
-        if min_bytes > 0 && self.unspilled_body_bytes() < min_bytes {
-            return Ok(false);
-        }
-        self.drain_spills()?;
-        Ok(true)
-    }
-
     pub fn enqueue(&self, creates: &[ScriptHashRecord]) {
         if !self.is_enabled() || creates.is_empty() {
             return;
@@ -1620,9 +1587,6 @@ mod tests {
             creates.push(ScriptHashRecord::from_fk(sh, Fk(i)));
         }
         b.enqueue(&creates);
-        // Tiny unspilled: threshold drain must no-op; force drain advances SEAL.
-        assert!(!b.drain_spills_if_at_least(64 * 1024 * 1024).unwrap());
-        assert_eq!(b.sealed_max_create_fk(), 0);
         b.drain_spills().unwrap();
         assert!(
             b.sealed_max_create_fk() >= 50,
@@ -1633,7 +1597,11 @@ mod tests {
         let before = b.enqueued.load(Ordering::Relaxed);
         b.enqueue(&creates);
         assert_eq!(b.enqueued.load(Ordering::Relaxed), before);
-        assert!(ShRunBuilder::recollect_spill_target_bytes() >= 64 * 1024 * 1024);
+        // Parallel recollect path: direct catalog spill.
+        let mut more = vec![ScriptHashRecord::from_fk([0xee; 32], Fk(99))];
+        let (mfk, n) = b.spill_creates_catalog(&mut more).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(mfk, 99);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,20 +1,17 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
-//! Schema **13+** fused FdOnly machine on **one** TLS [`UringSession`]:
-//! 1. **probe** — page-coalesced `tx.head` loads on the same session → candidates
-//! 2. **STAGE_ID** — `txid.body` sidefile identity (32 B) per cand, depth-first
-//! 3. **STAGE_IDX** — `tx.idx` OS-page pread → `(body_off, body_len)` for the hit
-//! 4. **denserels** (optional second wave) — packed body when outs are needed
+//! Schema **13+** fused FdOnly machine on **one** TLS [`UringSession`], **two waves**:
+//! 1. **Hot probe** — page-coalesced loads for non-DONTCACHE segs (ages ≤3) → cands
+//! 2. **STAGE_ID / STAGE_IDX** — sidefile identity + idx range (depth-first)
+//! 3. If any key still unmatched: **cold probe** (DONTCACHE segs ages ≥4) for
+//!    survivors only → full cand list (no per-seg short-circuit) → ID/IDX again
+//! 4. **denserels** (optional) — packed body when outs are needed
 //!
-//! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: same per-key
-//! pipeline, **stops after STAGE_IDX**, returns `(fk, body_range)` so prep can
-//! denserels-load by offset without re-idx.
+//! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
+//! STAGE_IDX, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
-//! **IO shape:** one `with_thread_local` owns the ring for the whole resolve.
-//! Nested TLS uring is a hard error — probe and idx never call bulk_io's
-//! `with_thread_local` while this machine holds the session. Up to
-//! [`MAX_IN_FLIGHT`] keys in flight for ID/IDX; each key walks cands
-//! **depth-first** (hit → STAGE_IDX → done; miss → next cand).
+//! **IO shape:** one `with_thread_local` owns the ring for both waves. Nested TLS
+//! uring is a hard error. Up to [`MAX_IN_FLIGHT`] keys in flight for ID/IDX.
 //!
 //! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
 
@@ -107,7 +104,7 @@ pub fn resolve_fk_and_denserels_batch(
     }
 }
 
-// ── pread: depth-first per key (no cross-key depth rounds) ──────────────────
+// ── pread: two-wave (hot → ID; cold survivors → ID) ─────────────────────────
 
 fn resolve_fk_and_range_pread(
     table: &TxTable,
@@ -116,38 +113,109 @@ fn resolve_fk_and_range_pread(
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
-    let t_probe = Instant::now();
-    let all_cands = table.head.probe_candidates_batch(&mixed)?;
-    let probe_ns = t_probe.elapsed().as_nanos() as u64;
-    let cands_total: u64 = all_cands.iter().map(|c| c.len() as u64).sum();
-    crate::head_resolve_stats::add_probe(probe_ns);
-    crate::head_resolve_stats::add_cands(cands_total);
-
     let side = table.txid_sidefile();
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
     let mut idx_ns = 0u64;
+    let mut probe_ns = 0u64;
+    let mut cands_total = 0u64;
 
-    for (ki, cands) in all_cands.iter().enumerate() {
+    // Wave 1: hot (cacheable) head segments.
+    let t_probe = Instant::now();
+    let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
+    probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+    cands_total = cands_total.saturating_add(hot_cands.iter().map(|c| c.len() as u64).sum());
+    id_idx_wave_pread(
+        table,
+        txids,
+        &hot_cands,
+        side,
+        &mut winner,
+        /*skip_if_won=*/ false,
+        &mut body_lookups,
+        &mut miss_peeks,
+        &mut id_ns,
+        &mut idx_ns,
+    )?;
+
+    // Wave 2: full cold depth for keys that missed hot (no further short-circuit).
+    let mut need_cold = false;
+    let mut active = vec![false; txids.len()];
+    for (i, w) in winner.iter().enumerate() {
+        if w.is_none() {
+            active[i] = true;
+            need_cold = true;
+        }
+    }
+    if need_cold {
+        let t_probe = Instant::now();
+        let cold_cands = table.head.probe_candidates_batch_cold(&mixed, &active)?;
+        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+        cands_total = cands_total.saturating_add(cold_cands.iter().map(|c| c.len() as u64).sum());
+        id_idx_wave_pread(
+            table,
+            txids,
+            &cold_cands,
+            side,
+            &mut winner,
+            /*skip_if_won=*/ true,
+            &mut body_lookups,
+            &mut miss_peeks,
+            &mut id_ns,
+            &mut idx_ns,
+        )?;
+    }
+
+    crate::head_resolve_stats::add_probe(probe_ns);
+    crate::head_resolve_stats::add_cands(cands_total);
+    crate::head_resolve_stats::add_body(id_ns);
+    crate::head_resolve_stats::add_idx(idx_ns);
+    crate::head_resolve_stats::add_body_lookups(body_lookups);
+    crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+
+    Ok(txids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, winner[i]))
+        .collect())
+}
+
+/// Depth-first sidefile + idx for each key's cand list (pread).
+fn id_idx_wave_pread(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    cands_by_key: &[Vec<Fk>],
+    side: &TxidBody,
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    skip_if_won: bool,
+    body_lookups: &mut u64,
+    miss_peeks: &mut u64,
+    id_ns: &mut u64,
+    idx_ns: &mut u64,
+) -> Result<(), StoreError> {
+    for (ki, cands) in cands_by_key.iter().enumerate() {
+        if skip_if_won && winner[ki].is_some() {
+            continue;
+        }
         for (rank0, &fk) in cands.iter().enumerate() {
             let rank = (rank0 + 1) as u64;
             let t_id = Instant::now();
             let got = match side.get(fk) {
                 Ok(t) => t,
                 Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {
-                    id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-                    miss_peeks = miss_peeks.saturating_add(1);
-                    body_lookups = body_lookups.saturating_add(1);
+                    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+                    *miss_peeks = miss_peeks.saturating_add(1);
+                    *body_lookups = body_lookups.saturating_add(1);
                     continue;
                 }
                 Err(e) => return Err(e),
             };
-            id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-            body_lookups = body_lookups.saturating_add(1);
+            *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+            *body_lookups = body_lookups.saturating_add(1);
             if got != txids[ki] {
-                miss_peeks = miss_peeks.saturating_add(1);
+                *miss_peeks = miss_peeks.saturating_add(1);
                 continue;
             }
             crate::head_resolve_stats::add_hit_rank(rank);
@@ -159,21 +227,11 @@ fn resolve_fk_and_range_pread(
                 Ok(_) | Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
                 Err(e) => return Err(e),
             }
-            idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-            break; // depth-first short-circuit
+            *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+            break; // depth-first short-circuit within this wave's cands
         }
     }
-
-    crate::head_resolve_stats::add_body(id_ns);
-    crate::head_resolve_stats::add_idx(idx_ns);
-    crate::head_resolve_stats::add_body_lookups(body_lookups);
-    crate::head_resolve_stats::add_miss_peeks(miss_peeks);
-
-    Ok(txids
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, winner[i]))
-        .collect())
+    Ok(())
 }
 
 fn resolve_denserels_pread(
@@ -262,46 +320,142 @@ fn resolve_fk_and_range_uring_on(
     let side_fd: RawFd = side.body_read_fd();
     let side_path = side.file_path().to_path_buf();
     let count = table.body.count();
-
-    // ── Stage: head page probe on this session (page-coalesced) ───────────
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
-    let t_probe = Instant::now();
-    let all_cands = table
-        .head
-        .probe_candidates_batch_on_session(&mixed, session)?;
-    let probe_ns = t_probe.elapsed().as_nanos() as u64;
-    let cands_u64: Vec<Vec<u64>> = all_cands
-        .into_iter()
-        .map(|v| v.into_iter().map(|f| f.0).collect())
-        .collect();
-    let cands_total: u64 = cands_u64.iter().map(|v| v.len() as u64).sum();
 
-    // Ring is idle after streaming probe (probe drains before return).
-    debug_assert_eq!(session.in_flight(), 0);
-
-    // ── Stages STAGE_ID + STAGE_IDX: depth-first per key, many in flight ──
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
-    let mut done = vec![false; txids.len()];
-    let mut next_key = 0usize;
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
     let mut idx_ns = 0u64;
+    let mut probe_ns = 0u64;
+    let mut cands_total = 0u64;
 
+    // ── Wave 1: hot head pages + ID/IDX ───────────────────────────────────
+    let t_probe = Instant::now();
+    let hot_cands = table
+        .head
+        .probe_candidates_batch_hot_on_session(&mixed, session)?;
+    probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+    let hot_u64: Vec<Vec<u64>> = hot_cands
+        .into_iter()
+        .map(|v| v.into_iter().map(|f| f.0).collect())
+        .collect();
+    cands_total = cands_total.saturating_add(hot_u64.iter().map(|v| v.len() as u64).sum());
+    debug_assert_eq!(session.in_flight(), 0);
+
+    id_idx_wave_uring(
+        session,
+        table,
+        txids,
+        &hot_u64,
+        side,
+        side_fd,
+        &side_path,
+        count,
+        &mut winner,
+        /*only_unset=*/ false,
+        &mut body_lookups,
+        &mut miss_peeks,
+        &mut id_ns,
+        &mut idx_ns,
+    )?;
+
+    // ── Wave 2: full cold head for survivors + ID/IDX (no further SC) ─────
+    let mut need_cold = false;
+    let mut active = vec![false; txids.len()];
+    for (i, w) in winner.iter().enumerate() {
+        if w.is_none() {
+            active[i] = true;
+            need_cold = true;
+        }
+    }
+    if need_cold {
+        let t_probe = Instant::now();
+        let cold_cands = table.head.probe_candidates_batch_cold_on_session(
+            &mixed,
+            &active,
+            session,
+        )?;
+        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+        let cold_u64: Vec<Vec<u64>> = cold_cands
+            .into_iter()
+            .map(|v| v.into_iter().map(|f| f.0).collect())
+            .collect();
+        cands_total = cands_total.saturating_add(cold_u64.iter().map(|v| v.len() as u64).sum());
+        debug_assert_eq!(session.in_flight(), 0);
+
+        id_idx_wave_uring(
+            session,
+            table,
+            txids,
+            &cold_u64,
+            side,
+            side_fd,
+            &side_path,
+            count,
+            &mut winner,
+            /*only_unset=*/ true,
+            &mut body_lookups,
+            &mut miss_peeks,
+            &mut id_ns,
+            &mut idx_ns,
+        )?;
+    }
+
+    crate::head_resolve_stats::add_probe(probe_ns);
+    crate::head_resolve_stats::add_idx(idx_ns);
+    crate::head_resolve_stats::add_body(id_ns);
+    crate::head_resolve_stats::add_cands(cands_total);
+    crate::head_resolve_stats::add_body_lookups(body_lookups);
+    crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+
+    Ok(txids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, winner[i]))
+        .collect())
+}
+
+/// One ID/IDX wave on a held session for the given cand lists.
+///
+/// When `only_unset` is true, keys that already have a winner are skipped
+/// (wave-2 cold pass after hot hits).
+fn id_idx_wave_uring(
+    session: &mut UringSession,
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    cands_u64: &[Vec<u64>],
+    side: &TxidBody,
+    side_fd: RawFd,
+    side_path: &std::path::Path,
+    count: u64,
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    only_unset: bool,
+    body_lookups: &mut u64,
+    miss_peeks: &mut u64,
+    id_ns: &mut u64,
+    idx_ns: &mut u64,
+) -> Result<(), StoreError> {
+    let mut done = vec![false; txids.len()];
+    if only_unset {
+        for (i, w) in winner.iter().enumerate() {
+            if w.is_some() {
+                done[i] = true;
+            }
+        }
+    }
+    let mut next_key = 0usize;
     let mut free_slots: Vec<usize> = (0..MAX_IN_FLIGHT).collect();
     // SQE destinations declared *before* the drain guard: on Err/unwind the
     // guard drops first (drains ring) while these buffers are still live.
-    // Prior bug: Err return dropped KeyWork buffers with SQEs still in flight
-    // → kernel wrote into freed memory → SIGSEGV.
     let mut slots: Vec<Option<KeyWork>> = (0..MAX_IN_FLIGHT).map(|_| None).collect();
     let mut in_flight = 0usize;
-    // Holds exclusive session access for the ID/IDX wave; drains on drop.
     let mut ring = DrainSessionOnDrop(session);
 
     arm_keys(
         table,
         txids,
-        &cands_u64,
+        cands_u64,
         side,
         &mut ring,
         side_fd,
@@ -311,7 +465,7 @@ fn resolve_fk_and_range_uring_on(
         &mut in_flight,
         &mut next_key,
         &mut done,
-        &mut id_ns,
+        id_ns,
     )?;
     ring.sync_submission();
     let _ = ring.submit();
@@ -335,8 +489,8 @@ fn resolve_fk_and_range_uring_on(
 
             match kind {
                 STAGE_ID => {
-                    id_ns = id_ns.saturating_add(wait_ns);
-                    body_lookups = body_lookups.saturating_add(1);
+                    *id_ns = id_ns.saturating_add(wait_ns);
+                    *body_lookups = body_lookups.saturating_add(1);
                     let outcome = on_stage_id(
                         table,
                         txids,
@@ -345,14 +499,14 @@ fn resolve_fk_and_range_uring_on(
                         &mut ring,
                         side,
                         side_fd,
-                        &side_path,
+                        side_path,
                         count,
                         res,
-                        &mut id_ns,
-                        &mut idx_ns,
-                        &mut winner,
+                        id_ns,
+                        idx_ns,
+                        winner,
                         &mut done,
-                        &mut miss_peeks,
+                        miss_peeks,
                     )?;
                     match outcome {
                         SqeOutcome::SqePushed => in_flight += 1,
@@ -363,7 +517,7 @@ fn resolve_fk_and_range_uring_on(
                     }
                 }
                 STAGE_IDX => {
-                    idx_ns = idx_ns.saturating_add(wait_ns);
+                    *idx_ns = idx_ns.saturating_add(wait_ns);
                     let outcome = on_stage_idx(
                         table,
                         &mut slots,
@@ -373,11 +527,11 @@ fn resolve_fk_and_range_uring_on(
                         side_fd,
                         count,
                         res,
-                        &mut id_ns,
-                        &mut idx_ns,
-                        &mut winner,
+                        id_ns,
+                        idx_ns,
+                        winner,
                         &mut done,
-                        &mut miss_peeks,
+                        miss_peeks,
                     )?;
                     match outcome {
                         SqeOutcome::SqePushed => in_flight += 1,
@@ -394,7 +548,7 @@ fn resolve_fk_and_range_uring_on(
         arm_keys(
             table,
             txids,
-            &cands_u64,
+            cands_u64,
             side,
             &mut ring,
             side_fd,
@@ -404,27 +558,14 @@ fn resolve_fk_and_range_uring_on(
             &mut in_flight,
             &mut next_key,
             &mut done,
-            &mut id_ns,
+            id_ns,
         )?;
         ring.sync_submission();
         let _ = ring.submit();
     }
 
-    // Drain before slots drop (also runs on Err/unwind via Drop).
     drop(ring);
-
-    crate::head_resolve_stats::add_probe(probe_ns);
-    crate::head_resolve_stats::add_idx(idx_ns);
-    crate::head_resolve_stats::add_body(id_ns);
-    crate::head_resolve_stats::add_cands(cands_total);
-    crate::head_resolve_stats::add_body_lookups(body_lookups);
-    crate::head_resolve_stats::add_miss_peeks(miss_peeks);
-
-    Ok(txids
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, winner[i]))
-        .collect())
+    Ok(())
 }
 
 /// Drain the session on drop while caller-held SQE buffers are still live.
@@ -827,6 +968,10 @@ fn arm_keys(
     {
         let key_i = *next_key;
         *next_key += 1;
+        // Wave-2: winners already marked done; skip without taking a slot.
+        if done[key_i] {
+            continue;
+        }
         let slot = free_slots.pop().unwrap();
         let cands = cands_by_key[key_i].clone();
         if cands.is_empty() {
@@ -925,6 +1070,61 @@ mod tests {
                 assert_eq!(t.body.record_range(*fk).unwrap(), *range);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a small (no cold segs) store, hot∪cold cands equal full probe.
+    #[test]
+    fn hot_plus_cold_cands_match_full_probe() {
+        let (dir, t, txids) = seed_table(24);
+        let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
+        let full = t.head.probe_candidates_batch(&mixed).unwrap();
+        let hot = t.head.probe_candidates_batch_hot(&mixed).unwrap();
+        let active = vec![true; mixed.len()];
+        let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
+        assert_eq!(full.len(), hot.len());
+        for i in 0..full.len() {
+            let mut merged = hot[i].clone();
+            merged.extend(cold[i].iter().copied());
+            assert_eq!(merged, full[i], "key {i}");
+        }
+        // Tiny store: everything is hot; cold must be empty.
+        assert!(cold.iter().all(|c| c.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn miss_and_deepest_create_wins() {
+        let dir = tmp("bip30");
+        let t = TxTable::create(&dir).unwrap();
+        let txid = [0xcd; 32];
+        let mk = |hint: u8| {
+            (
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![hint],
+                    witness: vec![],
+                }],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            )
+        };
+        let _fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+        let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+        let got = resolve_fk_and_range_batch(&t, &[txid, [0xff; 32]]).unwrap();
+        assert_eq!(got[0].1.map(|(f, _)| f), Some(fk2));
+        assert_eq!(got[1].1, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

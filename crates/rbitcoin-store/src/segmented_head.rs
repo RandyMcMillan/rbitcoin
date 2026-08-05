@@ -405,7 +405,37 @@ impl SegmentedTxHead {
         self.persist_meta_locked()?;
         Ok(())
     }
+}
 
+/// Which head segments to probe (two-wave resolve vs full baseline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadProbeWave {
+    /// Open + all sealed (legacy full probe).
+    All,
+    /// Non-DONTCACHE only (ages ≤3): open + up to 3 sealed.
+    Hot,
+    /// DONTCACHE sealed only (ages ≥4).
+    Cold,
+}
+
+impl HeadProbeWave {
+    #[inline]
+    fn includes_hot(self) -> bool {
+        matches!(self, HeadProbeWave::All | HeadProbeWave::Hot)
+    }
+
+    /// `dc` = [`crate::dontcache_policy::head_or_idx_segment_index`] for the seg.
+    #[inline]
+    fn includes_seg(self, dontcache: bool) -> bool {
+        match self {
+            HeadProbeWave::All => true,
+            HeadProbeWave::Hot => !dontcache,
+            HeadProbeWave::Cold => dontcache,
+        }
+    }
+}
+
+impl SegmentedTxHead {
     /// Probe absolute create_fk candidates for a mixed key (open → sealed new→old).
     ///
     /// Order within each segment: deepest probe first is applied by reversing
@@ -422,7 +452,7 @@ impl SegmentedTxHead {
     /// Sealed segments still fuse-gate per key; only keys that pass are batched
     /// for that segment's page loads. Page IO uses TLS bulk_io.
     pub fn probe_candidates_batch(&self, mixed: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None)
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::All, None)
     }
 
     /// Same as [`Self::probe_candidates_batch`] but head page preads use the
@@ -432,38 +462,97 @@ impl SegmentedTxHead {
         mixed: &[[u8; 32]],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session))
+        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::All, None)
+    }
+
+    /// Two-wave resolve: probe only **hot** (non-DONTCACHE) segments for all keys.
+    pub(crate) fn probe_candidates_batch_hot(
+        &self,
+        mixed: &[[u8; 32]],
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Hot, None)
+    }
+
+    /// Two-wave resolve: hot probe on a held plan TLS session.
+    pub(crate) fn probe_candidates_batch_hot_on_session(
+        &self,
+        mixed: &[[u8; 32]],
+        session: &mut crate::uring_session::UringSession,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Hot, None)
+    }
+
+    /// Two-wave resolve: probe only **cold** (DONTCACHE) segments for keys where
+    /// `active[i]` is true (wave-1 misses). Inactive keys get empty cand lists.
+    pub(crate) fn probe_candidates_batch_cold(
+        &self,
+        mixed: &[[u8; 32]],
+        active: &[bool],
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Cold, Some(active))
+    }
+
+    /// Two-wave resolve: cold probe on a held plan TLS session.
+    pub(crate) fn probe_candidates_batch_cold_on_session(
+        &self,
+        mixed: &[[u8; 32]],
+        active: &[bool],
+        session: &mut crate::uring_session::UringSession,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Cold, Some(active))
     }
 
     fn probe_candidates_batch_inner(
         &self,
         mixed: &[[u8; 32]],
         mut session: Option<&mut crate::uring_session::UringSession>,
+        wave: HeadProbeWave,
+        active: Option<&[bool]>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n = mixed.len();
         let mut out = vec![Vec::new(); n];
         if n == 0 {
             return Ok(out);
         }
+        if let Some(a) = active {
+            if a.len() != n {
+                return Err(StoreError::Corrupt("probe active mask len"));
+            }
+        }
         let segs = self.segments_snapshot();
         if segs.is_empty() {
             return Ok(out);
         }
 
+        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
+
         let n_segs = segs.len();
         let last = segs.last().unwrap();
-        if !last.sealed {
-            LOOKUP_OPEN.fetch_add(n as u64, Ordering::Relaxed);
-            // Open segment = tip (age 0) → never DONTCACHE.
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(n_segs - 1, n_segs);
-            let rel_lists = match session.as_mut() {
-                Some(s) => last.head.probe_fks_batch_dontcache_on_session(mixed, dc, s)?,
-                None => last.head.probe_fks_batch_dontcache(mixed, dc)?,
-            };
-            for (i, rels) in rel_lists.into_iter().enumerate() {
-                for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
-                        out[i].push(fk);
+        // Open is always age 0 → never DONTCACHE → hot only (not cold).
+        if !last.sealed && wave.includes_hot() {
+            let mut pass_i: Vec<usize> = Vec::new();
+            let mut pass_keys: Vec<[u8; 32]> = Vec::new();
+            for i in 0..n {
+                if !key_on(i) {
+                    continue;
+                }
+                pass_i.push(i);
+                pass_keys.push(mixed[i]);
+            }
+            if !pass_keys.is_empty() {
+                LOOKUP_OPEN.fetch_add(pass_keys.len() as u64, Ordering::Relaxed);
+                let dc = crate::dontcache_policy::head_or_idx_segment_index(n_segs - 1, n_segs);
+                let rel_lists = match session.as_mut() {
+                    Some(s) => last
+                        .head
+                        .probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
+                    None => last.head.probe_fks_batch_dontcache(&pass_keys, dc)?,
+                };
+                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                    for r in rels.into_iter().rev() {
+                        if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
+                            out[orig_i].push(fk);
+                        }
                     }
                 }
             }
@@ -481,6 +570,10 @@ impl SegmentedTxHead {
             if !seg.sealed {
                 continue;
             }
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
+            if !wave.includes_seg(dc) {
+                continue;
+            }
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };
@@ -488,6 +581,9 @@ impl SegmentedTxHead {
             let mut pass_i: Vec<usize> = Vec::new();
             let mut pass_keys: Vec<[u8; 32]> = Vec::new();
             for (i, m) in mixed.iter().enumerate() {
+                if !key_on(i) {
+                    continue;
+                }
                 LOOKUP_FUSE_CHK.fetch_add(1, Ordering::Relaxed);
                 let fuse_key = fuse_key_from_mixed(m);
                 if !fuse.contains(fuse_key) {
@@ -501,7 +597,6 @@ impl SegmentedTxHead {
             if pass_keys.is_empty() {
                 continue;
             }
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             let rel_lists = match session.as_mut() {
                 Some(s) => seg.head.probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
                 None => seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?,

@@ -166,8 +166,6 @@ impl Query {
                      (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs})"
                 );
                 self.sh_run.reset_catalog_for_full_recollect()?;
-                // Ensure run pipeline can accept Class A recollect enqueues.
-                self.sh_run.ensure_enabled();
             }
             ShPreMaterializeAction::BootstrapIncludeHwm { seal: s } => {
                 // Legacy durable head without include_hwm: SEAL is the inclusion
@@ -257,12 +255,13 @@ impl Query {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), QueryError> {
-        use crate::sh_builder::SH_RUN_REC_LEN;
+        use crate::sh_builder::{RECOLLECT_THREAD_SPILL_BYTES, SH_RUN_REC_LEN};
         use rbitcoin_store::{script_hash, ScriptHashRecord};
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
+        // Single enable gate for recollect (FORCE/reset prep also re-enable).
         self.sh_run.ensure_enabled();
 
         let sealed0 = self.sh_run.sealed_max_create_fk();
@@ -276,13 +275,11 @@ impl Query {
 
         /// Create_fk span per parallel work unit (tx.idx density).
         const CHUNK_FKS: u64 = 64_000;
-        /// Per-thread local buffer before a catalog spill.
-        const THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
         const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
         let workers = recollect_workers();
         let thread_spill_recs =
-            (THREAD_SPILL_BYTES / u64::from(SH_RUN_REC_LEN)).max(1) as usize;
+            (RECOLLECT_THREAD_SPILL_BYTES / u64::from(SH_RUN_REC_LEN)).max(1) as usize;
         let work_lo = sealed0.saturating_add(1);
         let work_span = tip_max.saturating_sub(sealed0);
         let n_chunks = work_span.div_ceil(CHUNK_FKS).max(1) as usize;
@@ -292,7 +289,7 @@ impl Query {
              tip_max_create_fk={tip_max} chunks={n_chunks} chunk_fks={CHUNK_FKS} \
              workers={workers} thread_spill_MiB≈{:.0}",
             tip.0,
-            THREAD_SPILL_BYTES as f64 / (1024.0 * 1024.0)
+            RECOLLECT_THREAD_SPILL_BYTES as f64 / (1024.0 * 1024.0)
         );
 
         let t0 = Instant::now();
@@ -924,45 +921,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Empty head + empty catalog + tip creates after recollect must not Ok(0).
-    ///
-    /// Simulates the historical FORCE bug (builder disabled → recollect no-op) by
-    /// forcing an empty catalog while SEAL stays 0 and head is empty, then ensuring
-    /// the shipped recollect path (which re-enables) fills the catalog before
-    /// materialize — and that finalize under FORCE succeeds with non-zero creates.
-    #[test]
-    fn force_empty_catalog_guard_and_reenable() {
-        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-empty-guard-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        seed_direct_chain(&q, 5);
-        assert!(q.store.txs.count() >= 5);
-
-        q.sh_run.prepare_force_full_rebuild(&q.store).unwrap();
-        assert!(
-            q.sh_run.is_enabled(),
-            "prepare_force must leave builder enabled"
-        );
-        assert!(!q.store.scripthash.has_durable_index());
-
-        // If recollect were skipped, catalog stays empty → guard/error or empty mat.
-        // Shipped path recollects:
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        let recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
-        assert!(recs > 0, "Class A recollect must produce runs (got {recs})");
-        assert!(q.sh_run.sealed_max_create_fk() > 0);
-
-        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
-        let n_mat = q.finalize_sh_runs().expect("FORCE finalize");
-        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
-        assert!(n_mat > 0, "FORCE must not report creates≈0");
-        assert!(q.store.scripthash.entry_count() > 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

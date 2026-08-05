@@ -142,12 +142,13 @@ runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**eve
 10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
 `catalog_complete` / `seal` / `tip_max_fk`. **Full cold reinit only if the SH
 head is empty** (or force rebuild); a nearly complete index with residual runs
-uses **warm batch apply** only. **`RBITCOIN_SH_FORCE_REBUILD=1`:** clears
-runs/SEAL/include_hwm/cold_progress, reinit head, recollect **all** Class A
-creates (SEAL=0 → stream `tx.body` into SH runs with ~10s status logs; cancel
-advances durable SEAL so restart resumes), then cold materialize — not a
-catch-up tail. Empty catalog after recollect while Class A remains is an error
-(never silent `creates≈0` on a zeroed head).
+uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large catalog spills; tip Class A
+recollect is parallel (~64k-fk chunks, ~128 MiB per-thread spills, contiguous
+SEAL prefix for resume); tip materialize is WarmOnly / ColdResume / FullCold.
+Catalog compact only rewrites **crumbs** (&lt;~96 MiB), not intentional recollect
+spills (tip k-ways those directly). **`RBITCOIN_SH_FORCE_REBUILD=1`:** wipe head
++ runs + SEAL/HWM, full Class A recollect + cold load — never silent `creates≈0`
+while Class A still has work. Long recollect/materialize: ~10s status logs.
 Incomplete catalog (high SEAL + tiny run mass, or consumed runs with no head)
 on an **empty** head triggers full Class A recollect (SEAL=0). **Durable head**
 never uses run-mass incompleteness (empty runs after successful materialize are

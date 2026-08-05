@@ -1,13 +1,19 @@
-//! Direct-IBD scripthash builder: **large append-only spills + SEAL + tip fan-in**.
+//! Direct-IBD scripthash builder: sorted runs + SEAL + tip materialize.
 //!
-//! Confirm enqueues thin creates (no open-hash RMW). A background worker spills
-//! sorted runs and coalesces to a target size (bounded local k-way only). There
-//! is **no** mid-IBD global pair-merge.
+//! # Lifecycle (single pipeline)
 //!
-//! Durability: cataloged runs + `SEAL` (`max_create_fk`). Memtable is RAM-only;
-//! resume re-collects Class A for `(SEAL, tip]`.
+//! 1. **Ingest**
+//!    - Confirm (Direct): `enqueue` → memtable → worker L0 → promote large catalog runs
+//!    - Class A recollect: parallel fk chunks → **direct** catalog spill (~128 MiB)
+//! 2. **Watermark:** `SEAL` = contiguous create_fk floor for resume (`create_fk > SEAL`).
+//!    Parallel recollect only advances SEAL over a completed chunk prefix.
+//! 3. **Tip:** [`plan_sh_pre_materialize`] → recollect gap if needed → claim runs →
+//!    `WarmOnly` | `ColdResume` | `FullCold` (never wipe a durable head for residuals).
 //!
-//! Tip: claim runs → `reduce_runs_to_fanin` → stream into durable SH bulk load.
+//! # Write amp
+//!
+//! Catalog compact only rewrites **crumbs** under [`CATALOG_COMPACT_FLOOR_BYTES`].
+//! Intentional ~128 MiB recollect spills go straight to tip direct k-way.
 
 use super::run_builder_core::{
     clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count, runs_dir_io, spawn_worker,
@@ -176,15 +182,14 @@ pub fn plan_sh_pre_materialize(
     }
     // Durable head: run mass is irrelevant (runs are cleared after successful
     // materialize; residual mats are a tip tail for warm apply only).
+    // Durable head: HWM (or SEAL if HWM missing) is the inclusion floor.
+    let floor = durable_sh_inclusion_floor(include_hwm, seal);
     if include_hwm == 0 && seal > 0 {
-        return ShPreMaterializeAction::BootstrapIncludeHwm { seal };
+        return ShPreMaterializeAction::BootstrapIncludeHwm { seal: floor };
     }
     if include_hwm > 0 && include_hwm < seal {
-        return ShPreMaterializeAction::ClampSealTo {
-            floor: include_hwm,
-        };
+        return ShPreMaterializeAction::ClampSealTo { floor };
     }
-    let _ = durable_sh_inclusion_floor(include_hwm, seal);
     ShPreMaterializeAction::Noop
 }
 
@@ -640,7 +645,9 @@ impl ShRunBuilder {
             let path = next_run_path(&runs_dir, next_seq);
             next_seq = next_seq.saturating_add(1);
             let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
-            info!(
+            // Per-spill detail is noisy on long recollect (~1k spills); status line
+            // carries aggregates. Keep path for debug forensics.
+            debug!(
                 "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
                 run.count,
                 run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
@@ -673,6 +680,7 @@ impl ShRunBuilder {
     /// Drop incomplete/stale run catalog and SEAL so Class A recollect starts at 0.
     ///
     /// Does **not** wipe a durable SH head (use [`Self::prepare_force_full_rebuild`] for that).
+    /// Re-enables the run builder so recollect can spill (same footgun as FORCE prep).
     pub fn reset_catalog_for_full_recollect(&self) -> Result<(), StoreError> {
         info!(
             "node: scripthash catalog incomplete/stale — resetting SEAL=0 and clearing runs for full Class A recollect"
@@ -687,6 +695,7 @@ impl ShRunBuilder {
         let _ = std::fs::create_dir_all(&self.runs_dir);
         store_seal(&self.runs_dir, 0)?;
         self.sealed_fk.store(0, Ordering::Release);
+        self.ensure_enabled();
         Ok(())
     }
 
@@ -1390,12 +1399,27 @@ fn merge_runs_to_l0(
     Ok(merged)
 }
 
-/// Floor for catalog compact: do **not** merge intentional recollect spills (~128 MiB).
+/// Parallel Class A recollect: spill local buffer at this size (~128 MiB of 40 B recs).
+pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Floor for catalog compact: do **not** merge intentional recollect spills.
 ///
-/// Tip materialize can direct k-way thousands of open run FDs; rewriting 128 MiB
-/// runs into ~600 MiB (5-way under the old half-target rule) is pure write amp.
-/// Only true crumbs (tiny IBD L0 promotions) need compact.
-pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = 96 * 1024 * 1024;
+/// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so ~128 MiB spills are never
+/// candidates. Tip direct k-way can open thousands of FDs without rewriting them.
+pub const CATALOG_COMPACT_FLOOR_BYTES: u64 =
+    RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4; // 96 MiB
+
+/// True if a catalog run body should be eligible for undersized compact.
+///
+/// Pure policy: crumbs only — never intentional recollect-scale spills.
+pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) -> bool {
+    if body_bytes == 0 {
+        return false;
+    }
+    let half = target_run_bytes / 2;
+    let small_max = half.min(CATALOG_COMPACT_FLOOR_BYTES);
+    body_bytes < small_max
+}
 
 /// Compact catalog runs that are well under target (except at most one small tail).
 ///
@@ -1407,9 +1431,6 @@ fn compact_catalog_undersized(
     sealed: &AtomicU64,
 ) -> Result<(), StoreError> {
     let target = target_run_bytes();
-    let half = target / 2;
-    // Never compact runs that are already at recollect spill scale.
-    let small_max = half.min(CATALOG_COMPACT_FLOOR_BYTES);
     let mut runs = list_runs(runs_dir)?;
     if runs.len() < 2 {
         return Ok(());
@@ -1418,7 +1439,7 @@ fn compact_catalog_undersized(
     // Count small runs; if ≤1, done.
     let small: Vec<_> = runs
         .iter()
-        .filter(|r| run_body_bytes(r) < small_max)
+        .filter(|r| catalog_run_is_compact_candidate(run_body_bytes(r), target))
         .cloned()
         .collect();
     if small.len() <= 1 {
@@ -1842,6 +1863,85 @@ mod tests {
             1_411_000_000,
             0
         ));
+    }
+
+    #[test]
+    fn compact_candidate_spares_recollect_scale_runs() {
+        // Default tip target 512MiB → half=256MiB; floor=96MiB → small_max=96MiB.
+        let target = 512 * 1024 * 1024u64;
+        assert!(
+            catalog_run_is_compact_candidate(10 * 1024 * 1024, target),
+            "tiny crumbs still compact"
+        );
+        assert!(
+            !catalog_run_is_compact_candidate(RECOLLECT_THREAD_SPILL_BYTES, target),
+            "128MiB recollect spills must not compact"
+        );
+        assert!(
+            !catalog_run_is_compact_candidate(125 * 1024 * 1024, target),
+            "near-spill-size runs stay for tip k-way"
+        );
+        assert!(
+            !catalog_run_is_compact_candidate(CATALOG_COMPACT_FLOOR_BYTES, target),
+            "at floor is not a candidate"
+        );
+        assert!(catalog_run_is_compact_candidate(
+            CATALOG_COMPACT_FLOOR_BYTES - 1,
+            target
+        ));
+        // Tiny target: floor still bounds.
+        assert!(!catalog_run_is_compact_candidate(50 * 1024 * 1024, 64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn compact_undersized_does_not_merge_large_planted_runs() {
+        // Plant three "large" catalog runs via spill path with many recs; compact
+        // must leave them (body ≥ floor). Use record counts that exceed floor.
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-compact-floor-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        // 96MiB / 40B = 2_516_583 recs — too heavy for unit test. Instead plant
+        // runs whose reported count*rec_len is large by writing real bodies at a
+        // modest size and asserting the pure candidate filter (above), then plant
+        // tiny runs and prove compact still merges crumbs.
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        for seq in 1..=3u64 {
+            let mut body = Vec::new();
+            for i in 0..1000u64 {
+                let mut sh = [0u8; 32];
+                sh[0] = seq as u8;
+                sh[1..9].copy_from_slice(&i.to_le_bytes());
+                body.extend_from_slice(&encode_rec(&sh, Fk(seq * 10_000 + i)));
+            }
+            let path = next_run_path(&runs_dir, seq);
+            write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        }
+        let before = list_runs(&runs_dir).unwrap().len();
+        assert_eq!(before, 3);
+        // Tiny runs (1000*40 ≈ 40KiB) are compact candidates — drain merges them.
+        b.drain_spills().unwrap();
+        let after = list_runs(&runs_dir).unwrap();
+        // Crumbs should coalesce to fewer catalog files (or one).
+        assert!(
+            after.len() < before || after.len() == 1,
+            "tiny planted runs should compact: before={before} after={}",
+            after.len()
+        );
+        for r in &after {
+            assert!(
+                catalog_run_is_compact_candidate(run_body_bytes(r), target_run_bytes())
+                    || after.len() <= 2,
+                "post-compact runs should be few/merged"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

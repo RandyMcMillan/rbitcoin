@@ -266,35 +266,56 @@ impl Query {
             return Ok(());
         }
 
-        // Spill cadence: keep peak RAM bounded and advance SEAL for resume.
-        const BATCH_CREATES: usize = 64_000;
+        // Soft enqueue chunks (~10 MiB of 40 B records). Do **not** force-promote
+        // each chunk: that wrote ~2.4 MiB catalog runs then compact rewrote the
+        // growing catalog every spill (write amp disaster). Promote only when
+        // unspilled body reaches recollect spill target (default ~0.75× run target).
+        const ENQUEUE_CHUNK: usize = 256_000;
         const STATUS_INTERVAL: Duration = Duration::from_secs(10);
+        let spill_target = crate::sh_builder::ShRunBuilder::recollect_spill_target_bytes();
 
         rbitcoin_log::info!(
             "node: scripthash Class A recollect start seal={sealed0} tip_height={} \
-             tip_max_create_fk={tip_max}",
-            tip.0
+             tip_max_create_fk={tip_max} spill_target_MiB≈{:.0}",
+            tip.0,
+            spill_target as f64 / (1024.0 * 1024.0)
         );
         let t0 = Instant::now();
         let mut last_status = Instant::now();
         let mut batch: Vec<rbitcoin_store::ScriptHashRecord> =
-            Vec::with_capacity(BATCH_CREATES.min(4096));
+            Vec::with_capacity(ENQUEUE_CHUNK.min(65_536));
         let mut n_txs = 0u64;
         let mut n_creates = 0u64;
         let mut max_fk = sealed0;
         let mut heights_scanned = 0u64;
+        let mut n_spills = 0u64;
 
-        let flush_batch = |batch: &mut Vec<ScriptHashRecord>,
-                           sh_run: &crate::sh_builder::ShRunBuilder|
+        let enqueue_chunk = |batch: &mut Vec<rbitcoin_store::ScriptHashRecord>,
+                             sh_run: &crate::sh_builder::ShRunBuilder|
          -> Result<(), QueryError> {
             if batch.is_empty() {
                 return Ok(());
             }
             sh_run.enqueue(batch);
             batch.clear();
-            // force_all promote → durable SEAL bump so cancel/restart is O(remaining).
-            sh_run.drain_spills()?;
-            sh_run.refresh_seal();
+            Ok(())
+        };
+
+        // Promote only when enough unspilled bytes (or force at cancel/end).
+        let maybe_spill = |sh_run: &crate::sh_builder::ShRunBuilder,
+                           force: bool,
+                           n_spills: &mut u64|
+         -> Result<(), QueryError> {
+            let drained = if force {
+                sh_run.drain_spills()?;
+                true
+            } else {
+                sh_run.drain_spills_if_at_least(spill_target)?
+            };
+            if drained {
+                *n_spills = n_spills.saturating_add(1);
+                sh_run.refresh_seal();
+            }
             Ok(())
         };
 
@@ -303,10 +324,11 @@ impl Query {
                 .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                 .unwrap_or(false)
             {
-                flush_batch(&mut batch, &self.sh_run)?;
+                enqueue_chunk(&mut batch, &self.sh_run)?;
+                maybe_spill(&self.sh_run, true, &mut n_spills)?;
                 rbitcoin_log::warn!(
                     "node: scripthash Class A recollect cancelled height={h}/{} \
-                     txs≈{n_txs} creates≈{n_creates} seal={} elapsed={:?}",
+                     txs≈{n_txs} creates≈{n_creates} seal={} spills={n_spills} elapsed={:?}",
                     tip.0,
                     self.sh_run.sealed_max_create_fk(),
                     t0.elapsed()
@@ -334,12 +356,15 @@ impl Query {
                 self.collect_scripthash_creates(Fk(fk), &mut batch, None)?;
                 n_creates = n_creates.saturating_add((batch.len() - before) as u64);
                 max_fk = max_fk.max(fk);
-                if batch.len() >= BATCH_CREATES {
-                    flush_batch(&mut batch, &self.sh_run)?;
+                if batch.len() >= ENQUEUE_CHUNK {
+                    enqueue_chunk(&mut batch, &self.sh_run)?;
+                    maybe_spill(&self.sh_run, false, &mut n_spills)?;
                 }
             }
             if last_status.elapsed() >= STATUS_INTERVAL {
+                self.sh_run.refresh_seal();
                 let seal_now = self.sh_run.sealed_max_create_fk();
+                let unspilled = self.sh_run.unspilled_body_bytes();
                 let elapsed = t0.elapsed();
                 let rate = if elapsed.as_secs_f64() > 0.0 {
                     n_creates as f64 / elapsed.as_secs_f64()
@@ -350,17 +375,18 @@ impl Query {
                     "node: scripthash Class A recollect status height={h}/{} \
                      heights_scanned≈{heights_scanned} txs≈{n_txs} creates≈{n_creates} \
                      max_fk={max_fk} seal={seal_now} tip_max_fk={tip_max} \
-                     rate≈{:.0} creates/s elapsed={:?}",
+                     unspilled_MiB≈{:.1} spills={n_spills} rate≈{:.0} creates/s elapsed={:?}",
                     tip.0,
+                    unspilled as f64 / (1024.0 * 1024.0),
                     rate,
                     elapsed
                 );
                 last_status = Instant::now();
             }
         }
-        flush_batch(&mut batch, &self.sh_run)?;
-        // Final drain (empty batch is no-op; ensure L0 promoted).
-        self.sh_run.drain_spills()?;
+        enqueue_chunk(&mut batch, &self.sh_run)?;
+        // Final force-promote remaining memtable/L0 → catalog + SEAL.
+        maybe_spill(&self.sh_run, true, &mut n_spills)?;
         self.sh_run.refresh_seal();
         let seal_final = self.sh_run.sealed_max_create_fk();
         if n_txs == 0 && n_creates == 0 {
@@ -374,8 +400,9 @@ impl Query {
         rbitcoin_log::info!(
             "node: scripthash Class A recollect done txs≈{n_txs} creates≈{n_creates} \
              seal={sealed0}→{seal_final} max_fk={max_fk} tip_height={} tip_max_fk={tip_max} \
-             elapsed={:?}",
+             spills={n_spills} spill_target_MiB≈{:.0} elapsed={:?}",
             tip.0,
+            spill_target as f64 / (1024.0 * 1024.0),
             t0.elapsed()
         );
         Ok(())

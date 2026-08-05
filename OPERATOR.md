@@ -131,14 +131,17 @@ after Class C. Those two indexes are **complete before tip** — catch-up must
 finish; tip entry does not backfill them. Scripthash is **not** progressively
 materialized into heads: confirm only enqueues sorted runs (background flush +
 merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
-tables before Electrum (the only deferred index work). Tip fan-in reduce logs a
-status line about **every 10s** (`pass=i/P chunks=c/C pct≈…`); parallel chunk
-merges default to **all CPUs** (`RBITCOIN_SH_MERGE_WORKERS`, set `1` for serial).
-**SIGINT during tip SH materialize** is cooperative: stop between chunks/passes
-and leave `scripthash.runs/merge/CHECKPOINT` (last finished pass) or `READY`
-(stream phase); restart resumes without redoing finished reduce work.
-On enter Direct, leftover `ibd_utxo.map` / `point.runs` / `tx.runs` from old
-Catchup datadirs are removed — prefer a **fresh datadir**.
+tables before Electrum (the only deferred index work). Tip SH materialize uses a **single** dynamic fan-in pass (chunk width chosen so
+outputs ≤32 for the final stream), then cold bulk-load. Reduce logs ~**every
+10s** (`pass=1/1 chunks=c/C pct≈…`). Parallel chunk merges default to **all
+CPUs** (`RBITCOIN_SH_MERGE_WORKERS=1` for serial). After each chunk finishes,
+inputs are deleted and `merge/CHECKPOINT` is rewritten (partial-pass resume).
+**SIGINT** is cooperative: keep CHECKPOINT (or READY once stream inputs are
+committed); restart resumes reduce or stream. Catalog runs created while you
+were offline (post-interrupt catch-up) are **deferred** and warm-inserted into
+the SH head **after** cold materialize. On enter Direct, leftover
+`ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
+— prefer a **fresh datadir**.
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** 16 shards, **tx.head** = **segmented** fixed **25-bit**

@@ -19,7 +19,7 @@ use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
     merge_runs, next_run_path, reduce_runs_to_fanin_cancellable, write_sorted_run, ScriptHashEntry,
-    ScriptHashRecord, Store, StoreError, SortedRunPath,
+    ScriptHashRecord, Store, StoreError, SortedRunPath, FANIN_TARGET_STREAM_RUNS,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -346,8 +346,10 @@ impl ShRunBuilder {
 
     /// Like [`Self::finalize_and_bulk_materialize`] with cooperative cancel (SIGINT).
     ///
-    /// Mid-reduce cancel leaves a fan-in **CHECKPOINT** so the next finalize resumes
-    /// from the last completed pass. Mid-stream cancel restarts stream from READY.
+    /// Mid-reduce cancel leaves a per-chunk **CHECKPOINT** (remaining + done outs).
+    /// Catalog runs that appear after materialize starts (catch-up while interrupted)
+    /// are applied to the live SH head **after** cold bulk load — not mixed into
+    /// an in-progress reduce.
     pub fn finalize_and_bulk_materialize_cancellable(
         &self,
         store: &Store,
@@ -367,6 +369,8 @@ impl ShRunBuilder {
         let t_claim = Instant::now();
         let mut claimed: Vec<SortedRunPath> = Vec::new();
         let mut stream_inputs: Vec<SortedRunPath> = Vec::new();
+        // New catalog runs deferred until after cold materialize (post-interrupt catch-up).
+        let mut pending_after: Vec<SortedRunPath> = Vec::new();
         let mut resumed_from_ready = false;
         let mut resume_checkpoint = false;
         {
@@ -375,29 +379,34 @@ impl ShRunBuilder {
             let mut runs = list_runs(&runs_dir)?;
             runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
 
-            // Resume: fan-in finished and claimed inputs already dropped.
-            if prior.is_empty() && runs.is_empty() {
-                if let Some(reduced) = list_fanin_reduce_outputs(&merge_dir)? {
-                    info!(
-                        "node: scripthash resuming fan-in READY outputs ({}) under merge/",
-                        reduced.len()
-                    );
-                    stream_inputs = reduced;
-                    resumed_from_ready = true;
-                }
-            }
+            let ready_out = list_fanin_reduce_outputs(&merge_dir)?;
+            let has_cp = load_fanin_checkpoint(&merge_dir)?.is_some();
 
-            if !resumed_from_ready {
-                // Mid-reduce checkpoint: keep merge/ work; still need claims/mats.
-                if load_fanin_checkpoint(&merge_dir)?.is_some() {
-                    resume_checkpoint = true;
-                    info!(
-                        "node: scripthash resuming fan-in CHECKPOINT (partial reduce progress)"
-                    );
-                } else {
-                    // No checkpoint — discard incomplete merge work only.
-                    let _ = std::fs::remove_dir_all(&merge_dir);
-                }
+            if let Some(reduced) = ready_out {
+                // READY: stream reduced outputs; any new catalog runs are deferred.
+                info!(
+                    "node: scripthash resuming fan-in READY outputs ({}) under merge/",
+                    reduced.len()
+                );
+                stream_inputs = reduced;
+                resumed_from_ready = true;
+                // Leftover claims should not exist after READY; if present, treat as deferred.
+                pending_after.append(&mut prior);
+                pending_after.append(&mut runs);
+            } else if has_cp {
+                // Mid-reduce: resume CHECKPOINT only — do not claim new catalog runs into reduce.
+                resume_checkpoint = true;
+                info!(
+                    "node: scripthash resuming fan-in CHECKPOINT (partial reduce); \
+                     deferring {} new catalog run(s) until after materialize",
+                    runs.len()
+                );
+                pending_after.append(&mut runs);
+                // Old mats may still exist if not yet deleted by chunk merges.
+                claimed.append(&mut prior);
+            } else {
+                // Fresh materialize: claim everything.
+                let _ = std::fs::remove_dir_all(&merge_dir);
                 if !prior.is_empty() {
                     info!(
                         "node: scripthash resuming {} incomplete materialize claim(s)",
@@ -413,44 +422,50 @@ impl ShRunBuilder {
         let claim_ns = t_claim.elapsed().as_nanos() as u64;
 
         if !resumed_from_ready && claimed.is_empty() && !resume_checkpoint {
-            info!("node: scripthash bulk materialize: no runs");
+            if pending_after.is_empty() {
+                info!("node: scripthash bulk materialize: no runs");
+                clear_runs_dir(&runs_dir);
+                return Ok(0);
+            }
+            // Only deferred new runs — apply warm without cold reinit.
+            info!(
+                "node: scripthash apply {} deferred run(s) to empty/live head (no cold reduce)",
+                pending_after.len()
+            );
+            let n = apply_runs_to_live_sh(store, &pending_after, cancel)?;
+            for r in &pending_after {
+                let _ = std::fs::remove_file(&r.path);
+            }
             clear_runs_dir(&runs_dir);
-            // Keep SEAL if any; tip may still re-collect.
-            return Ok(0);
+            return Ok(n);
         }
 
-        let fanin = merge_fanin();
         let workers = rbitcoin_store::sh_merge_workers();
         let t_reduce = Instant::now();
         if !resumed_from_ready {
-            if claimed.is_empty() && !resume_checkpoint {
-                info!("node: scripthash bulk materialize: no runs after claim");
-                return Ok(0);
-            }
             let claimed_recs: u64 = claimed.iter().map(|r| r.count).sum();
             let claimed_body: u64 = claimed
                 .iter()
                 .map(|r| r.count.saturating_mul(u64::from(r.rec_len)))
                 .sum();
-            let passes = rbitcoin_store::fanin_passes_total(claimed.len().max(1), fanin);
             info!(
-                "node: scripthash tip fanin reduce start claimed={} fanin={fanin} workers={workers} \
-                 records≈{claimed_recs} body≈{:.1}MiB passes≈{passes} checkpoint_resume={resume_checkpoint}",
+                "node: scripthash tip fanin reduce start claimed={} workers={workers} \
+                 records≈{claimed_recs} body≈{:.1}MiB passes=1 target_stream≤{} checkpoint_resume={resume_checkpoint}",
                 claimed.len(),
                 claimed_body as f64 / (1024.0 * 1024.0),
+                FANIN_TARGET_STREAM_RUNS,
             );
             stream_inputs = {
                 let _io = runs_io.lock().unwrap();
-                // Checkpoint resume loads level from CHECKPOINT; claimed mats are
-                // retained until READY commit drops them.
+                // Dynamic single-pass fanin inside reduce; claimed only used when no CP.
                 let out =
-                    reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, fanin, cancel)?;
+                    reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, 0, cancel)?;
                 commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
                 out
             };
             info!(
-                "node: scripthash tip fanin reduce done claimed={} stream={} fanin={fanin} \
-                 workers={workers} elapsed={:?} pct=100",
+                "node: scripthash tip fanin reduce done claimed={} stream={} workers={workers} \
+                 elapsed={:?} pct=100",
                 claimed.len(),
                 stream_inputs.len(),
                 t_reduce.elapsed()
@@ -577,7 +592,7 @@ impl ShRunBuilder {
         store.scripthash.flush()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
-        // Success barrier: drop any leftover claims, stream inputs, merge work, catalog.
+        // Success barrier: drop materialize artifacts (not deferred new runs).
         for run in &claimed {
             let _ = std::fs::remove_file(&run.path);
         }
@@ -585,6 +600,19 @@ impl ShRunBuilder {
             let _ = std::fs::remove_file(&run.path);
         }
         let _ = std::fs::remove_dir_all(&merge_dir);
+
+        // Post-interrupt catch-up runs: warm-insert into live SH head (no reinit).
+        let mut n_deferred = 0u64;
+        if !pending_after.is_empty() {
+            info!(
+                "node: scripthash applying {} deferred run(s) after cold materialize",
+                pending_after.len()
+            );
+            n_deferred = apply_runs_to_live_sh(store, &pending_after, cancel)?;
+            for r in &pending_after {
+                let _ = std::fs::remove_file(&r.path);
+            }
+        }
         clear_runs_dir(&runs_dir);
         if max_fk_seen > 0 {
             let _ = store_seal(&runs_dir, max_fk_seen);
@@ -593,7 +621,7 @@ impl ShRunBuilder {
 
         info!(
             "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} \
-             shards={n_shards} elapsed={:?} \
+             deferred≈{n_deferred} shards={n_shards} elapsed={:?} \
              stages: claim={:?} reduce={:?} reinit={:?} stream={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
             t0.elapsed(),
             Duration::from_nanos(claim_ns),
@@ -605,8 +633,39 @@ impl ShRunBuilder {
             Duration::from_nanos(finish_ns),
         );
         let _ = FAMILY_SH;
-        Ok(n_total)
+        Ok(n_total.saturating_add(n_deferred))
     }
+}
+
+/// Stream sorted-run records into the **live** SH table (tip-style append).
+fn apply_runs_to_live_sh(
+    store: &Store,
+    runs: &[SortedRunPath],
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, StoreError> {
+    if runs.is_empty() {
+        return Ok(0);
+    }
+    let mut n = 0u64;
+    for_each_merged_rec_opts(runs, false, |rec| {
+        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+            return Err(StoreError::Cancelled("scripthash deferred apply"));
+        }
+        if rec.len() < SH_RUN_REC_LEN as usize {
+            return Err(StoreError::Corrupt("sh run short record in deferred apply"));
+        }
+        let (sh, tx_fk) = decode_rec_fixed(rec);
+        if tx_fk.is_null() {
+            return Ok(());
+        }
+        store
+            .scripthash
+            .put_create(&ScriptHashRecord::from_fk(sh, tx_fk))?;
+        n = n.saturating_add(1);
+        Ok(())
+    })?;
+    store.scripthash.flush()?;
+    Ok(n)
 }
 
 /// Coalesce L0 spills into cataloged runs under `runs_dir` MANIFEST.

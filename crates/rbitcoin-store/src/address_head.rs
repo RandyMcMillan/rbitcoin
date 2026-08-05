@@ -1125,7 +1125,7 @@ impl AddressHead {
     }
 
     /// Byte length of a probe page load (slot array only, not footer).
-    fn probe_page_need(&self, page_base: u64, n_slots: u64) -> usize {
+    pub(crate) fn probe_page_need(&self, page_base: u64, n_slots: u64) -> usize {
         let es = self.layout.entry_bytes as usize;
         let mut need = (n_slots as usize).saturating_mul(es);
         need = need.min(PROBE_REGION_BYTES);
@@ -1134,6 +1134,12 @@ impl AddressHead {
         let avail = data_end.saturating_sub(off) as usize;
         need = need.min(avail);
         (need / es) * es
+    }
+
+    /// Positional read FD for plan head-resolve HEAD jobs.
+    #[inline]
+    pub(crate) fn read_fd(&self) -> std::os::fd::RawFd {
+        self.file.read_fd()
     }
 
     pub fn get_all_candidates(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {

@@ -4,7 +4,7 @@
 //! SH uses append-only target-sized runs + SEAL during Direct; bulk-loads at tip.
 
 use super::*;
-use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_primitives::Fk;
 use std::sync::atomic::Ordering;
 
 /// Index / spentness mode.
@@ -245,16 +245,24 @@ impl Query {
         self.rebuild_sh_unsealed_from_class_a_cancellable(None)
     }
 
-    /// Stream Class A → SH runs for `create_fk > SEAL`, with ~10s status logs,
-    /// cooperative cancel, and SEAL-advancing spills (restart continues from SEAL).
+    /// Parallel Class A → SH runs for `create_fk > SEAL`.
+    ///
+    /// Work units are fixed **create_fk chunks** (~64k idx entries). One OS thread
+    /// per CPU collects independently and spills a sorted catalog run whenever its
+    /// local buffer exceeds **128 MiB** (some later merge/compact is expected).
+    ///
+    /// SEAL advances only over a **contiguous prefix** of completed chunks so
+    /// cancel/restart never skips unfinished lower ranges. Status ~every 10s.
     fn rebuild_sh_unsealed_from_class_a_cancellable(
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), QueryError> {
+        use crate::sh_builder::SH_RUN_REC_LEN;
+        use rbitcoin_store::{script_hash, ScriptHashRecord};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
-        // FORCE prep / prior finalize_wait_join leave the builder disabled — enqueue
-        // would silently drop. Always re-enable before recollect.
         self.sh_run.ensure_enabled();
 
         let sealed0 = self.sh_run.sealed_max_create_fk();
@@ -262,134 +270,248 @@ impl Query {
             return Ok(());
         };
         let tip_max = self.store.txs.count();
-        if tip_max == 0 {
+        if tip_max == 0 || sealed0 >= tip_max {
             return Ok(());
         }
 
-        // Soft enqueue chunks (~10 MiB of 40 B records). Do **not** force-promote
-        // each chunk: that wrote ~2.4 MiB catalog runs then compact rewrote the
-        // growing catalog every spill (write amp disaster). Promote only when
-        // unspilled body reaches recollect spill target (default ~0.75× run target).
-        const ENQUEUE_CHUNK: usize = 256_000;
+        /// Create_fk span per parallel work unit (tx.idx density).
+        const CHUNK_FKS: u64 = 64_000;
+        /// Per-thread local buffer before a catalog spill.
+        const THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
         const STATUS_INTERVAL: Duration = Duration::from_secs(10);
-        let spill_target = crate::sh_builder::ShRunBuilder::recollect_spill_target_bytes();
+
+        let workers = recollect_workers();
+        let thread_spill_recs =
+            (THREAD_SPILL_BYTES / u64::from(SH_RUN_REC_LEN)).max(1) as usize;
+        let work_lo = sealed0.saturating_add(1);
+        let work_span = tip_max.saturating_sub(sealed0);
+        let n_chunks = work_span.div_ceil(CHUNK_FKS).max(1) as usize;
 
         rbitcoin_log::info!(
             "node: scripthash Class A recollect start seal={sealed0} tip_height={} \
-             tip_max_create_fk={tip_max} spill_target_MiB≈{:.0}",
+             tip_max_create_fk={tip_max} chunks={n_chunks} chunk_fks={CHUNK_FKS} \
+             workers={workers} thread_spill_MiB≈{:.0}",
             tip.0,
-            spill_target as f64 / (1024.0 * 1024.0)
+            THREAD_SPILL_BYTES as f64 / (1024.0 * 1024.0)
         );
+
         let t0 = Instant::now();
-        let mut last_status = Instant::now();
-        let mut batch: Vec<rbitcoin_store::ScriptHashRecord> =
-            Vec::with_capacity(ENQUEUE_CHUNK.min(65_536));
-        let mut n_txs = 0u64;
-        let mut n_creates = 0u64;
-        let mut max_fk = sealed0;
-        let mut heights_scanned = 0u64;
-        let mut n_spills = 0u64;
+        let next_chunk = AtomicUsize::new(0);
+        let n_txs = AtomicU64::new(0);
+        let n_creates = AtomicU64::new(0);
+        let n_spills = AtomicU64::new(0);
+        let max_fk_seen = AtomicU64::new(sealed0);
+        let seal_prefix = AtomicUsize::new(0);
+        let done_flags = Mutex::new(vec![false; n_chunks]);
+        let first_err: Mutex<Option<StoreError>> = Mutex::new(None);
+        let stop = AtomicBool::new(false);
 
-        let enqueue_chunk = |batch: &mut Vec<rbitcoin_store::ScriptHashRecord>,
-                             sh_run: &crate::sh_builder::ShRunBuilder|
-         -> Result<(), QueryError> {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            sh_run.enqueue(batch);
-            batch.clear();
-            Ok(())
-        };
+        let store = &self.store;
+        let sh_run = &self.sh_run;
 
-        // Promote only when enough unspilled bytes (or force at cancel/end).
-        let maybe_spill = |sh_run: &crate::sh_builder::ShRunBuilder,
-                           force: bool,
-                           n_spills: &mut u64|
-         -> Result<(), QueryError> {
-            let drained = if force {
-                sh_run.drain_spills()?;
-                true
-            } else {
-                sh_run.drain_spills_if_at_least(spill_target)?
-            };
-            if drained {
-                *n_spills = n_spills.saturating_add(1);
-                sh_run.refresh_seal();
-            }
-            Ok(())
-        };
-
-        for h in 0..=tip.0 {
-            if cancel
-                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(false)
-            {
-                enqueue_chunk(&mut batch, &self.sh_run)?;
-                maybe_spill(&self.sh_run, true, &mut n_spills)?;
-                rbitcoin_log::warn!(
-                    "node: scripthash Class A recollect cancelled height={h}/{} \
-                     txs≈{n_txs} creates≈{n_creates} seal={} spills={n_spills} elapsed={:?}",
-                    tip.0,
-                    self.sh_run.sealed_max_create_fk(),
-                    t0.elapsed()
-                );
-                return Err(StoreError::Cancelled("scripthash Class A recollect"));
-            }
-            heights_scanned = heights_scanned.saturating_add(1);
-            let Some(hfk) = self.store.confirmed.get(Height(h))? else {
-                continue;
-            };
-            let Some((first, count)) = self.store.header_txs.get_range(hfk)? else {
-                continue;
-            };
-            if count == 0 || first.is_null() {
-                continue;
-            }
-            let start = first.0;
-            let end = start.saturating_add(u64::from(count));
-            for fk in start..end {
-                if fk <= sealed0 {
-                    continue;
+        std::thread::scope(|scope| {
+            // Status heartbeats (same scope as workers; 1s poll, log every 10s).
+            scope.spawn(|| {
+                let mut last_log = Instant::now();
+                loop {
+                    if stop.load(AtomicOrdering::Relaxed)
+                        || seal_prefix.load(AtomicOrdering::Relaxed) >= n_chunks
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    if last_log.elapsed() < STATUS_INTERVAL {
+                        continue;
+                    }
+                    last_log = Instant::now();
+                    let elapsed = t0.elapsed();
+                    let creates = n_creates.load(AtomicOrdering::Relaxed);
+                    let rate = if elapsed.as_secs_f64() > 0.0 {
+                        creates as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    let prefix = seal_prefix.load(AtomicOrdering::Relaxed);
+                    rbitcoin_log::info!(
+                        "node: scripthash Class A recollect status \
+                         seal_prefix={prefix}/{n_chunks} assigned={} seal={} \
+                         txs≈{} creates≈{creates} max_fk={} spills={} workers={workers} \
+                         rate≈{:.0} creates/s elapsed={:?}",
+                        next_chunk.load(AtomicOrdering::Relaxed).min(n_chunks),
+                        sh_run.sealed_max_create_fk(),
+                        n_txs.load(AtomicOrdering::Relaxed),
+                        max_fk_seen.load(AtomicOrdering::Relaxed),
+                        n_spills.load(AtomicOrdering::Relaxed),
+                        rate,
+                        elapsed
+                    );
                 }
-                n_txs = n_txs.saturating_add(1);
-                let before = batch.len();
-                self.collect_scripthash_creates(Fk(fk), &mut batch, None)?;
-                n_creates = n_creates.saturating_add((batch.len() - before) as u64);
-                max_fk = max_fk.max(fk);
-                if batch.len() >= ENQUEUE_CHUNK {
-                    enqueue_chunk(&mut batch, &self.sh_run)?;
-                    maybe_spill(&self.sh_run, false, &mut n_spills)?;
-                }
+            });
+
+            for _w in 0..workers {
+                scope.spawn(|| {
+                    let mut local: Vec<ScriptHashRecord> =
+                        Vec::with_capacity(thread_spill_recs.min(1 << 20));
+                    loop {
+                        if stop.load(AtomicOrdering::Relaxed)
+                            || cancel
+                                .map(|c| c.load(AtomicOrdering::Relaxed))
+                                .unwrap_or(false)
+                        {
+                            stop.store(true, AtomicOrdering::Relaxed);
+                            break;
+                        }
+                        if first_err.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let i = next_chunk.fetch_add(1, AtomicOrdering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        let lo =
+                            work_lo.saturating_add((i as u64).saturating_mul(CHUNK_FKS));
+                        let hi = lo
+                            .saturating_add(CHUNK_FKS)
+                            .saturating_sub(1)
+                            .min(tip_max);
+                        if lo > tip_max {
+                            if let Err(e) = mark_recollect_chunk_done(
+                                i,
+                                n_chunks,
+                                sealed0,
+                                tip_max,
+                                CHUNK_FKS,
+                                &done_flags,
+                                &seal_prefix,
+                                sh_run,
+                            ) {
+                                *first_err.lock().unwrap() = Some(e);
+                                stop.store(true, AtomicOrdering::Relaxed);
+                            }
+                            continue;
+                        }
+
+                        let mut chunk_txs = 0u64;
+                        let mut chunk_max = sealed0;
+                        let mut fk = lo;
+                        while fk <= hi {
+                            if cancel
+                                .map(|c| c.load(AtomicOrdering::Relaxed))
+                                .unwrap_or(false)
+                                || stop.load(AtomicOrdering::Relaxed)
+                            {
+                                stop.store(true, AtomicOrdering::Relaxed);
+                                if !local.is_empty() {
+                                    if let Err(e) =
+                                        spill_local(sh_run, &mut local, &n_spills, &n_creates, &max_fk_seen)
+                                    {
+                                        *first_err.lock().unwrap() = Some(e);
+                                    }
+                                }
+                                return;
+                            }
+                            match store.get_tx_meta_and_outputs(Fk(fk)) {
+                                Ok((_tx, outputs)) => {
+                                    chunk_txs = chunk_txs.saturating_add(1);
+                                    chunk_max = chunk_max.max(fk);
+                                    for o in &outputs {
+                                        local.push(ScriptHashRecord::from_fk(
+                                            script_hash(&o.script),
+                                            Fk(fk),
+                                        ));
+                                    }
+                                    if local.len() >= thread_spill_recs {
+                                        if let Err(e) = spill_local(
+                                            sh_run,
+                                            &mut local,
+                                            &n_spills,
+                                            &n_creates,
+                                            &max_fk_seen,
+                                        ) {
+                                            *first_err.lock().unwrap() = Some(e);
+                                            stop.store(true, AtomicOrdering::Relaxed);
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
+                                Err(e) => {
+                                    *first_err.lock().unwrap() = Some(e);
+                                    stop.store(true, AtomicOrdering::Relaxed);
+                                    return;
+                                }
+                            }
+                            fk = fk.saturating_add(1);
+                        }
+
+                        if !local.is_empty() {
+                            if let Err(e) =
+                                spill_local(sh_run, &mut local, &n_spills, &n_creates, &max_fk_seen)
+                            {
+                                *first_err.lock().unwrap() = Some(e);
+                                stop.store(true, AtomicOrdering::Relaxed);
+                                return;
+                            }
+                        }
+                        n_txs.fetch_add(chunk_txs, AtomicOrdering::Relaxed);
+                        max_fk_seen.fetch_max(chunk_max, AtomicOrdering::Relaxed);
+                        if let Err(e) = mark_recollect_chunk_done(
+                            i,
+                            n_chunks,
+                            sealed0,
+                            tip_max,
+                            CHUNK_FKS,
+                            &done_flags,
+                            &seal_prefix,
+                            sh_run,
+                        ) {
+                            *first_err.lock().unwrap() = Some(e);
+                            stop.store(true, AtomicOrdering::Relaxed);
+                            return;
+                        }
+                    }
+                });
             }
-            if last_status.elapsed() >= STATUS_INTERVAL {
-                self.sh_run.refresh_seal();
-                let seal_now = self.sh_run.sealed_max_create_fk();
-                let unspilled = self.sh_run.unspilled_body_bytes();
-                let elapsed = t0.elapsed();
-                let rate = if elapsed.as_secs_f64() > 0.0 {
-                    n_creates as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                rbitcoin_log::info!(
-                    "node: scripthash Class A recollect status height={h}/{} \
-                     heights_scanned≈{heights_scanned} txs≈{n_txs} creates≈{n_creates} \
-                     max_fk={max_fk} seal={seal_now} tip_max_fk={tip_max} \
-                     unspilled_MiB≈{:.1} spills={n_spills} rate≈{:.0} creates/s elapsed={:?}",
-                    tip.0,
-                    unspilled as f64 / (1024.0 * 1024.0),
-                    rate,
-                    elapsed
-                );
-                last_status = Instant::now();
-            }
+        });
+
+        stop.store(true, AtomicOrdering::Relaxed);
+
+        if let Some(e) = first_err.lock().unwrap().take() {
+            return Err(e);
         }
-        enqueue_chunk(&mut batch, &self.sh_run)?;
-        // Final force-promote remaining memtable/L0 → catalog + SEAL.
-        maybe_spill(&self.sh_run, true, &mut n_spills)?;
+
+        let cancelled = cancel
+            .map(|c| c.load(AtomicOrdering::Relaxed))
+            .unwrap_or(false);
+        let prefix = seal_prefix.load(AtomicOrdering::Relaxed);
         self.sh_run.refresh_seal();
-        let seal_final = self.sh_run.sealed_max_create_fk();
-        if n_txs == 0 && n_creates == 0 {
+        let seal_final = if prefix >= n_chunks {
+            tip_max
+        } else {
+            sealed0
+                .saturating_add((prefix as u64).saturating_mul(CHUNK_FKS))
+                .min(tip_max)
+        };
+        self.sh_run.publish_seal_watermark(seal_final)?;
+        self.sh_run.refresh_seal();
+
+        let txs = n_txs.load(AtomicOrdering::Relaxed);
+        let creates = n_creates.load(AtomicOrdering::Relaxed);
+        let spills = n_spills.load(AtomicOrdering::Relaxed);
+        let max_fk = max_fk_seen.load(AtomicOrdering::Relaxed);
+
+        if cancelled && prefix < n_chunks {
+            rbitcoin_log::warn!(
+                "node: scripthash Class A recollect cancelled \
+                 seal_prefix={prefix}/{n_chunks} txs≈{txs} creates≈{creates} \
+                 seal={sealed0}→{} spills={spills} elapsed={:?}",
+                self.sh_run.sealed_max_create_fk(),
+                t0.elapsed()
+            );
+            return Err(StoreError::Cancelled("scripthash Class A recollect"));
+        }
+
+        if txs == 0 && creates == 0 {
             rbitcoin_log::info!(
                 "node: scripthash Class A recollect done (nothing above seal={sealed0}) \
                  tip_max_fk={tip_max} elapsed={:?}",
@@ -398,15 +520,77 @@ impl Query {
             return Ok(());
         }
         rbitcoin_log::info!(
-            "node: scripthash Class A recollect done txs≈{n_txs} creates≈{n_creates} \
-             seal={sealed0}→{seal_final} max_fk={max_fk} tip_height={} tip_max_fk={tip_max} \
-             spills={n_spills} spill_target_MiB≈{:.0} elapsed={:?}",
+            "node: scripthash Class A recollect done txs≈{txs} creates≈{creates} \
+             seal={sealed0}→{} max_fk={max_fk} tip_height={} tip_max_fk={tip_max} \
+             chunks={n_chunks} workers={workers} spills={spills} elapsed={:?}",
+            self.sh_run.sealed_max_create_fk(),
             tip.0,
-            spill_target as f64 / (1024.0 * 1024.0),
             t0.elapsed()
         );
         Ok(())
     }
+}
+
+fn spill_local(
+    sh_run: &crate::sh_builder::ShRunBuilder,
+    local: &mut Vec<rbitcoin_store::ScriptHashRecord>,
+    n_spills: &std::sync::atomic::AtomicU64,
+    n_creates: &std::sync::atomic::AtomicU64,
+    max_fk_seen: &std::sync::atomic::AtomicU64,
+) -> Result<(), StoreError> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    if local.is_empty() {
+        return Ok(());
+    }
+    let (mfk, n) = sh_run.spill_creates_catalog(local)?;
+    local.clear();
+    n_spills.fetch_add(1, AtomicOrdering::Relaxed);
+    n_creates.fetch_add(n, AtomicOrdering::Relaxed);
+    max_fk_seen.fetch_max(mfk, AtomicOrdering::Relaxed);
+    Ok(())
+}
+
+fn mark_recollect_chunk_done(
+    chunk_id: usize,
+    n_chunks: usize,
+    sealed0: u64,
+    tip_max: u64,
+    chunk_fks: u64,
+    done_flags: &std::sync::Mutex<Vec<bool>>,
+    seal_prefix: &std::sync::atomic::AtomicUsize,
+    sh_run: &crate::sh_builder::ShRunBuilder,
+) -> Result<(), StoreError> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let mut d = done_flags.lock().unwrap();
+    if chunk_id < d.len() {
+        d[chunk_id] = true;
+    }
+    let mut p = seal_prefix.load(AtomicOrdering::Relaxed);
+    while p < d.len() && d[p] {
+        p += 1;
+    }
+    seal_prefix.store(p, AtomicOrdering::Relaxed);
+    let new_seal = if p >= n_chunks {
+        tip_max
+    } else {
+        sealed0
+            .saturating_add((p as u64).saturating_mul(chunk_fks))
+            .min(tip_max)
+    };
+    sh_run.publish_seal_watermark(new_seal)
+}
+
+/// Parallel recollect worker count (`RBITCOIN_SH_RECOLLECT_WORKERS`, else CPUs).
+fn recollect_workers() -> usize {
+    if let Ok(s) = std::env::var("RBITCOIN_SH_RECOLLECT_WORKERS") {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.clamp(1, 256);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 256)
 }
 
 #[cfg(test)]

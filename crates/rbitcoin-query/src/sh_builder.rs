@@ -616,6 +616,93 @@ impl ShRunBuilder {
         }
     }
 
+    /// Thread-safe: sort `creates` and append one **catalog** run (direct write).
+    ///
+    /// Used by parallel Class A recollect so each worker can spill ~128 MiB without
+    /// going through the single-threaded memtable. Does **not** advance SEAL —
+    /// the recollect coordinator bumps a **contiguous** watermark so resume never
+    /// skips unfinished lower fk ranges.
+    ///
+    /// Returns `(max_create_fk, record_count)`.
+    pub fn spill_creates_catalog(
+        &self,
+        creates: &mut [ScriptHashRecord],
+    ) -> Result<(u64, u64), StoreError> {
+        if creates.is_empty() {
+            return Ok((0, 0));
+        }
+        creates.sort_unstable_by(|a, b| {
+            a.scripthash
+                .cmp(&b.scripthash)
+                .then_with(|| a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
+        });
+        let mut body = Vec::with_capacity(creates.len().saturating_mul(SH_RUN_REC_LEN as usize));
+        let mut max_fk = 0u64;
+        let mut n = 0u64;
+        let mut prev: Option<([u8; 32], u64)> = None;
+        for rec in creates.iter() {
+            if rec.create_tx_fk.is_null() {
+                continue;
+            }
+            let fk = rec.create_tx_fk.0;
+            // Dedup identical (sh, fk) after sort.
+            if let Some((psh, pfk)) = prev {
+                if psh == rec.scripthash && pfk == fk {
+                    continue;
+                }
+            }
+            prev = Some((rec.scripthash, fk));
+            max_fk = max_fk.max(fk);
+            body.extend_from_slice(&encode_rec(&rec.scripthash, rec.create_tx_fk));
+            n = n.saturating_add(1);
+        }
+        if body.is_empty() {
+            return Ok((0, 0));
+        }
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+        };
+        let mut next_seq = {
+            let g = self.inner.lock().unwrap();
+            g.ctrl.next_seq
+        };
+        let run = {
+            let _io = runs_io.lock().unwrap();
+            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+            let path = next_run_path(&runs_dir, next_seq);
+            next_seq = next_seq.saturating_add(1);
+            let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
+            info!(
+                "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
+                run.count,
+                run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
+                run.path.display()
+            );
+            run
+        };
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.ctrl.next_seq = next_seq.max(g.ctrl.next_seq);
+        }
+        let _ = run;
+        Ok((max_fk, n))
+    }
+
+    /// Publish contiguous SEAL watermark (recollect resume floor).
+    pub fn publish_seal_watermark(&self, seal: u64) -> Result<(), StoreError> {
+        if seal == 0 {
+            return Ok(());
+        }
+        let cur = self.sealed_max_create_fk();
+        if seal <= cur {
+            return Ok(());
+        }
+        store_seal(&self.runs_dir, seal)?;
+        self.sealed_fk.store(seal, Ordering::Release);
+        Ok(())
+    }
+
     /// Drop incomplete/stale run catalog and SEAL so Class A recollect starts at 0.
     ///
     /// Does **not** wipe a durable SH head (use [`Self::prepare_force_full_rebuild`] for that).

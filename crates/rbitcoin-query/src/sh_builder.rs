@@ -547,6 +547,9 @@ impl ShRunBuilder {
     ///
     /// Used by `RBITCOIN_SH_FORCE_REBUILD=1` so tip materialize recollects **all**
     /// Class A creates (SEAL=0) instead of a catch-up tail only.
+    ///
+    /// **Re-enables** the run builder after wipe so Class A recollect can enqueue
+    /// (finalize_wait_join had disabled it). Materialize will join the worker again.
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
         info!(
             "node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head"
@@ -566,7 +569,18 @@ impl ShRunBuilder {
         let hwm_path = store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
         let _ = std::fs::remove_file(&hwm_path);
         store.scripthash.reinit_empty_for_cold_materialize()?;
+        // Critical: recollect enqueues into the SH run pipeline. Leaving `enabled`
+        // false (after finalize_wait_join) made rebuild_sh a silent no-op and tip
+        // finished FullCold with creates≈0 on a zeroed head.
+        self.enable();
         Ok(())
+    }
+
+    /// Ensure the SH run worker is enabled (idempotent). Used before Class A recollect.
+    pub fn ensure_enabled(&self) {
+        if !self.is_enabled() {
+            self.enable();
+        }
     }
 
     /// Drop incomplete/stale run catalog and SEAL so Class A recollect starts at 0.

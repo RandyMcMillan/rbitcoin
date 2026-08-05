@@ -125,7 +125,7 @@ impl Query {
     ) -> Result<u64, QueryError> {
         use crate::sh_builder::{
             plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild,
-            ShPreMaterializeAction,
+            ShPreMaterializeAction, SH_SEAL_LAG_OK,
         };
 
         self.sh_run.refresh_seal();
@@ -142,6 +142,11 @@ impl Query {
             tip_max,
             run_recs,
             include_hwm,
+        );
+        let need_full_recollect = matches!(
+            action,
+            ShPreMaterializeAction::ForceFullRebuild
+                | ShPreMaterializeAction::ResetCatalogFullRecollect
         );
 
         match action {
@@ -161,6 +166,8 @@ impl Query {
                      (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs})"
                 );
                 self.sh_run.reset_catalog_for_full_recollect()?;
+                // Ensure run pipeline can accept Class A recollect enqueues.
+                self.sh_run.ensure_enabled();
             }
             ShPreMaterializeAction::BootstrapIncludeHwm { seal: s } => {
                 // Legacy durable head without include_hwm: SEAL is the inclusion
@@ -182,13 +189,47 @@ impl Query {
         }
 
         self.sh_run.refresh_seal();
-        self.rebuild_sh_unsealed_from_class_a()?;
-        match cancel {
-            None => self.sh_run.finalize_and_bulk_materialize(&self.store),
+        self.rebuild_sh_unsealed_from_class_a_cancellable(cancel)?;
+
+        // Fail closed: never FullCold / "no runs" success on a zeroed head when
+        // Class A still has creates above SEAL (FORCE / empty-head full recollect).
+        self.sh_run.refresh_seal();
+        let seal_after = self.sh_run.sealed_max_create_fk();
+        let run_after = sh_catalog_total_records(&self.store.path().join("scripthash.runs"));
+        let tip_max = self.store.txs.count();
+        let head_durable = self.store.scripthash.has_durable_index();
+        if !head_durable
+            && tip_max > 0
+            && run_after == 0
+            && seal_after.saturating_add(SH_SEAL_LAG_OK) < tip_max
+        {
+            rbitcoin_log::error!(
+                "node: scripthash recollect left empty catalog seal={seal_after} \
+                 tip_max_create_fk={tip_max} force_or_reset={need_full_recollect} — abort"
+            );
+            return Err(StoreError::Corrupt(
+                "scripthash Class A recollect produced empty catalog while creates remain above SEAL",
+            ));
+        }
+
+        let n = match cancel {
+            None => self.sh_run.finalize_and_bulk_materialize(&self.store)?,
             Some(c) => self
                 .sh_run
-                .finalize_and_bulk_materialize_cancellable(&self.store, Some(c)),
+                .finalize_and_bulk_materialize_cancellable(&self.store, Some(c))?,
+        };
+
+        // Second guard: materialize Ok(0) with empty head + Class A present.
+        if n == 0
+            && !self.store.scripthash.has_durable_index()
+            && tip_max > 0
+            && seal_after.saturating_add(SH_SEAL_LAG_OK) < tip_max
+        {
+            return Err(StoreError::Corrupt(
+                "scripthash materialize finished empty while Class A creates remain above SEAL",
+            ));
         }
+        Ok(n)
     }
 
     /// On-disk scripthash sorted-run count (Direct IBD cache).
@@ -201,16 +242,78 @@ impl Query {
     /// Covers kill after tip advance while memtable was still unspilled. Work is
     /// O(crash window) when SEAL tracks near tip; full chain only if SEAL=0.
     fn rebuild_sh_unsealed_from_class_a(&self) -> Result<(), QueryError> {
-        if !self.sh_run.is_enabled() {
-            return Ok(());
-        }
-        let sealed = self.sh_run.sealed_max_create_fk();
+        self.rebuild_sh_unsealed_from_class_a_cancellable(None)
+    }
+
+    /// Stream Class A → SH runs for `create_fk > SEAL`, with ~10s status logs,
+    /// cooperative cancel, and SEAL-advancing spills (restart continues from SEAL).
+    fn rebuild_sh_unsealed_from_class_a_cancellable(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), QueryError> {
+        use std::time::{Duration, Instant};
+
+        // FORCE prep / prior finalize_wait_join leave the builder disabled — enqueue
+        // would silently drop. Always re-enable before recollect.
+        self.sh_run.ensure_enabled();
+
+        let sealed0 = self.sh_run.sealed_max_create_fk();
         let Some(tip) = self.store.tip_height() else {
             return Ok(());
         };
-        let mut creates = Vec::new();
+        let tip_max = self.store.txs.count();
+        if tip_max == 0 {
+            return Ok(());
+        }
+
+        // Spill cadence: keep peak RAM bounded and advance SEAL for resume.
+        const BATCH_CREATES: usize = 64_000;
+        const STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+        rbitcoin_log::info!(
+            "node: scripthash Class A recollect start seal={sealed0} tip_height={} \
+             tip_max_create_fk={tip_max}",
+            tip.0
+        );
+        let t0 = Instant::now();
+        let mut last_status = Instant::now();
+        let mut batch: Vec<rbitcoin_store::ScriptHashRecord> =
+            Vec::with_capacity(BATCH_CREATES.min(4096));
         let mut n_txs = 0u64;
+        let mut n_creates = 0u64;
+        let mut max_fk = sealed0;
+        let mut heights_scanned = 0u64;
+
+        let flush_batch = |batch: &mut Vec<ScriptHashRecord>,
+                           sh_run: &crate::sh_builder::ShRunBuilder|
+         -> Result<(), QueryError> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            sh_run.enqueue(batch);
+            batch.clear();
+            // force_all promote → durable SEAL bump so cancel/restart is O(remaining).
+            sh_run.drain_spills()?;
+            sh_run.refresh_seal();
+            Ok(())
+        };
+
         for h in 0..=tip.0 {
+            if cancel
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                flush_batch(&mut batch, &self.sh_run)?;
+                rbitcoin_log::warn!(
+                    "node: scripthash Class A recollect cancelled height={h}/{} \
+                     txs≈{n_txs} creates≈{n_creates} seal={} elapsed={:?}",
+                    tip.0,
+                    self.sh_run.sealed_max_create_fk(),
+                    t0.elapsed()
+                );
+                return Err(StoreError::Cancelled("scripthash Class A recollect"));
+            }
+            heights_scanned = heights_scanned.saturating_add(1);
             let Some(hfk) = self.store.confirmed.get(Height(h))? else {
                 continue;
             };
@@ -223,24 +326,58 @@ impl Query {
             let start = first.0;
             let end = start.saturating_add(u64::from(count));
             for fk in start..end {
-                if fk <= sealed {
+                if fk <= sealed0 {
                     continue;
                 }
                 n_txs = n_txs.saturating_add(1);
-                self.collect_scripthash_creates(Fk(fk), &mut creates, None)?;
+                let before = batch.len();
+                self.collect_scripthash_creates(Fk(fk), &mut batch, None)?;
+                n_creates = n_creates.saturating_add((batch.len() - before) as u64);
+                max_fk = max_fk.max(fk);
+                if batch.len() >= BATCH_CREATES {
+                    flush_batch(&mut batch, &self.sh_run)?;
+                }
+            }
+            if last_status.elapsed() >= STATUS_INTERVAL {
+                let seal_now = self.sh_run.sealed_max_create_fk();
+                let elapsed = t0.elapsed();
+                let rate = if elapsed.as_secs_f64() > 0.0 {
+                    n_creates as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                rbitcoin_log::info!(
+                    "node: scripthash Class A recollect status height={h}/{} \
+                     heights_scanned≈{heights_scanned} txs≈{n_txs} creates≈{n_creates} \
+                     max_fk={max_fk} seal={seal_now} tip_max_fk={tip_max} \
+                     rate≈{:.0} creates/s elapsed={:?}",
+                    tip.0,
+                    rate,
+                    elapsed
+                );
+                last_status = Instant::now();
             }
         }
-        if creates.is_empty() {
+        flush_batch(&mut batch, &self.sh_run)?;
+        // Final drain (empty batch is no-op; ensure L0 promoted).
+        self.sh_run.drain_spills()?;
+        self.sh_run.refresh_seal();
+        let seal_final = self.sh_run.sealed_max_create_fk();
+        if n_txs == 0 && n_creates == 0 {
+            rbitcoin_log::info!(
+                "node: scripthash Class A recollect done (nothing above seal={sealed0}) \
+                 tip_max_fk={tip_max} elapsed={:?}",
+                t0.elapsed()
+            );
             return Ok(());
         }
         rbitcoin_log::info!(
-            "node: scripthash resume rebuild txs≈{n_txs} creates≈{} seal={sealed} tip={}",
-            creates.len(),
-            tip.0
+            "node: scripthash Class A recollect done txs≈{n_txs} creates≈{n_creates} \
+             seal={sealed0}→{seal_final} max_fk={max_fk} tip_height={} tip_max_fk={tip_max} \
+             elapsed={:?}",
+            tip.0,
+            t0.elapsed()
         );
-        self.sh_run.enqueue(&creates);
-        self.sh_run.drain_spills()?;
-        self.sh_run.refresh_seal();
         Ok(())
     }
 }
@@ -249,18 +386,77 @@ impl Query {
 mod tests {
     use super::*;
     use crate::sh_builder::{
-        load_seal, plan_sh_pre_materialize, store_seal, ShPreMaterializeAction, SH_RUN_KEY_LEN,
-        SH_RUN_REC_LEN,
+        load_seal, plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild, store_seal,
+        ShPreMaterializeAction, SH_RUN_KEY_LEN, SH_RUN_REC_LEN,
     };
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_store::{next_run_path, write_sorted_run, ScriptHashRecord};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_store::{
+        next_run_path, write_sorted_run, HeaderRecord, InputRecord, OutputRecord, ScriptHashRecord,
+        TxRecord,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Serialize FORCE_REBUILD env mutations (parallel tests share process env).
+    static FORCE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn encode_rec(sh: &[u8; 32], fk: Fk) -> [u8; 40] {
         let mut buf = [0u8; 40];
         buf[..32].copy_from_slice(sh);
         buf[32..40].copy_from_slice(&fk.0.to_le_bytes());
         buf
+    }
+
+    fn coinbase_block(h: u32, prev: Fk) -> (HeaderRecord, crate::TxApply) {
+        let mut hash = [0u8; 32];
+        hash[0..4].copy_from_slice(&h.to_le_bytes());
+        hash[4] = 0xcd;
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version: 1,
+            timestamp: h + 1,
+            bits: 0x207fffff,
+            nonce: h,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = crate::TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51, h as u8])],
+        };
+        (header, ta)
+    }
+
+    /// Archive + confirm `n` coinbase blocks under Direct mode (Class A + tip height).
+    fn seed_direct_chain(q: &Query, n: u32) {
+        q.enter_direct_index_mode().unwrap();
+        let mut prev = Fk::NULL;
+        for h in 0..n {
+            let (header, ta) = coinbase_block(h, prev);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        assert_eq!(q.tip_height(), Some(Height(n - 1)));
+        assert!(q.store.txs.count() >= u64::from(n));
     }
 
     /// Drive [`Query::finalize_sh_runs`] with durable head + high SEAL + no HWM.
@@ -359,6 +555,164 @@ mod tests {
         q.sh_run.reset_catalog_for_full_recollect().unwrap();
         assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
         assert_eq!(load_seal(&runs_dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FORCE prep used to leave the SH builder **disabled**, so Class A recollect
+    /// was a silent no-op and tip materialize reported creates≈0 on a zeroed head.
+    #[test]
+    fn force_rebuild_recollects_class_a_not_empty_materialize() {
+        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-force-recol-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 6);
+        let tip_max = q.store.txs.count();
+        assert!(tip_max >= 6);
+
+        // Ship path: prepare_force disables worker then must re-enable for recollect.
+        q.sh_run.prepare_force_full_rebuild(&q.store).unwrap();
+        assert!(
+            q.sh_run.is_enabled(),
+            "FORCE prep must re-enable SH builder for Class A recollect"
+        );
+        assert!(!q.store.scripthash.has_durable_index());
+        assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
+
+        // Recollect alone must produce catalog runs + advance SEAL.
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        q.sh_run.refresh_seal();
+        let seal = q.sh_run.sealed_max_create_fk();
+        let run_recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        assert!(
+            seal > 0 && run_recs > 0,
+            "recollect must spill runs seal={seal} recs={run_recs} tip_max={tip_max}"
+        );
+
+        // Full finalize under FORCE_REBUILD env must not Ok empty head.
+        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
+        assert!(sh_force_rebuild());
+        let result = q.finalize_sh_runs();
+        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
+        let n_mat = result.expect("finalize after FORCE must not fail empty");
+        assert!(
+            n_mat > 0,
+            "materialize must load Class A creates, got {n_mat}"
+        );
+        assert!(
+            q.store.scripthash.has_durable_index(),
+            "head must not stay empty after FORCE recollect+materialize"
+        );
+        assert!(q.store.scripthash.entry_count() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mid-recollect cancel preserves SEAL; resume continues from watermark.
+    #[test]
+    fn class_a_recollect_cancel_resume_from_seal() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-recol-resume-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 12);
+        let tip_max = q.store.txs.count();
+        let mid = (tip_max / 2).max(1);
+
+        // Plant SEAL mid (as after a partial spill), then cancel on entry.
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        q.sh_run.ensure_enabled();
+        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
+        let cancel = AtomicBool::new(true);
+        let err = q
+            .rebuild_sh_unsealed_from_class_a_cancellable(Some(&cancel))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Cancelled(_)),
+            "expected Cancelled, got {err}"
+        );
+        q.sh_run.refresh_seal();
+        assert_eq!(
+            q.sh_run.sealed_max_create_fk(),
+            mid,
+            "cancel must not wipe SEAL watermark"
+        );
+
+        // Resume without cancel: only create_fk > mid, then materialize.
+        cancel.store(false, Ordering::Relaxed);
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        q.sh_run.refresh_seal();
+        let seal_done = q.sh_run.sealed_max_create_fk();
+        assert!(
+            seal_done >= mid,
+            "resume must keep/advance SEAL (got {seal_done} mid={mid})"
+        );
+        let run_recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        // Creates above mid should have been spilled (unless mid already covered tip).
+        if mid + 1 < tip_max {
+            assert!(
+                run_recs > 0 || seal_done > mid,
+                "resume recollect should spill remaining creates"
+            );
+        }
+        let n_mat = q
+            .sh_run
+            .finalize_and_bulk_materialize(&q.store)
+            .unwrap();
+        if run_recs > 0 {
+            assert!(n_mat > 0, "materialize residual after resume");
+            assert!(q.store.scripthash.has_durable_index());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty head + empty catalog + tip creates after recollect must not Ok(0).
+    ///
+    /// Simulates the historical FORCE bug (builder disabled → recollect no-op) by
+    /// forcing an empty catalog while SEAL stays 0 and head is empty, then ensuring
+    /// the shipped recollect path (which re-enables) fills the catalog before
+    /// materialize — and that finalize under FORCE succeeds with non-zero creates.
+    #[test]
+    fn force_empty_catalog_guard_and_reenable() {
+        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-empty-guard-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 5);
+        assert!(q.store.txs.count() >= 5);
+
+        q.sh_run.prepare_force_full_rebuild(&q.store).unwrap();
+        assert!(
+            q.sh_run.is_enabled(),
+            "prepare_force must leave builder enabled"
+        );
+        assert!(!q.store.scripthash.has_durable_index());
+
+        // If recollect were skipped, catalog stays empty → guard/error or empty mat.
+        // Shipped path recollects:
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        let recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        assert!(recs > 0, "Class A recollect must produce runs (got {recs})");
+        assert!(q.sh_run.sealed_max_create_fk() > 0);
+
+        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
+        let n_mat = q.finalize_sh_runs().expect("FORCE finalize");
+        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
+        assert!(n_mat > 0, "FORCE must not report creates≈0");
+        assert!(q.store.scripthash.entry_count() > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

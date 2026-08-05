@@ -144,7 +144,10 @@ runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**eve
 head is empty** (or force rebuild); a nearly complete index with residual runs
 uses **warm batch apply** only. **`RBITCOIN_SH_FORCE_REBUILD=1`:** clears
 runs/SEAL/include_hwm/cold_progress, reinit head, recollect **all** Class A
-creates (SEAL=0 → full body scan), then cold materialize — not a catch-up tail.
+creates (SEAL=0 → stream `tx.body` into SH runs with ~10s status logs; cancel
+advances durable SEAL so restart resumes), then cold materialize — not a
+catch-up tail. Empty catalog after recollect while Class A remains is an error
+(never silent `creates≈0` on a zeroed head).
 Incomplete catalog (high SEAL + tiny run mass, or consumed runs with no head)
 on an **empty** head triggers full Class A recollect (SEAL=0). **Durable head**
 never uses run-mass incompleteness (empty runs after successful materialize are

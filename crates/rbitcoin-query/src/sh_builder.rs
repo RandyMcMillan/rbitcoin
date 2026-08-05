@@ -22,6 +22,55 @@ use rbitcoin_store::{
     ColdProgress, ScriptHashEntry, ScriptHashRecord, Store, StoreError, SortedRunPath,
     FANIN_TARGET_STREAM_RUNS,
 };
+
+/// How tip finalize applies remaining SH runs (pure decision; no I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShTipMaterializeMode {
+    /// Head empty (or force rebuild): wipe + cold stream.
+    FullCold,
+    /// Resume interrupted cold from `next_shard` (progress present).
+    ColdResume { next_shard: u32 },
+    /// Durable head present: batch-warm residual runs only — **never** reinit.
+    WarmOnly,
+}
+
+/// Select materialize mode. **Never** returns FullCold when head already holds durable data
+/// unless `force_rebuild`.
+pub fn select_sh_tip_materialize_mode(
+    head_empty: bool,
+    entry_count: u64,
+    progress_next_shard: Option<u32>,
+    n_shards: u32,
+    stream_run_count: usize,
+    force_rebuild: bool,
+) -> ShTipMaterializeMode {
+    if stream_run_count == 0 {
+        return ShTipMaterializeMode::WarmOnly;
+    }
+    if force_rebuild {
+        return ShTipMaterializeMode::FullCold;
+    }
+    let n_shards = n_shards.max(1);
+    if let Some(ns) = progress_next_shard {
+        if ns > 0 && ns < n_shards {
+            return ShTipMaterializeMode::ColdResume { next_shard: ns };
+        }
+    }
+    // Residual runs after a finished cold load (or any non-empty head): warm only.
+    if !head_empty || entry_count > 0 {
+        return ShTipMaterializeMode::WarmOnly;
+    }
+    ShTipMaterializeMode::FullCold
+}
+
+fn sh_force_rebuild() -> bool {
+    matches!(
+        std::env::var("RBITCOIN_SH_FORCE_REBUILD")
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .ok(),
+        Some(true)
+    )
+}
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -465,11 +514,22 @@ impl ShRunBuilder {
                 "node: scripthash apply {} deferred run(s) to empty/live head (no cold reduce)",
                 pending_after.len()
             );
+            let mut max_fk = store.scripthash.include_hwm();
+            for r in &pending_after {
+                if let Ok(body) = rbitcoin_store::read_run_body(r) {
+                    max_fk = max_fk.max(max_fk_in_body(&body));
+                }
+            }
             let n = apply_runs_to_live_sh(store, &pending_after, cancel)?;
             for r in &pending_after {
                 let _ = std::fs::remove_file(&r.path);
             }
             clear_runs_dir(&runs_dir);
+            if max_fk > 0 {
+                let _ = store.scripthash.note_include_hwm(max_fk);
+                let _ = store_seal(&runs_dir, max_fk);
+                self.sealed_fk.store(max_fk, Ordering::Release);
+            }
             return Ok(n);
         }
 
@@ -536,17 +596,86 @@ impl ShRunBuilder {
         let n_shards = store.scripthash.head_shard_count();
         let store_dir = store.path();
         let progress = ColdProgress::load(store_dir).ok().flatten();
-        let resume_from = progress
-            .as_ref()
-            .map(|p| p.next_shard as usize)
-            .unwrap_or(0)
-            .min(n_shards);
+        let force = sh_force_rebuild();
+        let mode = select_sh_tip_materialize_mode(
+            head_empty,
+            n_existing,
+            progress.as_ref().map(|p| p.next_shard),
+            n_shards as u32,
+            stream_inputs.len(),
+            force,
+        );
+        info!(
+            "node: scripthash tip materialize path={mode:?} entry_count={n_existing} \
+             head_empty={head_empty} stream_runs={} records≈{total_recs} direct_kway={direct_kway} \
+             force_rebuild={force} progress={:?}",
+            stream_inputs.len(),
+            progress.as_ref().map(|p| p.next_shard),
+        );
+
+        // ── Warm-only: residual runs against a live index (never reinit) ─────
+        if matches!(mode, ShTipMaterializeMode::WarmOnly) {
+            info!(
+                "node: scripthash warm apply residual runs={} (protecting durable head; no reinit)",
+                stream_inputs.len()
+            );
+            let t0 = Instant::now();
+            // Inclusion HWM before deleting run files.
+            let mut max_fk = store.scripthash.include_hwm();
+            for r in stream_inputs.iter().chain(pending_after.iter()) {
+                if let Ok(body) = rbitcoin_store::read_run_body(r) {
+                    max_fk = max_fk.max(max_fk_in_body(&body));
+                }
+            }
+            let n_warm = apply_runs_to_live_sh(store, &stream_inputs, cancel)?;
+            // Deferred catch-up catalog runs (not claimed into stream).
+            let mut n_deferred = 0u64;
+            if !pending_after.is_empty() {
+                info!(
+                    "node: scripthash applying {} deferred run(s) after warm residual",
+                    pending_after.len()
+                );
+                n_deferred = apply_runs_to_live_sh(store, &pending_after, cancel)?;
+                for r in &pending_after {
+                    let _ = std::fs::remove_file(&r.path);
+                }
+            }
+            for run in &claimed {
+                let _ = std::fs::remove_file(&run.path);
+            }
+            for run in &stream_inputs {
+                let _ = std::fs::remove_file(&run.path);
+            }
+            let _ = std::fs::remove_dir_all(&merge_dir);
+            clear_runs_dir(&runs_dir);
+            if max_fk > 0 {
+                let _ = store.scripthash.note_include_hwm(max_fk);
+                let _ = store_seal(&runs_dir, max_fk);
+                self.sealed_fk.store(max_fk, Ordering::Release);
+            }
+            info!(
+                "node: scripthash warm residual done written≈{} deferred≈{n_deferred} \
+                 include_hwm={max_fk} elapsed={:?}",
+                n_warm,
+                t0.elapsed()
+            );
+            let _ = FAMILY_SH;
+            let _ = (claim_ns, reduce_ns);
+            return Ok(n_warm.saturating_add(n_deferred));
+        }
+
+        // ── Cold path (full or resume) ───────────────────────────────────────
+        let resume_from = match &mode {
+            ShTipMaterializeMode::ColdResume { next_shard } => *next_shard as usize,
+            _ => 0,
+        };
         let t_reinit = Instant::now();
-        let mut session = if resume_from > 0 {
-            if let Some(ref p) = progress {
+        let mut session = match mode {
+            ShTipMaterializeMode::ColdResume { .. } => {
+                let p = progress.expect("ColdResume requires progress");
                 info!(
                     "node: scripthash cold resume next_shard={}/{} keys≈{} creates≈{} bump={} \
-                     stream_runs={} direct_kway={direct_kway}",
+                     stream_runs={}",
                     p.next_shard,
                     n_shards,
                     p.keys_written,
@@ -554,23 +683,22 @@ impl ShRunBuilder {
                     p.body_bump,
                     stream_inputs.len()
                 );
-                store.scripthash.prepare_cold_resume(p)?;
-                store.scripthash.bulk_session_resume(0, p)?
-            } else {
-                unreachable!()
+                store.scripthash.prepare_cold_resume(&p)?;
+                store.scripthash.bulk_session_resume(0, &p)?
             }
-        } else {
-            info!(
-                "node: scripthash reinit empty for cold rematerialize \
-                 stream_runs={} entry_count={n_existing} head_empty={head_empty} \
-                 direct_kway={direct_kway} n_shards={n_shards}",
-                stream_inputs.len()
-            );
-            store.scripthash.reinit_empty_for_cold_materialize()?;
-            debug_assert_eq!(store.scripthash.entry_count(), 0);
-            debug_assert!(store.scripthash.head_is_empty());
-            // unique_hint=0 → env/default; never pass create-count (oversizes OA image).
-            store.scripthash.bulk_session(0)?
+            ShTipMaterializeMode::FullCold => {
+                info!(
+                    "node: scripthash reinit empty for cold rematerialize \
+                     stream_runs={} entry_count={n_existing} head_empty={head_empty} \
+                     n_shards={n_shards} (full cold authorized: empty head or force_rebuild)",
+                    stream_inputs.len()
+                );
+                store.scripthash.reinit_empty_for_cold_materialize()?;
+                debug_assert_eq!(store.scripthash.entry_count(), 0);
+                debug_assert!(store.scripthash.head_is_empty());
+                store.scripthash.bulk_session(0)?
+            }
+            ShTipMaterializeMode::WarmOnly => unreachable!("warm handled above"),
         };
         let reinit_ns = t_reinit.elapsed().as_nanos() as u64;
         info!(
@@ -585,7 +713,6 @@ impl ShRunBuilder {
         let mut unique_in = 0u64;
         let mut last_log: Option<Instant> = None;
         let mut max_fk_seen = 0u64;
-        let mut cancelled = false;
 
         let t_stream = Instant::now();
         let stream_result = for_each_merged_rec_opts(&stream_inputs, false, |rec| {
@@ -614,7 +741,6 @@ impl ShRunBuilder {
                             .map(|c| c.load(Ordering::Relaxed))
                             .unwrap_or(false)
                         {
-                            cancelled = true;
                             return Err(StoreError::Cancelled("scripthash materialize stream"));
                         }
                         let due = match last_log {
@@ -686,7 +812,6 @@ impl ShRunBuilder {
         let (n_total, n_keys, body_flush_ns, head_fill_ns) = session.finish()?;
         store.scripthash.flush()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
-        let _ = cancelled;
 
         // Success barrier: drop materialize artifacts (not deferred new runs).
         for run in &claimed {
@@ -714,6 +839,7 @@ impl ShRunBuilder {
         if max_fk_seen > 0 {
             let _ = store_seal(&runs_dir, max_fk_seen);
             self.sealed_fk.store(max_fk_seen, Ordering::Release);
+            let _ = store.scripthash.note_include_hwm(max_fk_seen);
         }
 
         info!(
@@ -1185,7 +1311,9 @@ mod tests {
     }
 
     #[test]
-    fn materialize_reinits_nonempty_table_for_cold_reload() {
+    fn materialize_warm_merges_residual_into_nonempty_table() {
+        // Formerly expected full reinit (wipe to 40). Policy now: warm-merge into
+        // durable head so prior creates (30) are preserved.
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1222,8 +1350,9 @@ mod tests {
         assert!(store.scripthash.entry_count() > 0);
 
         let n2 = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert!(n2 >= 40, "inserted={n2}");
-        assert_eq!(store.scripthash.entry_count(), n2 as u64);
+        assert!(n2 >= 40, "warm inserted={n2}");
+        // 30 prior + 40 residual (disjoint keys/fks).
+        assert_eq!(store.scripthash.entry_count(), 70);
         assert!(list_materialize_claims(&runs_dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1309,6 +1438,88 @@ mod tests {
             .unwrap();
         assert_eq!(n, 20);
         assert_eq!(store.scripthash.entries(&sh).unwrap().len(), 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_mode_never_full_cold_when_head_has_data() {
+        // Regression: residual run after finished cold must not FullCold.
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1, false),
+            ShTipMaterializeMode::WarmOnly
+        );
+        assert_eq!(
+            select_sh_tip_materialize_mode(true, 100, None, 64, 1, false),
+            ShTipMaterializeMode::WarmOnly
+        );
+        assert_eq!(
+            select_sh_tip_materialize_mode(true, 0, None, 64, 10, false),
+            ShTipMaterializeMode::FullCold
+        );
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32, false),
+            ShTipMaterializeMode::ColdResume { next_shard: 40 }
+        );
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1, false),
+            ShTipMaterializeMode::WarmOnly
+        );
+        // Explicit rebuild may wipe.
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 1e9 as u64, None, 64, 1, true),
+            ShTipMaterializeMode::FullCold
+        );
+        // Complete progress (next == n_shards) + residual → warm, not resume past end.
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1, false),
+            ShTipMaterializeMode::WarmOnly
+        );
+    }
+
+    #[test]
+    fn residual_run_on_full_head_warm_only_no_reinit() {
+        // Ship path: durable head + leftover catalog run → warm apply, preserve head.
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-warm-guard-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        let mut sh0 = [0u8; 32];
+        sh0[0] = 0x11;
+        b.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(1))]);
+        let n0 = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert!(n0 >= 1);
+        assert_eq!(store.scripthash.entries(&sh0).unwrap().len(), 1);
+        let count_before = store.scripthash.entry_count();
+        assert!(count_before >= 1);
+        assert!(!store.scripthash.head_is_empty() || count_before > 0);
+
+        // Residual run with a second key (as after cancelled deferred apply).
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut sh1 = [0u8; 32];
+        sh1[0] = 0x22;
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&sh1, Fk(2)));
+        let path = next_run_path(&runs_dir, 99);
+        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+
+        let n1 = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert!(n1 >= 1, "warm should apply residual");
+        // Original key must still be present (reinit would wipe).
+        assert_eq!(
+            store.scripthash.entries(&sh0).unwrap().len(),
+            1,
+            "durable head must not be wiped for residual run"
+        );
+        assert_eq!(store.scripthash.entries(&sh1).unwrap().len(), 1);
+        assert!(store.scripthash.entry_count() >= count_before);
+        assert!(store.scripthash.include_hwm() >= 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

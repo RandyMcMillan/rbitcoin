@@ -139,10 +139,12 @@ create counts — `RBITCOIN_SH_UNIQUE_HINT` optional). Fan-in reduce is **fallba
 only** when the catalog exceeds max direct. IBD promotes L0 spills only at
 ≥75% of target run size (default target **512 MiB**) and compacts tiny catalog
 runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**every
-10s**. **SIGINT** mid cold stream: keeps finished prefix shards
-(`scripthash.cold_progress`); restart skips those bands and continues. Mid-reduce
-keeps CHECKPOINT. Catalog runs created while interrupted are **deferred** and
-**batch warm-applied** after cold materialize (10s status). On enter Direct, leftover
+10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly`. **Full cold reinit
+only if the SH head is empty** (or `RBITCOIN_SH_FORCE_REBUILD=1`); a nearly
+complete index with residual runs uses **warm batch apply** only. **SIGINT** mid
+cold stream keeps finished prefix shards (`scripthash.cold_progress`). Inclusion
+HWM: `scripthash.include_hwm`. Mid-reduce keeps CHECKPOINT. Deferred/residual
+runs are batch warm-applied (10s status). On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
 — prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with
 **`scripthash.runs` still present** auto-migrates on open (old head renamed

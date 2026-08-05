@@ -28,6 +28,8 @@ use std::sync::Mutex;
 /// Durable cold-materialize resume marker (next to `scripthash.head`).
 pub const COLD_PROGRESS_NAME: &str = "scripthash.cold_progress";
 const COLD_PROGRESS_MAGIC: &[u8; 8] = b"SHCOLDP1";
+/// Max create_fk fully present in durable SH (inclusion HWM; crash catch-up).
+pub const INCLUDE_HWM_NAME: &str = "scripthash.include_hwm";
 
 /// Progress after each fully installed prefix shard (SIGINT resume).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +91,41 @@ impl ColdProgress {
     pub fn clear(store_dir: &Path) {
         let _ = std::fs::remove_file(Self::path(store_dir));
     }
+}
+
+/// Load durable inclusion HWM (`0` if missing/corrupt).
+pub fn load_include_hwm(store_dir: &Path) -> u64 {
+    let p = store_dir.join(INCLUDE_HWM_NAME);
+    let Ok(buf) = std::fs::read(&p) else {
+        return 0;
+    };
+    if buf.len() < 8 {
+        return 0;
+    }
+    u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]))
+}
+
+/// Store durable inclusion HWM (monotonic: never decreases).
+pub fn store_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), StoreError> {
+    if max_create_fk == 0 {
+        return Ok(());
+    }
+    let cur = load_include_hwm(store_dir);
+    if max_create_fk <= cur {
+        return Ok(());
+    }
+    let p = store_dir.join(INCLUDE_HWM_NAME);
+    let tmp = store_dir.join(format!("{INCLUDE_HWM_NAME}.tmp"));
+    std::fs::write(&tmp, max_create_fk.to_le_bytes()).map_err(|e| StoreError::io(&tmp, e))?;
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+    }
+    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+    Ok(())
 }
 
 /// Electrum scripthash = SHA256(scriptPubKey) (binary; API often reverses for hex).
@@ -386,6 +423,21 @@ impl ScriptHashTable {
             .path()
             .parent()
             .unwrap_or_else(|| Path::new("."))
+    }
+
+    /// Max create_fk known present in durable SH (see [`load_include_hwm`]).
+    pub fn include_hwm(&self) -> u64 {
+        load_include_hwm(self.store_dir())
+    }
+
+    /// Advance inclusion HWM after successful cold/warm materialize.
+    pub fn note_include_hwm(&self, max_create_fk: u64) -> Result<(), StoreError> {
+        store_include_hwm(self.store_dir(), max_create_fk)
+    }
+
+    /// True if durable head has any occupancy or live creates (protect from wipe).
+    pub fn has_durable_index(&self) -> bool {
+        self.entry_count() > 0 || !self.head_is_empty()
     }
 
     /// Head value for a key (process-cache seed / disconnect refresh).

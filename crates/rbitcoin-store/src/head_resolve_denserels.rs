@@ -499,13 +499,67 @@ fn resolve_fk_and_range_uring_on(
             let mut cqes = ring.harvest_ready();
             if cqes.is_empty() {
                 if ring.in_flight() == 0 {
-                    // Should not happen mid-wave with work left.
+                    // Free any pages that finished without a trailing CQE.
+                    for s in 0..MAX_PAGE_SLOTS {
+                        if slots[s].occupied
+                            && slots[s].keys_finished >= slots[s].keys.len()
+                        {
+                            slots[s].clear();
+                            free.push(s);
+                        }
+                    }
                     if page_q.is_empty() && free.len() == MAX_PAGE_SLOTS {
                         break;
                     }
-                    ring.submit_and_wait_one()?;
-                    cqes = ring.harvest_ready();
-                } else {
+                    // Occupied unfinished page + zero in-flight: re-arm ID/IDX.
+                    for s in 0..MAX_PAGE_SLOTS {
+                        if slots[s].occupied
+                            && slots[s].keys_finished < slots[s].keys.len()
+                        {
+                            arm_next_key_or_idle(
+                                &mut slots[s],
+                                &mut keys,
+                                &mut ring,
+                                s as u32,
+                                side,
+                                side_fd,
+                                body_count,
+                                side_n,
+                                &mut id_ns,
+                            )?;
+                            // After re-arm, page may be fully finished (invalid cands).
+                            if slots[s].occupied
+                                && slots[s].keys_finished >= slots[s].keys.len()
+                            {
+                                slots[s].clear();
+                                free.push(s);
+                            }
+                        }
+                    }
+                    arm_pages(&mut ring, seg, &mut page_q, &mut free, &mut slots)?;
+                    ring.sync_submission();
+                    let _ = ring.submit();
+                    if ring.in_flight() == 0 {
+                        // Still nothing to wait on: free complete pages again.
+                        for s in 0..MAX_PAGE_SLOTS {
+                            if slots[s].occupied
+                                && slots[s].keys_finished >= slots[s].keys.len()
+                            {
+                                slots[s].clear();
+                                free.push(s);
+                            }
+                        }
+                        if free.len() == MAX_PAGE_SLOTS && page_q.is_empty() {
+                            break;
+                        }
+                        if free.len() < MAX_PAGE_SLOTS {
+                            return Err(StoreError::Corrupt(
+                                "head resolve: page slot stuck with no in-flight SQE",
+                            ));
+                        }
+                    }
+                }
+                if ring.in_flight() > 0 {
                     ring.submit_and_wait_one()?;
                     cqes = ring.harvest_ready();
                 }
@@ -734,27 +788,19 @@ fn on_head_cqe(
 
     slot.phase = SlotPhase::KeyIo;
     slot.key_pos = 0;
-    // Skip finished keys at front.
-    while slot.key_pos < slot.keys.len() {
-        let ki = slot.keys[slot.key_pos] as usize;
-        if keys[ki].active && !keys[ki].cands.is_empty() {
-            break;
-        }
-        slot.key_pos += 1;
-    }
-    if slot.key_pos >= slot.keys.len() {
-        // All done without ID.
-        return Ok(());
-    }
-    // Arm first identity for current key.
-    submit_next_id(
-        &mut keys[slot.keys[slot.key_pos] as usize],
+    // Arm first identity SQE; keys with empty/invalid cands are finished here.
+    // Critical: if submit_next_id returns false (all cands invalid), we must
+    // finish that key and try the next — otherwise the slot stays occupied
+    // with zero in-flight SQEs and the segment wave hangs forever.
+    arm_next_key_or_idle(
+        slot,
+        keys,
         session,
+        slot_id,
         side,
         side_fd,
         body_count,
         side_n,
-        slot_id,
         id_ns,
     )?;
     let _ = (table, txids);
@@ -987,6 +1033,9 @@ fn finish_key_on_page(slot: &mut PageSlot) {
 }
 
 /// Arm identity for the next unfinished key on this page, or leave slot idle.
+///
+/// Empty-cand / inactive keys were already counted in `keys_finished` at hop.
+/// Keys with only invalid fks (0 / OOB) get finished here when submit fails.
 fn arm_next_key_or_idle(
     slot: &mut PageSlot,
     keys: &mut [KeyState],
@@ -1000,32 +1049,30 @@ fn arm_next_key_or_idle(
 ) -> Result<(), StoreError> {
     while slot.key_pos < slot.keys.len() {
         let ki = slot.keys[slot.key_pos] as usize;
-        if keys[ki].active && keys[ki].cand_i < keys[ki].cands.len() {
-            if submit_next_id(
-                &mut keys[ki],
-                session,
-                side,
-                side_fd,
-                body_count,
-                side_n,
-                slot_id,
-                id_ns,
-            )? {
-                return Ok(());
-            }
-            // Cand list empty after filter — finish key.
+        if !keys[ki].active || keys[ki].cands.is_empty() {
+            // Already counted finished at hop — skip past.
+            slot.key_pos = slot.key_pos.saturating_add(1);
+            continue;
+        }
+        if keys[ki].cand_i >= keys[ki].cands.len() {
+            // Exhausted without a prior finish_key_on_page (defensive).
             finish_key_on_page(slot);
             continue;
         }
-        // Inactive or already exhausted at hop (empty cands already counted in keys_finished).
-        if keys[ki].active && !keys[ki].cands.is_empty() && keys[ki].cand_i >= keys[ki].cands.len()
-        {
-            // Exhausted via peeks but finish not yet counted (caller should have finish_key_on_page).
-            finish_key_on_page(slot);
-            continue;
+        if submit_next_id(
+            &mut keys[ki],
+            session,
+            side,
+            side_fd,
+            body_count,
+            side_n,
+            slot_id,
+            id_ns,
+        )? {
+            return Ok(());
         }
-        // Empty-cand / inactive keys were counted at hop; skip.
-        slot.key_pos = slot.key_pos.saturating_add(1);
+        // All remaining cands invalid (0 / OOB) — finish key, try next.
+        finish_key_on_page(slot);
     }
     Ok(())
 }

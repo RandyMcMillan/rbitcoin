@@ -144,16 +144,20 @@ runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**eve
 head is empty** (or force rebuild); a nearly complete index with residual runs
 uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large catalog spills; tip Class A
 recollect is parallel (~64k-fk chunks, ~128 MiB per-thread spills, contiguous
-SEAL prefix for resume); tip materialize is WarmOnly / ColdResume / FullCold.
-Catalog compact only rewrites **crumbs** (&lt;~96 MiB), not intentional recollect
-spills (tip k-ways those directly). **`RBITCOIN_SH_FORCE_REBUILD=1`:** wipe head
-+ runs + SEAL/HWM, full Class A recollect + cold load — never silent `creates≈0`
-while Class A still has work. Long recollect/materialize: ~10s status logs.
-Incomplete catalog (high SEAL + tiny run mass, or consumed runs with no head)
-on an **empty** head triggers full Class A recollect (SEAL=0). **Durable head**
-never uses run-mass incompleteness (empty runs after successful materialize are
-normal): missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); only
-when `0 < include_hwm < SEAL` is SEAL clamped for gap recollect + warm residual.
+SEAL prefix for resume). Direct enter only recollects a small SEAL gap (crash
+window); full recollect is tip finalize. Tip materialize: WarmOnly / ColdResume
+/ FullCold. Catalog compact is **IBD worker only** (crumbs &lt;~96 MiB).
+**`RBITCOIN_SH_FORCE_REBUILD=1`:** sticky env must never redo multi-hour Class A
+work. Empty head + **usable** catalog (real run mass, not a stale high-SEAL tail)
+→ **reinit head only** + FullCold (keep runs/SEAL; gap recollect fills tip lag).
+Empty head + **unusable** catalog → nuclear wipe + full recollect. **Durable
+head** + FORCE → never wipe (bootstrap/clamp/Noop + warm residual only; materialize
+mode is WarmOnly). Unset the env after a successful rebuild. Incomplete catalog
+(high SEAL + tiny run mass, or consumed runs with no head) on an **empty** head
+triggers full Class A recollect (SEAL=0). **Durable head** never uses run-mass
+incompleteness (empty runs after successful materialize are normal): missing
+`include_hwm` bootstraps from SEAL (never clamp SEAL→0); only when
+`0 < include_hwm < SEAL` is SEAL clamped for gap recollect + warm residual.
 Clearing residual run files **preserves `SEAL`** (watermark is not a run).
 **SIGINT** mid cold keeps finished prefix shards (`scripthash.cold_progress`).
 Mid-reduce keeps CHECKPOINT.

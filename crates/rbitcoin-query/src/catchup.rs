@@ -61,14 +61,31 @@ impl Query {
     /// confirm (batch), SH target-sized runs + SEAL (bulk at tip).
     ///
     /// Best-effort removes leftover `ibd_utxo.map` / point+tx run dirs from old
-    /// Catchup datadirs. Re-enqueues Class A creates with `create_fk > SEAL`
-    /// through confirmed tip (kill after tip before spill).
+    /// Catchup datadirs. Re-collects Class A creates only for a **small** SEAL gap
+    /// (crash window). Multi-hour full recollect is tip finalize only — never at
+    /// Direct enter (avoids recollect-then-FORCE-wipe loops).
     pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
+        use crate::sh_builder::{should_defer_direct_recollect, SH_DIRECT_RECOLLECT_MAX_GAP};
+
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
         self.set_tx_index(true);
         self.sh_run.enable();
         self.drop_legacy_catchup_artifacts()?;
+        self.sh_run.refresh_seal();
+        let seal = self.sh_run.sealed_max_create_fk();
+        let tip_max = self.store.txs.count();
+        let gap = tip_max.saturating_sub(seal);
+        if gap == 0 {
+            return Ok(());
+        }
+        if should_defer_direct_recollect(seal, tip_max) {
+            rbitcoin_log::info!(
+                "node: scripthash defer Class A recollect to tip finalize \
+                 (gap≈{gap} creates > max_direct={SH_DIRECT_RECOLLECT_MAX_GAP}; seal={seal} tip_max={tip_max})"
+            );
+            return Ok(());
+        }
         self.rebuild_sh_unsealed_from_class_a()?;
         Ok(())
     }
@@ -156,6 +173,14 @@ impl Query {
                      catalog_recs≈{run_recs} head_durable={head_durable} include_hwm={include_hwm}"
                 );
                 self.sh_run.prepare_force_full_rebuild(&self.store)?;
+            }
+            ShPreMaterializeAction::ForceColdFromExistingCatalog => {
+                rbitcoin_log::warn!(
+                    "node: scripthash FORCE_REBUILD env set but catalog complete \
+                     (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs}) — \
+                     reinit head only; unset RBITCOIN_SH_FORCE_REBUILD after success"
+                );
+                self.sh_run.prepare_force_cold_from_catalog(&self.store)?;
             }
             ShPreMaterializeAction::ResetCatalogFullRecollect => {
                 // Empty/wiped head + stale high SEAL + tail-only runs (or consumed
@@ -635,8 +660,9 @@ fn recollect_workers() -> usize {
 mod tests {
     use super::*;
     use crate::sh_builder::{
-        load_seal, plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild, store_seal,
-        ShPreMaterializeAction, SH_RUN_KEY_LEN, SH_RUN_REC_LEN,
+        load_seal, plan_sh_pre_materialize, sh_catalog_looks_complete, sh_catalog_total_records,
+        sh_force_rebuild, should_defer_direct_recollect, store_seal, ShPreMaterializeAction,
+        SH_DIRECT_RECOLLECT_MAX_GAP, SH_RUN_KEY_LEN, SH_RUN_REC_LEN,
     };
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_store::{
@@ -923,4 +949,378 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Mainnet regression: complete recollect then sticky FORCE must not wipe catalog.
+    #[test]
+    fn plan_force_with_complete_catalog_does_not_full_wipe() {
+        let seal = 1_411_839_527u64;
+        let tip = 1_411_887_545u64;
+        let recs = 3_741_750_509u64;
+        assert!(sh_catalog_looks_complete(seal, tip, recs));
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal, tip, recs, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog,
+            "sticky FORCE + empty head + complete catalog must not ForceFullRebuild"
+        );
+        // Tip advanced multi-million past seal during recollect — still cold-load.
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal, seal + 10_000_000, recs, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog,
+            "usable catalog must survive sticky FORCE even when tip >> seal"
+        );
+        // Durable tip + sticky FORCE → Noop even if floor lags tip (never wipe head).
+        assert_eq!(
+            plan_sh_pre_materialize(true, true, seal, seal + 10_000_000, 0, seal),
+            ShPreMaterializeAction::Noop
+        );
+        // Incomplete tail + FORCE still nuclear.
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal, tip, 222_511, 0),
+            ShPreMaterializeAction::ForceFullRebuild
+        );
+    }
+
+    /// End-to-end: recollect fills catalog → FORCE finalize cold-loads without SEAL=0 wipe.
+    #[test]
+    fn scenario_recollect_then_sticky_force_does_not_redo_class_a() {
+        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-force-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 8);
+        let tip_max = q.store.txs.count();
+
+        // Simulate completed recollect: seal at tip, large enough run mass, empty head.
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        q.sh_run.refresh_seal();
+        let seal = q.sh_run.sealed_max_create_fk();
+        let recs = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        assert!(seal > 0 && recs > 0);
+        assert!(!q.store.scripthash.has_durable_index());
+
+        // Sticky FORCE at tip: must keep catalog, reinit head, materialize.
+        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
+        let n_mat = q.finalize_sh_runs().expect("sticky FORCE finalize");
+        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
+        assert!(n_mat > 0);
+        assert!(q.store.scripthash.has_durable_index());
+        // SEAL must not have been zeroed for a full redo.
+        q.sh_run.refresh_seal();
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= seal.min(tip_max),
+            "SEAL must survive sticky FORCE when catalog was complete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct enter defers multi-million gaps; small crash-window still recollects.
+    #[test]
+    fn scenario_direct_enter_defers_large_recollect_gap() {
+        // Pure policy (mainnet-scale gaps without building millions of txs).
+        assert!(!should_defer_direct_recollect(0, 0));
+        assert!(!should_defer_direct_recollect(0, SH_DIRECT_RECOLLECT_MAX_GAP));
+        assert!(!should_defer_direct_recollect(100, 100 + SH_DIRECT_RECOLLECT_MAX_GAP));
+        assert!(should_defer_direct_recollect(
+            0,
+            SH_DIRECT_RECOLLECT_MAX_GAP + 1
+        ));
+        assert!(should_defer_direct_recollect(42_752_000, 1_411_839_527));
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-direct-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 3);
+        let tip_max = q.store.txs.count();
+        // Small chain: enter_direct recollects (gap ≤ max).
+        assert!(!should_defer_direct_recollect(0, tip_max));
+        q.sh_run.set_sealed_max_for_recollect(0).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        q.sh_run.refresh_seal();
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= tip_max.saturating_sub(1)
+                || tip_max == 0,
+            "small-gap direct enter must recollect up to tip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fresh IBD: direct seed → tip finalize materializes; second pass is stable.
+    #[test]
+    fn scenario_fresh_ibd_tip_materialize() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-fresh-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 5);
+        let n_mat = q.finalize_sh_runs().unwrap();
+        assert!(
+            n_mat > 0 || q.store.scripthash.has_durable_index() || q.scripthash_run_count() == 0,
+            "fresh tip finalize should settle SH"
+        );
+        let seal1 = q.sh_run.sealed_max_create_fk();
+        let count1 = q.store.scripthash.entry_count();
+        // Second finalize is cheap (durable head, no wipe).
+        let _n2 = q.finalize_sh_runs().unwrap();
+        assert_eq!(q.sh_run.sealed_max_create_fk(), seal1);
+        assert!(
+            q.store.scripthash.entry_count() >= count1,
+            "repeat finalize must not thrash durable head"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resumed IBD: partial SEAL + leftover runs, then tip finalize completes.
+    #[test]
+    fn scenario_resumed_ibd_partial_seal_then_tip() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-resume-ibd-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 12);
+        let tip_max = q.store.txs.count();
+        let mid = (tip_max / 2).max(1);
+
+        // Simulate crash after partial recollect: SEAL at mid, some catalog from first half.
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        q.sh_run.set_sealed_max_for_recollect(0).unwrap();
+        // Recollect only lower half by planting mid SEAL after a full rebuild then
+        // resetting catalog is hard; instead: recollect all, then set seal mid + clear
+        // would lose data. Better: plant seal=mid with empty runs (crash before spill).
+        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
+        assert_eq!(q.sh_run.sealed_max_create_fk(), mid);
+
+        // Restart path: enter_direct (small gap) + tip finalize.
+        q.enter_direct_index_mode().unwrap();
+        q.sh_run.refresh_seal();
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= mid,
+            "resume must not lower SEAL"
+        );
+        let n_mat = q.finalize_sh_runs().unwrap();
+        assert!(
+            q.store.scripthash.has_durable_index() || n_mat > 0 || mid >= tip_max,
+            "resumed IBD tip finalize should settle SH"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash mid-recollect: SEAL preserved; resume fills remainder; tip materializes.
+    #[test]
+    fn scenario_crash_resume_recollect_then_tip() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-crash-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 10);
+        let tip_max = q.store.txs.count();
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        let mid = (tip_max / 2).max(1);
+        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
+        let cancel = AtomicBool::new(true);
+        let _ = q.rebuild_sh_unsealed_from_class_a_cancellable(Some(&cancel));
+        assert_eq!(q.sh_run.sealed_max_create_fk(), mid);
+        // Resume + tip (no FORCE).
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        let seal_after = q.sh_run.sealed_max_create_fk();
+        assert!(seal_after >= mid);
+        let n_mat = q.finalize_sh_runs().unwrap();
+        assert!(
+            q.store.scripthash.has_durable_index() || n_mat > 0 || mid >= tip_max,
+            "crash resume should finish SH"
+        );
+        // Third pass after crash-resume must not recollect from 0.
+        let seal_final = q.sh_run.sealed_max_create_fk();
+        let _ = q.finalize_sh_runs().unwrap();
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= seal_final,
+            "post-settle finalize must not reset SEAL"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mainnet sequence: recollect complete → sticky FORCE tip → cold load (not wipe)
+    /// → durable head → sticky FORCE again is Noop.
+    #[test]
+    fn scenario_mainnet_recollect_then_force_then_stable() {
+        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-mainnet-seq-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 8);
+        let tip_max = q.store.txs.count();
+
+        // Phase 1: full Class A recollect (as enter_direct / pre-tip).
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        q.sh_run.refresh_seal();
+        let seal1 = q.sh_run.sealed_max_create_fk();
+        let recs1 = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        assert!(seal1 > 0 && recs1 > 0, "recollect must produce catalog");
+        assert!(!q.store.scripthash.has_durable_index());
+
+        // Phase 2: tip finalize with sticky FORCE (mainnet wipe bug).
+        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal1, tip_max, recs1, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog
+        );
+        let n_mat = q.finalize_sh_runs().expect("FORCE finalize cold-load");
+        assert!(n_mat > 0);
+        assert!(q.store.scripthash.has_durable_index());
+        q.sh_run.refresh_seal();
+        let seal2 = q.sh_run.sealed_max_create_fk();
+        assert!(
+            seal2 >= seal1.min(tip_max),
+            "SEAL must survive FORCE cold path (got {seal2}, had {seal1})"
+        );
+        let count_after = q.store.scripthash.entry_count();
+        assert!(count_after > 0);
+
+        // Phase 3: sticky FORCE still set on durable head → Noop plan, no wipe.
+        assert_eq!(
+            plan_sh_pre_materialize(
+                true,
+                true,
+                seal2,
+                tip_max,
+                0,
+                q.store.scripthash.include_hwm().max(seal2)
+            ),
+            ShPreMaterializeAction::Noop
+        );
+        let _ = q.finalize_sh_runs().unwrap();
+        assert!(q.store.scripthash.has_durable_index());
+        assert!(
+            q.store.scripthash.entry_count() >= count_after,
+            "second FORCE finalize must not wipe durable head"
+        );
+        assert!(q.sh_run.sealed_max_create_fk() >= seal2.min(tip_max));
+        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
+
+        // Phase 4: clean restart finalize (no FORCE) stays stable.
+        let seal3 = q.sh_run.sealed_max_create_fk();
+        let _ = q.finalize_sh_runs().unwrap();
+        assert_eq!(q.sh_run.sealed_max_create_fk(), seal3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Incomplete FORCE (stale high SEAL + tiny runs) still does nuclear full rebuild.
+    #[test]
+    fn scenario_force_incomplete_catalog_still_full_rebuild() {
+        let _g = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-force-stale-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 6);
+        let tip_max = q.store.txs.count();
+
+        // Plant stale high SEAL + tiny run (catch-up tail, not full catalog).
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        store_seal(&runs_dir, 1_400_000_000).unwrap();
+        q.sh_run.refresh_seal();
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&[0xab; 32], Fk(99)));
+        write_sorted_run(
+            &next_run_path(&runs_dir, 1),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+        )
+        .unwrap();
+        let recs = sh_catalog_total_records(&runs_dir);
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, 1_400_000_000, tip_max.max(1_410_000_000), recs, 0),
+            ShPreMaterializeAction::ForceFullRebuild
+        );
+
+        std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
+        let n_mat = q.finalize_sh_runs().expect("FORCE incomplete must recollect+materialize");
+        std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
+        assert!(n_mat > 0);
+        assert!(q.store.scripthash.has_durable_index());
+        // After nuclear path SEAL should track real tip, not the planted 1.4e9.
+        q.sh_run.refresh_seal();
+        assert!(
+            q.sh_run.sealed_max_create_fk() <= tip_max + 1_000,
+            "full rebuild SEAL should match Class A tip, not stale plant"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Residual run after cold materialize must warm-apply (never FullCold wipe).
+    #[test]
+    fn scenario_tip_residual_warm_after_materialize() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-scenario-warm-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 4);
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        let n0 = q.finalize_sh_runs().unwrap();
+        assert!(n0 > 0 || q.store.scripthash.has_durable_index());
+        let count_before = q.store.scripthash.entry_count();
+        let seal_before = q.sh_run.sealed_max_create_fk();
+        // Plant residual run.
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&[0xee; 32], Fk(99)));
+        write_sorted_run(
+            &next_run_path(&runs_dir, 50),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+        )
+        .unwrap();
+        let n1 = q.finalize_sh_runs().unwrap();
+        assert!(n1 >= 1 || q.store.scripthash.entry_count() >= count_before);
+        assert!(
+            q.store.scripthash.entry_count() >= count_before,
+            "warm residual must not wipe durable head"
+        );
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= seal_before,
+            "warm residual must not reset SEAL"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

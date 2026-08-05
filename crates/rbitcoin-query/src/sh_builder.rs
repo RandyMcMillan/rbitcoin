@@ -40,9 +40,13 @@ pub enum ShTipMaterializeMode {
     WarmOnly,
 }
 
-/// Select materialize mode. **Never** returns FullCold when head already holds durable data
-/// unless `force_rebuild`. Incomplete catalog should be fixed *before* this (Class A
-/// recollect); `catalog_complete` is logged/diagnostic for empty-head FullCold.
+/// Select materialize mode. **Never** returns FullCold when head already holds durable data.
+///
+/// Sticky `RBITCOIN_SH_FORCE_REBUILD` must not wipe a live head here either — intentional
+/// full cold runs after prep has already reinit'd the head empty
+/// ([`ShRunBuilder::prepare_force_full_rebuild`] / [`ShRunBuilder::prepare_force_cold_from_catalog`]).
+/// Incomplete catalog is fixed *before* this (Class A recollect); `catalog_complete` is
+/// logged/diagnostic for empty-head FullCold.
 pub fn select_sh_tip_materialize_mode(
     head_empty: bool,
     entry_count: u64,
@@ -53,16 +57,15 @@ pub fn select_sh_tip_materialize_mode(
     catalog_complete: bool,
 ) -> ShTipMaterializeMode {
     let _ = catalog_complete; // caller recollects incomplete catalogs before selecting
-    if force_rebuild {
-        return ShTipMaterializeMode::FullCold;
-    }
+    let _ = force_rebuild; // prep reinit's head before materialize; never override durable head
     let n_shards = n_shards.max(1);
+    // Mid multi-shard cold resume (prior shards may already have entry_count > 0).
     if let Some(ns) = progress_next_shard {
         if ns > 0 && ns < n_shards {
             return ShTipMaterializeMode::ColdResume { next_shard: ns };
         }
     }
-    // Residual runs against a live durable head: warm only (never wipe).
+    // Finished durable head + residual runs: warm only (never wipe — sticky FORCE too).
     if !head_empty || entry_count > 0 {
         return ShTipMaterializeMode::WarmOnly;
     }
@@ -145,13 +148,23 @@ pub fn durable_sh_inclusion_floor(include_hwm: u64, seal: u64) -> u64 {
 /// Pre-materialize catalog / SEAL action (pure; no I/O).
 ///
 /// Covers catch-up ↔ tip ↔ restart transitions:
-/// - **FORCE_REBUILD:** wipe head+runs, SEAL=0, full Class A recollect.
+/// - **FORCE_REBUILD + empty head + unusable catalog:** wipe head+runs, full Class A.
+/// - **FORCE_REBUILD + empty head + usable catalog:** reinit head only (FullCold) —
+///   **never** wipe a just-finished multi-hour recollect (sticky env). Gap recollect
+///   fills any SEAL↔tip lag after cold load.
+/// - **FORCE_REBUILD + durable head:** never wipe; same bootstrap/clamp/Noop as normal
+///   durable path (gap recollect + warm residual handle lag).
 /// - **Empty head + stale tail / no usable catalog:** reset SEAL+runs, full recollect.
 /// - **Durable head:** never wipe; never clamp SEAL to 0 for missing HWM; bootstrap
 ///   HWM from SEAL; clamp SEAL to HWM only when `0 < hwm < seal`.
+///
+/// Mainnet regression (2026-08-05): recollect done seal→1.41e9 catalog_recs≈3.7e9,
+/// then tip FORCE wiped catalog and recollected from seal=0 — must not recur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShPreMaterializeAction {
     ForceFullRebuild,
+    /// FORCE set but catalog usable — reinit head for FullCold only (keep runs/SEAL).
+    ForceColdFromExistingCatalog,
     /// Empty head cannot be cold-loaded from current runs — SEAL=0 + clear runs.
     ResetCatalogFullRecollect,
     /// Durable head: write `include_hwm = seal` (legacy missing file).
@@ -171,18 +184,31 @@ pub fn plan_sh_pre_materialize(
     include_hwm: u64,
 ) -> ShPreMaterializeAction {
     if force {
-        return ShPreMaterializeAction::ForceFullRebuild;
-    }
-    if !head_durable {
+        if head_durable {
+            // Sticky FORCE must never nuclear-wipe a live durable head. Fall through
+            // to durable maintenance (bootstrap HWM / clamp SEAL / Noop). Gap recollect
+            // after this plan fills any floor↔tip lag via WarmOnly residual.
+        } else if empty_head_needs_full_class_a_recollect(
+            seal,
+            tip_max_create_fk,
+            run_records,
+        ) {
+            // Stale high SEAL + tiny tail, or empty/consumed catalog with no head.
+            return ShPreMaterializeAction::ForceFullRebuild;
+        } else {
+            // Usable catalog (complete mass, or high SEAL with real run rows even if
+            // tip advanced past SH_SEAL_LAG_OK during recollect). Keep runs/SEAL;
+            // reinit head only. Gap recollect fills seal→tip before FullCold.
+            return ShPreMaterializeAction::ForceColdFromExistingCatalog;
+        }
+    } else if !head_durable {
         // Empty / wiped head: decide whether on-disk runs can seed FullCold.
         if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
             return ShPreMaterializeAction::ResetCatalogFullRecollect;
         }
         return ShPreMaterializeAction::Noop;
     }
-    // Durable head: run mass is irrelevant (runs are cleared after successful
-    // materialize; residual mats are a tip tail for warm apply only).
-    // Durable head: HWM (or SEAL if HWM missing) is the inclusion floor.
+    // Durable head (FORCE sticky or not): HWM (or SEAL if HWM missing) is floor.
     let floor = durable_sh_inclusion_floor(include_hwm, seal);
     if include_hwm == 0 && seal > 0 {
         return ShPreMaterializeAction::BootstrapIncludeHwm { seal: floor };
@@ -191,6 +217,17 @@ pub fn plan_sh_pre_materialize(
         return ShPreMaterializeAction::ClampSealTo { floor };
     }
     ShPreMaterializeAction::Noop
+}
+
+/// Max create_fk gap recollected at Direct enter (crash-window only).
+///
+/// Larger gaps defer to tip finalize so startup does not re-scan all Class A
+/// only for tip FORCE to wipe the catalog again.
+pub const SH_DIRECT_RECOLLECT_MAX_GAP: u64 = 2_000_000;
+
+/// True when Direct enter should skip Class A recollect (leave it for tip finalize).
+pub fn should_defer_direct_recollect(seal: u64, tip_max: u64) -> bool {
+    tip_max.saturating_sub(seal) > SH_DIRECT_RECOLLECT_MAX_GAP
 }
 
 /// Empty head: full Class A recollect when catalog cannot seed a complete cold load.
@@ -593,6 +630,28 @@ impl ShRunBuilder {
         // finished FullCold with creates≈0 on a zeroed head.
         self.enable();
         // Parallel recollect will write catalog; keep compact off until Direct IBD.
+        self.set_ibd_catalog_compact(false);
+        Ok(())
+    }
+
+    /// FORCE with complete catalog: wipe head only — keep runs/SEAL for FullCold.
+    pub fn prepare_force_cold_from_catalog(&self, store: &Store) -> Result<(), StoreError> {
+        info!(
+            "node: scripthash FORCE_REBUILD — catalog already complete; reinit head only \
+             (not wiping runs/SEAL)"
+        );
+        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending.clear();
+            g.l0.clear();
+            g.l0_bytes = 0;
+        }
+        ColdProgress::clear(store.path());
+        let hwm_path = store.path().join(rbitcoin_store::INCLUDE_HWM_NAME);
+        let _ = std::fs::remove_file(&hwm_path);
+        store.scripthash.reinit_empty_for_cold_materialize()?;
+        self.ensure_enabled();
         self.set_ibd_catalog_compact(false);
         Ok(())
     }
@@ -1869,6 +1928,7 @@ mod tests {
             select_sh_tip_materialize_mode(true, 0, None, 64, 10, false, true),
             ShTipMaterializeMode::FullCold
         );
+        // Mid multi-shard cold: progress wins even with partial entry_count.
         assert_eq!(
             select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32, false, true),
             ShTipMaterializeMode::ColdResume { next_shard: 40 }
@@ -1877,9 +1937,15 @@ mod tests {
             select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1, false, true),
             ShTipMaterializeMode::WarmOnly
         );
-        // Explicit rebuild may wipe.
+        // Sticky FORCE on durable head (no mid-cold progress) → warm, not wipe.
         assert_eq!(
             select_sh_tip_materialize_mode(false, 1e9 as u64, None, 64, 1, true, true),
+            ShTipMaterializeMode::WarmOnly,
+            "sticky FORCE must not FullCold a live durable head"
+        );
+        // FORCE + empty head + streams → FullCold (after prep reinit).
+        assert_eq!(
+            select_sh_tip_materialize_mode(true, 0, None, 64, 1, true, true),
             ShTipMaterializeMode::FullCold
         );
         // Complete progress (next == n_shards) + residual → warm, not resume past end.
@@ -2038,16 +2104,42 @@ mod tests {
             plan_sh_pre_materialize(false, false, seal, seal, 0, 0),
             ShPreMaterializeAction::ResetCatalogFullRecollect
         );
-        // FORCE always full rebuild regardless of head.
-        assert_eq!(
-            plan_sh_pre_materialize(true, true, seal, tip, 222_511, seal),
-            ShPreMaterializeAction::ForceFullRebuild
-        );
+        // Incomplete catalog + FORCE → nuclear.
         assert_eq!(
             plan_sh_pre_materialize(true, false, seal, tip, 222_511, 0),
             ShPreMaterializeAction::ForceFullRebuild
         );
-        // Good empty-head catalog: seal near tip, huge mass → keep, FullCold later.
+        // Complete catalog + empty head + FORCE → cold from catalog (no wipe).
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, tip, tip, 3_700_000_000, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog
+        );
+        // Mainnet wipe regression: seal near tip, huge catalog, tip advanced past
+        // SH_SEAL_LAG_OK during recollect — still cold-load, never seal=0 wipe.
+        let seal_main = 1_411_839_527u64;
+        let tip_main = 1_411_887_545u64;
+        let recs_main = 3_741_750_509u64;
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal_main, tip_main, recs_main, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog
+        );
+        // Same with multi-million tip advance past seal — catalog mass still usable.
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal_main, seal_main + 5_000_000, recs_main, 0),
+            ShPreMaterializeAction::ForceColdFromExistingCatalog,
+            "usable catalog + tip lag must not ForceFullRebuild"
+        );
+        // Durable head + sticky FORCE even when floor lags tip → Noop (never wipe).
+        assert_eq!(
+            plan_sh_pre_materialize(true, true, seal, tip, 0, seal),
+            ShPreMaterializeAction::Noop
+        );
+        // Durable + FORCE + missing HWM → bootstrap (not wipe).
+        assert_eq!(
+            plan_sh_pre_materialize(true, true, seal, tip, 0, 0),
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal }
+        );
+        // Good empty-head catalog without FORCE → Noop (FullCold from runs later).
         assert_eq!(
             plan_sh_pre_materialize(false, false, tip, tip, 3_700_000_000, 0),
             ShPreMaterializeAction::Noop

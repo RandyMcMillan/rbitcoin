@@ -35,29 +35,9 @@ pub enum ShTipMaterializeMode {
 }
 
 /// Select materialize mode. **Never** returns FullCold when head already holds durable data
-/// unless `force_rebuild`.
+/// unless `force_rebuild`. Incomplete catalog should be fixed *before* this (Class A
+/// recollect); `catalog_complete` is logged/diagnostic for empty-head FullCold.
 pub fn select_sh_tip_materialize_mode(
-    head_empty: bool,
-    entry_count: u64,
-    progress_next_shard: Option<u32>,
-    n_shards: u32,
-    stream_run_count: usize,
-    force_rebuild: bool,
-) -> ShTipMaterializeMode {
-    select_sh_tip_materialize_mode_ex(
-        head_empty,
-        entry_count,
-        progress_next_shard,
-        n_shards,
-        stream_run_count,
-        force_rebuild,
-        /*catalog_complete*/ true,
-    )
-}
-
-/// Extended selector: when `catalog_complete` is false and head is empty, FullCold is still
-/// chosen only after the caller has rebuilt runs from Class A (not from a tail catalog).
-pub fn select_sh_tip_materialize_mode_ex(
     head_empty: bool,
     entry_count: u64,
     progress_next_shard: Option<u32>,
@@ -66,6 +46,7 @@ pub fn select_sh_tip_materialize_mode_ex(
     force_rebuild: bool,
     catalog_complete: bool,
 ) -> ShTipMaterializeMode {
+    let _ = catalog_complete; // caller recollects incomplete catalogs before selecting
     if force_rebuild {
         return ShTipMaterializeMode::FullCold;
     }
@@ -79,16 +60,9 @@ pub fn select_sh_tip_materialize_mode_ex(
     if !head_empty || entry_count > 0 {
         return ShTipMaterializeMode::WarmOnly;
     }
-    // Empty head: need stream inputs; incomplete catalog is handled *before* this
-    // by full Class A recollect (caller). With no runs, nothing to do.
+    // Empty head: need stream inputs.
     if stream_run_count == 0 {
         return ShTipMaterializeMode::WarmOnly;
-    }
-    if !catalog_complete {
-        // Caller should have rebuilt; if still incomplete, refuse silent partial cold.
-        // Prefer FullCold only after recollect; if still incomplete, still FullCold
-        // (operator must fix) — log is caller's job.
-        return ShTipMaterializeMode::FullCold;
     }
     ShTipMaterializeMode::FullCold
 }
@@ -729,7 +703,7 @@ impl ShRunBuilder {
         let seal_now = self.sealed_max_create_fk();
         let cat_recs = stream_inputs.iter().map(|r| r.count).sum::<u64>();
         let catalog_ok = sh_catalog_looks_complete(seal_now, tip_max, cat_recs);
-        let mode = select_sh_tip_materialize_mode_ex(
+        let mode = select_sh_tip_materialize_mode(
             head_empty,
             n_existing,
             progress.as_ref().map(|p| p.next_shard),
@@ -1579,33 +1553,33 @@ mod tests {
     fn select_mode_never_full_cold_when_head_has_data() {
         // Regression: residual run after finished cold must not FullCold.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1, false),
+            select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1, false, true),
             ShTipMaterializeMode::WarmOnly
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(true, 100, None, 64, 1, false),
+            select_sh_tip_materialize_mode(true, 100, None, 64, 1, false, true),
             ShTipMaterializeMode::WarmOnly
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(true, 0, None, 64, 10, false),
+            select_sh_tip_materialize_mode(true, 0, None, 64, 10, false, true),
             ShTipMaterializeMode::FullCold
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32, false),
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32, false, true),
             ShTipMaterializeMode::ColdResume { next_shard: 40 }
         );
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1, false),
+            select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1, false, true),
             ShTipMaterializeMode::WarmOnly
         );
         // Explicit rebuild may wipe.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 1e9 as u64, None, 64, 1, true),
+            select_sh_tip_materialize_mode(false, 1e9 as u64, None, 64, 1, true, true),
             ShTipMaterializeMode::FullCold
         );
         // Complete progress (next == n_shards) + residual → warm, not resume past end.
         assert_eq!(
-            select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1, false),
+            select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1, false, true),
             ShTipMaterializeMode::WarmOnly
         );
     }

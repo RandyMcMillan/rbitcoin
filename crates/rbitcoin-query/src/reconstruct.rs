@@ -185,11 +185,19 @@ impl Query {
                 inp.prev_txid = txid;
                 continue;
             }
-            let txid = if let Some(t) = batch.and_then(|b| b.txid(Fk(id))) {
-                t
-            } else {
-                self.store.txs.body_txid(Fk(id))?
+            // Schema 13: packed body meta has no leading txid. BatchFullBodies may
+            // still hold a zero identity until stamped from `txid.body`. Prefer a
+            // non-zero batch hit; never treat all-zero as resolved (that made
+            // multi-input wire rebuild look like double-spends of null:0).
+            let txid = match batch.and_then(|b| b.txid(Fk(id))) {
+                Some(t) if t != [0u8; 32] => t,
+                _ => self.store.txs.body_txid(Fk(id))?,
             };
+            if txid == [0u8; 32] {
+                return Err(StoreError::Corrupt(
+                    "wire rebuild: create identity still zero after txid.body",
+                ));
+            }
             cache.insert(id, txid);
             inp.prev_txid = txid;
         }

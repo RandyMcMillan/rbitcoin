@@ -82,8 +82,8 @@
               cargo
               rustfmt
               clippy
-              llvmPackages.bintools
-              llvmPackages.llvm
+              llvmPackages_19.bintools
+              llvmPackages_19.llvm
               cargo-llvm-cov
               pkg-config
             ];
@@ -91,8 +91,8 @@
             # Dev shell still denies warnings; release package uses its own RUSTFLAGS.
             RUSTFLAGS = "-Dwarnings";
             shellHook = ''
-              export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
-              export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
+              export LLVM_COV="${pkgs.llvmPackages_19.llvm}/bin/llvm-cov"
+              export LLVM_PROFDATA="${pkgs.llvmPackages_19.llvm}/bin/llvm-profdata"
               echo "rbitcoin devShell: rustc=$(rustc --version) (pinned nixpkgs via flake)"
             '';
           };

@@ -11,9 +11,18 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Sleep after a productive flush so confirm keeps the disk.
+///
+/// Under `cfg(test)` keep this tiny so unit/scenario SH builders do not pay
+/// multi-×40ms sleeps per spill (production IBD still uses 40ms).
+#[cfg(not(test))]
 pub const AFTER_WORK: Duration = Duration::from_millis(40);
+#[cfg(test)]
+pub const AFTER_WORK: Duration = Duration::from_millis(1);
 /// Idle wait when neither flush nor finalize.
+#[cfg(not(test))]
 pub const IDLE_POLL: Duration = Duration::from_millis(100);
+#[cfg(test)]
+pub const IDLE_POLL: Duration = Duration::from_millis(5);
 /// Finalize wait: 10ms × this ≈ 60s budget for large memtables.
 pub const FINALIZE_POLL_MAX: u32 = 6000;
 

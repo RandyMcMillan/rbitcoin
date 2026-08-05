@@ -1726,6 +1726,10 @@ fn resolve_prevout(
         path_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         path_n.fetch_add(1, Ordering::Relaxed);
         confirm_phase_stats::ASM_IN_N.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if std::ptr::eq(path_n, &confirm_phase_stats::ASM_PREV_BATCH_N) {
+            confirm_phase_stats::tl_note_batch_hit();
+        }
     }
 
     // Same-block spend of an earlier output in this block.
@@ -1874,16 +1878,24 @@ fn resolve_prevout(
         match cold_why {
             ColdWhy::NullFk => {
                 confirm_phase_stats::ASM_PREV_COLD_NULL_FK_N.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_null_fk();
             }
             ColdWhy::NotPin => {
                 confirm_phase_stats::ASM_PREV_COLD_NOT_PIN_N.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_not_pin();
             }
             ColdWhy::TxidMismatch => {
                 confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N
                     .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_txid_mismatch();
             }
             ColdWhy::VoutMiss => {
                 confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_vout_miss();
             }
         }
         return Ok(ResolvedPrevout {
@@ -2926,9 +2938,9 @@ mod structure_rule_tests {
         let same_block: HashMap<[u8; 32], usize> = HashMap::new();
         let mut cb_cache: HashMap<Fk, Option<u32>> = HashMap::new();
 
-        // Drain shared counters (parallel tests may have dirtied them).
-        let _ = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
-        let _ = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+        // Thread-local N1 counters (process-global atomics race under parallel cargo test).
+        let _ = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+        let _ = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
 
         // ── null_fk: no hint; head still finds parent → cold ──────────
         {
@@ -2945,10 +2957,10 @@ mod structure_rule_tests {
                 false,
             )
             .expect("null_fk cold");
-            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
-            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (1, 0, 0, 0), "null_fk why={why:?}");
-            assert_eq!(det.8, 1, "cold_n={}", det.8); // cold_n
+            assert_eq!(cold_n, 1, "cold_n={cold_n}");
         }
 
         // ── not_pin: correct fk, empty BatchParents ───────────────────
@@ -2966,10 +2978,10 @@ mod structure_rule_tests {
                 false,
             )
             .expect("not_pin cold");
-            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
-            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 1, 0, 0), "not_pin why={why:?}");
-            assert_eq!(det.8, 1, "cold_n");
+            assert_eq!(cold_n, 1, "cold_n");
         }
 
         // ── batch hit: no cold ────────────────────────────────────────
@@ -3001,11 +3013,11 @@ mod structure_rule_tests {
                 false,
             )
             .expect("batch hit");
-            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
-            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+            let (batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 0, 0, 0), "batch hit must not cold why={why:?}");
-            assert_eq!(det.2, 1, "batch_n"); // batch_n
-            assert_eq!(det.8, 0, "cold_n");
+            assert_eq!(batch_n, 1, "batch_n");
+            assert_eq!(cold_n, 0, "cold_n");
         }
 
         // ── txid_mismatch: batch has vout under wrong parent txid ─────
@@ -3027,10 +3039,10 @@ mod structure_rule_tests {
                 false,
             )
             .expect("mismatch cold");
-            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
-            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 0, 1, 0), "mismatch why={why:?}");
-            assert_eq!(det.8, 1, "cold_n");
+            assert_eq!(cold_n, 1, "cold_n");
         }
 
         // ── vout_miss: parent in batch, needed vout not sparse-pinned ─
@@ -3054,10 +3066,10 @@ mod structure_rule_tests {
                 false,
             )
             .expect("vout_miss cold");
-            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
-            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
+            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 0, 0, 1), "vout_miss why={why:?}");
-            assert_eq!(det.8, 1, "cold_n");
+            assert_eq!(cold_n, 1, "cold_n");
         }
 
         let _ = std::fs::remove_dir_all(&path);

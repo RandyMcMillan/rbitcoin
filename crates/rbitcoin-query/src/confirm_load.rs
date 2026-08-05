@@ -219,6 +219,35 @@ impl Query {
             for c in creates {
                 by_fk.insert(c.fk.get().unwrap_or(0), c);
             }
+            // Bulk stamp schema-13 create identity (one sidefile range when dense).
+            let mut id_by_fk: HashMap<u64, [u8; 32]> = HashMap::with_capacity(range_fks.len());
+            if let (Some(first), Some(last)) = (
+                range_fks.first().and_then(|f| f.get()),
+                range_fks.last().and_then(|f| f.get()),
+            ) {
+                let consecutive = range_fks
+                    .windows(2)
+                    .all(|w| match (w[0].get(), w[1].get()) {
+                        (Some(a), Some(b)) => b == a.saturating_add(1),
+                        _ => false,
+                    });
+                if consecutive && last >= first {
+                    let ids = self.store.txs.body_txid_range(first, last)?;
+                    for (i, fk) in range_fks.iter().enumerate() {
+                        if let Some(id) = fk.get() {
+                            if let Some(tid) = ids.get(i).copied() {
+                                id_by_fk.insert(id, tid);
+                            }
+                        }
+                    }
+                } else {
+                    for fk in &range_fks {
+                        if let Some(id) = fk.get() {
+                            id_by_fk.insert(id, self.store.txs.body_txid(*fk)?);
+                        }
+                    }
+                }
+            }
             for fk in &range_fks {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -243,6 +272,22 @@ impl Query {
                 };
                 let body_range = Some(c.body_range);
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+                // Schema 13: packed Full decode leaves tx.txid zero — stamp from
+                // dense `txid.body` so wire rebuild / same-batch prevouts see real
+                // create identity (not null:0 double-spend false positives).
+                let mut tx = tx;
+                if tx.txid == [0u8; 32] {
+                    tx.txid = id_by_fk
+                        .get(&id)
+                        .copied()
+                        .ok_or(StoreError::Corrupt("confirm load missing create identity"))?;
+                    if tx.txid == [0u8; 32] {
+                        return Err(StoreError::Corrupt(
+                            "confirm load create identity still zero",
+                        )
+                        .into());
+                    }
+                }
                 let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
                     .iter()
                     .map(|inp| {

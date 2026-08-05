@@ -377,6 +377,71 @@ pub mod confirm_phase_stats {
         )
     }
 
+    // Thread-local N1 cold-why / batch / cold path counts for unit tests.
+    // Process-global atomics race under parallel cargo test; N1 samples these TLS
+    // counters updated only by this thread's resolve_prevout (cfg(test)).
+    #[cfg(test)]
+    thread_local! {
+        static TL_COLD_WHY: std::cell::Cell<(u64, u64, u64, u64)> =
+            const { std::cell::Cell::new((0, 0, 0, 0)) };
+        static TL_BATCH_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static TL_COLD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn tl_note_cold_why_null_fk() {
+        TL_COLD_WHY.with(|c| {
+            let (a, b, c2, d) = c.get();
+            c.set((a + 1, b, c2, d));
+        });
+        TL_COLD_N.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn tl_note_cold_why_not_pin() {
+        TL_COLD_WHY.with(|c| {
+            let (a, b, c2, d) = c.get();
+            c.set((a, b + 1, c2, d));
+        });
+        TL_COLD_N.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn tl_note_cold_why_txid_mismatch() {
+        TL_COLD_WHY.with(|c| {
+            let (a, b, c2, d) = c.get();
+            c.set((a, b, c2 + 1, d));
+        });
+        TL_COLD_N.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn tl_note_cold_why_vout_miss() {
+        TL_COLD_WHY.with(|c| {
+            let (a, b, c2, d) = c.get();
+            c.set((a, b, c2, d + 1));
+        });
+        TL_COLD_N.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn tl_note_batch_hit() {
+        TL_BATCH_N.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn sample_tl_assemble_cold_why_and_reset() -> (u64, u64, u64, u64) {
+        TL_COLD_WHY.with(|c| c.replace((0, 0, 0, 0)))
+    }
+    #[cfg(test)]
+    #[inline]
+    pub fn sample_tl_batch_cold_n_and_reset() -> (u64, u64) {
+        let b = TL_BATCH_N.with(|c| c.replace(0));
+        let cold = TL_COLD_N.with(|c| c.replace(0));
+        (b, cold)
+    }
+
     /// Wire-prep residual subtimers (ns): `(wire_arc, struct, header, prepare, filter_plan)`.
     ///
     /// These sit inside [`LOAD_NS`] but outside pin (confirm_load_stats). Pin and

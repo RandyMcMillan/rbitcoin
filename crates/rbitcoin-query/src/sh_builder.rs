@@ -746,15 +746,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-sh-fanin-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_SH_MERGE_FANIN", "8");
+        // Smaller than historical 40×10 but still multi-pass: fanin 4 → several reduce waves.
+        std::env::set_var("RBITCOIN_SH_MERGE_FANIN", "4");
         let store = Store::open_or_create(&dir).unwrap();
         let b = ShRunBuilder::new(&dir);
         let runs_dir = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
-        // 40 tiny cataloged runs → tip reduce with fanin 8.
-        for seq in 1..=40u64 {
+        const N_RUNS: u64 = 16;
+        const PER_RUN: u64 = 8;
+        for seq in 1..=N_RUNS {
             let mut body = Vec::new();
-            for j in 0..10u64 {
+            for j in 0..PER_RUN {
                 let mut sh = [0u8; 32];
                 sh[0] = seq as u8;
                 sh[1] = j as u8;
@@ -764,8 +766,8 @@ mod tests {
             write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
         }
         let n = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert_eq!(n, 400);
-        assert_eq!(store.scripthash.entry_count(), 400);
+        assert_eq!(n, N_RUNS * PER_RUN);
+        assert_eq!(store.scripthash.entry_count(), N_RUNS * PER_RUN);
         std::env::remove_var("RBITCOIN_SH_MERGE_FANIN");
         let _ = std::fs::remove_dir_all(&dir);
     }

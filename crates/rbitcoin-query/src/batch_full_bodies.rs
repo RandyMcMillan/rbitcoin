@@ -89,9 +89,19 @@ impl BatchFullBodies {
         Some((b.tx.clone(), b.inputs.clone(), b.outputs.clone()))
     }
 
-    /// Create txid if this batch decoded the create body.
+    /// Create txid if this batch decoded the create body with non-zero identity.
+    ///
+    /// Schema 13 packed decode leaves `TxRecord.txid` zero until stamped from
+    /// `txid.body`. Returning `None` for zero forces wire rebuild to the sidefile
+    /// rather than treating null identity as a valid prev_txid.
     pub fn txid(&self, fk: Fk) -> Option<[u8; 32]> {
-        self.get(fk).map(|b| b.tx.txid)
+        self.get(fk).and_then(|b| {
+            if b.tx.txid == [0u8; 32] {
+                None
+            } else {
+                Some(b.tx.txid)
+            }
+        })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Fk, &BatchBody)> {
@@ -158,5 +168,20 @@ mod tests {
         b.insert(Fk(5), 3, sample_tx(5), vec![], vec![], None, vec![]);
         assert!(!b.is_empty());
         assert_eq!(b.len(), 1);
+    }
+
+    /// Schema 13: unstamped body meta must not look like a resolved create id.
+    #[test]
+    fn txid_none_when_zero_identity() {
+        let mut b = BatchFullBodies::new();
+        let mut tx = sample_tx(0);
+        tx.txid = [0u8; 32];
+        b.insert(Fk(9), 1, tx, vec![], vec![], None, vec![]);
+        assert_eq!(
+            b.txid(Fk(9)),
+            None,
+            "zero identity must force wire path to txid.body"
+        );
+        assert!(b.get(Fk(9)).is_some());
     }
 }

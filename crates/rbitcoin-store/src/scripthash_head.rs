@@ -25,14 +25,55 @@ const DEFAULT_SLOTS: u64 = 64;
 const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
 const CHUNK_CACHE_MAX: usize = 256;
 
+/// Open-address slot count for `keys` unique entries at 7/8 max load (pow2).
+#[inline]
+pub fn sh_slots_for_keys(keys: u64) -> u64 {
+    if keys == 0 {
+        return DEFAULT_SLOTS;
+    }
+    let min = keys
+        .saturating_mul(MAX_LOAD_DEN)
+        .div_ceil(MAX_LOAD_NUM)
+        .max(1);
+    min.next_power_of_two().max(DEFAULT_SLOTS)
+}
+
+/// Default unique-key hint for cold live OA pre-size (mainnet ~2e9).
+///
+/// Override with `RBITCOIN_SH_UNIQUE_HINT`. Tiny/test scale uses a small default
+/// so unit tests do not allocate multi-GiB tables.
+pub fn sh_unique_hint_default() -> u64 {
+    if let Ok(s) = std::env::var("RBITCOIN_SH_UNIQUE_HINT") {
+        if let Ok(n) = s.parse::<u64>() {
+            return n.max(1);
+        }
+    }
+    match HeadScale::from_env() {
+        HeadScale::Tiny => 4_096,
+        HeadScale::Mainnet => 2_000_000_000,
+    }
+}
+
+/// Per-shard key capacity from a global unique hint (25% skew margin).
+#[inline]
+pub fn sh_per_shard_key_budget(unique_hint: u64, n_shards: usize) -> u64 {
+    let n = n_shards.max(1) as u64;
+    unique_hint
+        .max(1)
+        .div_ceil(n)
+        .saturating_mul(5)
+        .div_ceil(4)
+        .max(1)
+}
+
 /// Shard index from the **high bits** of `scripthash[0]` (power-of-two `n_shards`).
 ///
 /// Unlike `key[0] % n`, this makes lexicographic order of full scripthashes
-/// contiguous per shard: for 16 shards, bytes `0x00–0x0f` → shard 0,
-/// `0x10–0x1f` → 1, … So sorted runs already stream one complete shard at a
-/// time — cold materialize can bulk-fill each head without multipass.
+/// contiguous per shard: for 64 shards, bytes `0x00–0x03` → shard 0,
+/// `0x04–0x07` → 1, … So sorted runs already stream one complete shard at a
+/// time — cold materialize builds one live OA image per band.
 ///
-/// `n_shards` must be 1 or a power of two ≤ 256 (mainnet SH uses 16).
+/// `n_shards` must be 1 or a power of two ≤ 256 (mainnet SH uses **64**).
 #[inline]
 pub fn prefix_shard_of(full: &[u8; 32], n_shards: usize) -> usize {
     let n = n_shards.max(1);
@@ -315,14 +356,7 @@ impl ScriptHashHead {
     }
 
     fn slots_for_keys(keys: u64) -> u64 {
-        if keys == 0 {
-            return DEFAULT_SLOTS;
-        }
-        let min = keys
-            .saturating_mul(MAX_LOAD_DEN)
-            .div_ceil(MAX_LOAD_NUM)
-            .max(1);
-        min.next_power_of_two().max(DEFAULT_SLOTS)
+        sh_slots_for_keys(keys)
     }
 
     pub fn occupied(&self) -> u64 {
@@ -347,6 +381,45 @@ impl ScriptHashHead {
             }
         }
         Ok(())
+    }
+
+    /// Install a pre-built cold slot image (live in-RAM fill). Requires empty occupied.
+    pub fn install_cold_image(
+        &self,
+        table: &[u8],
+        slots: u64,
+        occupied: u64,
+    ) -> Result<(), StoreError> {
+        let slots = slots.max(2).next_power_of_two();
+        let need_bytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
+        if table.len() != need_bytes {
+            return Err(StoreError::Corrupt(
+                "scripthash install_cold_image: table len mismatch",
+            ));
+        }
+        if self.state.lock().unwrap().occupied != 0 {
+            return Err(StoreError::Corrupt(
+                "scripthash install_cold_image: not empty",
+            ));
+        }
+        let new_bytes = need_bytes as u64;
+        let need = FILE_HEADER_LEN as u64 + new_bytes;
+        self.file.ensure_capacity(need)?;
+        self.file.set_logical_len(need)?;
+        self.file.write_at(FILE_HEADER_LEN as u64, table)?;
+        let mut state = self.state.lock().unwrap();
+        state.slots = slots;
+        state.occupied = occupied;
+        Ok(())
+    }
+
+    /// Best-effort drop of head pages from page cache after cold install.
+    pub fn advise_dont_need_all(&self) {
+        let len = self.file.logical_len();
+        if len > FILE_HEADER_LEN as u64 {
+            self.file
+                .advise_dont_need(FILE_HEADER_LEN as u64, len - FILE_HEADER_LEN as u64);
+        }
     }
 
     /// Expand an **empty** open-address table to `new_slots` (power of two).
@@ -606,7 +679,131 @@ impl<'a> SlotPageCache<'a> {
     }
 }
 
-/// Sharded facade (16-way mainnet) over [`ScriptHashHead`].
+/// In-RAM open-address image for **one** cold-materialize shard.
+///
+/// Pre-sized to final `slots` at construction (no grow-from-tiny happy path).
+/// Stream inserts by probe; on shard exit [`Self::install_into`] writes once.
+pub struct LiveShardTable {
+    slots: u64,
+    occupied: u64,
+    table: Vec<u8>,
+    /// Unique keys inserted (same as occupied for cold empty-start).
+    keys: u64,
+}
+
+impl LiveShardTable {
+    /// Allocate a zeroed slot image for `key_budget` unique keys (final size).
+    pub fn with_key_budget(key_budget: u64) -> Self {
+        let slots = sh_slots_for_keys(key_budget);
+        let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
+        Self {
+            slots,
+            occupied: 0,
+            table: vec![0u8; nbytes],
+            keys: 0,
+        }
+    }
+
+    pub fn slots(&self) -> u64 {
+        self.slots
+    }
+
+    pub fn occupied(&self) -> u64 {
+        self.occupied
+    }
+
+    pub fn keys(&self) -> u64 {
+        self.keys
+    }
+
+    pub fn table_bytes(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Insert one head value (full Electrum scripthash). Overwrites same key16.
+    pub fn insert(&mut self, full: &[u8; 32], val: &ShHeadValue) -> Result<(), StoreError> {
+        if val.is_empty() {
+            return Ok(());
+        }
+        // Exception path only: pathological skew past pre-size.
+        if self.occupied.saturating_add(1).saturating_mul(MAX_LOAD_DEN)
+            > self.slots.saturating_mul(MAX_LOAD_NUM)
+        {
+            self.rehash_double()?;
+        }
+        let key = head_key_from_full(full);
+        let enc = val.encode();
+        self.place(key, &enc)?;
+        self.keys = self.keys.saturating_add(1);
+        Ok(())
+    }
+
+    fn place(&mut self, key: ShHeadKey, enc: &[u8; SH_HEAD_VALUE_LEN]) -> Result<(), StoreError> {
+        let mut slot = open_address::primary_slot(&key, self.slots);
+        for _ in 0..self.slots {
+            let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
+            let slot_key: ShHeadKey = self.table[off..off + SH_HEAD_KEY_LEN]
+                .try_into()
+                .unwrap();
+            let slot_v: [u8; SH_HEAD_VALUE_LEN] = self.table
+                [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                .try_into()
+                .unwrap();
+            if is_empty_slot(&slot_key, &slot_v) {
+                self.table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(&key);
+                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                    .copy_from_slice(enc);
+                self.occupied = self.occupied.saturating_add(1);
+                return Ok(());
+            }
+            if slot_key == key {
+                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                    .copy_from_slice(enc);
+                return Ok(());
+            }
+            slot = (slot + 1) & (self.slots - 1);
+        }
+        Err(StoreError::Corrupt("scripthash live shard table full"))
+    }
+
+    fn rehash_double(&mut self) -> Result<(), StoreError> {
+        let new_slots = self.slots.saturating_mul(2).max(2).next_power_of_two();
+        let mut neu = LiveShardTable {
+            slots: new_slots,
+            occupied: 0,
+            table: vec![0u8; (new_slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE)],
+            keys: 0,
+        };
+        let old_slots = self.slots;
+        let old = std::mem::take(&mut self.table);
+        for s in 0..old_slots {
+            let off = (s as usize) * SH_HEAD_SLOT_SIZE;
+            let k: ShHeadKey = old[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
+            let v: [u8; SH_HEAD_VALUE_LEN] = old
+                [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                .try_into()
+                .unwrap();
+            if !is_empty_slot(&k, &v) {
+                neu.place(k, &v)?;
+            }
+        }
+        neu.keys = self.keys;
+        *self = neu;
+        Ok(())
+    }
+
+    /// Sequential write into an **empty** on-disk shard; frees this image.
+    pub fn install_into(self, head: &ScriptHashHead) -> Result<(), StoreError> {
+        if head.occupied() != 0 {
+            return Err(StoreError::Corrupt(
+                "scripthash live install: shard not empty",
+            ));
+        }
+        head.install_cold_image(&self.table, self.slots, self.occupied)
+    }
+}
+
+/// Sharded facade (64-way mainnet) over [`ScriptHashHead`].
 pub struct ShardedScriptHashHead {
     shards: Vec<ScriptHashHead>,
 }
@@ -661,7 +858,7 @@ impl ShardedScriptHashHead {
         Ok(())
     }
 
-    pub fn open_for_role(path: impl Into<PathBuf>, _role: HeadRole) -> Result<Self, StoreError> {
+    pub fn open_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             let mut names: Vec<String> = std::fs::read_dir(&path)
@@ -673,6 +870,13 @@ impl ShardedScriptHashHead {
             names.sort();
             if names.is_empty() {
                 return Err(StoreError::Corrupt("sharded scripthash head empty"));
+            }
+            // Mainnet expects 64-way; refuse legacy 16-way (reindex). Tiny is 1 (file not dir).
+            let expected = shard_count_for_role(role);
+            if expected > 1 && names.len() != expected {
+                return Err(StoreError::Corrupt(
+                    "scripthash head shard count mismatch (reindex; expected 64-way mainnet layout)",
+                ));
             }
             let mut shards = Vec::with_capacity(names.len());
             for (i, name) in names.iter().enumerate() {
@@ -729,66 +933,28 @@ impl ShardedScriptHashHead {
         self.shards.iter().all(|s| s.occupied() == 0)
     }
 
-    /// Pre-size shards for an upcoming bulk insert (`additional` keys globally).
-    pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
-        if self.shards.is_empty() {
-            return Ok(());
-        }
-        // Spread estimate evenly; each shard grows if needed.
-        let per = additional.div_ceil(self.shards.len() as u64).max(1);
-        for s in &self.shards {
-            s.reserve_additional(per)?;
-        }
-        Ok(())
-    }
-
-    /// Pre-size every **empty** shard so a single RAM [`ScriptHashHead::insert_many`]
-    /// bulk-fill can place `expected_keys` (global) without mid-fill rehash.
-    ///
-    /// Inflates by 25% then even-splits across shards (hash skew margin).
-    /// Slot table bytes = `slots × 32`; peak RAM for one `bulk_fill_empty`.
-    pub fn reserve_for_cold_bulk(&self, expected_keys: u64) -> Result<(), StoreError> {
-        if expected_keys == 0 {
-            return Ok(());
-        }
-        if !self.is_empty() {
-            return Err(StoreError::Corrupt(
-                "scripthash head reserve_for_cold_bulk: head not empty",
-            ));
-        }
-        let inflated = expected_keys.saturating_mul(5).div_ceil(4).max(1);
-        self.reserve_additional(inflated)
-    }
-
-    /// Empty-table bulk fill for **one** shard: full slot image in RAM, one write.
-    ///
-    /// `entries` must all belong to `shard`. Requires that shard empty. Frees
-    /// the caller's vector via `std::mem::take` after insert.
-    pub fn bulk_fill_one_shard_cold(
+    /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
+    pub fn install_live_shard(
         &self,
         shard: usize,
-        entries: &mut Vec<([u8; 32], ShHeadValue)>,
+        live: LiveShardTable,
     ) -> Result<(), StoreError> {
         if shard >= self.shards.len() {
             return Err(StoreError::Corrupt(
-                "scripthash bulk_fill_one_shard_cold: shard out of range",
+                "scripthash install_live_shard: shard out of range",
             ));
         }
-        let s = &self.shards[shard];
-        if s.occupied() != 0 {
-            return Err(StoreError::Corrupt(
-                "scripthash bulk_fill_one_shard_cold: shard not empty",
-            ));
-        }
-        let bucket = std::mem::take(entries);
-        if bucket.is_empty() {
+        if live.keys() == 0 && live.occupied() == 0 {
             return Ok(());
         }
-        s.reserve_additional(bucket.len() as u64)?;
-        // insert_many → bulk_fill_empty while occupied==0.
-        s.insert_many(&bucket)?;
-        drop(bucket);
-        Ok(())
+        live.install_into(&self.shards[shard])
+    }
+
+    /// Best-effort page-cache release after a cold shard write.
+    pub fn shard_advise_dont_need(&self, shard: usize) {
+        if let Some(s) = self.shards.get(shard) {
+            s.advise_dont_need_all();
+        }
     }
 
     /// Insert head values, applying **one shard at a time** (sorted within shard).
@@ -912,8 +1078,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Rehash, bulk_fill_empty, empty insert_many, clear miss, for_each, open.
-    /// reserve_additional / reserve_for_cold_bulk / bulk_fill error arms.
+    /// Rehash, live install, clear miss, for_each, open.
     #[test]
     fn scripthash_head_reserve_and_bulk_errors() {
         // Single-file head: reserve_additional cold + rehash.
@@ -935,7 +1100,7 @@ mod tests {
         h.reserve_additional(50).unwrap(); // rehash when occupied
         let _ = std::fs::remove_file(&path);
 
-        // Sharded facade: is_empty, cold bulk reserve, shard OOB.
+        // Sharded facade: live install + OOB.
         let sh_path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-sharded-{}",
             std::time::SystemTime::now()
@@ -946,41 +1111,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sh_path);
         let sh = ShardedScriptHashHead::create_sharded(&sh_path, 4, 16).unwrap();
         assert!(sh.is_empty());
-        sh.reserve_additional(0).unwrap();
-        sh.reserve_for_cold_bulk(0).unwrap();
-        sh.reserve_for_cold_bulk(100).unwrap();
-        // Insert into one shard via insert_many if available, or single-key path
-        let mut k2 = [0u8; 32];
-        k2[0] = 0x10; // shard 1 of 4 when nibble-based
-        // Use first shard insert via sharded API if present
-        if let Ok(()) = sh.reserve_additional(1) {
-            // After cold reserve still empty until insert
-        }
-        // bulk_fill_one_shard_cold: shard OOB
-        let mut entries = Vec::new();
+        let mut live = LiveShardTable::with_key_budget(8);
+        let mut k0 = [0u8; 32];
+        k0[0] = 0x00;
+        live.insert(&k0, &ShHeadValue::inline_one(ShEntry::new(Fk(3))))
+            .unwrap();
+        sh.install_live_shard(0, live).unwrap();
+        assert!(!sh.is_empty());
         assert!(matches!(
-            sh.bulk_fill_one_shard_cold(9999, &mut entries),
+            sh.install_live_shard(9999, LiveShardTable::with_key_budget(1)),
             Err(StoreError::Corrupt(_))
         ));
-        // Non-empty: insert then cold bulk fails
-        // Prefer bulk_fill on empty shard 0
-        let mut fill = vec![(
-            {
-                let mut k = [0u8; 32];
-                k[0] = 0x00;
-                k
-            },
-            ShHeadValue::inline_one(ShEntry::new(Fk(3))),
-        )];
-        let _ = sh.bulk_fill_one_shard_cold(0, &mut fill);
-        if !sh.is_empty() {
-            assert!(matches!(
-                sh.reserve_for_cold_bulk(10),
-                Err(StoreError::Corrupt(_))
-            ));
-        }
         let _ = std::fs::remove_dir_all(&sh_path);
-        let _ = std::fs::remove_file(&sh_path);
     }
 
     #[test]

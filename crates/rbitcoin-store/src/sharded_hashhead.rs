@@ -17,8 +17,10 @@ use std::path::PathBuf;
 /// Historical 256-way header layout (new headers are single-file; constant kept
 /// for docs / env notes). Not used for new creates.
 pub const SHARD_COUNT: usize = 256;
-/// Mainnet **scripthash** shard count (16 files).
-pub const SHARD_COUNT_TX_SH: usize = 16;
+/// Mainnet **scripthash** shard count (64 files; ~0.5–1 GiB OA image per shard at tip).
+pub const SHARD_COUNT_TX_SH: usize = 64;
+/// Alias for docs / call sites that mean SH specifically.
+pub const SHARD_COUNT_SCRIPTHASH: usize = SHARD_COUNT_TX_SH;
 
 /// How many shards to create for the active scale (legacy helper; uses header layout).
 pub fn shard_count_for_scale() -> usize {
@@ -28,7 +30,7 @@ pub fn shard_count_for_scale() -> usize {
 /// Shard count for a new head of `role` (existing dirs keep their layout on open).
 ///
 /// - **Header:** **1** (single file; ~1 M headers ever — no need for 256-way)
-/// - **ScriptHash:** 16 (open-address rehash locality)
+/// - **ScriptHash:** **64** (cold live OA image ~0.5–1 GiB/shard on mainnet)
 /// - **Tx:** unused for address head (kept for any legacy callers)
 pub fn shard_count_for_role(role: HeadRole) -> usize {
     match HeadScale::from_env() {

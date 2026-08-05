@@ -7,7 +7,9 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadRole;
-use crate::scripthash_head::ShardedScriptHashHead;
+use crate::scripthash_head::{
+    sh_per_shard_key_budget, sh_unique_hint_default, LiveShardTable, ShardedScriptHashHead,
+};
 use crate::scripthash_layout::{
     class_for_count, payload_start, slab_bytes, slab_cap, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
     SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_ENTRY_LEN, SH_INLINE_CAP, SH_MAX_CLASS,
@@ -609,38 +611,46 @@ impl ScriptHashTable {
         Ok(())
     }
 
-    /// Start a buffered cold bulk session (historical migration builder path).
+    /// Start a cold bulk session (live in-RAM OA image per prefix shard).
     ///
-    /// Pre-sizes **empty** head shards for `expected_keys`. Callers stream
-    /// **scripthash-sorted** chains via [`ScriptHashBulkSession::put_chain`]:
-    /// with prefix sharding, lex order is contiguous per shard, so the session
-    /// bulk-fills each head as the stream crosses a shard boundary (only one
-    /// shard's head values in RAM). Exclusive until finish.
-    pub fn bulk_session(&self, expected_keys: u64) -> Result<ScriptHashBulkSession<'_>, StoreError> {
+    /// `unique_hint`: global unique-key estimate for **final** per-shard table
+    /// pre-size. Pass **0** to use [`sh_unique_hint_default`] (env
+    /// `RBITCOIN_SH_UNIQUE_HINT` / mainnet ~2e9 / tiny tests ~4k).
+    ///
+    /// **Do not** pass create-record counts — that oversizes the OA image.
+    ///
+    /// Callers stream **scripthash-sorted** chains via [`ScriptHashBulkSession::put_chain`].
+    /// Peak head RAM ≈ one final-sized shard table only.
+    pub fn bulk_session(&self, unique_hint: u64) -> Result<ScriptHashBulkSession<'_>, StoreError> {
         if !self.head.is_empty() {
             return Err(StoreError::Corrupt(
                 "scripthash bulk_session requires empty head (reinit first)",
             ));
         }
-        if expected_keys > 0 {
-            self.head.reserve_for_cold_bulk(expected_keys)?;
-        }
         let n_shards = self.head.shard_count().max(1);
-        let per_cap = (expected_keys as usize)
-            .div_ceil(n_shards)
-            .saturating_add(1)
-            .min(1 << 20);
+        let hint = if unique_hint == 0 {
+            sh_unique_hint_default()
+        } else {
+            unique_hint
+        };
+        let key_budget = sh_per_shard_key_budget(hint, n_shards);
         let (bump, live_count) = {
             let a = self.alloc.lock().unwrap();
             (a.bump, a.live_count)
         };
+        rbitcoin_log::info!(
+            "store: scripthash bulk_session live OA n_shards={n_shards} unique_hint={hint} \
+             per_shard_keys≈{key_budget} table_MiB≈{:.1}",
+            (crate::scripthash_head::sh_slots_for_keys(key_budget) as f64 * 32.0)
+                / (1024.0 * 1024.0)
+        );
         Ok(ScriptHashBulkSession {
             table: self,
             bump,
             live_count,
             active_shard: None,
-            head_buf: Vec::with_capacity(per_cap),
-            head_cap_hint: per_cap,
+            live: None,
+            key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
             body_write_off: bump,
             finished: false,
@@ -648,30 +658,31 @@ impl ScriptHashTable {
             shards_flushed: 0,
             body_flush_ns: 0,
             head_fill_ns: 0,
+            peak_table_bytes: 0,
         })
     }
 
-    /// Number of SH head shards (1 on Tiny, 16 on mainnet).
+    /// Number of SH head shards (1 on Tiny, 64 on mainnet).
     pub fn head_shard_count(&self) -> usize {
         self.head.shard_count()
     }
 }
 
-/// Buffered bulk writer for cold SH materialize.
+/// Live-OA bulk writer for cold SH materialize.
 ///
-/// Stream **scripthash-sorted** [`put_chain`] calls (as sorted runs produce).
-/// Prefix sharding makes that order contiguous per head shard: body slabs
-/// buffer (~16 MiB); when the stream enters a new shard, the previous shard's
-/// head is written with one empty-table bulk fill and the head buffer is
-/// freed. Peak head RAM ≈ one shard only.
+/// Stream **scripthash-sorted** [`put_chain`] calls. Prefix sharding makes that
+/// order contiguous per head shard: body slabs buffer (~16 MiB); each key is
+/// probe-inserted into a **pre-sized** in-RAM OA image for the active shard.
+/// On shard boundary the image is written once and freed. Peak head RAM ≈ one
+/// final-sized shard table.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     bump: u64,
     live_count: u64,
     active_shard: Option<usize>,
-    /// Deferred heads for `active_shard` only.
-    head_buf: Vec<([u8; 32], ShHeadValue)>,
-    head_cap_hint: usize,
+    live: Option<LiveShardTable>,
+    /// Unique-key budget used to size each live table (final size).
+    key_budget: u64,
     body_buf: Vec<u8>,
     body_write_off: u64,
     finished: bool,
@@ -679,8 +690,10 @@ pub struct ScriptHashBulkSession<'a> {
     shards_flushed: u32,
     /// Wall time spent in body `write_at` flushes.
     pub body_flush_ns: u64,
-    /// Wall time spent bulk-filling head shards.
+    /// Wall time spent installing head shards (write of live image).
     pub head_fill_ns: u64,
+    /// Peak live OA table allocation (bytes) — test/bench meter.
+    pub peak_table_bytes: usize,
 }
 
 const BULK_BODY_FLUSH: usize = 16 * 1024 * 1024;
@@ -696,7 +709,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.keys_written
     }
 
-    /// Head shards fully bulk-filled so far.
+    /// Head shards fully installed so far.
     pub fn shards_flushed(&self) -> u32 {
         self.shards_flushed
     }
@@ -704,7 +717,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     /// Pack one key's live creates (oldest→newest). Empty chains are skipped.
     ///
     /// Keys must be presented in **non-decreasing scripthash order** (sorted-run
-    /// merge). Crossing a prefix-shard boundary flushes the previous shard head.
+    /// merge). Crossing a prefix-shard boundary installs the previous live image.
     pub fn put_chain(&mut self, key: [u8; 32], entries: &[ShEntry]) -> Result<(), StoreError> {
         let n = entries.len() as u32;
         if n == 0 {
@@ -720,8 +733,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 }
                 self.flush_active_shard()?;
             }
-            self.active_shard = Some(si);
-            self.head_buf = Vec::with_capacity(self.head_cap_hint);
+            self.start_live_shard(si)?;
         }
 
         self.live_count = self.live_count.saturating_add(u64::from(n));
@@ -762,7 +774,25 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
         };
 
-        self.head_buf.push((key, val));
+        let live = self
+            .live
+            .as_mut()
+            .ok_or(StoreError::Corrupt("scripthash bulk: no live shard"))?;
+        live.insert(&key, &val)?;
+        Ok(())
+    }
+
+    fn start_live_shard(&mut self, si: usize) -> Result<(), StoreError> {
+        let live = LiveShardTable::with_key_budget(self.key_budget);
+        self.peak_table_bytes = self.peak_table_bytes.max(live.table_bytes());
+        rbitcoin_log::info!(
+            "store: scripthash live shard start id={si} slots={} table_MiB≈{:.1} key_budget={}",
+            live.slots(),
+            live.table_bytes() as f64 / (1024.0 * 1024.0),
+            self.key_budget
+        );
+        self.live = Some(live);
+        self.active_shard = Some(si);
         Ok(())
     }
 
@@ -827,25 +857,31 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    /// Flush body buffer, bulk-fill active shard head, free head RAM.
+    /// Flush body buffer, install live OA image, free head RAM.
     fn flush_active_shard(&mut self) -> Result<(), StoreError> {
         let Some(si) = self.active_shard else {
             return Ok(());
         };
         // Body slabs for this shard's keys must be durable before head points at them.
         self.flush_body()?;
-        if !self.head_buf.is_empty() {
+        if let Some(live) = self.live.take() {
             let t0 = std::time::Instant::now();
-            self.table
-                .head
-                .bulk_fill_one_shard_cold(si, &mut self.head_buf)?;
+            let keys = live.keys();
+            let slots = live.slots();
+            let table_mib = live.table_bytes() as f64 / (1024.0 * 1024.0);
+            let occ = live.occupied();
+            self.table.head.install_live_shard(si, live)?;
+            let elapsed = t0.elapsed();
             self.head_fill_ns = self
                 .head_fill_ns
-                .saturating_add(t0.elapsed().as_nanos() as u64);
+                .saturating_add(elapsed.as_nanos() as u64);
             self.shards_flushed = self.shards_flushed.saturating_add(1);
+            rbitcoin_log::info!(
+                "store: scripthash live shard done id={si} keys={keys} occupied={occ} \
+                 slots={slots} table_MiB≈{table_mib:.1} write={elapsed:?}"
+            );
+            let _ = self.table.head.shard_advise_dont_need(si);
         }
-        self.head_buf.clear();
-        self.head_buf.shrink_to_fit();
         self.active_shard = None;
         Ok(())
     }
@@ -1308,8 +1344,7 @@ mod tests {
 
     #[test]
     fn bulk_session_flushes_head_on_prefix_shard_boundary() {
-        // Active-shard heads stay in RAM until the stream crosses a prefix-shard
-        // boundary (or finish); each boundary does one bulk_fill_empty.
+        // Live OA image stays off-disk until shard boundary / finish.
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         const N: u32 = 80_000;
@@ -1327,7 +1362,7 @@ mod tests {
             session
                 .put_chain(sh, &[ShEntry::new(Fk(u64::from(i) + 1))])
                 .unwrap();
-            // Active shard not yet bulk-filled: this key is only in the head buffer.
+            // Active shard not yet installed: this key is only in the live image.
             if i == 70_000 {
                 assert!(
                     t.head_value(&sh).unwrap().is_none(),
@@ -1335,16 +1370,42 @@ mod tests {
                 );
             }
         }
+        let peak = session.peak_table_bytes;
         let (creates, keys, _, _) = session.finish().unwrap();
         assert_eq!(creates, u64::from(N));
         assert_eq!(keys, u64::from(N));
         assert_eq!(t.entry_count(), u64::from(N));
-        // Spot-check a few keys survive bulk fill.
+        // Peak live table sized from unique_hint, not a multi-GiB create-count bug.
+        let budget = crate::scripthash_head::sh_per_shard_key_budget(u64::from(N), 1);
+        let expect_slots = crate::scripthash_head::sh_slots_for_keys(budget);
+        assert_eq!(peak, (expect_slots as usize) * 32);
+        // Spot-check a few keys survive live install.
         for i in [0u32, 1, 65_535, 70_000, N - 1] {
             let ents = t.entries(&key(i)).unwrap();
             assert_eq!(ents.len(), 1, "i={i}");
             assert_eq!(ents[0].1.create_tx_fk, Fk(u64::from(i) + 1));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_session_does_not_size_from_create_count() {
+        // Regression: bulk_session(total_recs) used to allocate create-count-sized
+        // OA images. unique_hint=1000 must not allocate a multi-GiB table.
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let mut session = t.bulk_session(1_000).unwrap();
+        let mut sh = [0u8; 32];
+        sh[0] = 1;
+        session
+            .put_chain(sh, &[ShEntry::new(Fk(1))])
+            .unwrap();
+        let peak = session.peak_table_bytes;
+        let _ = session.finish().unwrap();
+        let budget = crate::scripthash_head::sh_per_shard_key_budget(1_000, 1);
+        let expect = (crate::scripthash_head::sh_slots_for_keys(budget) as usize) * 32;
+        assert_eq!(peak, expect);
+        assert!(peak < 16 * 1024 * 1024, "peak {peak} looks like create-count sizing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

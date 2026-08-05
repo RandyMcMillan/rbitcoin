@@ -69,14 +69,18 @@ pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale,
 };
 pub use sharded_hashhead::{
-    shard_count_for_role, shard_count_for_scale, SHARD_COUNT, SHARD_COUNT_TX_SH,
+    shard_count_for_role, shard_count_for_scale, SHARD_COUNT, SHARD_COUNT_SCRIPTHASH,
+    SHARD_COUNT_TX_SH,
 };
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{
     script_hash, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable,
 };
-pub use scripthash_head::prefix_shard_of;
+pub use scripthash_head::{
+    prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,
+    LiveShardTable,
+};
 pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, crc32, detach_run,

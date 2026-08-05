@@ -131,20 +131,23 @@ after Class C. Those two indexes are **complete before tip** — catch-up must
 finish; tip entry does not backfill them. Scripthash is **not** progressively
 materialized into heads: confirm only enqueues sorted runs (background flush +
 merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
-tables before Electrum (the only deferred index work). Tip SH materialize uses a **single** dynamic fan-in pass (chunk width chosen so
-outputs ≤32 for the final stream), then cold bulk-load. Reduce logs ~**every
-10s** (`pass=1/1 chunks=c/C pct≈…`). Parallel chunk merges default to **all
-CPUs** (`RBITCOIN_SH_MERGE_WORKERS=1` for serial). After each chunk finishes,
-inputs are deleted and `merge/CHECKPOINT` is rewritten (partial-pass resume).
-**SIGINT** is cooperative: keep CHECKPOINT (or READY once stream inputs are
-committed); restart resumes reduce or stream. Catalog runs created while you
-were offline (post-interrupt catch-up) are **deferred** and warm-inserted into
-the SH head **after** cold materialize. On enter Direct, leftover
+tables before Electrum (the only deferred index work). Tip SH materialize
+**streams catalog runs with direct k-way merge** (up to ~4096 open files;
+`RBITCOIN_SH_MAX_DIRECT_MERGE`) into a **live in-RAM open-address image per
+prefix shard** (final-sized, ~0.5–1 GiB peak on mainnet 64-way; never size from
+create counts — `RBITCOIN_SH_UNIQUE_HINT` optional). Fan-in reduce is **fallback
+only** when the catalog exceeds max direct. IBD promotes L0 spills only at
+≥75% of target run size (default target **512 MiB**) and compacts tiny catalog
+runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**every
+10s**. **SIGINT** mid-stream: reinit + re-stream claims; mid-reduce keeps
+CHECKPOINT. Catalog runs created while interrupted are **deferred** and
+warm-inserted after cold materialize. On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
-— prefer a **fresh datadir**.
+— prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` dirs need
+**reindex**.
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
-256-way), **scripthash** 16 shards, **tx.head** = **segmented** fixed **25-bit**
+256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
 heads (`tx.head.meta` + `tx.head.NNNNNN`, **4 B relative** create ids, 128 MiB per
 segment). Probe is **page-local**: high mixed-txid bits select a 1024-slot page,
 double-hash within the page (one 4 KiB IO @ 4 B). Capacity ends at

@@ -38,11 +38,29 @@ pub const SH_RUN_KEY_LEN: u32 = 32;
 const DEFAULT_MEMTABLE_CAP: usize = 1_000_000;
 const HARD_MEMTABLE_MUL: usize = 2;
 /// Coalesce L0 spills until a cataloged run is about this large.
-const DEFAULT_TARGET_RUN_BYTES: u64 = 256 * 1024 * 1024;
-/// Max open runs in any k-way pass (tip + L0 coalesce).
-const DEFAULT_MERGE_FANIN: usize = 32;
+const DEFAULT_TARGET_RUN_BYTES: u64 = 512 * 1024 * 1024;
+/// Max open runs in any k-way pass (L0 coalesce).
+const DEFAULT_MERGE_FANIN: usize = 64;
+/// Promote L0→catalog only when merged body ≥ this fraction of target (except finalize).
+const PROMOTE_FRAC_NUM: u64 = 3;
+const PROMOTE_FRAC_DEN: u64 = 4; // 0.75
 /// Wall interval for cold bulk-materialize INFO heartbeats (time-based only).
 const MATERIALIZE_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+fn max_direct_merge() -> usize {
+    std::env::var("RBITCOIN_SH_MAX_DIRECT_MERGE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(FANIN_TARGET_STREAM_RUNS)
+        .clamp(32, 8192)
+}
+
+fn promote_min_bytes(target: u64) -> u64 {
+    target
+        .saturating_mul(PROMOTE_FRAC_NUM)
+        .div_ceil(PROMOTE_FRAC_DEN)
+        .max(u64::from(SH_RUN_REC_LEN) * 1024)
+}
 
 #[inline]
 fn run_body_bytes(run: &SortedRunPath) -> u64 {
@@ -62,7 +80,7 @@ fn merge_fanin() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MERGE_FANIN)
-        .clamp(8, 64)
+        .clamp(8, 128)
 }
 
 fn encode_rec(sh: &[u8; 32], tx_fk: Fk) -> [u8; SH_RUN_REC_LEN as usize] {
@@ -317,7 +335,9 @@ impl ShRunBuilder {
         self.sealed_fk.store(s, Ordering::Release);
     }
 
-    /// Force flush memtable + L0 coalesce (tests / resume).
+    /// Force flush memtable + L0 coalesce (tests / resume / tip finalize).
+    ///
+    /// Promotes all L0 (including undersized tails) and compacts tiny catalog runs.
     pub fn drain_spills(&self) -> Result<(), StoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.pending.is_empty() {
@@ -329,13 +349,23 @@ impl ShRunBuilder {
         let l0 = std::mem::take(&mut g.l0);
         g.l0_bytes = 0;
         drop(g);
-        if !l0.is_empty() {
+        let leftover = {
             let _io = runs_io.lock().unwrap();
-            coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &self.sealed_fk)?;
-        }
+            // Planted catalog runs (tests / crash recovery) may outrun next_seq.
+            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+            let left =
+                coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &self.sealed_fk, true)?;
+            compact_catalog_undersized(&runs_dir, &mut next_seq, &self.sealed_fk)?;
+            left
+        };
         {
             let mut g = self.inner.lock().unwrap();
             g.ctrl.next_seq = next_seq;
+            // force_all should leave nothing; keep any remainder for safety.
+            for r in leftover {
+                g.l0_bytes = g.l0_bytes.saturating_add(run_body_bytes(&r));
+                g.l0.push(r);
+            }
         }
         self.refresh_seal();
         Ok(())
@@ -444,34 +474,47 @@ impl ShRunBuilder {
 
         let workers = rbitcoin_store::sh_merge_workers();
         let t_reduce = Instant::now();
+        let max_direct = max_direct_merge();
+        let mut direct_kway = false;
         if !resumed_from_ready {
             let claimed_recs: u64 = claimed.iter().map(|r| r.count).sum();
             let claimed_body: u64 = claimed
                 .iter()
                 .map(|r| r.count.saturating_mul(u64::from(r.rec_len)))
                 .sum();
-            info!(
-                "node: scripthash tip fanin reduce start claimed={} workers={workers} \
-                 records≈{claimed_recs} body≈{:.1}MiB passes=1 target_stream≤{} checkpoint_resume={resume_checkpoint}",
-                claimed.len(),
-                claimed_body as f64 / (1024.0 * 1024.0),
-                FANIN_TARGET_STREAM_RUNS,
-            );
-            stream_inputs = {
-                let _io = runs_io.lock().unwrap();
-                // Dynamic single-pass fanin inside reduce; claimed only used when no CP.
-                let out =
-                    reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, 0, cancel)?;
-                commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
-                out
-            };
-            info!(
-                "node: scripthash tip fanin reduce done claimed={} stream={} workers={workers} \
-                 elapsed={:?} pct=100",
-                claimed.len(),
-                stream_inputs.len(),
-                t_reduce.elapsed()
-            );
+            if !resume_checkpoint && claimed.len() <= max_direct {
+                // Primary path: stream claimed mats directly (no intermediate rewrite).
+                direct_kway = true;
+                info!(
+                    "node: scripthash tip direct k-way claimed={} workers={workers} \
+                     records≈{claimed_recs} body≈{:.1}MiB max_direct={max_direct}",
+                    claimed.len(),
+                    claimed_body as f64 / (1024.0 * 1024.0),
+                );
+                stream_inputs = std::mem::take(&mut claimed);
+            } else {
+                info!(
+                    "node: scripthash tip fanin reduce start claimed={} workers={workers} \
+                     records≈{claimed_recs} body≈{:.1}MiB passes=1 target_stream≤{max_direct} \
+                     checkpoint_resume={resume_checkpoint}",
+                    claimed.len(),
+                    claimed_body as f64 / (1024.0 * 1024.0),
+                );
+                stream_inputs = {
+                    let _io = runs_io.lock().unwrap();
+                    let out =
+                        reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, 0, cancel)?;
+                    commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
+                    out
+                };
+                info!(
+                    "node: scripthash tip fanin reduce done claimed={} stream={} workers={workers} \
+                     elapsed={:?} pct=100",
+                    claimed.len(),
+                    stream_inputs.len(),
+                    t_reduce.elapsed()
+                );
+            }
         } else {
             info!(
                 "node: scripthash tip fanin reduce resumed stream={} (READY) workers={workers}",
@@ -489,9 +532,11 @@ impl ShRunBuilder {
         let total_recs: u64 = stream_inputs.iter().map(|r| r.count).sum();
         let n_existing = store.scripthash.entry_count();
         let head_empty = store.scripthash.head_is_empty();
+        let n_shards = store.scripthash.head_shard_count();
         info!(
             "node: scripthash reinit empty for cold rematerialize \
-             stream_runs={} entry_count={n_existing} head_empty={head_empty}",
+             stream_runs={} entry_count={n_existing} head_empty={head_empty} \
+             direct_kway={direct_kway} n_shards={n_shards}",
             stream_inputs.len()
         );
         let t_reinit = Instant::now();
@@ -500,12 +545,13 @@ impl ShRunBuilder {
         debug_assert_eq!(store.scripthash.entry_count(), 0);
         debug_assert!(store.scripthash.head_is_empty());
         info!(
-            "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true",
+            "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true \
+             direct_kway={direct_kway} n_shards={n_shards}",
             stream_inputs.len()
         );
         let t0 = Instant::now();
-        let n_shards = store.scripthash.head_shard_count();
-        let mut session = store.scripthash.bulk_session(total_recs.max(1))?;
+        // unique_hint=0 → env/default; never pass create-count (oversizes OA image).
+        let mut session = store.scripthash.bulk_session(0)?;
         let mut cur_key: Option<[u8; 32]> = None;
         let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
         let mut long_seen: Option<HashSet<u64>> = None;
@@ -677,26 +723,42 @@ fn apply_runs_to_live_sh(
     Ok(n)
 }
 
+/// Next seq id strictly above any cataloged run (and current counter).
+fn next_seq_ceiling(runs_dir: &Path) -> u64 {
+    list_runs(runs_dir)
+        .ok()
+        .and_then(|rs| rs.iter().filter_map(|r| r.seq()).max())
+        .map(|m| m.saturating_add(1))
+        .unwrap_or(1)
+}
+
 /// Coalesce L0 spills into cataloged runs under `runs_dir` MANIFEST.
+///
+/// Promotes only when merged body ≥ [`promote_min_bytes`] unless `force_all`
+/// (finalize / tip drain). Undersized remainder is rewritten back into L0 so
+/// the catalog does not accumulate tiny alternating runs.
 fn coalesce_l0_to_catalog(
     runs_dir: &Path,
     mut l0: Vec<SortedRunPath>,
     next_seq: &mut u64,
     sealed: &AtomicU64,
-) -> Result<(), StoreError> {
+    force_all: bool,
+) -> Result<Vec<SortedRunPath>, StoreError> {
     if l0.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     l0.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
     let fanin = merge_fanin();
     let target = target_run_bytes();
+    let promote_min = promote_min_bytes(target);
+    let mut leftover: Vec<SortedRunPath> = Vec::new();
     let mut i = 0;
     while i < l0.len() {
         let mut chunk = Vec::new();
         let mut bytes = 0u64;
         while i < l0.len() && chunk.len() < fanin {
             let b = run_body_bytes(&l0[i]);
-            if !chunk.is_empty() && bytes + b > target && bytes >= target / 4 {
+            if !chunk.is_empty() && bytes + b > target && bytes >= promote_min {
                 break;
             }
             bytes += b;
@@ -706,6 +768,108 @@ fn coalesce_l0_to_catalog(
                 break;
             }
         }
+        if chunk.is_empty() {
+            break;
+        }
+        let mut max_fk = 0u64;
+        for r in &chunk {
+            if let Ok(body) = rbitcoin_store::read_run_body(r) {
+                max_fk = max_fk.max(max_fk_in_body(&body));
+            }
+        }
+        // Single small input and not finalizing: keep in L0 without rewrite.
+        if !force_all && chunk.len() == 1 && bytes < promote_min {
+            leftover.push(chunk[0].clone());
+            continue;
+        }
+        let promote = force_all || bytes >= promote_min;
+        if promote {
+            let out = next_run_path(runs_dir, *next_seq);
+            *next_seq += 1;
+            let merged = merge_runs(&chunk, &out)?;
+            info!(
+                "ibd: SH catalog promote runs_in={} body≈{:.1}MiB path={}",
+                chunk.len(),
+                run_body_bytes(&merged) as f64 / (1024.0 * 1024.0),
+                merged.path.display()
+            );
+            if max_fk > 0 {
+                bump_seal(runs_dir, max_fk)?;
+                let cur = sealed.load(Ordering::Relaxed);
+                if max_fk > cur {
+                    sealed.store(max_fk, Ordering::Release);
+                }
+            }
+        } else {
+            // Merge undersized chunk back into one L0 file to reduce file count.
+            let l0_dir = runs_dir.join("l0");
+            std::fs::create_dir_all(&l0_dir).map_err(|e| StoreError::io(&l0_dir, e))?;
+            let out = next_run_path(&l0_dir, *next_seq);
+            *next_seq += 1;
+            let merged = merge_runs_to_l0(&chunk, &out)?;
+            leftover.push(merged);
+            debug!(
+                "ibd: SH L0 hold undersized body≈{:.1}MiB (promote_min≈{:.1}MiB)",
+                bytes as f64 / (1024.0 * 1024.0),
+                promote_min as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+    Ok(leftover)
+}
+
+/// Merge into an L0 path without parent catalog MANIFEST.
+fn merge_runs_to_l0(
+    inputs: &[SortedRunPath],
+    out: &Path,
+) -> Result<SortedRunPath, StoreError> {
+    let merged = rbitcoin_store::merge_runs_to_file(inputs, out)?;
+    for r in inputs {
+        let _ = std::fs::remove_file(&r.path);
+    }
+    let l0_dir = out.parent().unwrap_or(out);
+    let _ = std::fs::remove_file(l0_dir.join("MANIFEST"));
+    Ok(merged)
+}
+
+/// Compact catalog runs that are well under target (except at most one small tail).
+fn compact_catalog_undersized(
+    runs_dir: &Path,
+    next_seq: &mut u64,
+    sealed: &AtomicU64,
+) -> Result<(), StoreError> {
+    let target = target_run_bytes();
+    let half = target / 2;
+    let mut runs = list_runs(runs_dir)?;
+    if runs.len() < 2 {
+        return Ok(());
+    }
+    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
+    // Count small runs; if ≤1, done.
+    let small: Vec<_> = runs
+        .iter()
+        .filter(|r| run_body_bytes(r) < half)
+        .cloned()
+        .collect();
+    if small.len() <= 1 {
+        return Ok(());
+    }
+    let fanin = merge_fanin();
+    let mut i = 0;
+    while i < small.len() {
+        let mut chunk = Vec::new();
+        let mut bytes = 0u64;
+        while i < small.len() && chunk.len() < fanin {
+            bytes += run_body_bytes(&small[i]);
+            chunk.push(small[i].clone());
+            i += 1;
+            if bytes >= target {
+                break;
+            }
+        }
+        if chunk.len() < 2 {
+            break;
+        }
         let mut max_fk = 0u64;
         for r in &chunk {
             if let Ok(body) = rbitcoin_store::read_run_body(r) {
@@ -714,8 +878,12 @@ fn coalesce_l0_to_catalog(
         }
         let out = next_run_path(runs_dir, *next_seq);
         *next_seq += 1;
-        // merge_runs works for 1..N inputs: writes out, deletes inputs, MANIFEST.
-        let _merged = merge_runs(&chunk, &out)?;
+        let merged = merge_runs(&chunk, &out)?;
+        info!(
+            "ibd: SH catalog compact inputs={} body≈{:.1}MiB",
+            chunk.len(),
+            run_body_bytes(&merged) as f64 / (1024.0 * 1024.0)
+        );
         if max_fk > 0 {
             bump_seal(runs_dir, max_fk)?;
             let cur = sealed.load(Ordering::Relaxed);
@@ -724,8 +892,6 @@ fn coalesce_l0_to_catalog(
             }
         }
     }
-    let l0_dir = runs_dir.join("l0");
-    let _ = std::fs::remove_dir_all(&l0_dir);
     Ok(())
 }
 
@@ -744,8 +910,10 @@ fn sh_worker_loop(
             break;
         }
         let need_flush = g.pending.len() >= soft_cap || (g.ctrl.finalize && !g.pending.is_empty());
+        // Coalesce on **bytes** toward target (or finalize). Do not promote on
+        // L0 file count alone — that created alternating large/small catalog runs.
         let need_coalesce = g.l0_bytes >= target
-            || g.l0.len() >= fanin
+            || (g.l0.len() >= fanin && g.l0_bytes >= promote_min_bytes(target))
             || (g.ctrl.finalize && !g.l0.is_empty());
 
         if need_flush {
@@ -761,19 +929,36 @@ fn sh_worker_loop(
         }
 
         if need_coalesce {
+            let force_all = g.ctrl.finalize;
             let l0 = std::mem::take(&mut g.l0);
             g.l0_bytes = 0;
             let runs_io = Arc::clone(&g.ctrl.runs_io);
             let mut next_seq = g.ctrl.next_seq;
             drop(g);
-            {
+            let leftover = {
                 let _io = runs_io.lock().unwrap();
-                if let Err(e) = coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &sealed) {
-                    warn!("ibd: SH L0 coalesce failed: {e}");
+                next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+                match coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &sealed, force_all) {
+                    Ok(left) => {
+                        if let Err(e) =
+                            compact_catalog_undersized(&runs_dir, &mut next_seq, &sealed)
+                        {
+                            warn!("ibd: SH catalog compact failed: {e}");
+                        }
+                        left
+                    }
+                    Err(e) => {
+                        warn!("ibd: SH L0 coalesce failed: {e}");
+                        Vec::new()
+                    }
                 }
-            }
+            };
             let mut g = inner.lock().unwrap();
             g.ctrl.next_seq = next_seq;
+            for r in leftover {
+                g.l0_bytes = g.l0_bytes.saturating_add(run_body_bytes(&r));
+                g.l0.push(r);
+            }
             drop(g);
             std::thread::sleep(AFTER_WORK);
             continue;

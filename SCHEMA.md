@@ -276,7 +276,9 @@ Thin create index: **create_tx_fk only** (no vout in the index).
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
 - Slot = **32 B**: key[16] + value[16] (two u64s).
-- May be sharded (16 shards) for open-address locality.
+- Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
+  one shard band at a time). Cold load builds one **final-sized** OA image in RAM
+  then sequential-writes the shard file (~0.5–1 GiB peak).
 
 | Mode | When | Value |
 |------|------|--------|

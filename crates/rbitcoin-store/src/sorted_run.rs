@@ -933,9 +933,11 @@ const CHECKPOINT_MAGIC_V2: &str = "RBFANCP2";
 /// Legacy full-pass-only checkpoints (ignored → fresh reduce).
 const CHECKPOINT_MAGIC_V1: &str = "RBFANCP1";
 
-/// Target max runs fed to the final materialize stream after one fan-in pass.
-pub const FANIN_TARGET_STREAM_RUNS: usize = 32;
-/// Upper bound on k-way open cursors per chunk merge.
+/// Max runs for **direct** k-way materialize (and rare fan-in fallback target).
+///
+/// Catalog should stay O(10³) via IBD promote; hosts can open a few thousand FDs.
+pub const FANIN_TARGET_STREAM_RUNS: usize = 4096;
+/// Upper bound on k-way open cursors per chunk merge (fallback reduce only).
 pub const FANIN_MAX_CHUNK: usize = 512;
 
 /// Durable partial reduce state for resume.
@@ -1998,8 +2000,9 @@ mod tests {
         let d = tmp_dir();
         let work = d.join("merge");
         let mut inputs = Vec::new();
-        // > TARGET_STREAM so reduce actually runs.
-        for i in 1..=64u64 {
+        // Must exceed FANIN_TARGET_STREAM_RUNS so reduce actually runs.
+        let n = (FANIN_TARGET_STREAM_RUNS + 64) as u64;
+        for i in 1..=n {
             let p = next_run_path(&d, i);
             write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
             inputs.push(open_run(&p).unwrap());
@@ -2020,7 +2023,7 @@ mod tests {
             );
         }
         let total: u64 = out.iter().map(|r| r.count).sum();
-        assert_eq!(total, 64);
+        assert_eq!(total, n);
         commit_fanin_reduce_and_drop_inputs(&work, &inputs, &out).unwrap();
         assert!(work.join(FANIN_READY_NAME).is_file());
         std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
@@ -2031,14 +2034,16 @@ mod tests {
     fn dynamic_fanin_one_pass_geometry() {
         assert_eq!(dynamic_merge_fanin(10), 10);
         assert_eq!(dynamic_merge_fanin(32), 32);
-        // 1000 runs → ceil(1000/32)=32 → 32 outputs in one pass.
-        assert_eq!(dynamic_merge_fanin(1000), 32);
-        assert_eq!(fanin_passes_total(1000, 32), 1);
+        // Under target (4096): fanin == n (direct stream; no reduce).
+        assert_eq!(dynamic_merge_fanin(1000), 1000);
+        assert_eq!(fanin_passes_total(1000, 1000), 0);
         assert_eq!(fanin_passes_total(10, 10), 0);
-        // 64 → ceil(64/32)=2 clamped min 8 → 8 outputs still one pass.
-        assert_eq!(dynamic_merge_fanin(64), 8);
-        // 2000 → ceil(2000/32)=63.
-        assert_eq!(dynamic_merge_fanin(2000), 63);
+        assert_eq!(dynamic_merge_fanin(64), 64);
+        // Above target: ceil(n/TARGET) clamped.
+        let n = FANIN_TARGET_STREAM_RUNS * 2 + 100;
+        let f = dynamic_merge_fanin(n);
+        assert!(f >= 8 && f <= FANIN_MAX_CHUNK);
+        assert!(n.div_ceil(f) <= FANIN_TARGET_STREAM_RUNS);
     }
 
     /// Partial checkpoint: simulate mid-reduce then resume.
@@ -2048,16 +2053,16 @@ mod tests {
         std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
         let work = d.join("merge");
         fs::create_dir_all(&work).unwrap();
-        // Build 64 tiny runs; merge first 2 chunks manually into checkpoint.
+        let n_runs = FANIN_TARGET_STREAM_RUNS + 64;
         let mut all = Vec::new();
-        for i in 1..=64u64 {
+        for i in 1..=n_runs as u64 {
             let p = next_run_path(&d, i);
             write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
             all.push(open_run(&p).unwrap());
         }
-        let fanin = dynamic_merge_fanin(64);
-        // 64 → ceil(64/32)=2 clamped to min 8 → one pass, 8 stream runs.
-        assert_eq!(fanin, 8);
+        let fanin = dynamic_merge_fanin(n_runs);
+        assert!(fanin >= 8 && fanin <= FANIN_MAX_CHUNK);
+        assert!(n_runs.div_ceil(fanin) <= FANIN_TARGET_STREAM_RUNS);
         // Complete first chunk only.
         let chunk: Vec<_> = all[..fanin].to_vec();
         let rest: Vec<_> = all[fanin..].to_vec();
@@ -2069,14 +2074,14 @@ mod tests {
         write_fanin_checkpoint(&work, 0, 2, fanin, &rest, &[merged]).unwrap();
 
         let cp = load_fanin_checkpoint(&work).unwrap().expect("cp");
-        assert_eq!(cp.remaining.len(), 64 - fanin);
+        assert_eq!(cp.remaining.len(), n_runs - fanin);
         assert_eq!(cp.done_outputs.len(), 1);
 
         // Resume finishes remaining.
         let out = reduce_runs_to_fanin(&[], &work, 0).unwrap();
         assert!(out.len() <= FANIN_TARGET_STREAM_RUNS);
         let n: u64 = out.iter().map(|r| r.count).sum();
-        assert_eq!(n, 64);
+        assert_eq!(n, n_runs as u64);
         std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
         let _ = fs::remove_dir_all(&d);
     }
@@ -2086,7 +2091,8 @@ mod tests {
         let d = tmp_dir();
         let work = d.join("merge");
         let mut inputs = Vec::new();
-        for i in 1..=64u64 {
+        let n = (FANIN_TARGET_STREAM_RUNS + 64) as u64;
+        for i in 1..=n {
             let p = next_run_path(&d, i);
             write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
             inputs.push(open_run(&p).unwrap());
@@ -2105,8 +2111,9 @@ mod tests {
     fn reduce_fanin_parallel_preserves_count() {
         let d = tmp_dir();
         std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
+        let n = (FANIN_TARGET_STREAM_RUNS + 32) as u64;
         let mut inputs = Vec::new();
-        for i in 1..=64u64 {
+        for i in 1..=n {
             let p = next_run_path(&d, i);
             write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
             inputs.push(open_run(&p).unwrap());
@@ -2117,16 +2124,16 @@ mod tests {
 
         std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "4");
         let mut inputs2 = Vec::new();
-        for i in 1..=64u64 {
-            let p = next_run_path(&d, 100 + i);
+        for i in 1..=n {
+            let p = next_run_path(&d, 10_000 + i);
             write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
             inputs2.push(open_run(&p).unwrap());
         }
         let work2 = d.join("merge2");
         let out2 = reduce_runs_to_fanin(&inputs2, &work2, 0).unwrap();
         let n2: u64 = out2.iter().map(|r| r.count).sum();
-        assert_eq!(n1, 64);
-        assert_eq!(n2, 64);
+        assert_eq!(n1, n);
+        assert_eq!(n2, n);
         assert!(out1.len() <= FANIN_TARGET_STREAM_RUNS);
         assert!(out2.len() <= FANIN_TARGET_STREAM_RUNS);
         std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");

@@ -23,6 +23,20 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 Release builds set remapped path prefixes and strip symbols so digests do not
 depend on the builder’s checkout path or username.
 
+### Heap allocator
+
+Product binaries (`rbitcoin-node`, `rbitcoin-cli`, `rbitcoin-store-bench`) use
+**mimalloc** as the process-wide `#[global_allocator]` on both targets:
+
+| Package | Link | Allocator |
+|---------|------|-----------|
+| `rbitcoin-musl` | fully static musl | mimalloc (compiled into the binary) |
+| `rbitcoin-glibc` | dynamic glibc | mimalloc (static into binary; libc is still glibc) |
+
+Library unit tests keep the platform default allocator. Mimalloc is not selected
+via `LD_PRELOAD` — static musl cannot use preload, and the Rust global allocator
+path is the same for both packages.
+
 ### Crane layers (build speed)
 
 `nix/rbitcoin.nix` uses **crane**:

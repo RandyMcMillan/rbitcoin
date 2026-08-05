@@ -20,6 +20,8 @@ getrandom = "0.2"
 # Sealed segment binary fuse8 (~9 bits/key).
 xorf = { workspace = true }
 bincode = { workspace = true }
+# Product bin only (store_bench); library tests keep the platform allocator.
+mimalloc = { workspace = true }
 
 [[bin]]
 name = "rbitcoin-store-bench"

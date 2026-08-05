@@ -19,6 +19,9 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn usage() {
     eprintln!(
         "usage: rbitcoin-store-bench [--n KEYS] [--bits BITS] [--access fd] [--dir DIR]\n\

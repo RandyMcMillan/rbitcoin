@@ -56,6 +56,9 @@ bip324 = { version = "0.11", default-features = true, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt", "signal", "fs"] }
 # Lock-free Arc publish for immutable pin outs/layout halves
 arc-swap = "1"
+# Process-wide heap for product binaries (musl static + glibc). Replaces the
+# platform default (musl/glibc malloc) via #[global_allocator] in each bin.
+mimalloc = "0.1"
 
 # Fail the build on rustc warnings (unused imports, dead code, …).
 [workspace.lints.rust]

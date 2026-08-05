@@ -11,6 +11,7 @@ name = "rbitcoin-cli"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { workspace = true }
 
 [lints]
 workspace = true

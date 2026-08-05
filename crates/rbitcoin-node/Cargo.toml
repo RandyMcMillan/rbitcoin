@@ -23,6 +23,7 @@ rbitcoin-rpc = { workspace = true }
 rbitcoin-electrum = { workspace = true }
 bitcoin = { workspace = true }
 tokio = { workspace = true }
+mimalloc = { workspace = true }
 
 [lints]
 workspace = true

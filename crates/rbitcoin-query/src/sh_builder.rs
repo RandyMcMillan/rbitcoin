@@ -432,6 +432,10 @@ pub struct ShRunBuilder {
     /// Process cache of SEAL (shared with worker).
     sealed_fk: Arc<AtomicU64>,
     runs_dir: PathBuf,
+    /// When true, the single IBD SH worker may crumb-compact the catalog.
+    /// Cleared for tip finalize and parallel Class A recollect (no multi-thread
+    /// rewrite against live catalog writers).
+    ibd_catalog_compact: Arc<AtomicBool>,
 }
 
 impl ShRunBuilder {
@@ -452,6 +456,7 @@ impl ShRunBuilder {
             enqueued: AtomicU64::new(0),
             sealed_fk: Arc::new(AtomicU64::new(sealed)),
             runs_dir,
+            ibd_catalog_compact: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -464,6 +469,11 @@ impl ShRunBuilder {
         self.sealed_fk.load(Ordering::Acquire)
     }
 
+    /// Allow single-thread catalog crumb compact on the IBD worker only.
+    pub fn set_ibd_catalog_compact(&self, on: bool) {
+        self.ibd_catalog_compact.store(on, Ordering::Release);
+    }
+
     pub fn enable(&self) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -471,10 +481,13 @@ impl ShRunBuilder {
         }
         let sealed = load_seal(&self.runs_dir);
         self.sealed_fk.store(sealed, Ordering::Release);
+        // Steady Direct IBD: worker may compact crumbs single-threaded.
+        self.ibd_catalog_compact.store(true, Ordering::Release);
         let inner_w = Arc::clone(&self.inner);
         let cv_w = Arc::clone(&self.cv);
         let runs_dir = self.runs_dir.clone();
         let sealed_w = Arc::clone(&self.sealed_fk);
+        let compact_w = Arc::clone(&self.ibd_catalog_compact);
 
         spawn_worker(
             "ibd-sh-index",
@@ -493,6 +506,7 @@ impl ShRunBuilder {
                     cv_w,
                     runs_dir,
                     sealed_w,
+                    compact_w,
                 );
                 debug!("ibd: SH run worker stopped");
             },
@@ -578,6 +592,8 @@ impl ShRunBuilder {
         // false (after finalize_wait_join) made rebuild_sh a silent no-op and tip
         // finished FullCold with creates≈0 on a zeroed head.
         self.enable();
+        // Parallel recollect will write catalog; keep compact off until Direct IBD.
+        self.set_ibd_catalog_compact(false);
         Ok(())
     }
 
@@ -696,6 +712,7 @@ impl ShRunBuilder {
         store_seal(&self.runs_dir, 0)?;
         self.sealed_fk.store(0, Ordering::Release);
         self.ensure_enabled();
+        self.set_ibd_catalog_compact(false);
         Ok(())
     }
 
@@ -708,7 +725,9 @@ impl ShRunBuilder {
 
     /// Force flush memtable + L0 coalesce (tests / resume / tip finalize).
     ///
-    /// Promotes all L0 (including undersized tails) and compacts tiny catalog runs.
+    /// Promotes all L0 (including undersized tails). **Does not** compact the
+    /// catalog — crumb compact is IBD-worker-only (see [`sh_worker_loop`]) so tip
+    /// finalize / parallel recollect never rewrite runs multi-threaded against IBD.
     pub fn drain_spills(&self) -> Result<(), StoreError> {
         let mut g = self.inner.lock().unwrap();
         if !g.pending.is_empty() {
@@ -724,10 +743,7 @@ impl ShRunBuilder {
             let _io = runs_io.lock().unwrap();
             // Planted catalog runs (tests / crash recovery) may outrun next_seq.
             next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
-            let left =
-                coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &self.sealed_fk, true)?;
-            compact_catalog_undersized(&runs_dir, &mut next_seq, &self.sealed_fk)?;
-            left
+            coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &self.sealed_fk, true)?
         };
         {
             let mut g = self.inner.lock().unwrap();
@@ -739,6 +755,27 @@ impl ShRunBuilder {
             }
         }
         self.refresh_seal();
+        Ok(())
+    }
+
+    /// Test-only: single-thread crumb compact under `runs_io` (production: IBD worker).
+    #[cfg(test)]
+    pub fn compact_undersized_catalog_for_test(&self) -> Result<(), StoreError> {
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+        };
+        let mut next_seq = {
+            let g = self.inner.lock().unwrap();
+            g.ctrl.next_seq
+        };
+        {
+            let _io = runs_io.lock().unwrap();
+            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+            compact_catalog_undersized(&runs_dir, &mut next_seq, &self.sealed_fk)?;
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.ctrl.next_seq = next_seq.max(g.ctrl.next_seq);
         Ok(())
     }
 
@@ -758,6 +795,8 @@ impl ShRunBuilder {
         store: &Store,
         cancel: Option<&AtomicBool>,
     ) -> Result<u64, StoreError> {
+        // Tip path: no IBD catalog compact (k-way the runs as-is).
+        self.set_ibd_catalog_compact(false);
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
         // Drain any leftover pending + L0 (worker may have stopped with L0 in RAM).
         self.drain_spills()?;
@@ -1423,8 +1462,12 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
 
 /// Compact catalog runs that are well under target (except at most one small tail).
 ///
-/// Runs ≥ [`CATALOG_COMPACT_FLOOR_BYTES`] are left alone so parallel Class A
-/// recollect's ~128 MiB spills stream straight into tip k-way merge.
+/// **Call site:** only the single IBD SH worker during steady Direct coalesce
+/// (`!force_all`). Never tip `drain_spills` or parallel recollect (multi-thread
+/// writers would race IBD and reintroduce write amp).
+///
+/// Runs ≥ [`CATALOG_COMPACT_FLOOR_BYTES`] are left alone so recollect's ~128 MiB
+/// spills stream straight into tip k-way merge.
 fn compact_catalog_undersized(
     runs_dir: &Path,
     next_seq: &mut u64,
@@ -1492,6 +1535,7 @@ fn sh_worker_loop(
     cv: Arc<Condvar>,
     runs_dir: PathBuf,
     sealed: Arc<AtomicU64>,
+    ibd_catalog_compact: Arc<AtomicBool>,
 ) {
     let target = target_run_bytes();
     let fanin = merge_fanin();
@@ -1520,7 +1564,11 @@ fn sh_worker_loop(
         }
 
         if need_coalesce {
+            // force_all: tip/finalize drain — promote L0 only, no catalog compact.
+            // Steady IBD: single-thread crumb compact only when flag is on.
             let force_all = g.ctrl.finalize;
+            let allow_compact = !force_all
+                && ibd_catalog_compact.load(Ordering::Acquire);
             let l0 = std::mem::take(&mut g.l0);
             g.l0_bytes = 0;
             let runs_io = Arc::clone(&g.ctrl.runs_io);
@@ -1531,10 +1579,12 @@ fn sh_worker_loop(
                 next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
                 match coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &sealed, force_all) {
                     Ok(left) => {
-                        if let Err(e) =
-                            compact_catalog_undersized(&runs_dir, &mut next_seq, &sealed)
-                        {
-                            warn!("ibd: SH catalog compact failed: {e}");
+                        if allow_compact {
+                            if let Err(e) =
+                                compact_catalog_undersized(&runs_dir, &mut next_seq, &sealed)
+                            {
+                                warn!("ibd: SH catalog compact failed: {e}");
+                            }
                         }
                         left
                     }
@@ -1925,8 +1975,8 @@ mod tests {
         }
         let before = list_runs(&runs_dir).unwrap().len();
         assert_eq!(before, 3);
-        // Tiny runs (1000*40 ≈ 40KiB) are compact candidates — drain merges them.
-        b.drain_spills().unwrap();
+        // Tiny runs (1000*40 ≈ 40KiB) are compact candidates — IBD compact only.
+        b.compact_undersized_catalog_for_test().unwrap();
         let after = list_runs(&runs_dir).unwrap();
         // Crumbs should coalesce to fewer catalog files (or one).
         assert!(
@@ -1934,13 +1984,14 @@ mod tests {
             "tiny planted runs should compact: before={before} after={}",
             after.len()
         );
-        for r in &after {
-            assert!(
-                catalog_run_is_compact_candidate(run_body_bytes(r), target_run_bytes())
-                    || after.len() <= 2,
-                "post-compact runs should be few/merged"
-            );
-        }
+        // Tip drain_spills must NOT compact (IBD-only policy).
+        let n_before_drain = after.len();
+        b.drain_spills().unwrap();
+        assert_eq!(
+            list_runs(&runs_dir).unwrap().len(),
+            n_before_drain,
+            "drain_spills must not compact catalog (tip/recollect path)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

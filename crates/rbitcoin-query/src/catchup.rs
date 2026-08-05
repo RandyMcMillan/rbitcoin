@@ -262,6 +262,8 @@ impl Query {
         use std::time::{Duration, Instant};
 
         // Single enable gate for recollect (FORCE/reset prep also re-enable).
+        // Parallel catalog writers: never run IBD crumb compact concurrently.
+        self.sh_run.set_ibd_catalog_compact(false);
         self.sh_run.ensure_enabled();
 
         let sealed0 = self.sh_run.sealed_max_create_fk();

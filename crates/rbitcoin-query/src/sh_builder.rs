@@ -77,10 +77,32 @@ pub fn sh_force_rebuild() -> bool {
     )
 }
 
+/// Allowed SEAL lag behind tip create count (memtable / crash window).
+pub const SH_SEAL_LAG_OK: u64 = 50_000;
+
+/// True when SEAL is near tip create HWM (small lag for unsealed memtable).
+pub fn sh_catalog_seal_covers_tip(seal_max_fk: u64, tip_max_create_fk: u64) -> bool {
+    if tip_max_create_fk == 0 {
+        return true;
+    }
+    seal_max_fk.saturating_add(SH_SEAL_LAG_OK) >= tip_max_create_fk
+}
+
+/// High SEAL with only a tiny on-disk run mass — catch-up tail, not full IBD spills.
+///
+/// After a **successful** cold materialize, runs are cleared while SEAL stays high.
+/// That success state is **not** a stale tail when the durable head is live; only
+/// use this heuristic when the head is empty (or FORCE_REBUILD already wiped it).
+pub fn sh_catalog_is_stale_tail(seal_max_fk: u64, total_run_records: u64) -> bool {
+    seal_max_fk >= 1_000_000 && total_run_records < seal_max_fk / 50
+}
+
 /// True when catalog SEAL / run record mass can cover Class A through `tip_max_create_fk`.
 ///
-/// Incomplete when SEAL lags tip, or SEAL is huge but on-disk run rows are a tiny tail
-/// (common after catch-up-only rebuild with a stale high SEAL).
+/// For **empty-head** FullCold decisions only. Incomplete when SEAL lags tip, or
+/// SEAL is huge but on-disk run rows are a tiny tail (catch-up-only rebuild with
+/// a stale high SEAL). **Do not** use this alone on a durable head — empty runs
+/// after consume are normal (see [`plan_sh_pre_materialize`]).
 pub fn sh_catalog_looks_complete(
     seal_max_fk: u64,
     tip_max_create_fk: u64,
@@ -89,20 +111,106 @@ pub fn sh_catalog_looks_complete(
     if tip_max_create_fk == 0 {
         return true;
     }
-    // Allow small lag for unsealed tip creates still in memtable.
-    const SEAL_LAG_OK: u64 = 50_000;
-    if seal_max_fk.saturating_add(SEAL_LAG_OK) < tip_max_create_fk {
+    if !sh_catalog_seal_covers_tip(seal_max_fk, tip_max_create_fk) {
         return false;
     }
     if seal_max_fk == 0 {
         return total_run_records == 0;
     }
-    // SEAL claims coverage through seal_max_fk, but each create yields ≥0 SH rows.
-    // A multi‑million SEAL with only ~1e5 run rows is a tail catalog, not a full IBD spill set.
-    if seal_max_fk >= 1_000_000 && total_run_records < seal_max_fk / 50 {
+    if sh_catalog_is_stale_tail(seal_max_fk, total_run_records) {
         return false;
     }
     true
+}
+
+/// Inclusion floor for a durable SH head.
+///
+/// Prefer `include_hwm` when present. When the HWM file is missing (legacy
+/// datadir / cold finished before the feature), fall back to SEAL — never treat
+/// missing HWM as `0` for clamp purposes.
+pub fn durable_sh_inclusion_floor(include_hwm: u64, seal: u64) -> u64 {
+    if include_hwm > 0 {
+        include_hwm
+    } else {
+        seal
+    }
+}
+
+/// Pre-materialize catalog / SEAL action (pure; no I/O).
+///
+/// Covers catch-up ↔ tip ↔ restart transitions:
+/// - **FORCE_REBUILD:** wipe head+runs, SEAL=0, full Class A recollect.
+/// - **Empty head + stale tail / no usable catalog:** reset SEAL+runs, full recollect.
+/// - **Durable head:** never wipe; never clamp SEAL to 0 for missing HWM; bootstrap
+///   HWM from SEAL; clamp SEAL to HWM only when `0 < hwm < seal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShPreMaterializeAction {
+    ForceFullRebuild,
+    /// Empty head cannot be cold-loaded from current runs — SEAL=0 + clear runs.
+    ResetCatalogFullRecollect,
+    /// Durable head: write `include_hwm = seal` (legacy missing file).
+    BootstrapIncludeHwm { seal: u64 },
+    /// Durable head: lower SEAL to authoritative HWM for gap recollect.
+    ClampSealTo { floor: u64 },
+    Noop,
+}
+
+/// Plan SEAL/catalog prep before Class A recollect + tip materialize.
+pub fn plan_sh_pre_materialize(
+    force: bool,
+    head_durable: bool,
+    seal: u64,
+    tip_max_create_fk: u64,
+    run_records: u64,
+    include_hwm: u64,
+) -> ShPreMaterializeAction {
+    if force {
+        return ShPreMaterializeAction::ForceFullRebuild;
+    }
+    if !head_durable {
+        // Empty / wiped head: decide whether on-disk runs can seed FullCold.
+        if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
+            return ShPreMaterializeAction::ResetCatalogFullRecollect;
+        }
+        return ShPreMaterializeAction::Noop;
+    }
+    // Durable head: run mass is irrelevant (runs are cleared after successful
+    // materialize; residual mats are a tip tail for warm apply only).
+    if include_hwm == 0 && seal > 0 {
+        return ShPreMaterializeAction::BootstrapIncludeHwm { seal };
+    }
+    if include_hwm > 0 && include_hwm < seal {
+        return ShPreMaterializeAction::ClampSealTo {
+            floor: include_hwm,
+        };
+    }
+    let _ = durable_sh_inclusion_floor(include_hwm, seal);
+    ShPreMaterializeAction::Noop
+}
+
+/// Empty head: full Class A recollect when catalog cannot seed a complete cold load.
+fn empty_head_needs_full_class_a_recollect(
+    seal: u64,
+    tip_max: u64,
+    run_records: u64,
+) -> bool {
+    if tip_max == 0 {
+        return false;
+    }
+    // Catch-up-only runs under a stale high SEAL (FORCE / wipe recovery).
+    if sh_catalog_is_stale_tail(seal, run_records) {
+        return true;
+    }
+    // No runs left and SEAL does not cover tip — nothing to cold-load.
+    if run_records == 0 && !sh_catalog_seal_covers_tip(seal, tip_max) {
+        return true;
+    }
+    // Runs consumed (empty) while head still empty: prior materialize did not
+    // leave a durable index — only full recollect recovers.
+    if run_records == 0 && seal > 0 && sh_catalog_seal_covers_tip(seal, tip_max) {
+        return true;
+    }
+    false
 }
 
 /// Sum of `count` over catalog + materialize claims under `runs_dir`.
@@ -220,7 +328,8 @@ pub fn load_seal(runs_dir: &Path) -> u64 {
     u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]))
 }
 
-fn store_seal(runs_dir: &Path, max_fk: u64) -> Result<(), StoreError> {
+/// Write SEAL (max create_fk) — tests / catch-up clamp / force rebuild.
+pub fn store_seal(runs_dir: &Path, max_fk: u64) -> Result<(), StoreError> {
     let path = seal_path(runs_dir);
     let tmp = runs_dir.join("SEAL.tmp");
     std::fs::create_dir_all(runs_dir).map_err(|e| StoreError::io(runs_dir, e))?;
@@ -702,7 +811,14 @@ impl ShRunBuilder {
         let tip_max = store.txs.count();
         let seal_now = self.sealed_max_create_fk();
         let cat_recs = stream_inputs.iter().map(|r| r.count).sum::<u64>();
-        let catalog_ok = sh_catalog_looks_complete(seal_now, tip_max, cat_recs);
+        // Durable head: empty/tiny residual runs are normal after consume — do not
+        // flag mass incompleteness (that is an empty-head / FORCE concern only).
+        let head_live = !head_empty || n_existing > 0;
+        let catalog_ok = if head_live {
+            sh_catalog_seal_covers_tip(seal_now, tip_max)
+        } else {
+            sh_catalog_looks_complete(seal_now, tip_max, cat_recs)
+        };
         let mode = select_sh_tip_materialize_mode(
             head_empty,
             n_existing,
@@ -1592,6 +1708,7 @@ mod tests {
             1_416_000_000,
             222_511
         ));
+        assert!(sh_catalog_is_stale_tail(1_411_832_114, 222_511));
         assert!(!sh_catalog_looks_complete(1_000_000, 2_000_000, 10_000));
         // Full IBD-style: seal near tip, huge run mass.
         assert!(sh_catalog_looks_complete(
@@ -1600,6 +1717,72 @@ mod tests {
             3_700_000_000
         ));
         assert!(sh_catalog_looks_complete(0, 0, 0));
+        // Post-success state: high SEAL, zero runs — incomplete for *empty* head only.
+        assert!(sh_catalog_is_stale_tail(1_411_000_000, 0));
+        assert!(!sh_catalog_looks_complete(
+            1_411_000_000,
+            1_411_000_000,
+            0
+        ));
+    }
+
+    #[test]
+    fn plan_pre_materialize_durable_head_never_clamps_seal_to_zero() {
+        // Skeptic regression: high SEAL + empty runs + missing HWM must NOT
+        // reset SEAL (old code treated catalog incomplete → clamp to hwm=0).
+        let seal = 1_411_000_000u64;
+        let tip = 1_411_000_000u64;
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, seal, tip, 0, 0),
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal }
+        );
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, seal, tip, 222_511, 0),
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal }
+        );
+        // Authoritative HWM below SEAL → clamp (never to 0).
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, seal, tip, 0, 1_400_000_000),
+            ShPreMaterializeAction::ClampSealTo {
+                floor: 1_400_000_000
+            }
+        );
+        // Healthy: HWM == SEAL, empty residual runs.
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, seal, tip, 0, seal),
+            ShPreMaterializeAction::Noop
+        );
+        assert_eq!(durable_sh_inclusion_floor(0, seal), seal);
+        assert_eq!(durable_sh_inclusion_floor(99, seal), 99);
+    }
+
+    #[test]
+    fn plan_pre_materialize_empty_head_stale_tail_full_recollect() {
+        let seal = 1_411_832_114u64;
+        let tip = 1_416_000_000u64;
+        assert_eq!(
+            plan_sh_pre_materialize(false, false, seal, tip, 222_511, 0),
+            ShPreMaterializeAction::ResetCatalogFullRecollect
+        );
+        // Empty runs + high SEAL + empty head (consumed catalog, no head).
+        assert_eq!(
+            plan_sh_pre_materialize(false, false, seal, seal, 0, 0),
+            ShPreMaterializeAction::ResetCatalogFullRecollect
+        );
+        // FORCE always full rebuild regardless of head.
+        assert_eq!(
+            plan_sh_pre_materialize(true, true, seal, tip, 222_511, seal),
+            ShPreMaterializeAction::ForceFullRebuild
+        );
+        assert_eq!(
+            plan_sh_pre_materialize(true, false, seal, tip, 222_511, 0),
+            ShPreMaterializeAction::ForceFullRebuild
+        );
+        // Good empty-head catalog: seal near tip, huge mass → keep, FullCold later.
+        assert_eq!(
+            plan_sh_pre_materialize(false, false, tip, tip, 3_700_000_000, 0),
+            ShPreMaterializeAction::Noop
+        );
     }
 
     #[test]
@@ -1682,6 +1865,69 @@ mod tests {
         assert_eq!(store.scripthash.entries(&sh1).unwrap().len(), 1);
         assert!(store.scripthash.entry_count() >= count_before);
         assert!(store.scripthash.include_hwm() >= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Catchup pre-step + finalize: durable head, high SEAL, empty runs, no HWM
+    /// file must not zero SEAL or wipe the head (skeptic finding 1).
+    #[test]
+    fn durable_head_high_seal_missing_hwm_preserves_seal_on_prep() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-hwm-boot-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        let mut sh0 = [0u8; 32];
+        sh0[0] = 0x33;
+        b.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(7))]);
+        let n0 = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert!(n0 >= 1);
+        assert!(store.scripthash.has_durable_index());
+
+        // Simulate legacy success: high SEAL, runs cleared, include_hwm deleted.
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let high_seal = 1_411_000_000u64;
+        store_seal(&runs_dir, high_seal).unwrap();
+        b.refresh_seal();
+        let hwm_path = dir.join(rbitcoin_store::INCLUDE_HWM_NAME);
+        let _ = std::fs::remove_file(&hwm_path);
+        assert_eq!(store.scripthash.include_hwm(), 0);
+        assert_eq!(b.sealed_max_create_fk(), high_seal);
+        // Mass check would say incomplete — durable plan must bootstrap, not clamp.
+        assert!(sh_catalog_is_stale_tail(high_seal, 0));
+        let action = plan_sh_pre_materialize(
+            false,
+            true,
+            high_seal,
+            high_seal,
+            0,
+            0,
+        );
+        assert_eq!(
+            action,
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal: high_seal }
+        );
+        // Apply the action the way catchup does.
+        match action {
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal: s } => {
+                store.scripthash.note_include_hwm(s).unwrap();
+            }
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert_eq!(store.scripthash.include_hwm(), high_seal);
+        assert_eq!(b.sealed_max_create_fk(), high_seal, "SEAL must not be zeroed");
+        assert_eq!(store.scripthash.entries(&sh0).unwrap().len(), 1);
+        // Second prep with HWM present → Noop.
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, high_seal, high_seal, 0, high_seal),
+            ShPreMaterializeAction::Noop
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

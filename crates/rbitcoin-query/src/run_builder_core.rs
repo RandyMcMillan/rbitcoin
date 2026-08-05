@@ -182,10 +182,22 @@ pub fn runs_dir_io(ctrl: &RunControl) -> (PathBuf, Arc<Mutex<()>>) {
     (ctrl.runs_dir.clone(), Arc::clone(&ctrl.runs_io))
 }
 
+/// Remove run/mat/merge artifacts under `runs_dir`, **preserving `SEAL`**.
+///
+/// SEAL is the durable max-create_fk watermark (catch-up resume floor). Wiping it
+/// whenever residual runs are absent would force full Class A recollect on the
+/// next tip finalize. Callers that need SEAL=0 write it explicitly via
+/// `store_seal(..., 0)` after this (force rebuild / full recollect).
 pub fn clear_runs_dir(runs_dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(runs_dir) {
         for e in rd.flatten() {
             let p = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // Keep SEAL (+ in-flight tmp) across run cleanup.
+            if name == "SEAL" || name == "SEAL.tmp" {
+                continue;
+            }
             if p.is_dir() {
                 let _ = std::fs::remove_dir_all(&p);
             } else {

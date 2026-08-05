@@ -145,10 +145,14 @@ head is empty** (or force rebuild); a nearly complete index with residual runs
 uses **warm batch apply** only. **`RBITCOIN_SH_FORCE_REBUILD=1`:** clears
 runs/SEAL/include_hwm/cold_progress, reinit head, recollect **all** Class A
 creates (SEAL=0 → full body scan), then cold materialize — not a catch-up tail.
-Incomplete catalog (high SEAL + tiny run mass, or SEAL ≪ tip) on an **empty**
-head also triggers full Class A recollect. Durable head + incomplete catalog:
-clamp SEAL to `include_hwm` and warm the gap. **SIGINT** mid cold keeps finished
-prefix shards (`scripthash.cold_progress`). Mid-reduce keeps CHECKPOINT.
+Incomplete catalog (high SEAL + tiny run mass, or consumed runs with no head)
+on an **empty** head triggers full Class A recollect (SEAL=0). **Durable head**
+never uses run-mass incompleteness (empty runs after successful materialize are
+normal): missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); only
+when `0 < include_hwm < SEAL` is SEAL clamped for gap recollect + warm residual.
+Clearing residual run files **preserves `SEAL`** (watermark is not a run).
+**SIGINT** mid cold keeps finished prefix shards (`scripthash.cold_progress`).
+Mid-reduce keeps CHECKPOINT.
 Deferred/residual runs batch warm-apply (10s status). On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
 — prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with

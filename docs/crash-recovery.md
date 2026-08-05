@@ -77,4 +77,4 @@ Kill mid-payload before HWM publish: readers never see past previous published l
   - **Full cold** when head empty (after catalog is complete) or **`RBITCOIN_SH_FORCE_REBUILD=1`** (wipes head+runs+SEAL+HWM, recollects **all** Class A, then cold load).
   - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
   - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats).
-  Catalog sanity: high SEAL with tiny run mass is treated as incomplete (full Class A recollect if head empty; SEAL clamp to `include_hwm` if head live). Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.
+  Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: empty/tiny residual runs are normal post-consume; missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); clamp SEAL to HWM only when `0 < hwm < SEAL`. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.

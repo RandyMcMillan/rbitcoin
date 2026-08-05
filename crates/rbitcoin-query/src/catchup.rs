@@ -124,7 +124,8 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
         use crate::sh_builder::{
-            sh_catalog_looks_complete, sh_catalog_total_records, sh_force_rebuild,
+            plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild,
+            ShPreMaterializeAction,
         };
 
         self.sh_run.refresh_seal();
@@ -132,34 +133,52 @@ impl Query {
         let seal = self.sh_run.sealed_max_create_fk();
         let run_recs = sh_catalog_total_records(&self.store.path().join("scripthash.runs"));
         let head_durable = self.store.scripthash.has_durable_index();
-        let catalog_ok = sh_catalog_looks_complete(seal, tip_max, run_recs);
+        let include_hwm = self.store.scripthash.include_hwm();
         let force = sh_force_rebuild();
+        let action = plan_sh_pre_materialize(
+            force,
+            head_durable,
+            seal,
+            tip_max,
+            run_recs,
+            include_hwm,
+        );
 
-        if force {
-            rbitcoin_log::info!(
-                "node: scripthash FORCE_REBUILD seal={seal} tip_max_create_fk={tip_max} \
-                 catalog_recs≈{run_recs} head_durable={head_durable}"
-            );
-            self.sh_run.prepare_force_full_rebuild(&self.store)?;
-        } else if !head_durable && !catalog_ok {
-            // Empty/wiped head + stale high SEAL + tail-only runs would cold-load a
-            // tiny incomplete index — recollect Class A from 0 instead.
-            rbitcoin_log::warn!(
-                "node: scripthash catalog incomplete for empty head \
-                 (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs}) — full Class A recollect"
-            );
-            self.sh_run.reset_catalog_for_full_recollect()?;
-        } else if head_durable && !catalog_ok {
-            // Live head: do not wipe. Align SEAL down to include_hwm so recollect
-            // only fills the gap (warm path will apply residual runs).
-            let hwm = self.store.scripthash.include_hwm();
-            if hwm < seal {
+        match action {
+            ShPreMaterializeAction::ForceFullRebuild => {
                 rbitcoin_log::info!(
-                    "node: scripthash durable head include_hwm={hwm} < seal={seal} — \
+                    "node: scripthash FORCE_REBUILD seal={seal} tip_max_create_fk={tip_max} \
+                     catalog_recs≈{run_recs} head_durable={head_durable} include_hwm={include_hwm}"
+                );
+                self.sh_run.prepare_force_full_rebuild(&self.store)?;
+            }
+            ShPreMaterializeAction::ResetCatalogFullRecollect => {
+                // Empty/wiped head + stale high SEAL + tail-only runs (or consumed
+                // catalog with no head) would cold-load a tiny incomplete index —
+                // recollect Class A from 0 instead.
+                rbitcoin_log::warn!(
+                    "node: scripthash empty head needs full Class A recollect \
+                     (seal={seal} tip_max={tip_max} catalog_recs≈{run_recs})"
+                );
+                self.sh_run.reset_catalog_for_full_recollect()?;
+            }
+            ShPreMaterializeAction::BootstrapIncludeHwm { seal: s } => {
+                // Legacy durable head without include_hwm: SEAL is the inclusion
+                // watermark. Never clamp SEAL→0 (that would re-scan all Class A).
+                rbitcoin_log::info!(
+                    "node: scripthash durable head missing include_hwm — \
+                     bootstrapping from SEAL={s} (no SEAL clamp)"
+                );
+                self.store.scripthash.note_include_hwm(s)?;
+            }
+            ShPreMaterializeAction::ClampSealTo { floor } => {
+                rbitcoin_log::info!(
+                    "node: scripthash durable head include_hwm={floor} < seal={seal} — \
                      clamping SEAL to HWM for gap recollect (warm residual)"
                 );
-                self.sh_run.set_sealed_max_for_recollect(hwm)?;
+                self.sh_run.set_sealed_max_for_recollect(floor)?;
             }
+            ShPreMaterializeAction::Noop => {}
         }
 
         self.sh_run.refresh_seal();
@@ -223,5 +242,123 @@ impl Query {
         self.sh_run.drain_spills()?;
         self.sh_run.refresh_seal();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sh_builder::{
+        load_seal, plan_sh_pre_materialize, store_seal, ShPreMaterializeAction, SH_RUN_KEY_LEN,
+        SH_RUN_REC_LEN,
+    };
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{next_run_path, write_sorted_run, ScriptHashRecord};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn encode_rec(sh: &[u8; 32], fk: Fk) -> [u8; 40] {
+        let mut buf = [0u8; 40];
+        buf[..32].copy_from_slice(sh);
+        buf[32..40].copy_from_slice(&fk.0.to_le_bytes());
+        buf
+    }
+
+    /// Drive [`Query::finalize_sh_runs`] with durable head + high SEAL + no HWM.
+    /// Must not zero SEAL or wipe the head (catchup clamp regression).
+    #[test]
+    fn finalize_sh_runs_durable_head_missing_hwm_keeps_seal() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-hwm-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        let mut sh0 = [0u8; 32];
+        sh0[0] = 0x44;
+        q.sh_run
+            .enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(3))]);
+        let n0 = q.sh_run.finalize_and_bulk_materialize(&q.store).unwrap();
+        assert!(n0 >= 1);
+        assert!(q.store.scripthash.has_durable_index());
+        let count_before = q.store.scripthash.entry_count();
+
+        // Legacy post-materialize: high SEAL, empty runs, delete include_hwm.
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let high_seal = 1_411_000_000u64;
+        store_seal(&runs_dir, high_seal).unwrap();
+        q.sh_run.refresh_seal();
+        let _ = std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME));
+        assert_eq!(q.store.scripthash.include_hwm(), 0);
+        assert_eq!(q.sh_run.sealed_max_create_fk(), high_seal);
+
+        // No tip txs → rebuild_sh is a no-op; prep must still bootstrap HWM.
+        let _ = q.finalize_sh_runs().unwrap();
+        assert_eq!(
+            q.sh_run.sealed_max_create_fk(),
+            high_seal,
+            "SEAL must not be clamped to 0 when HWM was missing"
+        );
+        assert_eq!(
+            q.store.scripthash.include_hwm(),
+            high_seal,
+            "include_hwm must bootstrap from SEAL"
+        );
+        assert_eq!(
+            q.store.scripthash.entries(&sh0).unwrap().len(),
+            1,
+            "durable head must remain"
+        );
+        assert!(q.store.scripthash.entry_count() >= count_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_sh_runs_empty_head_stale_tail_resets_seal() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-stale-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        assert!(!q.store.scripthash.has_durable_index());
+
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let high_seal = 1_400_000_000u64;
+        store_seal(&runs_dir, high_seal).unwrap();
+        q.sh_run.refresh_seal();
+        // Tiny catch-up tail run.
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&[0xab; 32], Fk(99)));
+        let path = next_run_path(&runs_dir, 1);
+        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+
+        assert_eq!(
+            plan_sh_pre_materialize(
+                false,
+                false,
+                high_seal,
+                high_seal + 1_000_000,
+                1,
+                0
+            ),
+            ShPreMaterializeAction::ResetCatalogFullRecollect
+        );
+
+        // finalize with empty Class A tip: prep resets SEAL; materialize may apply
+        // leftover or clear — SEAL after reset must start at 0 before recollect.
+        // Call prep path only via plan (already asserted) + reset helper.
+        q.sh_run.reset_catalog_for_full_recollect().unwrap();
+        assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
+        assert_eq!(load_seal(&runs_dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

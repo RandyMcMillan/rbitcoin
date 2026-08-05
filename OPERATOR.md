@@ -134,6 +134,9 @@ merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
 tables before Electrum (the only deferred index work). Tip fan-in reduce logs a
 status line about **every 10s** (`pass=i/P chunks=c/C pct≈…`); parallel chunk
 merges default to **all CPUs** (`RBITCOIN_SH_MERGE_WORKERS`, set `1` for serial).
+**SIGINT during tip SH materialize** is cooperative: stop between chunks/passes
+and leave `scripthash.runs/merge/CHECKPOINT` (last finished pass) or `READY`
+(stream phase); restart resumes without redoing finished reduce work.
 On enter Direct, leftover `ibd_utxo.map` / `point.runs` / `tx.runs` from old
 Catchup datadirs are removed — prefer a **fresh datadir**.
 

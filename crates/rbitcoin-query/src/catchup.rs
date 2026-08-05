@@ -112,9 +112,22 @@ impl Query {
     ///
     /// Direct IBD: append-only target-sized runs + SEAL. Tip: fan-in reduce + bulk load.
     pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
+        self.finalize_sh_runs_cancellable(None)
+    }
+
+    /// Like [`Self::finalize_sh_runs`] with cooperative cancel (SIGINT → leave CHECKPOINT).
+    pub fn finalize_sh_runs_cancellable(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<u64, QueryError> {
         self.sh_run.refresh_seal();
         self.rebuild_sh_unsealed_from_class_a()?;
-        self.sh_run.finalize_and_bulk_materialize(&self.store)
+        match cancel {
+            None => self.sh_run.finalize_and_bulk_materialize(&self.store),
+            Some(c) => self
+                .sh_run
+                .finalize_and_bulk_materialize_cancellable(&self.store, Some(c)),
+        }
     }
 
     /// On-disk scripthash sorted-run count (Direct IBD cache).

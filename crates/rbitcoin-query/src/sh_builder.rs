@@ -17,8 +17,8 @@ use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
-    list_fanin_reduce_outputs, list_materialize_claims, list_runs, merge_runs, next_run_path,
-    reduce_runs_to_fanin, write_sorted_run, ScriptHashEntry,
+    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
+    merge_runs, next_run_path, reduce_runs_to_fanin_cancellable, write_sorted_run, ScriptHashEntry,
     ScriptHashRecord, Store, StoreError, SortedRunPath,
 };
 use std::collections::HashSet;
@@ -341,6 +341,18 @@ impl ShRunBuilder {
 
     /// Flush memtable, coalesce, claim runs, fan-in reduce, cold bulk-load durable SH.
     pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
+        self.finalize_and_bulk_materialize_cancellable(store, None)
+    }
+
+    /// Like [`Self::finalize_and_bulk_materialize`] with cooperative cancel (SIGINT).
+    ///
+    /// Mid-reduce cancel leaves a fan-in **CHECKPOINT** so the next finalize resumes
+    /// from the last completed pass. Mid-stream cancel restarts stream from READY.
+    pub fn finalize_and_bulk_materialize_cancellable(
+        &self,
+        store: &Store,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
         // Drain any leftover pending + L0 (worker may have stopped with L0 in RAM).
         self.drain_spills()?;
@@ -355,7 +367,8 @@ impl ShRunBuilder {
         let t_claim = Instant::now();
         let mut claimed: Vec<SortedRunPath> = Vec::new();
         let mut stream_inputs: Vec<SortedRunPath> = Vec::new();
-        let mut resumed_from_reduce = false;
+        let mut resumed_from_ready = false;
+        let mut resume_checkpoint = false;
         {
             let _io = runs_io.lock().unwrap();
             let mut prior = list_materialize_claims(&runs_dir)?;
@@ -366,17 +379,25 @@ impl ShRunBuilder {
             if prior.is_empty() && runs.is_empty() {
                 if let Some(reduced) = list_fanin_reduce_outputs(&merge_dir)? {
                     info!(
-                        "node: scripthash resuming fan-in reduce outputs ({}) under merge/",
+                        "node: scripthash resuming fan-in READY outputs ({}) under merge/",
                         reduced.len()
                     );
                     stream_inputs = reduced;
-                    resumed_from_reduce = true;
+                    resumed_from_ready = true;
                 }
             }
 
-            if !resumed_from_reduce {
-                // Incomplete prior reduce (no READY) — discard partial work files.
-                let _ = std::fs::remove_dir_all(&merge_dir);
+            if !resumed_from_ready {
+                // Mid-reduce checkpoint: keep merge/ work; still need claims/mats.
+                if load_fanin_checkpoint(&merge_dir)?.is_some() {
+                    resume_checkpoint = true;
+                    info!(
+                        "node: scripthash resuming fan-in CHECKPOINT (partial reduce progress)"
+                    );
+                } else {
+                    // No checkpoint — discard incomplete merge work only.
+                    let _ = std::fs::remove_dir_all(&merge_dir);
+                }
                 if !prior.is_empty() {
                     info!(
                         "node: scripthash resuming {} incomplete materialize claim(s)",
@@ -391,7 +412,7 @@ impl ShRunBuilder {
         }
         let claim_ns = t_claim.elapsed().as_nanos() as u64;
 
-        if !resumed_from_reduce && claimed.is_empty() {
+        if !resumed_from_ready && claimed.is_empty() && !resume_checkpoint {
             info!("node: scripthash bulk materialize: no runs");
             clear_runs_dir(&runs_dir);
             // Keep SEAL if any; tip may still re-collect.
@@ -401,24 +422,29 @@ impl ShRunBuilder {
         let fanin = merge_fanin();
         let workers = rbitcoin_store::sh_merge_workers();
         let t_reduce = Instant::now();
-        if !resumed_from_reduce {
+        if !resumed_from_ready {
+            if claimed.is_empty() && !resume_checkpoint {
+                info!("node: scripthash bulk materialize: no runs after claim");
+                return Ok(0);
+            }
             let claimed_recs: u64 = claimed.iter().map(|r| r.count).sum();
             let claimed_body: u64 = claimed
                 .iter()
                 .map(|r| r.count.saturating_mul(u64::from(r.rec_len)))
                 .sum();
-            let passes = rbitcoin_store::fanin_passes_total(claimed.len(), fanin);
+            let passes = rbitcoin_store::fanin_passes_total(claimed.len().max(1), fanin);
             info!(
                 "node: scripthash tip fanin reduce start claimed={} fanin={fanin} workers={workers} \
-                 records≈{claimed_recs} body≈{:.1}MiB passes≈{passes}",
+                 records≈{claimed_recs} body≈{:.1}MiB passes≈{passes} checkpoint_resume={resume_checkpoint}",
                 claimed.len(),
                 claimed_body as f64 / (1024.0 * 1024.0),
             );
             stream_inputs = {
                 let _io = runs_io.lock().unwrap();
-                let out = reduce_runs_to_fanin(&claimed, &merge_dir, fanin)?;
-                // Free claimed `*.run.mat` / catalog inputs now fully folded into
-                // merge/ (READY marker enables crash resume without re-claims).
+                // Checkpoint resume loads level from CHECKPOINT; claimed mats are
+                // retained until READY commit drops them.
+                let out =
+                    reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, fanin, cancel)?;
                 commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
                 out
             };
@@ -431,7 +457,7 @@ impl ShRunBuilder {
             );
         } else {
             info!(
-                "node: scripthash tip fanin reduce resumed stream={} (skip re-reduce) workers={workers}",
+                "node: scripthash tip fanin reduce resumed stream={} (READY) workers={workers}",
                 stream_inputs.len()
             );
         }
@@ -491,6 +517,13 @@ impl ShRunBuilder {
                         chain.clear();
                         long_seen = None;
                         let keys = session.keys_written();
+                        // SIGINT mid-stream: READY already committed — restart re-streams.
+                        if cancel
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .unwrap_or(false)
+                        {
+                            return Err(StoreError::Cancelled("scripthash materialize stream"));
+                        }
                         let shards = session.shards_flushed();
                         if keys == 1
                             || keys.saturating_sub(last_log_keys) >= 100_000

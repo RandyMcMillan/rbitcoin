@@ -81,9 +81,10 @@ pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, crc32, detach_run,
     for_each_merged_rec, for_each_merged_rec_opts, list_fanin_reduce_outputs,
-    fanin_passes_total, list_materialize_claims, list_runs, lookup_key, merge_runs,
-    merge_runs_to_file, next_run_path, open_run, read_run_body, reduce_runs_to_fanin, remove_run,
-    sh_merge_workers, verify_run_body, write_sorted_run,
+    fanin_passes_total, list_materialize_claims, list_runs, load_fanin_checkpoint, lookup_key,
+    merge_runs, merge_runs_to_file, next_run_path, open_run, read_run_body, reduce_runs_to_fanin,
+    reduce_runs_to_fanin_cancellable, remove_run, sh_merge_workers, verify_run_body,
+    write_fanin_checkpoint, write_sorted_run, FANIN_CHECKPOINT_NAME,
     SortedRunPath, FANIN_READY_NAME,
 };
 pub use store::Store;

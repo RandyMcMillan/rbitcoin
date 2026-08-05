@@ -5,6 +5,7 @@ use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
+use rbitcoin_store::StoreError;
 use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -367,14 +368,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Only when catch_up_complete: mid-chain peer death must not enter tip mode
     // (would bulk-load SH while still behind horizon).
     if catch_up_complete && !shutdown.requested() {
-        enter_tip_mode(&node.hub.query);
-        // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
-        mempool.set_relay_enabled(true);
-        info!(
-            "node: catch-up complete tip={:?} — tip tracking + block/tx relay (mempool live={})",
-            node.tip_height(),
-            mempool.live_count()
-        );
+        let sh_ok = enter_tip_mode(&node.hub.query, Some(Arc::clone(&shutdown.flag)));
+        if sh_ok && !shutdown.requested() {
+            // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
+            mempool.set_relay_enabled(true);
+            info!(
+                "node: catch-up complete tip={:?} — tip tracking + block/tx relay (mempool live={})",
+                node.tip_height(),
+                mempool.live_count()
+            );
+        } else if shutdown.requested() {
+            warn!(
+                "node: tip SH materialize interrupted — restart to resume (CHECKPOINT/READY kept under scripthash.runs/merge/)"
+            );
+        }
     } else if !catch_up_complete && !shutdown.requested() {
         warn!(
             "node: catch-up not complete tip={:?} — skip tip mode / Electrum materialize; restart to resume IBD",
@@ -696,27 +703,52 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 /// No automatic `tx.head` / spend backfill: those paths are recovery tools
 /// ([`Query::backfill_tx_index`] for future head rehash rebuild; spend rewrite is
 /// not part of tip entry). Corrupt head/spends ⇒ reindex, not silent tip repair.
-pub(crate) fn enter_tip_mode(query: &Query) {
+/// Enter tip index mode after SH materialize.
+///
+/// Returns `false` if SH materialize failed or was cancelled (do not treat as
+/// Electrum-ready). On SIGINT mid-reduce, a fan-in **CHECKPOINT** is left so the
+/// next process resumes from the last completed pass.
+pub(crate) fn enter_tip_mode(
+    query: &Query,
+    cancel: Option<Arc<AtomicBool>>,
+) -> bool {
     // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
-    // Retries incomplete `*.run.mat` claims from a prior crash/SIGINT.
+    // Retries incomplete `*.run.mat` claims / CHECKPOINT / READY from crash/SIGINT.
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");
-    match query.finalize_sh_runs() {
-        Ok(n) => info!("node: scripthash bulk materialize creates≈{n}"),
+    let cancel_ref = cancel.as_deref();
+    let sh_ok = match query.finalize_sh_runs_cancellable(cancel_ref) {
+        Ok(n) => {
+            info!("node: scripthash bulk materialize creates≈{n}");
+            true
+        }
+        Err(StoreError::Cancelled(msg)) => {
+            warn!("node: scripthash bulk materialize cancelled ({msg})");
+            warn!(
+                "node: partial fan-in progress kept (merge/CHECKPOINT or READY) — \
+                 restart to resume; Electrum not ready yet"
+            );
+            false
+        }
         Err(e) => {
             warn!("node: scripthash bulk materialize failed: {e}");
             warn!(
                 "node: Electrum history incomplete until materialize succeeds — \
-                 keep store/scripthash.runs (incl. *.run.mat) and restart; \
+                 keep store/scripthash.runs (incl. *.run.mat / merge/) and restart; \
                  finalize will reinit SH tables and cold-load from claims"
             );
+            false
         }
-    }
+    };
     let leftover = query.scripthash_run_count();
     if leftover > 0 {
         warn!(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
              Electrum history may be incomplete; fix and restart to retry finalize"
         );
+    }
+
+    if !sh_ok {
+        return false;
     }
 
     query.enter_tip_index_mode();
@@ -730,6 +762,7 @@ pub(crate) fn enter_tip_mode(query: &Query) {
     );
 
     info!("node: tip-mode complete — safe to start Electrum");
+    true
 }
 
 #[cfg(test)]
@@ -752,7 +785,7 @@ mod tests {
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
 
-        enter_tip_mode(&q);
+        enter_tip_mode(&q, None);
         assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
@@ -886,7 +919,7 @@ mod tests {
         let q = Query::open_or_create(dir.join("store")).unwrap();
         q.enter_direct_index_mode().unwrap();
         // Empty store: finalize has no runs; still flips to tip.
-        enter_tip_mode(&q);
+        enter_tip_mode(&q, None);
         assert_eq!(q.index_mode(), IndexMode::Tip);
         let _ = std::fs::remove_dir_all(&dir);
     }

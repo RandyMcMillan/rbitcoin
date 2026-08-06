@@ -309,6 +309,15 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_hit_rank_avg_x100: u64,
     pub arch_prep_hit_rank_n: u64,
     pub arch_prep_miss_peeks: u64,
+    /// Winner sealed-age CDF % (0/3/7/15/31); `cdf3` ≈ wave1 hit % under ages≤3 policy.
+    pub arch_prep_age_cdf0_pct: u64,
+    pub arch_prep_age_cdf3_pct: u64,
+    pub arch_prep_age_cdf7_pct: u64,
+    pub arch_prep_age_cdf15_pct: u64,
+    pub arch_prep_age_cdf31_pct: u64,
+    /// Winner age hist compact `h0:h1:…:h7+tail`.
+    pub arch_prep_age_hit_compact: String,
+    pub arch_prep_age_hit_n: u64,
     /// Plan denserels wave: fks + packed body bytes (approx).
     pub arch_head_dens_fks: u64,
     pub arch_head_dens_bytes: u64,
@@ -547,6 +556,13 @@ impl Default for IbdPerfSample {
             arch_prep_hit_rank_avg_x100: 0,
             arch_prep_hit_rank_n: 0,
             arch_prep_miss_peeks: 0,
+            arch_prep_age_cdf0_pct: 0,
+            arch_prep_age_cdf3_pct: 0,
+            arch_prep_age_cdf7_pct: 0,
+            arch_prep_age_cdf15_pct: 0,
+            arch_prep_age_cdf31_pct: 0,
+            arch_prep_age_hit_compact: String::new(),
+            arch_prep_age_hit_n: 0,
             arch_head_dens_fks: 0,
             arch_head_dens_bytes: 0,
             arch_prep_body_lookups: 0,
@@ -965,6 +981,13 @@ pub(crate) fn sample(
         arch_prep_hit_rank_avg_x100: (head_res.hit_rank_avg() * 100.0).round() as u64,
         arch_prep_hit_rank_n: head_res.hit_rank_n,
         arch_prep_miss_peeks: head_res.miss_peeks,
+        arch_prep_age_cdf0_pct: head_res.age_cdf_pct(0),
+        arch_prep_age_cdf3_pct: head_res.age_cdf_pct(3),
+        arch_prep_age_cdf7_pct: head_res.age_cdf_pct(7),
+        arch_prep_age_cdf15_pct: head_res.age_cdf_pct(15),
+        arch_prep_age_cdf31_pct: head_res.age_cdf_pct(31),
+        arch_prep_age_hit_compact: head_res.age_hit_compact(),
+        arch_prep_age_hit_n: head_res.age_hit_n(),
         arch_head_dens_fks: arch_res.head_dens_fks,
         arch_head_dens_bytes: arch_res.head_dens_bytes,
         arch_prep_body_lookups: head_res.body_lookups,
@@ -1121,6 +1144,18 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.stamp_batch_head_ms,
             s.stamp_batch_stamp_ms,
             s.stamp_batch_finish_ms,
+        ));
+    }
+    // Winner sealed-age locality (cdf3 ≈ wave1 hit % under ages≤3 hot policy).
+    if s.arch_prep_age_hit_n > 0 {
+        out.push_str(&format!(
+            " head_loc(cdf0={} cdf3={} cdf7={} cdf15={} cdf31={} n={})",
+            s.arch_prep_age_cdf0_pct,
+            s.arch_prep_age_cdf3_pct,
+            s.arch_prep_age_cdf7_pct,
+            s.arch_prep_age_cdf15_pct,
+            s.arch_prep_age_cdf31_pct,
+            s.arch_prep_age_hit_n,
         ));
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
@@ -1513,7 +1548,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             out.push_str(&format!(
                 " head_rd(probe={} idx={} body={} keys={} cands={} lookups={} \
                  avg_cands={} avg_lookups={} hit_rank_avg={hit_rank_avg:.2} hit_n={} miss_peeks={} \
-                 probe_us/key={} idx_us/key={} body_us/key={})",
+                 probe_us/key={} idx_us/key={} body_us/key={} \
+                 age_cdf(0={} 3={} 7={} 15={} 31={}) age_hit={} age_n={})",
                 s.arch_prep_probe_ms,
                 s.arch_prep_idx_ms,
                 s.arch_prep_body_txid_ms,
@@ -1527,6 +1563,17 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                 probe_us_key,
                 idx_us_key,
                 body_us_key,
+                s.arch_prep_age_cdf0_pct,
+                s.arch_prep_age_cdf3_pct,
+                s.arch_prep_age_cdf7_pct,
+                s.arch_prep_age_cdf15_pct,
+                s.arch_prep_age_cdf31_pct,
+                if s.arch_prep_age_hit_compact.is_empty() {
+                    "0:0:0:0:0:0:0:0:0"
+                } else {
+                    s.arch_prep_age_hit_compact.as_str()
+                },
+                s.arch_prep_age_hit_n,
             ));
         }
         if s.arch_head_dens_fks > 0 || s.arch_prep_head_dens_ms > 0 {
@@ -2029,6 +2076,10 @@ mod tests {
             assert!(line.contains("probe_us/key="), "{line}");
             assert!(line.contains("idx_us/key="), "{line}");
             assert!(line.contains("body_us/key="), "{line}");
+        }
+        if s.arch_prep_age_hit_n > 0 {
+            assert!(line.contains("age_cdf("), "{line}");
+            assert!(line.contains("age_hit="), "{line}");
         }
     }
 

@@ -1,10 +1,25 @@
-//! Head resolve sub-timers (probe / idx / body prefix) + probe-depth metrics.
+//! Head resolve sub-timers (probe / idx / body) + winner locality metrics.
 //!
 //! Reset by the IBD ~5s sampler. Used to split archive prep `head_fk` cost into
-//! open-address probes vs `tx.idx` range vs thin `tx.body` txid prefix reads,
-//! and to measure **winning candidate rank** (PR-0 gate for Shape A denserels merge).
+//! open-address probes vs `tx.idx` range vs `txid.body` identity peeks, and to
+//! measure **winning candidate rank** plus **winner sealed-age** for hot-window sizing.
+//!
+//! # Winner age histogram
+//!
+//! On each resolved parent (`create_fk` winner), we record
+//! `sealed_age = n_segs - 1 - si` (0 = open/tip). Ages ≥ [`AGE_CAP`]−1 share the
+//! last bucket. Sample CDFs:
+//!
+//! - `age_cdf(3)` ≈ fraction of hits inside today's wave1 window (ages ≤ 3)
+//! - `age_cdf(K)` → how far to grow the hot set for locality
+//!
+//! No separate wave1/wave2 counters: under current policy, winners at age ≤ 3 are
+//! wave1 hits; age ≥ 4 are wave2. Hist is over **resolved** keys only (`hit_n`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Histogram buckets for winner sealed-age (last bucket is ages ≥ CAP−1).
+pub const AGE_CAP: usize = 48;
 
 static PROBE_NS: AtomicU64 = AtomicU64::new(0);
 static IDX_NS: AtomicU64 = AtomicU64::new(0);
@@ -22,7 +37,10 @@ static HIT_RANK_N: AtomicU64 = AtomicU64::new(0);
 /// Body peeks that did **not** match the wanted txid (wrong cand).
 static MISS_PEEKS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Default, Clone, Copy)]
+/// Winner sealed-age histogram (index = age from tip; last bucket is tail).
+static AGE_HIT: [AtomicU64; AGE_CAP] = [const { AtomicU64::new(0) }; AGE_CAP];
+
+#[derive(Debug, Clone, Copy)]
 pub struct Sample {
     pub probe_ns: u64,
     pub idx_ns: u64,
@@ -34,6 +52,25 @@ pub struct Sample {
     pub hit_rank_sum: u64,
     pub hit_rank_n: u64,
     pub miss_peeks: u64,
+    /// Hits by sealed-age from tip (`age_hit[AGE_CAP-1]` = ages ≥ CAP−1).
+    pub age_hit: [u64; AGE_CAP],
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self {
+            probe_ns: 0,
+            idx_ns: 0,
+            body_ns: 0,
+            keys: 0,
+            cands: 0,
+            body_lookups: 0,
+            hit_rank_sum: 0,
+            hit_rank_n: 0,
+            miss_peeks: 0,
+            age_hit: [0; AGE_CAP],
+        }
+    }
 }
 
 impl Sample {
@@ -51,6 +88,81 @@ impl Sample {
             self.hit_rank_sum as f64 / self.hit_rank_n as f64
         }
     }
+
+    /// Total histogram counts (should match resolved hits when fully instrumented).
+    pub fn age_hit_n(&self) -> u64 {
+        self.age_hit.iter().copied().sum()
+    }
+
+    /// Fraction of winner hits with sealed_age ≤ `k` (0.0 if no hits).
+    ///
+    /// Under ages≤3 hot policy, `age_cdf(3)` ≈ wave1 hit fraction among resolved keys.
+    pub fn age_cdf(&self, k: u32) -> f64 {
+        let n = self.age_hit_n();
+        if n == 0 {
+            return 0.0;
+        }
+        let mut sum = 0u64;
+        let last = (k as usize).min(AGE_CAP - 1);
+        for i in 0..=last {
+            sum = sum.saturating_add(self.age_hit[i]);
+        }
+        sum as f64 / n as f64
+    }
+
+    /// Integer percent for logs: `round(100 * age_cdf(k))`.
+    pub fn age_cdf_pct(&self, k: u32) -> u64 {
+        (self.age_cdf(k) * 100.0).round() as u64
+    }
+
+    /// Compact `h0:h1:…:h7+tail` (first 8 ages + sum of the rest).
+    pub fn age_hit_compact(&self) -> String {
+        let mut parts = Vec::with_capacity(9);
+        for i in 0..8.min(AGE_CAP) {
+            parts.push(self.age_hit[i].to_string());
+        }
+        let mut tail = 0u64;
+        for i in 8..AGE_CAP {
+            tail = tail.saturating_add(self.age_hit[i]);
+        }
+        parts.push(tail.to_string());
+        parts.join(":")
+    }
+}
+
+/// Map `create_fk` → sealed-age from tip using segment `first_fk` boundaries.
+///
+/// `first_fks[si]` is the inclusive start of segment `si` (last = open/tip).
+/// Returns `None` if `fk` is zero or below the first segment.
+#[inline]
+pub fn sealed_age_for_fk(first_fks: &[u64], fk: u64) -> Option<u32> {
+    if first_fks.is_empty() || fk == 0 {
+        return None;
+    }
+    // Largest si with first_fks[si] <= fk.
+    let mut lo = 0usize;
+    let mut hi = first_fks.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if first_fks[mid] <= fk {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if first_fks[lo] > fk {
+        return None;
+    }
+    Some(crate::dontcache_policy::sealed_age_from_index(
+        lo,
+        first_fks.len(),
+    ))
+}
+
+/// Bucket index for a sealed-age (ages ≥ CAP−1 share the last bucket).
+#[inline]
+pub fn age_bucket(age: u32) -> usize {
+    (age as usize).min(AGE_CAP - 1)
 }
 
 #[inline]
@@ -104,6 +216,30 @@ pub fn add_hit_rank(rank: u64) {
     }
 }
 
+/// Record one winner at sealed-age `age` (tip-relative).
+#[inline]
+pub fn add_hit_age(age: u32) {
+    AGE_HIT[age_bucket(age)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Flush a batch-local age histogram into process counters.
+#[inline]
+pub fn add_hit_ages(local: &[u64; AGE_CAP]) {
+    for (i, &n) in local.iter().enumerate() {
+        if n > 0 {
+            AGE_HIT[i].fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Note winner age into a batch-local hist (no atomics until [`add_hit_ages`]).
+#[inline]
+pub fn note_local_hit_age(local: &mut [u64; AGE_CAP], first_fks: &[u64], fk: u64) {
+    if let Some(age) = sealed_age_for_fk(first_fks, fk) {
+        local[age_bucket(age)] = local[age_bucket(age)].saturating_add(1);
+    }
+}
+
 #[inline]
 pub fn add_miss_peeks(n: u64) {
     if n > 0 {
@@ -112,6 +248,10 @@ pub fn add_miss_peeks(n: u64) {
 }
 
 pub fn sample_and_reset() -> Sample {
+    let mut age_hit = [0u64; AGE_CAP];
+    for (i, slot) in AGE_HIT.iter().enumerate() {
+        age_hit[i] = slot.swap(0, Ordering::Relaxed);
+    }
     Sample {
         probe_ns: PROBE_NS.swap(0, Ordering::Relaxed),
         idx_ns: IDX_NS.swap(0, Ordering::Relaxed),
@@ -122,6 +262,7 @@ pub fn sample_and_reset() -> Sample {
         hit_rank_sum: HIT_RANK_SUM.swap(0, Ordering::Relaxed),
         hit_rank_n: HIT_RANK_N.swap(0, Ordering::Relaxed),
         miss_peeks: MISS_PEEKS.swap(0, Ordering::Relaxed),
+        age_hit,
     }
 }
 
@@ -129,43 +270,64 @@ pub fn sample_and_reset() -> Sample {
 mod tests {
     use super::*;
 
+    /// Pure Sample math (no process atomics — safe under parallel cargo test).
     #[test]
-    fn add_sample_reset_and_sum() {
-        add_probe(0);
-        add_idx(0);
-        add_body(0);
-        add_keys(0);
-        add_cands(0);
-        add_body_lookups(0);
-        add_hit_rank(0);
-        add_miss_peeks(0);
-        let _ = sample_and_reset();
-
-        add_probe(10);
-        add_idx(20);
-        add_body(30);
-        add_keys(4);
-        add_cands(5);
-        add_body_lookups(6);
-        add_hit_rank(1);
-        add_hit_rank(3);
-        add_miss_peeks(2);
-        let s = sample_and_reset();
-        assert_eq!(s.probe_ns, 10);
-        assert_eq!(s.idx_ns, 20);
-        assert_eq!(s.body_ns, 30);
-        assert_eq!(s.keys, 4);
-        assert_eq!(s.cands, 5);
-        assert_eq!(s.body_lookups, 6);
-        assert_eq!(s.hit_rank_sum, 4);
-        assert_eq!(s.hit_rank_n, 2);
+    fn sample_age_cdf_and_compact() {
+        let mut s = Sample::default();
+        s.age_hit[0] = 2;
+        s.age_hit[3] = 1;
+        s.age_hit[AGE_CAP - 1] = 1;
+        assert_eq!(s.age_hit_n(), 4);
+        assert!((s.age_cdf(0) - 0.5).abs() < 1e-9);
+        assert!((s.age_cdf(3) - 0.75).abs() < 1e-9);
+        assert!((s.age_cdf(47) - 1.0).abs() < 1e-9);
+        assert_eq!(s.age_cdf_pct(3), 75);
+        assert!(s.age_hit_compact().starts_with("2:0:0:1:"));
+        s.hit_rank_sum = 4;
+        s.hit_rank_n = 2;
         assert!((s.hit_rank_avg() - 2.0).abs() < 1e-9);
-        assert_eq!(s.miss_peeks, 2);
+        s.probe_ns = 10;
+        s.idx_ns = 20;
+        s.body_ns = 30;
         assert_eq!(s.sum_ns(), 60);
+        let empty = Sample::default();
+        assert_eq!(empty.age_cdf(3), 0.0);
+        assert_eq!(empty.age_hit_n(), 0);
+    }
 
-        let empty = sample_and_reset();
-        assert_eq!(empty.sum_ns(), 0);
-        assert_eq!(empty.keys, 0);
-        assert_eq!(empty.hit_rank_n, 0);
+    #[test]
+    fn sealed_age_for_fk_binary_search() {
+        // segs: [1, 100, 200] → ages from tip: si0 age2, si1 age1, si2 age0
+        let first = [1u64, 100, 200];
+        assert_eq!(sealed_age_for_fk(&first, 0), None);
+        assert_eq!(sealed_age_for_fk(&first, 1), Some(2));
+        assert_eq!(sealed_age_for_fk(&first, 99), Some(2));
+        assert_eq!(sealed_age_for_fk(&first, 100), Some(1));
+        assert_eq!(sealed_age_for_fk(&first, 199), Some(1));
+        assert_eq!(sealed_age_for_fk(&first, 200), Some(0));
+        assert_eq!(sealed_age_for_fk(&first, 999_999), Some(0));
+        assert_eq!(sealed_age_for_fk(&[], 1), None);
+        assert_eq!(age_bucket(0), 0);
+        assert_eq!(age_bucket(3), 3);
+        assert_eq!(age_bucket(100), AGE_CAP - 1);
+    }
+
+    #[test]
+    fn note_local_hit_age_buckets() {
+        let first = [1u64, 50, 100];
+        let mut local = [0u64; AGE_CAP];
+        note_local_hit_age(&mut local, &first, 10); // age 2
+        note_local_hit_age(&mut local, &first, 60); // age 1
+        note_local_hit_age(&mut local, &first, 100); // age 0
+        note_local_hit_age(&mut local, &first, 100); // age 0
+        note_local_hit_age(&mut local, &first, 0); // ignore
+        assert_eq!(local[0], 2);
+        assert_eq!(local[1], 1);
+        assert_eq!(local[2], 1);
+        assert_eq!(local.iter().sum::<u64>(), 4);
+        // Flush path is best-effort under parallel tests; still exercise the API.
+        add_hit_ages(&local);
+        add_hit_age(7);
+        let _ = sample_and_reset();
     }
 }

@@ -233,6 +233,16 @@ impl SegmentedTxHead {
         self.segments_snapshot().len()
     }
 
+    /// Per-segment `first_fk` (index 0 = oldest; last = open/tip).
+    ///
+    /// Used by head-resolve winner-age stats ([`crate::head_resolve_stats::sealed_age_for_fk`]).
+    pub fn first_fks_snapshot(&self) -> Vec<u64> {
+        self.segments_snapshot()
+            .iter()
+            .map(|s| s.first_fk)
+            .collect()
+    }
+
     pub fn sealed_segment_count(&self) -> usize {
         self.segments_snapshot()
             .iter()

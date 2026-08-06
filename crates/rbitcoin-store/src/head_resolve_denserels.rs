@@ -114,6 +114,8 @@ fn resolve_fk_and_range_pread(
 
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let side = table.txid_sidefile();
+    let first_fks = table.head.first_fks_snapshot();
+    let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
@@ -138,6 +140,8 @@ fn resolve_fk_and_range_pread(
         &mut miss_peeks,
         &mut id_ns,
         &mut idx_ns,
+        &first_fks,
+        &mut local_age,
     )?;
 
     // Wave 2: full cold depth for keys that missed hot (no further short-circuit).
@@ -165,6 +169,8 @@ fn resolve_fk_and_range_pread(
             &mut miss_peeks,
             &mut id_ns,
             &mut idx_ns,
+            &first_fks,
+            &mut local_age,
         )?;
     }
 
@@ -174,6 +180,7 @@ fn resolve_fk_and_range_pread(
     crate::head_resolve_stats::add_idx(idx_ns);
     crate::head_resolve_stats::add_body_lookups(body_lookups);
     crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+    crate::head_resolve_stats::add_hit_ages(&local_age);
 
     Ok(txids
         .iter()
@@ -194,6 +201,8 @@ fn id_idx_wave_pread(
     miss_peeks: &mut u64,
     id_ns: &mut u64,
     idx_ns: &mut u64,
+    first_fks: &[u64],
+    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
 ) -> Result<(), StoreError> {
     for (ki, cands) in cands_by_key.iter().enumerate() {
         if skip_if_won && winner[ki].is_some() {
@@ -223,6 +232,7 @@ fn id_idx_wave_pread(
             match table.body.record_range(fk) {
                 Ok((off, len)) if len > 0 => {
                     winner[ki] = Some((fk, (off, len)));
+                    crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
                 }
                 Ok(_) | Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
                 Err(e) => return Err(e),
@@ -321,6 +331,8 @@ fn resolve_fk_and_range_uring_on(
     let side_path = side.file_path().to_path_buf();
     let count = table.body.count();
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
+    let first_fks = table.head.first_fks_snapshot();
+    let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
 
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut body_lookups = 0u64;
@@ -358,6 +370,8 @@ fn resolve_fk_and_range_uring_on(
         &mut miss_peeks,
         &mut id_ns,
         &mut idx_ns,
+        &first_fks,
+        &mut local_age,
     )?;
 
     // ── Wave 2: full cold head for survivors + ID/IDX (no further SC) ─────
@@ -399,6 +413,8 @@ fn resolve_fk_and_range_uring_on(
             &mut miss_peeks,
             &mut id_ns,
             &mut idx_ns,
+            &first_fks,
+            &mut local_age,
         )?;
     }
 
@@ -408,6 +424,7 @@ fn resolve_fk_and_range_uring_on(
     crate::head_resolve_stats::add_cands(cands_total);
     crate::head_resolve_stats::add_body_lookups(body_lookups);
     crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+    crate::head_resolve_stats::add_hit_ages(&local_age);
 
     Ok(txids
         .iter()
@@ -435,6 +452,8 @@ fn id_idx_wave_uring(
     miss_peeks: &mut u64,
     id_ns: &mut u64,
     idx_ns: &mut u64,
+    first_fks: &[u64],
+    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
 ) -> Result<(), StoreError> {
     let mut done = vec![false; txids.len()];
     if only_unset {
@@ -532,6 +551,8 @@ fn id_idx_wave_uring(
                         winner,
                         &mut done,
                         miss_peeks,
+                        first_fks,
+                        local_age,
                     )?;
                     match outcome {
                         SqeOutcome::SqePushed => in_flight += 1,
@@ -723,6 +744,8 @@ fn on_stage_idx(
     winner: &mut [Option<(Fk, (u64, u64))>],
     done: &mut [bool],
     _miss_peeks: &mut u64,
+    first_fks: &[u64],
+    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
 ) -> Result<SqeOutcome, StoreError> {
     let w = slots[slot].as_mut().unwrap();
     let page_i = w.idx_page_i as usize;
@@ -806,6 +829,7 @@ fn on_stage_idx(
     let fk = Fk(w.pending_fk);
     if let Some(r) = range {
         winner[key_i] = Some((fk, r));
+        crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
         done[key_i] = true;
         return Ok(SqeOutcome::Finished);
     }
@@ -1070,6 +1094,43 @@ mod tests {
                 assert_eq!(t.body.record_range(*fk).unwrap(), *range);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Single-segment store: every winner is sealed_age 0 (open/tip).
+    ///
+    /// Multi-age mapping is covered by `head_resolve_stats::sealed_age_for_fk_*`.
+    /// Global AGE_HIT atomics race parallel tests, so we pin mapping on winners
+    /// via `first_fks` and only require the process counters moved for age 0.
+    #[test]
+    fn resolve_records_winner_age_open_segment() {
+        crate::segmented_head::SegmentedTxHead::test_set_soft_span_bytes(0);
+        let _ = crate::head_resolve_stats::sample_and_reset();
+        let (dir, t, txids) = seed_table(16);
+        assert_eq!(t.head.segment_count(), 1, "unexpected segs={}", t.head.segment_count());
+        let first = t.head.first_fks_snapshot();
+        assert_eq!(first, vec![1]);
+        let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
+        let hits = got.iter().filter(|(_, r)| r.is_some()).count() as u64;
+        assert_eq!(hits, txids.len() as u64);
+        for (_tid, row) in &got {
+            if let Some((fk, _)) = row {
+                assert_eq!(
+                    crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0),
+                    Some(0),
+                    "fk={}",
+                    fk.0
+                );
+            }
+        }
+        let s = crate::head_resolve_stats::sample_and_reset();
+        // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
+        assert!(
+            s.age_hit[0] >= hits,
+            "age0={} hits={hits} age_hit={:?}",
+            s.age_hit[0],
+            &s.age_hit[..8]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

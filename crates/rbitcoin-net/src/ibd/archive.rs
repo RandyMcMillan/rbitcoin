@@ -161,7 +161,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             // height > tip but already flagged done — keep payload, still note feed.
             kept_above_tip_flag = kept_above_tip_flag.saturating_add(1);
         }
-        // Minimal integrity: rec must have non-empty payload_len; full decode at prep.
+        // Minimal integrity: rec must have non-empty payload_len; full decode at confirm load.
         if qb.payload_len == 0 {
             empty_skip = empty_skip.saturating_add(1);
             let _ = hub.query.block_queue_dequeue_height(qb.height);

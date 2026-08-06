@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Prep-thread state so load(N+1) can run while commit(N) has not advanced tip.
+/// Lookup-thread state so lookup(N+1) can run while write(N) has not advanced tip.
 ///
 /// In-flight creates are an **immutable layer log** ([`rbitcoin_query::InFlightLog`]):
-/// each successful plan pack publishes a frozen layer; prep receives
+/// each successful lookup pack publishes a frozen layer; load receives
 /// [`InFlightLog::snapshot`] (Arc bumps only — no `Arc::make_mut` of a shared map).
 struct LoadAheadState {
     next_tx_start: u64,
@@ -104,7 +104,7 @@ impl LoadAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        // Publish an immutable layer — never mutates prior layers (prep may hold them).
+        // Publish an immutable layer — never mutates prior layers (load may hold them).
         let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
             rbitcoin_query::InFlightLayer::from_plan_pins(
                 plan.planned_fks
@@ -700,7 +700,7 @@ impl ConfirmQueueDepths {
 /// [`super::events::apply_confirm_reject`] (`unexpected previous header` only)
 /// or [`ConfirmEvent::BodyMissing`] — not this path.
 ///
-/// Kept as a named hook so multi-block / prep error handling stays uniform;
+/// Kept as a named hook so multi-block / load error handling stays uniform;
 /// always returns false.
 #[inline]
 pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
@@ -1062,7 +1062,7 @@ pub(crate) fn spawn_confirm_engine(
         .expect("spawn ibd-confirm-write");
 
     // Scripts: loaded batch → script verify (rayon) → write queue.
-    // **Feed-ahead (depth-1 safe):** while joining batch N, poll prep `try_recv`
+    // **Feed-ahead (depth-1 safe):** while joining batch N, poll load `try_recv`
     // and submit N+1 to rayon *during* the wait — not only once before a blocking
     // join (that left the pool idle under default scriptq cap=1).
     // Write handoff stays height-ordered (join N then N+1).
@@ -1591,7 +1591,7 @@ pub(crate) fn spawn_confirm_engine(
                     stats: &loop_stats,
                 };
 
-                // Pack always leaves decoded wire — Arc once for stamp/prep (no re-decode).
+                // Pack always leaves decoded wire — Arc once for stamp/load (no re-decode).
                 let wire_batch: Vec<(u32, BlockHash, std::sync::Arc<bitcoin::Block>)> = batch
                     .into_iter()
                     .map(|(h, ha, w)| (h, ha, std::sync::Arc::new(w)))
@@ -1691,7 +1691,7 @@ pub(crate) fn spawn_confirm_engine(
                         let work_ns = stamped.work_ns;
                         let stamp_ms = work_ns / 1_000_000;
                         // Reserve create fks for plan(N+1) while this batch is still
-                        // in prep/scripts/write (load-ahead in-flight).
+                        // in load/scripts/write (load-ahead in-flight).
                         let t_note = Instant::now();
                         if let Some(ref p) = stamped.plan {
                             if let Some((lh, raw)) = wire_batch
@@ -1704,7 +1704,7 @@ pub(crate) fn spawn_confirm_engine(
                         } else if let Some((lh, ha, _)) = wire_batch.last() {
                             lookup_ahead.last_loaded = Some((*lh, ha.to_byte_array()));
                         }
-                        // Pipeline after note_lookup_ok: prep pin sees prior+this offline denserels.
+                        // Pipeline after note_lookup_ok: load pin sees prior+this offline denserels.
                         let pipe_for_prep = lookup_ahead.pipeline_for(expect_h, store_path_lo);
                         confirm_thr_stats::add_lookup_other(t_note.elapsed());
                         let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
@@ -1993,7 +1993,7 @@ mod tests {
         }
     }
 
-    /// Plan may note new packs while prep holds a prior snapshot — prior Arc
+    /// Lookup may note new packs while load holds a prior snapshot — prior Arc
     /// layers must stay frozen (no whole-map make_mut).
     #[test]
     fn note_while_prep_holds_snapshot_does_not_clone_prior_layers() {
@@ -2189,7 +2189,7 @@ mod tests {
         assert!(*run.last().unwrap() <= path_lo + ahead);
     }
 
-    /// requeue_wire after empty prep must clear inflight (Ok(None) leak regression).
+    /// requeue_wire after empty load must clear inflight (Ok(None) leak regression).
     #[test]
     fn requeue_clears_inflight_so_tip_can_retry() {
         let feed = ConfirmFeed::new();
@@ -2227,7 +2227,7 @@ mod tests {
     }
 
     /// Debug overflow on script_wire_bytes / parents used to abort IBD confirm
-    /// threads under parallel prep (seen on two_node IBD). Counters must saturate.
+    /// threads under parallel load (seen on two_node IBD). Counters must saturate.
     #[test]
     fn queue_load_send_saturates_wire_and_parents() {
         let q = ConfirmQueueDepths::new();

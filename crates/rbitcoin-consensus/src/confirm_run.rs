@@ -1419,7 +1419,7 @@ fn fill_create_txid_from_ram(
     }
 }
 
-/// Pin parents for wire prep: **only spent parents** (sparse outs).
+/// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight packed outs (+ offline denserels) → cold denserels
 /// (when [`ColdPinMode::Allow`]). Does not pin every batch create.
@@ -1910,7 +1910,7 @@ fn pin_for_wire_batch(
             cold_decode_ns = t_dec.elapsed().as_nanos() as u64;
             confirm_load_stats::BODY_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
             confirm_load_stats::FULL_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
-            // Every cold parent must have been loaded — silent miss is a prep/store bug.
+            // Every cold parent must have been loaded — silent miss is a load/store bug.
             for id in cold.keys() {
                 let fk = rbitcoin_primitives::Fk(*id);
                 if !batch_parents.contains(fk) {
@@ -1940,7 +1940,7 @@ fn pin_for_wire_batch(
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;
 
-    // One store lock: publish Weaks so peer prep/writeq can adopt the same Arc.
+    // One store lock: publish Weaks so peer load/writeq can adopt the same Arc.
     let t_publish = Instant::now();
     batch_parents.publish_to_store();
     let publish_ns = t_publish.elapsed().as_nanos() as u64;
@@ -2014,7 +2014,7 @@ fn pin_for_wire_batch(
     Ok((batch_parents, batch_thin, warm))
 }
 
-/// SCRIPTS STAGE: pure verification of jobs already assembled at prep/load.
+/// SCRIPTS STAGE: pure verification of jobs already assembled at load.
 ///
 /// **No store / Query / side effects.** Input is a [`LoadedBatch`] (script jobs
 /// hold prevouts + txs + softfork flags); output is a [`ScriptOkBatch`] for the
@@ -2339,7 +2339,7 @@ fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
 
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC.
 ///
-/// When `batch.archive_plan` is set (wire prep path), Class A is appended in this
+/// When `batch.archive_plan` is set (wire lookup/load path), Class A is appended in this
 /// same stage before structural/annotate — single ordered commit era.
 /// **Class A never leads tip** (no dual-track archive-ahead / body DONTNEED lead).
 ///
@@ -2353,7 +2353,7 @@ pub fn confirm_write_phase(
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     // Idempotent: skip heights already on the confirmed tip (dup pipeline race).
     let tip = query.tip_height().map(|h| h.0);
-    let mut prep = Vec::with_capacity(batch.prepared.len());
+    let mut kept = Vec::with_capacity(batch.prepared.len());
     let mut wires = Vec::with_capacity(batch.wire_blocks.len());
     for (p, w) in batch
         .prepared
@@ -2363,13 +2363,13 @@ pub fn confirm_write_phase(
         if !write_height_needed(tip, p.height.0) {
             continue;
         }
-        prep.push(p);
+        kept.push(p);
         wires.push(w);
     }
-    if prep.is_empty() {
+    if kept.is_empty() {
         return Ok(Vec::new());
     }
-    batch.prepared = prep;
+    batch.prepared = kept;
     batch.wire_blocks = wires;
 
     let t_wall = Instant::now();
@@ -2479,7 +2479,7 @@ pub fn confirm_write_phase(
 /// planned creates only.
 ///
 /// Uses `tx_body_range_batch` — **no** Class A body pread. Skips creates not in
-/// `batch_parents` (most of the batch). Prefer denserels already set at prep pin;
+/// `batch_parents` (most of the batch). Prefer denserels already set at load pin;
 /// missing denserels come from shared [`rbitcoin_query::CreatePin`] (no packed reclone).
 fn fill_planned_create_layout_after_commit(
     query: &Query,
@@ -2521,7 +2521,7 @@ fn fill_planned_create_layout_after_commit(
         let Some((off, len)) = range else {
             continue;
         };
-        // Prep already attached sparse denserels: only body_range was missing.
+        // Load already attached sparse denserels: only body_range was missing.
         batch_parents.set_body_range_only(fk, (off, len));
         if batch_parents.has_abs_layout(fk) {
             continue;
@@ -2542,7 +2542,7 @@ fn fill_planned_create_layout_after_commit(
 /// Ensure denserels/abs for every spend edge on the write batch.
 ///
 /// Covers residual gaps after pin offline denserels + fill_planned ranges:
-/// 1. Prep-ahead parents not yet committed when prepped (body_range missing)
+/// 1. Load-ahead parents not yet committed when loaded (body_range missing)
 /// 2. Already-archived Class A same-batch creates never pinned
 /// 3. Retry after partial write
 ///
@@ -2696,7 +2696,7 @@ fn ensure_spend_abs_layouts(
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
                 continue;
             }
-            // Not pinned at prep (e.g. already-archived same-batch create): insert
+            // Not pinned at load (e.g. already-archived same-batch create): insert
             // with layout so annotate/structural abs paths work.
             let mut checked = need_v;
             if checked.is_empty() {
@@ -3390,7 +3390,7 @@ mod write_idempotent_tests {
         assert!(after > before, "skip counter should bump");
     }
 
-    /// Plan-stage denserels ensure + Forbid pin: cold path must not re-run on prep.
+    /// Lookup-stage denserels ensure + Forbid pin: cold path must not re-run on load.
     /// External parents land in plan-local map only.
     #[test]
     fn plan_ensure_denserels_then_forbid_skips_cold_io() {
@@ -3799,13 +3799,13 @@ mod write_idempotent_tests {
             parents.get_parent_out(Fk(parent_id), 0).is_some(),
             "sparse need-vout must be in BatchParents"
         );
-        // Plan map still the shared Arc until prep clears it.
+        // Plan map still the shared Arc until load clears it.
         assert!(Arc::ptr_eq(
             plan.external_parent_outs.get(&parent_id).unwrap(),
             &external
         ));
 
-        // Production prep freezes plan after pin so write queue is lean.
+        // Production load freezes plan after pin so write queue is lean.
         plan.freeze_after_pin();
         assert!(
             plan.external_parent_outs.is_empty(),
@@ -4718,7 +4718,7 @@ fn post_commit(
                 .map_err(ConsensusError::Store)?;
             if !cold.is_empty() {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: spend annotate abs cold (OOB or IO); prep/layout bug",
+                    "invariant: spend annotate abs cold (OOB or IO); load/layout bug",
                 )));
             }
             let ann_ns = t_ann.elapsed().as_nanos() as u64;

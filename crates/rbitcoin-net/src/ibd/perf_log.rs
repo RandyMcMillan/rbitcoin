@@ -139,7 +139,7 @@ pub(crate) struct IbdPerfSample {
     pub meta_n: u64,
     pub resolve_ms: u64,
     pub load_ms: u64,
-    /// Wire prep residual (inside load/pre_asm, outside pin): Arc clone.
+    /// Wire load residual (inside load/pre_asm, outside pin): Arc clone.
     pub prep_wire_arc_ms: u64,
     /// Structure validate.
     pub prep_struct_ms: u64,
@@ -1781,9 +1781,9 @@ mod tests {
         assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
-        // prep = load(30)+assemble(8) = 38
+        // load wall = load_ms(30)+assemble(8) = 38
         assert!(line.contains("load=38ms"), "{line}");
-        assert!(!line.contains("connect="), "assemble is inside prep, not a peer stage: {line}");
+        assert!(!line.contains("connect="), "assemble is inside load, not a peer stage: {line}");
         // write = class_a(12)+ensure(3)+class_c(40)+spend(25)+tip_gc(5) = 85
         assert!(line.contains("write=85ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");

@@ -342,7 +342,7 @@ impl ChainHub {
         Ok(Some(out))
     }
 
-    /// IBD **prep** after plan: pin denserels + assemble (does not re-plan).
+    /// IBD **load** after lookup: pin denserels + assemble (does not re-lookup).
     pub fn confirm_wire_load_from_plan(
         &self,
         stamped: PlanStampOutcome,
@@ -1067,7 +1067,7 @@ mod tests {
         assert!(mat1.batch.archive_plan.is_some());
         assert_eq!(hub.tip_height(), Some(0), "tip must not advance on load alone");
 
-        // Update pipeline caches from plan (prep-thread note_lookup_ok).
+        // Update pipeline caches from plan (lookup-thread note_lookup_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
         {
             let mut log = rbitcoin_query::InFlightLog::new();

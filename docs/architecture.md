@@ -7,9 +7,6 @@ indexers.
 
 **Status:** experimental 0.x. On-disk format and APIs are **unstable until 1.0**.
 
-Recent tidy pass (what was deleted vs intentional dual paths):
-[`cleanup-2026-07-27.md`](./cleanup-2026-07-27.md).
-
 ---
 
 ## One-screen picture
@@ -82,9 +79,8 @@ Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).
 
 ## Novel on-disk model
 
-Deep layout: [`SCHEMA.md`](../SCHEMA.md). Durability zones:
-[`libbitcoin-durable-archive-variant.md`](../libbitcoin-durable-archive-variant.md).
-Crash / tip commit: [`docs/crash-recovery.md`](./crash-recovery.md).
+Deep layout: [`SCHEMA.md`](../SCHEMA.md). Crash / tip commit:
+[`docs/crash-recovery.md`](./crash-recovery.md).
 
 ### Class A / B / C (intuition)
 
@@ -104,7 +100,7 @@ a LevelDB bag.
 - **Historical blocks** are rebuilt from Class A (packed full txs) rather than
   kept forever as raw wire `blk` files.
 - After IBD, a **wire-format ring** covers the soft tip window for serve,
-  reorg, and recovery ([durable archive variant](../libbitcoin-durable-archive-variant.md)).
+  reorg, and recovery ([crash recovery](./crash-recovery.md)).
 - **Epoch finalize** fsyncs buried archive prefixes in steady state; IBD itself
   does not promise Core-class durability mid-catch-up.
 
@@ -120,9 +116,9 @@ See SCHEMA.
 
 ## Concurrent IBD / IO model
 
-Roles and locks: [`docs/concurrency.md`](./concurrency.md). IO history and
-host-pressure levers: [`docs/ibd-io-audit.md`](./ibd-io-audit.md). Process RAM
-budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
+Roles and locks: [`docs/concurrency.md`](./concurrency.md). IO modality:
+[`docs/io-modality.md`](./io-modality.md). Process RAM budgets:
+[`docs/ibd-memory.md`](./ibd-memory.md).
 
 ### Design principles
 
@@ -197,7 +193,7 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | Doc | Contents |
 |-----|----------|
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
-| [`libbitcoin-durable-archive-variant.md`](../libbitcoin-durable-archive-variant.md) | Epochs, wire ring, IBD vs steady durability |
+| [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
 | [`docs/experimental-mainnet.md`](./experimental-mainnet.md) | Lab mainnet ops |
 | [`OPERATOR.md`](../OPERATOR.md) | Knobs, logging, memory budgets |

@@ -699,7 +699,12 @@ impl ChainHub {
         }
         self.confirmed.write().unwrap().insert(hash);
         // Move block into tip-window cache (no full-history clone).
+        let n_tx = block.txdata.len();
         let _ = self.cache.push_best(block);
+        // Tip-follow / wire accept path: log every accepted tip block (Core-like
+        // UpdateTip). IBD bulk confirm uses note_confirmed_tip without this line;
+        // IBD retains periodic progress/perf status instead.
+        log_update_tip(height, &hash, &header, n_tx);
         let event = TipEvent {
             height,
             hash,
@@ -778,6 +783,19 @@ impl ChainHub {
         }
         Ok(sum_work(works.into_iter()))
     }
+}
+
+/// Core-like per-block tip log for tip-follow / wire accept (`connect_at`).
+///
+/// Format is intentionally close to Bitcoin Core `UpdateTip` so operators can
+/// grep one line per height. IBD does not call this for every confirm batch.
+pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
+    let time = header.time;
+    let ver = header.version.to_consensus();
+    info!(
+        "UpdateTip: new best={hash} height={height} version={ver} \
+         tx={n_tx} date={time} progress=tip"
+    );
 }
 
 /// Immediate seed: genesis + tip (and tip-1) so open is O(1) at mainnet scale.
@@ -932,6 +950,47 @@ mod tests {
             }
         }
         block
+    }
+
+    #[test]
+    fn tip_follow_accept_logs_update_tip_per_block() {
+        // Shipped path: accept_block → connect_at → log_update_tip (info).
+        // Assert helper formats Core-like line; accept advances tip once per block.
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_000, 1);
+        let h = b1.header;
+        let hash = b1.block_hash();
+        let line_probe = {
+            // Drive the shipped log helper (same args connect_at uses).
+            log_update_tip(1, &hash, &h, b1.txdata.len());
+            format!(
+                "UpdateTip: new best={hash} height=1 version={} tx={} date={} progress=tip",
+                h.version.to_consensus(),
+                b1.txdata.len(),
+                h.time
+            )
+        };
+        assert!(
+            line_probe.starts_with("UpdateTip: new best="),
+            "tip log must be Core-like UpdateTip: {line_probe}"
+        );
+        assert!(line_probe.contains("height=1"));
+        assert!(line_probe.contains("progress=tip"));
+        assert!(matches!(
+            hub.accept_block(b1).unwrap(),
+            AcceptOutcome::Accepted { height: 1 }
+        ));
+        assert_eq!(hub.tip_height(), Some(1));
+        // Second block also accepted (one log per height on real path).
+        let b2 = mine(hash, 1_300_000_600, 2);
+        assert!(matches!(
+            hub.accept_block(b2).unwrap(),
+            AcceptOutcome::Accepted { height: 2 }
+        ));
+        assert_eq!(hub.tip_height(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

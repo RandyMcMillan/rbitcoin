@@ -29,6 +29,44 @@ that produces a Nix-glibc dynamic link that fails outside the store. Dev/test
 builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
+## CLI (operator-first)
+
+Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
+
+```bash
+./target/release/rbitcoin-node --smoke --datadir /tmp/rb-smoke --network regtest
+```
+
+| Flag | Core-ish alias | Default |
+|------|----------------|---------|
+| `--datadir PATH` | same | `./datadir` |
+| `--network NET` | `--chain` | `mainnet` |
+| `--listen ADDR` | | bind later default port |
+| `--connect ADDR` | (repeatable) | seeds |
+| `--milestone HEIGHT` | `--assumevalid-height` | network default (mainnet 840000) |
+| `--max-outbound N` | `--maxoutbound` | 16 live download peers |
+| `--maxinbound N` | `--maxconnections` | 125 inbound sessions |
+| `--mempool-size-mb N` | `--maxmempool` | ~300 MiB weight |
+| `--archive-queue-mb N` | | 512 |
+| `--class-a-cache-mb N` | | unset (store default) |
+| `--conf FILE` | | none |
+| `--log-level LEVEL` | | `info` |
+| `--no-seeds` | `--noseeds` | seeds on |
+| `--electrum-listen ADDR` | | disabled |
+| `--inhibit-suspend` | | off |
+
+Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
+
+```
+network=signet
+maxinbound=64
+archive_queue_mb=256
+mempool_size_mb=100
+```
+
+**Advanced** IO/perf tunables may still use `RBITCOIN_*` (see below); they are
+**not required** for normal signet/mainnet sync or tip follow.
+
 ## Logging
 
 Operational logs go to **stderr** with UTC timestamps:
@@ -40,9 +78,20 @@ Operational logs go to **stderr** with UTC timestamps:
 | Control | Values |
 |---------|--------|
 | `--log-level LEVEL` | `error` `warn` `info` `debug` `trace` `off` |
-| `RBITCOIN_LOG` / `RUST_LOG` | bare level or `rbitcoin=debug` style |
+| `RBITCOIN_LOG` / `RUST_LOG` | advanced fallback if CLI omits `--log-level` |
 
 Default: **info**. CLI wins over env.
+
+### Tip-follow (every block)
+
+After IBD, each accepted tip extension logs one **info** line (Core-like):
+
+```
+UpdateTip: new best=<hash> height=<n> version=<v> tx=<n> date=<unix> progress=tip
+```
+
+Emitted from the tip-follow / wire accept path (`ChainHub::connect_at`). IBD bulk
+confirm does **not** spam this line per block — use the periodic IBD status below.
 
 ### IBD status lines (every ~5s)
 
@@ -100,10 +149,11 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | IBD concurrent getdata | **1024** | code `IbdConfig::window` |
 | Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
 | Live IBD peers | **16** | `--max-outbound` |
-| Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
-| Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
+| Inbound P2P sessions | **125** | `--maxinbound` / `--maxconnections` |
+| Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` / `--assumevalid-height` (`0` = full scripts) |
+| Archive queue RAM | **512 MiB** | `--archive-queue-mb` (or advanced `RBITCOIN_ARCHIVE_QUEUE_MB`) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP. No create pin FIFO / `RBITCOIN_RESIDENCY_BYTES` |
-| Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
+| Class A working-set cache | **256 MiB** | `--class-a-cache-mb` (or advanced `RBITCOIN_CLASS_A_CACHE_MB`) |
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
@@ -290,18 +340,14 @@ Full script validation (slow, used for consensus parity labs):
 ## 16 GiB RAM / sluggish disk (mainnet)
 
 Full-validation IBD will be **disk-bound** and can freeze the UI if `datadir` shares
-the desktop disk. See **[docs/store-efficiency-plan.md](./docs/store-efficiency-plan.md)**
-for the TB-scale store + Electrum redesign plan.
-
-Practical profile until the fat Electrum index lands:
+the desktop disk. Prefer a dedicated volume and modest memory knobs:
 
 ```bash
-export RBITCOIN_ARCHIVE_QUEUE_MB=128
-export RBITCOIN_CLASS_A_CACHE_MB=128
 export RAYON_NUM_THREADS=4
 # Prefer --milestone 840000 for catch-up, then reindex/full validate later if needed
 nice -n 10 ionice -c 3 ./target/release/rbitcoin-node \
   --datadir /mnt/dedicated/datadir-mainnet \
+  --archive-queue-mb 128 --class-a-cache-mb 128 \
   --network mainnet \
   --max-outbound 12 \
   --mempool-size-mb 200 \

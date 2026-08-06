@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 for the **0.x** experimental line (breaking on-disk and API changes are expected
 before 1.0).
 
+## [Unreleased]
+
+### Changed
+
+- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
+  `--class-a-cache-mb`, `--conf`, Core-like aliases (`--assumevalid-height`,
+  `--maxmempool`, `--chain`). Normal sync does not require `RBITCOIN_*` exports.
+- **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`
+  (IBD keeps periodic progress/perf lines only).
+- **Docs hygiene:** removed abandoned plans/forensics notes from the release
+  surface; COMPAT documents BIP324 short-ID live-set vs deferred Core IDs.
+
 ## [0.1.0] — 2026-07-26
 
 ### Experimental first public packaging

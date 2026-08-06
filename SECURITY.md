@@ -30,8 +30,9 @@ issues that affect consensus, P2P DoS surface, or Electrum/data integrity.
 - **Consensus and script:** pure-Rust verification; bugs can mean accepting
   invalid chain data or rejecting valid data. Report both.
 - **P2P:** BIP324 v2-only; DoS parity with Bitcoin Core is **not** claimed.
-  Default mitigations: max inbound sessions (`RBITCOIN_P2P_MAX_INBOUND`, default
-  125), per-session message/byte rate windows, misbehavior score disconnect.
+  Default mitigations: max inbound sessions (`--maxinbound` / `--maxconnections`,
+  default 125; advanced env `RBITCOIN_P2P_MAX_INBOUND` still honored via CLI
+  apply), per-session message/byte rate windows, misbehavior score disconnect.
 - **Electrum:** plain TCP; TLS is an operator reverse-proxy concern. Default
   mitigations: max connections (256), max request line (1 MiB), max scripthash
   subs/connection (1000), idle timeout (120 s), broadcast hex cap.

@@ -328,6 +328,71 @@ mod tests {
         assert_eq!(command_for_short_id(18), Some("ping"));
     }
 
+    /// Live IBD + tip-follow + tip-tx command set must map to Core BIP324 short IDs.
+    #[test]
+    fn short_ids_cover_live_ibd_tip_commands() {
+        // Commands used on current sync / tip follow / tip tx relay paths.
+        let live = [
+            ("addr", 1u8),
+            ("block", 2),
+            ("blocktxn", 3),
+            ("cmpctblock", 4),
+            ("feefilter", 5),
+            ("getblocks", 9),
+            ("getblocktxn", 10),
+            ("getdata", 11),
+            ("getheaders", 12),
+            ("headers", 13),
+            ("inv", 14),
+            ("mempool", 15),
+            ("notfound", 17),
+            ("ping", 18),
+            ("pong", 19),
+            ("sendcmpct", 20),
+            ("tx", 21),
+            ("addrv2", 28),
+        ];
+        for (cmd, id) in live {
+            assert_eq!(
+                short_id_for_command(cmd),
+                Some(id),
+                "short id for {cmd}"
+            );
+            assert_eq!(command_for_short_id(id), Some(cmd));
+            // Round-trip through encode/parse for empty-payload or simple msgs.
+        }
+        // Application handshake uses long form (not short-id).
+        assert!(short_id_for_command("version").is_none());
+        assert!(short_id_for_command("verack").is_none());
+        assert!(short_id_for_command("wtxidrelay").is_none());
+        assert!(short_id_for_command("sendheaders").is_none());
+        assert!(short_id_for_command("sendaddrv2").is_none());
+        // Placeholder slots 29–36 stay empty (unknown short id → protocol error).
+        for id in 29u8..=36 {
+            assert!(command_for_short_id(id).is_none(), "slot {id} empty");
+        }
+        assert_eq!(command_for_short_id(37), Some("feature"));
+    }
+
+    #[test]
+    fn encode_parse_live_short_id_messages() {
+        let magic = signet_magic();
+        for payload in [
+            NetworkMessage::Ping(1),
+            NetworkMessage::Pong(1),
+            NetworkMessage::MemPool,
+            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                send_compact: true,
+                version: 2,
+            }),
+        ] {
+            let contents = encode_v2_contents(payload.clone()).unwrap();
+            assert_ne!(contents[0], 0, "expected short id for {:?}", payload.cmd());
+            let frame = parse_v2_contents(magic, &contents).unwrap();
+            assert_eq!(frame.decode().payload().cmd(), payload.cmd());
+        }
+    }
+
     #[test]
     fn encode_parse_verack_long_form() {
         let magic = signet_magic();

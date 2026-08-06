@@ -20,11 +20,10 @@ relational mmap archive** and a **pure-Rust consensus/script** path.
 Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electrum
 backends are **external indexers** of another node. rbitcoin does neither:
 
-1. **On-disk archive** — Class A/B/C memory-mapped tables: packed txs, keyless
-   `tx.head`, spend annotations, native scripthash. Historical blocks are
-   **reconstructed** from the archive; tip keeps a **wire ring** and **epoch**
-   durability after catch-up. Deep layout: [`SCHEMA.md`](./SCHEMA.md),
-   durability: [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
+1. **On-disk archive** — Class A/B/C tables: packed txs, keyless `tx.head`, spend
+   annotations, native scripthash. Historical blocks are **reconstructed** from
+   the archive; tip keeps a **wire ring** and **epoch** durability after catch-up.
+   Deep layout: [`SCHEMA.md`](./SCHEMA.md), concurrency: [`docs/concurrency.md`](./docs/concurrency.md).
 2. **Concurrent IBD / IO** — fixed writer roles, allocate-then-publish HWMs,
    lock-free map epochs on the hot path, confirm as load → scripts → write,
    bulk **io_uring** where available. Map: [`docs/concurrency.md`](./docs/concurrency.md).

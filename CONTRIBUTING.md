@@ -3,7 +3,7 @@
 ## Principles
 
 1. Prefer design notes in [`docs/architecture.md`](./docs/architecture.md),
-   [`SCHEMA.md`](./SCHEMA.md), and [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md)
+   [`SCHEMA.md`](./SCHEMA.md), and [`docs/crash-recovery.md`](./docs/crash-recovery.md)
    over inventing parallel specs.
 2. Prefer **high-level functional/integration tests** over unit tests
    ([`COVERAGE.md`](./COVERAGE.md), [`TESTING.md`](./TESTING.md)).
@@ -11,8 +11,8 @@
    (`./scripts/coverage.sh` — same bar as CI).
 4. Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/wallet/mining
    without an explicit plan change.
-5. Store durability follows
-   [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
+5. Store durability / tip commit: [`docs/crash-recovery.md`](./docs/crash-recovery.md)
+   and [`docs/concurrency.md`](./docs/concurrency.md).
 6. Security-sensitive reports go through [`SECURITY.md`](./SECURITY.md), not
    public issues.
 

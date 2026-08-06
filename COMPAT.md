@@ -42,6 +42,30 @@ wallet / mining parity.
 | relayfee / estimatefee / histogram | done | Libre min + live median |
 | TLS | external | terminate at reverse proxy; node is plain TCP |
 
+## BIP324 v2 short-ID surface (live paths)
+
+Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.rs`).
+**Live IBD + tip follow + tip tx relay** commands with short IDs:
+
+| Short ID | Command | Role |
+|----------|---------|------|
+| 1 | addr | peers |
+| 2 | block | IBD / tip body |
+| 3 | blocktxn | compact fill |
+| 4 | cmpctblock | tip HB |
+| 5 | feefilter | tip policy |
+| 9–15 | getblocks…mempool | headers/blocks/inv |
+| 17–21 | notfound…tx | ping/pong/sendcmpct/tx |
+| 28 | addrv2 | BIP155 |
+
+Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
+`sendaddrv2`, and unknown/extension commands.
+
+**Not implemented as product features** (short slots 22–27 compact filters, 29–36
+placeholders, 37 `feature`): decode may reject unknown short IDs; peers that
+only need the live set above interoperate. Full Core filter/light-client APIs
+are deferred.
+
 ## Deferred surfaces
 
 Core wallet RPC, mining GBT, fee-estimator research quality, BIP331 native wire

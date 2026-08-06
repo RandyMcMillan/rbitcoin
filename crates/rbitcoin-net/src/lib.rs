@@ -15,7 +15,7 @@ mod tx_relay;
 mod v2;
 
 pub use cache::BlockCache;
-pub use chain::{AcceptOutcome, ChainHub, TipEvent};
+pub use chain::{log_update_tip, AcceptOutcome, ChainHub, TipEvent};
 pub use error::NetError;
 pub use ibd::{
     ibd, ibd_cancellable, IbdConfig, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,

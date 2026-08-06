@@ -2151,11 +2151,11 @@ fn block_cache_and_mempool_hub_surface() {
 
 // ─── Unified wire pipeline (raw block → validated tip) ───────────────────────
 
-/// Multi-height raw wire → tip via split prep/scripts/commit (no pre-archive reload).
+/// Multi-height raw wire → tip via split load/scripts/commit (no pre-archive reload).
 #[test]
 fn unified_wire_pipeline_multi_block_to_tip() {
     use rbitcoin_consensus::{
-        confirm_scripts_phase, confirm_wire_prep_phase, confirm_write_phase, ChainParams,
+        confirm_scripts_phase, confirm_wire_load_phase, confirm_write_phase, ChainParams,
         Milestone, ScriptPreverified,
     };
 
@@ -2179,7 +2179,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     }
 
     rbitcoin_query::reset_body_ok_reads();
-    let mat = confirm_wire_prep_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
+    let mat = confirm_wire_load_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
         .expect("wire prep");
     assert_eq!(mat.batch.len(), 4);
     assert!(
@@ -2218,7 +2218,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
 #[test]
 fn wire_prep_external_parent_denserels_cold_class_a() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, confirm_scripts_phase, confirm_wire_prep_phase,
+        accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_phase,
         confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::split_anyone_can_spend;
@@ -2280,7 +2280,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
     let _ = parent_fk;
 
     // Prep A/B: external parent denserels from Class A (plan-local / cold).
-    let mat_a = confirm_wire_prep_phase(
+    let mat_a = confirm_wire_load_phase(
         &q,
         &params,
         ms,
@@ -2291,7 +2291,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
     let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
     confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
 
-    let mat_b = confirm_wire_prep_phase(
+    let mat_b = confirm_wire_load_phase(
         &q,
         &params,
         ms,
@@ -2312,7 +2312,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
 fn wire_prep_already_archived_bodies_spend_annotate() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
-        confirm_wire_prep_phase, confirm_write_phase, ChainParams, Milestone,
+        confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone,
         ScriptPreverified,
     };
 
@@ -2357,7 +2357,7 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
 
     // Wire prep both heights: need empty → plan None; must still annotate.
     let batch = [(Height(ha), ba.clone()), (Height(hb), bb.clone())];
-    let mat = confirm_wire_prep_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
+    let mat = confirm_wire_load_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
         .expect("wire prep already-archived");
     assert!(
         mat.batch.archive_plan.is_none() || mat.batch.archive_plan.as_ref().is_some_and(|p| p.is_empty()),
@@ -2379,7 +2379,7 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
 #[test]
 fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, confirm_scripts_phase, confirm_wire_prep_phase_pipelined,
+        accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_phase_pipelined,
         confirm_write_phase, ChainParams, Milestone, ScriptPreverified, WirePrepPipeline,
     };
 
@@ -2422,7 +2422,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         in_flight: rbitcoin_query::InFlightView::empty(),
         parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
     };
-    let mat_a = confirm_wire_prep_phase_pipelined(
+    let mat_a = confirm_wire_load_phase_pipelined(
         &q,
         &params,
         ms,
@@ -2438,7 +2438,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     // Prep freezes plan after pin; only sparse BatchParents remains.
     assert!(
         plan_a.external_parent_outs.is_empty(),
-        "post-pin plan must not retain external sparse outs on prep→scripts→write handoff"
+        "post-pin plan must not retain external sparse outs on load→scripts→write handoff"
     );
     // packed pin half and batch_pin share CreatePin Arc (no outs double-store).
     assert_eq!(plan_a.batch_pin.len(), plan_a.packed.len());
@@ -2478,7 +2478,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
 
     // Prep B while A is still uncommitted — parent pin uses in_flight view
     // (no denserels). This is the IBD prep∥write pipeline shape.
-    let mat_b = confirm_wire_prep_phase_pipelined(
+    let mat_b = confirm_wire_load_phase_pipelined(
         &q,
         &params,
         ms,
@@ -2559,10 +2559,10 @@ fn unified_wire_prep_source_has_no_wire_rebuild() {
         env!("CARGO_MANIFEST_DIR"),
         "/../rbitcoin-consensus/src/confirm_run.rs"
     ));
-    // confirm_wire_prep_phase body must not invoke wire_rebuild.
+    // confirm_wire_load_phase body must not invoke wire_rebuild.
     let start = src
-        .find("pub fn confirm_wire_prep_phase")
-        .expect("confirm_wire_prep_phase");
+        .find("pub fn confirm_wire_load_phase")
+        .expect("confirm_wire_load_phase");
     let rest = &src[start..];
     let end = rest
         .find("\npub fn confirm_wire_run")

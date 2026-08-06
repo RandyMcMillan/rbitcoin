@@ -12,29 +12,29 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Prep-thread state so prep(N+1) can plan while commit(N) has not advanced tip.
+/// Prep-thread state so load(N+1) can run while commit(N) has not advanced tip.
 ///
 /// In-flight creates are an **immutable layer log** ([`rbitcoin_query::InFlightLog`]):
 /// each successful plan pack publishes a frozen layer; prep receives
 /// [`InFlightLog::snapshot`] (Arc bumps only — no `Arc::make_mut` of a shared map).
-struct PrepAheadState {
+struct LoadAheadState {
     next_tx_start: u64,
-    /// Append-only published packs (plan thread only mutates via note/prune/clear).
+    /// Append-only published packs (lookup thread only mutates via note/prune/clear).
     in_flight: rbitcoin_query::InFlightLog,
-    /// Shared sparse parent pins for concurrent prep/scripts/write batches.
+    /// Shared sparse parent pins for concurrent load/scripts/write batches.
     parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
-    /// Last height successfully prepped (still in pipeline or already committed).
-    last_prepped: Option<(u32, [u8; 32])>,
+    /// Last height successfully loaded (still in pipeline or already committed).
+    last_loaded: Option<(u32, [u8; 32])>,
 }
 
-impl PrepAheadState {
+impl LoadAheadState {
     fn new(hub: &ChainHub) -> Self {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
-            last_prepped: None,
+            last_loaded: None,
         }
     }
 
@@ -57,10 +57,10 @@ impl PrepAheadState {
         self.next_tx_start = self
             .next_tx_start
             .max(body_n.saturating_add(1).max(1));
-        if let Some((h, _)) = self.last_prepped {
+        if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
             if h <= tip {
-                self.last_prepped = None;
+                self.last_loaded = None;
             }
         }
         self.publish_mem_stats();
@@ -84,7 +84,7 @@ impl PrepAheadState {
         let parent_hash = if path_lo == store_path_lo {
             None
         } else {
-            self.last_prepped
+            self.last_loaded
                 .filter(|(h, _)| *h + 1 == path_lo)
                 .map(|(_, hash)| hash)
         };
@@ -97,7 +97,7 @@ impl PrepAheadState {
         }
     }
 
-    fn note_plan_ok(
+    fn note_lookup_ok(
         &mut self,
         _hub: &ChainHub,
         plan: &rbitcoin_query::ArchiveWritePlan,
@@ -125,16 +125,16 @@ impl PrepAheadState {
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
-        self.last_prepped = Some((last_height, last_hash));
+        self.last_loaded = Some((last_height, last_hash));
         self.publish_mem_stats();
     }
 
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
-        // Arc-swap store so in-flight prep/write batches keep their Arcs.
+        // Arc-swap store so in-flight load/write batches keep their Arcs.
         self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
         self.publish_mem_stats();
-        self.last_prepped = None;
+        self.last_loaded = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
 }
@@ -142,16 +142,16 @@ impl PrepAheadState {
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
 ///
 /// **Sole intake:** peer/rehydrate enqueues wire into the **body queue**, then
-/// notes height/hash here. Plan/prep reload wire from the body queue — the feed
+/// notes height/hash here. Lookup/load reload wire from the body queue — the feed
 /// does **not** retain `Block`s. Class A alone is never enough (no hash-only
 /// confirm). Tip-follow reorgs use peer wire via `ChainHub::accept_block`.
 ///
 /// Optional wire slots remain for rare in-process requeue; production requeues
 /// strip wire so RAM stays in the body queue + pipeline stage batches only.
 ///
-/// **In-flight tracking:** once plan claims a contiguous run, those heights sit
+/// **In-flight tracking:** once lookup claims a contiguous run, those heights sit
 /// in `inflight` until write finishes (or re-queue). `note` will not re-insert
-/// them — otherwise offer re-notes tip+1 every main-loop tick and plan
+/// them — otherwise offer re-notes tip+1 every main-loop tick and lookup
 /// re-claims the same batch (duplicate work).
 pub(crate) struct ConfirmFeed {
     pub(crate) inner: std::sync::Mutex<ConfirmFeedInner>,
@@ -162,7 +162,7 @@ pub(crate) struct ConfirmFeed {
 pub(crate) struct ConfirmFeedInner {
     /// height → (hash, optional wire — normally `None`; body queue holds payloads)
     pub(crate) ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
-    /// Claimed by prep; not yet written or released. Offer must not re-note.
+    /// Claimed by lookup; not yet written or released. Offer must not re-note.
     pub(crate) inflight: std::collections::HashSet<u32>,
 }
 
@@ -275,7 +275,7 @@ pub(crate) enum ConfirmEvent {
 /// Hard cap on consecutive ready heights in one confirm wave.
 ///
 /// Primary bound is soft **input** budget ([`confirm_batch_max_inputs`]); this
-/// caps how many thin early-chain blocks pack into one plan/prep/script wave.
+/// caps how many thin early-chain blocks pack into one lookup/load/script wave.
 pub(crate) const CONFIRM_RUN_MAX_BLOCKS: usize = 144;
 
 /// Default soft max Σ `tx.input` over a packed confirm run.
@@ -323,21 +323,24 @@ pub(crate) fn pack_stop_after(sum_inputs: u32, n_blocks: usize, soft_max_inputs:
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default plan→prep depth: one batch of slack (plan is steady; scripts long-pole).
-pub(crate) const PLAN_QUEUE_CAP_DEFAULT: usize = 1;
-/// Default prep→scripts depth: one batch of slack.
+/// Default lookup→load depth (`loadq`): one batch of slack (lookup is steady; scripts long-pole).
 pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 1;
+/// Default load→scripts depth (`scriptq`): one batch of slack.
+pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 1;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 10;
 /// Hard clamp per stage (env abuse / OOM guard).
 pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
 
-/// Resolved plan / prep / write queue capacities (OnceLock; process-lifetime).
+/// Resolved load / script / write queue capacities (OnceLock; process-lifetime).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
-    pub plan: usize,
+    /// lookup→load (`loadq`)
     pub load: usize,
+    /// load→scripts (`scriptq`)
+    pub script: usize,
+    /// scripts→write (`writeq`)
     pub write: usize,
 }
 
@@ -351,9 +354,9 @@ fn parse_queue_cap(raw: Option<&str>, default: usize) -> usize {
 ///
 /// | Queue | Env | Default |
 /// |-------|-----|---------|
-/// | plan→prep | `RBITCOIN_CONFIRM_PLAN_QUEUE` | **1** |
-/// | prep→scripts | `RBITCOIN_CONFIRM_PREP_QUEUE` | **1** |
-/// | scripts→write | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **10** |
+/// | lookup→load (`loadq`) | `RBITCOIN_CONFIRM_LOAD_QUEUE` (legacy `…_PLAN_QUEUE`) | **1** |
+/// | load→scripts (`scriptq`) | `RBITCOIN_CONFIRM_SCRIPT_QUEUE` (legacy `…_PREP_QUEUE`) | **1** |
+/// | scripts→write (`writeq`) | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **10** |
 ///
 /// Legacy: if a per-stage env is unset, `RBITCOIN_CONFIRM_QUEUE` (when set) supplies
 /// that stage's default instead of the table above. Clamp **1..=64** each.
@@ -367,32 +370,40 @@ pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .map(|n| n.clamp(1, CONFIRM_QUEUE_CAP_MAX));
 
-        let plan_raw = std::env::var("RBITCOIN_CONFIRM_PLAN_QUEUE").ok();
-        let prep_raw = std::env::var("RBITCOIN_CONFIRM_PREP_QUEUE").ok();
+        let load_raw = std::env::var("RBITCOIN_CONFIRM_LOAD_QUEUE")
+            .or_else(|_| std::env::var("RBITCOIN_CONFIRM_PLAN_QUEUE"))
+            .ok();
+        let script_raw = std::env::var("RBITCOIN_CONFIRM_SCRIPT_QUEUE")
+            .or_else(|_| std::env::var("RBITCOIN_CONFIRM_PREP_QUEUE"))
+            .ok();
         let write_raw = std::env::var("RBITCOIN_CONFIRM_WRITE_QUEUE").ok();
 
-        let plan = parse_queue_cap(
-            plan_raw.as_deref(),
-            legacy_n.unwrap_or(PLAN_QUEUE_CAP_DEFAULT),
-        );
         let load = parse_queue_cap(
-            prep_raw.as_deref(),
+            load_raw.as_deref(),
             legacy_n.unwrap_or(LOAD_QUEUE_CAP_DEFAULT),
+        );
+        let script = parse_queue_cap(
+            script_raw.as_deref(),
+            legacy_n.unwrap_or(SCRIPT_QUEUE_CAP_DEFAULT),
         );
         let write = parse_queue_cap(
             write_raw.as_deref(),
             legacy_n.unwrap_or(WRITE_QUEUE_CAP_DEFAULT),
         );
-        let caps = ConfirmQueueCaps { plan, load, write };
-        let non_default = plan != PLAN_QUEUE_CAP_DEFAULT
-            || load != LOAD_QUEUE_CAP_DEFAULT
+        let caps = ConfirmQueueCaps {
+            load,
+            script,
+            write,
+        };
+        let non_default = load != LOAD_QUEUE_CAP_DEFAULT
+            || script != SCRIPT_QUEUE_CAP_DEFAULT
             || write != WRITE_QUEUE_CAP_DEFAULT
             || legacy.is_some();
         if non_default {
             rbitcoin_log::info!(
-                "ibd: confirm pipeline queues planq cap={plan} prepq cap={load} \
+                "ibd: confirm pipeline queues loadq cap={load} scriptq cap={script} \
                  writeq cap={write} \
-                 (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / _WRITE_QUEUE; \
+                 (RBITCOIN_CONFIRM_LOAD_QUEUE / _SCRIPT_QUEUE / _WRITE_QUEUE; \
                  legacy RBITCOIN_CONFIRM_QUEUE={})",
                 legacy.as_deref().unwrap_or("unset"),
             );
@@ -401,42 +412,42 @@ pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     })
 }
 
-/// Plan→prep `SyncSender` capacity.
-pub(crate) fn plan_queue_cap() -> usize {
-    confirm_queue_caps().plan
-}
-/// Prep→scripts capacity.
+/// Lookup→load (`loadq`) `SyncSender` capacity.
 pub(crate) fn load_queue_cap() -> usize {
     confirm_queue_caps().load
 }
-/// Scripts→write capacity.
+/// Load→scripts (`scriptq`) capacity.
+pub(crate) fn script_queue_cap() -> usize {
+    confirm_queue_caps().script
+}
+/// Scripts→write (`writeq`) capacity.
 pub(crate) fn write_queue_cap() -> usize {
     confirm_queue_caps().write
 }
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).
 ///
-/// Plan may start the next run while prep/scripts/write hold earlier ones,
+/// Lookup may start the next run while load/scripts/write hold earlier ones,
 /// but must **not** skip a stuck tip+1 and claim thousands of far heights.
 /// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
     let q = c
-        .plan
-        .saturating_add(c.load)
+        .load
+        .saturating_add(c.script)
         .saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32)
         .saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
 }
 
-/// Plan-stage output: stamp + pipeline-local parent denserels for prep pin.
-struct PlanDone {
+/// Lookup-stage output: stamp + pipeline-local parent denserels for load pin.
+struct LookupDone {
     /// Heights/hashes for feed finish/requeue bookkeeping.
     heights_hashes: Vec<(u32, BlockHash)>,
-    /// Structure + plan_mega (create_fk stamped); head-miss parents carry
+    /// Structure + plan batch (create_fk stamped); head-miss parents carry
     /// denserels on `ArchiveWritePlan::external_parent_outs`.
     stamped: PlanStampOutcome,
-    /// In-flight creates/outs for prep pin (prior uncommitted batches).
+    /// In-flight creates/outs for load pin (prior uncommitted batches).
     pipeline: WirePrepPipeline,
 }
 
@@ -447,29 +458,29 @@ struct PlanDone {
 ///
 /// High-water marks (`*_hwm`) track max depth since the last
 /// [`ConfirmQueueDepths::sample_hwm_and_reset`] (≈5s status tick). Point
-/// samples alone almost always show 0 under a plan-limited pipeline.
+/// samples alone almost always show 0 under a lookup-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
-    /// plan → prep (`SyncSender` capacity [`plan_queue_cap`]).
-    plan_to_prep: AtomicUsize,
-    /// prep → scripts (`SyncSender` capacity [`load_queue_cap`]).
+    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
+    lookup_to_load: AtomicUsize,
+    /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
     load_to_scripts: AtomicUsize,
-    /// scripts → write (`SyncSender` capacity [`write_queue_cap`]).
+    /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
     scripts_to_write: AtomicUsize,
-    /// Max plan→prep depth since last HWM sample.
-    plan_hwm: AtomicUsize,
-    /// Max prep→scripts depth since last HWM sample.
+    /// Max lookup→load depth since last HWM sample.
     load_hwm: AtomicUsize,
+    /// Max load→scripts depth since last HWM sample.
+    script_hwm: AtomicUsize,
     /// Max scripts→write depth since last HWM sample.
     write_hwm: AtomicUsize,
-    /// Sum of `batch.len()` sitting in plan→prep.
-    plan_blocks: AtomicUsize,
-    /// Sum of `batch.len()` sitting in prep→scripts.
+    /// Sum of `batch.len()` sitting in lookup→load.
     load_blocks: AtomicUsize,
-    /// Sum of approx wire bytes of those batches.
-    load_wire_bytes: AtomicUsize,
-    /// Sum of `BatchParents` entries riding prep→scripts batches.
-    load_parents: AtomicUsize,
+    /// Sum of `batch.len()` sitting in load→scripts.
+    script_blocks: AtomicUsize,
+    /// Sum of approx wire bytes of load→scripts batches.
+    script_wire_bytes: AtomicUsize,
+    /// Sum of `BatchParents` entries riding load→scripts batches.
+    script_parents: AtomicUsize,
     /// Sum of `batch.len()` sitting in scripts→write.
     write_blocks: AtomicUsize,
     write_wire_bytes: AtomicUsize,
@@ -480,12 +491,12 @@ pub(crate) struct ConfirmQueueDepths {
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConfirmPipelineSizes {
-    pub plan_batches: usize,
-    pub plan_blocks: usize,
     pub load_batches: usize,
     pub load_blocks: usize,
-    pub load_wire_bytes: usize,
-    pub load_parents: usize,
+    pub script_batches: usize,
+    pub script_blocks: usize,
+    pub script_wire_bytes: usize,
+    pub script_parents: usize,
     pub write_batches: usize,
     pub write_blocks: usize,
     pub write_wire_bytes: usize,
@@ -495,10 +506,10 @@ pub(crate) struct ConfirmPipelineSizes {
 }
 
 impl ConfirmPipelineSizes {
-    /// Parent entries sitting in prepq + writeq (pipeline-wide, no budget).
+    /// Parent entries sitting in scriptq + writeq (pipeline-wide, no budget).
     #[inline]
     pub fn parents_total(&self) -> usize {
-        self.load_parents.saturating_add(self.write_parents)
+        self.script_parents.saturating_add(self.write_parents)
     }
 }
 
@@ -515,23 +526,23 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline queue depths for progress/perf: `planq… prepq… writeq…`.
+/// Confirm pipeline queue depths for progress/perf: `loadq… scriptq… writeq…`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
-/// `planq` = plan→prep; `prepq` = prep→scripts; `writeq` = scripts→write.
+/// `loadq` = lookup→load; `scriptq` = load→scripts; `writeq` = scripts→write.
 #[inline]
 pub(crate) fn format_conf_q(
-    plan: usize,
-    prep: usize,
+    load: usize,
+    script: usize,
     write: usize,
-    plan_cap: usize,
-    prep_cap: usize,
+    load_cap: usize,
+    script_cap: usize,
     write_cap: usize,
 ) -> String {
     format!(
         "{} {} {}",
-        format_queue_depth("planq", plan, plan_cap),
-        format_queue_depth("prepq", prep, prep_cap),
+        format_queue_depth("loadq", load, load_cap),
+        format_queue_depth("scriptq", script, script_cap),
         format_queue_depth("writeq", write, write_cap),
     )
 }
@@ -541,10 +552,10 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
-    /// `(plan→prep, prep→scripts, scripts→write)`.
+    /// `(lookup→load, load→scripts, scripts→write)`.
     pub(crate) fn snap(&self) -> (usize, usize, usize) {
         (
-            self.plan_to_prep.load(Ordering::Relaxed),
+            self.lookup_to_load.load(Ordering::Relaxed),
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
@@ -553,8 +564,8 @@ impl ConfirmQueueDepths {
     /// Max queue depths since last call; resets HWMs to 0.
     pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
         (
-            self.plan_hwm.swap(0, Ordering::Relaxed),
             self.load_hwm.swap(0, Ordering::Relaxed),
+            self.script_hwm.swap(0, Ordering::Relaxed),
             self.write_hwm.swap(0, Ordering::Relaxed),
         )
     }
@@ -562,12 +573,12 @@ impl ConfirmQueueDepths {
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
-            plan_batches: self.plan_to_prep.load(Ordering::Relaxed),
-            plan_blocks: self.plan_blocks.load(Ordering::Relaxed),
-            load_batches: self.load_to_scripts.load(Ordering::Relaxed),
+            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
             load_blocks: self.load_blocks.load(Ordering::Relaxed),
-            load_wire_bytes: self.load_wire_bytes.load(Ordering::Relaxed),
-            load_parents: self.load_parents.load(Ordering::Relaxed),
+            script_batches: self.load_to_scripts.load(Ordering::Relaxed),
+            script_blocks: self.script_blocks.load(Ordering::Relaxed),
+            script_wire_bytes: self.script_wire_bytes.load(Ordering::Relaxed),
+            script_parents: self.script_parents.load(Ordering::Relaxed),
             write_batches: self.scripts_to_write.load(Ordering::Relaxed),
             write_blocks: self.write_blocks.load(Ordering::Relaxed),
             write_wire_bytes: self.write_wire_bytes.load(Ordering::Relaxed),
@@ -583,58 +594,58 @@ impl ConfirmQueueDepths {
         let _ = hwm.fetch_max(depth_after, Ordering::Relaxed);
     }
 
-    fn note_plan_send(&self, blocks: usize) {
-        let d = self.plan_to_prep.fetch_add(1, Ordering::Relaxed) + 1;
-        Self::note_depth_hwm(&self.plan_hwm, d);
-        self.plan_blocks
+    fn note_lookup_send(&self, blocks: usize) {
+        let d = self.lookup_to_load.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::note_depth_hwm(&self.load_hwm, d);
+        self.load_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(blocks))
             })
             .ok();
     }
-    fn note_plan_recv(&self, blocks: usize) {
-        self.plan_to_prep.fetch_sub(1, Ordering::Relaxed);
-        self.plan_blocks
+    fn note_lookup_recv(&self, blocks: usize) {
+        self.lookup_to_load.fetch_sub(1, Ordering::Relaxed);
+        self.load_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(blocks))
             })
             .ok();
     }
 
-    fn note_load_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
+    fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         let d = self.load_to_scripts.fetch_add(1, Ordering::Relaxed) + 1;
-        Self::note_depth_hwm(&self.load_hwm, d);
-        // Saturating: concurrent note_load_send under parallel prep can race past
+        Self::note_depth_hwm(&self.script_hwm, d);
+        // Saturating: concurrent note_script_send under parallel load can race past
         // usize::MAX on wire_bytes/parents counters in debug overflow checks.
-        self.load_blocks
+        self.script_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(blocks))
             })
             .ok();
-        self.load_wire_bytes
+        self.script_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(wire_bytes))
             })
             .ok();
-        self.load_parents
+        self.script_parents
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(parents))
             })
             .ok();
     }
-    fn note_load_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
+    fn note_script_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.load_to_scripts.fetch_sub(1, Ordering::Relaxed);
-        self.load_blocks
+        self.script_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(blocks))
             })
             .ok();
-        self.load_wire_bytes
+        self.script_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(wire_bytes))
             })
             .ok();
-        self.load_parents
+        self.script_parents
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(parents))
             })
@@ -680,7 +691,7 @@ impl ConfirmQueueDepths {
     }
 }
 
-/// True when a plan/prep error should re-queue the batch (not permanent reject).
+/// True when a lookup/load error should re-queue the batch (not permanent reject).
 ///
 /// **Policy:** internal confirm invariants are permanent failures — fix the
 /// root cause (in-flight prune, denserels pin, claim readiness). Soft-looping
@@ -697,7 +708,7 @@ pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
 }
 
 /// Drain scripts→write after `first` is already dequeued (and accounted):
-/// non-blocking `try_recv` until empty, merge contiguous into one megabatch.
+/// non-blocking `try_recv` until empty, merge contiguous into one batch.
 ///
 /// `on_extra` runs only for additionally drained parts (queue depth). Non-contig
 /// leftover is returned for the next write iteration (ordered scripts should
@@ -711,23 +722,23 @@ fn drain_script_ok_write_queue(
     usize,
     Option<rbitcoin_consensus::ScriptOkBatch>,
 ) {
-    let mut mega = first;
+    let mut batch = first;
     let mut parts = 1usize;
     loop {
         match rx.try_recv() {
             Ok(more) => {
                 on_extra(&more);
-                match mega.append_contiguous(more) {
+                match batch.append_contiguous(more) {
                     Ok(()) => {
                         parts = parts.saturating_add(1);
                     }
                     Err(leftover) => {
-                        // Height gap or length invariant — write mega first.
+                        // Height gap or length invariant — write batch first.
                         warn!(
-                            "ibd: write mega drain gap after parts={parts} leftover_blks={}",
+                            "ibd: write batch drain gap after parts={parts} leftover_blks={}",
                             leftover.len()
                         );
-                        return (mega, parts, Some(leftover));
+                        return (batch, parts, Some(leftover));
                     }
                 }
             }
@@ -735,28 +746,28 @@ fn drain_script_ok_write_queue(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    (mega, parts, None)
+    (batch, parts, None)
 }
 
-/// OS-thread occupancy for the confirm pipeline (plan / prep / scripts / write).
+/// OS-thread occupancy for the confirm pipeline (lookup / load / scripts / write).
 ///
 /// Stage `plan_ms` / `script_ms` / … are **work** sums and mis-rank the long
-/// pole when planq is empty. These timers include **wait** (claim, recv, send
+/// pole when loadq is empty. These timers include **wait** (claim, recv, send
 /// block) so a 5s window can show who is busy vs idle.
 pub(crate) mod confirm_thr_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    static PLAN_CLAIM_NS: AtomicU64 = AtomicU64::new(0);
-    static PLAN_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
-    static PLAN_CLONE_NS: AtomicU64 = AtomicU64::new(0);
-    static PLAN_STAMP_NS: AtomicU64 = AtomicU64::new(0);
-    static PLAN_OTHER_NS: AtomicU64 = AtomicU64::new(0);
-    static PLAN_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_CLAIM_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_OTHER_NS: AtomicU64 = AtomicU64::new(0);
+    static LOOKUP_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
-    static PREP_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    static PREP_WORK_NS: AtomicU64 = AtomicU64::new(0);
-    static PREP_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static LOAD_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static LOAD_WORK_NS: AtomicU64 = AtomicU64::new(0);
+    static LOAD_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
     static SCRIPT_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
     static SCRIPT_WORK_NS: AtomicU64 = AtomicU64::new(0);
@@ -774,41 +785,41 @@ pub(crate) mod confirm_thr_stats {
     }
 
     #[inline]
-    pub fn add_plan_claim(d: Duration) {
-        add(&PLAN_CLAIM_NS, d);
+    pub fn add_lookup_claim(d: Duration) {
+        add(&LOOKUP_CLAIM_NS, d);
     }
     #[inline]
-    pub fn add_plan_resolve(d: Duration) {
-        add(&PLAN_RESOLVE_NS, d);
+    pub fn add_lookup_resolve(d: Duration) {
+        add(&LOOKUP_RESOLVE_NS, d);
     }
     #[inline]
-    pub fn add_plan_clone(d: Duration) {
-        add(&PLAN_CLONE_NS, d);
+    pub fn add_lookup_clone(d: Duration) {
+        add(&LOOKUP_CLONE_NS, d);
     }
     #[inline]
-    pub fn add_plan_stamp(d: Duration) {
-        add(&PLAN_STAMP_NS, d);
+    pub fn add_lookup_stamp(d: Duration) {
+        add(&LOOKUP_STAMP_NS, d);
     }
     #[inline]
-    pub fn add_plan_other(d: Duration) {
-        add(&PLAN_OTHER_NS, d);
+    pub fn add_lookup_other(d: Duration) {
+        add(&LOOKUP_OTHER_NS, d);
     }
     #[inline]
-    pub fn add_plan_send_wait(d: Duration) {
-        add(&PLAN_SEND_WAIT_NS, d);
+    pub fn add_lookup_send_wait(d: Duration) {
+        add(&LOOKUP_SEND_WAIT_NS, d);
     }
 
     #[inline]
-    pub fn add_prep_recv_wait(d: Duration) {
-        add(&PREP_RECV_WAIT_NS, d);
+    pub fn add_load_recv_wait(d: Duration) {
+        add(&LOAD_RECV_WAIT_NS, d);
     }
     #[inline]
-    pub fn add_prep_work(d: Duration) {
-        add(&PREP_WORK_NS, d);
+    pub fn add_load_work(d: Duration) {
+        add(&LOAD_WORK_NS, d);
     }
     #[inline]
-    pub fn add_prep_send_wait(d: Duration) {
-        add(&PREP_SEND_WAIT_NS, d);
+    pub fn add_load_send_wait(d: Duration) {
+        add(&LOAD_SEND_WAIT_NS, d);
     }
 
     #[inline]
@@ -835,15 +846,15 @@ pub(crate) mod confirm_thr_stats {
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
-        pub plan_claim_ns: u64,
-        pub plan_resolve_ns: u64,
-        pub plan_clone_ns: u64,
-        pub plan_stamp_ns: u64,
-        pub plan_other_ns: u64,
-        pub plan_send_wait_ns: u64,
-        pub prep_recv_wait_ns: u64,
-        pub prep_work_ns: u64,
-        pub prep_send_wait_ns: u64,
+        pub lookup_claim_ns: u64,
+        pub lookup_resolve_ns: u64,
+        pub lookup_clone_ns: u64,
+        pub lookup_stamp_ns: u64,
+        pub lookup_other_ns: u64,
+        pub lookup_send_wait_ns: u64,
+        pub load_recv_wait_ns: u64,
+        pub load_work_ns: u64,
+        pub load_send_wait_ns: u64,
         pub script_recv_wait_ns: u64,
         pub script_work_ns: u64,
         pub script_send_wait_ns: u64,
@@ -853,15 +864,15 @@ pub(crate) mod confirm_thr_stats {
 
     pub fn sample_and_reset() -> Sample {
         Sample {
-            plan_claim_ns: PLAN_CLAIM_NS.swap(0, Ordering::Relaxed),
-            plan_resolve_ns: PLAN_RESOLVE_NS.swap(0, Ordering::Relaxed),
-            plan_clone_ns: PLAN_CLONE_NS.swap(0, Ordering::Relaxed),
-            plan_stamp_ns: PLAN_STAMP_NS.swap(0, Ordering::Relaxed),
-            plan_other_ns: PLAN_OTHER_NS.swap(0, Ordering::Relaxed),
-            plan_send_wait_ns: PLAN_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
-            prep_recv_wait_ns: PREP_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
-            prep_work_ns: PREP_WORK_NS.swap(0, Ordering::Relaxed),
-            prep_send_wait_ns: PREP_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
+            lookup_claim_ns: LOOKUP_CLAIM_NS.swap(0, Ordering::Relaxed),
+            lookup_resolve_ns: LOOKUP_RESOLVE_NS.swap(0, Ordering::Relaxed),
+            lookup_clone_ns: LOOKUP_CLONE_NS.swap(0, Ordering::Relaxed),
+            lookup_stamp_ns: LOOKUP_STAMP_NS.swap(0, Ordering::Relaxed),
+            lookup_other_ns: LOOKUP_OTHER_NS.swap(0, Ordering::Relaxed),
+            lookup_send_wait_ns: LOOKUP_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
+            load_recv_wait_ns: LOAD_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
+            load_work_ns: LOAD_WORK_NS.swap(0, Ordering::Relaxed),
+            load_send_wait_ns: LOAD_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
             script_recv_wait_ns: SCRIPT_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
             script_work_ns: SCRIPT_WORK_NS.swap(0, Ordering::Relaxed),
             script_send_wait_ns: SCRIPT_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
@@ -871,13 +882,13 @@ pub(crate) mod confirm_thr_stats {
     }
 }
 
-/// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
+/// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
-/// Plan (claim + structure + stamp create_fk) → depth-5 →
-/// prep (pin denserels + assemble) → scripts → write.
-/// Overlap: plan(N+1) head-stamp ∥ prep(N) denserels ∥ scripts ∥ write.
+/// Lookup (claim + structure + stamp create_fk) → loadq →
+/// load (pin denserels + assemble) → scriptq → scripts → writeq → write.
+/// Overlap: lookup(N+1) head-stamp ∥ load(N) denserels ∥ scripts ∥ write.
 /// Handoff is owned [`PlanStampOutcome`] (pipeline pins only).
-/// Returns the plan-thread join handle and shared queue-depth counters.
+/// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
@@ -887,16 +898,17 @@ pub(crate) fn spawn_confirm_engine(
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
     let caps = confirm_queue_caps();
-    let (plan_tx, plan_rx) = std::sync::mpsc::sync_channel::<PlanDone>(caps.plan);
+    // loadq: lookup → load; scriptq: load → scripts; writeq: scripts → write.
+    let (loadq_tx, loadq_rx) = std::sync::mpsc::sync_channel::<LookupDone>(caps.load);
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
-    )>(caps.load);
+    )>(caps.script);
     let (write_tx, write_rx) =
         std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(caps.write);
-    // Write reject: plan drops reserved fks + last_prepped so re-plan after
+    // Write reject: plan drops reserved fks + last_loaded so re-lookup after
     // Class A partial commit does not drift next_tx_start.
-    let prep_ahead_reset = Arc::new(AtomicBool::new(false));
+    let load_ahead_reset = Arc::new(AtomicBool::new(false));
 
     // Write: structural + class_c + annotate; emits tip events.
     let hub_wb = Arc::clone(&hub);
@@ -905,7 +917,7 @@ pub(crate) fn spawn_confirm_engine(
     let accepted_wb = Arc::clone(&accepted);
     let loop_stats_wb = Arc::clone(&loop_stats);
     let q_wb = Arc::clone(&queues);
-    let prep_ahead_reset_wb = Arc::clone(&prep_ahead_reset);
+    let load_ahead_reset_wb = Arc::clone(&load_ahead_reset);
     let write_thr = std::thread::Builder::new()
         .name("ibd-confirm-write".into())
         .spawn(move || {
@@ -929,7 +941,7 @@ pub(crate) fn spawn_confirm_engine(
                     },
                 };
                 // Drain everything already in the scripts→write queue into one
-                // megabatch: larger Class A / Class C / tip advance → fewer fsyncs.
+                // batch: larger Class A / Class C / tip advance → fewer fsyncs.
                 // Scripts send height-ordered FIFO; append_contiguous enforces that.
                 let (batch, parts, next_left) =
                     drain_script_ok_write_queue(first, &write_rx, |b| {
@@ -1027,15 +1039,15 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         // Write reject — clear inflight (reject event handles
                         // wire soft re-get vs permanent blacklist). Invalidate
-                        // prep-ahead caches so reserved create fks / last_prepped
+                        // load-ahead caches so reserved create fks / last_loaded
                         // do not drift.
-                        prep_ahead_reset_wb.store(true, Ordering::Release);
+                        load_ahead_reset_wb.store(true, Ordering::Release);
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
                         warn!(
-                            "ibd: confirm write reject @ {height} mega_parts={parts}: {e}"
+                            "ibd: confirm write reject @ {height} batch_parts={parts}: {e}"
                         );
                         let _ = event_tx_wb.send(ConfirmEvent::Reject {
                             height,
@@ -1052,7 +1064,7 @@ pub(crate) fn spawn_confirm_engine(
     // Scripts: loaded batch → script verify (rayon) → write queue.
     // **Feed-ahead (depth-1 safe):** while joining batch N, poll prep `try_recv`
     // and submit N+1 to rayon *during* the wait — not only once before a blocking
-    // join (that left the pool idle under default PREP_QUEUE=1).
+    // join (that left the pool idle under default scriptq cap=1).
     // Write handoff stays height-ordered (join N then N+1).
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
@@ -1077,8 +1089,8 @@ pub(crate) fn spawn_confirm_engine(
             ) -> Inflight {
                 let n = mat_batch.len();
                 let load_wire = mat_batch.approx_wire_bytes();
-                let load_parents = mat_batch.parent_count();
-                q_sc.note_load_recv(n, load_wire, load_parents);
+                let script_parents = mat_batch.parent_count();
+                q_sc.note_script_recv(n, load_wire, script_parents);
                 let meta =
                     rbitcoin_consensus::ScriptsBatchMeta::from_batch(&mat_batch, mat_ns);
                 // Non-blocking submit onto rayon global pool.
@@ -1155,7 +1167,7 @@ pub(crate) fn spawn_confirm_engine(
                         q_sc.note_write_send(wb, ww, parents);
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
-                                "ibd: confirm scripts slow batch={} first={} prep_ms={mat_ms} script_ms={script_ms} wall_ms={}",
+                                "ibd: confirm scripts slow batch={} first={} load_ms={mat_ms} script_ms={script_ms} wall_ms={}",
                                 inflight.meta.n,
                                 inflight.meta.first_h,
                                 inflight.meta.t0.elapsed().as_millis()
@@ -1217,28 +1229,28 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Prep: stamped batches → pin denserels + assemble → scripts.
-    let hub_prep = Arc::clone(&hub);
-    let feed_prep = Arc::clone(&feed);
-    let event_tx_prep = event_tx.clone();
-    let loop_stats_prep = Arc::clone(&loop_stats);
-    let queues_prep = Arc::clone(&queues);
-    let prep_join = std::thread::Builder::new()
+    // Load: stamped batches → pin denserels + assemble → scripts.
+    let hub_load = Arc::clone(&hub);
+    let feed_load = Arc::clone(&feed);
+    let event_tx_load = event_tx.clone();
+    let loop_stats_load = Arc::clone(&loop_stats);
+    let queues_load = Arc::clone(&queues);
+    let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!(
-                "ibd: confirm prep on dedicated OS thread (planq → pin denserels+assemble)"
+                "ibd: confirm load on dedicated OS thread (loadq → pin denserels+assemble)"
             );
             loop {
                 let t_recv = Instant::now();
-                let done = match plan_rx.recv() {
+                let done = match loadq_rx.recv() {
                     Ok(d) => d,
                     Err(_) => break,
                 };
-                confirm_thr_stats::add_prep_recv_wait(t_recv.elapsed());
+                confirm_thr_stats::add_load_recv_wait(t_recv.elapsed());
                 let n = done.heights_hashes.len();
-                queues_prep.note_plan_recv(n);
-                if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
+                queues_load.note_lookup_recv(n);
+                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     break;
                 }
 
@@ -1259,19 +1271,19 @@ pub(crate) fn spawn_confirm_engine(
                         self.stats.confirm_end();
                     }
                 }
-                // Prep live: block count known; inputs already accounted on plan live.
-                loop_stats_prep.confirm_begin(expect_h, heights_hashes.len() as u32, 0);
+                // Load live: block count known; inputs already accounted on lookup live.
+                loop_stats_load.confirm_begin(expect_h, heights_hashes.len() as u32, 0);
                 let _live_guard = LiveGuard {
-                    stats: &loop_stats_prep,
+                    stats: &loop_stats_load,
                 };
 
-                // Pin denserels (Allow) + assemble using owned stamped plan — no re-plan.
+                // Pin denserels (Allow) + assemble using owned stamped plan — no re-lookup.
                 let t_work = Instant::now();
-                let mat_res = hub_prep.confirm_wire_prep_from_plan(done.stamped, Some(&pipe));
-                confirm_thr_stats::add_prep_work(t_work.elapsed());
+                let mat_res = hub_load.confirm_wire_load_from_plan(done.stamped, Some(&pipe));
+                confirm_thr_stats::add_load_work(t_work.elapsed());
                 drop(_live_guard);
 
-                if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
+                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     drop(mat_tx);
                     let _ = scripts.join();
                     return;
@@ -1291,13 +1303,13 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm scripts channel closed");
                             return;
                         }
-                        confirm_thr_stats::add_prep_send_wait(t_send.elapsed());
-                        queues_prep.note_load_send(prepared_n, wire, parents);
+                        confirm_thr_stats::add_load_send_wait(t_send.elapsed());
+                        queues_load.note_script_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
                             let pin = rbitcoin_query::confirm_load_stats::last_pin_phases();
                             let pms = rbitcoin_query::confirm_load_stats::LastPinPhases::ms;
                             info!(
-                                "ibd: confirm prep slow batch={prepared_n} claim={} first={expect_h} \
+                                "ibd: confirm load slow batch={prepared_n} claim={} first={expect_h} \
                                  work_ms={work_ms} plan_stamp_ms={} \
                                  pin(adopt={}ms plan={}ms/n={} cold={}ms/n={} contract={}ms publish={}ms) \
                                  parents={}",
@@ -1317,7 +1329,7 @@ pub(crate) fn spawn_confirm_engine(
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
-                            info!("ibd: confirm prep cancelled @ {expect_h}");
+                            info!("ibd: confirm load cancelled @ {expect_h}");
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
@@ -1326,15 +1338,15 @@ pub(crate) fn spawn_confirm_engine(
                             let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
                                 heights_hashes
                                     .iter()
-                                    .filter(|(_, ha)| !hub_prep.has_block(ha))
+                                    .filter(|(_, ha)| !hub_load.has_block(ha))
                                     .map(|(h, ha)| (*h, *ha, None))
                                     .collect();
-                            feed_prep.requeue_wire(&retry);
+                            feed_load.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
                                 warn!(
-                                    "ibd: confirm prep incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
+                                    "ibd: confirm load incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
                                 );
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -1345,17 +1357,17 @@ pub(crate) fn spawn_confirm_engine(
                                 heights_hashes
                                     .iter()
                                     .skip(1)
-                                    .filter(|(_, ha)| !hub_prep.has_block(ha))
+                                    .filter(|(_, ha)| !hub_load.has_block(ha))
                                     .map(|(h, ha)| (*h, *ha, None))
                                     .collect();
-                            feed_prep.requeue_wire(&tail);
+                            feed_load.requeue_wire(&tail);
                         }
-                        feed_prep.finish(std::iter::once(expect_h));
-                        loop_stats_prep
+                        feed_load.finish(std::iter::once(expect_h));
+                        loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm prep reject {first_hash} @ {expect_h}: {e}");
-                        if event_tx_prep
+                        warn!("ibd: confirm load reject {first_hash} @ {expect_h}: {e}");
+                        if event_tx_load
                             .send(ConfirmEvent::Reject {
                                 height: expect_h,
                                 hash: first_hash,
@@ -1371,21 +1383,21 @@ pub(crate) fn spawn_confirm_engine(
             }
             drop(mat_tx);
             let _ = scripts.join();
-            info!("ibd: confirm prep exit");
+            info!("ibd: confirm load exit");
         })
         .expect("spawn ibd-confirm-load");
 
-    // Plan: claim feed → resolve wire → plan+stamp+ensure denserels → prep queue.
-    let queues_plan = Arc::clone(&queues);
-    let prep_ahead_reset_plan = Arc::clone(&prep_ahead_reset);
-    let plan_join = std::thread::Builder::new()
-        .name("ibd-confirm-plan".into())
+    // Lookup: claim feed → resolve wire → stamp+ensure denserels → loadq.
+    let queues_lookup = Arc::clone(&queues);
+    let load_ahead_reset_lookup = Arc::clone(&load_ahead_reset);
+    let lookup_join = std::thread::Builder::new()
+        .name("ibd-confirm-lookup".into())
         .spawn(move || {
             info!(
-                "ibd: confirm plan on dedicated OS thread (claim → stamp create_fk → prep queue/{})",
-                plan_queue_cap()
+                "ibd: confirm lookup on dedicated OS thread (claim → stamp create_fk → load queue/{})",
+                load_queue_cap()
             );
-            let mut plan_ahead = PrepAheadState::new(&hub);
+            let mut lookup_ahead = LoadAheadState::new(&hub);
             loop {
                 if feed.stopped() {
                     break;
@@ -1397,8 +1409,8 @@ pub(crate) fn spawn_confirm_engine(
                     let found: Option<(Vec<(u32, BlockHash, bitcoin::Block)>, u32)> = loop {
                         if feed.stopped() {
                             drop(g);
-                            drop(plan_tx);
-                            let _ = prep_join.join();
+                            drop(loadq_tx);
+                            let _ = load_join.join();
                             return;
                         }
                         let tip = hub.tip_height();
@@ -1492,7 +1504,7 @@ pub(crate) fn spawn_confirm_engine(
                                 }
                             }
                             // BQ load+decode wall (was plan_resolve before online pack).
-                            confirm_thr_stats::add_plan_resolve(t_pack_io.elapsed());
+                            confirm_thr_stats::add_lookup_resolve(t_pack_io.elapsed());
                             if !body_missing.is_empty() {
                                 for (mh, mhash) in &body_missing {
                                     let _ = event_tx.send(ConfirmEvent::BodyMissing {
@@ -1520,18 +1532,18 @@ pub(crate) fn spawn_confirm_engine(
                     match found {
                         Some(x) => x,
                         None => {
-                            confirm_thr_stats::add_plan_claim(t_claim.elapsed());
+                            confirm_thr_stats::add_lookup_claim(t_claim.elapsed());
                             continue;
                         }
                     }
                 };
-                confirm_thr_stats::add_plan_claim(t_claim.elapsed());
+                confirm_thr_stats::add_lookup_claim(t_claim.elapsed());
 
                 let (batch, batch_inputs) = batch;
                 if batch.is_empty() {
                     let t_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(20));
-                    confirm_thr_stats::add_plan_claim(t_sleep.elapsed());
+                    confirm_thr_stats::add_lookup_claim(t_sleep.elapsed());
                     continue;
                 }
 
@@ -1549,17 +1561,17 @@ pub(crate) fn spawn_confirm_engine(
                         .map(|(h, ha, b)| (*h, *ha, Some(b.clone())))
                         .collect();
                     feed.requeue_wire(&req);
-                    drop(plan_tx);
-                    let _ = prep_join.join();
+                    drop(loadq_tx);
+                    let _ = load_join.join();
                     return;
                 }
 
                 let t_other = Instant::now();
-                if prep_ahead_reset_plan.swap(false, Ordering::AcqRel) {
-                    plan_ahead.clear_all(&hub);
+                if load_ahead_reset_lookup.swap(false, Ordering::AcqRel) {
+                    lookup_ahead.clear_all(&hub);
                 }
-                plan_ahead.prune_committed(&hub);
-                confirm_thr_stats::add_plan_other(t_other.elapsed());
+                lookup_ahead.prune_committed(&hub);
+                confirm_thr_stats::add_lookup_other(t_other.elapsed());
 
                 // Live wall for stall watchdog / perf while plan runs (often multi-s).
                 struct LiveGuard<'a> {
@@ -1588,7 +1600,7 @@ pub(crate) fn spawn_confirm_engine(
                     None => 0u32,
                     Some(t) => t.saturating_add(1),
                 };
-                let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
+                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
                 let use_pipe = pipe.path_lo >= store_path_lo;
                 let mut wire_batch = wire_batch;
                 let t_clone = Instant::now();
@@ -1599,9 +1611,9 @@ pub(crate) fn spawn_confirm_engine(
                     .iter()
                     .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), std::sync::Arc::clone(w)))
                     .collect();
-                confirm_thr_stats::add_plan_clone(t_clone.elapsed());
+                confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
-                let plan_res = hub.confirm_wire_plan_phase(
+                let plan_res = hub.confirm_wire_lookup_phase(
                     &plan_items,
                     if use_pipe { Some(&pipe) } else { None },
                 );
@@ -1622,7 +1634,7 @@ pub(crate) fn spawn_confirm_engine(
                             Err(e)
                         } else {
                             warn!(
-                                "ibd: confirm plan multi-block fail @ {expect_h} n={} — \
+                                "ibd: confirm lookup multi-block fail @ {expect_h} n={} — \
                                  retry first alone, re-queue tail: {msg}",
                                 wire_batch.len()
                             );
@@ -1641,7 +1653,7 @@ pub(crate) fn spawn_confirm_engine(
                                 rbitcoin_primitives::Height(expect_h),
                                 std::sync::Arc::clone(&wire_batch[0].2),
                             )];
-                            hub.confirm_wire_plan_phase(
+                            hub.confirm_wire_lookup_phase(
                                 &one,
                                 if use_pipe { Some(&pipe) } else { None },
                             )
@@ -1649,7 +1661,7 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     other => other,
                 };
-                confirm_thr_stats::add_plan_stamp(t_stamp.elapsed());
+                confirm_thr_stats::add_lookup_stamp(t_stamp.elapsed());
                 drop(_live_guard);
 
                 match plan_res {
@@ -1664,7 +1676,7 @@ pub(crate) fn spawn_confirm_engine(
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 500 == 0 {
                                 debug!(
-                                    "ibd: confirm plan empty outcome first={expect_h} n={} \
+                                    "ibd: confirm lookup empty outcome first={expect_h} n={} \
                                      (path not contiguous / already confirmed; re-queue, count={n})",
                                     retry.len()
                                 );
@@ -1679,7 +1691,7 @@ pub(crate) fn spawn_confirm_engine(
                         let work_ns = stamped.work_ns;
                         let stamp_ms = work_ns / 1_000_000;
                         // Reserve create fks for plan(N+1) while this batch is still
-                        // in prep/scripts/write (prep-ahead in-flight).
+                        // in prep/scripts/write (load-ahead in-flight).
                         let t_note = Instant::now();
                         if let Some(ref p) = stamped.plan {
                             if let Some((lh, raw)) = wire_batch
@@ -1687,88 +1699,88 @@ pub(crate) fn spawn_confirm_engine(
                                 .map(|(h, ha, _)| (*h, ha.to_byte_array()))
                                 .max_by_key(|(h, _)| *h)
                             {
-                                plan_ahead.note_plan_ok(&hub, p, lh, raw);
+                                lookup_ahead.note_lookup_ok(&hub, p, lh, raw);
                             }
                         } else if let Some((lh, ha, _)) = wire_batch.last() {
-                            plan_ahead.last_prepped = Some((*lh, ha.to_byte_array()));
+                            lookup_ahead.last_loaded = Some((*lh, ha.to_byte_array()));
                         }
-                        // Pipeline after note_plan_ok: prep pin sees prior+this offline denserels.
-                        let pipe_for_prep = plan_ahead.pipeline_for(expect_h, store_path_lo);
-                        confirm_thr_stats::add_plan_other(t_note.elapsed());
+                        // Pipeline after note_lookup_ok: prep pin sees prior+this offline denserels.
+                        let pipe_for_prep = lookup_ahead.pipeline_for(expect_h, store_path_lo);
+                        confirm_thr_stats::add_lookup_other(t_note.elapsed());
                         let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
                             .iter()
                             .map(|(h, ha, _)| (*h, *ha))
                             .collect();
                         let n = heights_hashes.len();
                         let t_send = Instant::now();
-                        if plan_tx
-                            .send(PlanDone {
+                        if loadq_tx
+                            .send(LookupDone {
                                 heights_hashes,
                                 stamped,
                                 pipeline: pipe_for_prep,
                             })
                             .is_err()
                         {
-                            info!("ibd: confirm plan→prep channel closed");
-                            let _ = prep_join.join();
+                            info!("ibd: confirm lookup→load channel closed");
+                            let _ = load_join.join();
                             return;
                         }
                         let send_ms = t_send.elapsed().as_millis() as u64;
-                        confirm_thr_stats::add_plan_send_wait(t_send.elapsed());
-                        queues_plan.note_plan_send(n);
+                        confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
+                        queues_lookup.note_lookup_send(n);
                         // Per-batch stamp is often 0.5–1.5s while 5s plan wall is multi-s
                         // (many packs). Use the same 500ms gate as the old one-liner so
-                        // every notable pack gets mega/head_fk breakdown — not only >2s.
+                        // every notable pack gets batch/head_fk breakdown — not only >2s.
                         if stamp_ms > 500 {
                             let st = rbitcoin_consensus::plan_stamp_sub_stats::last_stamp();
-                            let mega = rbitcoin_query::archive_phase_stats::last_plan_mega();
-                            let ms = rbitcoin_query::archive_phase_stats::LastPlanMega::ms;
+                            let planb = rbitcoin_query::archive_phase_stats::last_plan_batch();
+                            let ms = rbitcoin_query::archive_phase_stats::LastPlanBatch::ms;
                             let sms = rbitcoin_consensus::plan_stamp_sub_stats::LastStamp::ms;
-                            let head_hit_pct = if mega.head_need > 0 {
-                                (100 * mega.head_hit) / mega.head_need
+                            let head_hit_pct = if planb.head_need > 0 {
+                                (100 * planb.head_hit) / planb.head_need
                             } else {
                                 0
                             };
                             // "slow" when stamp >2s; otherwise still full detail (was bare one-liner).
                             let tag = if stamp_ms > 2_000 {
-                                "confirm plan slow"
+                                "confirm lookup slow"
                             } else {
-                                "confirm plan"
+                                "confirm lookup"
                             };
                             info!(
                                 "ibd: {tag} batch={n} first={expect_h} stamp_ms={stamp_ms} \
                                  send_w={send_ms}ms \
-                                 stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms) \
-                                 mega(assign={}ms collect={}ms sticky={}ms inflight={}ms \
+                                 stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms) \
+                                 plan_batch(assign={}ms collect={}ms sticky={}ms inflight={}ms \
                                  head_fk={}ms head_dens={}ms stamp={}ms finish={}ms) \
                                  resolve(ext_need={} head_need={} head_hit={} hit%={} \
                                  batch_stamp={} resolved_stamp={})",
                                 sms(st.struct_ns),
                                 sms(st.prepare_ns),
                                 sms(st.filter_ns),
-                                sms(st.mega_ns),
-                                ms(mega.assign_ns),
-                                ms(mega.collect_ns),
-                                ms(mega.sticky_ns),
-                                ms(mega.inflight_ns),
-                                ms(mega.head_fk_ns),
-                                ms(mega.head_dens_ns),
-                                ms(mega.stamp_ns),
-                                ms(mega.finish_ns),
-                                mega.ext_need,
-                                mega.head_need,
-                                mega.head_hit,
+                                sms(st.batch_ns),
+                                ms(planb.assign_ns),
+                                ms(planb.collect_ns),
+                                ms(planb.sticky_ns),
+                                ms(planb.inflight_ns),
+                                ms(planb.head_fk_ns),
+                                ms(planb.head_dens_ns),
+                                ms(planb.stamp_ns),
+                                ms(planb.finish_ns),
+                                planb.ext_need,
+                                planb.head_need,
+                                planb.head_hit,
                                 head_hit_pct,
-                                mega.batch_stamp,
-                                mega.resolved_stamp,
+                                planb.batch_stamp,
+                                planb.resolved_stamp,
                             );
                         }
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed.stopped() {
-                            drop(plan_tx);
-                            let _ = prep_join.join();
+                            drop(loadq_tx);
+                            let _ = load_join.join();
                             return;
                         }
                         if is_confirm_load_retryable(&msg) {
@@ -1782,7 +1794,7 @@ pub(crate) fn spawn_confirm_engine(
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
                                 warn!(
-                                    "ibd: confirm plan incomplete first={expect_h} — re-queue (n={n}): {msg}"
+                                    "ibd: confirm lookup incomplete first={expect_h} — re-queue (n={n}): {msg}"
                                 );
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -1798,12 +1810,12 @@ pub(crate) fn spawn_confirm_engine(
                                 .collect();
                             feed.requeue_wire(&tail);
                         }
-                        plan_ahead.clear_all(&hub);
+                        lookup_ahead.clear_all(&hub);
                         feed.finish(std::iter::once(expect));
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm plan reject {hash} @ {expect}: {e}");
+                        warn!("ibd: confirm lookup reject {hash} @ {expect}: {e}");
                         let _ = event_tx.send(ConfirmEvent::Reject {
                             height: expect,
                             hash,
@@ -1813,12 +1825,12 @@ pub(crate) fn spawn_confirm_engine(
                     }
                 }
             }
-            drop(plan_tx);
-            let _ = prep_join.join();
-            info!("ibd: confirm plan exit");
+            drop(loadq_tx);
+            let _ = load_join.join();
+            info!("ibd: confirm lookup exit");
         })
-        .expect("spawn ibd-confirm-plan");
-    (plan_join, queues)
+        .expect("spawn ibd-confirm-lookup");
+    (lookup_join, queues)
 }
 
 enum PackWireErr {
@@ -2120,13 +2132,13 @@ mod tests {
     #[test]
     fn pipeline_parents_meter_prep_and_write() {
         let q = ConfirmQueueDepths::new();
-        q.note_load_send(2, 1_000, 50);
+        q.note_script_send(2, 1_000, 50);
         q.note_write_send(3, 2_000, 80);
         let c = q.content_snap();
-        assert_eq!(c.load_parents, 50);
+        assert_eq!(c.script_parents, 50);
         assert_eq!(c.write_parents, 80);
         assert_eq!(c.parents_total(), 130);
-        q.note_load_recv(2, 1_000, 50);
+        q.note_script_recv(2, 1_000, 50);
         q.note_write_recv(3, 2_000, 80);
         let c2 = q.content_snap();
         assert_eq!(c2.parents_total(), 0);
@@ -2201,10 +2213,10 @@ mod tests {
     #[test]
     fn queue_hwm_tracks_max_depth() {
         let q = ConfirmQueueDepths::new();
-        q.note_plan_send(32);
-        q.note_plan_send(32);
+        q.note_lookup_send(32);
+        q.note_lookup_send(32);
         assert_eq!(q.snap().0, 2);
-        q.note_plan_recv(32);
+        q.note_lookup_recv(32);
         assert_eq!(q.snap().0, 1);
         let (ph, lh, wh) = q.sample_hwm_and_reset();
         assert_eq!(ph, 2, "hwm keeps max even after recv");
@@ -2214,24 +2226,24 @@ mod tests {
         assert_eq!(ph2, 0, "hwm resets each sample window");
     }
 
-    /// Debug overflow on load_wire_bytes / parents used to abort IBD confirm
+    /// Debug overflow on script_wire_bytes / parents used to abort IBD confirm
     /// threads under parallel prep (seen on two_node IBD). Counters must saturate.
     #[test]
     fn queue_load_send_saturates_wire_and_parents() {
         let q = ConfirmQueueDepths::new();
         // Near-max wire_bytes so a second large add would wrap without saturating.
         let half = usize::MAX / 2 + 1;
-        q.note_load_send(1, half, half);
-        q.note_load_send(1, half, half);
+        q.note_script_send(1, half, half);
+        q.note_script_send(1, half, half);
         let c = q.content_snap();
-        assert_eq!(c.load_wire_bytes, usize::MAX);
-        assert_eq!(c.load_parents, usize::MAX);
-        assert_eq!(c.load_blocks, 2);
+        assert_eq!(c.script_wire_bytes, usize::MAX);
+        assert_eq!(c.script_parents, usize::MAX);
+        assert_eq!(c.script_blocks, 2);
         // recv must not underflow
-        q.note_load_recv(1, half, half);
+        q.note_script_recv(1, half, half);
         let c2 = q.content_snap();
-        assert!(c2.load_wire_bytes <= usize::MAX);
-        assert!(c2.load_parents <= usize::MAX);
+        assert!(c2.script_wire_bytes <= usize::MAX);
+        assert!(c2.script_parents <= usize::MAX);
     }
 
     #[test]
@@ -2239,26 +2251,26 @@ mod tests {
         use super::confirm_thr_stats;
         use std::time::Duration;
         let _ = confirm_thr_stats::sample_and_reset(); // clear
-        confirm_thr_stats::add_plan_resolve(Duration::from_millis(10));
-        confirm_thr_stats::add_plan_clone(Duration::from_millis(5));
-        confirm_thr_stats::add_prep_recv_wait(Duration::from_millis(20));
+        confirm_thr_stats::add_lookup_resolve(Duration::from_millis(10));
+        confirm_thr_stats::add_lookup_clone(Duration::from_millis(5));
+        confirm_thr_stats::add_load_recv_wait(Duration::from_millis(20));
         let s = confirm_thr_stats::sample_and_reset();
-        assert!(s.plan_resolve_ns >= 10_000_000);
-        assert!(s.plan_clone_ns >= 5_000_000);
-        assert!(s.prep_recv_wait_ns >= 20_000_000);
+        assert!(s.lookup_resolve_ns >= 10_000_000);
+        assert!(s.lookup_clone_ns >= 5_000_000);
+        assert!(s.load_recv_wait_ns >= 20_000_000);
         let busy = s
-            .plan_resolve_ns
-            .saturating_add(s.plan_clone_ns)
-            .saturating_add(s.plan_stamp_ns)
-            .saturating_add(s.plan_other_ns);
-        assert_eq!(busy, s.plan_resolve_ns + s.plan_clone_ns);
+            .lookup_resolve_ns
+            .saturating_add(s.lookup_clone_ns)
+            .saturating_add(s.lookup_stamp_ns)
+            .saturating_add(s.lookup_other_ns);
+        assert_eq!(busy, s.lookup_resolve_ns + s.lookup_clone_ns);
         let z = confirm_thr_stats::sample_and_reset();
-        assert_eq!(z.plan_resolve_ns, 0);
+        assert_eq!(z.lookup_resolve_ns, 0);
     }
 
     #[test]
     fn is_confirm_load_retryable_always_false() {
-        // Policy: no plan/prep soft-requeue. Internal errors permanent; wire
+        // Policy: no lookup/load soft-requeue. Internal errors permanent; wire
         // recovery is soft re-getdata / BodyMissing only.
         assert!(!is_confirm_load_retryable(
             "confirm: load incomplete (parent package not ready, timeout)"
@@ -2322,60 +2334,60 @@ mod tests {
         assert!(!g.inflight.contains(&11));
     }
 
-    /// Log tokens + live caps (OPERATOR.md planq/prepq/writeq defaults 1/1/10).
+    /// Log tokens + live caps (OPERATOR.md loadq/scriptq/writeq defaults 1/1/10).
     #[test]
     fn queue_depth_log_and_caps_surface() {
-        assert_eq!(format_queue_depth("prep", 0, 2), "prep<0/2");
+        assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");
         assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
-        assert_eq!(format_queue_depth("prep", 1, 2), "prep=1/2");
+        assert_eq!(format_queue_depth("script", 1, 2), "script=1/2");
         assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
         assert_eq!(
             format_conf_q(0, 0, 1, 2, 2, 2),
-            "planq<0/2 prepq<0/2 writeq=1/2"
+            "loadq<0/2 scriptq<0/2 writeq=1/2"
         );
         assert_eq!(
             format_conf_q(1, 1, 0, 2, 2, 2),
-            "planq=1/2 prepq=1/2 writeq<0/2"
+            "loadq=1/2 scriptq=1/2 writeq<0/2"
         );
         assert_eq!(
             format_conf_q(0, 0, 0, 2, 2, 2),
-            "planq<0/2 prepq<0/2 writeq<0/2"
+            "loadq<0/2 scriptq<0/2 writeq<0/2"
         );
 
         // Defaults when per-stage + legacy env unset (OnceLock — do not set
         // RBITCOIN_CONFIRM_*_QUEUE in this test process).
         let caps = super::confirm_queue_caps();
-        assert_eq!(caps.plan, super::PLAN_QUEUE_CAP_DEFAULT);
         assert_eq!(caps.load, super::LOAD_QUEUE_CAP_DEFAULT);
+        assert_eq!(caps.script, super::SCRIPT_QUEUE_CAP_DEFAULT);
         assert_eq!(caps.write, super::WRITE_QUEUE_CAP_DEFAULT);
-        assert_eq!(super::plan_queue_cap(), caps.plan);
         assert_eq!(super::load_queue_cap(), caps.load);
+        assert_eq!(super::script_queue_cap(), caps.script);
         assert_eq!(super::write_queue_cap(), caps.write);
-        for c in [caps.plan, caps.load, caps.write] {
+        for c in [caps.load, caps.script, caps.write] {
             assert!(
                 (1..=super::CONFIRM_QUEUE_CAP_MAX).contains(&c),
                 "queue cap out of range: {c}"
             );
         }
         assert_eq!(
-            format_conf_q(0, 0, 0, caps.plan, caps.load, caps.write),
+            format_conf_q(0, 0, 0, caps.load, caps.script, caps.write),
             format!(
-                "planq<0/{} prepq<0/{} writeq<0/{}",
-                caps.plan, caps.load, caps.write
+                "loadq<0/{} scriptq<0/{} writeq<0/{}",
+                caps.load, caps.script, caps.write
             )
         );
         assert_eq!(
             format_conf_q(
-                caps.plan,
                 caps.load,
+                caps.script,
                 caps.write,
-                caps.plan,
                 caps.load,
+                caps.script,
                 caps.write
             ),
             format!(
-                "planq={0}/{0} prepq={1}/{1} writeq={2}/{2}",
-                caps.plan, caps.load, caps.write
+                "loadq={0}/{0} scriptq={1}/{1} writeq={2}/{2}",
+                caps.load, caps.script, caps.write
             )
         );
     }
@@ -2413,18 +2425,18 @@ mod tests {
         let q = ConfirmQueueDepths::new();
         assert_eq!(q.snap(), (0, 0, 0));
         let c0 = q.content_snap();
-        assert_eq!(c0.load_batches, 0);
+        assert_eq!(c0.script_batches, 0);
         assert_eq!(c0.write_batches, 0);
         assert_eq!(c0.feed_ready, 0);
         assert_eq!(c0.feed_inflight, 0);
 
-        q.note_load_send(3, 1000, 2);
+        q.note_script_send(3, 1000, 2);
         q.note_write_send(2, 500, 7);
         let c1 = q.content_snap();
-        assert_eq!(c1.load_batches, 1);
-        assert_eq!(c1.load_blocks, 3);
-        assert_eq!(c1.load_wire_bytes, 1000);
-        assert_eq!(c1.load_parents, 2);
+        assert_eq!(c1.script_batches, 1);
+        assert_eq!(c1.script_blocks, 3);
+        assert_eq!(c1.script_wire_bytes, 1000);
+        assert_eq!(c1.script_parents, 2);
         assert_eq!(c1.write_batches, 1);
         assert_eq!(c1.write_blocks, 2);
         assert_eq!(c1.write_wire_bytes, 500);
@@ -2432,16 +2444,16 @@ mod tests {
         assert_eq!(c1.parents_total(), 9);
         assert_eq!(q.snap(), (0, 1, 1));
 
-        q.note_load_recv(3, 1000, 2);
+        q.note_script_recv(3, 1000, 2);
         q.note_write_recv(2, 500, 7);
         let c2 = q.content_snap();
-        assert_eq!(c2.load_batches, 0);
+        assert_eq!(c2.script_batches, 0);
         assert_eq!(c2.write_batches, 0);
-        assert_eq!(c2.load_blocks, 0);
+        assert_eq!(c2.script_blocks, 0);
         assert_eq!(c2.write_blocks, 0);
         // saturating sub: over-recv is safe
-        q.note_load_recv(99, 99, 99);
-        assert_eq!(q.content_snap().load_blocks, 0);
+        q.note_script_recv(99, 99, 99);
+        assert_eq!(q.content_snap().script_blocks, 0);
     }
 
     #[test]

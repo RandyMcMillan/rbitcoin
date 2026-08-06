@@ -470,7 +470,7 @@ pub mod archive_phase_stats {
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
 
     // ── prep walls (ns) ──────────────────────────────────────────────────
-    /// Full prep batch wall (struct → plan → enqueue wait).
+    /// Full load batch wall (struct → lookup → enqueue wait).
     pub static PREP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_FILTER_NS: AtomicU64 = AtomicU64::new(0);
@@ -666,14 +666,14 @@ pub mod archive_phase_stats {
         add(&HEAD_DENS_BYTES, dens_bytes);
     }
 
-    /// Prep sub-phases for one mega-batch plan (`archive_plan_mega_from`).
+    /// Lookup sub-phases for one plan batch (`archive_plan_batch_from`).
     ///
     /// `head_fk_ns`: pure `get_fk_by_txid_batch`.  
     /// `head_dens_ns`: plan-time external-parent denserels load.  
     /// `head` total = head_fk + head_dens (also stored on `PREP_HEAD_NS`).
     ///
-    /// Also overwrites **last-batch** mega snapshot for slow-plan logs (not
-    /// window-summed; see [`last_plan_mega`]).
+    /// Also overwrites **last-batch** plan snapshot for slow-lookup logs (not
+    /// window-summed; see [`last_plan_batch`]).
     #[inline]
     pub fn note_prep_plan(
         assign_ns: u64,
@@ -708,7 +708,7 @@ pub mod archive_phase_stats {
         LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
     }
 
-    // ── Last completed plan_mega (slow-plan logs; not window-summed) ────────
+    // ── Last completed plan_batch (slow-plan logs; not window-summed) ────────
     static LAST_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_STICKY_NS: AtomicU64 = AtomicU64::new(0);
@@ -726,7 +726,7 @@ pub mod archive_phase_stats {
 
     /// Snapshot of the most recent [`note_prep_plan`] + resolve mix (one plan batch).
     #[derive(Debug, Clone, Copy, Default)]
-    pub struct LastPlanMega {
+    pub struct LastPlanBatch {
         pub blocks: u64,
         pub ext_need: u64,
         pub head_need: u64,
@@ -743,15 +743,15 @@ pub mod archive_phase_stats {
         pub finish_ns: u64,
     }
 
-    impl LastPlanMega {
+    impl LastPlanBatch {
         #[inline]
         pub fn ms(ns: u64) -> u64 {
             ns / 1_000_000
         }
     }
 
-    pub fn last_plan_mega() -> LastPlanMega {
-        LastPlanMega {
+    pub fn last_plan_batch() -> LastPlanBatch {
+        LastPlanBatch {
             blocks: LAST_BLOCKS.load(Ordering::Relaxed),
             ext_need: LAST_EXT_NEED.load(Ordering::Relaxed),
             head_need: LAST_HEAD_NEED.load(Ordering::Relaxed),
@@ -1299,7 +1299,7 @@ impl Query {
         Ok(g.load_all()?)
     }
 
-    /// Body-queue intake for confirm prep: payload for `height` without dequeue.
+    /// Body-queue intake for confirm load: payload for `height` without dequeue.
     ///
     /// Peer → RAM body queue is the only source of wire for the unified path;
     /// ConfirmFeed carries readiness (height/hash), not retained `Block`s.
@@ -1874,18 +1874,18 @@ mod tests {
         let _ = archive_phase_stats::sample_and_reset();
         archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
         archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
-        let last = archive_phase_stats::last_plan_mega();
-        // last_plan_mega is last-writer; re-note immediately before read if raced.
+        let last = archive_phase_stats::last_plan_batch();
+        // last_plan_batch is last-writer; re-note immediately before read if raced.
         if last.head_fk_ns != 10 {
             archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7);
         }
-        let last = archive_phase_stats::last_plan_mega();
+        let last = archive_phase_stats::last_plan_batch();
         assert_eq!(last.head_fk_ns, 10);
         assert_eq!(last.head_dens_ns, 20);
         assert_eq!(last.head_need, 4);
         assert_eq!(last.head_hit, 5);
         assert_eq!(last.assign_ns, 1);
-        assert_eq!(archive_phase_stats::LastPlanMega::ms(10_000_000), 10);
+        assert_eq!(archive_phase_stats::LastPlanBatch::ms(10_000_000), 10);
         archive_phase_stats::note_head_dens_wave(9, 1024);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);

@@ -96,16 +96,16 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 
 | Line | Level | Use |
 |------|-------|-----|
-| `ibd: progress` | INFO | Tip rate, `planq`/`prepq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
+| `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
 | `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **load / script / write** walls; live confirm `h= n= in=` (blocks + inputs in current pack); pin/write detail |
 | `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
-| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega head resolve** + **class_a commit**, contig park |
+| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch head resolve** + **class_a commit**, contig park |
 
-At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-mega / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
+At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents` / plan-local external parents). No process pin FIFO. Header plans via ConfirmParentCache.
 
-**Archive `tx.head` split (perf_dbg):** `plan_mega … head_rd=` is parent
+**Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
 `class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 
@@ -155,7 +155,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
-| Confirm stages | **plan · prep · scripts · write** | Pipeline queues default **plan=1 · prep=1 · write=10** (`planq=n/1 prepq=n/1 writeq=n/10`). Env: `RBITCOIN_CONFIRM_PLAN_QUEUE`, `RBITCOIN_CONFIRM_PREP_QUEUE`, `RBITCOIN_CONFIRM_WRITE_QUEUE` (each **1..=64**). Legacy `RBITCOIN_CONFIRM_QUEUE` fills any stage whose specific env is unset. Plan packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks — at dense heights **usually a few blocks per plan** (live `n=`), not large multi-dozen block waves |
+| Confirm stages | **lookup · load · scripts · write** | Pipeline queues default **loadq=1 · scriptq=1 · writeq=10** (`loadq=n/1 scriptq=n/1 writeq=n/10`). Env: `RBITCOIN_CONFIRM_LOAD_QUEUE`, `RBITCOIN_CONFIRM_SCRIPT_QUEUE`, `RBITCOIN_CONFIRM_WRITE_QUEUE` (each **1..=64**). Legacy aliases: `…_PLAN_QUEUE` → loadq, `…_PREP_QUEUE` → scriptq; `RBITCOIN_CONFIRM_QUEUE` fills any stage whose specific env is unset. Lookup packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks — at dense heights **usually a few blocks per batch** (live `n=`), not large multi-dozen block waves |
 | Confirm batch inputs | **8000** soft | `RBITCOIN_CONFIRM_BATCH_INPUTS` (1..=1e6). Live line: `h= n= in=` (**n** = blocks in this pack, **in** = Σ inputs). Dense mainnet: **n** often 1–3 |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

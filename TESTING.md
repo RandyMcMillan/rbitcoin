@@ -50,7 +50,7 @@ cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
 
 Target: default suite wall **well under a few minutes** (stretch &lt;2 min on a warm tree).
 
-**Hang note:** full IBD paths (`P2PNode::sync` → confirm plan claim) can stall for many minutes under parallel `cargo test --workspace` load on this host (planq full, claim ~5 s loops). They stay `#[ignore]` until that is fixed; still covered by `scripts/integration.sh` / `--ignored`.
+**Hang note:** full IBD paths (`P2PNode::sync` → confirm lookup claim) can stall for many minutes under parallel `cargo test --workspace` load on this host (loadq full, claim ~5 s loops). They stay `#[ignore]` until that is fixed; still covered by `scripts/integration.sh` / `--ignored`.
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios).
 

@@ -18,7 +18,7 @@ indexers.
   IBD densify getdata ──► in-RAM body queue (process-local FIFO)
         │                              │
         │                              ▼
-        │                    Confirm prep → scripts → commit
+        │                    Confirm lookup → load → scripts → write
         │                    (sole Class A appender + Class C tip)
         │                              │
         └──── Mempool / tip follow ────┘
@@ -28,8 +28,8 @@ indexers.
 ```
 
 **IBD height-ordered path (current):** peer **offers raw framed wire into the
-body queue** and notes readiness on the confirm feed; confirm **prep** reloads
-wire by height, **scripts** are pure CPU, **commit** is the only Class A
+body queue** and notes readiness on the confirm feed; confirm **lookup** claims and **load** reloads
+wire by height, **scripts** are pure CPU, **write** is the only Class A
 appender and dequeues the body-queue entry after tip advance.
 
 **Invariant — Class A never leads tip:** there is no dual-track “archive Class A
@@ -126,9 +126,9 @@ Roles and locks: [`docs/concurrency.md`](./concurrency.md). IO modality:
    spend annotator per process; **N readers** of published ranges are free.
 2. **Allocate-then-publish.** Write body → idx → count/HWM (Release); readers
    use Acquire. Incomplete records are invisible.
-3. **Confirm pipeline** splits **prep (body-queue wire + plan/pin) → scripts
-   (CPU only) → commit** so disk work, script verify, and Class A/C publish
-   overlap without pausing queries under a map lock. Confirm commit is the
+3. **Confirm pipeline** splits **lookup (stamp) → load (body-queue wire + pin) → scripts
+   (CPU only) → write** so disk work, script verify, and Class A/C publish
+   overlap without pausing queries under a map lock. Confirm write is the
    **sole Class A appender** on the unified IBD path.
 4. **Request-bounded wire memory.** Durable **body-queue soft time-depth**
    (and optional absolute byte ceiling) limit new densify `getdata` — **not**

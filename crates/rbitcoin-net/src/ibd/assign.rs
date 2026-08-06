@@ -1,4 +1,4 @@
-//! Getdata assign for the **unified body-queue → prep → scripts → write** path.
+//! Getdata assign for the **unified body-queue → lookup → load → scripts → write** path.
 //!
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always

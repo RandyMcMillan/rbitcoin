@@ -892,7 +892,7 @@ impl BatchParents {
         e.covers_need(vouts)
     }
 
-    /// Absorb another batch's handles (write megabatch). Same create → keep one Arc
+    /// Absorb another batch's handles (write batch). Same create → keep one Arc
     /// (prefer already-present; merge sparse fields from `other` if needed).
     pub fn extend_from(&mut self, other: Self) {
         if other.pins.is_empty() {

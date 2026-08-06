@@ -51,7 +51,7 @@ async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
 /// Two nodes, seed has 8 blocks, peer syncs tip.
 ///
 /// Default suite keeps only non-IBD multinode (`reorg_to_longer_branch`). Full
-/// IBD can stall on confirm plan claim under parallel workspace load.
+/// IBD can stall on confirm lookup claim under parallel workspace load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "single-hop IBD; run via scripts/integration.sh"]
 async fn two_node_header_and_block_sync() {

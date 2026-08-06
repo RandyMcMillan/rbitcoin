@@ -95,7 +95,7 @@ pub struct WirePrepPipeline {
     pub path_lo: u32,
     /// Parent of `path_lo` when ahead of store tip (last wire hash of prior prepped batch).
     pub parent_hash: Option<[u8; 32]>,
-    /// Inclusive create-fk start for [`Query::archive_plan_mega_from`].
+    /// Inclusive create-fk start for [`Query::archive_plan_batch_from`].
     pub next_tx_start: u64,
     /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
     ///
@@ -115,7 +115,7 @@ pub struct WirePrepPipeline {
 /// structural / annotate (single ordered commit era).
 pub struct LoadedBatch {
     prepared: Vec<Prepared>,
-    /// Shared wire (Arc) so prep→scripts→write does not deep-clone full blocks.
+    /// Shared wire (Arc) so load→scripts→write does not deep-clone full blocks.
     wire_blocks: Vec<Arc<Block>>,
     /// Per-batch pin map: prep → assemble → write structural, then drop.
     batch_parents: rbitcoin_query::BatchParents,
@@ -285,14 +285,14 @@ pub fn confirm_load_phase_preverified(
 ///
 /// `pipeline`: when `Some`, first height may be ahead of store tip (prep(N+1)
 /// while commit(N) in flight). Use reserved create-fk HWM + in-flight creates.
-pub fn confirm_wire_prep_phase(
+pub fn confirm_wire_load_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    confirm_wire_prep_phase_pipelined(
+    confirm_wire_load_phase_pipelined(
         query,
         params,
         milestone,
@@ -303,10 +303,10 @@ pub fn confirm_wire_prep_phase(
     )
 }
 
-/// Like [`confirm_wire_prep_phase`] with optional pipeline caches for prep-ahead.
+/// Like [`confirm_wire_load_phase`] with optional pipeline caches for prep-ahead.
 ///
 /// `cold_mode`: IBD prep after denserels stage uses [`ColdPinMode::Forbid`].
-pub fn confirm_wire_prep_phase_pipelined(
+pub fn confirm_wire_load_phase_pipelined(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -465,14 +465,14 @@ pub fn confirm_wire_prep_phase_pipelined(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_mega_from(
+                .archive_plan_batch_from(
                     &mut need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
                 )
                 .map_err(ConsensusError::Store)?,
             None => query
-                .archive_plan_mega_owned(&mut need)
+                .archive_plan_batch_owned(&mut need)
                 .map_err(ConsensusError::Store)?,
         };
         let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
@@ -595,26 +595,26 @@ pub fn confirm_wire_run_preverified(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let mat = confirm_wire_prep_phase(query, params, milestone, blocks, preverified)?;
+    let mat = confirm_wire_load_phase(query, params, milestone, blocks, preverified)?;
     let ok = confirm_scripts_phase(mat.batch)?;
     confirm_write_phase(query, params, milestone, ok.batch)
 }
 
 /// Whether wire pin may cold-load denserels from Class A body.
 ///
-/// IBD **plan** stage ensures external-parent denserels into **plan-local**
+/// IBD **lookup** stage ensures external-parent denserels into **plan-local**
 /// state. Prep then uses [`ColdPinMode::Forbid`] so cold denserels is never
-/// duplicated on the prep thread. Tests / one-shot [`confirm_wire_prep_phase`]
+/// duplicated on the load thread. Tests / one-shot [`confirm_wire_load_phase`]
 /// use [`ColdPinMode::Allow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdPinMode {
     /// Plan-local miss → `load_creates_once` cold denserels (tests / Allow pin).
     Allow,
-    /// Miss after plan ensure → hard `invariant: denserels stage miss` (prep after plan).
+    /// Miss after plan ensure → hard `invariant: denserels stage miss` (load after lookup).
     Forbid,
 }
 
-/// Stats from plan-stage denserels ensure (external parents → plan-local).
+/// Stats from lookup-stage denserels ensure (external parents → plan-local).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
@@ -846,7 +846,7 @@ pub fn ensure_external_parent_denserels_from_plan(
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
     // Parent mix + subtimers; wall TOTAL_NS is owned by plan stage caller.
-    plan_stage_stats::note(
+    lookup_stage_stats::note(
         0, // blocks counted by caller
         st.parents as u64,
         st.already as u64,
@@ -870,24 +870,24 @@ pub fn ensure_external_parent_denserels_from_plan(
     Ok(st)
 }
 
-/// Plan-stage output: structure + plan mega only (create_fk stamped).
+/// Lookup-stage output: structure + plan batch only (create_fk stamped).
 ///
 /// Denserels pin + assemble stay on **prep** so the pipeline stays balanced:
 /// plan(N+1) head-stamp overlaps prep(N) denserels IO. Handoff is the owned
 /// [`ArchiveWritePlan`] + wire/metas (pipeline pins only).
 pub struct PlanStampOutcome {
     pub plan: Option<rbitcoin_query::ArchiveWritePlan>,
-    /// Wall ns for structure + plan_mega (head stamp).
+    /// Wall ns for structure + plan_batch (head stamp).
     pub work_ns: u64,
     metas: Vec<BodyMeta>,
     wire_blocks: Vec<Arc<Block>>,
 }
 
-/// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
+/// IBD **lookup** stage: structure + stamp create_fk only (no denserels pin).
 ///
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
 /// cloning full `Block` payloads into stamp.
-pub fn confirm_wire_plan_stamp(
+pub fn confirm_wire_lookup_stamp(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -896,11 +896,11 @@ pub fn confirm_wire_plan_stamp(
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
     let (plan, metas, wire_blocks, plan_ns) =
-        wire_plan_phase(query, params, milestone, blocks, pipeline)?;
-    plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-    plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
+        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+    lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+    lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
     let work_ns = t0.elapsed().as_nanos() as u64;
-    plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
+    lookup_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
     Ok(PlanStampOutcome {
         plan,
         work_ns,
@@ -911,8 +911,8 @@ pub fn confirm_wire_plan_stamp(
 
 /// IBD **prep** after plan: pin denserels once (Allow) + assemble.
 ///
-/// Uses the owned stamped plan — does **not** re-run plan_mega / head resolve.
-pub fn confirm_wire_prep_from_plan(
+/// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.
+pub fn confirm_wire_load_from_plan(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -975,7 +975,7 @@ pub fn confirm_wire_prep_from_plan(
 }
 
 /// Plan + ensure denserels into plan-local external_parent_outs (no pin). Unit tests.
-pub fn confirm_wire_plan_and_ensure_denserels(
+pub fn confirm_wire_lookup_and_ensure_denserels(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -985,19 +985,19 @@ pub fn confirm_wire_plan_and_ensure_denserels(
 {
     let t0 = Instant::now();
     let (mut plan, _metas, _wire, plan_ns) =
-        wire_plan_phase(query, params, milestone, blocks, pipeline)?;
-    plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-    plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
+        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+    lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+    lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
 
     let ifo = pipeline.map(|p| &p.in_flight);
     let warm = ensure_external_parent_denserels_from_plan(query, plan.as_mut(), ifo)?;
     let work_ns = t0.elapsed().as_nanos() as u64;
-    plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
+    lookup_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
     Ok((plan, warm, work_ns))
 }
 
-/// Structure + prepare + plan_mega only (stamp create_fk). Shared by plan stage.
-fn wire_plan_phase(
+/// Structure + prepare + plan_batch only (stamp create_fk). Shared by plan stage.
+fn wire_lookup_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -1008,7 +1008,7 @@ fn wire_plan_phase(
         Option<rbitcoin_query::ArchiveWritePlan>,
         Vec<BodyMeta>,
         Vec<Arc<Block>>,
-        u64, // plan wall ns (filter+plan_mega dominate)
+        u64, // plan wall ns (filter+plan_batch dominate)
     ),
     ConsensusError,
 > {
@@ -1036,7 +1036,7 @@ fn wire_plan_phase(
     };
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
 
-    // Stamp sub-walls (structure + prepare summed over batch; mega below).
+    // Stamp sub-walls (structure + prepare summed over batch; plan batch below).
     let mut struct_ns = 0u64;
     let mut prepare_ns = 0u64;
 
@@ -1125,7 +1125,7 @@ fn wire_plan_phase(
         .archive_filter_need_bodies(&mut with_fk)
         .map_err(ConsensusError::Store)?;
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
-    let t_mega = Instant::now();
+    let t_batch = Instant::now();
     let plan = if need.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
@@ -1150,14 +1150,14 @@ fn wire_plan_phase(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_mega_from(
+                .archive_plan_batch_from(
                     &mut need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
                 )
                 .map_err(ConsensusError::Store)?,
             None => query
-                .archive_plan_mega_owned(&mut need)
+                .archive_plan_batch_owned(&mut need)
                 .map_err(ConsensusError::Store)?,
         };
         let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
@@ -1200,22 +1200,22 @@ fn wire_plan_phase(
         }
         Some(plan)
     };
-    let mega_ns = t_mega.elapsed().as_nanos() as u64;
-    // plan_ns for HEAD_NS: filter + mega (legacy “plan wall” without struct/prepare).
-    let plan_ns = filter_ns.saturating_add(mega_ns);
+    let batch_ns = t_batch.elapsed().as_nanos() as u64;
+    // plan_ns for HEAD_NS: filter + batch (legacy “lookup wall” without struct/prepare).
+    let plan_ns = filter_ns.saturating_add(batch_ns);
     plan_stamp_sub_stats::note_last(
         blocks.len() as u64,
         struct_ns,
         prepare_ns,
         filter_ns,
-        mega_ns,
+        batch_ns,
     );
     Ok((plan, metas, wire_blocks, plan_ns))
 }
 
-/// Stamp-phase sub-walls for plan_thr diagnosis (structure / prepare / filter / mega).
+/// Stamp-phase sub-walls for lookup_thr diagnosis (structure / prepare / filter / batch).
 ///
-/// Mega is the archive plan_mega wall (assign+collect+res+head_fk+head_dens+stamp+finish
+/// Batch is the archive plan_batch wall (assign+collect+res+head_fk+head_dens+stamp+finish
 /// already timed in `archive_phase_stats`). `head_fk` = get_fk_by_txid_batch;
 /// `head_dens` = plan-time external-parent denserels load; `head` = sum.
 ///
@@ -1227,14 +1227,14 @@ pub mod plan_stamp_sub_stats {
     static STRUCT_NS: AtomicU64 = AtomicU64::new(0);
     static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
     static FILTER_NS: AtomicU64 = AtomicU64::new(0);
-    static MEGA_NS: AtomicU64 = AtomicU64::new(0);
+    static BATCH_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_FILTER_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_MEGA_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_BATCH_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_N_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
-    pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, mega_ns: u64) {
+    pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
         if struct_ns > 0 {
             STRUCT_NS.fetch_add(struct_ns, Ordering::Relaxed);
         }
@@ -1244,19 +1244,19 @@ pub mod plan_stamp_sub_stats {
         if filter_ns > 0 {
             FILTER_NS.fetch_add(filter_ns, Ordering::Relaxed);
         }
-        if mega_ns > 0 {
-            MEGA_NS.fetch_add(mega_ns, Ordering::Relaxed);
+        if batch_ns > 0 {
+            BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
         }
     }
 
     /// Record last stamp sub-walls for one plan batch (slow-plan logs).
-    pub fn note_last(n_blocks: u64, struct_ns: u64, prepare_ns: u64, filter_ns: u64, mega_ns: u64) {
-        note(struct_ns, prepare_ns, filter_ns, mega_ns);
+    pub fn note_last(n_blocks: u64, struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
+        note(struct_ns, prepare_ns, filter_ns, batch_ns);
         LAST_N_BLOCKS.store(n_blocks, Ordering::Relaxed);
         LAST_STRUCT_NS.store(struct_ns, Ordering::Relaxed);
         LAST_PREPARE_NS.store(prepare_ns, Ordering::Relaxed);
         LAST_FILTER_NS.store(filter_ns, Ordering::Relaxed);
-        LAST_MEGA_NS.store(mega_ns, Ordering::Relaxed);
+        LAST_BATCH_NS.store(batch_ns, Ordering::Relaxed);
     }
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -1264,7 +1264,7 @@ pub mod plan_stamp_sub_stats {
         pub struct_ns: u64,
         pub prepare_ns: u64,
         pub filter_ns: u64,
-        pub mega_ns: u64,
+        pub batch_ns: u64,
     }
 
     pub fn sample_and_reset() -> Sample {
@@ -1272,7 +1272,7 @@ pub mod plan_stamp_sub_stats {
             struct_ns: STRUCT_NS.swap(0, Ordering::Relaxed),
             prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
             filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
-            mega_ns: MEGA_NS.swap(0, Ordering::Relaxed),
+            batch_ns: BATCH_NS.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -1283,7 +1283,7 @@ pub mod plan_stamp_sub_stats {
         pub struct_ns: u64,
         pub prepare_ns: u64,
         pub filter_ns: u64,
-        pub mega_ns: u64,
+        pub batch_ns: u64,
     }
 
     impl LastStamp {
@@ -1299,13 +1299,13 @@ pub mod plan_stamp_sub_stats {
             struct_ns: LAST_STRUCT_NS.load(Ordering::Relaxed),
             prepare_ns: LAST_PREPARE_NS.load(Ordering::Relaxed),
             filter_ns: LAST_FILTER_NS.load(Ordering::Relaxed),
-            mega_ns: LAST_MEGA_NS.load(Ordering::Relaxed),
+            batch_ns: LAST_BATCH_NS.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Accumulators for the **plan** pipeline stage (plan+stamp + denserels ensure).
-pub mod plan_stage_stats {
+/// Accumulators for the **lookup** pipeline stage (plan+stamp + denserels ensure).
+pub mod lookup_stage_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -1822,7 +1822,7 @@ fn pin_for_wire_batch(
         if !cold.is_empty() {
             if cold_mode == ColdPinMode::Forbid {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: plan stage miss (prep cold denserels forbidden)",
+                    "invariant: lookup stage miss (load cold denserels forbidden)",
                 )));
             }
             let t_io = Instant::now();
@@ -2048,7 +2048,7 @@ pub fn confirm_scripts_phase(
 ///
 /// IBD scripts OS thread starts the next batch with [`confirm_scripts_phase_async`]
 /// **while** joining the prior (poll claim + short timeouts), so rayon stays fed
-/// even when prep→scripts depth is 1.
+/// even when load→scripts depth is 1.
 pub struct ScriptsPhaseHandle {
     rx: std::sync::mpsc::Receiver<Result<ConfirmScriptOutcome, ConsensusError>>,
 }
@@ -2064,7 +2064,7 @@ impl ScriptsPhaseHandle {
     }
 
     /// Wait up to `timeout` for the wave result (production feed-ahead polls
-    /// prep→scripts `try_recv` between timeouts so N+1 can start mid-join).
+    /// load→scripts `try_recv` between timeouts so N+1 can start mid-join).
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
@@ -2152,13 +2152,13 @@ pub fn confirm_scripts_feed_ahead(
     Ok(out)
 }
 
-/// Drive the **production** scripts claim/feed-ahead pattern from a prep→scripts
+/// Drive the **production** scripts claim/feed-ahead pattern from a load→scripts
 /// channel (including depth 1): blocking claim for current, then
 /// [`join_scripts_polling`] with `try_recv` to start N+1 mid-join.
 ///
 /// Used by the IBD scripts OS thread and unit tests that exercise real
 /// `sync_channel(1)` timing.
-pub fn scripts_stage_from_prep_channel(
+pub fn scripts_stage_from_load_channel(
     mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
     mut on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
     mut on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
@@ -2803,12 +2803,12 @@ impl ScriptOkBatch {
         self.batch_parents.len()
     }
 
-    /// Absorb another script-ok batch for write megabatch (FIFO drain).
+    /// Absorb another script-ok batch for write batch (FIFO drain).
     ///
     /// Scripts enqueue height-ordered tip extensions; write drains the channel
     /// and merges so Class A + Class C + annotate run once (fewer tip fsyncs).
     /// Returns `Err(other)` if not a contiguous height extension (caller keeps
-    /// `other` for the next megabatch).
+    /// `other` for the next batch).
     pub fn append_contiguous(&mut self, mut other: Self) -> Result<(), Self> {
         if other.is_empty() {
             return Ok(());
@@ -2848,7 +2848,7 @@ impl ScriptOkBatch {
 mod write_idempotent_tests {
     use super::write_height_needed;
 
-    /// Megabatch append: contiguous heights merge; gap returns Err(other).
+    /// Batch append: contiguous heights merge; gap returns Err(other).
     #[test]
     fn script_ok_append_contiguous_and_gap() {
         use super::{Prepared, ScriptOkBatch};
@@ -2993,7 +2993,7 @@ mod write_idempotent_tests {
     /// **Production claim timing under depth-1:** batch B is submitted to rayon
     /// while A’s wave is still open (not only after A’s join returns).
     ///
-    /// Drives [`scripts_stage_from_prep_channel`] (same `try_recv` +
+    /// Drives [`scripts_stage_from_load_channel`] (same `try_recv` +
     /// [`join_scripts_polling`] pattern as the IBD scripts OS thread) on a
     /// `sync_channel(1)`. First wave holds in [`confirm_scripts_phase`] until
     /// a second async submit is observed — deadlocks if feed-ahead only
@@ -3001,7 +3001,7 @@ mod write_idempotent_tests {
     #[test]
     fn scripts_stage_depth1_submits_second_before_first_finishes() {
         use super::{
-            scripts_feed_test_sync, scripts_stage_from_prep_channel, ConfirmScriptOutcome,
+            scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
             ScriptsBatchMeta,
         };
         use std::sync::mpsc;
@@ -3012,13 +3012,13 @@ mod write_idempotent_tests {
         scripts_feed_test_sync::reset();
         scripts_feed_test_sync::set_hold_first_until_second_submit(true);
 
-        // Depth 1 — same default prep→scripts capacity class.
+        // Depth 1 — same default load→scripts capacity class.
         let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
         let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let outcomes_w = Arc::clone(&outcomes);
 
         let stage = thread::spawn(move || {
-            scripts_stage_from_prep_channel(
+            scripts_stage_from_load_channel(
                 &mat_rx,
                 |ok, _meta: ScriptsBatchMeta| {
                     outcomes_w.lock().unwrap().push(ok);

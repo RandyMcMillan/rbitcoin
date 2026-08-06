@@ -395,7 +395,7 @@ pub async fn ibd_cancellable(
     hub.query.clear_confirm_cancel();
 
     info!(
-        "ibd: confirm pipeline prep+scripts+commit (raw BQ wire; single Class A commit)"
+        "ibd: confirm pipeline lookup+load+scripts+write (raw BQ wire; single Class A commit)"
     );
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
     // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
@@ -878,13 +878,13 @@ pub async fn ibd_cancellable(
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // plan_q/prepq/writeq; `name<0/cap` = empty.
+            // plan_q/scriptq/writeq; `name<0/cap` = empty.
             // bq soft=n/win RAM=: in-RAM body queue; win = 1-min confirm window at rate.
             let conf_q = confirm::format_conf_q(
                 plan_q,
                 load_q,
                 write_q,
-                confirm::plan_queue_cap(),
+                confirm::load_queue_cap(),
                 confirm::load_queue_cap(),
                 confirm::write_queue_cap(),
             );
@@ -950,7 +950,7 @@ pub async fn ibd_cancellable(
             // bug only when the **confirm pipeline is idle**. Mid-mainnet 32-block
             // prep+scripts+write often takes 8–15s (and cold restart first batch
             // longer); peer `inflight` empty is normal with a full body queue.
-            // Do **not** WARN while feed has claims or plan/prep/scripts/write
+            // Do **not** WARN while feed has claims or lookup/load/scripts/write
             // queues hold work (post-rehydrate cold start used to spam tip stall with
             // ready=false even though prep was live on tip+1).
             let conf_busy = feed_inflight > 0

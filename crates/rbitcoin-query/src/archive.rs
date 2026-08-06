@@ -1,7 +1,7 @@
 //! Class A archive write path.
 //!
 //! Split for IBD dual-thread (prep/write may overlap with a small plan queue):
-//! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
+//! - **Plan** ([`Query::archive_plan_batch_owned`] / [`Query::archive_plan_batch_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   in-flight planned creates + `tx.head` resolve, stamp inputs.
 //!   Head-miss parents use **fk-only** head resolve (no denserels on plan stamp);
@@ -10,7 +10,7 @@
 //!   head index, header_txs. Pipeline pins stay on the plan (`batch_pin`); no
 //!   process create FIFO seed.
 //!
-//! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
+//! Overlap requires the in-flight map: a later plan batch may spend outputs from a
 //! prior plan that is still queued/committing (not yet in head).
 
 use super::*;
@@ -45,7 +45,7 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 pub type SparseExternalPin =
     std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>;
 
-/// Write-ready mega-batch from plan (prep) to commit (writer).
+/// Write-ready plan batch from lookup/load to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
 /// appender returns different fks (another writer interleave — must not happen).
@@ -79,7 +79,7 @@ pub struct ArchiveWritePlan {
     pub external_parent_txids: std::collections::HashMap<u64, [u8; 32]>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
-    /// only). Confirm `note_plan_ok` only `Arc::clone`s into in-flight outs.
+    /// only). Confirm `note_lookup_ok` only `Arc::clone`s into in-flight outs.
     pub batch_pin: Vec<CreatePin>,
     pub index_tx: bool,
     pub body_est: u64,
@@ -125,17 +125,17 @@ impl ArchiveWritePlan {
         self.external_parent_txids.shrink_to_fit();
     }
 
-    /// Freeze plan for write megabatch: drop all pin-staging maps.
+    /// Freeze plan for write batch: drop all pin-staging maps.
     ///
     /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
     /// / headers / spends / `batch_pin`). Prep must call this (or
     /// [`Self::clear_external_parent_outs`]) before enqueue to scripts/write so
-    /// mega-merge never mutates growing external HashMaps.
+    /// batch-merge never mutates growing external HashMaps.
     pub fn freeze_after_pin(&mut self) {
         self.clear_external_parent_outs();
     }
 
-    /// Append another **frozen** plan for write megabatch (height-ordered Class A).
+    /// Append another **frozen** plan for write batch (height-ordered Class A).
     ///
     /// Callers must drain scripts→write in height order so `planned_fks` stay
     /// contiguous and match the sole Class A appender sequence.
@@ -172,7 +172,7 @@ impl Query {
         header: &HeaderRecord,
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
-        // Single-block path: one clone into owned mega-batch.
+        // Single-block path: one clone into owned plan batch.
         let mut items = vec![(header.clone(), txs.to_vec())];
         let mut out = self.archive_prepared_owned(&mut items)?;
         Ok(out.pop().expect("one archive result"))
@@ -221,7 +221,7 @@ impl Query {
         }
         let mut header_fks = Vec::with_capacity(items.len());
         let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
-        // First occurrence wins inside one mega-batch (duplicate peer deliveries).
+        // First occurrence wins inside one plan batch (duplicate peer deliveries).
         let mut seen_headers = std::collections::HashSet::new();
         for (fk, _header, txs) in items.iter_mut() {
             header_fks.push(*fk);
@@ -239,7 +239,7 @@ impl Query {
             }
         }
         if !need.is_empty() {
-            let plan = self.archive_plan_mega_owned(&mut need)?;
+            let plan = self.archive_plan_batch_owned(&mut need)?;
             self.archive_commit_plan(plan)?;
         }
         Ok(header_fks)
@@ -277,27 +277,27 @@ impl Query {
     /// inputs. No Class A body/head writes (those are [`Self::archive_commit_plan`]).
     ///
     /// Planned create fks start at `txs.count()+1`. For overlapping plan/write
-    /// (prep queue depth &gt; 1), use [`Self::archive_plan_mega_from`] with a
+    /// (prep queue depth &gt; 1), use [`Self::archive_plan_batch_from`] with a
     /// reserved FK HWM so in-flight plans do not collide.
-    pub fn archive_plan_mega_owned(
+    pub fn archive_plan_batch_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_mega_from(need, start, &crate::InFlightView::empty())
+        self.archive_plan_batch_from(need, start, &crate::InFlightView::empty())
     }
 
-    /// Like [`Self::archive_plan_mega_owned`], but assign create fks from
+    /// Like [`Self::archive_plan_batch_owned`], but assign create fks from
     /// `next_tx_start` (inclusive) instead of live `txs.count()+1`.
     ///
     /// IBD prep keeps a local reserved HWM: after each successful non-empty plan,
-    /// advance to `planned_fks.last()+1` so the next mega-batch can be planned
+    /// advance to `planned_fks.last()+1` so the next plan batch can be planned
     /// while a prior batch is still committing (ordered writer preserves match).
     ///
     /// `in_flight`: create txid→fk from prior plans that are queued/committing
     /// but not yet in sticky/head. Required for queue depth &gt; 1 when a later
     /// batch spends a prior batch's creates.
-    pub fn archive_plan_mega_from(
+    pub fn archive_plan_batch_from(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
@@ -375,7 +375,7 @@ impl Query {
         let mut resolved: HashMap<[u8; 32], Fk> =
             HashMap::with_capacity(need_vec.len() / 2);
 
-        // Prior mega-batch(es) still in the write queue: not head yet.
+        // Prior plan batch(es) still in the write queue: not head yet.
         let t_inflight = Instant::now();
         if !in_flight.is_empty() {
             for t in &need_vec {
@@ -698,7 +698,7 @@ mod tests {
         let (dir, q) = temp_query("batch-pin-arc");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.batch_pin.len(), plan.planned_fks.len());
         assert_eq!(plan.batch_pin.len(), plan.packed.len());
@@ -711,7 +711,7 @@ mod tests {
             // plan construction: one Arc for packed + one for batch_pin.
             assert_eq!(Arc::strong_count(pin), 2);
         }
-        // Simulated note_plan_ok: Arc::clone only (strong_count rises, no deep clone).
+        // Simulated note_lookup_ok: Arc::clone only (strong_count rises, no deep clone).
         let mut ifo: HashMap<u64, super::CreatePin> = HashMap::new();
         for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
             if let Some(id) = fk.get() {
@@ -740,7 +740,7 @@ mod tests {
         let (dir, q) = temp_query("arch-phases");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.planned_fks.len(), 2);
         q.archive_commit_plan(plan).unwrap();
@@ -772,7 +772,7 @@ mod tests {
         let seed = vec![(Fk(1), vec![coinbase_apply(1)])];
         // Need a real header_fk path: plan only needs Vec<(Fk, Vec<TxApply>)>.
         let mut need0 = seed;
-        let p0 = q.archive_plan_mega_owned(&mut need0).unwrap();
+        let p0 = q.archive_plan_batch_owned(&mut need0).unwrap();
         q.archive_commit_plan(p0).unwrap();
         assert_eq!(q.tx_body_count(), 1);
 
@@ -780,13 +780,13 @@ mod tests {
         let empty = crate::InFlightView::empty();
         let mut next = q.tx_body_count() + 1;
         let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
-        let plan_a = q.archive_plan_mega_from(&mut need_a, next, &empty).unwrap();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, next, &empty).unwrap();
         assert_eq!(plan_a.planned_fks, vec![Fk(2), Fk(3)]);
         next = plan_a.planned_fks.last().unwrap().0 + 1;
         assert_eq!(next, 4);
 
         let mut need_b = vec![(Fk(20), vec![coinbase_apply(20)])];
-        let plan_b = q.archive_plan_mega_from(&mut need_b, next, &empty).unwrap();
+        let plan_b = q.archive_plan_batch_from(&mut need_b, next, &empty).unwrap();
         assert_eq!(plan_b.planned_fks, vec![Fk(4)]);
         // Durable count still 1 until commit.
         assert_eq!(q.tx_body_count(), 1);
@@ -799,14 +799,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Overlapping plan must resolve parents from a prior uncommitted mega-batch.
+    /// Overlapping plan must resolve parents from a prior uncommitted plan batch.
     /// Without `in_flight`, this is the "parent create_fk unresolved" corruption.
     #[test]
     fn overlap_plan_resolves_parent_via_inflight_creates() {
         let (dir, q) = temp_query("inflight-parent");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let empty = crate::InFlightView::empty();
-        let plan_a = q.archive_plan_mega_from(&mut need_a, 1, &empty).unwrap();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
         assert_eq!(plan_a.planned_fks, vec![Fk(1)]);
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
@@ -838,7 +838,7 @@ mod tests {
 
         // Without in_flight → unresolved.
         let err = q
-            .archive_plan_mega_from(&mut need_b, 2, &empty)
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
             .unwrap_err();
         assert!(
             err.to_string().contains("create_fk unresolved"),
@@ -877,7 +877,7 @@ mod tests {
         ));
         let inflight = inflight_log.snapshot();
         let plan_b = q
-            .archive_plan_mega_from(&mut need_b, 2, &inflight)
+            .archive_plan_batch_from(&mut need_b, 2, &inflight)
             .expect("inflight parent resolve");
         assert_eq!(plan_b.planned_fks, vec![Fk(2)]);
         assert_eq!(
@@ -967,7 +967,7 @@ mod tests {
         };
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 2, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need, 2, &crate::InFlightView::empty())
             .expect("parent via head");
         assert_eq!(plan.planned_fks, vec![Fk(2)]);
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
@@ -1004,7 +1004,7 @@ mod tests {
         let (dir, q) = temp_query("shared-create-pin");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1)])];
         let plan = q
-            .archive_plan_mega_from(&mut need, 1, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need, 1, &crate::InFlightView::empty())
             .unwrap();
         assert_eq!(plan.packed.len(), 1);
         assert_eq!(plan.batch_pin.len(), 1);
@@ -1012,7 +1012,7 @@ mod tests {
             Arc::ptr_eq(&plan.packed[0].0, &plan.batch_pin[0]),
             "outs must live in one Arc shared by packed and batch_pin"
         );
-        // note_plan_ok only Arc-clones into in-flight.
+        // note_lookup_ok only Arc-clones into in-flight.
         let ifo_pin = Arc::clone(&plan.batch_pin[0]);
         assert!(Arc::ptr_eq(&ifo_pin, &plan.batch_pin[0]));
         assert_eq!(Arc::strong_count(&plan.batch_pin[0]), 3);
@@ -1020,7 +1020,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Freeze + append: mega-merge is vector concat of frozen commit halves;
+    /// Freeze + append: batch-merge is vector concat of frozen commit halves;
     /// external staging maps are dropped (not union-mutated).
     #[test]
     fn freeze_after_pin_then_append_preserves_fk_order() {
@@ -1028,7 +1028,7 @@ mod tests {
         let (dir, q) = temp_query("freeze-append");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let mut plan_a = q
-            .archive_plan_mega_from(&mut need_a, 1, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need_a, 1, &crate::InFlightView::empty())
             .unwrap();
         // Simulate residual staging (must not survive freeze/append).
         plan_a.external_parent_outs.insert(
@@ -1048,7 +1048,7 @@ mod tests {
 
         let mut need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
         let mut plan_b = q
-            .archive_plan_mega_from(&mut need_b, 2, &crate::InFlightView::empty())
+            .archive_plan_batch_from(&mut need_b, 2, &crate::InFlightView::empty())
             .unwrap();
         plan_b.external_parent_outs.insert(
             88,

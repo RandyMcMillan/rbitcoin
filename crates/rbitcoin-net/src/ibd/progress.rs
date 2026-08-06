@@ -38,7 +38,7 @@ pub(crate) struct ProgressLineInput {
     pub tip_rate: f64,
     pub tip_hole: usize,
     pub peers: usize,
-    /// Confirm pipeline depths already formatted (`planq… prepq… writeq…`).
+    /// Confirm pipeline depths already formatted (`loadq… scriptq… writeq…`).
     pub conf_q: String,
     pub txs: u64,
     pub horizon: u32,
@@ -76,10 +76,10 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     )
 }
 
-/// True if confirm plan/prep can claim this height without another getdata.
+/// True if confirm lookup/load can claim this height without another getdata.
 ///
 /// **Only** body-queue / pending wire. Class A alone is not claim-ready — the
-/// sole confirm intake is bq → plan → prep (wire). Tip-follow reorgs use
+/// sole confirm intake is bq → lookup → load (wire). Tip-follow reorgs use
 /// peer wire via [`crate::chain::ChainHub::accept_block`], not this feed.
 pub(crate) fn claim_ready(
     hub: &ChainHub,
@@ -313,7 +313,7 @@ mod tests {
             tip_rate: 12.5,
             tip_hole: 3,
             peers: 8,
-            conf_q: "planq=1/2 prepq=1/2 writeq=0/2".into(),
+            conf_q: "loadq=1/2 scriptq=1/2 writeq=0/2".into(),
             txs: 50_000_000,
             horizon: 900_000,
             eta: "eta=18h".into(),
@@ -323,7 +323,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 loadq=1/2 scriptq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
         );
         // Current schema tokens present.
         assert!(line.contains(" hole="), "{line}");
@@ -332,8 +332,8 @@ mod tests {
         assert!(!line.contains(" bq n="), "count lives in soft= only: {line}");
         assert!(!line.contains(" disk="), "queue is RAM not disk: {line}");
         assert!(!line.contains("pending_ram="), "no RAM overflow meter: {line}");
-        assert!(line.contains("planq"), "{line}");
-        assert!(line.contains("prepq"), "{line}");
+        assert!(line.contains("loadq"), "{line}");
+        assert!(line.contains("scriptq"), "{line}");
         // Retired dual-track progress tokens forbidden.
         assert!(
             !line.contains("arch_hwm"),
@@ -355,7 +355,7 @@ mod tests {
             tip_rate: 2.4,
             tip_hole: 0,
             peers: 1,
-            conf_q: "planq<0/2 prepq<0/2 writeq<0/2".into(),
+            conf_q: "loadq<0/2 scriptq<0/2 writeq<0/2".into(),
             txs: 1,
             horizon: 1000,
             eta: "eta=?".into(),

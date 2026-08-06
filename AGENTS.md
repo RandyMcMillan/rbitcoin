@@ -62,7 +62,7 @@ land the simplification as a drive-by cleanup.
 | Rule | Detail |
 |------|--------|
 | Pin material | **Plan / batch only** — `batch_pin`, `BatchParents`, plan-local **sparse** `external_parent_outs` (`SparseExternalPin`). SharedParentPin = immutable body compose. No process create pin FIFO |
-| IBD confirm intake | **body queue wire only** → plan → prep (no hash-only / Class-A-only confirm) |
+| IBD confirm intake | **body queue wire only** → lookup → load (no hash-only / Class-A-only confirm) |
 | Ancient parents | Cold Class A denserels into plan-local / BatchParents only |
 | Header plans | **ConfirmParentCache** always on (MTP / tip-ahead headers) |
 | Removed | **CreateResidency**, **OutFifo**, **archive sticky**, half-row / out-slim, **`RBITCOIN_CONFIRM_CACHE`**, **`RBITCOIN_RESIDENCY_BYTES`** |
@@ -128,7 +128,7 @@ to), still do the static musl install and say the tree was **not** committed.
 | Rule | Detail |
 |------|--------|
 | **Shared helpers** | Prefer one production implementation (composition or shared fn) over copy-paste probe/hash/layout math across modules. Put the helper in the **lowest crate that owns the concept** (`open_address` for FNV/open-hash, etc.). |
-| **Invariants > silent fallbacks** | On confirm/store hot path, if prep or body load promised a fact (range present, packed decode, denserels for need_vouts), missing fact → `StoreError::Corrupt("invariant: …")` (or consensus wrap). Do **not** soft-continue to a colder path that hides bugs. Env/protocol multi-path (io_uring off, multi-spender list, RPC reconstruct) stays non-invariant. |
+| **Invariants > silent fallbacks** | On confirm/store hot path, if load or body load promised a fact (range present, packed decode, denserels for need_vouts), missing fact → `StoreError::Corrupt("invariant: …")` (or consensus wrap). Do **not** soft-continue to a colder path that hides bugs. Env/protocol multi-path (io_uring off, multi-spender list, RPC reconstruct) stays non-invariant. |
 | **No test-only production APIs** | Do not add `*_for_test` / budget overrides / backdoors on production types when tests can use real clamps (large payloads, env, or public constructors). Prefer demoting or deleting over growing `cfg(test)` surface that does not exist for dependent crates. |
 | **No re-implemented oracles in tests** | A test must drive the **shipped** function. Local helpers that re-code the unit under test and then “assert” that helper are test theater — delete them. |
 | **Collapse same-entry duplicates** | Prefer one unit test next to the shipped path over twin unit+integration suites covering the same lines. Keep the closer entry-point test; drop the other only when coverage remains. |
@@ -176,7 +176,7 @@ that shows a clear change after.
 1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire,
    in-RAM body queue) from **kernel page cache** under store mmaps (`RssFile`).
    Do not “fix” RSS by gutting intentional caches (body queue, ConfirmParentCache header plans).
-2. **Unified path only:** peer → in-RAM **body queue** → confirm plan/prep/
+2. **Unified path only:** peer → in-RAM **body queue** → confirm lookup/load/
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
    Body queue is **RAM-only** (redownload on restart) to avoid double disk write

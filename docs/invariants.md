@@ -33,10 +33,10 @@ header plan after load planned it, stamped `create_fk`, etc.).
 
 ```
 wire / body-queue
-  → plan (stamp create_fk, offline denserels when packed)
-  → pin (BatchParents: outs for need_vouts; denserels when available)
+  → lookup (stamp create_fk, offline denserels when packed)
+  → load / pin (BatchParents: outs for need_vouts; denserels when available)
   → scripts (pure CPU)
-  → Class A commit (if plan)
+  → Class A commit (if ArchiveWritePlan present)
   → ensure abs (pin layout → Class A denserels body; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread; multi-list protocol cold only)
   → Class C tip

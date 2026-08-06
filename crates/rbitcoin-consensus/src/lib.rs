@@ -215,15 +215,15 @@ pub mod confirm_phase_stats {
     /// Wire path: structure + plan Class A + pin parents (stops before assemble).
     /// Full prep wall ≈ `LOAD_NS` + [`CONNECT_NS`] (assemble).
     pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire prep sub: `Arc::new(block.clone())` (target for Arc handoff).
+    /// Wire load sub: `Arc::new(block.clone())` (target for Arc handoff).
     pub static PREP_WIRE_ARC_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire prep sub: structure + softfork shape checks.
+    /// Wire load sub: structure + softfork shape checks.
     pub static PREP_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire prep sub: header validate/put + parent-cache header plan seed.
+    /// Wire load sub: header validate/put + parent-cache header plan seed.
     pub static PREP_HEADER_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire prep sub: `prepare_block_for_archive` (tx apply packing).
+    /// Wire load sub: `prepare_block_for_archive` (tx apply packing).
     pub static PREP_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire prep sub: filter need + plan mega + meta/tx_fks wiring (not pin).
+    /// Wire load sub: filter need + plan batch + meta/tx_fks wiring (not pin).
     pub static PREP_FILTER_PLAN_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -575,11 +575,11 @@ pub fn confirm_archived_at(
 pub use confirm_run::{
     confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
     confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_feed_ahead,
-    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_plan_and_ensure_denserels,
-    confirm_wire_plan_stamp, confirm_wire_prep_from_plan, confirm_wire_prep_phase,
-    confirm_wire_prep_phase_pipelined, confirm_wire_run, confirm_wire_run_preverified,
+    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_lookup_and_ensure_denserels,
+    confirm_wire_lookup_stamp, confirm_wire_load_from_plan, confirm_wire_load_phase,
+    confirm_wire_load_phase_pipelined, confirm_wire_run, confirm_wire_run_preverified,
     confirm_write_phase, ensure_external_parent_denserels_from_plan, join_scripts_polling,
-    plan_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_prep_channel,
+    lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_load_channel,
     ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
     PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
     WirePrepPipeline,
@@ -638,8 +638,8 @@ pub fn accept_and_connect_block_preverified(
         }
     }
 
-    // Unified height-ordered path: wire → prep (plan+pin+assemble) → scripts →
-    // commit (Class A + structural + Class C + annotate). No archive-then-reload.
+    // Unified height-ordered path: wire → lookup → load (pin+assemble) → scripts →
+    // write (Class A + structural + Class C + annotate). No archive-then-reload.
     let fks = confirm_wire_run_preverified(
         query,
         params,

@@ -127,7 +127,7 @@ export RBITCOIN_IO=uring   # or pread for second arm
 
 # Capture steady-state minutes:
 grep 'ibd: perf' host.log
-grep 'ibd: perf_dbg' host.log    # head=, plan_mega, class_a head insert, pin
+grep 'ibd: perf_dbg' host.log    # head=, plan_batch, class_a head insert, pin
 grep 'ibd: sizes' host.log       # rss= anon= file=
 ```
 

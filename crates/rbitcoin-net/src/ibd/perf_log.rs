@@ -5,10 +5,10 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
-//! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **prep_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, loadq/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
+//! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **load_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega head resolve; class_a commit |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
 //!
 //! **Pins:** pipeline-local (plan batch_pin / BatchParents / external_parent_outs).
 //!
@@ -24,9 +24,9 @@
 //! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tip GC
 //!
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
-//! `planq`/`prepq` stay empty. Prefer `plan_thr busy=` / `thr prep=busy/wait=` /
-//! `planq_hwm=` (OS-thread occupancy + queue high-water). High prep_recv_wait
-//! + empty planq_hwm ⇒ plan is the production pole.
+//! `loadq`/`scriptq` stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
+//! `loadq_hwm=` (OS-thread occupancy + queue high-water). High load_recv_wait
+//! + empty loadq_hwm ⇒ lookup is the production pole.
 //!
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
@@ -146,7 +146,7 @@ pub(crate) struct IbdPerfSample {
     pub prep_header_ms: u64,
     /// prepare_block_for_archive.
     pub prep_prepare_ms: u64,
-    /// filter need + plan mega + tx_fks wiring.
+    /// filter need + plan batch + tx_fks wiring.
     pub prep_filter_plan_ms: u64,
     pub cache_tip_ms: u64,
     // raw ns for us/blk
@@ -225,48 +225,49 @@ pub(crate) struct IbdPerfSample {
     pub load_ready_through: u32,
     pub cache_bodies: usize,
     pub cache_plans: usize,
-    pub conf_plan_q: usize,
     pub conf_load_q: usize,
+    pub conf_script_q: usize,
     pub conf_write_q: usize,
-    pub conf_plan_q_cap: usize,
     pub conf_load_q_cap: usize,
+    pub conf_script_q_cap: usize,
     pub conf_write_q_cap: usize,
-    /// Max plan→prep depth since last 5s sample (not instantaneous).
-    pub conf_plan_q_hwm: usize,
+    /// Max loadq depth since last 5s sample (not instantaneous).
     pub conf_load_q_hwm: usize,
+    /// Max scriptq depth since last 5s sample.
+    pub conf_script_q_hwm: usize,
     pub conf_write_q_hwm: usize,
-    // OS-thread occupancy (ms) — wait vs busy; explains empty planq vs work sums.
-    pub thr_plan_claim_ms: u64,
-    pub thr_plan_resolve_ms: u64,
-    pub thr_plan_clone_ms: u64,
-    pub thr_plan_stamp_ms: u64,
-    pub thr_plan_other_ms: u64,
-    pub thr_plan_send_wait_ms: u64,
-    /// Stamp sub-walls (structure / prepare / filter / plan_mega).
+    // OS-thread occupancy (ms) — wait vs busy; explains empty loadq vs work sums.
+    pub thr_lookup_claim_ms: u64,
+    pub thr_lookup_resolve_ms: u64,
+    pub thr_lookup_clone_ms: u64,
+    pub thr_lookup_stamp_ms: u64,
+    pub thr_lookup_other_ms: u64,
+    pub thr_lookup_send_wait_ms: u64,
+    /// Stamp sub-walls (structure / prepare / filter / plan_batch).
     pub stamp_struct_ms: u64,
     pub stamp_prepare_ms: u64,
     pub stamp_filter_ms: u64,
-    pub stamp_mega_ms: u64,
-    /// plan_mega internals (from archive_phase_stats).
-    pub stamp_mega_assign_ms: u64,
-    pub stamp_mega_collect_ms: u64,
+    pub stamp_batch_ms: u64,
+    /// plan_batch internals (from archive_phase_stats).
+    pub stamp_batch_assign_ms: u64,
+    pub stamp_batch_collect_ms: u64,
     /// head_fk + head_dens (legacy total).
-    pub stamp_mega_head_ms: u64,
+    pub stamp_batch_head_ms: u64,
     /// Pure get_fk_by_txid_batch wall.
-    pub stamp_mega_head_fk_ms: u64,
+    pub stamp_batch_head_fk_ms: u64,
     /// Plan-time external-parent denserels load.
-    pub stamp_mega_head_dens_ms: u64,
-    pub stamp_mega_stamp_ms: u64,
-    pub stamp_mega_finish_ms: u64,
-    pub thr_prep_recv_wait_ms: u64,
-    pub thr_prep_work_ms: u64,
-    pub thr_prep_send_wait_ms: u64,
+    pub stamp_batch_head_dens_ms: u64,
+    pub stamp_batch_stamp_ms: u64,
+    pub stamp_batch_finish_ms: u64,
+    pub thr_load_recv_wait_ms: u64,
+    pub thr_load_work_ms: u64,
+    pub thr_load_send_wait_ms: u64,
     pub thr_script_recv_wait_ms: u64,
     pub thr_script_work_ms: u64,
     pub thr_script_send_wait_ms: u64,
     pub thr_write_recv_wait_ms: u64,
     pub thr_write_work_ms: u64,
-    // Plan stage (bq → plan+denserels ensure → prep queue)
+    // Plan stage (bq → plan+denserels ensure → load queue)
     pub plan_blks: u64,
     pub plan_ms: u64,
     pub plan_collect_ms: u64,
@@ -474,35 +475,35 @@ impl Default for IbdPerfSample {
             load_ready_through: 0,
             cache_bodies: 0,
             cache_plans: 0,
-            conf_plan_q: 0,
             conf_load_q: 0,
+            conf_script_q: 0,
             conf_write_q: 0,
-            conf_plan_q_cap: super::confirm::plan_queue_cap(),
             conf_load_q_cap: super::confirm::load_queue_cap(),
+            conf_script_q_cap: super::confirm::script_queue_cap(),
             conf_write_q_cap: super::confirm::write_queue_cap(),
-            conf_plan_q_hwm: 0,
             conf_load_q_hwm: 0,
+            conf_script_q_hwm: 0,
             conf_write_q_hwm: 0,
-            thr_plan_claim_ms: 0,
-            thr_plan_resolve_ms: 0,
-            thr_plan_clone_ms: 0,
-            thr_plan_stamp_ms: 0,
-            thr_plan_other_ms: 0,
-            thr_plan_send_wait_ms: 0,
+            thr_lookup_claim_ms: 0,
+            thr_lookup_resolve_ms: 0,
+            thr_lookup_clone_ms: 0,
+            thr_lookup_stamp_ms: 0,
+            thr_lookup_other_ms: 0,
+            thr_lookup_send_wait_ms: 0,
             stamp_struct_ms: 0,
             stamp_prepare_ms: 0,
             stamp_filter_ms: 0,
-            stamp_mega_ms: 0,
-            stamp_mega_assign_ms: 0,
-            stamp_mega_collect_ms: 0,
-            stamp_mega_head_ms: 0,
-            stamp_mega_head_fk_ms: 0,
-            stamp_mega_head_dens_ms: 0,
-            stamp_mega_stamp_ms: 0,
-            stamp_mega_finish_ms: 0,
-            thr_prep_recv_wait_ms: 0,
-            thr_prep_work_ms: 0,
-            thr_prep_send_wait_ms: 0,
+            stamp_batch_ms: 0,
+            stamp_batch_assign_ms: 0,
+            stamp_batch_collect_ms: 0,
+            stamp_batch_head_ms: 0,
+            stamp_batch_head_fk_ms: 0,
+            stamp_batch_head_dens_ms: 0,
+            stamp_batch_stamp_ms: 0,
+            stamp_batch_finish_ms: 0,
+            thr_load_recv_wait_ms: 0,
+            thr_load_work_ms: 0,
+            thr_load_send_wait_ms: 0,
             thr_script_recv_wait_ms: 0,
             thr_script_work_ms: 0,
             thr_script_send_wait_ms: 0,
@@ -675,8 +676,8 @@ pub(crate) fn sample(
     headers_done: bool,
     // (ready_through, ahead, parents, bodies, plans).
     load: (u32, u32, usize, usize, usize),
-    conf_plan_q: usize,
     conf_load_q: usize,
+    conf_script_q: usize,
     conf_write_q: usize,
     conf_q_hwm: (usize, usize, usize),
     sh_runs: usize,
@@ -753,7 +754,7 @@ pub(crate) fn sample(
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
-    let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
+    let dens = rbitcoin_consensus::lookup_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
     let (load_ready_through, _cache_ahead, _cache_parents, cache_bodies, cache_plans) = load;
@@ -892,35 +893,35 @@ pub(crate) fn sample(
         load_ready_through,
         cache_bodies,
         cache_plans,
-        conf_plan_q,
         conf_load_q,
+        conf_script_q,
         conf_write_q,
-        conf_plan_q_cap: super::confirm::plan_queue_cap(),
         conf_load_q_cap: super::confirm::load_queue_cap(),
+        conf_script_q_cap: super::confirm::script_queue_cap(),
         conf_write_q_cap: super::confirm::write_queue_cap(),
-        conf_plan_q_hwm: conf_q_hwm.0,
-        conf_load_q_hwm: conf_q_hwm.1,
+        conf_load_q_hwm: conf_q_hwm.0,
+        conf_script_q_hwm: conf_q_hwm.1,
         conf_write_q_hwm: conf_q_hwm.2,
-        thr_plan_claim_ms: ns_ms(thr.plan_claim_ns),
-        thr_plan_resolve_ms: ns_ms(thr.plan_resolve_ns),
-        thr_plan_clone_ms: ns_ms(thr.plan_clone_ns),
-        thr_plan_stamp_ms: ns_ms(thr.plan_stamp_ns),
-        thr_plan_other_ms: ns_ms(thr.plan_other_ns),
-        thr_plan_send_wait_ms: ns_ms(thr.plan_send_wait_ns),
+        thr_lookup_claim_ms: ns_ms(thr.lookup_claim_ns),
+        thr_lookup_resolve_ms: ns_ms(thr.lookup_resolve_ns),
+        thr_lookup_clone_ms: ns_ms(thr.lookup_clone_ns),
+        thr_lookup_stamp_ms: ns_ms(thr.lookup_stamp_ns),
+        thr_lookup_other_ms: ns_ms(thr.lookup_other_ns),
+        thr_lookup_send_wait_ms: ns_ms(thr.lookup_send_wait_ns),
         stamp_struct_ms: ns_ms(stamp_sub.struct_ns),
         stamp_prepare_ms: ns_ms(stamp_sub.prepare_ns),
         stamp_filter_ms: ns_ms(stamp_sub.filter_ns),
-        stamp_mega_ms: ns_ms(stamp_sub.mega_ns),
-        stamp_mega_assign_ms: ns_ms(arch_res.prep_assign_ns),
-        stamp_mega_collect_ms: ns_ms(arch_res.prep_collect_ns),
-        stamp_mega_head_ms: ns_ms(arch_res.prep_head_ns),
-        stamp_mega_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
-        stamp_mega_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
-        stamp_mega_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
-        stamp_mega_finish_ms: ns_ms(arch_res.prep_finish_ns),
-        thr_prep_recv_wait_ms: ns_ms(thr.prep_recv_wait_ns),
-        thr_prep_work_ms: ns_ms(thr.prep_work_ns),
-        thr_prep_send_wait_ms: ns_ms(thr.prep_send_wait_ns),
+        stamp_batch_ms: ns_ms(stamp_sub.batch_ns),
+        stamp_batch_assign_ms: ns_ms(arch_res.prep_assign_ns),
+        stamp_batch_collect_ms: ns_ms(arch_res.prep_collect_ns),
+        stamp_batch_head_ms: ns_ms(arch_res.prep_head_ns),
+        stamp_batch_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
+        stamp_batch_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
+        stamp_batch_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
+        stamp_batch_finish_ms: ns_ms(arch_res.prep_finish_ns),
+        thr_load_recv_wait_ms: ns_ms(thr.load_recv_wait_ns),
+        thr_load_work_ms: ns_ms(thr.load_work_ns),
+        thr_load_send_wait_ms: ns_ms(thr.load_send_wait_ns),
         thr_script_recv_wait_ms: ns_ms(thr.script_recv_wait_ns),
         thr_script_work_ms: ns_ms(thr.script_work_ns),
         thr_script_send_wait_ms: ns_ms(thr.script_send_wait_ns),
@@ -1001,16 +1002,16 @@ fn append_nz(out: &mut String, key: &str, v: u64) {
     }
 }
 
-/// Full prep-stage wall (pre-assemble + assemble).
+/// Full load-stage wall (pre-assemble + assemble).
 ///
 /// `load_ms` = structure+plan+pin; `connect_ms` = assemble. Together they are
-/// the prep OS-thread work for the window.
-fn prep_stage_ms(s: &IbdPerfSample) -> u64 {
+/// the load OS-thread work for the window.
+fn load_stage_wall_ms(s: &IbdPerfSample) -> u64 {
     s.load_ms.saturating_add(s.connect_ms)
 }
 
-/// Plan-mega sub-wall sum (assign/collect/head/stamp/finish) when present.
-fn plan_mega_ms(s: &IbdPerfSample) -> u64 {
+/// Plan-batch sub-wall sum (assign/collect/head/stamp/finish) when present.
+fn plan_batch_ms(s: &IbdPerfSample) -> u64 {
     s.arch_prep_assign_ms
         .saturating_add(s.arch_prep_collect_ms)
         .saturating_add(s.arch_prep_inflight_ms)
@@ -1033,7 +1034,7 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
         .saturating_add(s.cache_tip_ms)
 }
 
-/// Stable INFO line for production grepping (unified prep→scripts→write).
+/// Stable INFO line for production grepping (unified load→scripts→write).
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let write_ms = write_stage_ms(s);
@@ -1051,79 +1052,79 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Four-stage confirm **work** walls (sums; may mis-rank vs empty planq).
-    // Prefer thr busy/wait + planq_hwm for long-pole diagnosis.
-    let prep_ms = prep_stage_ms(s);
-    let thr_plan_busy = s
-        .thr_plan_resolve_ms
-        .saturating_add(s.thr_plan_clone_ms)
-        .saturating_add(s.thr_plan_stamp_ms)
-        .saturating_add(s.thr_plan_other_ms);
-    let thr_plan_wait = s
-        .thr_plan_claim_ms
-        .saturating_add(s.thr_plan_send_wait_ms);
-    let thr_prep_wait = s
-        .thr_prep_recv_wait_ms
-        .saturating_add(s.thr_prep_send_wait_ms);
+    // Four-stage confirm **work** walls (sums; may mis-rank vs empty loadq).
+    // Prefer thr busy/wait + loadq_hwm for long-pole diagnosis.
+    let load_wall_ms = load_stage_wall_ms(s);
+    let thr_lookup_busy = s
+        .thr_lookup_resolve_ms
+        .saturating_add(s.thr_lookup_clone_ms)
+        .saturating_add(s.thr_lookup_stamp_ms)
+        .saturating_add(s.thr_lookup_other_ms);
+    let thr_lookup_wait = s
+        .thr_lookup_claim_ms
+        .saturating_add(s.thr_lookup_send_wait_ms);
+    let thr_load_wait = s
+        .thr_load_recv_wait_ms
+        .saturating_add(s.thr_load_send_wait_ms);
     let thr_script_wait = s
         .thr_script_recv_wait_ms
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
-        " | conf blks={} plan={}ms prep={}ms script={}ms write={}ms \
-         plan_thr busy={}ms(claim={}ms resolve={}ms clone={}ms stamp={}ms other={}ms send_w={}ms) \
-         thr prep=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
-         planq_hwm={}/{} prepq_hwm={}/{} writeq_hwm={}/{}",
+        " | conf blks={} lookup={}ms load={}ms script={}ms write={}ms \
+         lookup_thr busy={}ms(claim={}ms resolve={}ms clone={}ms stamp={}ms other={}ms send_w={}ms) \
+         thr load=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
+         loadq_hwm={}/{} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
         s.plan_ms,
-        prep_ms,
+        load_wall_ms,
         s.script_ms,
         write_ms,
-        thr_plan_busy,
-        s.thr_plan_claim_ms,
-        s.thr_plan_resolve_ms,
-        s.thr_plan_clone_ms,
-        s.thr_plan_stamp_ms,
-        s.thr_plan_other_ms,
-        s.thr_plan_send_wait_ms,
-        s.thr_prep_work_ms,
-        thr_prep_wait,
+        thr_lookup_busy,
+        s.thr_lookup_claim_ms,
+        s.thr_lookup_resolve_ms,
+        s.thr_lookup_clone_ms,
+        s.thr_lookup_stamp_ms,
+        s.thr_lookup_other_ms,
+        s.thr_lookup_send_wait_ms,
+        s.thr_load_work_ms,
+        thr_load_wait,
         s.thr_script_work_ms,
         thr_script_wait,
         s.thr_write_work_ms,
         s.thr_write_recv_wait_ms,
-        s.conf_plan_q_hwm,
-        s.conf_plan_q_cap,
         s.conf_load_q_hwm,
         s.conf_load_q_cap,
+        s.conf_script_q_hwm,
+        s.conf_script_q_cap,
         s.conf_write_q_hwm,
         s.conf_write_q_cap,
     ));
-    let _ = thr_plan_wait; // claim+send already in plan_thr fields
+    let _ = thr_lookup_wait; // claim+send already in lookup_thr fields
     if s.stamp_struct_ms > 0
         || s.stamp_prepare_ms > 0
-        || s.stamp_mega_ms > 0
-        || s.thr_plan_stamp_ms > 0
+        || s.stamp_batch_ms > 0
+        || s.thr_lookup_stamp_ms > 0
     {
         out.push_str(&format!(
-            " stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms \
-             mega_assign={}ms collect={}ms head_fk={}ms head_dens={}ms head={}ms \
+            " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
+             batch_assign={}ms collect={}ms head_fk={}ms head_dens={}ms head={}ms \
              stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
             s.stamp_filter_ms,
-            s.stamp_mega_ms,
-            s.stamp_mega_assign_ms,
-            s.stamp_mega_collect_ms,
-            s.stamp_mega_head_fk_ms,
-            s.stamp_mega_head_dens_ms,
-            s.stamp_mega_head_ms,
-            s.stamp_mega_stamp_ms,
-            s.stamp_mega_finish_ms,
+            s.stamp_batch_ms,
+            s.stamp_batch_assign_ms,
+            s.stamp_batch_collect_ms,
+            s.stamp_batch_head_fk_ms,
+            s.stamp_batch_head_dens_ms,
+            s.stamp_batch_head_ms,
+            s.stamp_batch_stamp_ms,
+            s.stamp_batch_finish_ms,
         ));
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " plan_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
@@ -1138,7 +1139,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
-    // Prep stage detail: plan mega + pin mix + assemble.
+    // Load stage detail: plan batch + pin mix + assemble.
     // pin_hit% = plan / (plan+cold) for this window's pin path mix.
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
@@ -1180,22 +1181,22 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     } else {
         0
     };
-    let plan_mega = plan_mega_ms(s);
-    // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan mega + …).
+    let plan_batch = plan_batch_ms(s);
+    // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan batch + …).
     let pre_assemble = s.load_ms;
-    // I1 prep budget: total = pre_asm + assemble; pin = parent pin wall; other residual.
+    // I1 load budget: total = pre_asm + assemble; pin = parent pin wall; other residual.
     let pin_budget_ms = s.load_parent_pin_ms;
     let asm_budget_ms = s.connect_ms;
-    let other_budget_ms = prep_ms
+    let other_budget_ms = load_wall_ms
         .saturating_sub(pin_budget_ms)
         .saturating_sub(asm_budget_ms);
     out.push_str(&format!(
-        " | prep_budget total={}ms pin={}ms asm={}ms other={}ms",
-        prep_ms, pin_budget_ms, asm_budget_ms, other_budget_ms,
+        " | load_budget total={}ms pin={}ms asm={}ms other={}ms",
+        load_wall_ms, pin_budget_ms, asm_budget_ms, other_budget_ms,
     ));
     out.push_str(&format!(
-        " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
-         filter_plan={}ms plan_mega={}ms pin={}ms) \
+        " | load blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
+         filter_plan={}ms plan_batch={}ms pin={}ms) \
          assemble={}ms(prevout={} us/in={} batch={}/n={} same={}/n={} cold={}/n={} \
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
@@ -1203,14 +1204,14 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          adopt={}ms range_fill={}ms contract={}ms publish={}ms) \
          pin_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
-        prep_ms,
+        load_wall_ms,
         pre_assemble,
         s.prep_wire_arc_ms,
         s.prep_struct_ms,
         s.prep_header_ms,
         s.prep_prepare_ms,
         s.prep_filter_plan_ms,
-        plan_mega,
+        plan_batch,
         s.load_parent_pin_ms,
         s.connect_ms,
         s.asm_prevout_ms,
@@ -1312,11 +1313,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_plan_q,
         s.conf_load_q,
+        s.conf_script_q,
         s.conf_write_q,
-        s.conf_plan_q_cap,
         s.conf_load_q_cap,
+        s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
@@ -1357,7 +1358,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         .saturating_add(s.utxo_apply_ns)
         .saturating_add(s.cache_tip_ns);
     let mut out = format!(
-        "ibd: perf_dbg us/blk prep={} (pre_asm={} assemble={}) script={} write={} \
+        "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
          spend={}(r={} i={} skip={}) tip_gc={}",
         us(prep_ns),
@@ -1406,16 +1407,16 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_plan_q,
         s.conf_load_q,
+        s.conf_script_q,
         s.conf_write_q,
-        s.conf_plan_q_cap,
         s.conf_load_q_cap,
+        s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
     let bq_mib = s.bq_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | bq soft={}/{} RAM={}MiB | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={}",
+        " | bq soft={}/{} RAM={}MiB | {conf_q} | load thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={}",
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
@@ -1450,7 +1451,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    // Plan-mega resolve mix (head / in-flight / stamp — no process pin FIFO).
+    // Plan-batch resolve mix (head / in-flight / stamp — no process pin FIFO).
     if s.arch_ext_need > 0 || s.arch_prep_assign_ms > 0 {
         let resolve_us_blk = if s.arch_resolve_blocks > 0 {
             (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
@@ -1458,7 +1459,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | plan_mega assign={} collect={} inflight={} head_fk={} head_dens={} head={} \
+            " | plan_batch assign={} collect={} inflight={} head_fk={} head_dens={} head={} \
              stamp={} finish={} resolve_us/blk={} ext={} head_hit={}/{} \
              stamp_n batch={}",
             s.arch_prep_assign_ms,
@@ -1590,7 +1591,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let h = &o.head;
     let cp = &s.conf_pipe;
     let primary_mib = h.primary_body_bytes / (1024 * 1024);
-    let load_wire_mib = cp.load_wire_bytes / (1024 * 1024);
+    let script_wire_mib = cp.script_wire_bytes / (1024 * 1024);
     let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
     // file% of RSS: how much of process RSS is file-backed (mmap tables + .so).
     let file_pct = if s.rss_kb > 0 {
@@ -1604,7 +1605,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let ps_mib = o.pstore_bytes / (1024 * 1024);
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
     let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
-    let conf_wire_mib = (load_wire_mib.saturating_add(write_wire_mib)) as u64;
+    let conf_wire_mib = (script_wire_mib.saturating_add(write_wire_mib)) as u64;
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
         .saturating_add(ps_mib)
@@ -1618,7 +1619,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body known={} pend={} miss={} rej={} \
          | bq soft={}/{} RAM={}MiB \
          | conf_plans={} \
-         | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf loadq={}/{} blks={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
            wire={}MiB accounted≈{}MiB residual≈{}MiB \
@@ -1647,18 +1648,18 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_soft_stop,
         bq_mib,
         o.conf_plans,
-        cp.plan_batches,
-        s.conf_plan_q_cap,
-        cp.plan_blocks,
         cp.load_batches,
         s.conf_load_q_cap,
         cp.load_blocks,
-        load_wire_mib,
+        cp.script_batches,
+        s.conf_script_q_cap,
+        cp.script_blocks,
+        script_wire_mib,
         cp.write_batches,
         s.conf_write_q_cap,
         cp.write_blocks,
         write_wire_mib,
-        // Pipeline-wide parent entries in prepq + writeq (meter only; no budget).
+        // Pipeline-wide parent entries in scriptq + writeq (meter only; no budget).
         cp.parents_total(),
         cp.feed_ready,
         cp.feed_inflight,
@@ -1698,12 +1699,12 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
     if s.phase_blks > 0 {
         let c_ms = s.class_c_ms / s.phase_blks.max(1);
         let sh_ms = s.sh_ms / s.phase_blks.max(1);
-        let prep_ms = prep_stage_ms(s) / s.phase_blks.max(1);
+        let load_wall_ms = load_stage_wall_ms(s) / s.phase_blks.max(1);
         let write_ms = write_stage_ms(s) / s.phase_blks.max(1);
-        if c_ms >= 1000 || sh_ms >= 1000 || prep_ms >= 5000 || write_ms >= 5000 {
+        if c_ms >= 1000 || sh_ms >= 1000 || load_wall_ms >= 5000 || write_ms >= 5000 {
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk prep={} script={} write={} class_a={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
-                prep_ms,
+                "ibd: slow confirm phase ms/blk load={} script={} write={} class_a={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
+                load_wall_ms,
                 s.script_ms / s.phase_blks.max(1),
                 write_ms,
                 s.class_a_ms / s.phase_blks.max(1),
@@ -1724,11 +1725,11 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn prep_and_write_stage_walls_sum_parts() {
+    fn load_and_write_stage_walls_sum_parts() {
         let mut s = IbdPerfSample::default();
         s.load_ms = 30;
         s.connect_ms = 8;
-        assert_eq!(prep_stage_ms(&s), 38);
+        assert_eq!(load_stage_wall_ms(&s), 38);
         s.class_a_ms = 15;
         s.ensure_ms = 2;
         s.structural_ms = 50;
@@ -1780,7 +1781,7 @@ mod tests {
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
         // prep = load(30)+assemble(8) = 38
-        assert!(line.contains("prep=38ms"), "{line}");
+        assert!(line.contains("load=38ms"), "{line}");
         assert!(!line.contains("connect="), "assemble is inside prep, not a peer stage: {line}");
         // write = class_a(12)+ensure(3)+class_c(40)+spend(25)+tip_gc(5) = 85
         assert!(line.contains("write=85ms"), "{line}");
@@ -1795,11 +1796,11 @@ mod tests {
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 in=8000 1500ms"), "{line}");
-        s.conf_plan_q = 0;
-        s.conf_load_q = 1;
+        s.conf_load_q = 0;
+        s.conf_script_q = 1;
         s.conf_write_q = 2;
-        s.conf_plan_q_cap = 2;
         s.conf_load_q_cap = 2;
+        s.conf_script_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
         s.load_blocks = 32;
@@ -1822,7 +1823,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("planq<0/2 prepq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("loadq<0/2 scriptq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         // pin_residency slot always 0 (process pin FIFO removed); pin_plan_cache label retired.
         assert!(!line.contains("pin_res="), "{line}");
@@ -1854,7 +1855,7 @@ mod tests {
         assert!(!line.contains("denserels_hit%"), "{line}");
         assert!(line.contains("cold_io=14ms"), "{line}");
         // I1–I4 fields present with zero path counts when unset.
-        assert!(line.contains("prep_budget total="), "{line}");
+        assert!(line.contains("load_budget total="), "{line}");
         assert!(line.contains("us/in="), "{line}");
         assert!(line.contains("us/new="), "{line}");
         assert!(line.contains("cold_range="), "{line}");
@@ -1869,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn format_info_prep_instrumentation_i1_i4() {
+    fn format_info_load_instrumentation_i1_i4() {
         let mut s = IbdPerfSample::default();
         s.load_ms = 2000;
         s.connect_ms = 3000;
@@ -1908,7 +1909,7 @@ mod tests {
         assert!(line.contains("contract=25ms"), "{line}");
         assert!(line.contains("publish=12ms"), "{line}");
         // I1: total = load+connect = 5000; pin=1800; asm=3000; other=200
-        assert!(line.contains("prep_budget total=5000ms pin=1800ms asm=3000ms other=200ms"), "{line}");
+        assert!(line.contains("load_budget total=5000ms pin=1800ms asm=3000ms other=200ms"), "{line}");
         // I3: us/in = 2500*1000/50000 = 50
         assert!(line.contains("us/in=50"), "{line}");
         assert!(line.contains("batch=2000/n=40000"), "{line}");
@@ -1956,8 +1957,10 @@ mod tests {
         s.wf_store_body_ms = 50;
         // (no cache/lock fields — pruned)
         s.conf_load_q = 0;
+        s.conf_script_q = 0;
         s.conf_write_q = 1;
         s.conf_load_q_cap = 2;
+        s.conf_script_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
         s.load_blocks = 16;
@@ -1978,7 +1981,7 @@ mod tests {
         s.bq_soft_stop = 256;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
-        assert!(line.contains("us/blk prep="), "{line}");
+        assert!(line.contains("us/blk load="), "{line}");
         assert!(line.contains("pre_asm="), "{line}");
         assert!(line.contains("assemble="), "{line}");
         assert!(line.contains("class_a="), "{line}");
@@ -2000,8 +2003,8 @@ mod tests {
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
-        assert!(line.contains("planq"), "{line}");
-        assert!(line.contains("prepq<0/2 writeq=1/2") || line.contains("prepq="), "{line}");
+        assert!(line.contains("loadq"), "{line}");
+        assert!(line.contains("scriptq<0/2 writeq=1/2") || line.contains("scriptq="), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
@@ -2012,7 +2015,7 @@ mod tests {
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
-        assert!(line.contains("plan_mega "), "{line}");
+        assert!(line.contains("plan_batch "), "{line}");
         assert!(!line.contains("res_txid"), "{line}");
         assert!(!line.contains("res_seed"), "{line}");
         assert!(!line.contains("sticky="), "{line}");
@@ -2075,14 +2078,17 @@ mod tests {
         s.owned.head.class_a_n = 2_000_000;
         s.conf_pipe.load_batches = 2;
         s.conf_pipe.load_blocks = 40;
-        s.conf_pipe.load_wire_bytes = 12 * 1024 * 1024;
-        s.conf_pipe.load_parents = 500;
+        s.conf_pipe.script_batches = 2;
+        s.conf_pipe.script_blocks = 16;
+        s.conf_pipe.script_wire_bytes = 12 * 1024 * 1024;
+        s.conf_pipe.script_parents = 500;
         s.conf_pipe.write_batches = 1;
         s.conf_pipe.write_blocks = 16;
         s.conf_pipe.write_wire_bytes = 4 * 1024 * 1024;
         s.conf_pipe.feed_ready = 8;
         s.conf_pipe.feed_inflight = 32;
         s.conf_load_q_cap = 5;
+        s.conf_script_q_cap = 5;
         s.conf_write_q_cap = 5;
         let line = format_sizes(&s);
         assert!(line.starts_with("ibd: sizes "), "{line}");
@@ -2108,8 +2114,9 @@ mod tests {
         assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
-        // parents= is pipeline total (prepq + writeq entry counts).
-        assert!(line.contains("prepq=2/5 blks=40 wire=12MiB"), "{line}");
+        // parents= is pipeline total (scriptq + writeq entry counts).
+        assert!(line.contains("loadq=2/5 blks=40"), "{line}");
+        assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
         assert!(line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"), "{line}");
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
         assert!(line.contains("txhead bits=25"), "{line}");
@@ -2188,7 +2195,7 @@ mod tests {
             8,   // peers
             true, // headers_done
             (50, 10, 0, 0, 0),
-            0, // planq
+            0, // loadq
             0, // load_q
             0, // write_q
             (0, 0, 0), // q hwm
@@ -2205,10 +2212,10 @@ mod tests {
         assert_eq!(s.confirm_blocks, 1);
         assert_eq!(s.sh_runs, 1);
         // thr / hwm fields present (zero when idle).
-        assert_eq!(s.conf_plan_q_hwm, 0);
+        assert_eq!(s.conf_load_q_hwm, 0);
         let line = format_info(&s);
-        assert!(line.contains("plan_thr busy="), "{line}");
-        assert!(line.contains("planq_hwm="), "{line}");
+        assert!(line.contains("lookup_thr busy="), "{line}");
+        assert!(line.contains("loadq_hwm="), "{line}");
 
         // Edge format arms: spend_mix, miss_p, headers_done, zero pin_hit.
         let mut edge = s.clone();

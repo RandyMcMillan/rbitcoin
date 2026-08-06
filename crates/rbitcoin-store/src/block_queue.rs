@@ -246,7 +246,7 @@ impl BlockQueue {
         Ok(out)
     }
 
-    /// Load payload for a height (confirm prep intake). First match by height.
+    /// Load payload for a height (confirm load intake). First match by height.
     ///
     /// Does **not** dequeue — confirm-write / permanent reject removes the rec.
     pub fn get_by_height(&self, height: u32) -> Result<Option<QueuedBlock>, StoreError> {

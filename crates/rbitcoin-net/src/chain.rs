@@ -8,8 +8,8 @@ use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_plan_stamp,
-    confirm_wire_prep_from_plan as consensus_prep_from_plan, confirm_wire_prep_phase_pipelined,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_lookup_stamp,
+    confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
     confirm_write_phase, genesis_block, header_to_record, ChainParams, Milestone, PlanStampOutcome,
     ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
 };
@@ -323,7 +323,7 @@ impl ChainHub {
     /// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
     ///
     /// Wire is `Arc<Block>` so body-queue decode is not re-cloned into stamp.
-    pub fn confirm_wire_plan_phase(
+    pub fn confirm_wire_lookup_phase(
         &self,
         blocks: &[(Height, std::sync::Arc<Block>)],
         pipeline: Option<&WirePrepPipeline>,
@@ -331,7 +331,7 @@ impl ChainHub {
         let Some(contig) = self.confirm_wire_contig_arc(blocks, pipeline) else {
             return Ok(None);
         };
-        let out = confirm_wire_plan_stamp(
+        let out = confirm_wire_lookup_stamp(
             &self.query,
             &self.params,
             self.milestone,
@@ -343,12 +343,12 @@ impl ChainHub {
     }
 
     /// IBD **prep** after plan: pin denserels + assemble (does not re-plan).
-    pub fn confirm_wire_prep_from_plan(
+    pub fn confirm_wire_load_from_plan(
         &self,
         stamped: PlanStampOutcome,
         pipeline: Option<&WirePrepPipeline>,
     ) -> Result<rbitcoin_consensus::ConfirmLoadOutcome, NetError> {
-        consensus_prep_from_plan(
+        consensus_load_from_plan(
             &self.query,
             &self.params,
             self.milestone,
@@ -367,24 +367,24 @@ impl ChainHub {
     /// while commit(N) has not advanced tip.
     ///
     /// One-shot path (tests / tip-follow): plan+pin+assemble with cold denserels
-    /// allowed. IBD uses [`Self::confirm_wire_plan_phase`] then
-    /// [`Self::confirm_wire_prep_from_plan`].
-    pub fn confirm_wire_prep_phase(
+    /// allowed. IBD uses [`Self::confirm_wire_lookup_phase`] then
+    /// [`Self::confirm_wire_load_from_plan`].
+    pub fn confirm_wire_load_phase(
         &self,
         blocks: &[(Height, Block)],
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
-        self.confirm_wire_prep_phase_pipelined(blocks, None)
+        self.confirm_wire_load_phase_pipelined(blocks, None)
     }
 
     /// Prep with optional pipeline caches (reserved create fks + in-flight creates).
     ///
     /// Cold denserels **allowed** (tests / one-shot). IBD: plan stamps, prep pins.
-    pub fn confirm_wire_prep_phase_pipelined(
+    pub fn confirm_wire_load_phase_pipelined(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WirePrepPipeline>,
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
-        self.confirm_wire_prep_phase_pipelined_cold(
+        self.confirm_wire_load_phase_pipelined_cold(
             blocks,
             pipeline,
             rbitcoin_consensus::ColdPinMode::Allow,
@@ -392,7 +392,7 @@ impl ChainHub {
     }
 
     /// One-shot prep with explicit cold denserels policy.
-    pub fn confirm_wire_prep_phase_pipelined_cold(
+    pub fn confirm_wire_load_phase_pipelined_cold(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WirePrepPipeline>,
@@ -401,7 +401,7 @@ impl ChainHub {
         let Some(contig) = self.confirm_wire_contig(blocks, pipeline) else {
             return Ok(None);
         };
-        let ok = confirm_wire_prep_phase_pipelined(
+        let ok = confirm_wire_load_phase_pipelined(
             &self.query,
             &self.params,
             self.milestone,
@@ -1060,14 +1060,14 @@ mod tests {
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
         };
         let mat1 = hub
-            .confirm_wire_prep_phase_pipelined(&batch1, Some(&pipe))
+            .confirm_wire_load_phase_pipelined(&batch1, Some(&pipe))
             .expect("prep1")
             .expect("prep1 some");
         assert_eq!(mat1.batch.len(), 1);
         assert!(mat1.batch.archive_plan.is_some());
         assert_eq!(hub.tip_height(), Some(0), "tip must not advance on prep alone");
 
-        // Update pipeline caches from plan (prep-thread note_plan_ok).
+        // Update pipeline caches from plan (prep-thread note_lookup_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
         {
             let mut log = rbitcoin_query::InFlightLog::new();
@@ -1098,7 +1098,7 @@ mod tests {
         // Batch 2 while tip still 0 — must NOT Ok(None).
         let batch2 = [(rbitcoin_primitives::Height(2), b2.clone())];
         let mat2 = hub
-            .confirm_wire_prep_phase_pipelined(&batch2, Some(&pipe))
+            .confirm_wire_load_phase_pipelined(&batch2, Some(&pipe))
             .expect("prep2 err")
             .expect("prep2 must Some — pipeline path_lo=2 with tip=0");
         assert_eq!(mat2.batch.len(), 1);

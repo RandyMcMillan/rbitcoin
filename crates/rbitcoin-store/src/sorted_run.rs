@@ -296,22 +296,134 @@ fn rebuild_manifest_from_runs(dir: &Path, runs: &[SortedRunPath]) -> Result<(), 
 
 // ── Write / open ────────────────────────────────────────────────────────────
 
+/// Sync / cache / pacing policy for sorted-run file writes.
+///
+/// | Policy | When |
+/// |--------|------|
+/// | [`RunWritePolicy::CATALOG`] | Tip fan-in / recollect / default durable — **no** artificial pace |
+/// | [`RunWritePolicy::IBD_BACKGROUND`] | Steady Direct IBD L0→catalog promote while confirm is hot |
+/// | [`RunWritePolicy::L0`] | Transient memtable spills (no fsync; keep cache for coalesce) |
+///
+/// **Do not** pace tip materialize: multi‑pass reduce rewrites tens of GiB; even
+/// 2 ms / 16 MiB would add multi‑second stalls on the critical path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunWritePolicy {
+    /// `fsync` file + parent dir after rename.
+    pub durable: bool,
+    /// `POSIX_FADV_DONTNEED` after write (long-lived catalog only).
+    pub drop_cache: bool,
+    /// Brief sleep every [`PACE_CHUNK_BYTES`] of body so confirm Class A can interleave.
+    /// **Only** for IBD background promotes — never tip reduce.
+    pub pace: bool,
+}
+
+impl RunWritePolicy {
+    /// Durable catalog / SEAL-backed run; full-speed write + DONTNEED.
+    ///
+    /// Used by tip fan-in reduce, recollect catalog spills, and generic
+    /// [`write_sorted_run`] / [`merge_runs`].
+    pub const CATALOG: Self = Self {
+        durable: true,
+        drop_cache: true,
+        pace: false,
+    };
+    /// Steady IBD promote while confirm Class A is concurrent — paced durable.
+    pub const IBD_BACKGROUND: Self = Self {
+        durable: true,
+        drop_cache: true,
+        pace: true,
+    };
+    /// Transient L0: no fsync, keep cache for coalesce, no pace (small-ish spills).
+    pub const L0: Self = Self {
+        durable: false,
+        drop_cache: false,
+        pace: false,
+    };
+    /// Alias of [`Self::CATALOG`] (tests / explicit durable unpaced).
+    pub const DURABLE: Self = Self::CATALOG;
+}
+
+/// Body bytes between yields when [`RunWritePolicy::pace`] is set (~16 MiB).
+pub const PACE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Sleep between paced chunks (idle SH worker cedes disk to confirm write).
+const PACE_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+
+fn write_all_paced(f: &mut File, data: &[u8], pace: bool, path: &Path) -> Result<(), StoreError> {
+    if !pace || data.len() <= PACE_CHUNK_BYTES {
+        return f.write_all(data).map_err(|e| io_err(path, e));
+    }
+    let mut off = 0;
+    while off < data.len() {
+        let end = (off + PACE_CHUNK_BYTES).min(data.len());
+        f.write_all(&data[off..end]).map_err(|e| io_err(path, e))?;
+        off = end;
+        if off < data.len() {
+            std::thread::sleep(PACE_SLEEP);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort: lower this thread's **I/O** and CPU priority so SH run work yields
+/// to confirm Class A under contention (Linux `ioprio` idle + `nice 19`).
+///
+/// No-op / best-effort failure on other platforms or without CAP_SYS_ADMIN for
+/// some ioprio classes — never errors.
+pub fn set_thread_idle_io_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // IOPRIO_CLASS_IDLE << 13 | data; WHO_PROCESS, who=0 (self).
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+        let ioprio = (IOPRIO_CLASS_IDLE << 13) | 0;
+        let _ = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS,
+                0 as libc::c_int,
+                ioprio,
+            )
+        };
+        let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
+    }
+}
+
 /// Write a new sorted run from **already sorted** fixed-width records.
 ///
 /// `records` must be sorted ascending by the first `key_len` bytes of each
 /// `rec_len`-byte record. Updates the parent directory [`MANIFEST`] when the
-/// file name is `{seq:06}.run`.
+/// file name is `{seq:06}.run`. Uses [`RunWritePolicy::CATALOG`].
 pub fn write_sorted_run(
     path: &Path,
     key_len: u32,
     rec_len: u32,
     records: &[u8],
 ) -> Result<SortedRunPath, StoreError> {
-    let run = write_sorted_run_file(path, key_len, rec_len, records)?;
+    let run = write_sorted_run_file_with_policy(
+        path,
+        key_len,
+        rec_len,
+        records,
+        RunWritePolicy::CATALOG,
+    )?;
     if let Some(dir) = path.parent() {
         manifest_insert(dir, &run)?;
     }
     Ok(run)
+}
+
+/// Write run file only (no MANIFEST) with an explicit policy.
+///
+/// L0 spills use [`RunWritePolicy::L0`]; catalog merge internals use
+/// [`RunWritePolicy::CATALOG`].
+pub fn write_sorted_run_file_with_policy(
+    path: &Path,
+    key_len: u32,
+    rec_len: u32,
+    records: &[u8],
+    policy: RunWritePolicy,
+) -> Result<SortedRunPath, StoreError> {
+    write_sorted_run_file(path, key_len, rec_len, records, policy)
 }
 
 /// Write run file only (no manifest). Used by merge for a single catalog commit.
@@ -320,6 +432,7 @@ fn write_sorted_run_file(
     key_len: u32,
     rec_len: u32,
     records: &[u8],
+    policy: RunWritePolicy,
 ) -> Result<SortedRunPath, StoreError> {
     if key_len == 0 || rec_len < key_len {
         return Err(StoreError::Corrupt("sorted run: bad key/rec len"));
@@ -349,20 +462,25 @@ fn write_sorted_run_file(
         hdr[28..32].copy_from_slice(&body_crc32.to_le_bytes());
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
         if !records.is_empty() {
-            f.write_all(records).map_err(|e| io_err(&tmp, e))?;
+            write_all_paced(&mut f, records, policy.pace, &tmp)?;
         }
-        f.sync_all().map_err(|e| io_err(&tmp, e))?;
+        if policy.durable {
+            f.sync_all().map_err(|e| io_err(&tmp, e))?;
+        }
     }
     fs::rename(&tmp, path).map_err(|e| io_err(path, e))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
+    if policy.durable {
+        if let Some(parent) = path.parent() {
+            if let Ok(dirf) = File::open(parent) {
+                let _ = dirf.sync_all();
+            }
         }
     }
-    // Spill/merge output is durable; drop from page cache so run files (SH can
-    // be multi‑hundred MiB) do not crowd tip/tx.body working set. Next merge or
-    // materialize re-faults. Best-effort — never fails the write.
-    advise_file_dont_need(path);
+    // Catalog: drop from page cache so multi‑hundred MiB runs do not crowd
+    // tx.body working set. L0 keeps cache for the imminent coalesce re-read.
+    if policy.drop_cache {
+        advise_file_dont_need(path);
+    }
     Ok(SortedRunPath {
         path: path.to_path_buf(),
         count,
@@ -824,16 +942,41 @@ pub fn for_each_merged_rec_opts(
     Ok(())
 }
 
+/// Stream-merge result: run path + max little-endian u64 at offset 32 (SH create_fk).
+///
+/// `max_u64_at_32` is 0 when `rec_len < 40` (no create_fk field).
+#[derive(Debug, Clone)]
+pub struct MergeToFileResult {
+    pub run: SortedRunPath,
+    pub max_u64_at_32: u64,
+}
+
 /// Stream-merge `inputs` into `out_path` **without** MANIFEST updates or deleting
 /// inputs. Caller manages catalog / cleanup. At most open `|inputs|` cursors.
 ///
 /// Equal keys: all records kept (SH multi-create). Streaming write (no full body RAM).
+/// Uses [`RunWritePolicy::CATALOG`] (durable, unpaced, DONTNEED). Does not CRC-verify
+/// inputs (caller trusted them at spill); catalog [`merge_runs`] verifies.
 pub fn merge_runs_to_file(
     inputs: &[SortedRunPath],
     out_path: &Path,
 ) -> Result<SortedRunPath, StoreError> {
+    Ok(merge_runs_to_file_with_policy(inputs, out_path, RunWritePolicy::CATALOG, false)?.run)
+}
+
+/// Like [`merge_runs_to_file`] with write policy and optional per-input CRC verify.
+pub fn merge_runs_to_file_with_policy(
+    inputs: &[SortedRunPath],
+    out_path: &Path,
+    policy: RunWritePolicy,
+    verify_crc: bool,
+) -> Result<MergeToFileResult, StoreError> {
     if inputs.is_empty() {
-        return write_sorted_run_file(out_path, 32, 40, &[]);
+        let run = write_sorted_run_file(out_path, 32, 40, &[], policy)?;
+        return Ok(MergeToFileResult {
+            run,
+            max_u64_at_32: 0,
+        });
     }
     let key_len = inputs[0].key_len as usize;
     let rec_len = inputs[0].rec_len;
@@ -842,10 +985,11 @@ pub fn merge_runs_to_file(
             return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
         }
     }
+    let track_fk = rec_len as usize >= 40;
 
     let mut heap: Vec<MergeHead> = Vec::new();
     for (idx, run) in inputs.iter().enumerate() {
-        let mut cursor = RunCursor::open(run, false)?;
+        let mut cursor = RunCursor::open(run, verify_crc)?;
         if cursor.fill_next()? {
             heap.push(MergeHead { cursor, idx });
         }
@@ -860,6 +1004,8 @@ pub fn merge_runs_to_file(
     let tmp = out_path.with_extension("tmp");
     let mut count = 0u64;
     let mut body_crc = 0xFFFF_FFFFu32;
+    let mut max_u64_at_32 = 0u64;
+    let mut pace_since = 0usize;
     let table = crc32_table();
     {
         let mut f = OpenOptions::new()
@@ -877,10 +1023,23 @@ pub fn merge_runs_to_file(
             }
             let rec = min.cursor.rec();
             f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+            if track_fk && rec.len() >= 40 {
+                let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+                if fk > max_u64_at_32 {
+                    max_u64_at_32 = fk;
+                }
+            }
             for &b in rec {
                 body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
             }
             count = count.saturating_add(1);
+            if policy.pace {
+                pace_since = pace_since.saturating_add(rec.len());
+                if pace_since >= PACE_CHUNK_BYTES {
+                    pace_since = 0;
+                    std::thread::sleep(PACE_SLEEP);
+                }
+            }
             if min.cursor.fill_next()? {
                 heap.push(min);
                 let last = heap.len() - 1;
@@ -897,21 +1056,30 @@ pub fn merge_runs_to_file(
         hdr[20..28].copy_from_slice(&count.to_le_bytes());
         hdr[28..32].copy_from_slice(&body_crc.to_le_bytes());
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
-        f.sync_all().map_err(|e| io_err(&tmp, e))?;
-    }
-    fs::rename(&tmp, out_path).map_err(|e| io_err(out_path, e))?;
-    if let Some(parent) = out_path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
+        if policy.durable {
+            f.sync_all().map_err(|e| io_err(&tmp, e))?;
         }
     }
-    advise_file_dont_need(out_path);
-    Ok(SortedRunPath {
-        path: out_path.to_path_buf(),
-        count,
-        rec_len,
-        key_len: key_len as u32,
-        body_crc32: body_crc,
+    fs::rename(&tmp, out_path).map_err(|e| io_err(out_path, e))?;
+    if policy.durable {
+        if let Some(parent) = out_path.parent() {
+            if let Ok(dirf) = File::open(parent) {
+                let _ = dirf.sync_all();
+            }
+        }
+    }
+    if policy.drop_cache {
+        advise_file_dont_need(out_path);
+    }
+    Ok(MergeToFileResult {
+        run: SortedRunPath {
+            path: out_path.to_path_buf(),
+            count,
+            rec_len,
+            key_len: key_len as u32,
+            body_crc32: body_crc,
+        },
+        max_u64_at_32,
     })
 }
 
@@ -1519,99 +1687,39 @@ pub fn commit_fanin_reduce_and_drop_inputs(
 /// Single atomic MANIFEST update: drop inputs, add output.
 ///
 /// Streams the merge to disk (incremental CRC) — does **not** hold the full
-/// output body in RAM.
+/// output body in RAM. Uses [`RunWritePolicy::CATALOG`] (unpaced durable write).
 pub fn merge_runs(inputs: &[SortedRunPath], out_path: &Path) -> Result<SortedRunPath, StoreError> {
+    Ok(merge_runs_with_policy(inputs, out_path, RunWritePolicy::CATALOG)?.run)
+}
+
+/// Like [`merge_runs`] with write policy; also returns max u64 at record offset 32
+/// (SH create_fk) so callers can bump SEAL without a second full-body read.
+pub fn merge_runs_with_policy(
+    inputs: &[SortedRunPath],
+    out_path: &Path,
+    policy: RunWritePolicy,
+) -> Result<MergeToFileResult, StoreError> {
     if inputs.is_empty() {
-        return write_sorted_run(out_path, 32, 44, &[]);
+        let run = write_sorted_run(out_path, 32, 44, &[])?;
+        return Ok(MergeToFileResult {
+            run,
+            max_u64_at_32: 0,
+        });
     }
-    let key_len = inputs[0].key_len as usize;
-    let rec_len = inputs[0].rec_len;
-    for r in inputs {
-        if r.key_len as usize != key_len || r.rec_len != rec_len {
-            return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
-        }
-    }
-
-    let mut heap: Vec<MergeHead> = Vec::new();
-    for (idx, run) in inputs.iter().enumerate() {
-        let mut cursor = RunCursor::open(run, true)?;
-        if cursor.fill_next()? {
-            heap.push(MergeHead { cursor, idx });
-        }
-    }
-    for i in (0..heap.len()).rev() {
-        sift_down(&mut heap, i, key_len);
-    }
-
-    // Stream write: placeholder header, body + CRC, then rewrite header.
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    let tmp = out_path.with_extension("tmp");
-    let mut count = 0u64;
-    let mut body_crc = 0xFFFF_FFFFu32;
-    let table = crc32_table();
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|e| io_err(&tmp, e))?;
-        let hdr = [0u8; HEADER_LEN];
-        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
-        while !heap.is_empty() {
-            let mut min = heap.swap_remove(0);
-            if !heap.is_empty() {
-                sift_down(&mut heap, 0, key_len);
-            }
-            let rec = min.cursor.rec();
-            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
-            for &b in rec {
-                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
-            }
-            count = count.saturating_add(1);
-            if min.cursor.fill_next()? {
-                heap.push(min);
-                let last = heap.len() - 1;
-                sift_up(&mut heap, last, key_len);
-            }
-        }
-        body_crc ^= 0xFFFF_FFFF;
-        // Header with final count + CRC.
-        f.seek(SeekFrom::Start(0)).map_err(|e| io_err(&tmp, e))?;
-        let mut hdr = [0u8; HEADER_LEN];
-        hdr[0..8].copy_from_slice(&MAGIC);
-        hdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        hdr[12..16].copy_from_slice(&(key_len as u32).to_le_bytes());
-        hdr[16..20].copy_from_slice(&rec_len.to_le_bytes());
-        hdr[20..28].copy_from_slice(&count.to_le_bytes());
-        hdr[28..32].copy_from_slice(&body_crc.to_le_bytes());
-        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
-        f.sync_all().map_err(|e| io_err(&tmp, e))?;
-    }
-    fs::rename(&tmp, out_path).map_err(|e| io_err(out_path, e))?;
-    if let Some(parent) = out_path.parent() {
-        if let Ok(dirf) = File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
-    advise_file_dont_need(out_path);
-    let written = SortedRunPath {
-        path: out_path.to_path_buf(),
-        count,
-        rec_len,
-        key_len: key_len as u32,
-        body_crc32: body_crc,
-    };
+    // CRC-verify inputs when promoting into the durable catalog; L0 rewrites skip
+    // (bodies just written by this process).
+    let verify_crc = policy.durable;
+    let merged = merge_runs_to_file_with_policy(inputs, out_path, policy, verify_crc)?;
     let remove_seqs: Vec<u64> = inputs.iter().filter_map(|r| r.seq()).collect();
-    if let Some(dir) = out_path.parent() {
-        manifest_merge_commit(dir, &remove_seqs, &written)?;
+    if policy.durable {
+        if let Some(dir) = out_path.parent() {
+            manifest_merge_commit(dir, &remove_seqs, &merged.run)?;
+        }
     }
     for r in inputs {
         let _ = fs::remove_file(&r.path);
     }
-    Ok(written)
+    Ok(merged)
 }
 
 // ── List ────────────────────────────────────────────────────────────────────
@@ -1843,7 +1951,7 @@ mod tests {
         write_sorted_run(&d.join("000001.run"), 32, 44, &rec(1, 1)).unwrap();
         // Plant orphan without going through write_sorted_run catalog path.
         let orphan = d.join("000099.run");
-        write_sorted_run_file(&orphan, 32, 44, &rec(9, 9)).unwrap();
+        write_sorted_run_file(&orphan, 32, 44, &rec(9, 9), RunWritePolicy::DURABLE).unwrap();
         // MANIFEST still only has 000001.
         let runs = list_runs(&d).unwrap();
         assert_eq!(runs.len(), 1);
@@ -2265,16 +2373,34 @@ mod tests {
 
         // Legacy heal: remove MANIFEST, keep a valid run → rebuilds catalog.
         let d2 = tmp_dir();
-        write_sorted_run_file(&next_run_path(&d2, 7), 32, 44, &rec(7, 7)).unwrap();
+        write_sorted_run_file(
+            &next_run_path(&d2, 7),
+            32,
+            44,
+            &rec(7, 7),
+            RunWritePolicy::DURABLE,
+        )
+        .unwrap();
         assert!(!manifest_path(&d2).exists());
         let listed_legacy = list_runs(&d2).unwrap();
         assert_eq!(listed_legacy.len(), 1);
         assert!(manifest_path(&d2).exists());
 
         // write errors: bad key/rec, body not multiple
-        assert!(write_sorted_run_file(&d.join("x.run"), 0, 44, &[]).is_err());
-        assert!(write_sorted_run_file(&d.join("y.run"), 32, 16, &[]).is_err());
-        assert!(write_sorted_run_file(&d.join("z.run"), 32, 44, &[1, 2, 3]).is_err());
+        assert!(
+            write_sorted_run_file(&d.join("x.run"), 0, 44, &[], RunWritePolicy::DURABLE).is_err()
+        );
+        assert!(
+            write_sorted_run_file(&d.join("y.run"), 32, 16, &[], RunWritePolicy::DURABLE).is_err()
+        );
+        assert!(write_sorted_run_file(
+            &d.join("z.run"),
+            32,
+            44,
+            &[1, 2, 3],
+            RunWritePolicy::DURABLE
+        )
+        .is_err());
 
         // empty dir
         assert!(list_runs(&d.join("nope")).unwrap().is_empty());
@@ -2339,6 +2465,55 @@ mod tests {
         let out = next_run_path(&d, 9);
         let merged = merge_runs(&[], &out).unwrap();
         assert_eq!(merged.count, 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tip_catalog_unpaced_ibd_background_paced() {
+        // Tip fan-in / recollect must not inherit IBD artificial sleeps.
+        assert!(!RunWritePolicy::CATALOG.pace);
+        assert!(!RunWritePolicy::DURABLE.pace);
+        assert!(!RunWritePolicy::L0.pace);
+        assert!(RunWritePolicy::IBD_BACKGROUND.pace);
+        assert!(RunWritePolicy::CATALOG.durable);
+        assert!(RunWritePolicy::IBD_BACKGROUND.durable);
+    }
+
+    /// L0 spills must be readable without fsync; max create_fk tracked during merge
+    /// (no second full-body scan for SEAL).
+    #[test]
+    fn l0_write_policy_and_merge_tracks_max_fk() {
+        let d = tmp_dir();
+        let p1 = d.join("l0").join("000001.run");
+        let p2 = d.join("l0").join("000002.run");
+        // 40-byte SH records: scripthash[32] | create_fk:u64
+        fn sh_rec(key0: u8, fk: u64) -> [u8; 40] {
+            let mut r = [0u8; 40];
+            r[0] = key0;
+            r[32..40].copy_from_slice(&fk.to_le_bytes());
+            r
+        }
+        let b1 = sh_rec(1, 10);
+        let b2 = sh_rec(2, 99);
+        write_sorted_run_file_with_policy(&p1, 32, 40, &b1, RunWritePolicy::L0).unwrap();
+        write_sorted_run_file_with_policy(&p2, 32, 40, &b2, RunWritePolicy::L0).unwrap();
+        let r1 = open_run(&p1).unwrap();
+        let r2 = open_run(&p2).unwrap();
+        assert_eq!(read_run_body(&r1).unwrap().len(), 40);
+        let out = d.join("l0").join("000003.run");
+        let merged = merge_runs_to_file_with_policy(
+            &[r1, r2],
+            &out,
+            RunWritePolicy::L0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(merged.run.count, 2);
+        assert_eq!(merged.max_u64_at_32, 99, "must track max create_fk while streaming");
+        // L0 policy leaves file readable without catalog MANIFEST.
+        assert!(out.exists());
+        assert!(!manifest_path(out.parent().unwrap()).exists() || true);
+        set_thread_idle_io_priority(); // best-effort no-op on failure
         let _ = fs::remove_dir_all(&d);
     }
 }

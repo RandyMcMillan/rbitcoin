@@ -24,9 +24,10 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    merge_runs, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable, write_sorted_run,
-    ColdProgress, ScriptHashEntry, ScriptHashRecord, Store, StoreError, SortedRunPath,
-    FANIN_TARGET_STREAM_RUNS,
+    merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
+    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy,
+    ColdProgress, RunWritePolicy, ScriptHashEntry, ScriptHashRecord, Store, StoreError,
+    SortedRunPath, FANIN_TARGET_STREAM_RUNS,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -442,11 +443,15 @@ impl RunMemtable for Inner {
         let path = next_run_path(&l0_dir, self.ctrl.next_seq);
         self.ctrl.next_seq += 1;
         let _io = self.ctrl.runs_io.lock().unwrap();
-        // Write without parent MANIFEST (l0 dir has no catalog); file only.
-        let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
-        // Detach from l0 MANIFEST pollution: list_runs on l0 may build MANIFEST —
-        // we track l0 in RAM. Remove MANIFEST if write_sorted_run created one.
-        let _ = std::fs::remove_file(l0_dir.join("MANIFEST"));
+        // L0 is not SEAL-durable (resume recollects create_fk > SEAL). Skip fsync
+        // and DONTNEED so we do not thrash disk/cache before coalesce re-reads.
+        let run = write_sorted_run_file_with_policy(
+            &path,
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+            RunWritePolicy::L0,
+        )?;
         self.l0_bytes = self.l0_bytes.saturating_add(run_body_bytes(&run));
         self.l0.push(run);
         Ok(recs.len() as u64)
@@ -582,6 +587,8 @@ impl ShRunBuilder {
         let hard = cap.saturating_mul(HARD_MEMTABLE_MUL);
         let sealed = self.sealed_max_create_fk();
         let mut g = self.inner.lock().unwrap();
+        let mut crossed_soft = false;
+        let mut crossed_hard = false;
         for rec in creates {
             if rec.create_tx_fk.is_null() {
                 continue;
@@ -590,18 +597,21 @@ impl ShRunBuilder {
             if rec.create_tx_fk.0 <= sealed {
                 continue;
             }
-            while g.pending.len() >= hard && !g.ctrl.stop {
-                self.cv.notify_all();
-                g = self
-                    .cv
-                    .wait_timeout(g, Duration::from_millis(50))
-                    .unwrap()
-                    .0;
-            }
+            // Never block confirm write on SH drain. Soft/hard caps only wake the
+            // idle-prio worker; if disk is busy, memtable may exceed hard until
+            // coalesce catches up (crash resume still recollects create_fk > SEAL).
+            let before = g.pending.len();
             g.pending.push((rec.scripthash, rec.create_tx_fk));
             self.enqueued.fetch_add(1, Ordering::Relaxed);
+            let after = g.pending.len();
+            if before < cap && after >= cap {
+                crossed_soft = true;
+            }
+            if before < hard && after >= hard {
+                crossed_hard = true;
+            }
         }
-        if g.pending.len() >= cap {
+        if crossed_soft || crossed_hard || g.pending.len() >= cap {
             self.cv.notify_all();
         }
     }
@@ -1428,12 +1438,6 @@ fn coalesce_l0_to_catalog(
         if chunk.is_empty() {
             break;
         }
-        let mut max_fk = 0u64;
-        for r in &chunk {
-            if let Ok(body) = rbitcoin_store::read_run_body(r) {
-                max_fk = max_fk.max(max_fk_in_body(&body));
-            }
-        }
         // Single small input and not finalizing: keep in L0 without rewrite.
         if !force_all && chunk.len() == 1 && bytes < promote_min {
             leftover.push(chunk[0].clone());
@@ -1443,7 +1447,14 @@ fn coalesce_l0_to_catalog(
         if promote {
             let out = next_run_path(runs_dir, *next_seq);
             *next_seq += 1;
-            let merged = merge_runs(&chunk, &out)?;
+            // IBD background: paced durable merge so confirm Class A keeps disk;
+            // max create_fk tracked while streaming (no second full-body read).
+            // Tip fan-in uses unpaced CATALOG via merge_runs_to_file — do not pace
+            // that path (tens of GiB multi-pass reduce).
+            let merged =
+                merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
+            let max_fk = merged.max_u64_at_32;
+            let merged = merged.run;
             // Promote is steady IBD traffic — debug only; ~10s recollect/materialize
             // status lines cover long work. Compact (rare) stays at info.
             debug!(
@@ -1477,18 +1488,21 @@ fn coalesce_l0_to_catalog(
     Ok(leftover)
 }
 
-/// Merge into an L0 path without parent catalog MANIFEST.
+/// Merge into an L0 path without parent catalog MANIFEST / fsync / DONTNEED.
 fn merge_runs_to_l0(
     inputs: &[SortedRunPath],
     out: &Path,
 ) -> Result<SortedRunPath, StoreError> {
-    let merged = rbitcoin_store::merge_runs_to_file(inputs, out)?;
+    let merged = rbitcoin_store::merge_runs_to_file_with_policy(
+        inputs,
+        out,
+        RunWritePolicy::L0,
+        false,
+    )?;
     for r in inputs {
         let _ = std::fs::remove_file(&r.path);
     }
-    let l0_dir = out.parent().unwrap_or(out);
-    let _ = std::fs::remove_file(l0_dir.join("MANIFEST"));
-    Ok(merged)
+    Ok(merged.run)
 }
 
 /// Restores prior [`ShRunBuilder::ibd_catalog_compact`] when dropped.
@@ -1569,15 +1583,13 @@ fn compact_catalog_undersized(
         if chunk.len() < 2 {
             break;
         }
-        let mut max_fk = 0u64;
-        for r in &chunk {
-            if let Ok(body) = rbitcoin_store::read_run_body(r) {
-                max_fk = max_fk.max(max_fk_in_body(&body));
-            }
-        }
         let out = next_run_path(runs_dir, *next_seq);
         *next_seq += 1;
-        let merged = merge_runs(&chunk, &out)?;
+        // Crumb compact is IBD-worker-only (confirm hot) — paced like promotes.
+        let merged =
+            merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
+        let max_fk = merged.max_u64_at_32;
+        let merged = merged.run;
         info!(
             "ibd: SH catalog compact inputs={} body≈{:.1}MiB",
             chunk.len(),
@@ -1602,6 +1614,8 @@ fn sh_worker_loop(
     sealed: Arc<AtomicU64>,
     ibd_catalog_compact: Arc<AtomicBool>,
 ) {
+    // Yield disk/CPU to confirm Class A under contention (idle ioprio + nice 19).
+    set_thread_idle_io_priority();
     let target = target_run_bytes();
     let fanin = merge_fanin();
     loop {
@@ -2222,6 +2236,58 @@ mod tests {
         assert!(store.scripthash.head_is_empty());
         assert_eq!(store.scripthash.entry_count(), 0);
         assert_eq!(store.scripthash.include_hwm(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirm write must not stall when SH memtable is past the hard soft-cap.
+    ///
+    /// Regression: enqueue used to `wait_timeout(50ms)` while `pending >= 2×cap`,
+    /// coupling confirm Class C SH collect to worker drain. Now it always accepts
+    /// and only notifies the idle-prio worker.
+    ///
+    /// Do **not** hold `runs_io` here: the worker takes `inner` then `runs_io` on
+    /// flush, so an outer `runs_io` hold + enqueue would deadlock (not a
+    /// production path — confirm never holds `runs_io`).
+    #[test]
+    fn enqueue_never_blocks_past_hard_cap() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-noblock-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Serialize env mutation across parallel tests in this crate.
+        static CAP_LOCK: Mutex<()> = Mutex::new(());
+        let _cap_guard = CAP_LOCK.lock().unwrap();
+        // Tiny cap so a large batch exceeds hard (2× soft). Even with a live
+        // worker, the old wait loop paid multi-×50ms once pending crossed hard;
+        // non-blocking path is pure RAM push.
+        std::env::set_var("RBITCOIN_SH_MEMTABLE_CAP", "1000");
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        let mut batch = Vec::with_capacity(20_000);
+        for i in 1..=20_000u64 {
+            let mut sh = [0u8; 32];
+            sh[0] = (i % 251) as u8;
+            sh[1] = ((i / 251) % 251) as u8;
+            sh[2] = ((i / 63001) % 251) as u8;
+            batch.push(ScriptHashRecord::from_fk(sh, Fk(i)));
+        }
+        let t0 = Instant::now();
+        b.enqueue(&batch);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_millis() < 500,
+            "enqueue blocked confirm-like path for {elapsed:?}"
+        );
+        assert_eq!(
+            b.enqueued.load(Ordering::Relaxed),
+            20_000,
+            "all creates must be accepted"
+        );
+        let _ = b.drain_spills();
+        std::env::remove_var("RBITCOIN_SH_MEMTABLE_CAP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

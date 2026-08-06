@@ -88,10 +88,12 @@ pub use sorted_run::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, crc32, detach_run,
     for_each_merged_rec, for_each_merged_rec_opts, list_fanin_reduce_outputs,
     dynamic_merge_fanin, fanin_passes_total, list_materialize_claims, list_runs,
-    load_fanin_checkpoint, lookup_key, merge_runs, merge_runs_to_file, next_run_path, open_run,
+    load_fanin_checkpoint, lookup_key, merge_runs, merge_runs_to_file,
+    merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path, open_run,
     read_run_body, reduce_runs_to_fanin, reduce_runs_to_fanin_cancellable, remove_run,
-    sh_merge_workers, verify_run_body, write_fanin_checkpoint, write_sorted_run,
-    FANIN_CHECKPOINT_NAME, FANIN_TARGET_STREAM_RUNS, SortedRunPath, FANIN_READY_NAME,
+    set_thread_idle_io_priority, sh_merge_workers, verify_run_body, write_fanin_checkpoint,
+    write_sorted_run, write_sorted_run_file_with_policy, FANIN_CHECKPOINT_NAME,
+    FANIN_TARGET_STREAM_RUNS, MergeToFileResult, RunWritePolicy, SortedRunPath, FANIN_READY_NAME,
 };
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};

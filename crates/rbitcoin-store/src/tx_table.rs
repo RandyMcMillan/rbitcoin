@@ -1830,8 +1830,8 @@ impl TxTable {
                 offset: abs_offs[i],
                 buf: slice,
                 result: i32::MIN,
-                // Policy: all tx.body reads use RWF_DONTCACHE.
-                dontcache: crate::dontcache_policy::body_always(),
+                // Confirm write-stage meta: same pages as load pin — do not DONTCACHE.
+                dontcache: crate::dontcache_policy::body_read_confirm(),
             });
         }
         bulk_io::pread_batch_backend(&mut ops, backend);

@@ -1,10 +1,17 @@
-//! RWF_DONTCACHE policy for Class A / head / idx / sidefile IO (schema 13+).
+//! RWF_DONTCACHE / page-cache policy for Class A / head / idx / sidefile IO.
 //!
 //! | Target | When DONTCACHE |
 //! |--------|----------------|
-//! | `tx.body` reads & writes | **always** |
+//! | `tx.body` **writes** (Class A append, spend annotate pwrite) | **always** — drop after IO |
+//! | `tx.body` **reads** on confirm pipeline (load pin + write-stage meta) | **never** — leave pages for pure-write RMW |
+//! | `tx.body` **reads** generic (`get_raw` / off-pipeline) | **always** |
 //! | `tx.idx` / `tx.head` reads | segment older than **open + past 3 sealed** |
 //! | `txid.body` reads | entry more than **100_000_000** from tail |
+//!
+//! Confirm reuse: load reads parent bodies → structural meta preads → annotate
+//! pwrites hit the same pages. If load/meta DONTCACHE, every 9 B pure-write pays
+//! a kernel page RMW fault. Write-side DONTCACHE (uring `RWF_DONTCACHE`) is the
+//! fd-only equivalent of “drop after use” — not `madvise` (body is not mmap’d).
 //!
 //! Bool helpers feed [`crate::bulk_io::ReadOp::dontcache`] /
 //! [`crate::bulk_io::WriteOp::dontcache`]. Direct-session SQE helpers
@@ -13,9 +20,35 @@
 use crate::txid_body::TXID_DONTCACHE_FROM_TAIL;
 use crate::uring_session::RWF_DONTCACHE;
 
-/// Always DONTCACHE for Class A packed body payload IO.
+/// Class A body **writes**: always request DONTCACHE after the IO completes.
+///
+/// Covers Class A append and spend-annotate pure-write pwrites. Same intent as
+/// `posix_fadvise(DONTNEED)` on the written pages; for io_uring we set
+/// `RWF_DONTCACHE` on the SQE (body tables are fd-only, not `madvise`).
+#[inline]
+pub fn body_write() -> bool {
+    true
+}
+
+/// Historical alias: “body always DONTCACHE” meant writes + all reads.
+/// Prefer [`body_write`] / [`body_read_confirm`] / [`body_read_generic`].
 #[inline]
 pub fn body_always() -> bool {
+    body_write()
+}
+
+/// Confirm-pipeline body **reads** (load pin `idx_body` + write-stage meta preads).
+///
+/// **Do not** DONTCACHE: the same pages are re-touched for pure-write annotate
+/// (kernel RMW). Dropping here forces a cold page fault per annotate edge.
+#[inline]
+pub fn body_read_confirm() -> bool {
+    false
+}
+
+/// Off-pipeline / generic body **reads** (`get_raw`, RPC reconstruct, etc.).
+#[inline]
+pub fn body_read_generic() -> bool {
     true
 }
 
@@ -39,10 +72,10 @@ pub fn head_or_idx_segment_index(si: usize, n_segs: usize) -> bool {
     head_or_idx_segment(sealed_age_from_index(si, n_segs))
 }
 
-/// `rw_flags` for Class A body SQEs (0 when RWF_DONTCACHE unsupported).
+/// `rw_flags` for Class A body **write** SQEs (annotate / append).
 #[inline]
 pub fn body_sqe_rw_flags() -> i32 {
-    if body_always() && crate::bulk_io::rwf_dontcache_ok() {
+    if body_write() && crate::bulk_io::rwf_dontcache_ok() {
         RWF_DONTCACHE
     } else {
         0
@@ -88,8 +121,11 @@ mod tests {
     use rbitcoin_primitives::Fk;
 
     #[test]
-    fn body_always_true() {
+    fn body_write_yes_confirm_read_no() {
+        assert!(body_write());
         assert!(body_always());
+        assert!(!body_read_confirm());
+        assert!(body_read_generic());
     }
 
     #[test]
@@ -114,7 +150,7 @@ mod tests {
         assert_eq!(RWF_DONTCACHE, 0x80);
         #[cfg(not(target_os = "linux"))]
         assert_eq!(RWF_DONTCACHE, 0);
-        assert!(body_always());
+        assert!(body_write());
         assert!(head_or_idx_segment(4));
         assert!(txid_sidefile_entry(1, TXID_DONTCACHE_FROM_TAIL + 10));
     }
@@ -122,44 +158,52 @@ mod tests {
     #[test]
     fn policy_matches_sidefile_helper() {
         use crate::txid_body::TxidBody;
-        // Mirror TxidBody::dontcache_for_fk formula.
         let n = TXID_DONTCACHE_FROM_TAIL + 3;
         assert_eq!(txid_sidefile_entry(1, n), true);
         assert_eq!(txid_sidefile_entry(n, n), false);
         let _ = TxidBody::entry_offset(1).unwrap();
     }
 
-    /// Op construction: body always, old head/idx, far sidefile set `dontcache`.
+    /// Op construction: body write + generic read DONTCACHE; confirm read does not.
     #[test]
     fn read_write_op_flags_follow_policy() {
         use crate::bulk_io::{ReadOp, WriteOp};
         let mut rb = [0u8; 8];
-        let body_ro = ReadOp {
+        let conf_ro = ReadOp {
             fd: 0,
             offset: 0,
             buf: &mut rb,
             result: i32::MIN,
-            dontcache: body_always(),
+            dontcache: body_read_confirm(),
         };
-        assert!(body_ro.dontcache);
+        assert!(!conf_ro.dontcache);
+        let gen_ro = ReadOp {
+            fd: 0,
+            offset: 0,
+            buf: &mut rb,
+            result: i32::MIN,
+            dontcache: body_read_generic(),
+        };
+        assert!(gen_ro.dontcache);
         let wb = [0u8; 8];
         let body_wo = WriteOp {
             fd: 0,
             offset: 0,
             buf: &wb,
             result: i32::MIN,
-            dontcache: body_always(),
+            dontcache: body_write(),
         };
         assert!(body_wo.dontcache);
-        // Head/idx: open + past 3 sealed stay cacheable; older get DONTCACHE.
         assert!(!head_or_idx_segment(0));
         assert!(!head_or_idx_segment(3));
         assert!(head_or_idx_segment(4));
-        assert!(!head_or_idx_segment_index(4, 5)); // tip
-        assert!(head_or_idx_segment_index(0, 5)); // oldest of 5
-        // Sidefile far from tail.
+        assert!(!head_or_idx_segment_index(4, 5));
+        assert!(head_or_idx_segment_index(0, 5));
         assert!(txid_sidefile_entry(1, TXID_DONTCACHE_FROM_TAIL + 1));
-        assert!(!txid_sidefile_entry(TXID_DONTCACHE_FROM_TAIL + 1, TXID_DONTCACHE_FROM_TAIL + 1));
+        assert!(!txid_sidefile_entry(
+            TXID_DONTCACHE_FROM_TAIL + 1,
+            TXID_DONTCACHE_FROM_TAIL + 1
+        ));
         #[cfg(target_os = "linux")]
         assert_eq!(RWF_DONTCACHE, 0x80);
     }
@@ -180,14 +224,12 @@ mod tests {
         txid[0] = 0xab;
         h.insert(&txid, Fk(1)).unwrap();
 
-        // Tip (open) segment: no DONTCACHE.
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = h.probe_fks_batch_dontcache(&[txid], false).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty(), "probe must issue bulk page load");
         assert!(flags.iter().all(|&d| !d), "open/tip head must not DONTCACHE");
 
-        // Simulated old segment: production passes true from sealed-age policy.
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = h.probe_fks_batch_dontcache(&[txid], true).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
@@ -202,7 +244,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Class A body append builds WriteOp with body_always DONTCACHE.
+    /// Class A body append builds WriteOp with body_write DONTCACHE.
     #[test]
     fn body_append_write_op_sets_dontcache() {
         use crate::bulk_io;
@@ -236,20 +278,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// idx bulk path sets dontcache from segment index policy.
     #[test]
     fn idx_bulk_read_sets_dontcache_by_segment_age() {
-        // Pure policy used by tx_idx::record_starts_batch_bulk op construction.
         let n = 6usize;
-        // si=5 tip → age 0; si=0 age 5 → DONTCACHE
         assert!(!head_or_idx_segment_index(5, n));
-        assert!(!head_or_idx_segment_index(n - 1 - 3, n)); // age 3
-        assert!(head_or_idx_segment_index(n - 1 - 4, n)); // age 4
+        assert!(!head_or_idx_segment_index(n - 1 - 3, n));
+        assert!(head_or_idx_segment_index(n - 1 - 4, n));
         assert_eq!(sealed_age_from_index(0, n), 5);
         assert_eq!(sealed_age_from_index(5, n), 0);
     }
 
-    /// body_sqe_rw_flags matches RWF_DONTCACHE when supported.
     #[test]
     fn body_sqe_flags_match_constant_when_ok() {
         let f = body_sqe_rw_flags();
@@ -266,7 +304,6 @@ mod tests {
         let far = sidefile_sqe_rw_flags(1, n);
         let near = sidefile_sqe_rw_flags(n, n);
         assert_eq!(near, 0);
-        // Head/idx use ReadOp.dontcache bools (same sealed-age policy).
         assert!(head_or_idx_segment_index(0, 6));
         assert!(!head_or_idx_segment_index(5, 6));
         if crate::bulk_io::rwf_dontcache_ok() {
@@ -276,7 +313,7 @@ mod tests {
         }
     }
 
-    /// Serial Class A body get_raw routes through bulk_io with body_always.
+    /// Serial Class A body get_raw still DONTCACHE (generic / off-pipeline).
     #[test]
     fn body_get_raw_sets_dontcache_via_bulk_io() {
         use crate::bulk_io;
@@ -314,6 +351,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Confirm load pin path (`idx_body`) must **not** DONTCACHE body reads.
+    #[test]
+    fn idx_body_pipeline_confirm_load_no_dontcache() {
+        use crate::bulk_io;
+        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
+        use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-idx-body-dc-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = TxTable::create(&dir).unwrap();
+        let tx = TxRecord {
+            txid: [0xcd; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let outs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let fks = t
+            .put_full_batch_indexed(&[(tx, inputs, outs)], false)
+            .unwrap();
+        let mut jobs = vec![IdxBodyJob::new(fks[0].0, None)];
+        let _ = bulk_io::test_take_last_read_dontcache();
+        run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
+        assert!(jobs[0].ok);
+        let flags = bulk_io::test_take_last_read_dontcache();
+        assert!(
+            !flags.is_empty() && flags.iter().all(|&d| !d),
+            "confirm load body reads must not DONTCACHE; got {flags:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write-stage spender meta preads must **not** DONTCACHE (same pages as load).
+    #[test]
+    fn spender_meta_batch_confirm_read_no_dontcache() {
+        use crate::bulk_io;
+        use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-meta-dc-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = TxTable::create(&dir).unwrap();
+        let tx = TxRecord {
+            txid: [0xee; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        let fks = t
+            .put_full_batch_indexed(&[(tx, inputs, outs)], false)
+            .unwrap();
+        let (off, len) = t.body_range(fks[0]).unwrap();
+        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
+        let abs = off + u64::from(decoded[0].as_ref().unwrap().2[0]);
+        let _ = bulk_io::test_take_last_read_dontcache();
+        let _ = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+        let flags = bulk_io::test_take_last_read_dontcache();
+        assert!(
+            !flags.is_empty() && flags.iter().all(|&d| !d),
+            "confirm meta body reads must not DONTCACHE; got {flags:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Sidefile get always builds a bulk ReadOp with per-fk policy flag.
     #[test]
     fn sidefile_get_sets_dontcache_flag_on_read_op() {
@@ -346,7 +463,6 @@ mod tests {
         assert_eq!(tid, [3u8; 32]);
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty(), "sidefile get must issue bulk ReadOp");
-        // Near tail (count=1): no DONTCACHE.
         assert!(
             flags.iter().all(|&d| !d),
             "near-tail sidefile must not DONTCACHE; got {flags:?}"

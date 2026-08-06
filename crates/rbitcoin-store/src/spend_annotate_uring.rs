@@ -113,7 +113,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
             });
             {
                 let s = slots[slot].as_mut().unwrap();
-                // Policy: all tx.body reads use RWF_DONTCACHE.
+                // RMW fallback pread: still drop after (not confirm pure-write path).
                 let flags = crate::dontcache_policy::body_sqe_rw_flags();
                 session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
             }
@@ -687,8 +687,8 @@ mod tests {
     #[test]
     fn uring_rmw_body_sqe_sets_rwf_dontcache() {
         if !crate::bulk_io::io_uring_enabled() {
-            // No ring in this environment — policy helper still body-always.
-            assert!(crate::dontcache_policy::body_always());
+            // No ring in this environment — write path still requests DONTCACHE.
+            assert!(crate::dontcache_policy::body_write());
             return;
         }
         let (dir, t, spenders) = temp_table();

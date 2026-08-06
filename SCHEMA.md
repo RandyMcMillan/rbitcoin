@@ -153,7 +153,7 @@ Decode walks meta + runs to a logical end; any remaining bytes in the idx span m
 **Body meta (32 B):** version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
 On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload). Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-**IO policy (RWF_DONTCACHE):** **all** reads and writes to `tx.body` set `RWF_DONTCACHE` on uring SQEs. `tx.idx` / `tx.head` segment reads older than the **open segment + past 3 sealed** also set it.
+**IO policy (RWF_DONTCACHE):** `tx.body` **writes** (Class A append, spend annotate pwrite) always set `RWF_DONTCACHE` (fd-only equivalent of dropping pages after use — not `madvise`). Confirm-pipeline body **reads** (load pin + write-stage spender meta) do **not** DONTCACHE so pure-write annotate can RMW warm pages. Generic body reads (`get_raw`) still DONTCACHE. `tx.idx` / `tx.head` segment reads older than the **open segment + past 3 sealed** also set it.
 
 ### Segmented body index (`tx.idx.*`)
 

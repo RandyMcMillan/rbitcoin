@@ -235,7 +235,7 @@ impl VarTable {
 
     /// Inspect record bytes without copying into a `Vec`.
     ///
-    /// Body load uses schema-13 always-DONTCACHE (same as [`Self::get_raw`]).
+    /// Body load uses generic DONTCACHE (same as [`Self::get_raw`]; not confirm pin path).
     pub fn with_raw<R>(
         &self,
         fk: Fk,
@@ -247,7 +247,8 @@ impl VarTable {
 
     /// Inspect body bytes at a known absolute range (no idx read).
     ///
-    /// Schema 13: Class A body reads always request RWF_DONTCACHE.
+    /// Off-pipeline generic read: DONTCACHE. Confirm load uses
+    /// [`crate::idx_body_pipeline`] (cacheable).
     pub fn with_bytes_at<R>(
         &self,
         offset: u64,
@@ -276,7 +277,7 @@ impl VarTable {
     }
 
     /// Class A body payload write. Routes through bulk `WriteOp` with
-    /// [`crate::dontcache_policy::body_always`] so io_uring SQEs set
+    /// [`crate::dontcache_policy::body_write`] so io_uring SQEs set
     /// `RWF_DONTCACHE`; falls back to plain pwrite when uring is unavailable.
     fn write_body_blob_dontcache(&self, start: u64, body_blob: &[u8]) -> Result<(), StoreError> {
         if body_blob.is_empty() {
@@ -291,7 +292,7 @@ impl VarTable {
             offset: start,
             buf: body_blob,
             result: i32::MIN,
-            dontcache: crate::dontcache_policy::body_always(),
+            dontcache: crate::dontcache_policy::body_write(),
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
@@ -481,7 +482,7 @@ impl VarTable {
         Ok(n)
     }
 
-    /// Class A body pread with [`crate::dontcache_policy::body_always`].
+    /// Class A body pread with [`crate::dontcache_policy::body_read_generic`].
     fn read_body_dontcache(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         if buf.is_empty() {
             return Ok(());
@@ -490,7 +491,7 @@ impl VarTable {
             self.body.read_fd(),
             offset,
             buf,
-            crate::dontcache_policy::body_always(),
+            crate::dontcache_policy::body_read_generic(),
         );
         if rc < 0 {
             return Err(StoreError::io(

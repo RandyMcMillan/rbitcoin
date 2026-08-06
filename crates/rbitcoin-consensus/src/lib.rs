@@ -582,7 +582,7 @@ pub use confirm_run::{
     lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_load_channel,
     ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
     PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
-    WirePrepPipeline,
+    WireLoadPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

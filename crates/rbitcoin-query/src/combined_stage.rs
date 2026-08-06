@@ -252,7 +252,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Confirm prep intake: payload by height from RAM (no dequeue).
+    /// Confirm load intake: payload by height from RAM (no dequeue).
     #[test]
     fn block_queue_payload_peek_ram() {
         let (dir, q) = temp_query();

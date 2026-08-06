@@ -3,8 +3,8 @@
 //! **Unified height-ordered path (current):**
 //! - N outbound peer workers (TCP + cmd/event channels); decode on blocking pool
 //! - Peer offers wire into the durable **body queue** and notes height/hash readiness
-//! - **Confirm** pipeline: prep (reload wire by height + plan/pin) → scripts (CPU) →
-//!   **commit** as sole Class A appender + Class C tip; dequeue body queue after tip
+//! - **Confirm** pipeline: lookup (stamp create_fk) → load (reload wire + pin) →
+//!   scripts (CPU) → **write** as sole Class A appender + Class C tip; dequeue body queue after tip
 //! - **Densify getdata** fills missing heights tip-first while body-queue bytes have
 //!   room (`window` = in-flight cap, not tip-distance); tip-batch multi-peer race
 //! - Peer frames land **raw** in the body queue (no peer full-block decode);
@@ -265,7 +265,7 @@ pub async fn ibd_cancellable(
             .map(|n| n.get())
             .unwrap_or(1);
         info!(
-            "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: load+scripts+write OS threads)"
+            "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: lookup+load+scripts+write OS threads)"
         );
     }
     // Dial book: persisted peers (flags) + seeds/connect, ranked by PeerFlags.
@@ -865,7 +865,7 @@ pub async fn ibd_cancellable(
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
             let tip_rate = tip_delta as f64 / window_secs;
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            let (plan_q, load_q, write_q) = confirm_queues.snap();
+            let (load_q, script_q, write_q) = confirm_queues.snap();
             // Class A fks published in tx.idx (dense create_fk high-water).
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
@@ -878,14 +878,14 @@ pub async fn ibd_cancellable(
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // plan_q/scriptq/writeq; `name<0/cap` = empty.
+            // loadq/scriptq/writeq; `name<0/cap` = empty.
             // bq soft=n/win RAM=: in-RAM body queue; win = 1-min confirm window at rate.
             let conf_q = confirm::format_conf_q(
-                plan_q,
                 load_q,
+                script_q,
                 write_q,
                 confirm::load_queue_cap(),
-                confirm::load_queue_cap(),
+                confirm::script_queue_cap(),
                 confirm::write_queue_cap(),
             );
             let progress_line = format_progress_line(&ProgressLineInput {
@@ -915,7 +915,7 @@ pub async fn ibd_cancellable(
                 .saturating_add(st.inflight.len() as u32);
             // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
-            let (plan_q, load_q, write_q) = confirm_queues.snap();
+            let (load_q, script_q, write_q) = confirm_queues.snap();
             let conf_q_hwm = confirm_queues.sample_hwm_and_reset();
             let mut conf_pipe = confirm_queues.content_snap();
             let (feed_ready, feed_inflight) = confirm_feed.size_snap();
@@ -934,8 +934,8 @@ pub async fn ibd_cancellable(
                 peers_n,
                 st.headers_done,
                 parent_cache_snap,
-                plan_q,
                 load_q,
+                script_q,
                 write_q,
                 conf_q_hwm,
                 hub.query.scripthash_run_count(),
@@ -947,15 +947,15 @@ pub async fn ibd_cancellable(
             perf_log::log_sample(&perf);
 
             // Stall watchdog: tip frozen while path looks claim-ready — real confirm
-            // bug only when the **confirm pipeline is idle**. Mid-mainnet 32-block
-            // prep+scripts+write often takes 8–15s (and cold restart first batch
+            // bug only when the **confirm pipeline is idle**. Mid-mainnet batches
+            // load+scripts+write often take 8–15s (and cold restart first batch
             // longer); peer `inflight` empty is normal with a full body queue.
             // Do **not** WARN while feed has claims or lookup/load/scripts/write
             // queues hold work (post-rehydrate cold start used to spam tip stall with
-            // ready=false even though prep was live on tip+1).
+            // ready=false even though load was live on tip+1).
             let conf_busy = feed_inflight > 0
-                || plan_q > 0
                 || load_q > 0
+                || script_q > 0
                 || write_q > 0
                 || loop_stats.confirm_live_snap().is_some();
             if last_progress.elapsed() > Duration::from_secs(15)

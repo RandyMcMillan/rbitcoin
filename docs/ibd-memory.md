@@ -85,7 +85,7 @@ known retain structures:
 | `conf loadq` / `scriptq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= sh_mt= accounted= residual=` | Approx process heap: BQ + prep-ahead CreatePins + parent-store live pins + SH memtable + confirm wire; residual = anon − accounted |
+| `heap … iflight= pstore= sh_mt= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + SH memtable + confirm wire; residual = anon − accounted |
 
 Grep:
 

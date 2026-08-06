@@ -70,14 +70,14 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 
 ## Practical rules
 
-1. Do **not** spawn a second Class A writer while IBD confirm commit is running.
-2. Pipeline depth: prep(N+1) ∥ scripts(N) ∥ commit(N−1) via bounded load/write queues.
-3. Scripts for batch N may run while prep does N+1 and commit does N−1. Scripts never touch disk.
-4. **Prep ahead of store tip:** prep may plan batch N+1 while commit has not advanced tip.
-   Prep holds a **reserved create-fk HWM** and **in-flight create/out maps** from
-   uncommitted plans (`WirePrepPipeline` / `archive_plan_batch_from`). First height
-   of a batch is the **pipeline path_lo** (tip+1 or last-prepped+1), not only store tip.
-   Commit still applies batches in height order; on permanent reject, prep clears
+1. Do **not** spawn a second Class A writer while IBD confirm write is running.
+2. Pipeline depth: lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2) via bounded loadq/scriptq/writeq.
+3. Scripts for batch N may run while load does N+1 and write does N−1. Scripts never touch disk.
+4. **Load ahead of store tip:** lookup may stamp batch N+1 while write has not advanced tip.
+   Lookup holds a **reserved create-fk HWM** and **in-flight create/out maps** from
+   uncommitted plans (`WireLoadPipeline` / `archive_plan_batch_from`). First height
+   of a batch is the **pipeline path_lo** (tip+1 or last-loaded+1), not only store tip.
+   Write still applies batches in height order; on permanent reject, lookup clears
    reserved state and re-syncs from `txs.count()`.
 5. On SIGINT, IBD cancels cooperatively — do not drop nested runtimes mid-await.
 
@@ -89,8 +89,8 @@ can still stall the **host** (page cache / disk). Class C tip tables use L2
 write-behind (`flush_class_c_tip` before BQ dequeue); large tables stay L0.
 are small. See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
-### Confirm prep read pipeline
+### Confirm load read pipeline
 
-Cold parent `tx.idx` / `tx.body` on the **prep** thread uses
+Cold parent `tx.idx` / `tx.body` on the **load** thread uses
 **FdOnly idx + bulk body** (`idx_body_pipeline` → `bulk_io` uring/pread). Batch
 creates come from **wire**, not a second Class A full-decode pass.

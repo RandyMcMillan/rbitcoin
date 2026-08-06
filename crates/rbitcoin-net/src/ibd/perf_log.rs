@@ -15,11 +15,12 @@
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
 //!
-//! Unified path: peer → **body queue** → confirm **prep** (plan+pin+assemble) →
-//! **scripts** → **write** (sole Class A append + Class C / spends / tip).
+//! Unified path: peer → **body queue** → confirm **lookup** (stamp) → **load**
+//! (pin+assemble) → **scripts** → **write** (sole Class A append + Class C / spends / tip).
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
-//! - **prep** = pre-assemble (`LOAD_NS`: structure+plan+pin) + assemble (`CONNECT_NS`)
+//! - **lookup** = structure + stamp create_fk (`plan_ms` / lookup_thr)
+//! - **load** = pre-assemble (`LOAD_NS`: pin denserels) + assemble (`CONNECT_NS`)
 //! - **script** = `SCRIPT_NS`
 //! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tip GC
 //!

@@ -497,7 +497,7 @@ pub(crate) fn apply_confirm_reject(
     //   (signet partial IBD @~42k). Requeue without blacklisting; claim will
     //   retry once headers/plans catch up.
     //
-    // Internal pipeline races (prevout already spent, denserels pin, plan stage
+    // Internal pipeline races (prevout already spent, denserels pin, lookup stage
     // miss, parent create_fk unresolved, load incomplete) stay **permanent**.
     let soft_reget = err.contains("unexpected previous header")
         || err.contains("unexpected previous")

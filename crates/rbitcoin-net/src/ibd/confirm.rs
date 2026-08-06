@@ -5,7 +5,7 @@ use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::{PlanStampOutcome, WirePrepPipeline};
+use rbitcoin_consensus::{PlanStampOutcome, WireLoadPipeline};
 use rbitcoin_log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -80,7 +80,7 @@ impl LoadAheadState {
         rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
     }
 
-    fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WirePrepPipeline {
+    fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WireLoadPipeline {
         let parent_hash = if path_lo == store_path_lo {
             None
         } else {
@@ -88,7 +88,7 @@ impl LoadAheadState {
                 .filter(|(h, _)| *h + 1 == path_lo)
                 .map(|(_, hash)| hash)
         };
-        WirePrepPipeline {
+        WireLoadPipeline {
             path_lo,
             parent_hash,
             next_tx_start: self.next_tx_start,
@@ -448,7 +448,7 @@ struct LookupDone {
     /// denserels on `ArchiveWritePlan::external_parent_outs`.
     stamped: PlanStampOutcome,
     /// In-flight creates/outs for load pin (prior uncommitted batches).
-    pipeline: WirePrepPipeline,
+    pipeline: WireLoadPipeline,
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -2287,7 +2287,7 @@ mod tests {
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
         assert!(!is_confirm_load_retryable("unexpected previous header"));
-        assert!(!is_confirm_load_retryable("invariant: plan stage miss"));
+        assert!(!is_confirm_load_retryable("invariant: lookup stage miss"));
     }
 
     /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).

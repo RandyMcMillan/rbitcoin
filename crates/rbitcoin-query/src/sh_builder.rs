@@ -42,7 +42,7 @@ pub enum ShTipMaterializeMode {
 
 /// Select materialize mode. **Never** returns FullCold when head already holds durable data.
 ///
-/// Intentional full cold (FORCE / empty-head recollect) runs only after prep has
+/// Intentional full cold (FORCE / empty-head recollect) runs only after load has
 /// reinit'd the head empty. Incomplete catalogs are fixed *before* this (Class A
 /// recollect). Sticky FORCE alone never overrides a live durable head.
 pub fn select_sh_tip_materialize_mode(

@@ -2,15 +2,16 @@
 //!
 //! **Primary height-ordered pipeline** (raw wire → validated tip):
 //! ```text
-//! PREP STAGE (ibd-confirm-load OS thread):
-//!   wire Block → structure → plan Class A (stamp create_fk) → pin parents once
-//!   → assemble (uses intake wire; **no Class-A wire rebuild**)
+//! LOOKUP STAGE (ibd-confirm-lookup OS thread):
+//!   wire Block → structure → stamp create_fk (Class A planned only)
+//! LOAD STAGE (ibd-confirm-load OS thread):
+//!   pin denserels once → assemble (uses intake wire; **no Class-A wire rebuild**)
 //! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
 //!   pure CPU verify — no Query, no disk
-//! COMMIT STAGE (ibd-confirm-write OS thread, FIFO):
+//! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC
 //! ```
-//! IBD pipelines prep(N+1) ∥ scripts(N) ∥ commit(N−1). One Class A appender.
+//! IBD pipelines lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2). One Class A appender.
 //!
 //! [`confirm_wire_run`] is the unified entry (tests / tip / IBD).
 //! [`confirm_archived_run`] remains for already-archived Class A only.
@@ -84,32 +85,32 @@ struct Prepared {
 /// after accept). Empty = verify all jobs (IBD). Passed through load → scripts only.
 pub type ScriptPreverified = std::collections::HashSet<[u8; 32]>;
 
-/// Pipeline context so prep(N+1) can run while commit(N) has not advanced tip.
+/// Pipeline context so lookup(N+1) can run while write(N) has not advanced tip.
 ///
-/// Prep thread owns reserved create-fk HWM and in-flight creates/outs from
-/// batches sitting in load→scripts→write queues. Commit remains sole Class A
+/// Lookup thread owns reserved create-fk HWM and in-flight creates/outs from
+/// batches sitting in load→scripts→write queues. Write remains sole Class A
 /// appender and applies batches in height order.
 #[derive(Clone, Debug, Default)]
-pub struct WirePrepPipeline {
-    /// Expected first height of this batch (store tip+1, or last prepped + 1).
+pub struct WireLoadPipeline {
+    /// Expected first height of this batch (store tip+1, or last loaded + 1).
     pub path_lo: u32,
-    /// Parent of `path_lo` when ahead of store tip (last wire hash of prior prepped batch).
+    /// Parent of `path_lo` when ahead of store tip (last wire hash of prior loaded batch).
     pub parent_hash: Option<[u8; 32]>,
     /// Inclusive create-fk start for [`Query::archive_plan_batch_from`].
     pub next_tx_start: u64,
     /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
     ///
-    /// Prep looks up create fk / full CreatePin for parents still only in the
+    /// Load looks up create fk / full CreatePin for parents still only in the
     /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
     pub in_flight: rbitcoin_query::InFlightView,
-    /// Pipeline-wide sparse parent pin store (Weak map; prep get-or-insert only).
+    /// Pipeline-wide sparse parent pin store (Weak map; load get-or-insert only).
     /// Batches hold `Arc` handles so concurrent stages share one payload per create.
     pub parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
 }
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
-/// `Send` so IBD can hand off prep → scripts threads.
+/// `Send` so IBD can hand off load → scripts threads.
 /// Sparse spent-filtered parents ride on the batch (not tip-GCed).
 /// When [`archive_plan`] is `Some`, commit stage appends Class A before
 /// structural / annotate (single ordered commit era).
@@ -117,11 +118,11 @@ pub struct LoadedBatch {
     prepared: Vec<Prepared>,
     /// Shared wire (Arc) so load→scripts→write does not deep-clone full blocks.
     wire_blocks: Vec<Arc<Block>>,
-    /// Per-batch pin map: prep → assemble → write structural, then drop.
+    /// Per-batch pin map: load → assemble → write structural, then drop.
     batch_parents: rbitcoin_query::BatchParents,
     /// Mempool preverified txids for scripts stage (tip follow); empty on IBD.
     script_preverified: ScriptPreverified,
-    /// Planned Class A write from wire prep (committed in write stage).
+    /// Planned Class A write from wire lookup/load (committed in write stage).
     pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
 }
 
@@ -274,17 +275,18 @@ pub fn confirm_load_phase_preverified(
     })
 }
 
-/// PREP STAGE from **raw wire blocks** (unified height-ordered pipeline).
+/// LOAD STAGE from **raw wire blocks** (unified height-ordered pipeline).
 ///
+/// One-shot path (tests / tip-follow) runs lookup+load together:
 /// - Structure / PoW checks, ensure headers
-/// - Plan Class A (assign create fks, stamp inputs) **without** committing
+/// - Stamp Class A create fks **without** committing
 /// - Pin external parents once (denserels); same-batch from plan
 /// - Assemble using **intake wire** (no Class-A wire rebuild)
 ///
 /// The plan rides on [`LoadedBatch::archive_plan`] and is committed in write.
 ///
-/// `pipeline`: when `Some`, first height may be ahead of store tip (prep(N+1)
-/// while commit(N) in flight). Use reserved create-fk HWM + in-flight creates.
+/// `pipeline`: when `Some`, first height may be ahead of store tip (lookup(N+1)
+/// while write(N) in flight). Use reserved create-fk HWM + in-flight creates.
 pub fn confirm_wire_load_phase(
     query: &Query,
     params: &ChainParams,
@@ -303,16 +305,16 @@ pub fn confirm_wire_load_phase(
     )
 }
 
-/// Like [`confirm_wire_load_phase`] with optional pipeline caches for prep-ahead.
+/// Like [`confirm_wire_load_phase`] with optional pipeline caches for load-ahead.
 ///
-/// `cold_mode`: IBD prep after denserels stage uses [`ColdPinMode::Forbid`].
+/// `cold_mode`: IBD load after lookup denserels ensure uses [`ColdPinMode::Forbid`].
 pub fn confirm_wire_load_phase_pipelined(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
-    pipeline: Option<&WirePrepPipeline>,
+    pipeline: Option<&WireLoadPipeline>,
     cold_mode: ColdPinMode,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     if blocks.is_empty() {
@@ -357,7 +359,7 @@ pub fn confirm_wire_load_phase_pipelined(
         // Sole compute_txid pass for this block in the confirm pipeline.
         let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
-        // First height must sit at pipeline path_lo (store tip+1, or last prepped+1).
+        // First height must sit at pipeline path_lo (store tip+1, or last loaded+1).
         // Later heights in the same batch validate against prior wire, not store tip.
         let t = Instant::now();
         if i == 0 {
@@ -577,7 +579,7 @@ pub fn confirm_wire_load_phase_pipelined(
     })
 }
 
-/// Unified wire → tip (prep + scripts + commit). Primary production entry.
+/// Unified wire → tip (lookup+load + scripts + write). Primary production entry.
 pub fn confirm_wire_run(
     query: &Query,
     params: &ChainParams,
@@ -603,14 +605,14 @@ pub fn confirm_wire_run_preverified(
 /// Whether wire pin may cold-load denserels from Class A body.
 ///
 /// IBD **lookup** stage ensures external-parent denserels into **plan-local**
-/// state. Prep then uses [`ColdPinMode::Forbid`] so cold denserels is never
+/// state. Load then uses [`ColdPinMode::Forbid`] so cold denserels is never
 /// duplicated on the load thread. Tests / one-shot [`confirm_wire_load_phase`]
 /// use [`ColdPinMode::Allow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdPinMode {
     /// Plan-local miss → `load_creates_once` cold denserels (tests / Allow pin).
     Allow,
-    /// Miss after plan ensure → hard `invariant: denserels stage miss` (load after lookup).
+    /// Miss after lookup ensure → hard `invariant: denserels stage miss` (load after lookup).
     Forbid,
 }
 
@@ -635,7 +637,7 @@ pub struct DenserelsWarmStats {
 /// resolve here — plan already stamped via batch + head. Same-batch creates are
 /// skipped (pin uses offline denserels).
 ///
-/// Prep pin with [`ColdPinMode::Forbid`] must see every external parent covered
+/// Load pin with [`ColdPinMode::Forbid`] must see every external parent covered
 /// via plan-local map, in-flight, or same-batch.
 pub fn ensure_external_parent_denserels_from_plan(
     query: &Query,
@@ -797,7 +799,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                     )
                     .map_err(|_| {
                         ConsensusError::Store(StoreError::Corrupt(
-                            "invariant: plan stage external parent denserels decode failed",
+                            "invariant: lookup stage external parent denserels decode failed",
                         ))
                     })?
                 };
@@ -838,14 +840,14 @@ pub fn ensure_external_parent_denserels_from_plan(
                 .is_none_or(|pin| pin.1.is_empty() && pin.2.is_empty())
             {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: plan stage failed to load external parent denserels",
+                    "invariant: lookup stage failed to load external parent denserels",
                 )));
             }
         }
     }
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
-    // Parent mix + subtimers; wall TOTAL_NS is owned by plan stage caller.
+    // Parent mix + subtimers; wall TOTAL_NS is owned by lookup stage caller.
     lookup_stage_stats::note(
         0, // blocks counted by caller
         st.parents as u64,
@@ -872,8 +874,8 @@ pub fn ensure_external_parent_denserels_from_plan(
 
 /// Lookup-stage output: structure + plan batch only (create_fk stamped).
 ///
-/// Denserels pin + assemble stay on **prep** so the pipeline stays balanced:
-/// plan(N+1) head-stamp overlaps prep(N) denserels IO. Handoff is the owned
+/// Denserels pin + assemble stay on **load** so the pipeline stays balanced:
+/// lookup(N+1) head-stamp overlaps load(N) denserels IO. Handoff is the owned
 /// [`ArchiveWritePlan`] + wire/metas (pipeline pins only).
 pub struct PlanStampOutcome {
     pub plan: Option<rbitcoin_query::ArchiveWritePlan>,
@@ -892,7 +894,7 @@ pub fn confirm_wire_lookup_stamp(
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
-    pipeline: Option<&WirePrepPipeline>,
+    pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
     let (plan, metas, wire_blocks, plan_ns) =
@@ -909,7 +911,7 @@ pub fn confirm_wire_lookup_stamp(
     })
 }
 
-/// IBD **prep** after plan: pin denserels once (Allow) + assemble.
+/// IBD **load** after lookup: pin denserels once (Allow) + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.
 pub fn confirm_wire_load_from_plan(
@@ -917,7 +919,7 @@ pub fn confirm_wire_load_from_plan(
     params: &ChainParams,
     milestone: Milestone,
     stamped: PlanStampOutcome,
-    pipeline: Option<&WirePrepPipeline>,
+    pipeline: Option<&WireLoadPipeline>,
     preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     let t_work = Instant::now();
@@ -980,7 +982,7 @@ pub fn confirm_wire_lookup_and_ensure_denserels(
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
-    pipeline: Option<&WirePrepPipeline>,
+    pipeline: Option<&WireLoadPipeline>,
 ) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, DenserelsWarmStats, u64), ConsensusError>
 {
     let t0 = Instant::now();
@@ -996,13 +998,13 @@ pub fn confirm_wire_lookup_and_ensure_denserels(
     Ok((plan, warm, work_ns))
 }
 
-/// Structure + prepare + plan_batch only (stamp create_fk). Shared by plan stage.
+/// Structure + prepare + plan_batch only (stamp create_fk). Shared by lookup stage.
 fn wire_lookup_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
-    pipeline: Option<&WirePrepPipeline>,
+    pipeline: Option<&WireLoadPipeline>,
 ) -> Result<
     (
         Option<rbitcoin_query::ArchiveWritePlan>,
@@ -1581,7 +1583,7 @@ fn pin_for_wire_batch(
         }
         None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
     };
-    // One store lock: adopt live shared pins (writeq / peer prep overlap) so free
+    // One store lock: adopt live shared pins (writeq / peer load overlap) so free
     // path can skip OutputRecord clones when need is already covered.
     let t_adopt = Instant::now();
     if pipeline_parent_store.is_some() {
@@ -1735,7 +1737,7 @@ fn pin_for_wire_batch(
         }
     }
     let plan_pin_ns = t_plan.elapsed().as_nanos() as u64;
-    // Batch-local cold walls/counts for last-pin / slow-prep logs.
+    // Batch-local cold walls/counts for last-pin / slow-load logs.
     let mut cold_range_batch_ns = 0u64;
     let mut n_range_new = 0u64;
 
@@ -1921,7 +1923,7 @@ fn pin_for_wire_batch(
     }
 
     // Pin contract: every spent parent is in BatchParents with need outs.
-    // Denserels/body_range may wait for write ensure (prep-ahead plan pin).
+    // Denserels/body_range may wait for write ensure (load-ahead plan pin).
     let t_contract = Instant::now();
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
@@ -1967,7 +1969,7 @@ fn pin_for_wire_batch(
     if publish_ns > 0 {
         confirm_load_stats::PIN_PUBLISH_NS.fetch_add(publish_ns, Ordering::Relaxed);
     }
-    // Last-batch pin residual for slow-prep logs (overwrite; not window-summed).
+    // Last-batch pin residual for slow-load logs (overwrite; not window-summed).
     let cold_batch_ns = cold_range_batch_ns
         .saturating_add(cold_io_ns)
         .saturating_add(cold_decode_ns);
@@ -2089,7 +2091,7 @@ pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     ScriptsPhaseHandle { rx }
 }
 
-/// Join `handle`, repeatedly invoking `on_poll` (e.g. prep `try_recv` + async
+/// Join `handle`, repeatedly invoking `on_poll` (e.g. load `try_recv` + async
 /// submit) so a second ready batch reaches rayon **before** this join returns.
 ///
 /// This is the production feed-ahead primitive used under depth-1 channels.
@@ -2416,7 +2418,7 @@ pub fn confirm_write_phase(
         }
     }
     // Ensure denserels/abs for every spend edge before structural + annotate:
-    // - prep-ahead in-flight parents (no denserels at pin time)
+    // - load-ahead in-flight parents (no denserels at pin time)
     // - already-archived Class A (plan=None) same-batch creates never inserted
     // - partial pin after prior write committed Class A then failed annotate
     {
@@ -3435,7 +3437,7 @@ mod write_idempotent_tests {
             .unwrap()[0];
         // Parent on disk only (ancient / cold external parent).
 
-        // Plan with stamped parent create_fk (plan stage already did batch head).
+        // Plan with stamped parent create_fk (lookup stage already did batch head).
         let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
         let spend_tx = TxRecord {
             txid: [0xcd; 32],
@@ -3914,7 +3916,7 @@ mod write_idempotent_tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// Prep miss: spend edges without pin denserels must hard-fail (no cold tier).
+    /// Load miss: spend edges without pin denserels must hard-fail (no cold tier).
     #[test]
     fn post_commit_missing_denserels_is_invariant_error() {
         use super::{post_commit, Prepared};
@@ -4023,7 +4025,7 @@ mod write_idempotent_tests {
         let parent_fk = fks[0];
         let (body_off, body_len) = q.store().txs.body_range(parent_fk).unwrap();
 
-        // Pin denserels without body_range (prep-ahead shape before commit).
+        // Pin denserels without body_range (load-ahead shape before commit).
         let mut bp = BatchParents::new();
         bp.insert_owned(
             parent_fk,

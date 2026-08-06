@@ -2375,12 +2375,12 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
 /// Prep(N+1) while N is still uncommitted pins parents from in-flight outs
 /// **without denserels**. Write of N+1 must fill layout after N commits, or
 /// structural spentness / spend annotate fails with
-/// `missing pin denserels/abs` (mainnet IBD after prep-ahead: reject@tip+1).
+/// `missing pin denserels/abs` (mainnet IBD after load-ahead: reject@tip+1).
 #[test]
 fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     use rbitcoin_consensus::{
         accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_phase_pipelined,
-        confirm_write_phase, ChainParams, Milestone, ScriptPreverified, WirePrepPipeline,
+        confirm_write_phase, ChainParams, Milestone, ScriptPreverified, WireLoadPipeline,
     };
 
     let td = TestDatadir::new().unwrap();
@@ -2415,7 +2415,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     let spend_b = spend_anyone_can_spend(a_out_txid, 0, Amount::from_sat(48_0000_0000));
     let bb = mine_regtest_block(ha_hash, tip_time + 1200, hb, vec![spend_b]);
 
-    let mut pipe = WirePrepPipeline {
+    let mut pipe = WireLoadPipeline {
         path_lo: ha,
         parent_hash: None,
         next_tx_start: q.tx_body_count().saturating_add(1).max(1),
@@ -2499,7 +2499,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
     confirm_write_phase(&q, &params, ms, ok_b.batch).unwrap_or_else(|e| {
         panic!(
-            "write B after prep-ahead must fill parent denserels from committed A (got {e})"
+            "write B after load-ahead must fill parent denserels from committed A (got {e})"
         );
     });
     assert_eq!(q.tip_height(), Some(Height(hb)));

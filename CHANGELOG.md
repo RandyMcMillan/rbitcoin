@@ -12,8 +12,9 @@ before 1.0).
 ### Changed
 
 - **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
-  `--class-a-cache-mb`, `--conf`, Core-like aliases (`--assumevalid-height`,
-  `--maxmempool`, `--chain`). Normal sync does not require `RBITCOIN_*` exports.
+  `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
+  Explicit CLI/conf knobs publish to env; omitting them **preserves** advanced
+  `RBITCOIN_*` exports. Normal sync does not require any env export.
 - **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`
   (IBD keeps periodic progress/perf lines only).
 - **Docs hygiene:** removed abandoned plans/forensics notes from the release

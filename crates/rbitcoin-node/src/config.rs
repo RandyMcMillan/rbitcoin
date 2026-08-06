@@ -14,6 +14,11 @@ pub const DEFAULT_MAX_INBOUND: u32 = 125;
 /// Operator-critical knobs live here. Advanced IO/perf tunables may still be
 /// set via `RBITCOIN_*` env vars (documented as advanced); normal signet/mainnet
 /// sync does not require any env export.
+///
+/// **Env publish:** [`Self::apply_operator_env`] only writes process env for knobs
+/// that were **explicitly** set via CLI or conf (`*_explicit` flags). Omitting a
+/// flag leaves a pre-set advanced env (e.g. `RBITCOIN_P2P_MAX_INBOUND`) intact
+/// for library `from_env` readers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub datadir: PathBuf,
@@ -39,16 +44,21 @@ pub struct NodeConfig {
     pub max_outbound: u32,
     /// Max concurrent **inbound** P2P sessions (default [`DEFAULT_MAX_INBOUND`]).
     pub max_inbound: u32,
+    /// True when max_inbound came from CLI or conf (publish to env on apply).
+    pub max_inbound_explicit: bool,
     /// Soft densify / archive meter budget (MiB).
     pub archive_queue_mb: u64,
-    /// Optional Class A cache budget (MiB) applied via process env for store code.
-    pub class_a_cache_mb: Option<u64>,
+    /// True when archive_queue_mb came from CLI or conf.
+    pub archive_queue_mb_explicit: bool,
     /// Mempool weight budget in **WU** (default ~300M WU ≈ plan 300 MiB class).
     pub mempool_max_weight: u64,
     /// When true, ask systemd (if available) to block automatic suspend/idle.
     pub inhibit_suspend: bool,
     /// Optional conf file path that was loaded (for diagnostics).
     pub conf_path: Option<PathBuf>,
+    /// Log level from conf (`log_level=…`), if any. CLI `--log-level` overrides.
+    /// Values: error|warn|info|debug|trace|off (same as CLI).
+    pub conf_log_level: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -67,11 +77,13 @@ impl Default for NodeConfig {
             milestone_height: 0,
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,
+            max_inbound_explicit: false,
             archive_queue_mb: DEFAULT_ARCHIVE_QUEUE_MB,
-            class_a_cache_mb: None,
+            archive_queue_mb_explicit: false,
             mempool_max_weight: 300_000_000,
             inhibit_suspend: false,
             conf_path: None,
+            conf_log_level: None,
         }
     }
 }
@@ -155,20 +167,19 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Push operator knobs into process env so existing library `from_env` readers
-    /// see CLI/conf values without rewriting every hot-path call site.
+    /// Push **explicit** operator knobs into process env for library `from_env` readers.
     ///
-    /// Only sets vars for knobs this config owns; does not clear unrelated advanced
-    /// envs. Defaults match historical code defaults when CLI omits the flag.
+    /// Does **not** overwrite advanced envs when CLI/conf left a knob at the
+    /// structural default (user may have exported `RBITCOIN_P2P_MAX_INBOUND` etc.).
     pub fn apply_operator_env(&self) {
-        // Always publish inbound / archive so library code does not need CLI.
-        std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", self.max_inbound.to_string());
-        std::env::set_var(
-            "RBITCOIN_ARCHIVE_QUEUE_MB",
-            self.archive_queue_mb.to_string(),
-        );
-        if let Some(mb) = self.class_a_cache_mb {
-            std::env::set_var("RBITCOIN_CLASS_A_CACHE_MB", mb.to_string());
+        if self.max_inbound_explicit {
+            std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", self.max_inbound.to_string());
+        }
+        if self.archive_queue_mb_explicit {
+            std::env::set_var(
+                "RBITCOIN_ARCHIVE_QUEUE_MB",
+                self.archive_queue_mb.to_string(),
+            );
         }
     }
 
@@ -176,9 +187,8 @@ impl NodeConfig {
     ///
     /// Supported keys: `datadir`, `network` / `chain`, `listen`, `connect` (repeatable),
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
-    /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb`,
-    /// `archive_queue_mb`, `class_a_cache_mb`, `log_level` (informational only here),
-    /// `electrum_listen`, `noseeds` / `no_seeds`.
+    /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
+    /// `archive_queue_mb`, `log_level`, `electrum_listen`, `noseeds` / `no_seeds`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| NodeError::Config(format!(
             "read conf {}: {source}",
@@ -250,6 +260,7 @@ impl NodeConfig {
                     self.max_inbound = val.parse().map_err(|e| {
                         NodeError::Config(format!("conf maxinbound: {e}"))
                     })?;
+                    self.max_inbound_explicit = true;
                 }
                 "mempool_size_mb" | "maxmempool" => {
                     let mb: u64 = val.parse().map_err(|e| {
@@ -266,17 +277,18 @@ impl NodeConfig {
                     self.archive_queue_mb = val.parse().map_err(|e| {
                         NodeError::Config(format!("conf archive_queue_mb: {e}"))
                     })?;
+                    self.archive_queue_mb_explicit = true;
                 }
-                "class_a_cache_mb" => {
-                    self.class_a_cache_mb = Some(val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf class_a_cache_mb: {e}"))
-                    })?);
+                "log_level" => {
+                    if val.is_empty() {
+                        return Err(NodeError::Config(
+                            "conf log_level requires a value".into(),
+                        ));
+                    }
+                    self.conf_log_level = Some(val.to_string());
                 }
                 "noseeds" | "no_seeds" => {
                     self.use_seeds = !is_conf_true(val);
-                }
-                "log_level" | "debug" => {
-                    // Applied by CLI after merge; ignore here if bare conf load.
                 }
                 "regtest" if is_conf_true(val) => self.network = Network::Regtest,
                 "signet" if is_conf_true(val) => self.network = Network::Signet,
@@ -300,6 +312,10 @@ fn is_conf_true(val: &str) -> bool {
         "1" | "true" | "yes" | "on" | ""
     )
 }
+
+/// Serialize tests that mutate process `RBITCOIN_*` env (CLI + config unit tests).
+#[cfg(test)]
+pub(crate) static OPERATOR_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -326,6 +342,8 @@ mod tests {
         assert_eq!(cfg.mempool_path(), dir.join("mempool"));
         assert_eq!(cfg.max_inbound, DEFAULT_MAX_INBOUND);
         assert_eq!(cfg.archive_queue_mb, DEFAULT_ARCHIVE_QUEUE_MB);
+        assert!(!cfg.max_inbound_explicit);
+        assert!(!cfg.archive_queue_mb_explicit);
         cfg.ensure_datadir().unwrap();
         assert!(dir.join("store").is_dir());
         assert!(dir.join("mempool").is_dir());
@@ -347,6 +365,7 @@ mod tests {
              archive_queue_mb=128\n\
              mempool_size_mb=50\n\
              milestone=100\n\
+             log_level=debug\n\
              connect=127.0.0.1:38333\n",
         )
         .unwrap();
@@ -354,26 +373,79 @@ mod tests {
         cfg.merge_conf_file(&conf).unwrap();
         assert_eq!(cfg.network, Network::Signet);
         assert_eq!(cfg.max_inbound, 40);
+        assert!(cfg.max_inbound_explicit);
         assert_eq!(cfg.max_outbound, 8);
         assert_eq!(cfg.archive_queue_mb, 128);
+        assert!(cfg.archive_queue_mb_explicit);
         assert_eq!(cfg.mempool_max_weight, 50_000_000);
         assert_eq!(cfg.milestone_height, 100);
+        assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
         assert_eq!(cfg.connect.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: apply must not clobber pre-set advanced envs when knobs were
+    /// not explicit on CLI/conf.
+    #[test]
+    fn apply_operator_env_preserves_unset_advanced_env() {
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_in = std::env::var_os("RBITCOIN_P2P_MAX_INBOUND");
+        let prev_ar = std::env::var_os("RBITCOIN_ARCHIVE_QUEUE_MB");
+        std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "99");
+        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "55");
+        let cfg = NodeConfig::default(); // no explicit flags
+        assert!(!cfg.max_inbound_explicit);
+        assert!(!cfg.archive_queue_mb_explicit);
+        cfg.apply_operator_env();
+        assert_eq!(
+            std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
+            Ok("99"),
+            "must not overwrite advanced inbound env when CLI/conf omitted knob"
+        );
+        assert_eq!(
+            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
+            Ok("55"),
+            "must not overwrite advanced archive env when CLI/conf omitted knob"
+        );
+        // Explicit knobs do publish.
+        let mut explicit = NodeConfig::default();
+        explicit.max_inbound = 12;
+        explicit.max_inbound_explicit = true;
+        explicit.archive_queue_mb = 88;
+        explicit.archive_queue_mb_explicit = true;
+        explicit.apply_operator_env();
+        assert_eq!(
+            std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
+            Ok("12")
+        );
+        assert_eq!(
+            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
+            Ok("88")
+        );
+        // Restore prior process env (do not leave blank for parallel CLI tests).
+        match prev_in {
+            Some(v) => std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", v),
+            None => std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND"),
+        }
+        match prev_ar {
+            Some(v) => std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", v),
+            None => std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB"),
+        }
+    }
+
     #[test]
     fn operator_knob_defaults_and_fields() {
-        // Do not call apply_operator_env here — process env is shared with CLI tests.
         let cfg = NodeConfig {
             max_inbound: 42,
+            max_inbound_explicit: true,
             archive_queue_mb: 64,
-            class_a_cache_mb: Some(128),
+            archive_queue_mb_explicit: true,
             ..NodeConfig::default()
         };
         assert_eq!(cfg.max_inbound, 42);
         assert_eq!(cfg.archive_queue_mb, 64);
-        assert_eq!(cfg.class_a_cache_mb, Some(128));
         assert_eq!(NodeConfig::default().max_inbound, DEFAULT_MAX_INBOUND);
         assert_eq!(NodeConfig::default().archive_queue_mb, DEFAULT_ARCHIVE_QUEUE_MB);
     }

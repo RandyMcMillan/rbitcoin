@@ -35,7 +35,6 @@ where
     let mut max_inbound_set = false;
     let mut archive_queue_mb = crate::config::DEFAULT_ARCHIVE_QUEUE_MB;
     let mut archive_queue_set = false;
-    let mut class_a_cache_mb: Option<u64> = None;
     let mut max_run_secs: Option<u64> = None;
     let mut mempool_size_mb: Option<u64> = None;
     let mut inhibit_suspend = false;
@@ -53,17 +52,17 @@ where
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
-    [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] [--class-a-cache-mb N] \\\n\
+    [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
-Log level: error|warn|info|debug|trace|off (CLI wins; else RBITCOIN_LOG / RUST_LOG advanced).\n\
+Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
 Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound/--maxconnections (default 125).\n\
-Memory: --archive-queue-mb (default 512), --class-a-cache-mb (optional).\n\
+Memory: --archive-queue-mb (default 512 soft densify meter).\n\
 Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md.\n\
-Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync).\n\
+Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
 IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                     env!("CARGO_PKG_VERSION")
                 );
@@ -271,25 +270,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
-            "--class-a-cache-mb" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --class-a-cache-mb requires a number");
-                    return ExitCode::from(2);
-                }
-                match args[i].to_string_lossy().parse::<u64>() {
-                    Ok(n) if n > 0 => class_a_cache_mb = Some(n),
-                    Ok(_) => {
-                        eprintln!("error: --class-a-cache-mb must be >= 1");
-                        return ExitCode::from(2);
-                    }
-                    Err(e) => {
-                        eprintln!("error: bad --class-a-cache-mb: {e}");
-                        return ExitCode::from(2);
-                    }
-                }
-                i += 1;
-            }
             "--max-run-secs" => {
                 i += 1;
                 if i >= args.len() {
@@ -343,12 +323,23 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         }
     }
 
-    // Logging: CLI --log-level wins; else RBITCOIN_LOG / RUST_LOG; else Info.
+    // Logging: CLI --log-level > conf log_level > RBITCOIN_LOG / RUST_LOG > Info.
     match log_level_cli {
         Some(Some(level)) => rbitcoin_log::init(level),
         Some(None) => rbitcoin_log::init_off(),
         None => {
-            if !rbitcoin_log::init_from_env() {
+            if let Some(ref raw) = config.conf_log_level {
+                if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+                    rbitcoin_log::init_off();
+                } else if let Some(l) = Level::parse(raw) {
+                    rbitcoin_log::init(l);
+                } else {
+                    eprintln!(
+                        "error: conf log_level `{raw}` invalid (use error|warn|info|debug|trace|off)"
+                    );
+                    return ExitCode::from(2);
+                }
+            } else if !rbitcoin_log::init_from_env() {
                 rbitcoin_log::init(Level::Info);
             }
         }
@@ -391,12 +382,11 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if max_inbound_set {
         config.max_inbound = max_inbound;
+        config.max_inbound_explicit = true;
     }
     if archive_queue_set {
         config.archive_queue_mb = archive_queue_mb;
-    }
-    if class_a_cache_mb.is_some() {
-        config.class_a_cache_mb = class_a_cache_mb;
+        config.archive_queue_mb_explicit = true;
     }
     config.inhibit_suspend = inhibit_suspend;
     // Map MiB → weight units (1 MiB ≈ 1e6 WU for budget purposes).
@@ -404,8 +394,7 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.mempool_max_weight = mb.saturating_mul(1_000_000);
     }
 
-    // Publish operator knobs for library from_env readers (defaults unchanged
-    // when CLI/conf use defaults).
+    // Publish only explicit CLI/conf knobs (preserves pre-set advanced envs).
     config.apply_operator_env();
 
     // Hold for process lifetime; drop after run_node / run_p2p returns.
@@ -478,11 +467,8 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::config::OPERATOR_ENV_TEST_LOCK;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// Serialize CLI tests that call `apply_operator_env` (process env is shared).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_datadir() -> PathBuf {
         let n = SystemTime::now()
@@ -536,7 +522,7 @@ mod tests {
 
     #[test]
     fn smoke_open_and_shutdown() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -569,7 +555,7 @@ mod tests {
 
     #[test]
     fn help_lists_coreish_flags_not_only_env() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Parse accepts Core-like aliases (not env-only).
         let dir = tmp_datadir();
         let code = cli_main([
@@ -596,7 +582,7 @@ mod tests {
 
     #[test]
     fn conf_file_then_cli_override() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("node.conf");
@@ -625,6 +611,65 @@ mod tests {
         // conf maxinbound applied (CLI did not override inbound)
         assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "33");
         assert_eq!(std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").unwrap(), "77");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CLI omit of inbound/archive must not clobber pre-set advanced envs.
+    #[test]
+    fn cli_omit_preserves_advanced_env() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "91");
+        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "44");
+        let dir = tmp_datadir();
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--log-level",
+            "error",
+            "--no-seeds",
+            "--milestone",
+            "0",
+            // no --maxinbound / --archive-queue-mb
+        ]);
+        assert_exit(code, ExitCode::SUCCESS);
+        assert_eq!(
+            std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
+            Ok("91")
+        );
+        assert_eq!(
+            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
+            Ok("44")
+        );
+        std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND");
+        std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conf_log_level_applied_when_cli_omits() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_datadir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("log.conf");
+        std::fs::write(&conf, "log_level=warn\nnetwork=regtest\n").unwrap();
+        let data = dir.join("data");
+        // No --log-level: conf warn must init without error.
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--conf",
+            conf.to_str().unwrap(),
+            "--datadir",
+            data.to_str().unwrap(),
+            "--no-seeds",
+            "--milestone",
+            "0",
+        ]);
+        assert_exit(code, ExitCode::SUCCESS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

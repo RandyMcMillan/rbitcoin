@@ -505,6 +505,25 @@ impl ShRunBuilder {
         self.ibd_catalog_compact.store(on, Ordering::Release);
     }
 
+    /// Whether the IBD SH worker may crumb-compact the catalog.
+    pub fn ibd_catalog_compact(&self) -> bool {
+        self.ibd_catalog_compact.load(Ordering::Acquire)
+    }
+
+    /// Pause IBD crumb compact for parallel catalog writers; restore previous on drop.
+    ///
+    /// Parallel Class A recollect must not race the single-thread compact path.
+    /// Mid-IBD enter_direct recollect must **restore** compact=true so confirm
+    /// coalesces keep cleaning crumbs for the rest of Direct IBD.
+    pub fn pause_ibd_catalog_compact(&self) -> IbdCatalogCompactGuard<'_> {
+        let prev = self.ibd_catalog_compact();
+        self.set_ibd_catalog_compact(false);
+        IbdCatalogCompactGuard {
+            builder: self,
+            prev,
+        }
+    }
+
     pub fn enable(&self) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -618,13 +637,15 @@ impl ShRunBuilder {
         let _ = std::fs::remove_file(&hwm_path);
     }
 
-    /// Re-enable builder after finalize_wait_join; compact off until Direct IBD.
+    /// Re-enable builder after finalize_wait_join.
     ///
     /// Leaving `enabled` false made Class A recollect a silent no-op and tip
     /// finished FullCold with creates≈0 on a zeroed head.
+    ///
+    /// Does **not** force compact off — [`Self::pause_ibd_catalog_compact`] /
+    /// recollect restores prior compact state so mid-IBD Direct stays crumb-clean.
     fn rearm_for_recollect(&self) {
         self.ensure_enabled();
-        self.set_ibd_catalog_compact(false);
     }
 
     /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
@@ -1470,6 +1491,18 @@ fn merge_runs_to_l0(
     Ok(merged)
 }
 
+/// Restores prior [`ShRunBuilder::ibd_catalog_compact`] when dropped.
+pub struct IbdCatalogCompactGuard<'a> {
+    builder: &'a ShRunBuilder,
+    prev: bool,
+}
+
+impl Drop for IbdCatalogCompactGuard<'_> {
+    fn drop(&mut self) {
+        self.builder.set_ibd_catalog_compact(self.prev);
+    }
+}
+
 /// Parallel Class A recollect: spill local buffer at this size (~128 MiB of 40 B recs).
 pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -1958,6 +1991,36 @@ mod tests {
             1_411_000_000,
             0
         ));
+    }
+
+    #[test]
+    fn pause_ibd_catalog_compact_restores_prior_on_drop() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-compact-gate-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        b.enable();
+        assert!(b.ibd_catalog_compact());
+        {
+            let _g = b.pause_ibd_catalog_compact();
+            assert!(!b.ibd_catalog_compact(), "paused during guard");
+        }
+        assert!(
+            b.ibd_catalog_compact(),
+            "drop must restore prior compact=true"
+        );
+        // Prior false stays false after pause.
+        b.set_ibd_catalog_compact(false);
+        {
+            let _g = b.pause_ibd_catalog_compact();
+            assert!(!b.ibd_catalog_compact());
+        }
+        assert!(!b.ibd_catalog_compact(), "drop must restore prior compact=false");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -287,8 +287,10 @@ impl Query {
         use std::time::{Duration, Instant};
 
         // Single enable gate for recollect (FORCE/reset prep also re-enable).
-        // Parallel catalog writers: never run IBD crumb compact concurrently.
-        self.sh_run.set_ibd_catalog_compact(false);
+        // Parallel catalog writers: pause IBD crumb compact only for this scope —
+        // restore prior flag so mid-IBD enter_direct recollect does not leave
+        // compact permanently off for the rest of Direct IBD.
+        let _compact_gate = self.sh_run.pause_ibd_catalog_compact();
         self.sh_run.ensure_enabled();
 
         let sealed0 = self.sh_run.sealed_max_create_fk();
@@ -987,6 +989,56 @@ mod tests {
             q.sh_run.sealed_max_create_fk() >= tip_max.saturating_sub(1)
                 || tip_max == 0,
             "small-gap direct enter must recollect up to tip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skeptic regression: enter_direct small-gap recollect must not leave
+    /// `ibd_catalog_compact` permanently false for the rest of Direct IBD.
+    #[test]
+    fn enter_direct_small_recollect_restores_ibd_catalog_compact() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-compact-restore-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 6);
+        // enable() (via seed enter_direct) turns compact on.
+        assert!(
+            q.sh_run.ibd_catalog_compact(),
+            "Direct enable must allow IBD crumb compact"
+        );
+
+        // Crash-window gap: SEAL behind tip but well under max_direct.
+        let tip_max = q.store.txs.count();
+        let mid = (tip_max / 2).max(1);
+        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
+        assert!(!should_defer_direct_recollect(mid, tip_max));
+
+        // Re-enter Direct: runs small recollect (pause compact during, restore after).
+        q.enter_direct_index_mode().unwrap();
+        assert!(
+            q.sh_run.ibd_catalog_compact(),
+            "after small-gap recollect, IBD crumb compact must still be on for Direct"
+        );
+
+        // rebuild_sh alone (same path as enter_direct) must also restore.
+        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        assert!(
+            q.sh_run.ibd_catalog_compact(),
+            "rebuild_sh must restore prior compact flag"
+        );
+
+        // Early-exit rebuild (SEAL already at tip) must restore too.
+        q.sh_run.set_sealed_max_for_recollect(q.store.txs.count()).unwrap();
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        assert!(
+            q.sh_run.ibd_catalog_compact(),
+            "no-op rebuild_sh must restore prior compact flag"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

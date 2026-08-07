@@ -67,6 +67,24 @@ impl TxidBody {
         self.count.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Roll published identity count back to `new_count` (and HWM).
+    ///
+    /// Used when `txid.body` led body/idx (should be rare) so open can align.
+    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
+        let cur = self.count();
+        if new_count > cur {
+            return Err(StoreError::Corrupt("txid.body truncate past count"));
+        }
+        if new_count == cur {
+            return Ok(());
+        }
+        let new_len = TXID_BODY_HEADER + new_count * TXID_ENTRY_LEN;
+        self.file.set_logical_len(new_len)?;
+        self.count
+            .store(new_count, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Absolute file offset of the 32-byte entry for `fk` (1-based).
     #[inline]
     pub fn entry_offset(fk: u64) -> Result<u64, StoreError> {

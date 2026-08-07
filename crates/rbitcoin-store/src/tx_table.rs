@@ -1108,10 +1108,28 @@ impl TxTable {
         let body = VarTable::open(dir, "tx", TableKind::Tx)?;
         let txids = crate::txid_body::TxidBody::open(dir)?;
         let n_bodies = body.count();
-        if txids.count() != n_bodies {
-            return Err(StoreError::Corrupt(
-                "txid.body count != tx body count (reindex required for schema 13)",
-            ));
+        let n_txids = txids.count();
+        if n_txids != n_bodies {
+            // Incomplete Class A publish is the usual cause: body→idx→count then
+            // txid.body append. Crash between them leaves body/idx ahead of
+            // identity (or rarely the reverse). Align to the **common prefix**
+            // instead of demanding a full reindex for a few-thousand-row skew.
+            let n = n_bodies.min(n_txids);
+            rbitcoin_log::warn!(
+                "store: Class A count skew body/idx={n_bodies} txid.body={n_txids} — \
+                 truncating to {n} (incomplete last batch; not full reindex)"
+            );
+            if n_bodies > n {
+                body.truncate_to_count(n)?;
+            }
+            if n_txids > n {
+                txids.truncate_to_count(n)?;
+            }
+            if body.count() != txids.count() {
+                return Err(StoreError::Corrupt(
+                    "txid.body count != tx body count after repair (reindex required for schema 13)",
+                ));
+            }
         }
         let mut need_rebuild = false;
         let head = if !crate::segmented_head::head_meta_exists(dir) {
@@ -1188,7 +1206,18 @@ impl TxTable {
         if count == 0 {
             return Ok(());
         }
+        // After Class A count repair, open-tail may still list fks past body/txid
+        // HWM. `replace_open_keys` requires exact open-tail length — skip rebuild
+        // when head led identity (stale fuse keys until next seal path rebuilds).
+        let n_body = self.count();
         let last_fk = first_fk.saturating_add(count).saturating_sub(1);
+        if first_fk == 0 || first_fk > n_body || last_fk > n_body {
+            rbitcoin_log::warn!(
+                "store: skip open-tail fuse rebuild (head first={first_fk} count={count} \
+                 body={n_body}); head may lead truncated Class A"
+            );
+            return Ok(());
+        }
         let txids = self.body_txid_range(first_fk, last_fk)?;
         if txids.len() as u64 != count {
             return Err(StoreError::Corrupt(
@@ -2446,6 +2475,65 @@ mod tests {
             return Err(StoreError::Corrupt("input run trailing bytes"));
         }
         Ok(out)
+    }
+
+    /// Simulate crash after body/idx publish, before `txid.body` catch-up:
+    /// body leads identity → open truncates body/idx to the common prefix.
+    #[test]
+    fn open_repairs_body_leading_txid_count() {
+        let dir = tempfile_dir("skew-repair");
+        {
+            let t = create_tiny(&dir);
+            let mut items = Vec::new();
+            for i in 0..5u8 {
+                let mut txid = [0u8; 32];
+                txid[0] = i.wrapping_add(1);
+                let tx = TxRecord {
+                    txid,
+                    version: 2,
+                    locktime: 0,
+                    input_count: 0,
+                    output_count: 1,
+                    input_start_fk: Fk::NULL,
+                    output_start_fk: Fk::NULL,
+                };
+                let outs = vec![OutputRecord::unspent(1000 + i64::from(i), vec![0x51])];
+                items.push((tx, Vec::new(), outs));
+            }
+            t.put_full_batch_indexed(&items, true).unwrap();
+            assert_eq!(t.count(), 5);
+            assert_eq!(t.txid_sidefile().count(), 5);
+            // Identity lag only (body/idx still at 5).
+            t.txid_sidefile().truncate_to_count(3).unwrap();
+            assert_eq!(t.txid_sidefile().count(), 3);
+            assert_eq!(t.count(), 5);
+        }
+        let t2 = TxTable::open(&dir).expect("open should repair skew");
+        assert_eq!(t2.count(), 3);
+        assert_eq!(t2.txid_sidefile().count(), 3);
+        // Kept prefix still readable.
+        let tx = t2.get(Fk(1)).unwrap();
+        assert_eq!(tx.txid[0], 1);
+        let tx3 = t2.get(Fk(3)).unwrap();
+        assert_eq!(tx3.txid[0], 3);
+        assert!(t2.get(Fk(4)).is_err());
+        // Further appends work after repair.
+        let mut txid = [0u8; 32];
+        txid[0] = 99;
+        let tx = TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_count: 0,
+            output_count: 1,
+            input_start_fk: Fk::NULL,
+            output_start_fk: Fk::NULL,
+        };
+        let outs = vec![OutputRecord::unspent(42, vec![0x51])];
+        t2.put_full_batch_indexed(&[(tx, Vec::new(), outs)], true)
+            .unwrap();
+        assert_eq!(t2.count(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

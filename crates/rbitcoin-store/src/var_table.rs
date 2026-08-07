@@ -69,6 +69,37 @@ impl VarTable {
         })
     }
 
+    /// Truncate published Class A count to `new_count` (idx + RAM count + body HWM).
+    ///
+    /// Body bytes past the new end may remain on disk (append-only); HWM rolls
+    /// back to the start of the first dropped record so the next append reuses
+    /// that region. Call only from sole Class A open/repair path.
+    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
+        let cur = self.count.load(Ordering::Acquire);
+        if new_count > cur {
+            return Err(StoreError::Corrupt("var table truncate past count"));
+        }
+        if new_count == cur {
+            return Ok(());
+        }
+        // Body exclusive-end for kept prefix = start of first dropped record.
+        let new_end = if new_count == 0 {
+            FILE_HEADER_LEN as u64
+        } else if new_count < cur {
+            // record_start uses live idx count; still valid before idx truncate.
+            self.idx.record_start(new_count + 1)?
+        } else {
+            self.body.logical_len().max(FILE_HEADER_LEN as u64)
+        };
+        self.idx.truncate_to_count(new_count)?;
+        self.body.set_logical_len(new_end)?;
+        self.publish_begin();
+        self.published_body_end.store(new_end, Ordering::Relaxed);
+        self.count.store(new_count, Ordering::Relaxed);
+        self.publish_end();
+        Ok(())
+    }
+
     fn body_path(dir: &Path, stem: &str) -> PathBuf {
         dir.join(format!("{stem}.body"))
     }

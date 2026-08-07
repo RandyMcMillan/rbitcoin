@@ -137,6 +137,59 @@ impl TxIdx {
             .unwrap_or(0)
     }
 
+    /// Drop trailing slots so published count becomes `new_count` (1-based last fk).
+    ///
+    /// Used when Class A body/idx led an incomplete `txid.body` append (crash
+    /// between idx publish and identity sidefile). Does not punch body bytes.
+    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
+        let cur = self.slot_count();
+        if new_count > cur {
+            return Err(StoreError::Corrupt("tx.idx truncate past count"));
+        }
+        if new_count == cur {
+            return Ok(());
+        }
+        let mut segs = (*self.segments_snapshot()).clone();
+        if new_count == 0 {
+            segs.clear();
+            {
+                let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+                *guard = Arc::new(segs);
+            }
+            write_meta_from_segs(&self.dir, &self.stem, &[])?;
+            return Ok(());
+        }
+        // Keep segments fully at or before new_count; shrink the boundary segment.
+        let mut kept: Vec<Segment> = Vec::new();
+        for s in segs.drain(..) {
+            let last = s.first_fk.saturating_add(s.count).saturating_sub(1);
+            if last <= new_count {
+                kept.push(s);
+                continue;
+            }
+            if s.first_fk > new_count {
+                break;
+            }
+            // Boundary: keep first_fk..=new_count.
+            let keep_n = new_count.saturating_sub(s.first_fk).saturating_add(1);
+            kept.push(Segment {
+                first_fk: s.first_fk,
+                count: keep_n,
+                body_base: s.body_base,
+                file_id: s.file_id,
+                file: s.file,
+            });
+            break;
+        }
+        {
+            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::new(kept);
+        }
+        let segs = self.segments_snapshot();
+        write_meta_from_segs(&self.dir, &self.stem, &segs)?;
+        Ok(())
+    }
+
     fn segments_snapshot(&self) -> Arc<Vec<Segment>> {
         Arc::clone(&self.segments.read().unwrap_or_else(|e| e.into_inner()))
     }

@@ -1,5 +1,7 @@
 use crate::error::NodeError;
-use rbitcoin_consensus::Milestone;
+use bitcoin::hex::FromHex;
+use bitcoin::ScriptBuf;
+use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_primitives::Network;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,10 @@ pub const DEFAULT_MAX_INBOUND: u32 = 125;
 pub struct NodeConfig {
     pub datadir: PathBuf,
     pub network: Network,
+    /// Custom BIP325 challenge. `None` selects the default global Signet.
+    pub signet_challenge: Option<ScriptBuf>,
+    /// Custom Signet PoW target spacing in seconds.
+    pub signet_block_time: Option<u64>,
     pub archive_durability: bool,
     pub wire_depth_blocks: u32,
     /// Bind address for P2P listen (`None` = do not listen / default bind later).
@@ -69,6 +75,8 @@ impl Default for NodeConfig {
         Self {
             datadir: PathBuf::from("./datadir"),
             network: Network::Mainnet,
+            signet_challenge: None,
+            signet_block_time: None,
             archive_durability: true,
             wire_depth_blocks: 100,
             p2p_listen: None,
@@ -127,6 +135,17 @@ impl NodeConfig {
         }
     }
 
+    /// Compose immutable consensus parameters from operator configuration.
+    pub fn chain_params(&self) -> Result<ChainParams, NodeError> {
+        match self.signet_challenge.clone() {
+            Some(challenge) => {
+                ChainParams::custom_signet(challenge, self.signet_block_time.unwrap_or(10 * 60))
+                    .map_err(|e| NodeError::Config(e.into()))
+            }
+            None => Ok(ChainParams::for_network(self.network)),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), NodeError> {
         if self.datadir.as_os_str().is_empty() {
             return Err(NodeError::Config("datadir must not be empty".into()));
@@ -136,6 +155,23 @@ impl NodeConfig {
         }
         if self.max_inbound == 0 {
             return Err(NodeError::Config("max_inbound must be >= 1".into()));
+        }
+        if (self.signet_challenge.is_some() || self.signet_block_time.is_some())
+            && self.network != Network::Signet
+        {
+            return Err(NodeError::Config(
+                "signetchallenge and signetblocktime require network=signet".into(),
+            ));
+        }
+        if self.signet_block_time.is_some() && self.signet_challenge.is_none() {
+            return Err(NodeError::Config(
+                "signetblocktime requires signetchallenge".into(),
+            ));
+        }
+        if self.signet_block_time == Some(0) {
+            return Err(NodeError::Config(
+                "signetblocktime must be greater than zero".into(),
+            ));
         }
         let _ = (self.wire_depth_blocks, self.archive_durability);
         Ok(())
@@ -187,7 +223,7 @@ impl NodeConfig {
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
     /// `archive_queue_mb`, `log_level`, `electrum_listen`, `esplora_listen`,
-    /// `noseeds` / `no_seeds`.
+    /// `noseeds` / `no_seeds`, `signetchallenge`, and `signetblocktime`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -227,6 +263,18 @@ impl NodeConfig {
                 "network" | "chain" => {
                     self.network = Network::parse(val)
                         .map_err(|e| NodeError::Config(format!("conf network: {e}")))?;
+                }
+                "signetchallenge" | "signet_challenge" => {
+                    self.signet_challenge =
+                        Some(parse_signet_challenge(val).map_err(|e| {
+                            NodeError::Config(format!("conf signetchallenge: {e}"))
+                        })?);
+                }
+                "signetblocktime" | "signet_block_time" => {
+                    self.signet_block_time =
+                        Some(val.parse().map_err(|e| {
+                            NodeError::Config(format!("conf signetblocktime: {e}"))
+                        })?);
                 }
                 "listen" => {
                     self.p2p_listen = Some(
@@ -308,6 +356,12 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
+
+pub(crate) fn parse_signet_challenge(value: &str) -> Result<ScriptBuf, String> {
+    Vec::<u8>::from_hex(value)
+        .map(ScriptBuf::from_bytes)
+        .map_err(|e| format!("must be hexadecimal: {e}"))
 }
 
 fn is_conf_true(val: &str) -> bool {
@@ -455,6 +509,45 @@ mod tests {
             NodeConfig::default().archive_queue_mb,
             DEFAULT_ARCHIVE_QUEUE_MB
         );
+    }
+
+    #[test]
+    fn custom_signet_conf_builds_params() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("custom-signet.conf");
+        std::fs::write(
+            &conf,
+            "network=signet\n\
+             signetchallenge=51\n\
+             signetblocktime=60\n",
+        )
+        .unwrap();
+
+        let mut cfg = NodeConfig::default();
+        cfg.merge_conf_file(&conf).unwrap();
+        cfg.validate().unwrap();
+        let params = cfg.chain_params().unwrap();
+        assert_eq!(params.btc.pow_target_spacing, 60);
+        assert_eq!(params.signet_challenge.unwrap().as_bytes(), &[0x51]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_signet_options_require_signet_and_challenge() {
+        let challenge = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        let mainnet = NodeConfig {
+            signet_challenge: Some(challenge),
+            ..NodeConfig::default()
+        };
+        assert!(mainnet.validate().is_err());
+
+        let missing_challenge = NodeConfig {
+            network: Network::Signet,
+            signet_block_time: Some(30),
+            ..NodeConfig::default()
+        };
+        assert!(missing_challenge.validate().is_err());
     }
 
     #[test]

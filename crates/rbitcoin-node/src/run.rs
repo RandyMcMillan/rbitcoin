@@ -1,7 +1,6 @@
 use crate::config::NodeConfig;
 use crate::error::NodeError;
 use bitcoin::consensus::Encodable;
-use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_esplora::{run_esplora, EsploraConfig};
 use rbitcoin_log::{info, warn};
@@ -150,7 +149,7 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// and aborts peer tasks.
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
-    let params = ChainParams::for_network(config.network);
+    let params = config.chain_params()?;
     let milestone = config.milestone();
     if milestone.height > 0 {
         info!(
@@ -250,7 +249,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     for c in &config.connect {
         addrman.add(*c);
     }
-    if config.use_seeds && config.connect.is_empty() {
+    if should_resolve_default_seeds(&config) {
         info!(
             "ibd: resolving DNS/fixed seeds for {}…",
             config.network.as_str()
@@ -262,6 +261,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
+    } else if config.signet_challenge.is_some() && config.connect.is_empty() && addrman.is_empty() {
+        warn!("custom signet has no peers; use --connect ADDR or reuse a datadir with known peers");
     }
     // Shared with IBD so learned addrs/flags flush back on IBD exit.
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
@@ -754,6 +755,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
+    config.use_seeds && config.connect.is_empty() && config.signet_challenge.is_none()
+}
+
 /// Enter steady-state tip mode after true catch-up.
 ///
 /// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
@@ -842,6 +847,14 @@ pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> 
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn custom_signet_does_not_use_default_signet_seeds() {
+        let mut cfg = NodeConfig::default().with_network(rbitcoin_primitives::Network::Signet);
+        assert!(should_resolve_default_seeds(&cfg));
+        cfg.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        assert!(!should_resolve_default_seeds(&cfg));
+    }
 
     #[test]
     fn enter_tip_mode_reenables_indexes() {

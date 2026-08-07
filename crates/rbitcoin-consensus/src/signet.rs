@@ -6,7 +6,7 @@
 //! expensive for the IBD prep path).
 
 use bitcoin::absolute::LockTime;
-use bitcoin::consensus::Encodable;
+use bitcoin::consensus::{serialize, Encodable};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -24,6 +24,17 @@ pub fn default_signet_challenge() -> ScriptBuf {
     ScriptBuf::from_bytes(hex_decode(
         "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
     ))
+}
+
+/// Derive the four P2P message-start bytes for a BIP325 challenge.
+///
+/// Bitcoin Core hashes the consensus-serialized challenge byte vector, including
+/// its CompactSize length prefix, and uses the first four digest bytes.
+pub fn signet_magic(challenge: &Script) -> [u8; 4] {
+    let encoded = serialize(&challenge.as_bytes().to_vec());
+    sha256d::Hash::hash(&encoded).to_byte_array()[..4]
+        .try_into()
+        .expect("four-byte digest prefix")
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
@@ -434,6 +445,19 @@ mod tests {
         let challenge = default_signet_challenge();
         validate_signet_block_solution(&block, challenge.as_script())
             .expect("BIP325 solution for real signet height 1");
+    }
+
+    #[test]
+    fn custom_challenge_derives_expected_wire_magic() {
+        let challenge = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(
+            signet_magic(challenge.as_script()),
+            [0x54, 0xd2, 0x6f, 0xbd]
+        );
+        assert_eq!(
+            signet_magic(default_signet_challenge().as_script()),
+            [0x0a, 0x03, 0xcf, 0x40]
+        );
     }
 
     #[test]

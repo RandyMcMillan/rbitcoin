@@ -88,6 +88,9 @@ install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
   --listen 127.0.0.1:38333 --milestone 200000 --max-run-secs 120
 ```
 
+Custom Signets are supported with `--signetchallenge` and
+`--signetblocktime`; see the [custom Signet example](./OPERATOR.md#custom-signet).
+
 ## Build
 
 ### Portable static release (recommended)

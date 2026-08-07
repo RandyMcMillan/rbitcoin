@@ -71,15 +71,29 @@ impl ChainParams {
     }
 
     pub fn signet() -> Self {
+        Self::custom_signet(crate::signet::default_signet_challenge(), 10 * 60)
+            .expect("default signet block time is nonzero")
+    }
+
+    /// Build custom BIP325 signet parameters.
+    ///
+    /// `block_time` changes PoW target spacing while retaining Signet's two-week
+    /// target timespan, matching Bitcoin Core's `signetblocktime` behavior.
+    pub fn custom_signet(challenge: ScriptBuf, block_time: u64) -> Result<Self, &'static str> {
+        if block_time == 0 {
+            return Err("signet block time must be greater than zero");
+        }
         let genesis = constants::genesis_block(Network::Signet);
-        Self {
+        let mut btc = BtcParams::new(Network::Signet);
+        btc.pow_target_spacing = block_time;
+        Ok(Self {
             network: Network::Signet,
             genesis_hash: genesis.block_hash(),
             pow_limit: Target::MAX_ATTAINABLE_SIGNET,
             checkpoints: vec![],
-            btc: BtcParams::new(Network::Signet),
-            signet_challenge: Some(crate::signet::default_signet_challenge()),
-        }
+            btc,
+            signet_challenge: Some(challenge),
+        })
     }
 
     pub fn checkpoint_at(&self, height: Height) -> Option<BlockHash> {
@@ -311,6 +325,18 @@ mod tests {
         assert!(!p.segwit_active_at(0));
         assert!(p.segwit_active_at(1));
         assert!(p.signet_challenge.is_some());
+    }
+
+    #[test]
+    fn custom_signet_uses_challenge_and_block_time() {
+        let challenge = ScriptBuf::from_bytes(vec![0x51]);
+        let p = ChainParams::custom_signet(challenge.clone(), 60).unwrap();
+
+        assert_eq!(p.signet_challenge.as_ref(), Some(&challenge));
+        assert_eq!(p.btc.pow_target_spacing, 60);
+        assert_eq!(p.btc.pow_target_timespan, 14 * 24 * 60 * 60);
+        assert_eq!(p.difficulty_adjustment_interval(), 20_160);
+        assert!(ChainParams::custom_signet(challenge, 0).is_err());
     }
 
     /// Mainnet buried heights (Core + Inquisition).

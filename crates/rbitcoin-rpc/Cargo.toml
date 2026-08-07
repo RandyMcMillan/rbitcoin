@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "JSON-RPC server (Core-compatible surface)"
+repository.workspace = true
+description = "JSON-RPC server (stub / later phase — not a Core-compatible surface yet)"
 
 [dependencies]
 

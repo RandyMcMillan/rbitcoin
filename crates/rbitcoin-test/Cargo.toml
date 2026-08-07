@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 description = "High-level functional and integration tests for rbitcoin"
 publish = false
 

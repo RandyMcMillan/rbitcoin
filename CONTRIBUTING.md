@@ -9,8 +9,9 @@
    ([`COVERAGE.md`](./COVERAGE.md), [`TESTING.md`](./TESTING.md)).
 3. Every PR must keep **100% line and 100% branch** coverage on first-party code
    (`./scripts/coverage.sh` — same bar as CI).
-4. Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/wallet/mining
-   without an explicit plan change.
+4. Target is **production server-side** node software (wallet backends, etc.).
+   Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/end-user wallet/
+   mining without an explicit plan change.
 5. Store durability / tip commit: [`docs/crash-recovery.md`](./docs/crash-recovery.md)
    and [`docs/concurrency.md`](./docs/concurrency.md).
 6. Security-sensitive reports go through [`SECURITY.md`](./SECURITY.md), not

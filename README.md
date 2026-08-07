@@ -1,12 +1,14 @@
 # rbitcoin
 
-**Experimental** Bitcoin full node in Rust: multi-peer IBD, tip follow, block/tx
-relay (tip mode), and in-process Electrum — built around a **libbitcoin-class
-relational mmap archive** and a **pure-Rust consensus/script** path.
+Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
+IBD, tip follow, block/tx relay (tip mode), and in-process Electrum for **wallet
+backends** and similar infrastructure — built around a **libbitcoin-class
+relational archive** and a **pure-Rust consensus/script** path.
 
-> **Not** a production Bitcoin Core or Fulcrum replacement. On-disk format and
-> APIs are **unstable until 1.0**. Lab / reckless mainnet only after a signet
-> soak. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+> **0.x:** on-disk format and APIs are **unstable until 1.0**. Prefer a **signet
+> soak** before first mainnet cutover; treat early mainnet as high-scrutiny.
+> Security contact and policy: [`SECURITY.md`](./SECURITY.md). Operator notes:
+> [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 | | |
 |--|--|
@@ -37,9 +39,14 @@ Product surface: [`COMPAT.md`](./COMPAT.md).
 ## Status
 
 Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash,
-Electrum, libre mempool). **Mainnet is experimental** — run **signet lab first**
-([`OPERATOR.md`](./OPERATOR.md)). Finishing a particular operator’s first full
-mainnet sync is **not** a gate for using or packaging this tree.
+Electrum, libre mempool) for the **server-side / wallet-backend** role. **0.x
+mainnet** is early production: run **signet first**, then mainnet with
+monitoring ([`OPERATOR.md`](./OPERATOR.md)). Finishing any one operator’s first
+full mainnet sync is **not** a gate for using or packaging this tree.
+
+**Authorship:** first-party code is **AI-written** (Grok / xAI) under
+**Brandon Black** ([@reardencode](https://github.com/reardencode)) prompting —
+details in [`SECURITY.md`](./SECURITY.md).
 
 **Milestone (default mainnet 840000):** at/below `--milestone`, **script/sig
 checks are skipped** on block connect (assumevalid-style speed tradeoff).

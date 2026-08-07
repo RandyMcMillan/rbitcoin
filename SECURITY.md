@@ -1,46 +1,81 @@
 # Security policy
 
+**rbitcoin** is full-node software intended for **production server-side** use:
+IBD and tip follow, block/tx relay, and Electrum serving for **wallet backends**
+and similar infrastructure—not a desktop GUI or end-user wallet.
+
+Until **1.0**, treat mainnet deployment as **early production / high-scrutiny**:
+on-disk format and APIs can still change, and there is **no** long-term support
+SLA. Prefer a signet soak before first mainnet cutover. See
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md) and
+[`OPERATOR.md`](./OPERATOR.md).
+
 ## Supported versions
 
 | Version | Support |
 |---------|---------|
-| **0.x** (this tree) | Experimental. Security fixes land on a best-effort basis while the project is under active development. There is **no** long-term support promise and **no** production SLA. |
+| **0.x** (this tree) | Active development. Security-relevant fixes are prioritized; there is **no** multi-year LTS branch yet. |
+| **1.0+** (future) | Will define a clearer support window once the on-disk schema and public surface stabilize. |
 
-Treat any mainnet use as a **lab / reckless** deployment. Prefer signet and
-regtest for validation work. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+Report against a **git commit** (and binary digest if you built musl static).
 
 ## Reporting a vulnerability
 
-Please report security issues **privately** — do not open a public GitHub issue
-for unfixed remote or consensus-critical bugs.
+**Contact:** [security@reardencode.com](mailto:security@reardencode.com)
 
-1. If a public git remote / contact is published for this repository, use that
-   project’s preferred private channel (security email or private advisory).
-2. Until a public contact is listed here, contact the maintainers through the
-   same private channel you already use for this codebase (direct maintainer
-   contact). Include: affected version/commit, network (mainnet/signet/regtest),
-   impact assessment, and a minimal reproduction when possible.
-3. Allow reasonable time for a fix or public mitigation note before disclosure.
+Report security issues **privately** — do **not** open a public GitHub issue for
+unfixed remote, consensus-critical, or data-integrity bugs.
 
-We will acknowledge receipt when we can and coordinate disclosure timing for
-issues that affect consensus, P2P DoS surface, or Electrum/data integrity.
+Please include when possible:
 
-## Scope notes (experimental node)
+1. Affected **commit** (or release tag) and how the binary was built (e.g. musl
+   static via `nix build .#rbitcoin-musl`)
+2. Network: **mainnet** / **signet** / **regtest**
+3. Impact: consensus acceptance/rejection, P2P DoS, Electrum integrity, crash
+   under adversarial input, etc.
+4. Minimal reproduction (peer behavior, RPC/Electrum request, store fixture)
+
+We aim to acknowledge receipt promptly and to coordinate disclosure for issues
+that affect consensus, P2P attack surface, or Electrum/query integrity.
+
+## Scope
 
 - **Consensus and script:** pure-Rust verification; bugs can mean accepting
   invalid chain data or rejecting valid data. Report both.
-- **P2P:** BIP324 v2-only; DoS parity with Bitcoin Core is **not** claimed.
-  Default mitigations: max inbound sessions (`--maxinbound` / `--maxconnections`,
-  default 125; advanced env `RBITCOIN_P2P_MAX_INBOUND` still honored via CLI
-  apply), per-session message/byte rate windows, misbehavior score disconnect.
-- **Electrum:** plain TCP; TLS is an operator reverse-proxy concern. Default
-  mitigations: max connections (256), max request line (1 MiB), max scripthash
-  subs/connection (1000), idle timeout (120 s), broadcast hex cap.
-- **No wallet / keys in this repository:** do not send seed phrases or private
+- **P2P:** BIP324 v2-only. DoS parity with Bitcoin Core is **not** claimed, but
+  mitigations are intentional operator surface: max inbound sessions
+  (`--maxinbound` / `--maxconnections`, default 125), per-session message/byte
+  rate windows, misbehavior score disconnect.
+- **Electrum:** plain TCP; TLS is an operator reverse-proxy concern. Mitigations
+  include max connections, request line size, scripthash subscription caps, idle
+  timeout, and broadcast hex limits (see operator docs).
+- **Store / archive:** corruption or incorrect spend/scripthash results that
+  mislead a wallet backend are in scope.
+- **No wallet keys in this repository:** do **not** send seed phrases or private
   keys in reports.
+
+## Out of scope (for security@)
+
+- Feature requests, IBD performance, and non-sensitive crashes → ordinary
+  issues / [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- Compromised operator hosts, reverse-proxy misconfiguration, or third-party
+  wallet software outside this tree
+
+## Authorship and review expectations
+
+**100% of the first-party code in this repository was written by AI** (Grok,
+xAI), under the direction and prompting of **Brandon Black**
+([@reardencode](https://github.com/reardencode)).
+
+That does **not** change how to report bugs or how seriously we take
+consensus/P2P integrity. It **does** mean:
+
+- Callers should assume the usual need for **independent review**, fuzzing, and
+  adversarial testing before trusting a deployment with real funds.
+- Security reports remain welcome and will be handled through
+  [security@reardencode.com](mailto:security@reardencode.com).
 
 ## Non-security bugs
 
-Use ordinary issue trackers or contribution channels for crashes, IBD stalls,
-and documentation errors that are not security-sensitive — see
-[`CONTRIBUTING.md`](./CONTRIBUTING.md).
+Use ordinary issue trackers or contribution channels for non-sensitive crashes,
+IBD stalls, and documentation errors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).

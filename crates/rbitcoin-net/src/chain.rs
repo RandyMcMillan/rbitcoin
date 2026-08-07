@@ -841,13 +841,14 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     } else {
         (sh.total_sh_ns().saturating_mul(100)) / i.wall_ns.max(1)
     };
+    // class_c = strong + tip only (table work). SH is parallel and listed separately.
     format!(
         "tip: accept h={h} tx={n_tx} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
-         class_a={class_a_ms}ms class_c={class_c_ms}ms strong={strong_ms}ms tip_set={tip_ms}ms \
-         spend={spend_ms}ms sh={sh_ms}ms \
+         class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
+         sh={sh_ms}ms \
          (filter={filt_ms} collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
-         sh/wall={sh_ratio}%",
+         spend={spend_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
         n_tx = i.n_tx,
         pin = sh.pin,
@@ -866,7 +867,7 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
         _wire,
         connect_ns,
         script_ns,
-        class_c_ns,
+        _class_c_ns, // tables-only after fix; we recompute from strong+tip below
         strong_ns,
         _sh_sum,
         tip_ns,
@@ -887,6 +888,8 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
     // SH substeps/counts (FILTER/COLLECT/…/CREATE_N) — not cleared by sample_and_reset.
     let sh = rbitcoin_query::class_c_phase_stats::sample_tip_sh_and_reset();
     let ca = rbitcoin_query::archive_phase_stats::sample_and_reset();
+    // class_c = strong + tip only (parallel SH is not Class C table time).
+    let class_c_tables_ns = strong_ns.saturating_add(tip_ns);
     let line = format_tip_accept_sh_line(&TipAcceptShInput {
         height,
         n_tx,
@@ -895,7 +898,7 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
         load_ns: load_ns.saturating_add(connect_ns),
         script_ns,
         class_a_ns: ca.write_total_ns,
-        class_c_ns,
+        class_c_ns: class_c_tables_ns,
         spend_ns,
         strong_ns,
         tip_ns,
@@ -1108,7 +1111,8 @@ mod tests {
             load_ns: 100_000_000,
             script_ns: 200_000_000,
             class_a_ns: 50_000_000,
-            class_c_ns: 1_800_000_000,
+            // Tables only (strong+tip) — not SH join wall.
+            class_c_ns: 7_000_000,
             spend_ns: 80_000_000,
             strong_ns: 5_000_000,
             tip_ns: 2_000_000,
@@ -1128,6 +1132,8 @@ mod tests {
         });
         assert!(line.starts_with("tip: accept h=961445"), "{line}");
         assert!(line.contains("wall=2500ms"), "{line}");
+        assert!(line.contains("class_c=7ms"), "{line}");
+        assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
         assert!(line.contains("sh=1726ms"), "{line}"); // 1+20+5+800+600+300
         // Substep ms are unitless inside the paren (outer fields carry `ms`).
         assert!(line.contains("seed=800"), "{line}");

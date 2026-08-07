@@ -1039,16 +1039,17 @@ fn plan_batch_ms(s: &IbdPerfSample) -> u64 {
         .saturating_add(s.arch_prep_finish_ms)
 }
 
-/// Write-stage wall for this window.
+/// Write-stage exclusive work sum for this window (may exceed join wall slightly).
 ///
-/// Class A commit + denserels ensure + structural + class_c + spend annotate + tip GC.
-/// SH collect is inside class_c wall on the write thread; `sh_ms` is a sub-slice
-/// and is **not** double-counted here.
+/// Class A + denserels ensure + structural + **Class C tables** (strong+tip) +
+/// **SH** (parallel with strong on tip; was previously folded into a join-wall
+/// `class_c`) + spend annotate + tip GC.
 fn write_stage_ms(s: &IbdPerfSample) -> u64 {
     s.class_a_ms
         .saturating_add(s.ensure_ms)
         .saturating_add(s.structural_ms)
         .saturating_add(s.class_c_ms)
+        .saturating_add(s.sh_ms)
         .saturating_add(s.utxo_ms)
         .saturating_add(s.cache_tip_ms)
 }
@@ -1381,11 +1382,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let prep_ns = s.load_ns.saturating_add(s.connect_ns);
+    // Exclusive write attribution: class_c is tables-only; include SH separately
+    // (parallel with strong — sum may exceed join wall by ~strong).
     let write_ns = s
         .class_a_ns
         .saturating_add(s.ensure_ns)
         .saturating_add(s.structural_ns)
         .saturating_add(s.class_c_ns)
+        .saturating_add(s.sh_ns)
         .saturating_add(s.utxo_apply_ns)
         .saturating_add(s.cache_tip_ns);
     let mut out = format!(
@@ -1774,10 +1778,12 @@ mod tests {
         s.class_a_ms = 15;
         s.ensure_ms = 2;
         s.structural_ms = 50;
-        s.class_c_ms = 40;
+        s.class_c_ms = 40; // tables only
+        s.sh_ms = 100; // SH exclusive (parallel with strong; counted separately)
         s.utxo_ms = 25;
         s.cache_tip_ms = 5;
-        assert_eq!(write_stage_ms(&s), 137);
+        // 15+2+50+40+100+25+5 = 237
+        assert_eq!(write_stage_ms(&s), 237);
     }
 
     #[test]
@@ -1827,7 +1833,7 @@ mod tests {
             !line.contains("connect="),
             "assemble is inside load, not a peer stage: {line}"
         );
-        // write = class_a(12)+ensure(3)+class_c(40)+spend(25)+tip_gc(5) = 85
+        // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25)+tip_gc(5) = 85
         assert!(line.contains("write=85ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");
         assert!(line.contains("ensure=3ms"), "{line}");

@@ -146,7 +146,10 @@ pub mod confirm_phase_stats {
     pub static STRUCTURAL_CREATE_H_NS: AtomicU64 = AtomicU64::new(0);
     /// BIP68 relative locks + coin MTP (subset of structural; write path).
     pub static STRUCTURAL_BIP68_NS: AtomicU64 = AtomicU64::new(0);
-    /// Class C wall (`confirm_blocks_run` total).
+    /// Non-SH Class C **tables** only: strong/height + tip set/flush.
+    ///
+    /// **Not** the join wall of `confirm_blocks_run` (which is dominated by
+    /// parallel SH on tip mode). SH time lives in query `SCRIPTHASH_NS` / `SH_*`.
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage Class A append (`archive_commit_plan`) wall.
     ///
@@ -464,7 +467,9 @@ pub mod confirm_phase_stats {
     ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
     ///   spend_ranged, spend_idx, spend_skip, structural, structural_spent,
     ///   structural_create_h, structural_bip68)`.
-    /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`].
+    /// `class_c` is **strong+tip tables only** (not SH join wall; SH is
+    /// `scripthash`). `strong` / `scripthash` / `tip` come from
+    /// [`rbitcoin_query::class_c_phase_stats`].
     /// `recon` prefers wire sub-timer, else legacy total.
     /// `connect` is **load assemble**, not write structural — see `structural`.
     #[allow(clippy::type_complexity)]

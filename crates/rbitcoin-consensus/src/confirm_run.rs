@@ -2406,9 +2406,12 @@ pub fn confirm_write_phase(
     let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
     let n_blocks = batch.prepared.len();
-    let t_cc = Instant::now();
+    let cc0 = confirm_phase_stats::CLASS_C_NS.load(Ordering::Relaxed);
     let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
-    let class_c_ns = t_cc.elapsed().as_nanos() as u64;
+    // Tables only (strong+tip), matching CLASS_C_NS — not join wall / SH.
+    let class_c_ns = confirm_phase_stats::CLASS_C_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(cc0);
 
     let (spend_ann_ns, tip_gc_ns) =
         post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
@@ -4555,7 +4558,13 @@ fn class_c_commit(
     prepared: &mut [Prepared],
     write_create_pins: &HashMap<rbitcoin_primitives::Fk, rbitcoin_query::CreatePin>,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let t_class_c = Instant::now();
+    use rbitcoin_query::class_c_phase_stats::{STRONG_NS, TIP_NS};
+    use std::sync::atomic::Ordering as QOrd;
+
+    // CLASS_C_NS = strong + tip only (not join wall). SH runs in parallel and
+    // has its own SCRIPTHASH_NS / SH_* meters — do not fold SH into class_c.
+    let strong0 = STRONG_NS.load(QOrd::Relaxed);
+    let tip0 = TIP_NS.load(QOrd::Relaxed);
     let items: Vec<rbitcoin_query::ConfirmPrepared> = prepared
         .iter_mut()
         .map(|p| rbitcoin_query::ConfirmPrepared {
@@ -4572,8 +4581,12 @@ fn class_c_commit(
     let out = query
         .confirm_blocks_run_with_create_pins(&items, pins)
         .map_err(ConsensusError::Store)?;
+    let strong_d = STRONG_NS
+        .load(QOrd::Relaxed)
+        .saturating_sub(strong0);
+    let tip_d = TIP_NS.load(QOrd::Relaxed).saturating_sub(tip0);
     confirm_phase_stats::CLASS_C_NS
-        .fetch_add(t_class_c.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        .fetch_add(strong_d.saturating_add(tip_d), Ordering::Relaxed);
     Ok(out)
 }
 

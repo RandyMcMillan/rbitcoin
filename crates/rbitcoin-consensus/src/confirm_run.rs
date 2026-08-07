@@ -2350,25 +2350,27 @@ pub fn confirm_write_phase(
                         .map(|(pin, _)| std::sync::Arc::clone(pin))
                         .collect()
                 };
-            write_create_pins.reserve(planned_fks.len());
-            for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
-                write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
-            }
             let t_ca = Instant::now();
-            query
+            let committed = query
                 .archive_commit_plan(plan)
                 .map_err(ConsensusError::Store)?;
             class_a_ns = t_ca.elapsed().as_nanos() as u64;
-            // Layout only for planned creates (same-batch): pin denserels +
-            // body ranges from commit — zero additional Class A body preads.
-            let t_ens = Instant::now();
-            fill_planned_create_layout_after_commit(
-                query,
-                &mut batch.batch_parents,
-                &planned_fks,
-                &pins,
-            )?;
-            ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
+            // Layout + SH pins only after a real append. Idempotent skip (Class A
+            // already present) uses store denserels via ensure / class_c cold pins.
+            if committed {
+                write_create_pins.reserve(planned_fks.len());
+                for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
+                    write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
+                }
+                let t_ens = Instant::now();
+                fill_planned_create_layout_after_commit(
+                    query,
+                    &mut batch.batch_parents,
+                    &planned_fks,
+                    &pins,
+                )?;
+                ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
+            }
         }
     }
     // Ensure denserels/abs for every spend edge before structural + annotate:

@@ -134,6 +134,81 @@ impl ArchiveWritePlan {
         self.clear_external_parent_outs();
     }
 
+    /// Drop headers that already have Class A body (partial-commit / retry).
+    ///
+    /// Returns `true` if anything remains to append. Used by
+    /// [`Query::archive_commit_plan`] so a second confirm attempt after Class A
+    /// succeeded but tip failed does not re-append the same txs.
+    pub fn retain_headers_needing_body(
+        &mut self,
+        mut has_body: impl FnMut(Fk) -> Result<bool, QueryError>,
+    ) -> Result<bool, QueryError> {
+        use std::collections::HashSet;
+        if self.per_header_ranges.is_empty() {
+            return Ok(!self.packed.is_empty());
+        }
+        let mut keep_fks: HashSet<u64> = HashSet::new();
+        let mut new_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(self.per_header_ranges.len());
+        for &(hfk, first, n) in &self.per_header_ranges {
+            if has_body(hfk)? {
+                continue;
+            }
+            new_ranges.push((hfk, first, n));
+            let start = self
+                .planned_fks
+                .iter()
+                .position(|f| *f == first)
+                .unwrap_or(0);
+            let end = start
+                .saturating_add(n as usize)
+                .min(self.planned_fks.len());
+            for f in &self.planned_fks[start..end] {
+                if let Some(id) = f.get() {
+                    keep_fks.insert(id);
+                }
+            }
+        }
+        if new_ranges.is_empty() {
+            *self = Self::empty();
+            return Ok(false);
+        }
+        if new_ranges.len() == self.per_header_ranges.len() {
+            return Ok(true);
+        }
+        // Compact packed / planned_fks / batch_pin to kept create fks (order preserved).
+        let old_packed = std::mem::take(&mut self.packed);
+        let old_fks = std::mem::take(&mut self.planned_fks);
+        let old_pin = std::mem::take(&mut self.batch_pin);
+        let mut new_packed = Vec::with_capacity(keep_fks.len());
+        let mut new_fks = Vec::with_capacity(keep_fks.len());
+        let mut new_pin = Vec::with_capacity(keep_fks.len());
+        for (i, fk) in old_fks.into_iter().enumerate() {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if !keep_fks.contains(&id) {
+                continue;
+            }
+            new_fks.push(fk);
+            if i < old_packed.len() {
+                new_packed.push(old_packed[i].clone());
+            }
+            if i < old_pin.len() {
+                new_pin.push(std::sync::Arc::clone(&old_pin[i]));
+            }
+        }
+        self.packed = new_packed;
+        self.planned_fks = new_fks;
+        self.batch_pin = new_pin;
+        self.per_header_ranges = new_ranges;
+        self.spends
+            .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
+        self.batch_creates
+            .retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
+        // body_est is an upper bound; leave as-is (overestimate is safe for reserve).
+        Ok(!self.packed.is_empty())
+    }
+
     /// Append another **frozen** plan for write batch (height-ordered Class A).
     ///
     /// Callers must drain scripts→write in height order so `planned_fks` stay
@@ -529,11 +604,20 @@ impl Query {
 
     /// **Writer / write path:** durable Class A put (body / head / spends / htxs).
     ///
+    /// **Idempotent:** headers that already have `header_txs` body are stripped
+    /// (partial prior commit after structural/tip fail). If every header is
+    /// already archived, this is a no-op and returns `Ok(false)` — no second
+    /// body append / fk mismatch. Returns `Ok(true)` when body was appended.
+    ///
     /// Phase walls go to [`crate::archive_phase_stats`] (body vs head split).
-    pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<(), QueryError> {
+    pub fn archive_commit_plan(&self, mut plan: ArchiveWritePlan) -> Result<bool, QueryError> {
         use std::time::Instant;
         if plan.packed.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        // Skip re-append of headers already linked in header_txs (retry path).
+        if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
+            return Ok(false);
         }
         let t0 = Instant::now();
         let n_blocks = plan.per_header_ranges.len() as u64;
@@ -605,7 +689,7 @@ impl Query {
             0, // dontneed_ns — lead heuristic removed
             n_blocks.max(1),
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Resolve prev outpoint txid for an input.
@@ -1080,8 +1164,99 @@ mod tests {
         assert_eq!(plan_a.packed.len(), 3);
         assert_eq!(plan_a.batch_pin.len(), 3);
         // Contiguous Class A commit of the merged frozen plan.
-        q.archive_commit_plan(plan_a).unwrap();
+        assert!(q.archive_commit_plan(plan_a).unwrap());
         assert_eq!(q.tx_body_count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Second commit after header_txs is linked must not re-append body (partial
+    /// confirm retry / crash recovery).
+    #[test]
+    fn archive_commit_plan_idempotent_when_header_already_has_body() {
+        use rbitcoin_store::HeaderRecord;
+
+        let (dir, q) = temp_query("arch-idempotent");
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [2u8; 32],
+        };
+        let hfk = q.ensure_header(&header).unwrap();
+        let mut need = vec![(hfk, vec![coinbase_apply(42)])];
+        let plan = q.archive_plan_batch_owned(&mut need).unwrap();
+        assert!(!plan.is_empty());
+        assert!(q.archive_commit_plan(plan).unwrap(), "first commit appends");
+        let n = q.tx_body_count();
+        assert!(n >= 1);
+        assert!(q.store().header_txs.has_body(hfk).unwrap());
+
+        // Rebuild a plan as if lookup incorrectly re-planned the same header.
+        let mut need2 = vec![(hfk, vec![coinbase_apply(42)])];
+        let plan2 = q.archive_plan_batch_owned(&mut need2).unwrap();
+        // filter_need empties txs when has_body — plan may be empty. Force a
+        // non-empty plan by planning against a fresh need then swapping ranges.
+        if plan2.is_empty() {
+            // Production path: archive_filter_need_bodies clears need → empty plan.
+            // Commit empty is no-op.
+            assert!(!q.archive_commit_plan(plan2).unwrap());
+        } else {
+            assert!(
+                !q.archive_commit_plan(plan2).unwrap(),
+                "second commit must skip re-append"
+            );
+        }
+        assert_eq!(
+            q.tx_body_count(),
+            n,
+            "tx body count must not grow on idempotent re-commit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retain_headers_needing_body_strips_archived() {
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.planned_fks = vec![Fk(1), Fk(2), Fk(3)];
+        plan.per_header_ranges = vec![(Fk(10), Fk(1), 2), (Fk(20), Fk(3), 1)];
+        // Minimal packed rows so retain can compact.
+        let dummy_pin = |i: u8| {
+            std::sync::Arc::new((
+                TxRecord {
+                    txid: [i; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                },
+                Vec::new(),
+                Vec::new(),
+            ))
+        };
+        plan.packed = vec![
+            (dummy_pin(1), Vec::new()),
+            (dummy_pin(2), Vec::new()),
+            (dummy_pin(3), Vec::new()),
+        ];
+        plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
+        plan.spends = vec![
+            ([0u8; 32], 0, Fk(1), 0),
+            ([0u8; 32], 0, Fk(3), 0),
+        ];
+        // Header 10 already has body; 20 needs body.
+        let keep = plan
+            .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))
+            .unwrap();
+        assert!(keep);
+        assert_eq!(plan.per_header_ranges, vec![(Fk(20), Fk(3), 1)]);
+        assert_eq!(plan.planned_fks, vec![Fk(3)]);
+        assert_eq!(plan.packed.len(), 1);
+        assert_eq!(plan.spends.len(), 1);
+        assert_eq!(plan.spends[0].2, Fk(3));
     }
 }

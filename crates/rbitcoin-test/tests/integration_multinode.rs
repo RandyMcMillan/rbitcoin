@@ -551,6 +551,141 @@ fn reorg_competing_spend_extends_without_multi_fail() {
     assert_eq!(hub.tip_height(), Some(fork_h + 4));
 }
 
+/// Same-height competing tip with more work wins; then multi-block reorg to a
+/// longer side branch (tip-mode accept path, not IBD body-queue).
+#[test]
+fn reorg_same_height_then_multi_block_branch() {
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_net::{AcceptOutcome, ChainHub};
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create(dir.path().join("store")).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+
+    let genesis = regtest_genesis();
+    hub.accept_block(genesis.clone()).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut time = genesis.header.time;
+    for h in 1..=3u32 {
+        let b = mine_regtest_block(tip, time + 600, h, vec![]);
+        tip = b.block_hash();
+        time = b.header.time;
+        hub.accept_block(b).unwrap();
+    }
+    assert_eq!(hub.tip_height(), Some(3));
+    let parent_h2 = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .hash;
+    let parent = BlockHash::from_byte_array(parent_h2);
+    let t2 = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+
+    // Competing tip at height 3 (more work via later timestamp when PoW allows).
+    let rival = mine_regtest_block(parent, t2 + 900, 3, vec![]);
+    let outcome = hub.accept_block(rival.clone()).unwrap();
+    match outcome {
+        AcceptOutcome::Accepted { height: 3 } => {
+            assert_eq!(hub.tip_hash().unwrap(), rival.block_hash());
+        }
+        AcceptOutcome::IgnoredWeaker => {
+            // Equal work is OK for this network — still exercise multi-block reorg below.
+            assert_eq!(hub.tip_height(), Some(3));
+        }
+        other => panic!("unexpected same-height outcome: {other:?}"),
+    }
+
+    // Multi-block reorg from height 1: longer path 2'..5'.
+    let fork_parent = hub
+        .query
+        .header_at_height(Height(1))
+        .unwrap()
+        .unwrap()
+        .1
+        .hash;
+    let mut p = BlockHash::from_byte_array(fork_parent);
+    let mut t = hub
+        .query
+        .header_at_height(Height(1))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let mut branch = Vec::new();
+    for h in 2..=5u32 {
+        let b = mine_regtest_block(p, t + 700 + h, h, vec![]);
+        p = b.block_hash();
+        t = b.header.time;
+        branch.push(b);
+    }
+    let o = hub.accept_branch(&branch).unwrap();
+    assert!(
+        matches!(o, AcceptOutcome::Accepted { height: 5 }),
+        "multi-block reorg to height 5, got {o:?}"
+    );
+    assert_eq!(hub.tip_height(), Some(5));
+    assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
+
+    // Tip extension after multi-block reorg.
+    let ext = mine_regtest_block(p, t + 600, 6, vec![]);
+    assert!(matches!(
+        hub.accept_block(ext).unwrap(),
+        AcceptOutcome::Accepted { height: 6 }
+    ));
+}
+
+/// Class A archived ahead of tip, then wire confirm: second confirm attempt
+/// must not grow Class A body count (idempotent commit after partial fail shape).
+#[test]
+fn confirm_wire_idempotent_when_class_a_already_present() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, header_to_record,
+        ChainParams, Milestone,
+    };
+    use rbitcoin_primitives::Height as H;
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create(dir.path().join("store")).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone { height: 1_000_000 };
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, H::GENESIS, &genesis, ms).unwrap();
+    let g_fk = q
+        .get_header_by_hash(&genesis.block_hash().to_byte_array())
+        .unwrap()
+        .unwrap()
+        .0;
+    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
+    let hfk = q
+        .ensure_header(&header_to_record(g_fk, &b1.header))
+        .unwrap();
+    accept_and_archive_block(&q, &params, H(1), &b1, ms).unwrap();
+    assert!(q.is_block_archived(&b1.block_hash().to_byte_array()).unwrap());
+    let n_before = q.tx_body_count();
+
+    // Wire confirm with Class A already present — plan should be empty / no-op commit.
+    confirm_wire_run(&q, &params, ms, &[(H(1), b1.clone())]).unwrap();
+    assert_eq!(q.tip_height(), Some(H(1)));
+    let n_mid = q.tx_body_count();
+    assert_eq!(n_mid, n_before, "confirm must not re-append Class A");
+
+    // Idempotent re-entry (AlreadyHave / no tip change).
+    let tip = q.tip_height();
+    let _ = confirm_wire_run(&q, &params, ms, &[(H(1), b1)]);
+    assert_eq!(q.tip_height(), tip);
+    assert_eq!(q.tx_body_count(), n_before);
+    let _ = hfk;
+}
+
 /// Full `run_p2p` entry: listen, connect to seeder, exit via max_run_secs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "full run_p2p entry; run via scripts/integration.sh"]

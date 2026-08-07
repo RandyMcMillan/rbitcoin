@@ -26,7 +26,9 @@ mod progress;
 mod state;
 mod status;
 
-use archive::{rehydrate_block_queue_into_confirm, ArchiveQueueBudget};
+use archive::{
+    rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue, ArchiveQueueBudget,
+};
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
@@ -377,8 +379,8 @@ pub async fn ibd_cancellable(
     // Pipeline pins are plan-local / BatchParents only (no process create FIFO).
     // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
-    // RAM body queue starts empty after restart (no durable rehydrate). Call is
-    // a no-op that also drops any legacy on-disk residue via Query open.
+    // Body queue is RAM-only (no durable wire payloads). Same-process residual
+    // still notes feed readiness; after restart the queue is empty.
     match rehydrate_block_queue_into_confirm(
         hub.as_ref(),
         &mut st,
@@ -386,12 +388,27 @@ pub async fn ibd_cancellable(
         &archive_queued,
     ) {
         Ok(n) if n > 0 => {
-            // Live-process residual only (same run); restart cannot rehydrate wire.
             rbitcoin_log::debug!("ibd: rehydrate: noted {n} in-RAM body queue entries");
         }
         Ok(_) => {}
         Err(e) => {
             warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
+        }
+    }
+    // Class A on the tip path (partial confirm / prior densify) → reconstruct
+    // into BQ for the tip batch so claim_ready without peer re-getdata.
+    match rehydrate_class_a_into_body_queue(
+        hub.as_ref(),
+        &mut st,
+        confirm_feed.as_ref(),
+        TIP_HOLE_MAX,
+    ) {
+        Ok(n) if n > 0 => {
+            rbitcoin_log::debug!("ibd: Class A rehydrate filled {n} body-queue height(s)");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("ibd: Class A rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
     // Fresh cancel state for this IBD session (may have been set on prior stop).

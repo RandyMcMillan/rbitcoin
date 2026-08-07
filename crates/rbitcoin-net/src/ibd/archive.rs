@@ -1,14 +1,18 @@
-//! Archive queue budget + budget + durable BQ rehydrate into confirm.
+//! Archive queue budget + body-queue rehydrate into confirm.
 //!
 //! Dual-track archive-job Class A pipeline was removed — confirm is sole Class A.
+//! After restart the RAM body queue is empty; Class A bodies on the tip path are
+//! reconstructed into the queue so confirm can claim without re-getdata.
 
 use crate::chain::ChainHub;
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Default soft densify budget (~512 MiB). Override with `RBITCOIN_ARCHIVE_QUEUE_MB`.
 ///
@@ -241,6 +245,132 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
     Ok(n)
 }
 
+/// Reconstruct Class A bodies from tip+1 into the RAM body queue (restart path).
+///
+/// Body queue is RAM-only (no durable wire). Resume seed marks Class A as known
+/// for densify bookkeeping, but confirm intake is **BQ wire only**. Prefer
+/// Class A reconstruct → `block_queue_offer` over peer re-getdata for the tip
+/// confirm batch (`max`, typically [`super::TIP_HOLE_MAX`]).
+///
+/// Walks **contiguous** heights from tip+1: stops at the first height without
+/// Class A (or reconstruct/offer failure → mark_missing so assign re-gets).
+/// Already-queued / pending / confirmed heights are skipped without breaking
+/// the contiguous walk when still claim-ready.
+pub(crate) fn rehydrate_class_a_into_body_queue(
+    hub: &ChainHub,
+    st: &mut super::state::IbdWorkState,
+    confirm_feed: &super::confirm::ConfirmFeed,
+    max: usize,
+) -> Result<usize, String> {
+    use rbitcoin_log::{info, warn};
+
+    if max == 0 {
+        return Ok(0);
+    }
+    let path_lo = match hub.tip_height() {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
+    let t0 = Instant::now();
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    let mut h_min = u32::MAX;
+    let mut h_max = 0u32;
+    let mut failed = 0u32;
+
+    for ht in path_lo.. {
+        if n >= max {
+            break;
+        }
+        let Some(&hash) = st.height_to_hash.get(&ht) else {
+            break;
+        };
+        if hub.has_block(&hash) || st.body.is_rejected(&hash) {
+            // Confirmed or blacklisted — stop contiguous Class A rehydrate.
+            break;
+        }
+        // Already claim-ready wire.
+        if st.body.is_pending(&hash) || hub.query.block_queue_has_height(ht) {
+            st.body.mark_pending(hash);
+            confirm_feed.note(ht, hash);
+            n = n.saturating_add(1);
+            h_min = h_min.min(ht);
+            h_max = h_max.max(ht);
+            continue;
+        }
+        // Need Class A on disk (seed `mark_archived` and/or store probe).
+        let has_class_a = st.body.is_known_archived(&hash)
+            || hub
+                .query
+                .is_block_archived(&hash.to_byte_array())
+                .unwrap_or(false);
+        if !has_class_a {
+            break;
+        }
+
+        let block = match hub.query.reconstruct_archived_block(&hash.to_byte_array()) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                warn!(
+                    "ibd: Class A rehydrate h={ht}: header_txs missing after archive flag — re-getdata"
+                );
+                st.body.mark_missing(hash);
+                failed = failed.saturating_add(1);
+                break;
+            }
+            Err(e) => {
+                warn!("ibd: Class A rehydrate reconstruct h={ht} {hash}: {e} — re-getdata");
+                st.body.mark_missing(hash);
+                failed = failed.saturating_add(1);
+                break;
+            }
+        };
+
+        let mut payload = Vec::new();
+        if block.consensus_encode(&mut payload).is_err() {
+            warn!("ibd: Class A rehydrate encode h={ht} {hash} failed — re-getdata");
+            st.body.mark_missing(hash);
+            failed = failed.saturating_add(1);
+            break;
+        }
+        let header_fk = st
+            .header_fks
+            .get(&hash)
+            .copied()
+            .unwrap_or(Fk::NULL);
+        match hub
+            .query
+            .block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload)
+        {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("ibd: Class A rehydrate offer h={ht}: {e} — re-getdata");
+                st.body.mark_missing(hash);
+                failed = failed.saturating_add(1);
+                break;
+            }
+        }
+        st.body.mark_pending(hash);
+        // Keep known_archived for densify skip of far Class A; pending is claim-ready.
+        confirm_feed.note(ht, hash);
+        st.max_ready_height = st.max_ready_height.max(ht);
+        bytes = bytes.saturating_add(payload.len() as u64);
+        h_min = h_min.min(ht);
+        h_max = h_max.max(ht);
+        n = n.saturating_add(1);
+    }
+
+    if n > 0 || failed > 0 {
+        let mib = bytes / (1024 * 1024);
+        info!(
+            "ibd: Class A rehydrate → body queue n={n} h={h_min}..{h_max} \
+             {mib}MiB fail={failed} (store reconstruct {:?})",
+            t0.elapsed()
+        );
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::ArchiveQueueBudget;
@@ -251,5 +381,143 @@ mod budget_tests {
         assert!(b.can_assign());
         assert_eq!(b.count(), 0);
         assert!((b.far_admission_scale() - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod class_a_rehydrate_tests {
+    use super::rehydrate_class_a_into_body_queue;
+    use crate::ibd::confirm::ConfirmFeed;
+    use crate::ibd::progress::claim_ready;
+    use crate::ibd::state::IbdWorkState;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
+        TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+
+    fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
+        let mut ss = if height == 0 {
+            vec![0x00]
+        } else {
+            rbitcoin_consensus::bip34_height_script(height)
+        };
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time,
+            bits,
+            nonce: 0,
+        };
+        let mut block = Block {
+            header,
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn class_a_rehydrate_makes_tip_plus_one_claim_ready() {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ca-rehydrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let time = 1_300_000_000u32;
+        let mut tip = gen;
+        let mut hashes = Vec::new();
+        // Tip stays at genesis; archive heights 1..3 ahead (restart Class A shape).
+        for h in 1u32..=3 {
+            let b = mine(tip, time + h * 600, h);
+            hub.ensure_header(&b.header).unwrap();
+            hub.archive_block(h, b.clone()).unwrap();
+            hashes.push(b.block_hash());
+            tip = b.block_hash();
+        }
+
+        let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        super::super::path::seed_work_path_from_store(&mut st, &hub);
+        assert!(
+            st.body.is_known_archived(&hashes[0]),
+            "seed must mark Class A known"
+        );
+        assert!(
+            !hub.query.block_queue_has_height(1),
+            "BQ empty before rehydrate"
+        );
+        assert!(
+            !claim_ready(&hub, &mut st.body, 1, &hashes[0]),
+            "Class A alone is not claim-ready"
+        );
+
+        let feed = ConfirmFeed::new();
+        let n = rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 32).unwrap();
+        assert_eq!(n, 3, "contiguous Class A prefix should all rehydrate");
+        for (i, h) in hashes.iter().enumerate() {
+            let ht = (i as u32) + 1;
+            assert!(
+                hub.query.block_queue_has_height(ht),
+                "BQ must hold height {ht}"
+            );
+            assert!(
+                st.body.is_pending(h),
+                "pending after Class A rehydrate h={ht}"
+            );
+            assert!(
+                claim_ready(&hub, &mut st.body, ht, h),
+                "claim_ready after Class A rehydrate h={ht}"
+            );
+        }
+        assert_eq!(feed.size_snap().0, 3);
+
+        // Idempotent: second call counts already-queued as ready, no error.
+        let n2 = rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 32).unwrap();
+        assert_eq!(n2, 3);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

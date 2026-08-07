@@ -80,10 +80,12 @@ PY
     echo "FAIL: no LCOV totals (missing coverage/lcov.info or empty LF)" >&2
     exit 1
   fi
+  # Display uses 2 decimals only; the gate uses unrounded LH/LF (integer cross-multiply).
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
   echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS}"
   echo "Line coverage gate: ≥${LINE_MIN_PCT}% (constant LINE_MIN_PCT=${LINE_MIN_PCT})"
+  echo "Gate math: pass iff LH*100 >= LF*LINE_MIN_PCT (unrounded; not display-rounded %)"
 
   # Optional HTML diagnostic (not the pass condition).
   HTML_PRESENT=0
@@ -105,13 +107,15 @@ PY
     echo "HTML uncovered-line markers (diagnostic): ${UNCOV_TOTAL}"
   fi
 
-  PASS="$(python3 -c "print(1 if float('$LCOV_PCT') + 1e-9 >= float('$LINE_MIN_PCT') else 0)")"
+  # Exact ratio: LH/LF >= LINE_MIN_PCT/100  ⇔  LH*100 >= LF*LINE_MIN_PCT (integers).
+  # Do not compare the 2-decimal display string — 89.995% rounds to "90.00" but must FAIL.
+  PASS="$(python3 -c "print(1 if int('$LCOV_HIT') * 100 >= int('$LCOV_TOT') * int('$LINE_MIN_PCT') else 0)")"
   if [[ "$PASS" -ne 1 ]]; then
-    echo "FAIL: line coverage ${LCOV_PCT}% < ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT})" >&2
+    echo "FAIL: line coverage ${LCOV_PCT}% < ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT}; unrounded LH*100 < LF*${LINE_MIN_PCT})" >&2
     cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
     exit 1
   fi
-  echo "Coverage OK: ${LCOV_PCT}% ≥ ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT})"
+  echo "Coverage OK: ${LCOV_PCT}% ≥ ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT}; LH*100 >= LF*${LINE_MIN_PCT})"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   echo "Tooling: use llvmPackages matching rustc (rustc 1.82 → LLVM 19; see shell.nix)."

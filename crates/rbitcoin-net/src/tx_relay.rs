@@ -169,10 +169,19 @@ impl MempoolHub {
         Ok(res)
     }
 
-    /// Remove confirmed txids (tip connect / archive confirm).
+    /// Remove confirmed txids (tip connect / archive confirm) and re-try orphans
+    /// whose parents just confirmed (Query UTXO view).
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
+        let utxo = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
         let mut g = self.inner.lock().unwrap();
-        g.remove_for_block(txids).unwrap_or(0)
+        g.remove_for_block_with_utxo(txids, &utxo).unwrap_or(0)
+    }
+
+    /// Unique txs parked waiting on missing parents (Core-class orphanage).
+    pub fn orphan_count(&self) -> usize {
+        self.inner.lock().unwrap().orphan_count()
     }
 
     /// Re-admit txs after reorg disconnect (best-effort).
@@ -442,7 +451,7 @@ mod tests {
         hub.set_relay_enabled(true);
         assert!(hub.relay_enabled());
         assert_eq!(hub.live_count(), 0);
-        // Without chain UTXO, accept fails missing prevout — expected.
+        // Without chain UTXO, accept parks as orphan (Core-class soft path).
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -461,7 +470,8 @@ mod tests {
             }],
         };
         let err = hub.accept_tx(&tx).unwrap_err();
-        assert!(matches!(err, AcceptError::MissingPrevout(_)));
+        assert!(matches!(err, AcceptError::Orphaned(_)), "{err}");
+        assert_eq!(hub.orphan_count(), 1);
         assert!(hub.fee_histogram().is_empty());
         assert!(hub.estimate_fee_btc_per_kb(2) < 0.0 || hub.estimate_fee_btc_per_kb(2) >= 0.0);
         assert!(MempoolHub::relay_fee_btc_per_kb() > 0.0);

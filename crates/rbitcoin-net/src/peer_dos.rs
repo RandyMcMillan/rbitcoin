@@ -12,9 +12,15 @@ pub const DEFAULT_MAX_INBOUND: usize = 125;
 /// Sliding window for rate accounting.
 pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Max application messages per peer per window (after decrypt/frame).
-pub const DEFAULT_MAX_MSGS_PER_SEC: u32 = 200;
+///
+/// Tip mempool sync and compact-block reconstruction can burst many small inv /
+/// getdata / tx messages; 200/s was disconnecting useful peers (log: rate limit
+/// ban_score 50→100). 4k/s matches a healthy Core peer under load without
+/// inviting pure message-spam (byte budget still bounds bulk).
+pub const DEFAULT_MAX_MSGS_PER_SEC: u32 = 4_000;
 /// Max framed payload bytes per peer per window (BIP324 contents size).
-pub const DEFAULT_MAX_BYTES_PER_SEC: u64 = 4_000_000;
+/// ~16 MiB/s: enough for concurrent block + tx relay; still caps multi-peer floods.
+pub const DEFAULT_MAX_BYTES_PER_SEC: u64 = 16_000_000;
 /// Ban score added when a peer exceeds rate limits (disconnect at 100).
 pub const RATE_LIMIT_BAN_SCORE: u32 = 50;
 /// Ban score for oversized protocol messages already rejected as MessageTooLarge.

@@ -2,6 +2,7 @@
 
 use crate::error::MempoolError;
 use crate::graph::{TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+use crate::orphanage::Orphanage;
 use crate::store::Mempool;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
@@ -47,6 +48,8 @@ pub struct AcceptResult {
 pub enum AcceptError {
     Policy(&'static str),
     MissingPrevout(OutPoint),
+    /// Tx parked in the orphanage waiting on missing parent(s). Not a hard reject.
+    Orphaned(Txid),
     Duplicate(Txid),
     ClusterTooLarge { count: usize, weight: u64 },
     PackageTooLarge { count: usize, weight: u64 },
@@ -66,6 +69,7 @@ impl std::fmt::Display for AcceptError {
         match self {
             AcceptError::Policy(s) => write!(f, "policy: {s}"),
             AcceptError::MissingPrevout(op) => write!(f, "missing prevout {op}"),
+            AcceptError::Orphaned(t) => write!(f, "orphaned {t}"),
             AcceptError::Duplicate(t) => write!(f, "duplicate {t}"),
             AcceptError::ClusterTooLarge { count, weight } => {
                 write!(f, "cluster too large count={count} weight={weight}")
@@ -111,6 +115,8 @@ pub struct ActiveMempool {
     bodies: std::collections::HashMap<Txid, Transaction>,
     /// Evict worst chunks when live weight exceeds this.
     pub max_weight: u64,
+    /// Side pool of txs waiting on missing parents (Core-class weight budget).
+    pub orphanage: Orphanage,
 }
 
 impl ActiveMempool {
@@ -149,6 +155,7 @@ impl ActiveMempool {
             graph,
             bodies,
             max_weight,
+            orphanage: Orphanage::new(),
         })
     }
 
@@ -210,7 +217,22 @@ impl ActiveMempool {
     ///
     /// Durable order: write body → LIVE slot → RAM graph. Call [`flush`] to
     /// bump generation so a crash keeps the batch.
+    ///
+    /// When prevouts are missing from both mempool and chain UTXO, the tx is
+    /// parked in the [`Orphanage`] (Core-class weight budget) and
+    /// [`AcceptError::Orphaned`] is returned — not a hard peer reject.
     pub fn accept_tx(
+        &mut self,
+        tx: &Transaction,
+        utxos: &impl UtxoProvider,
+    ) -> Result<AcceptResult, AcceptError> {
+        let r = self.accept_tx_inner(tx, utxos)?;
+        // Promote orphans waiting on this parent (best-effort; nested orphans re-park).
+        self.promote_orphans_of(r.txid, utxos);
+        Ok(r)
+    }
+
+    fn accept_tx_inner(
         &mut self,
         tx: &Transaction,
         utxos: &impl UtxoProvider,
@@ -222,11 +244,16 @@ impl ActiveMempool {
         if self.graph.contains(&txid) {
             return Err(AcceptError::Duplicate(txid));
         }
+        // Already parked: soft re-announce of the same orphan.
+        if self.orphanage.contains(&txid) {
+            return Err(AcceptError::Orphaned(txid));
+        }
 
         // Resolve prevouts: in-mempool first, then provider (chain).
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
         let mut parent_txids = BTreeSet::new();
         let mut direct_conflicts: BTreeSet<Txid> = BTreeSet::new();
+        let mut missing_parents: BTreeSet<Txid> = BTreeSet::new();
         let mut input_value = 0u64;
         for inp in &tx.input {
             let op = inp.previous_output;
@@ -250,18 +277,30 @@ impl ActiveMempool {
                     .bodies
                     .get(&creator)
                     .ok_or(AcceptError::Durable("parent body missing".into()))?;
-                parent_tx
-                    .output
-                    .get(op.vout as usize)
-                    .cloned()
-                    .ok_or(AcceptError::MissingPrevout(op))?
+                match parent_tx.output.get(op.vout as usize).cloned() {
+                    Some(o) => o,
+                    None => {
+                        missing_parents.insert(op.txid);
+                        continue;
+                    }
+                }
+            } else if let Some(o) = utxos.get_txout(&op) {
+                o
             } else {
-                utxos
-                    .get_txout(&op)
-                    .ok_or(AcceptError::MissingPrevout(op))?
+                missing_parents.insert(op.txid);
+                continue;
             };
             input_value = input_value.saturating_add(txout.value.to_sat());
             prevouts.push(txout);
+        }
+
+        if !missing_parents.is_empty() {
+            // Park when any parent is unknown (Core TX_MISSING_INPUTS → orphanage).
+            if self.orphanage.insert(tx.clone(), missing_parents) {
+                return Err(AcceptError::Orphaned(txid));
+            }
+            // Cap full / overweight: surface as missing for diagnostics.
+            return Err(AcceptError::MissingPrevout(tx.input[0].previous_output));
         }
 
         let output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -368,6 +407,15 @@ impl ActiveMempool {
             weight,
             slot,
         })
+    }
+
+    /// Re-try orphans that listed `parent` as missing (recursive via accept_tx).
+    fn promote_orphans_of(&mut self, parent: Txid, utxos: &impl UtxoProvider) {
+        let children = self.orphanage.take_children_of(&parent);
+        for child in children {
+            // accept_tx re-parks if still missing other parents; ignores soft errors.
+            let _ = self.accept_tx(&child, utxos);
+        }
     }
 
     /// Remove lowest-feerate chunks until `total_weight <= max_weight`.
@@ -483,7 +531,22 @@ impl ActiveMempool {
     ///
     /// Missing mempool entries are skipped (already not in pool). Returns how many removed.
     /// May trigger compaction when DEAD slots dominate.
+    ///
+    /// Also drops orphanage entries that are confirmed or conflict with the block,
+    /// and best-effort re-accepts orphans whose parent just confirmed (caller must
+    /// pass a UTXO view that includes the new tip — use [`remove_for_block_with_utxo`]).
     pub fn remove_for_block(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
+        self.remove_for_block_with_utxo(block_txids, &MapUtxoProvider {
+            map: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Like [`remove_for_block`], then promote orphans of confirmed parents via `utxos`.
+    pub fn remove_for_block_with_utxo(
+        &mut self,
+        block_txids: &[Txid],
+        utxos: &impl UtxoProvider,
+    ) -> Result<usize, AcceptError> {
         let mut n = 0usize;
         for txid in block_txids {
             if self.graph.contains(txid) {
@@ -491,10 +554,20 @@ impl ActiveMempool {
                 n += 1;
             }
         }
+        // Re-accept orphans waiting on confirmed parents first, then drop any
+        // orphan that was itself included in the block.
+        for txid in block_txids {
+            self.promote_orphans_of(*txid, utxos);
+        }
+        self.orphanage.erase_for_block(block_txids);
         if n > 0 {
             let _ = self.maybe_compact();
         }
         Ok(n)
+    }
+
+    pub fn orphan_count(&self) -> usize {
+        self.orphanage.len()
     }
 
     /// Re-accept non-coinbase txs after a reorg disconnect (best-effort).
@@ -910,6 +983,7 @@ mod tests {
                 txid: Txid::from_byte_array([1; 32]),
                 vout: 0,
             }),
+            AcceptError::Orphaned(Txid::from_byte_array([4; 32])),
             AcceptError::Duplicate(Txid::from_byte_array([2; 32])),
             AcceptError::ClusterTooLarge {
                 count: 3,
@@ -993,8 +1067,8 @@ mod tests {
             Err(AcceptError::Duplicate(_))
         ));
 
-        // Missing prevout.
-        let (op2, _, empty) = chain_utxo(50_000);
+        // Missing prevout → parked in orphanage (Core-class soft accept).
+        let (_op2, _, empty) = chain_utxo(50_000);
         let missing = spend_tx(
             OutPoint {
                 txid: Txid::from_byte_array([0xcd; 32]),
@@ -1002,11 +1076,13 @@ mod tests {
             },
             1,
         );
+        let missing_id = missing.compute_txid();
         assert!(matches!(
             mp.accept_tx(&missing, &empty),
-            Err(AcceptError::MissingPrevout(_))
+            Err(AcceptError::Orphaned(_))
         ));
-        let _ = op2;
+        assert!(mp.orphanage.contains(&missing_id));
+        assert_eq!(mp.orphan_count(), 1);
 
         // maybe_compact with only live → None.
         assert!(mp.maybe_compact().unwrap().is_none());
@@ -1070,6 +1146,41 @@ mod tests {
         assert_eq!(r.txid, high.compute_txid());
         assert!(!mp.graph.contains(&low.compute_txid()));
         assert!(mp.graph.contains(&high.compute_txid()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Child arrives before parent: park in orphanage, promote when parent accepts.
+    #[test]
+    fn orphan_park_then_promote_on_parent() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let parent = spend_tx(op, 99_000);
+        let parent_id = parent.compute_txid();
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            98_000,
+        );
+        let child_id = child.compute_txid();
+
+        assert!(matches!(
+            mp.accept_tx(&child, &utxos),
+            Err(AcceptError::Orphaned(_))
+        ));
+        assert_eq!(mp.orphan_count(), 1);
+        assert!(!mp.graph.contains(&child_id));
+
+        mp.accept_tx(&parent, &utxos).expect("parent");
+        assert!(mp.graph.contains(&parent_id));
+        assert!(
+            mp.graph.contains(&child_id),
+            "child should promote when parent enters mempool"
+        );
+        assert_eq!(mp.orphan_count(), 0);
+        assert_eq!(mp.live_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

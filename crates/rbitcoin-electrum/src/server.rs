@@ -144,6 +144,7 @@ pub async fn run_electrum(
                         drop(stream);
                         continue;
                     };
+                    rbitcoin_log::info!("electrum: connect {peer}");
                     let q = query.clone();
                     let cfg = config.clone();
                     let p = params.clone();
@@ -151,7 +152,13 @@ pub async fn run_electrum(
                     let mp = mempool.clone();
                     tokio::spawn(async move {
                         let _permit = permit; // held until client task ends
-                        let _ = handle_client(stream, q, cfg, p, tip_rx, mp).await;
+                        let how = handle_client(stream, q, cfg, p, tip_rx, mp).await;
+                        match how {
+                            Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
+                            Err(e) => {
+                                rbitcoin_log::info!("electrum: disconnect {peer} ({e})")
+                            }
+                        }
                     });
                 }
                 Ok(Err(_)) => break,
@@ -290,7 +297,10 @@ where
             line = tokio::time::timeout(idle, read_line_capped(&mut reader, max_line)) => {
                 let line = match line {
                     Ok(Ok(Some(l))) => l,
-                    Ok(Ok(None)) => break, // EOF
+                    Ok(Ok(None)) => {
+                        // EOF
+                        return Ok(());
+                    }
                     Ok(Err(e)) => {
                         // Oversize line: best-effort error then drop client.
                         if e.kind() == std::io::ErrorKind::InvalidData {
@@ -299,12 +309,15 @@ where
                                 "error": {"code": -32600, "message": "request line too long"}
                             });
                             let _ = write_line(&mut writer, &resp).await;
+                            return Err(e);
                         }
-                        break;
+                        return Err(e);
                     }
                     Err(_) => {
-                        // Idle timeout.
-                        break;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "idle timeout",
+                        ));
                     }
                 };
                 if line.trim().is_empty() {

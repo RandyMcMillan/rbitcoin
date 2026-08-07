@@ -26,6 +26,7 @@
 mod accept;
 mod error;
 mod graph;
+mod orphanage;
 mod store;
 
 pub use accept::{
@@ -35,6 +36,10 @@ pub use accept::{
 };
 pub use error::MempoolError;
 pub use graph::{Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+pub use orphanage::{
+    Orphanage, DEFAULT_ORPHAN_MAX_COUNT, DEFAULT_ORPHAN_MAX_WEIGHT, MAX_ORPHAN_TX_WEIGHT,
+    ORPHAN_PEER_BUDGET, ORPHAN_RESERVED_WEIGHT_PER_PEER,
+};
 pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA};
 
 pub fn crate_name() -> &'static str {

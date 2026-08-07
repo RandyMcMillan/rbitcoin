@@ -769,7 +769,9 @@ async fn handle_peer_frame(
                     from_this_peer.insert(txid, ());
                     match mp.accept_tx(tx) {
                         Ok(_) => {}
+                        // Soft: already in pool, or parked waiting on parent(s).
                         Err(rbitcoin_mempool::AcceptError::Duplicate(_)) => {}
+                        Err(rbitcoin_mempool::AcceptError::Orphaned(_)) => {}
                         Err(e) => {
                             rbitcoin_log::debug!("txrelay: reject {txid}: {e}");
                         }

@@ -989,11 +989,21 @@ mod tests {
         assert!(net_error_is_store_not_found(&NetError::Consensus(
             "consensus: store: record not found".into()
         )));
+        assert!(net_error_is_store_not_found(&NetError::Consensus(
+            "StoreError::NotFound for fk".into()
+        )));
+        assert!(net_error_is_store_not_found(&NetError::Consensus(
+            "NOT FOUND".into()
+        )));
         assert!(!net_error_is_store_not_found(&NetError::Consensus(
             "corrupt record: multi-spender".into()
         )));
         assert!(!net_error_is_store_not_found(&NetError::Protocol(
             "unknown parent"
+        )));
+        assert!(!net_error_is_store_not_found(&NetError::Timeout));
+        assert!(!net_error_is_store_not_found(&NetError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, "x")
         )));
     }
 

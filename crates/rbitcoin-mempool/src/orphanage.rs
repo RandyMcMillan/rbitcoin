@@ -265,4 +265,40 @@ mod tests {
         assert!(DEFAULT_ORPHAN_MAX_WEIGHT > 10_000_000);
         assert!(DEFAULT_ORPHAN_MAX_WEIGHT < 11_000_000);
     }
+
+    #[test]
+    fn reject_oversize_duplicate_and_remove() {
+        let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 100);
+        let p = txid_n(3);
+        // Empty missing parents → refuse.
+        let tx = make_orphan(p, 1);
+        assert!(!o.insert(tx.clone(), BTreeSet::new()));
+        let mut miss = BTreeSet::new();
+        miss.insert(p);
+        assert!(o.insert(tx.clone(), miss.clone()));
+        // Duplicate insert rejected.
+        assert!(!o.insert(tx.clone(), miss.clone()));
+        let tid = tx.compute_txid();
+        o.remove_txid(&tid);
+        assert!(!o.contains(&tid));
+        // take_children on unknown parent is empty.
+        assert!(o.take_children_of(&txid_n(99)).is_empty());
+        // Count-cap eviction (with_limits floors max_weight at MAX_ORPHAN_TX_WEIGHT).
+        let mut o2 = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 3);
+        for i in 0..8u8 {
+            let t = make_orphan(p, i + 1);
+            let mut m = BTreeSet::new();
+            m.insert(p);
+            o2.insert(t, m);
+        }
+        assert!(o2.len() <= 3);
+        // erase_for_block drops matching orphans.
+        let t3 = make_orphan(p, 50);
+        let tid3 = t3.compute_txid();
+        let mut m = BTreeSet::new();
+        m.insert(p);
+        o2.insert(t3, m);
+        o2.erase_for_block(&[tid3]);
+        assert!(!o2.contains(&tid3));
+    }
 }

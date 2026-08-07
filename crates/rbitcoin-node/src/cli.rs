@@ -518,6 +518,60 @@ mod tests {
             cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
             ExitCode::from(2),
         );
+        // Missing values / parse rejects for advanced knobs.
+        assert_exit(cli_main(["rbitcoin-node", "--conf"]), ExitCode::from(2));
+        assert_exit(
+            cli_main(["rbitcoin-node", "--maxinbound"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--maxinbound", "0"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--maxinbound", "nope"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--archive-queue-mb"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--archive-queue-mb", "0"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--archive-queue-mb", "x"]),
+            ExitCode::from(2),
+        );
+        // Bad conf path / invalid conf log_level.
+        let dir = tmp_datadir();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_exit(
+            cli_main([
+                "rbitcoin-node",
+                "--conf",
+                dir.join("missing.conf").to_str().unwrap(),
+                "--datadir",
+                dir.join("d").to_str().unwrap(),
+            ]),
+            ExitCode::from(2),
+        );
+        let conf = dir.join("badlog.conf");
+        std::fs::write(&conf, "log_level=notalevel\nnetwork=regtest\n").unwrap();
+        assert_exit(
+            cli_main([
+                "rbitcoin-node",
+                "--smoke",
+                "--conf",
+                conf.to_str().unwrap(),
+                "--datadir",
+                dir.join("d2").to_str().unwrap(),
+                "--no-seeds",
+            ]),
+            ExitCode::from(2),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

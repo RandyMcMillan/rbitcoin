@@ -131,4 +131,36 @@ mod tests {
         let m = [1u8; 32];
         assert_eq!(fuse_key_from_mixed(&m), fuse_key_from_mixed(&m));
     }
+
+    #[test]
+    fn empty_build_and_bad_header_errors() {
+        // Empty key set uses the dummy-key construction arm.
+        let empty = SealedFuse8::build(&[]).unwrap();
+        // Dummy key 0 may or may not contain; just ensure build succeeded.
+        let _ = empty.contains(0);
+        assert!(empty.fingerprint_bytes() > 0);
+
+        let dir = tmp();
+        let path = dir.join("bad.fuse8");
+        // Bad magic.
+        std::fs::write(
+            &path,
+            b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+        assert!(matches!(
+            SealedFuse8::read_from(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Bad version (magic ok).
+        let mut bad_ver = Vec::from(*MAGIC);
+        bad_ver.extend_from_slice(&99u32.to_le_bytes());
+        bad_ver.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &bad_ver).unwrap();
+        assert!(matches!(
+            SealedFuse8::read_from(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

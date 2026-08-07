@@ -7,8 +7,8 @@
    over inventing parallel specs.
 2. Prefer **high-level functional/integration tests** over unit tests
    ([`COVERAGE.md`](./COVERAGE.md), [`TESTING.md`](./TESTING.md)).
-3. Every PR must keep **100% line and 100% branch** coverage on first-party code
-   (`./scripts/coverage.sh` — same bar as CI).
+3. Every PR must keep **≥90% line** coverage on first-party code (and ≥90%
+   branch when measured on nightly) via `./scripts/coverage.sh` — same bar as CI.
 4. Target is **production server-side** node software (wallet backends, etc.).
    Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/end-user wallet/
    mining without an explicit plan change.

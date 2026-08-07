@@ -1847,4 +1847,79 @@ mod tests {
             None => std::env::remove_var("RBITCOIN_TX_HEAD_BITS"),
         }
     }
+
+    #[test]
+    fn head_access_env_probe_stats_and_layout_helpers() {
+        let prev = std::env::var_os("RBITCOIN_TX_HEAD_ACCESS");
+        for val in ["map", "mmap", "mapfull", "fd", ""] {
+            if val.is_empty() {
+                std::env::remove_var("RBITCOIN_TX_HEAD_ACCESS");
+            } else {
+                std::env::set_var("RBITCOIN_TX_HEAD_ACCESS", val);
+            }
+            assert!(matches!(head_table_access_from_env(), TableAccess::FdOnly));
+        }
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_TX_HEAD_ACCESS", v),
+            None => std::env::remove_var("RBITCOIN_TX_HEAD_ACCESS"),
+        }
+
+        let _ = sample_probe_depth_stats(); // reset
+        let (w0, e0) = probe_depth_stats_snapshot();
+        assert_eq!(w0, 0);
+        assert_eq!(e0, 0);
+        note_probe_depth_on_insert(PROBE_DEPTH_WARN); // no-op ≤ warn
+        note_probe_depth_on_insert(PROBE_DEPTH_WARN + 1); // first warn
+        note_probe_depth_on_insert(PROBE_DEPTH_WARN + 50); // silent count
+        note_probe_exhausted();
+        let (w1, e1) = probe_depth_stats_snapshot();
+        assert!(w1 >= 2, "warn count={w1}");
+        assert!(e1 >= 1, "exhausted={e1}");
+        let (ws, es) = sample_probe_depth_stats();
+        assert!(ws >= 2 && es >= 1);
+        assert_eq!(probe_depth_stats_snapshot(), (0, 0));
+
+        assert!(is_probe_exhausted_error(&StoreError::Corrupt(
+            "address head probe exhausted on insert"
+        )));
+        assert!(!is_probe_exhausted_error(&StoreError::Corrupt("other")));
+
+        let txid = [0xABu8; 32];
+        let _ = page_index(&txid, MAINNET_BITS);
+        let _ = h1_in_page(&txid, MAINNET_BITS);
+        let _ = h2_in_page(&txid, MAINNET_BITS);
+        let _ = page_slot_count(MAINNET_BITS);
+        let _ = page_base_for_txid(&txid, MAINNET_BITS);
+        assert_eq!(entry_file_off(0, 4), 0);
+        assert_eq!(entry_file_off(3, 4), 12);
+        assert_eq!(entry_bytes_for_bits(TINY_BITS), 4);
+        assert_eq!(entry_bytes_for_bits(MAX_BITS), 8);
+        let layout = default_layout();
+        assert!((MIN_BITS..=MAX_BITS).contains(&layout.bits));
+        let l2 = layout_for_count(1_000_000);
+        assert_eq!(l2.bits, layout.bits);
+        assert!(!load_needs_roll(0, 100));
+        // Just above HEAD_LOAD_START (0.80) of 100 slots → roll.
+        assert!(load_needs_roll(81, 100));
+        assert!(!load_needs_resize(0, 100));
+        let ext = encode_layout_ext(layout, 7);
+        let (dec, gen) = decode_layout_ext(&ext).unwrap();
+        assert_eq!(dec.bits, layout.bits);
+        assert_eq!(gen, 7);
+        // Bad decode
+        let bad = [0u8; 16];
+        assert!(decode_layout_ext(&bad).is_err());
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-ah-meta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let meta = meta_path(&path);
+        std::fs::write(&meta, b"x").unwrap();
+        remove_legacy_meta_sidecar(&path);
+        assert!(!meta.exists());
+    }
 }

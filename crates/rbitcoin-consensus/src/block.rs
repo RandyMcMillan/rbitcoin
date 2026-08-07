@@ -3566,5 +3566,121 @@ mod sigop_cost_tests {
             true,
         );
         assert!(verify_scripts_pool(&[job]).is_ok());
+        // Borrowed job list path with one ACS job.
+        let job2 = ScriptCheckJob::new(
+            vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+            Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([8; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(verify_scripts_pool_jobs(&[&job2]).is_ok());
+    }
+
+    #[test]
+    fn job_tx_traits_and_shared_mut_panic() {
+        use super::{block_subsidy, is_anyone_can_spend, is_final_tx, JobTx};
+        use crate::params::ChainParams;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode};
+        use std::borrow::Borrow;
+        use std::sync::Arc;
+
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let owned: JobTx = tx.clone().into();
+        assert_eq!(owned.as_ref().output.len(), 1);
+        assert_eq!(Borrow::<Transaction>::borrow(&owned).output.len(), 1);
+        let mut owned_mut = JobTx::owned(tx.clone());
+        assert_eq!(owned_mut.output.len(), 1);
+        owned_mut.output[0].value = Amount::from_sat(2); // DerefMut owned
+
+        // Minimal block shell for shared JobTx.
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        let block = Arc::new(Block {
+            header,
+            txdata: vec![
+                Transaction {
+                    version: TxVersion::ONE,
+                    lock_time: LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: OutPoint::null(),
+                        script_sig: ScriptBuf::from_bytes(vec![0x00, 0x00]),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(50),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    }],
+                },
+                tx.clone(),
+            ],
+        });
+        let shared = JobTx::shared(Arc::clone(&block), 1);
+        assert_eq!(shared.as_ref().output.len(), 1);
+        let mut shared_mut = JobTx::shared(block, 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = &mut shared_mut.output;
+        }));
+        assert!(r.is_err(), "shared JobTx must panic on DerefMut");
+
+        let p = ChainParams::regtest();
+        assert_eq!(block_subsidy(0, &p), 50 * 100_000_000);
+        assert_eq!(block_subsidy(210_000, &p), 25 * 100_000_000);
+        assert_eq!(block_subsidy(6_930_000, &p), 0);
+        assert!(is_anyone_can_spend(
+            ScriptBuf::from_bytes(vec![0x51]).as_script()
+        ));
+        assert!(!is_anyone_can_spend(
+            ScriptBuf::from_bytes(vec![0x00]).as_script()
+        ));
+        let final_tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+        assert!(is_final_tx(&final_tx, 0, 0));
     }
 }

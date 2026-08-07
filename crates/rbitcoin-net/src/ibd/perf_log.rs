@@ -1997,6 +1997,103 @@ mod tests {
         assert!(!line.contains("pin_res="), "{line}");
     }
 
+    /// Drive the remaining format_* optional branches (stamp_sub, head_loc,
+    /// lookup_sub, plan_batch head_rd / dens) so LCOV hits those arms.
+    #[test]
+    fn format_info_and_debug_optional_subblocks() {
+        let mut s = IbdPerfSample::default();
+        s.phase_blks = 8;
+        s.plan_blks = 4;
+        s.plan_ms = 12;
+        s.plan_parents = 100;
+        s.plan_already = 10;
+        s.plan_cold = 20;
+        s.plan_same_batch = 5;
+        s.plan_collect_ms = 3;
+        s.plan_head_ms = 4;
+        s.plan_cold_io_ms = 5;
+        s.stamp_struct_ms = 1;
+        s.stamp_prepare_ms = 2;
+        s.stamp_filter_ms = 3;
+        s.stamp_batch_ms = 4;
+        s.stamp_batch_assign_ms = 1;
+        s.stamp_batch_collect_ms = 1;
+        s.stamp_batch_head_fk_ms = 1;
+        s.stamp_batch_head_dens_ms = 1;
+        s.stamp_batch_head_ms = 2;
+        s.stamp_batch_stamp_ms = 1;
+        s.stamp_batch_finish_ms = 1;
+        s.arch_prep_age_hit_n = 50;
+        s.arch_prep_age_cdf0_pct = 10;
+        s.arch_prep_age_cdf3_pct = 40;
+        s.arch_prep_age_cdf7_pct = 70;
+        s.arch_prep_age_cdf15_pct = 90;
+        s.arch_prep_age_cdf31_pct = 100;
+        s.arch_ext_need = 30;
+        s.arch_prep_assign_ms = 6;
+        s.arch_prep_collect_ms = 2;
+        s.arch_prep_inflight_ms = 1;
+        s.arch_prep_head_fk_ms = 1;
+        s.arch_prep_head_dens_ms = 2;
+        s.arch_prep_head_ms = 3;
+        s.arch_prep_stamp_ms = 1;
+        s.arch_prep_finish_ms = 1;
+        s.arch_resolve_ns = 8_000_000;
+        s.arch_resolve_blocks = 4;
+        s.arch_head_hit = 20;
+        s.arch_head_need = 25;
+        s.arch_batch_stamp = 4;
+        s.arch_prep_probe_ms = 8;
+        s.arch_prep_idx_ms = 4;
+        s.arch_prep_body_txid_ms = 2;
+        s.arch_prep_head_keys = 100;
+        s.arch_prep_head_cands = 300;
+        s.arch_prep_body_lookups = 200;
+        s.arch_prep_hit_rank_avg_x100 = 150;
+        s.arch_prep_hit_rank_n = 20;
+        s.arch_prep_miss_peeks = 5;
+        s.arch_prep_age_hit_compact = "1:2:3:0:0:0:0:0:0".into();
+        s.arch_head_dens_fks = 12;
+        s.arch_head_dens_bytes = 3 * 1024 * 1024;
+        s.sh_collect_pin = 7;
+        s.sh_collect_cold = 3;
+        s.sh_collect_ms = 9;
+        s.sh_filter_ms = 1;
+        s.sh_sort_ms = 1;
+        s.sh_seed_ms = 2;
+        s.sh_body_ms = 3;
+        s.sh_head_ms = 4;
+        s.wf_body_store = 1;
+        s.wf_store_body_ms = 2;
+        s.load_missing_parents = 3;
+        s.thr_lookup_stamp_ms = 1;
+        let info = format_info(&s);
+        assert!(info.contains("stamp_sub("), "{info}");
+        assert!(info.contains("head_loc(cdf0=10"), "{info}");
+        assert!(info.contains("lookup_sub(blks=4"), "{info}");
+        let dbg = format_debug(&s);
+        assert!(dbg.contains("plan_batch "), "{dbg}");
+        assert!(dbg.contains("head_rd("), "{dbg}");
+        assert!(dbg.contains("probe_us/key="), "{dbg}");
+        assert!(
+            dbg.contains("sh_src pin=7 cold=3") || dbg.contains("sh collect=9"),
+            "{dbg}"
+        );
+        // Zero-key / zero-block edge arms in the same helpers.
+        s.arch_resolve_blocks = 0;
+        s.arch_prep_head_keys = 0;
+        s.arch_prep_age_hit_compact.clear();
+        let dbg2 = format_debug(&s);
+        assert!(dbg2.contains("plan_batch "), "{dbg2}");
+        // Empty compact string uses the 0:0:… default when head_rd runs with hit_n.
+        s.arch_prep_probe_ms = 1;
+        s.arch_prep_head_keys = 0; // still enter outer if, but avg_* zero arms
+        let _ = format_debug(&s);
+        // read_proc_rss residual file_kb path exercised on Linux.
+        let rss = read_proc_rss();
+        assert!(rss.rss_kb > 0 || cfg!(not(target_os = "linux")));
+    }
+
     #[test]
     fn format_debug_has_detail_tokens() {
         let mut s = IbdPerfSample::default();
@@ -2294,5 +2391,13 @@ mod tests {
 
         // log_sample should not panic (INFO path always; DEBUG optional).
         log_sample(&edge);
+        // Slow-phase warn arm (ms/blk thresholds).
+        let mut slow = edge;
+        slow.phase_blks = 1;
+        slow.class_c_ms = 2000;
+        slow.sh_ms = 2000;
+        slow.load_ms = 6000;
+        slow.class_a_ms = 6000;
+        log_sample(&slow);
     }
 }

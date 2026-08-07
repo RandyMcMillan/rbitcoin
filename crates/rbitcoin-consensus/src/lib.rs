@@ -948,6 +948,14 @@ mod coverage_tests {
         let _ = sample_assemble_prevout_detail_and_reset();
         let _ = sample_assemble_cold_why_and_reset();
         let _ = sample_ensure_mix_and_reset();
+        let _ = sample_spend_ann_and_reset();
+        let _ = sample_spend_meta_and_reset();
+        let ab = sample_spend_ann_ab_and_reset();
+        assert_eq!(ab.0, 0);
+        assert_eq!(ab.1, 0);
+        let mb = sample_spend_meta_ab_and_reset();
+        assert_eq!(mb.0, 0);
+        assert_eq!(mb.1, 0);
     }
 
     #[test]

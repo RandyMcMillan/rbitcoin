@@ -382,6 +382,27 @@ mod tests {
         let role_path = dir.join("role");
         let h = ShardedHashHead::create_for_role(&role_path, HeadRole::Header).unwrap();
         assert_eq!(h.shards.len(), 1);
+        assert_eq!(h.occupied(), 0);
+        h.insert(&[1u8; 32], Fk(7)).unwrap();
+        assert!(h.occupied() >= 1);
+        // single-shard insert_many path
+        h.insert_many(&[([2u8; 32], Fk(8))]).unwrap();
+        assert!(h.occupied() >= 2);
+
+        // Mainnet scale role branches (restore after).
+        let prev_scale = std::env::var_os("RBITCOIN_HEAD_SCALE");
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
+        assert_eq!(shard_count_for_role(HeadRole::Header), 1);
+        assert_eq!(
+            shard_count_for_role(HeadRole::ScriptHash),
+            SHARD_COUNT_TX_SH
+        );
+        assert_eq!(initial_slots_per_shard(HeadRole::Header), 1 << 20);
+        assert_eq!(initial_slots_per_shard(HeadRole::ScriptHash), 1 << 16);
+        match prev_scale {
+            Some(v) => std::env::set_var("RBITCOIN_HEAD_SCALE", v),
+            None => std::env::remove_var("RBITCOIN_HEAD_SCALE"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

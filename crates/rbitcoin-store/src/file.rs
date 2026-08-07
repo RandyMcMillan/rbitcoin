@@ -748,6 +748,7 @@ mod advise_tests {
 
     #[test]
     fn table_access_always_fd_only() {
+        assert!(TableAccess::FdOnly.is_fd_only());
         assert_eq!(
             TableAccess::for_kind(TableKind::Tx, false),
             TableAccess::FdOnly

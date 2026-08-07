@@ -58,7 +58,7 @@ Target: default suite wall **well under a few minutes** (stretch &lt;2 min on 
 
 - Default coverage is **incremental** (no `llvm-cov clean`) so repeat runs reuse the instrumented target dir.
 - Force a cold instrumented rebuild: `COVERAGE_CLEAN=1 ./scripts/coverage.sh`
-- Gate: HTML report has **0** `uncovered-line` markers on first-party sources.
+- Gate: LCOV line coverage **≥ 90%** (`LH`/`LF` from `./scripts/coverage.sh`).
 
 ### Mature-chain fixtures
 

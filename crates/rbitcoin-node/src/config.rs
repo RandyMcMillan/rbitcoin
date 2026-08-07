@@ -473,4 +473,130 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn validate_rejects_zero_peer_caps_and_empty_datadir() {
+        let mut cfg = NodeConfig::default();
+        cfg.datadir = PathBuf::new();
+        assert!(cfg.validate().is_err());
+        let mut cfg = NodeConfig::default().with_datadir(tmp());
+        cfg.max_outbound = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_outbound = 1;
+        cfg.max_inbound = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_inbound = 1;
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.milestone(), Milestone::NONE);
+        cfg.milestone_height = 10;
+        assert_eq!(cfg.milestone().height, 10);
+    }
+
+    #[test]
+    fn conf_bare_network_flags_and_bad_line() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("flags.conf");
+        std::fs::write(
+            &conf,
+            "regtest\n\
+             # comment\n\
+             ; also\n\
+             \n\
+             noseeds=1\n",
+        )
+        .unwrap();
+        let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
+        cfg.merge_conf_file(&conf).unwrap();
+        assert_eq!(cfg.network, Network::Regtest);
+        assert!(!cfg.use_seeds);
+
+        let conf2 = dir.join("signet.conf");
+        std::fs::write(&conf2, "signet\n").unwrap();
+        let mut cfg2 = NodeConfig::default().with_datadir(dir.join("d2"));
+        cfg2.merge_conf_file(&conf2).unwrap();
+        assert_eq!(cfg2.network, Network::Signet);
+
+        let conf3 = dir.join("testnet.conf");
+        std::fs::write(&conf3, "testnet\n").unwrap();
+        let mut cfg3 = NodeConfig::default().with_datadir(dir.join("d3"));
+        cfg3.merge_conf_file(&conf3).unwrap();
+        assert_eq!(cfg3.network, Network::Testnet);
+
+        let conf_bad = dir.join("bad.conf");
+        std::fs::write(&conf_bad, "not_a_key_value\n").unwrap();
+        let mut cfg_bad = NodeConfig::default().with_datadir(dir.join("db"));
+        assert!(cfg_bad.merge_conf_file(&conf_bad).is_err());
+
+        let missing = dir.join("nope.conf");
+        assert!(cfg_bad.merge_conf_file(&missing).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conf_keys_parse_and_error_paths() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("full.conf");
+        std::fs::write(
+            &conf,
+            "listen=127.0.0.1:18444\n\
+             connect=127.0.0.1:18445\n\
+             electrum_listen=127.0.0.1:50001\n\
+             milestone=100\n\
+             maxoutbound=8\n\
+             maxinbound=32\n\
+             mempool_size_mb=50\n\
+             archive_queue_mb=64\n\
+             log_level=info\n\
+             noseeds=0\n\
+             unknown_key=1\n\
+             network=regtest\n",
+        )
+        .unwrap();
+        let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
+        cfg.merge_conf_file(&conf).unwrap();
+        assert_eq!(cfg.network, Network::Regtest);
+        assert!(cfg.p2p_listen.is_some());
+        assert_eq!(cfg.connect.len(), 1);
+        assert!(cfg.electrum_listen.is_some());
+        assert_eq!(cfg.milestone_height, 100);
+        assert_eq!(cfg.max_outbound, 8);
+        assert_eq!(cfg.max_inbound, 32);
+        assert!(cfg.max_inbound_explicit);
+        assert_eq!(cfg.mempool_max_weight, 50_000_000);
+        assert_eq!(cfg.archive_queue_mb, 64);
+        assert!(cfg.archive_queue_mb_explicit);
+        assert_eq!(cfg.conf_log_level.as_deref(), Some("info"));
+        assert!(cfg.use_seeds); // noseeds=0 → seeds on
+
+        // Error paths: bad listen / electrum / mempool 0 / empty log_level.
+        for (body, needle) in [
+            ("listen=not-an-addr\n", "listen"),
+            ("electrum_listen=bad\n", "electrum"),
+            ("mempool_size_mb=0\n", "mempool"),
+            ("log_level=\n", "log_level"),
+            ("network=notanet\n", "network"),
+            ("milestone=x\n", "milestone"),
+        ] {
+            let p = dir.join(format!("bad-{needle}.conf"));
+            std::fs::write(&p, body).unwrap();
+            let mut c = NodeConfig::default().with_datadir(dir.join("dx"));
+            let err = c.merge_conf_file(&p).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.to_ascii_lowercase().contains(needle)
+                    || msg.contains("conf")
+                    || msg.contains("parse"),
+                "body={body:?} msg={msg}"
+            );
+        }
+
+        // ensure_datadir rejects a file path as datadir.
+        let file_dd = dir.join("not-a-dir");
+        std::fs::write(&file_dd, b"x").unwrap();
+        let cfg_f = NodeConfig::default().with_datadir(&file_dd);
+        assert!(cfg_f.ensure_datadir().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

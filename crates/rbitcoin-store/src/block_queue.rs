@@ -347,6 +347,48 @@ mod tests {
     }
 
     #[test]
+    fn budget_from_env_bytes_and_gb_clamps() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_b = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
+        let prev_g = std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB");
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "1"); // below 64MiB floor
+        assert_eq!(BlockQueue::budget_from_env(), 64 * 1024 * 1024);
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_GB", "2");
+        assert_eq!(BlockQueue::budget_from_env(), 2u64 * 1024 * 1024 * 1024);
+        match prev_b {
+            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
+            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
+        }
+        match prev_g {
+            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_GB", v),
+            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB"),
+        }
+    }
+
+    #[test]
+    fn can_enqueue_and_fill_ratio_budgeted() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        assert!(q.can_enqueue(1024));
+        assert!(q.fill_ratio() >= 0.0);
+        let big = vec![0u8; 65 * 1024 * 1024];
+        assert!(!q.can_enqueue(big.len()));
+        assert!(q.enqueue(1, [9u8; 32], 1, &big).is_err());
+        // Unlimited budget: fill_ratio 0.
+        let q2 = BlockQueue::open_or_create_with_budget(&dir, u64::MAX).unwrap();
+        assert_eq!(q2.fill_ratio(), 0.0);
+        assert!(q2.can_enqueue(big.len()));
+        // Legacy dir cleanup path.
+        let legacy = dir.join("block_queue");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let _ = BlockQueue::open_or_create(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn max_height_span() {
         let dir = temp();
         let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
@@ -398,6 +440,41 @@ mod tests {
         q.enqueue(2, [2u8; 32], 2, &big).unwrap();
         // Third 32 MiB would exceed 64 MiB budget.
         assert!(q.enqueue(3, [3u8; 32], 3, &big).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ids_and_get_by_height_and_fill_ratio() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        assert!(q.ids().is_empty());
+        assert!(!q.contains_height(1));
+        assert!((q.fill_ratio() - 0.0).abs() < 1e-9);
+        assert!(q.can_enqueue(1));
+        let id = q.enqueue(7, [7u8; 32], 1, b"xyz").unwrap();
+        let mut ids = q.ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![id]);
+        assert!(q.contains_height(7));
+        assert!(!q.contains_height(8));
+        assert!(q.get_by_height(99).unwrap().is_none());
+        let got = q.get_by_height(7).unwrap().unwrap();
+        assert_eq!(got.payload, b"xyz");
+        assert_eq!(q.get(id).unwrap().unwrap().payload, b"xyz");
+        assert!(q.get(999).unwrap().is_none());
+        assert_eq!(q.min_height(), Some(7));
+        assert_eq!(q.max_height(), Some(7));
+        let _ = q.load_all().unwrap();
+        assert!(q.dequeue(id).unwrap());
+        assert!(!q.contains_height(7));
+        // budget_from_env with unset
+        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_MB");
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_MB");
+        let _ = BlockQueue::budget_from_env();
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_MB", v),
+            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_MB"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

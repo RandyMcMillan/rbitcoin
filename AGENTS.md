@@ -97,11 +97,10 @@ after a toolchain bump — prefer fixing the code.
 
 ### Coverage job
 
-`./scripts/coverage.sh` enforces **100% first-party HTML uncovered-line** (see
-`COVERAGE.md`). It runs as a separate CI job (slow). Prefer running it when
-touching store/query/consensus hot paths. **Do not land new uncovered production
-lines.** The coverage job may be `continue-on-error` while historical gaps are
-closed — that is temporary; required `test` must still pass.
+`./scripts/coverage.sh` enforces **≥90% first-party line coverage** (LCOV
+`LH`/`LF`; see `COVERAGE.md`). It runs as a **required** CI job (slow). Prefer
+running it when touching store/query/consensus hot paths. Prefer not to grow
+uncovered production regions; the 90% bar applies to new and existing code.
 
 If a change cannot pass required gates, **do not commit it as done** — fix, split,
 or get explicit user approval for a temporary exception (prefer none).

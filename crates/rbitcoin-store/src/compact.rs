@@ -145,7 +145,18 @@ mod tests {
             let (v, used) = read_compact_size(&buf).unwrap();
             assert_eq!(v, n);
             assert_eq!(used, buf.len());
+            assert_eq!(compact_size_len(n), buf.len());
         }
+        assert_eq!(compact_size_len(252), 1);
+        assert_eq!(compact_size_len(253), 3);
+        assert_eq!(compact_size_len(u16::MAX as u64), 3);
+        assert_eq!(compact_size_len(u16::MAX as u64 + 1), 5);
+        assert_eq!(compact_size_len(u32::MAX as u64), 5);
+        assert_eq!(compact_size_len(u32::MAX as u64 + 1), 9);
+        assert_eq!(uleb128_len(0), 1);
+        assert_eq!(uleb128_len(127), 1);
+        assert_eq!(uleb128_len(128), 2);
+        assert!(uleb128_len(u64::MAX) >= 9);
     }
 
     #[test]

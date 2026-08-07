@@ -236,11 +236,21 @@ mod tests {
     #[test]
     fn parse_tokens() {
         assert_eq!(parse_read_token("uring"), Some(ReadIoBackend::Uring));
+        assert_eq!(parse_read_token("io_uring"), Some(ReadIoBackend::Uring));
         assert_eq!(parse_read_token("pread"), Some(ReadIoBackend::Pread));
+        assert_eq!(parse_read_token("fd"), Some(ReadIoBackend::Pread));
+        assert_eq!(parse_read_token("libc"), Some(ReadIoBackend::Pread));
+        assert_eq!(parse_read_token("pwrite"), Some(ReadIoBackend::Pread));
         assert_eq!(parse_read_token("mmap"), Some(ReadIoBackend::Pread));
+        assert_eq!(parse_write_token("uring"), Some(WriteIoBackend::Uring));
+        assert_eq!(parse_write_token("io_uring"), Some(WriteIoBackend::Uring));
         assert_eq!(parse_write_token("pwrite"), Some(WriteIoBackend::Pwrite));
+        assert_eq!(parse_write_token("pread"), Some(WriteIoBackend::Pwrite));
+        assert_eq!(parse_write_token("fd"), Some(WriteIoBackend::Pwrite));
+        assert_eq!(parse_write_token("libc"), Some(WriteIoBackend::Pwrite));
         assert_eq!(parse_write_token("mmap"), Some(WriteIoBackend::Pwrite));
         assert!(parse_read_token("alternate").is_none());
+        assert!(parse_write_token("nope").is_none());
     }
 
     #[test]
@@ -251,6 +261,41 @@ mod tests {
         std::env::set_var("RBITCOIN_PIN_IO", "pread");
         assert_eq!(resolve_read("RBITCOIN_PIN_IO"), ReadIoBackend::Pread);
         clear_io_envs();
+    }
+
+    #[test]
+    fn global_env_io_uring_off_and_aliases() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_io_envs();
+        std::env::set_var("RBITCOIN_IO", "mmap");
+        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
+        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
+        clear_io_envs();
+        std::env::set_var("RBITCOIN_IO_URING", "0");
+        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
+        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
+        clear_io_envs();
+        std::env::set_var("RBITCOIN_IO_URING", "false");
+        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
+        clear_io_envs();
+        std::env::set_var("RBITCOIN_IO_URING", "off");
+        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
+        clear_io_envs();
+        // Unknown RBITCOIN_IO token → None (fall through).
+        std::env::set_var("RBITCOIN_IO", "not-a-backend");
+        assert_eq!(global_read_from_env(), None);
+        assert_eq!(global_write_from_env(), None);
+        clear_io_envs();
+    }
+
+    #[test]
+    fn effective_backends_demote_when_uring_disabled() {
+        // effective_* only demotes when bulk_io reports uring off; still exercises match arms.
+        let _ = effective_read(ReadIoBackend::Pread);
+        let _ = effective_read(ReadIoBackend::Uring);
+        let _ = effective_write(WriteIoBackend::Pwrite);
+        let _ = effective_write(WriteIoBackend::Uring);
+        assert!(class_a_append_uses_pwrite());
     }
 
     #[test]

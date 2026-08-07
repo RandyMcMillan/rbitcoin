@@ -927,4 +927,50 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn truncate_and_empty_helpers() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-var-trunc-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let fks = t
+            .put_batch_encode(5, 64, |i, buf| {
+                buf.extend_from_slice(&[i as u8; 16]);
+            })
+            .unwrap();
+        assert_eq!(fks.len(), 5);
+        assert_eq!(t.count(), 5);
+        // No-op truncate to same count.
+        t.truncate_to_count(5).unwrap();
+        assert_eq!(t.count(), 5);
+        // Shorten.
+        t.truncate_to_count(2).unwrap();
+        assert_eq!(t.count(), 2);
+        assert!(t.get_raw(Fk(1)).unwrap().len() >= 16);
+        assert!(matches!(t.get_raw(Fk(3)), Err(StoreError::NotFound)));
+        // Past count is corrupt.
+        assert!(matches!(
+            t.truncate_to_count(9),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Empty body helpers.
+        t.advise_body_dont_need(0, 0);
+        let _ = t.body_logical_len();
+        assert!(t.idx_segment_count() >= 1);
+        let ranges = t.record_range_batch(&[Fk(1), Fk(99)]).unwrap();
+        assert!(ranges[0].is_some());
+        assert!(ranges[1].is_none());
+        t.with_raw(Fk(1), |b| {
+            assert!(b.len() >= 16);
+            Ok(())
+        })
+        .unwrap();
+        // Empty batch.
+        let empty = t.put_batch_encode(0, 0, |_, _| {}).unwrap();
+        assert!(empty.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

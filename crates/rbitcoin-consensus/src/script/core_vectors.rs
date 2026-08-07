@@ -26,6 +26,48 @@ fn load_json() -> Value {
     serde_json::from_str(&s).expect("script_tests.json")
 }
 
+#[test]
+fn assemble_edges_string_hex_push_and_errors() {
+    // Quoted string → data push.
+    let b = assemble("'Az'").expect("string");
+    assert_eq!(b[0], 2); // push length
+    assert_eq!(&b[1..], b"Az");
+    // Hex raw bytes (not a push wrapper).
+    let b = assemble("0x5152").expect("hex");
+    assert_eq!(b, vec![0x51, 0x52]);
+    // Numbers and opcode names.
+    let b = assemble("1 2 ADD").expect("ops");
+    assert!(!b.is_empty());
+    // Push length encodings for larger payloads.
+    let long = "x".repeat(80);
+    let quoted = format!("'{long}'");
+    let b = assemble(&quoted).expect("long push");
+    assert_eq!(b[0], 0x4c); // OP_PUSHDATA1
+    assert_eq!(b[1], 80);
+    // Errors.
+    assert!(assemble("'unterminated").is_err());
+    assert!(assemble("0xabc").is_err()); // odd hex
+    assert!(assemble("NOTANOPCODE").is_err());
+    // Empty / whitespace only.
+    assert!(assemble("   ").unwrap().is_empty());
+    // 0X uppercase hex prefix.
+    let b = assemble("0X5152").expect("hex upper");
+    assert_eq!(b, vec![0x51, 0x52]);
+    // Negative scriptnum encoding.
+    let b = assemble("-1").expect("neg");
+    assert!(!b.is_empty());
+    // Larger push → OP_PUSHDATA1 already covered; force OP_PUSHDATA2 via long payload.
+    let long = "y".repeat(300);
+    let b = assemble(&format!("'{long}'")).expect("pushdata2");
+    assert_eq!(b[0], 0x4d); // OP_PUSHDATA2
+                            // Opcode token mixed case / known names.
+    let b = assemble("OP_DUP OP_HASH160").expect("ops named");
+    assert!(!b.is_empty());
+    // Zero token.
+    let b = assemble("0").expect("zero");
+    assert!(!b.is_empty());
+}
+
 // ── Core script language assembler ──────────────────────────────────────────
 
 /// Assemble Core script string ("1 2 ADD", "0x4c 0x01 0x07", "'Az'") to bytes.

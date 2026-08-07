@@ -2063,6 +2063,40 @@ mod tests {
     }
 
     #[test]
+    fn open_run_v1_and_unsupported_version_and_lookup_short() {
+        let d = tmp_dir();
+        // Unsupported version with current magic.
+        let bad_ver = d.join("000020.run");
+        let mut hdr = vec![0u8; 64];
+        hdr[0..8].copy_from_slice(b"RBSORT02");
+        hdr[8..12].copy_from_slice(&99u32.to_le_bytes());
+        fs::write(&bad_ver, &hdr).unwrap();
+        assert!(matches!(open_run(&bad_ver), Err(StoreError::Corrupt(_))));
+        // V1 magic with wrong version.
+        let bad_v1 = d.join("000021.run");
+        let mut h2 = vec![0u8; 64];
+        h2[0..8].copy_from_slice(b"RBSORT01");
+        h2[8..12].copy_from_slice(&99u32.to_le_bytes());
+        fs::write(&bad_v1, &h2).unwrap();
+        assert!(matches!(open_run(&bad_v1), Err(StoreError::Corrupt(_))));
+        // Valid run: short lookup key.
+        let path = d.join("000022.run");
+        let run = write_sorted_run(&path, 32, 44, &rec(1, 1)).unwrap();
+        assert!(matches!(
+            lookup_key(&run, &[0u8; 8]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Empty body path via zero-count run if supported.
+        let empty_path = d.join("000023.run");
+        if let Ok(empty) = write_sorted_run(&empty_path, 32, 44, &[]) {
+            assert!(lookup_key(&empty, &[0u8; 32]).unwrap().is_none());
+            let _ = read_run_body(&empty);
+        }
+        let _ = run;
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn merge_two_runs_sorted() {
         let d = tmp_dir();
         let p1 = d.join("000001.run");

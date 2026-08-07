@@ -454,4 +454,46 @@ mod tests {
         assert_eq!(t.get(2).unwrap(), 102);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+        // Gap set: index past len fills intermediate zeros.
+        t.set(3, 42).unwrap();
+        assert_eq!(t.len(), 4);
+        assert_eq!(t.get(0).unwrap(), 0);
+        assert_eq!(t.get(1).unwrap(), 0);
+        assert_eq!(t.get(2).unwrap(), 0);
+        assert_eq!(t.get(3).unwrap(), 42);
+        // set_many with gaps / rewrites.
+        t.set_many(&[(1, 11), (5, 55), (3, 33)]).unwrap();
+        assert_eq!(t.len(), 6);
+        assert_eq!(t.get(1).unwrap(), 11);
+        assert_eq!(t.get(3).unwrap(), 33);
+        assert_eq!(t.get(5).unwrap(), 55);
+        t.flush_async().unwrap();
+        t.flush_dirty().unwrap();
+        t.flush().unwrap();
+        // truncate to zero + reopen.
+        t.truncate(0).unwrap();
+        t.flush().unwrap();
+        assert_eq!(t.len(), 0);
+        drop(t);
+
+        // class_c_inram_max_bytes env parse paths.
+        let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+        std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+        assert_eq!(class_c_inram_max_bytes(), DEFAULT_CLASS_C_INRAM_MAX_BYTES);
+        std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "128");
+        assert_eq!(class_c_inram_max_bytes(), 128 * 1024 * 1024);
+        std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "not-a-number");
+        assert_eq!(class_c_inram_max_bytes(), 256 * 1024 * 1024); // parse fallback
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+            None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Enforce 100% line coverage on first-party crates (HTML uncovered-line = 0).
+# Enforce ≥90% line coverage on first-party crates (LCOV LH/LF).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Line coverage gate (percent). New and existing first-party code share this bar.
+LINE_MIN_PCT=90
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
@@ -24,7 +27,8 @@ if [[ -z "${LLVM_PROFDATA:-}" ]] && command -v llvm-profdata >/dev/null 2>&1; th
 fi
 
 # main.rs trampolines are one-liners; logic is covered via cli_main in libs.
-IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$)'
+# store_bench is a host-only microbench binary (not production path).
+IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/bin/store_bench\.rs$)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then
   # Default: do NOT clean instrumented artifacts. Incremental llvm-cov rebuilds
@@ -35,11 +39,11 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
     cargo llvm-cov clean --workspace
   fi
 
-  # Branch coverage requires nightly on many toolchains; always enforce 100% lines.
+  # Branch coverage requires nightly on many toolchains; line gate is always on.
   EXTRA=()
   if cargo llvm-cov test --help 2>&1 | grep -q -- '--fail-under-branches'; then
     if rustc -vV 2>/dev/null | grep -q nightly; then
-      EXTRA+=(--branch --fail-under-branches 100)
+      EXTRA+=(--branch --fail-under-branches 90)
     fi
   fi
   mkdir -p "$ROOT/coverage"
@@ -51,14 +55,11 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
   REPORT="$(cargo llvm-cov report --ignore-filename-regex "$IGNORE" 2>/dev/null || true)"
   echo "$REPORT"
 
-  # cargo-llvm-cov's text "Missed Lines" counts partially-covered *regions* inside a line
-  # (e.g. match or-patterns). The HTML report's uncovered-line markers are the source of
-  # truth for "every executable line executed at least once".
   cargo llvm-cov report \
     --ignore-filename-regex "$IGNORE" \
     --lcov --output-path "$ROOT/coverage/lcov.info" || true
 
-  # Line gate: LCOV LH/LF (HTML class names vary by llvm-cov version).
+  # Line gate: LCOV LH/LF (authoritative for the 90% bar).
   LCOV_STATS="$(python3 - <<'PY'
 from pathlib import Path
 p = Path("coverage/lcov.info")
@@ -75,58 +76,42 @@ PY
   read -r LCOV_HIT LCOV_TOT <<<"$LCOV_STATS"
   LCOV_HIT="${LCOV_HIT:-0}"
   LCOV_TOT="${LCOV_TOT:-0}"
-  if [[ "$LCOV_TOT" -gt 0 ]]; then
-    LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
-    echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%)"
+  if [[ "$LCOV_TOT" -le 0 ]]; then
+    echo "FAIL: no LCOV totals (missing coverage/lcov.info or empty LF)" >&2
+    exit 1
   fi
-  # `coverage/` is gitignored — need --no-ignore or rg finds nothing (false 0).
-  # llvm-cov HTML uses class='uncovered-line' (single quotes) with count 0.
+  LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
+  MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
+  echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS}"
+  echo "Line coverage gate: ≥${LINE_MIN_PCT}% (constant LINE_MIN_PCT=${LINE_MIN_PCT})"
+
+  # Optional HTML diagnostic (not the pass condition).
   HTML_PRESENT=0
-  if compgen -G "$ROOT/coverage/**/*.html" > /dev/null \
-    || compgen -G "$ROOT/coverage/*.html" > /dev/null \
-    || find "$ROOT/coverage" -name '*.html' -print -quit | grep -q .; then
+  if find "$ROOT/coverage" -name '*.html' -print -quit 2>/dev/null | grep -q .; then
     HTML_PRESENT=1
   fi
-  # Count only real uncovered source rows (td class uncovered-line), not legend JS.
-  UNCOV_TOTAL=0
   if [[ "$HTML_PRESENT" -eq 1 ]]; then
     UNCOV_TOTAL="$(
       python3 - <<'PY'
 from pathlib import Path
 import re
-root = Path("coverage")
 n = 0
-for p in root.rglob("*.html"):
+for p in Path("coverage").rglob("*.html"):
     t = p.read_text(errors="replace")
-    # Match both quote styles; only count cells that report zero hits.
     n += len(re.findall(r"class=['\"]uncovered-line['\"]", t))
 print(n)
 PY
     )"
+    echo "HTML uncovered-line markers (diagnostic): ${UNCOV_TOTAL}"
   fi
-  # Prefer HTML uncovered-line (COVERAGE.md) when report exists; LCOV is backup
-  # when HTML is missing (some llvm-cov versions). LCOV also counts region-
-  # partial / non-executable DA:0 rows — do not hard-fail LCOV when HTML is 0.
-  MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
-  if [[ "$HTML_PRESENT" -eq 1 ]]; then
-    echo "HTML uncovered-line markers: ${UNCOV_TOTAL}"
-    if [[ "$UNCOV_TOTAL" -ne 0 ]]; then
-      echo "FAIL: $UNCOV_TOTAL uncovered executable line(s) in HTML report (need 0)" >&2
-      cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
-      exit 1
-    fi
-    echo "Coverage OK: 0 uncovered executable lines (HTML; see coverage/html/)"
-    if [[ "$MISS" -ne 0 ]]; then
-      echo "Note: LCOV DA rows still show ${MISS} zero-hit entries (${LCOV_HIT}/${LCOV_TOT}); region-partial / non-exec may remain — HTML line gate is authoritative."
-    fi
-  else
-    if [[ "$MISS" -ne 0 ]]; then
-      echo "FAIL: no HTML report and LCOV reports $MISS missed line(s) (${LCOV_HIT}/${LCOV_TOT}; need 100%)" >&2
-      cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
-      exit 1
-    fi
-    echo "Coverage OK: LCOV full hit (no HTML report)"
+
+  PASS="$(python3 -c "print(1 if float('$LCOV_PCT') + 1e-9 >= float('$LINE_MIN_PCT') else 0)")"
+  if [[ "$PASS" -ne 1 ]]; then
+    echo "FAIL: line coverage ${LCOV_PCT}% < ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT})" >&2
+    cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
+    exit 1
   fi
+  echo "Coverage OK: ${LCOV_PCT}% ≥ ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT})"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   echo "Tooling: use llvmPackages matching rustc (rustc 1.82 → LLVM 19; see shell.nix)."

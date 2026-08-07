@@ -196,4 +196,25 @@ mod tests {
         assert_eq!(s, s2);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn load_rejects_overlong_secret_file() {
+        let dir = temp_dir();
+        let path = dir.join(SECRET_FILE);
+        // 33 bytes → corrupt (longer than 32).
+        std::fs::write(&path, vec![0u8; 33]).unwrap();
+        assert!(matches!(
+            StoreSecret::load_from_store_dir(&dir),
+            Err(StoreError::Corrupt(_))
+        ));
+        // generate forces first byte nonzero path when unlucky zeros — just call once more.
+        let mut s = StoreSecret::generate();
+        // force first byte path by reconstructing
+        let mut b = *s.as_bytes();
+        b[0] = 0;
+        // from_bytes keeps zero first byte (generate would fix)
+        s = StoreSecret::from_bytes(b);
+        assert_eq!(s.as_bytes()[0], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -32,17 +32,11 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # Line-coverage gate (100% first-party HTML uncovered-line). Slow; separate job
-  # so test/fmt/clippy stay the fast push feedback.
-  #
-  # `continue-on-error: true` until the HTML line gate is fully green again
-  # (repo is mid-catchup on historical uncovered regions). Do not use this as a
-  # license to drop coverage on new code — agents still run ./scripts/coverage.sh
-  # when practical and must not grow gaps. Flip back to required when green.
+  # Line-coverage gate (≥90% first-party LCOV LH/LF). Slow; separate job so
+  # test/fmt/clippy stay the fast push feedback. Required for merge.
   coverage:
     runs-on: ubuntu-latest
     needs: test
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.82.0

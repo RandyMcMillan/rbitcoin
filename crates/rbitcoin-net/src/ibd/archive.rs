@@ -369,14 +369,73 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
 
 #[cfg(test)]
 mod budget_tests {
-    use super::ArchiveQueueBudget;
+    use super::{
+        ArchiveQueueBudget, ARCHIVE_PRESSURE_ENTER, ARCHIVE_PRESSURE_EXIT,
+        DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES,
+    };
 
     #[test]
     fn budget_empty_can_assign() {
-        let b = ArchiveQueueBudget::new(1024 * 1024);
+        // `new` clamps to ≥16 MiB; use that floor as the explicit budget.
+        let floor = 16 * 1024 * 1024;
+        let b = ArchiveQueueBudget::new(floor);
         assert!(b.can_assign());
         assert_eq!(b.count(), 0);
+        assert_eq!(b.bytes(), 0);
+        assert_eq!(b.budget_bytes(), floor);
+        assert!((b.fill_ratio() - 0.0).abs() < 1e-9);
         assert!((b.far_admission_scale() - 1.0).abs() < 1e-9);
+        // Below floor still clamps up.
+        let tiny = ArchiveQueueBudget::new(1024 * 1024);
+        assert_eq!(tiny.budget_bytes(), floor);
+    }
+
+    #[test]
+    fn far_scale_from_pressure_hysteresis_and_proportional() {
+        // Enter pressure at ≥0.90 → scale 0.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(ARCHIVE_PRESSURE_ENTER, false);
+        assert!(p);
+        assert_eq!(s, 0.0);
+        // Stay in pressure between exit and enter.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(0.80, true);
+        assert!(p);
+        assert_eq!(s, 0.0);
+        // Exit pressure at ≤0.70 → proportional scale.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(ARCHIVE_PRESSURE_EXIT, true);
+        assert!(!p);
+        assert!((s - (1.0 - ARCHIVE_PRESSURE_EXIT)).abs() < 1e-9);
+        // Half full, not in pressure → scale 0.5.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(0.5, false);
+        assert!(!p);
+        assert!((s - 0.5).abs() < 1e-9);
+        // Overfull still pressure.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(1.2, false);
+        assert!(p);
+        assert_eq!(s, 0.0);
+        // Empty → scale 1.
+        let (s, p) = ArchiveQueueBudget::far_scale_from(0.0, false);
+        assert!(!p);
+        assert!((s - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn new_clamps_tiny_budget_and_from_env_default() {
+        let b = ArchiveQueueBudget::new(1);
+        assert!(b.budget_bytes() >= 16 * 1024 * 1024);
+        // from_env uses RBITCOIN_ARCHIVE_QUEUE_MB or default.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_ARCHIVE_QUEUE_MB");
+        std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB");
+        let b = ArchiveQueueBudget::from_env();
+        assert_eq!(b.budget_bytes(), DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
+        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "32");
+        let b2 = ArchiveQueueBudget::from_env();
+        assert_eq!(b2.budget_bytes(), 32 * 1024 * 1024);
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", v),
+            None => std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB"),
+        }
     }
 }
 

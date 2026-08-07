@@ -308,4 +308,45 @@ mod tests {
         assert_eq!(TxidBody::entry_offset(2).unwrap(), 64);
         assert!(TxidBody::entry_offset(0).is_err());
     }
+
+    #[test]
+    fn truncate_get_many_logical_and_errors() {
+        let dir = tmp();
+        let t = TxidBody::create(&dir).unwrap();
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let c = [0xCCu8; 32];
+        t.append_batch(0, &[a, b, c]).unwrap();
+        assert!(t.logical_len() >= 32 * 3);
+        // get_many: empty + mix of present / past-end.
+        assert!(t.get_many(&[]).unwrap().is_empty());
+        let many = t.get_many(&[Fk(1), Fk(2), Fk(99), Fk(3)]).unwrap();
+        assert_eq!(many[0], Some(a));
+        assert_eq!(many[1], Some(b));
+        assert_eq!(many[2], None);
+        assert_eq!(many[3], Some(c));
+        // NotFound on single get past end.
+        assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
+        // Truncate to shorter prefix.
+        t.truncate_to_count(2).unwrap();
+        assert_eq!(t.count(), 2);
+        assert_eq!(t.get(Fk(2)).unwrap(), b);
+        assert!(matches!(t.get(Fk(3)), Err(StoreError::NotFound)));
+        // No-op truncate to same count.
+        t.truncate_to_count(2).unwrap();
+        // Past-count truncate is corrupt.
+        assert!(matches!(
+            t.truncate_to_count(5),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Append at wrong expected count.
+        assert!(matches!(
+            t.append_batch(0, &[[0u8; 32]]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Empty append is fine.
+        t.append_batch(2, &[]).unwrap();
+        assert!(!t.read_op_dontcache(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

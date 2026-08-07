@@ -17,7 +17,7 @@ wallet / mining parity.
 
 | Area | This node | Bitcoin Core |
 |------|-----------|--------------|
-| Chainstore | Relational mmap archive | blocks/undo + LevelDB chainstate |
+| Chainstore | Relational **map-free** archive (fd tables; see [`docs/io-modality.md`](./docs/io-modality.md)) | blocks/undo + LevelDB chainstate |
 | Historical blocks | Reconstruct from archive; tip wire ring | `blocks/` blk*.dat |
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Mempool structure | Cluster graph + chunks | Cluster mempool (same lineage) |

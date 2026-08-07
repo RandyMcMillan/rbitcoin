@@ -22,13 +22,16 @@ relational archive** and a **pure-Rust consensus/script** path.
 Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electrum
 backends are **external indexers** of another node. rbitcoin does neither:
 
-1. **On-disk archive** — Class A/B/C tables: packed txs, keyless `tx.head`, spend
+1. **On-disk archive** — **map-free** Class A/B/C tables (pread/pwrite + fallocate
+   grow; kernel page cache as L0): packed txs, keyless `tx.head`, spend
    annotations, native scripthash. Historical blocks are **reconstructed** from
-   the archive; tip keeps a **wire ring** and **epoch** durability after catch-up.
-   Deep layout: [`SCHEMA.md`](./SCHEMA.md), concurrency: [`docs/concurrency.md`](./docs/concurrency.md).
-2. **Concurrent IBD / IO** — fixed writer roles, allocate-then-publish HWMs,
-   lock-free map epochs on the hot path, confirm as load → scripts → write,
-   bulk **io_uring** where available. Map: [`docs/concurrency.md`](./docs/concurrency.md).
+   the archive; tip keeps a **wire ring** and Class C tip durability after catch-up.
+   Layout: [`SCHEMA.md`](./SCHEMA.md); IO modality: [`docs/io-modality.md`](./docs/io-modality.md);
+   concurrency: [`docs/concurrency.md`](./docs/concurrency.md).
+2. **Concurrent IBD / IO** — fixed writer roles (one Class A appender),
+   allocate-then-publish HWMs (no map epochs), confirm as **lookup → load →
+   scripts → write**, bulk **io_uring** where available (pread/pwrite fallback).
+   Map: [`docs/concurrency.md`](./docs/concurrency.md).
 3. **Pure-Rust consensus** — structure, connect, and **script verification in
    Rust**; only **secp256k1** (via rust-bitcoin) as the crypto primitive — **no**
    `libbitcoinconsensus` dual-eval. Tests: [`docs/consensus-tests.md`](./docs/consensus-tests.md).
@@ -106,7 +109,7 @@ mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 | Crate | Role |
 |-------|------|
 | `rbitcoin-primitives` | Shared types / newtypes |
-| `rbitcoin-store` | mmap Class A/B/C tables, scripthash, epoch, bulk IO |
+| `rbitcoin-store` | Map-free Class A/B/C tables (fd pread/pwrite), scripthash, bulk IO |
 | `rbitcoin-query` | Domain API (archive, confirm, reconstruct, Electrum joins) |
 | `rbitcoin-wire-cache` | Tip wire-format block ring |
 | `rbitcoin-consensus` | Validation / confirm; pure-Rust scripts; milestone = scripts only |

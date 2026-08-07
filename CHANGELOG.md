@@ -27,7 +27,7 @@ before 1.0).
 Initial **0.x** packaging of an experimental Bitcoin full node in Rust:
 
 - Multi-peer IBD and tip follow over **BIP324 v2-only** P2P
-- Relational **mmap Class A/B/C** archive (reconstruct historical blocks; tip wire ring + epoch durability after catch-up)
+- Relational Class A/B/C archive (reconstruct historical blocks; tip wire ring + tip durability after catch-up; store later fully map-free — see `docs/io-modality.md`)
 - **Pure-Rust** consensus/script path (secp256k1 via rust-bitcoin only; no libbitcoinconsensus dual-eval)
 - Confirm pipeline (load / scripts / write), Direct index mode during IBD, native scripthash + in-process **Electrum** after tip
 - Libre-class mempool admission with script checks on accept; BIP152 v2 compact blocks and BIP339 wtxid relay on tip sessions

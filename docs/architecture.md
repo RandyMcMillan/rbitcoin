@@ -39,8 +39,9 @@ are one confirm-write era. Do not reintroduce plan-time “archive lead” heuri
 just-written body pages stay tip-hot. **No** ContigPark / archive-job fallback
 for unknown-height bodies (mark missing → re-getdata).
 
-- **Storage center** is a **transaction-relational mmap archive**, not a UTXO
-  set + LevelDB chainstate.
+- **Storage center** is a **transaction-relational archive** on **map-free**
+  tables (pread/pwrite + fallocate; no process `mmap` of Class A/B/C), not a
+  UTXO set + LevelDB chainstate. IO modality: [`io-modality.md`](./io-modality.md).
 - **Consensus scripts** are verified in **pure Rust** (secp256k1 only as the
   crypto primitive via the rust-bitcoin stack — **no** `libbitcoinconsensus`
   dual-eval).
@@ -55,10 +56,10 @@ for unknown-height bodies (mark missing → re-getdata).
 
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
-| Primary store | Memory-mapped Class A/B/C tables (append + heads) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
+| Primary store | **Map-free** Class A/B/C tables (fd pread/pwrite + heads; page cache L0) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
 | Historical block serve | **Reconstruct** from packed tx archive; tip soft zone keeps a **wire ring** | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
-| Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); lock-free publish on hot path | More global chainstate coupling |
+| Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Script verification | Pure Rust in-tree (`rbitcoin-consensus::script`) | libbitcoinconsensus / script interpreter in C++ |
 | Electrum | In-process index on confirm | External (Fulcrum, ElectrumX, …) |

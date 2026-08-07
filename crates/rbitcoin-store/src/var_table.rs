@@ -234,8 +234,6 @@ impl VarTable {
     }
 
     /// Inspect record bytes without copying into a `Vec`.
-    ///
-    /// Body load uses generic DONTCACHE (same as [`Self::get_raw`]; not confirm pin path).
     pub fn with_raw<R>(
         &self,
         fk: Fk,
@@ -246,9 +244,6 @@ impl VarTable {
     }
 
     /// Inspect body bytes at a known absolute range (no idx read).
-    ///
-    /// Off-pipeline generic read: DONTCACHE. Confirm load uses
-    /// [`crate::idx_body_pipeline`] (cacheable).
     pub fn with_bytes_at<R>(
         &self,
         offset: u64,
@@ -259,16 +254,15 @@ impl VarTable {
             return f(&[]);
         }
         let mut buf = vec![0u8; len as usize];
-        self.read_body_dontcache(offset, &mut buf)?;
+        self.read_body_bulk(offset, &mut buf)?;
         f(&buf)
     }
 
     /// Absolute write into Class A body via **pwrite** (never mmap).
     ///
-    /// Prefer [`Self::write_body_blob_dontcache`] for Class A append so uring
-    /// SQEs set **RWF_DONTCACHE**.
+    /// Prefer [`Self::write_body_blob_bulk`] for Class A append (bulk pwrite path).
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
-        self.write_body_blob_dontcache(abs_offset, data)
+        self.write_body_blob_bulk(abs_offset, data)
     }
 
     /// Alias of [`Self::write_body_abs`] (historical name).
@@ -276,10 +270,9 @@ impl VarTable {
         self.write_body_abs(abs_offset, data)
     }
 
-    /// Class A body payload write. Routes through bulk `WriteOp` with
-    /// [`crate::dontcache_policy::body_write`] so io_uring SQEs set
-    /// `RWF_DONTCACHE`; falls back to plain pwrite when uring is unavailable.
-    fn write_body_blob_dontcache(&self, start: u64, body_blob: &[u8]) -> Result<(), StoreError> {
+    /// Class A body payload write via bulk `WriteOp` (no RWF_DONTCACHE — permanent
+    /// spend-only policy). Falls back to plain pwrite when uring is unavailable.
+    fn write_body_blob_bulk(&self, start: u64, body_blob: &[u8]) -> Result<(), StoreError> {
         if body_blob.is_empty() {
             return Ok(());
         }
@@ -373,8 +366,8 @@ impl VarTable {
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
-        // Class A body writes always request RWF_DONTCACHE (uring when available).
-        self.write_body_blob_dontcache(start, &body_blob)?;
+        // Class A body append (bulk pwrite; no RWF_DONTCACHE).
+        self.write_body_blob_bulk(start, &body_blob)?;
         // Idx after body (publish order).
         self.idx.append_starts(base_count, &starts)?;
         let new_end = start.saturating_add(body_blob.len() as u64);
@@ -444,8 +437,6 @@ impl VarTable {
     }
 
     /// Raw unframed payload for `fk`.
-    ///
-    /// Body payload via bulk_io with schema-13 **always** RWF_DONTCACHE.
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let (count, body_end) = self.published_meta();
@@ -457,14 +448,12 @@ impl VarTable {
         let len = (end - start) as usize;
         let mut buf = vec![0u8; len];
         if len > 0 {
-            self.read_body_dontcache(start, &mut buf)?;
+            self.read_body_bulk(start, &mut buf)?;
         }
         Ok(buf)
     }
 
     /// Read only the first `buf.len()` bytes at absolute body `(offset, len)`.
-    ///
-    /// Schema 13: Class A body reads always request RWF_DONTCACHE.
     pub fn read_prefix_at(
         &self,
         offset: u64,
@@ -478,12 +467,12 @@ impl VarTable {
         if n == 0 {
             return Ok(0);
         }
-        self.read_body_dontcache(offset, &mut buf[..n])?;
+        self.read_body_bulk(offset, &mut buf[..n])?;
         Ok(n)
     }
 
-    /// Class A body pread with [`crate::dontcache_policy::body_read_generic`].
-    fn read_body_dontcache(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+    /// Class A body pread via bulk_io (never RWF_DONTCACHE — permanent spend-only policy).
+    fn read_body_bulk(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         if buf.is_empty() {
             return Ok(());
         }

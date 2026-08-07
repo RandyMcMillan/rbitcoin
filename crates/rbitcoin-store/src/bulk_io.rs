@@ -73,24 +73,16 @@ static RWF_DONTCACHE_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// Whether RWF_DONTCACHE is **capable** of being set on SQEs.
 ///
-/// False when env forces off (`0`/`false`/`off`) or a prior CQE returned ENOTSUP.
-/// Policy of *which* ops set the flag is [`crate::dontcache_policy`] (including
-/// `RBITCOIN_RWF_DONTCACHE=spend` for spend-annotate body writes only).
+/// Default true until a CQE returns ENOTSUP / EOPNOTSUPP (then permanently demoted
+/// for this process). Policy of *which* ops set the flag is permanent
+/// spend-annotate body pwrites only — see [`crate::dontcache_policy`].
 pub fn rwf_dontcache_ok() -> bool {
     match RWF_DONTCACHE_MODE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            // Capability off only for hard-off tokens; `spend` / full stay capable.
-            let want = std::env::var("RBITCOIN_RWF_DONTCACHE")
-                .map(|s| {
-                    let t = s.trim().to_ascii_lowercase();
-                    !matches!(t.as_str(), "0" | "false" | "off" | "no" | "none")
-                })
-                .unwrap_or(true);
-            let mode = if want { 1 } else { 2 };
-            RWF_DONTCACHE_MODE.store(mode, Ordering::Relaxed);
-            want
+            RWF_DONTCACHE_MODE.store(1, Ordering::Relaxed);
+            true
         }
     }
 }

@@ -685,17 +685,14 @@ mod tests {
     }
 
     /// Shipped uring spend path must push body **write** SQEs with RWF_DONTCACHE
-    /// when supported (Full or spend mode).
+    /// when capability allows (permanent spend-only policy).
     #[test]
     fn uring_rmw_body_sqe_sets_rwf_dontcache() {
-        let _lock = crate::dontcache_policy::test_mode_lock();
-        crate::dontcache_policy::test_set_mode(Some(crate::dontcache_policy::Mode::Full));
         if !crate::bulk_io::io_uring_enabled() {
-            // No ring — write policy still requests DONTCACHE when capability ok.
             if crate::bulk_io::rwf_dontcache_ok() {
                 assert!(crate::dontcache_policy::body_write_spend());
+                assert!(!crate::dontcache_policy::body_write());
             }
-            crate::dontcache_policy::test_set_mode(None);
             return;
         }
         let (dir, t, spenders) = temp_table();
@@ -731,7 +728,6 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
-        crate::dontcache_policy::test_set_mode(None);
     }
 
     #[test]

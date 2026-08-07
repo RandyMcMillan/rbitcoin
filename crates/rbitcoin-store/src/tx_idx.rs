@@ -334,7 +334,7 @@ impl TxIdx {
                 continue;
             }
             page_buf[..want].fill(0);
-            // Schema 13: old idx segments set RWF_DONTCACHE via bulk_io.
+            // Permanent spend-only: idx peeks never DONTCACHE.
             let dc = crate::dontcache_policy::head_or_idx_segment_index(si, segs.len());
             let rc = crate::bulk_io::pread_single(
                 seg.file.read_fd(),
@@ -1185,15 +1185,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serial `record_start` page loads set sealed-age DONTCACHE via bulk_io.
+    /// Serial `record_start` page loads never set DONTCACHE (permanent spend-only).
     #[test]
-    fn serial_record_start_sets_dontcache_by_segment_age() {
+    fn serial_record_start_never_dontcache() {
         use crate::bulk_io;
-        use crate::dontcache_policy::{self, Mode};
         use std::sync::atomic::{AtomicU64, Ordering};
-
-        let _lock = dontcache_policy::test_mode_lock();
-        dontcache_policy::test_set_mode(Some(Mode::Full));
 
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
@@ -1218,17 +1214,15 @@ mod tests {
             idx.segment_count()
         );
 
-        // Oldest (si=0, age ≥4): DONTCACHE (when capability ok).
+        // Oldest (si=0, age ≥4): still no DONTCACHE under permanent spend-only.
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = idx.record_start(1).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty(), "record_start must issue bulk page load");
-        if bulk_io::rwf_dontcache_ok() {
-            assert!(
-                flags.iter().all(|&d| d),
-                "old idx segment must set ReadOp.dontcache; got {flags:?}"
-            );
-        }
+        assert!(
+            flags.iter().all(|&d| !d),
+            "idx segment reads must not DONTCACHE; got {flags:?}"
+        );
 
         // Tip segment: no DONTCACHE.
         let _ = bulk_io::test_take_last_read_dontcache();
@@ -1241,7 +1235,6 @@ mod tests {
         );
 
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
-        dontcache_policy::test_set_mode(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

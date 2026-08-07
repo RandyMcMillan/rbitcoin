@@ -36,7 +36,7 @@ See [`SCHEMA.md`](./SCHEMA.md).
 - Dense **`txid.body`**: 32-byte header + 32-byte txid per create_fk (append with Class A).
 - Packed **`tx.body` meta without leading txid** (32 B meta only); 8-byte align only (no page non-straddle for body txid).
 - Head-resolve identity via **sidefile**, not Prefix33 body peeks.
-- **RWF_DONTCACHE** on uring SQEs: all `tx.body` r/w; `tx.idx`/`tx.head` older than open+past 3 sealed; `txid.body` reads more than 100M entries from tail.
+- **RWF_DONTCACHE** on uring SQEs (historical multi-target policy; current code is spend-annotate body pwrites only — see SCHEMA.md).
 - IBD **body queue is process-local RAM** (not durable `store/block_queue/`): avoids double disk write of every block (queue + Class A); restart redownloads; soft densify assign: under ~100 MiB free ahead; over that only ~1 min confirm window at tip rate. Legacy on-disk queue dirs are ignored/removed on open.
 - **Wipe / reindex required** from schema 12 (body layout + new sidefile incompatible).
 

@@ -76,16 +76,10 @@ impl TxidBody {
         Ok(TXID_BODY_HEADER + (fk - 1) * TXID_ENTRY_LEN)
     }
 
-    /// Whether a sidefile read for this fk should set RWF_DONTCACHE
-    /// (more than [`TXID_DONTCACHE_FROM_TAIL`] entries from the published tail).
+    /// Sidefile peeks never request RWF_DONTCACHE (permanent spend-only policy).
     #[inline]
-    pub fn dontcache_for_fk(&self, fk: u64) -> bool {
-        let n = self.count();
-        if fk == 0 || n == 0 {
-            return false;
-        }
-        let tail_lo = n.saturating_sub(TXID_DONTCACHE_FROM_TAIL).saturating_add(1);
-        fk < tail_lo
+    pub fn dontcache_for_fk(&self, _fk: u64) -> bool {
+        false
     }
 
     pub fn body_read_fd(&self) -> std::os::fd::RawFd {
@@ -124,9 +118,7 @@ impl TxidBody {
         Ok(())
     }
 
-    /// Read txid for create_fk.
-    ///
-    /// Routes through bulk_io so schema-13 far-from-tail entries set RWF_DONTCACHE.
+    /// Read txid for create_fk (bulk pread; no RWF_DONTCACHE).
     pub fn get(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let n = self.count();
@@ -155,9 +147,6 @@ impl TxidBody {
     }
 
     /// Bulk read txids for consecutive fks `first..=last` (1-based).
-    ///
-    /// One contiguous pread; DONTCACHE when the **entire** range is far from tail
-    /// (both endpoints past the 100M window window).
     pub fn get_range(&self, first: u64, last: u64) -> Result<Vec<[u8; 32]>, StoreError> {
         if last < first {
             return Ok(Vec::new());
@@ -169,9 +158,7 @@ impl TxidBody {
         let count = (last - first + 1) as usize;
         let off = Self::entry_offset(first)?;
         let mut blob = vec![0u8; count * 32];
-        // Whole range cold only if last is still far from tail.
-        let dc = self.dontcache_for_fk(first) && self.dontcache_for_fk(last);
-        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob, dc);
+        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob, false);
         if rc < 0 {
             return Err(StoreError::io(
                 self.file.path(),
@@ -190,17 +177,14 @@ impl TxidBody {
     }
 
     /// Fill `out[i]` with txid for `fks[i]` (scattered fks).
-    ///
-    /// Uses `pread_batch` with per-fk [`RWF_DONTCACHE`] when the entry is more
-    /// than [`TXID_DONTCACHE_FROM_TAIL`] from the published tail.
     pub fn get_many(&self, fks: &[Fk]) -> Result<Vec<Option<[u8; 32]>>, StoreError> {
         if fks.is_empty() {
             return Ok(Vec::new());
         }
         let n = self.count();
         let mut out = vec![None; fks.len()];
-        // Resolve valid (index, offset, dontcache) jobs.
-        let mut jobs: Vec<(usize, u64, bool)> = Vec::with_capacity(fks.len());
+        // Resolve valid (index, offset) jobs.
+        let mut jobs: Vec<(usize, u64)> = Vec::with_capacity(fks.len());
         for (i, fk) in fks.iter().enumerate() {
             let Some(id) = fk.get() else {
                 continue;
@@ -209,19 +193,18 @@ impl TxidBody {
                 continue;
             }
             let off = Self::entry_offset(id)?;
-            jobs.push((i, off, self.dontcache_for_fk(id)));
+            jobs.push((i, off));
         }
         if jobs.is_empty() {
             return Ok(out);
         }
-        // One 32-byte buffer per job; DONTCACHE when far from tail (all sizes).
         let mut bufs: Vec<[u8; 32]> = vec![[0u8; 32]; jobs.len()];
         {
             use crate::bulk_io::{self, ReadOp};
             let fd = self.file.read_fd();
             // SAFETY: each bufs[j] is a distinct element of the vec.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
-            for (j, &(_i, off, dc)) in jobs.iter().enumerate() {
+            for (j, &(_i, off)) in jobs.iter().enumerate() {
                 let ptr = bufs[j].as_mut_ptr();
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 32) };
                 ops.push(ReadOp {
@@ -229,7 +212,7 @@ impl TxidBody {
                     offset: off,
                     buf: slice,
                     result: i32::MIN,
-                    dontcache: dc,
+                    dontcache: self.dontcache_for_fk(0),
                 });
             }
             bulk_io::pread_batch(&mut ops);
@@ -289,16 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn dontcache_far_from_tail() {
+    fn dontcache_for_fk_always_false() {
         let dir = tmp();
         let t = TxidBody::create(&dir).unwrap();
-        // Simulate small count: no dontcache
         assert!(!t.dontcache_for_fk(1));
-        // Manually set count high for policy unit (without writing 100M entries)
         t.count
             .store(TXID_DONTCACHE_FROM_TAIL + 10, std::sync::atomic::Ordering::Release);
-        assert!(t.dontcache_for_fk(1)); // far from tail
-        assert!(!t.dontcache_for_fk(TXID_DONTCACHE_FROM_TAIL + 5)); // near tail
+        assert!(!t.dontcache_for_fk(1));
+        assert!(!t.dontcache_for_fk(TXID_DONTCACHE_FROM_TAIL + 5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -130,7 +130,7 @@ offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
 
 Append-published with Class A body/idx on the sole Class A write path. Count must match `tx.body` entry count. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
 
-**IO policy (RWF_DONTCACHE):** sidefile reads for entries more than **100_000_000** from the published tail (~3.2 GiB at 32 B) set `RWF_DONTCACHE` on uring SQEs.
+**IO policy (RWF_DONTCACHE):** sidefile peeks do **not** set `RWF_DONTCACHE` (permanent spend-annotate body pwrite only).
 
 ### Packed body (schema 13+)
 
@@ -153,7 +153,7 @@ Decode walks meta + runs to a logical end; any remaining bytes in the idx span m
 **Body meta (32 B):** version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
 On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload). Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-**IO policy (RWF_DONTCACHE):** env `RBITCOIN_RWF_DONTCACHE` selects policy (default **full**): full schema-13 rules below; `off` never sets the flag; `spend` only spend-annotate `tx.body` **pwrites**. Full mode: `tx.body` **writes** (Class A append + spend annotate) set `RWF_DONTCACHE` (fd-only drop after use — not `madvise`). Confirm-pipeline body **reads** (load pin + write-stage spender meta) do **not** DONTCACHE so pure-write annotate can RMW warm pages. Generic body reads (`get_raw`) still DONTCACHE. `tx.idx` / `tx.head` segment reads older than the **open segment + past 3 sealed** also set it.
+**IO policy (RWF_DONTCACHE):** permanent **spend-annotate `tx.body` pwrites only** (fd-only drop after spender meta write — not `madvise`). Class A append, confirm/load body reads, generic body reads, and head/idx/sidefile peeks do **not** set the flag. Kernel ENOTSUP demotes capability for the process.
 
 ### Segmented body index (`tx.idx.*`)
 

@@ -124,7 +124,7 @@ fewer usable peers than a dual-stack Core node.
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | v2-only + experimental user-agent |
 | Mempool | Libre policy (0.1 sat/vB, full RBF, no dust ban); **scripts verified on accept** |
-| Confirm lookup/load | Lookup packs by soft **Σ inputs** (default **8000**, `RBITCOIN_CONFIRM_BATCH_INPUTS`) or hard **144** blocks — at dense mainnet heights that is typically **a few blocks per batch** (often 1–3; live `n=`), not ~32-block waves. Queue defaults `loadq=*/1 scriptq=*/1 writeq=*/10` (env may raise writeq) |
+| Confirm lookup/load | Lookup packs by soft **Σ inputs** (default **8000**, `RBITCOIN_CONFIRM_BATCH_INPUTS`) or hard **144** blocks — at dense mainnet heights that is typically **a few blocks per batch** (often 1–3; live `n=`), not ~32-block waves. Queue defaults `loadq=*/8 scriptq=*/4 writeq=*/20` |
 | Not Core/Fulcrum | No production SLA; schema unstable until 1.0; reindex on incompatible layout changes |
 
 ## Related docs

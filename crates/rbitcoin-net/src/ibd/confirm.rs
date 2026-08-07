@@ -323,13 +323,13 @@ pub(crate) fn pack_stop_after(sum_inputs: u32, n_blocks: usize, soft_max_inputs:
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default lookup→load depth (`loadq`): one batch of slack (lookup is steady; scripts long-pole).
-pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 1;
-/// Default load→scripts depth (`scriptq`): one batch of slack.
-pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 1;
+/// Default lookup→load depth (`loadq`): enough ahead for pin/IO while scripts run.
+pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
+/// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
+pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
-pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 10;
+pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
 /// Hard clamp per stage (env abuse / OOM guard).
 pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
 
@@ -354,9 +354,9 @@ fn parse_queue_cap(raw: Option<&str>, default: usize) -> usize {
 ///
 /// | Queue | Env | Default |
 /// |-------|-----|---------|
-/// | lookup→load (`loadq`) | `RBITCOIN_CONFIRM_LOAD_QUEUE` (legacy `…_PLAN_QUEUE`) | **1** |
-/// | load→scripts (`scriptq`) | `RBITCOIN_CONFIRM_SCRIPT_QUEUE` (legacy `…_PREP_QUEUE`) | **1** |
-/// | scripts→write (`writeq`) | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **10** |
+/// | lookup→load (`loadq`) | `RBITCOIN_CONFIRM_LOAD_QUEUE` (legacy `…_PLAN_QUEUE`) | **8** |
+/// | load→scripts (`scriptq`) | `RBITCOIN_CONFIRM_SCRIPT_QUEUE` (legacy `…_PREP_QUEUE`) | **4** |
+/// | scripts→write (`writeq`) | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **20** |
 ///
 /// Legacy: if a per-stage env is unset, `RBITCOIN_CONFIRM_QUEUE` (when set) supplies
 /// that stage's default instead of the table above. Clamp **1..=64** each.
@@ -1064,7 +1064,7 @@ pub(crate) fn spawn_confirm_engine(
     // Scripts: loaded batch → script verify (rayon) → write queue.
     // **Feed-ahead (depth-1 safe):** while joining batch N, poll load `try_recv`
     // and submit N+1 to rayon *during* the wait — not only once before a blocking
-    // join (that left the pool idle under default scriptq cap=1).
+    // join (that left the pool idle under a tight scriptq cap).
     // Write handoff stays height-ordered (join N then N+1).
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
@@ -2334,7 +2334,7 @@ mod tests {
         assert!(!g.inflight.contains(&11));
     }
 
-    /// Log tokens + live caps (OPERATOR.md loadq/scriptq/writeq defaults 1/1/10).
+    /// Log tokens + live caps (OPERATOR.md loadq/scriptq/writeq defaults 8/4/20).
     #[test]
     fn queue_depth_log_and_caps_surface() {
         assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");

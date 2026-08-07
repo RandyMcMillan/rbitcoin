@@ -989,15 +989,16 @@ fn assemble_block_prevouts_mode(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                // Load pin spent-filtered sparse outs / body creates: skip durable
-                // probes when the parent out is already in the batch pin map or body.
+                // Load pin / thin create_fk is a **promise**: pin denserels must
+                // carry identity matching wire prev_txid (resolve hard-misses
+                // wrong pin; load fills schema-13 identity from plan RAM or
+                // txid.body). Do not treat thin as a soft spentness hint.
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| query.tx_fk_by_txid(op.txid.as_byte_array()).ok().flatten());
-                // Batch pin first (pipeline-local BatchParents only).
                 let pin_live = match prev_fk {
                     Some(fk) => batch_parents.has_parent_out(fk, op.vout),
                     None => false,
@@ -1006,7 +1007,6 @@ fn assemble_block_prevouts_mode(
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
                 if mode == AssembleMode::Full && !pin_live && !pending_creates.contains_key(&key) {
                     let spent = if let Some(cfk) = prev_fk {
-                        // `None` range → store resolves via tx.idx.
                         query
                             .store()
                             .has_confirmed_strong_spender_create(cfk, op.vout, None)
@@ -1021,8 +1021,6 @@ fn assemble_block_prevouts_mode(
                         return Err(ConsensusError::PrevoutSpent);
                     }
                 }
-                // Optimistic: skip create_height / coinbase store lookups (BIP68 +
-                // maturity run in structural). Full: resolve for in-walk BIP68.
                 let prev_out = resolve_prevout(
                     query,
                     block,
@@ -1034,6 +1032,7 @@ fn assemble_block_prevouts_mode(
                     ctx.height.0,
                     mode == AssembleMode::Full,
                 )?;
+                let create_fk = prev_out.create_fk;
                 if mode == AssembleMode::Full {
                     if let Some(created) = prev_out.coinbase_height {
                         let maturity = ctx.params.coinbase_maturity();
@@ -1044,7 +1043,6 @@ fn assemble_block_prevouts_mode(
                 }
                 // Same-run / provisional double-spend tracking (both modes).
                 pending_spent.insert(key);
-                let create_fk = prev_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
                 spends.push((
                     key.0,
                     key.1,
@@ -1276,6 +1274,9 @@ pub(crate) fn structural_validate_spends(
     }
 
     // abs_jobs: (create_id, vout, abs_off) — every non-null create must have abs.
+    // Load promises denserels for every external spend edge; missing abs is a
+    // load bug, not a soft cold spentness path (no unpinned “wire-corrected”
+    // recovery for stamp/identity bugs).
     let t_abs = Instant::now();
     let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
     for (id, vouts) in &vouts_by_create {
@@ -1289,17 +1290,17 @@ pub(crate) fn structural_validate_spends(
             abs_jobs.push((*id, v, abs));
         }
     }
-
     // Sparse durable **spent** set (honest IBD: almost all outs unspent).
     // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
     let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
+    let mut multi_list_ns = 0u64;
+
     let tip = query.tip_height().map(|h| h.0);
 
     // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
     // Serial with create_h heights below — combined multi-fd wave was measured
     // neutral/worse (body DONTCACHE peeks + height slots).
     let mut spent_strong_ns = 0u64;
-    let mut multi_list_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
         let meta_backend = rbitcoin_store::spend_meta_backend();
@@ -1349,9 +1350,30 @@ pub(crate) fn structural_validate_spends(
                 .store()
                 .is_confirmed_strong_at(field, tip)
                 .map_err(ConsensusError::Store)?;
-            if strong {
-                durable_spent.insert((id, vout));
+            if !strong {
+                continue;
             }
+            // Integrity: a confirmed-strong spender cannot predate its create.
+            // Prior tip-follow annotate bugs wrote garbage sole fields that point
+            // at ancient strong fks (e.g. create@961404 / field@22671) — that is
+            // not consensus PrevoutSpent. Ignore impossible meta (load/annotate
+            // corruption), do not soft-recover via wire re-check.
+            let create_h = query
+                .store()
+                .tx_height
+                .get(rbitcoin_primitives::Fk(id))
+                .map_err(ConsensusError::Store)?;
+            let spend_h = query
+                .store()
+                .tx_height
+                .get(field)
+                .map_err(ConsensusError::Store)?;
+            if let (Some(ch), Some(sh)) = (create_h, spend_h) {
+                if sh < ch {
+                    continue;
+                }
+            }
+            durable_spent.insert((id, vout));
         }
         spent_strong_ns = t_strong
             .elapsed()
@@ -1361,24 +1383,19 @@ pub(crate) fn structural_validate_spends(
     // abs ≈ collect + meta pread (not strong loop / multi walk).
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
-    // Null create_fk (rare): same-block / unset create — txid path, not Class A body cold.
-    let t_cold = Instant::now();
-    let mut durable_null_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-    null_create_keys.sort_unstable();
-    null_create_keys.dedup();
-    for &(prev_txid, vout) in &null_create_keys {
-        if query
-            .store()
-            .has_confirmed_strong_spender(&prev_txid, vout)
-            .map_err(ConsensusError::Store)?
-        {
-            durable_null_spent.insert((prev_txid, vout));
-        }
-    }
-    // Multi-list walks + null-create probes are protocol cold; sole abs path is hot.
-    let spent_cold_ns = multi_list_ns.saturating_add(t_cold.elapsed().as_nanos() as u64);
+    // Null create_fk = same-block spend (resolve sets NULL). Double-spend is
+    // **only** `pending_spent` within this confirm run — do **not** probe durable
+    // store by wire txid. Already-archived Class A rehydrate (plan=None) already
+    // holds those creates under the same txids before Class C tip; durable lookup
+    // can false-hit Class A rows / BIP30 siblings and reject valid same-block
+    // edges (mainnet 961461 tip stall).
+    let _ = null_create_keys; // same-block keys: pending only (no durable probe)
+    // Multi-list walks are protocol cold; same-block no longer probes store.
+    let spent_cold_ns = multi_list_ns;
 
     // Order-sensitive pending double-spend + durable rejection.
+    // create_fk is load-established (pin denserels + identity); durable_spent is
+    // keyed by that create. Same-block (null create_fk): pending only.
     let t_pending = Instant::now();
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
@@ -1386,7 +1403,7 @@ pub(crate) fn structural_validate_spends(
             return Err(ConsensusError::PrevoutSpent);
         }
         let spent = if create_fk.is_null() {
-            durable_null_spent.contains(&key)
+            false // same-block: pending_spent only
         } else if let Some(id) = create_fk.get() {
             // Present in durable_spent ⇒ confirmed-strong spent.
             durable_spent.contains(&(id, vout))
@@ -1612,6 +1629,9 @@ struct ResolvedPrevout {
     coinbase_height: Option<u32>,
     /// Block height that created this UTXO (BIP68). Same-block → spending height.
     create_height: u32,
+    /// Class A create fk for this prevout (or `NULL` for same-block). Load pin
+    /// denserels must carry identity matching wire `prev_txid` for this fk.
+    create_fk: rbitcoin_primitives::Fk,
 }
 
 /// BIP65/113 nLockTime threshold: values below are block heights, above are unix times.
@@ -1740,25 +1760,23 @@ fn resolve_prevout(
             } else {
                 0
             },
+            create_fk: rbitcoin_primitives::Fk::NULL,
         });
     }
 
-    // Batch pin first (no TxRecord clone — A3). Cold Class A on miss.
-    // Wire prev_txid is authoritative — reject wrong create_fk hits.
+    // Batch pin first (no TxRecord clone — A3). Cold Class A only when the
+    // create is not pin-covered. Pin identity/vout misses are hard invariants
+    // (load must fill schema-13 identity + denserels for need_vouts).
     // N1: classify warm-path miss so cold_n is explainable on `ibd: perf`.
     #[derive(Clone, Copy)]
     enum ColdWhy {
         NullFk,
         NotPin,
-        TxidMismatch,
-        VoutMiss,
     }
     let mut cold_why = ColdWhy::NullFk;
 
     if let Some(prev_fk) = prev_fk_hint {
         cold_why = ColdWhy::NotPin;
-        // Batch first. On txid mismatch: soft-miss (do not accept wrong out);
-        // then cold Class A.
         match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
             Some((value, script, parent_txid)) if parent_txid == prev_txid => {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
@@ -1790,20 +1808,36 @@ fn resolve_prevout(
                     },
                     coinbase_height: cb_h,
                     create_height,
+                    // Pin row matched wire prev_txid — denserels create_fk is trusted.
+                    create_fk: prev_fk,
                 });
             }
-            Some(_) => {
-                // Row present but pin txid ≠ wire (schema-13 zero-txid bug was
-                // the host 100% mismatch case; true fk collision also lands here).
-                cold_why = ColdWhy::TxidMismatch;
+            Some((_value, _script, parent_txid)) => {
+                // Pin promised this create_fk + vout but identity ≠ wire. Load bug
+                // (schema-13 zero identity, wrong denserels stamp) — hard fail.
+                // Do **not** soft-cold recover; fill pin identity at load instead.
+                let _ = parent_txid;
+                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N
+                    .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_txid_mismatch();
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: pin parent create identity mismatch wire prev_txid",
+                )));
             }
             None if batch_parents.contains(prev_fk) => {
-                // Parent create pinned, but needed vout not in sparse outs.
-                cold_why = ColdWhy::VoutMiss;
+                // Parent create pinned, but needed vout not in sparse outs — load bug.
+                confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_cold_why_vout_miss();
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: pin incomplete outs for spent parent vout",
+                )));
             }
-            None => {}
+            None => {
+                // Hint not in pin — cold Class A below (Allow pin / unit empty pin).
+            }
         }
-        // else: NotPin / mismatch / vout_miss → cold Class A below
     }
 
     // Cold path: create-fk candidates (thin → durable head / store).
@@ -1868,16 +1902,6 @@ fn resolve_prevout(
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_not_pin();
             }
-            ColdWhy::TxidMismatch => {
-                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N.fetch_add(1, Ordering::Relaxed);
-                #[cfg(test)]
-                confirm_phase_stats::tl_note_cold_why_txid_mismatch();
-            }
-            ColdWhy::VoutMiss => {
-                confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N.fetch_add(1, Ordering::Relaxed);
-                #[cfg(test)]
-                confirm_phase_stats::tl_note_cold_why_vout_miss();
-            }
         }
         return Ok(ResolvedPrevout {
             txout: TxOut {
@@ -1886,6 +1910,8 @@ fn resolve_prevout(
             },
             coinbase_height: cb_h,
             create_height,
+            // Cold candidate whose Class A body txid matches the wire prevout.
+            create_fk: prev_fk,
         });
     }
 
@@ -3037,14 +3063,14 @@ mod structure_rule_tests {
             assert_eq!(cold_n, 0, "cold_n");
         }
 
-        // ── txid_mismatch: batch has vout under wrong parent txid ─────
+        // ── txid_mismatch: pin present with wrong identity → hard invariant ─
         {
             let mut parents = BatchParents::new();
             let mut rec = q.get_tx_class_a(last_cb_fk).expect("class a");
             rec.txid = [0xee; 32]; // wrong identity
             let out = OutputRecord::unspent(50_0000_0000, vec![0x51]);
             parents.put_resolved(last_cb_fk, rec, &[(0, out)], &[0], Some(true));
-            resolve_prevout(
+            let err = match resolve_prevout(
                 &q,
                 &empty_block,
                 op,
@@ -3054,15 +3080,20 @@ mod structure_rule_tests {
                 &parents,
                 4,
                 false,
-            )
-            .expect("mismatch cold");
+            ) {
+                Ok(_) => panic!("mismatch must hard-fail"),
+                Err(e) => e,
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("invariant") && msg.contains("identity"),
+                "got {err}"
+            );
             let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
-            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 0, 1, 0), "mismatch why={why:?}");
-            assert_eq!(cold_n, 1, "cold_n");
         }
 
-        // ── vout_miss: parent in batch, needed vout not sparse-pinned ─
+        // ── vout_miss: parent in batch, needed vout not sparse-pinned → invariant ─
         {
             let mut parents = BatchParents::new();
             let rec = q.get_tx_class_a(last_cb_fk).expect("class a");
@@ -3071,7 +3102,7 @@ mod structure_rule_tests {
             parents.put_resolved(last_cb_fk, rec, &[(1, out)], &[1], Some(true));
             assert!(parents.contains(last_cb_fk));
             assert!(parents.get_parent_txout_parts(last_cb_fk, 0).is_none());
-            resolve_prevout(
+            let err = match resolve_prevout(
                 &q,
                 &empty_block,
                 op,
@@ -3081,12 +3112,268 @@ mod structure_rule_tests {
                 &parents,
                 4,
                 false,
-            )
-            .expect("vout_miss cold");
+            ) {
+                Ok(_) => panic!("vout_miss must hard-fail"),
+                Err(e) => e,
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("invariant") && msg.contains("incomplete outs"),
+                "got {err}"
+            );
             let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
-            let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
             assert_eq!(why, (0, 0, 0, 1), "vout_miss why={why:?}");
-            assert_eq!(cold_n, 1, "cold_n");
+        }
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Mainnet tip stall class (961460→961461): already-archived Class A tip+1
+    /// uses `plan=None` pin cold denserels. Schema-13 body has no leading txid;
+    /// load must fill pin identity from `txid.body` so assemble pin-hits match
+    /// wire (not soft spentness recovery for zero-identity pins).
+    ///
+    /// Shipped paths:
+    /// - archive body first → `confirm_wire_run` (plan=None) succeeds
+    /// - IBD-style `confirm_wire_load_from_plan(..., Forbid)` with plan=None must
+    ///   still succeed (load forces Allow cold denserels — not
+    ///   `lookup stage miss`)
+    /// - rapid tip+1/tip+2 accept; genuine double-spend still `PrevoutSpent`
+    #[test]
+    fn already_archived_schema13_pin_identity_tip_follow() {
+        use crate::{
+            accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+            confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_write_phase,
+            ColdPinMode, ScriptPreverified,
+        };
+        use std::sync::Arc;
+        use rbitcoin_query::Query;
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-plan-none-pin-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.set_spend_index(true);
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+        let maturity = params.coinbase_maturity();
+
+        fn mine_cb(prev: BlockHash, time: u32, h: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(h)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = bitcoin::Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+        fn mine_with(prev: BlockHash, time: u32, h: u32, extra: Vec<Transaction>) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut txs = vec![coinbase(h)];
+            txs.extend(extra);
+            let mut block = Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: txs,
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = bitcoin::Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+        fn spend_acs(prev: bitcoin::Txid, vout: u32, val: Amount) -> Transaction {
+            Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: prev, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: val,
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+
+        let b1 = mine_cb(tip, tip_time + 600, 1);
+        let c1_txid = b1.txdata[0].compute_txid();
+        accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+        tip = b1.block_hash();
+        tip_time = b1.header.time;
+
+        let b2 = mine_cb(tip, tip_time + 600, 2);
+        let c2_txid = b2.txdata[0].compute_txid();
+        accept_and_connect_block(&q, &params, Height(2), &b2, ms).unwrap();
+        tip = b2.block_hash();
+        tip_time = b2.header.time;
+
+        for h in 3..=maturity + 2 {
+            let b = mine_cb(tip, tip_time + 600, h);
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        // Spend C1 + same-block chain (txA→txB) on tip+1; archive Class A only
+        // then confirm plan=None. Same-block edges must not durable-probe Class A
+        // by wire txid (that false-PrevoutSpent mainnet 961461 rehydrate).
+        let h_spend = maturity + 3;
+        let tx_a = spend_acs(c1_txid, 0, Amount::from_sat(49_0000_0000));
+        let tx_a_id = tx_a.compute_txid();
+        let tx_b = spend_acs(tx_a_id, 0, Amount::from_sat(48_0000_0000));
+        let b_s1 = mine_with(
+            tip,
+            tip_time + 600,
+            h_spend,
+            vec![tx_a, tx_b],
+        );
+        accept_and_archive_block(&q, &params, Height(h_spend), &b_s1, ms).unwrap();
+        assert_eq!(q.tip_height().map(|h| h.0), Some(maturity + 2));
+        // IBD rehydrate path: stamp → load(Forbid) must not miss denserels stage
+        // when plan=None (consensus forces Allow cold + body_txid identity).
+        {
+            let arcs = [(Height(h_spend), Arc::new(b_s1.clone()))];
+            let stamped =
+                confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("lookup stamp");
+            assert!(
+                stamped.plan.is_none(),
+                "already-archived body must yield plan=None"
+            );
+            let mat = confirm_wire_load_from_plan(
+                &q,
+                &params,
+                ms,
+                stamped,
+                None,
+                &ScriptPreverified::new(),
+                ColdPinMode::Forbid, // IBD load always passes Forbid
+            )
+            .expect("plan=None + Forbid must force Allow cold denserels");
+            let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+            confirm_write_phase(&q, &params, ms, ok.batch)
+                .expect("plan=None confirm with same-block spends must succeed");
+        }
+        assert_eq!(q.tip_height().map(|h| h.0), Some(h_spend));
+        assert!(q.is_outpoint_spent(c1_txid.as_byte_array(), 0).unwrap());
+        tip = b_s1.block_hash();
+        tip_time = b_s1.header.time;
+
+        // Also exercise unified confirm_wire_run on a second already-archived spend.
+        // (tip already advanced above; remaining cases use accept_and_connect.)
+
+        // Rapid sequential tip-follow (tip+1 then tip+2) via shipped accept.
+        let h_n1 = h_spend + 1;
+        let b_n1 = mine_with(
+            tip,
+            tip_time + 600,
+            h_n1,
+            vec![spend_acs(c2_txid, 0, Amount::from_sat(49_0000_0000))],
+        );
+        accept_and_connect_block(&q, &params, Height(h_n1), &b_n1, ms)
+            .expect("rapid tip+1 valid spend of C2");
+        tip = b_n1.block_hash();
+        tip_time = b_n1.header.time;
+        let h_n2 = h_n1 + 1;
+        let b_n2 = mine_cb(tip, tip_time + 600, h_n2);
+        accept_and_connect_block(&q, &params, Height(h_n2), &b_n2, ms)
+            .expect("rapid tip+2 coinbase extension");
+        assert_eq!(q.tip_height().map(|h| h.0), Some(h_n2));
+        tip = b_n2.block_hash();
+        tip_time = b_n2.header.time;
+
+        // Genuine double-spend of already-spent C1 fails hard.
+        let b_ds = mine_with(
+            tip,
+            tip_time + 600,
+            h_n2 + 1,
+            vec![spend_acs(c1_txid, 0, Amount::from_sat(48_0000_0000))],
+        );
+        let err = accept_and_connect_block(&q, &params, Height(h_n2 + 1), &b_ds, ms)
+            .expect_err("double-spend of C1 must fail");
+        assert!(
+            matches!(err, ConsensusError::PrevoutSpent)
+                || format!("{err}").contains("spent")
+                || format!("{err}").contains("prevout"),
+            "got {err}"
+        );
+
+        // Structural without denserels/abs is invariant — not soft PrevoutSpent recovery.
+        {
+            use super::structural_validate_spends;
+            use rbitcoin_primitives::Fk;
+            use rbitcoin_query::BatchParents;
+            use std::collections::{HashMap, HashSet};
+            let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
+            let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
+            let parents = BatchParents::new();
+            let ctx =
+                ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
+            let mut pending = HashSet::new();
+            let mut mtp = HashMap::new();
+            let mut meta = HashMap::new();
+            let err = structural_validate_spends(
+                &q,
+                &b_n1,
+                &ctx,
+                Some(&[Fk::NULL, Fk(9_000_001)]),
+                &spends,
+                0,
+                &mut pending,
+                &parents,
+                &mut mtp,
+                &mut meta,
+            )
+            .expect_err("missing denserels abs must hard-fail");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("invariant") && msg.contains("denserels"),
+                "expected denserels invariant, got {err}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&path);

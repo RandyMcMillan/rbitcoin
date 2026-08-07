@@ -33,9 +33,11 @@ header plan after lookup planned it, stamped `create_fk`, etc.).
 
 ```
 wire / body-queue
-  → lookup (stamp create_fk, offline denserels when packed)
-  → load / pin (BatchParents: outs for need_vouts; denserels when available)
-  → scripts (pure CPU)
+  → lookup (stamp create_fk + parent body_range + parent txid;
+            IO: tx.head, tx.idx, txid.body — NEVER tx.body denserels)
+  → load / pin (BatchParents denserels by known range only;
+            IO: tx.body — NEVER head / idx / txid.body)
+  → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present)
   → ensure abs (pin layout → Class A denserels body; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread; multi-list protocol cold only)
@@ -43,12 +45,21 @@ wire / body-queue
   → abs spend annotate (put_spend_batch_by_abs_meta only)
 ```
 
+| Stage | Allowed IO | Forbidden |
+|-------|------------|-----------|
+| **lookup** | `tx.head`, `tx.idx` (fk + body_range), `txid.body`, headers | **`tx.body` denserels** |
+| **load** | **`tx.body` denserels by range** (from lookup stamp) | head, idx, `txid.body` |
+| **scripts** | none | any store IO |
+
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
-| Load body | Every published create has a body range | No sequential `get_tx_full` fallback |
-| Wire/load pin | Every spent parent in `BatchParents` with `pin_covered`; cold denserels decode fail is hard Err | Class A denserels body load **is** the pin cold tier (not a post-load fallback) |
+| Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
+| Load body denserels | By range only from lookup stamp; incomplete denserels → hard Err | **No** idx cold denserels on load |
 | Ensure (write) | Every non-null spend edge has denserels/abs after ensure returns | Residency then denserels body to **complete** load-ahead; incomplete → `invariant:` |
-| Structural spentness | Abs required when parent was pin-loaded; multi-list → confirmed-strong walk (reorg protocol) | Cold body-range walk only if **not** pinned (unit-test empty pin). Multi flag alone is **not** hard `Err` |
+| Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
+| Pin create identity | Schema-13 denserels pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
+| Tip already-archived | `plan=None`: lookup still stamps parent pin material; load denserels by range | Soft spentness recovery for zero pin identity is **not** OK |
+| Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
 | Spend annotate | Abs-only `put_spend_batch_by_abs_meta`; cold OOB/IO is hard Err | No ranged/by_create annotate tiers |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
@@ -73,5 +84,9 @@ structural cold spentness).
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
+| `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
+| `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load; structural IO split asserts |
+| `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
+| `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 soft requeue |
 | `pin_new_missing_parent_body_is_invariant_error` | `load_confirm_parents` pin_new ghost create_fk |
 | `pin_new_incomplete_need_vouts_is_invariant_error` | `load_confirm_parents` pin_new OOB need_vouts |

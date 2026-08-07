@@ -524,9 +524,21 @@ impl Query {
                         inp.create_fk = cfk;
                         resolved_stamp = resolved_stamp.saturating_add(1);
                     } else {
-                        return Err(StoreError::Corrupt(
-                            "archive: parent create_fk unresolved (contiguous batch required)",
-                        ));
+                        // Last chance: single head probe (batch may have missed
+                        // a race mid-insert). Still fail if absent.
+                        // Range is filled after stamp (idx) so load never re-probes head.
+                        if let Ok(Some(cfk)) = self.store.get_fk_by_txid(&inp.prev_txid) {
+                            inp.create_fk = cfk;
+                            resolved.insert(inp.prev_txid, cfk);
+                            if let Some(id) = cfk.get() {
+                                external_parent_txids.insert(id, inp.prev_txid);
+                            }
+                            resolved_stamp = resolved_stamp.saturating_add(1);
+                        } else {
+                            return Err(StoreError::Corrupt(
+                                "archive: parent create_fk unresolved (contiguous batch required)",
+                            ));
+                        }
                     }
                 }
                 if archive_spends {
@@ -541,6 +553,70 @@ impl Query {
             packed.push((pin, inputs));
         }
         let stamp_ns = t_stamp.elapsed().as_nanos() as u64;
+
+        // Lookup IO contract: every external parent create_fk must carry body_range
+        // (tx.idx) so load denserels from tx.body by range only — never head/idx.
+        // In-flight create_fk without prior head hit, and last-chance probes, used
+        // to leave ranges empty → load Forbid / cold denserels miss (mainnet 961466).
+        {
+            let mut batch_create_ids: std::collections::HashSet<u64> =
+                std::collections::HashSet::with_capacity(planned_fks.len());
+            for fk in &planned_fks {
+                if let Some(id) = fk.get() {
+                    batch_create_ids.insert(id);
+                }
+            }
+            let mut need_range: Vec<Fk> = Vec::new();
+            let mut seen_range: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for ((_pin, ins), _) in packed.iter().zip(planned_fks.iter()) {
+                for inp in ins {
+                    if inp.is_coinbase() || inp.prev_index == u32::MAX {
+                        continue;
+                    }
+                    let Some(id) = inp.create_fk.get() else {
+                        continue;
+                    };
+                    if batch_create_ids.contains(&id) {
+                        continue; // same-batch: offline denserels at pin
+                    }
+                    if external_parent_ranges.contains_key(&id) {
+                        continue;
+                    }
+                    // Uncommitted tip-ahead: full CreatePin already in in_flight —
+                    // load pin uses offline denserels; no body_range yet.
+                    if in_flight.get_out(id).is_some() {
+                        continue;
+                    }
+                    if seen_range.insert(id) {
+                        need_range.push(Fk(id));
+                    }
+                    // Wire reverse map may already be set; ensure identity key present.
+                    if !external_parent_txids.contains_key(&id) {
+                        if inp.prev_txid != [0u8; 32] {
+                            external_parent_txids.insert(id, inp.prev_txid);
+                        }
+                    }
+                }
+            }
+            if !need_range.is_empty() {
+                let ranges = self.store.tx_body_range_batch(&need_range)?;
+                for (fk, row) in need_range.into_iter().zip(ranges.into_iter()) {
+                    let Some(id) = fk.get() else {
+                        continue;
+                    };
+                    match row {
+                        Some(range) => {
+                            external_parent_ranges.insert(id, range);
+                        }
+                        None => {
+                            return Err(StoreError::Corrupt(
+                                "archive: external parent body_range missing after create_fk stamp (lookup idx)",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         let t_finish = Instant::now();
         let body_est: u64 = packed
@@ -1080,6 +1156,61 @@ mod tests {
         assert_eq!(batch_pin_len, 1);
         assert_eq!(q.tx_body_count(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creates-only in_flight (txid→fk, no denserels outs) must still get
+    /// body_range via idx so load denserels-by-range works (mainnet 961466 class).
+    #[test]
+    fn plan_inflight_creates_only_fills_parent_body_range() {
+        let (dir, q) = temp_query("plan-inflight-range");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        q.store
+            .txs
+            .put_full_batch_indexed(
+                &[(parent.tx, parent.inputs, parent.outputs)],
+                /*index=*/ true,
+            )
+            .unwrap();
+        // Creates-only layer: fk known, no CreatePin outs (archived mid-head race).
+        let mut log = crate::InFlightLog::new();
+        log.note_layer(crate::InFlightLayer::from_txid_fks([(parent_txid, Fk(1))]));
+        let ifo = log.snapshot();
+        assert!(ifo.get_out(1).is_none());
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xee;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(Fk(2), vec![child])];
+        let plan = q
+            .archive_plan_batch_from(&mut need, 2, &ifo)
+            .expect("parent via creates-only in_flight");
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert!(
+            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            "creates-only in_flight must still stamp body_range for load denserels"
+        );
+        assert_eq!(plan.external_parent_txid(1), Some(parent_txid));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

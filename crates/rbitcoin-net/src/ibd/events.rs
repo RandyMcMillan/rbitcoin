@@ -484,12 +484,17 @@ pub(crate) fn apply_confirm_reject(
     //   (signet partial IBD @~42k). Requeue without blacklisting; claim will
     //   retry once headers/plans catch up.
     //
-    // Internal pipeline races (prevout already spent, denserels pin, lookup stage
-    // miss, parent create_fk unresolved, load incomplete) stay **permanent**.
-    let soft_reget = err.contains("unexpected previous header")
+    // Soft re-getdata **only** for bad wire / missing header window — not for
+    // store invariants or tip-ahead races. Soft-requeue of "parent unresolved" /
+    // "fk mismatch" hid real bugs and livelocked tip; a corrupt store or bad
+    // block must permanent-blacklist so the operator sees the failure.
+    //
+    // - Wire-only: wrong/corrupt body (`unexpected previous header`)
+    // - Header window: `missing retarget first header` race
+    let soft_wire = err.contains("unexpected previous header")
         || err.contains("unexpected previous")
         || err.contains("missing retarget first header");
-    if soft_reget {
+    if soft_wire {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
@@ -576,7 +581,7 @@ mod confirm_reject_tests {
             "denserels layout miss is permanent (fix pipeline, not soft-reget)"
         );
 
-        // parent create_fk unresolved → permanent (fix head prune / in-flight).
+        // parent create_fk unresolved / fk mismatch: permanent (store or pipeline bug).
         let mut st = IbdWorkState::new(Vec::new(), None, Some(269_049));
         let hash = h(0x53);
         st.body.mark_archived(hash);
@@ -586,10 +591,26 @@ mod confirm_reject_tests {
             &mut st,
             269_050,
             hash,
-            "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)", None);
+            "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
+            None,
+        );
         assert!(
             st.body.is_rejected(&hash),
-            "parent create_fk unresolved is permanent after root fix"
+            "parent create_fk unresolved is permanent (fix pipeline, not soft-requeue)"
+        );
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(961_467));
+        let hash = h(0x68);
+        st.body.mark_archived(hash);
+        apply_confirm_reject(
+            &mut st,
+            961_468,
+            hash,
+            "consensus: store: corrupt record: tx put_full_batch fk mismatch (plan not committed in order)",
+            None,
+        );
+        assert!(
+            st.body.is_rejected(&hash),
+            "fk mismatch is permanent (not tip-ahead soft requeue)"
         );
 
         // Wire-only soft: unexpected previous header → re-getdata, not blacklist.

@@ -516,14 +516,19 @@ pub fn confirm_wire_load_phase_pipelined(
 
     let inflight = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
+    let parent_pin = match plan.as_ref() {
+        Some(p) => ParentPinStamp::from_plan(p),
+        None => stamp_parent_pin_archived(query, &metas, &wire_blocks, inflight)?,
+    };
+    let _ = cold_mode;
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
+        &parent_pin,
         &metas,
         &wire_blocks,
         inflight,
         parent_store,
-        cold_mode,
     )?;
     // Freeze plan for write: drop external staging maps (sparse BatchParents remains).
     if let Some(ref mut p) = plan {
@@ -582,6 +587,13 @@ pub fn confirm_wire_run(
 }
 
 /// Like [`confirm_wire_run`] with mempool script preverified set.
+///
+/// **Tip-follow / one-shot:** lookup stamp (create_fk + parent body ranges;
+/// never `tx.body`) → load pin denserels by range → scripts → write.
+///
+/// Parent create_fk + body_range + identity are **lookup promises**. Load only
+/// reads `tx.body` denserels. Soft spentness recovery for wrong pin identity
+/// is not a substitute for a correct lookup/load.
 pub fn confirm_wire_run_preverified(
     query: &Query,
     params: &ChainParams,
@@ -589,7 +601,24 @@ pub fn confirm_wire_run_preverified(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let mat = confirm_wire_load_phase(query, params, milestone, blocks, preverified)?;
+    if blocks.is_empty() {
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
+    }
+    let arcs: Vec<(Height, Arc<Block>)> = blocks
+        .iter()
+        .map(|(h, b)| (*h, Arc::new(b.clone())))
+        .collect();
+    // Lookup: structure + stamp create_fk + parent ranges (no body denserels).
+    let stamped = confirm_wire_lookup_stamp(query, params, milestone, &arcs, None)?;
+    let mat = confirm_wire_load_from_plan(
+        query,
+        params,
+        milestone,
+        stamped,
+        None,
+        preverified,
+        ColdPinMode::Forbid, // legacy arg; load denserels by range only
+    )?;
     let ok = confirm_scripts_phase(mat.batch)?;
     confirm_write_phase(query, params, milestone, ok.batch)
 }
@@ -656,6 +685,8 @@ pub fn ensure_external_parent_denserels_from_plan(
     }
 
     // Spent parent create_fk → need vouts (from stamped inputs only).
+    // Also fill reverse map from wire prev_txid (lookup stamp may have omitted
+    // when tests build synthetic plans).
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
     let t_collect = Instant::now();
     for ((_pin, ins), _) in plan.packed.iter().zip(plan.planned_fks.iter()) {
@@ -665,6 +696,11 @@ pub fn ensure_external_parent_denserels_from_plan(
             }
             if let Some(pid) = inp.create_fk.get() {
                 parent_vouts.entry(pid).or_default().push(inp.prev_index);
+                if inp.prev_txid != [0u8; 32] {
+                    plan.external_parent_txids
+                        .entry(pid)
+                        .or_insert(inp.prev_txid);
+                }
             }
         }
     }
@@ -714,7 +750,8 @@ pub fn ensure_external_parent_denserels_from_plan(
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if let Some(&range) = plan.external_parent_ranges.get(&id) {
-                let tid = known_create_txid_ram(id, Some(plan));
+                // ensure is load-prep body denserels: identity from plan stamp only.
+                let tid = known_create_txid_load(id, Some(plan))?;
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 by_range.push((*fk, range, tid, need));
             } else {
@@ -791,7 +828,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                         ))
                     })?
                 };
-                fill_create_txid_from_ram(&mut tx, id, Some(plan));
+                fill_create_txid_load(&mut tx, id, Some(plan))?;
                 // Sparse need only — drop full dense outs after selecting need vouts.
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 let live: Vec<(u32, rbitcoin_store::OutputRecord)> = if need.is_empty() {
@@ -863,21 +900,56 @@ pub fn ensure_external_parent_denserels_from_plan(
     Ok(st)
 }
 
-/// Lookup-stage output: structure + plan batch only (create_fk stamped).
+/// Lookup-stamped external parent material for load body denserels.
 ///
-/// Denserels pin + assemble stay on **load** so the pipeline stays balanced:
-/// lookup(N+1) head-stamp overlaps load(N) denserels IO. Handoff is the owned
-/// [`ArchiveWritePlan`] + wire/metas (pipeline pins only).
+/// **Lookup** fills this via `tx.head` / `tx.idx` / `txid.body` (never `tx.body`).
+/// **Load** denserels by range using only these maps (+ plan offline pins).
+#[derive(Debug, Default, Clone)]
+pub struct ParentPinStamp {
+    /// create_fk_id → Class A body range.
+    pub ranges: HashMap<u64, (u64, u64)>,
+    /// create_fk_id → create txid (wire / sidefile at lookup).
+    pub txids: HashMap<u64, [u8; 32]>,
+    /// prev_txid → create_fk_id (plan=None thin edges without head on load).
+    pub create_by_txid: HashMap<[u8; 32], u64>,
+}
+
+impl ParentPinStamp {
+    pub(crate) fn from_plan(plan: &rbitcoin_query::ArchiveWritePlan) -> Self {
+        let mut create_by_txid = HashMap::with_capacity(plan.external_parent_txids.len());
+        for (id, tid) in &plan.external_parent_txids {
+            create_by_txid.insert(*tid, *id);
+        }
+        Self {
+            ranges: plan.external_parent_ranges.clone(),
+            txids: plan.external_parent_txids.clone(),
+            create_by_txid,
+        }
+    }
+
+    #[inline]
+    fn create_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
+        self.txids.get(&create_fk_id).copied().filter(|t| *t != [0u8; 32])
+    }
+}
+
+/// Lookup-stage output: structure + plan batch (create_fk + parent body ranges).
+///
+/// **No `tx.body` denserels on lookup.** Load denserels by range from
+/// [`ParentPinStamp`] / plan ranges. Handoff is owned plan + parent pin stamp.
 pub struct PlanStampOutcome {
     pub plan: Option<rbitcoin_query::ArchiveWritePlan>,
+    /// External parent fk/range/txid stamped at lookup (always; including plan=None).
+    pub parent_pin: ParentPinStamp,
     /// Wall ns for structure + plan_batch (head stamp).
     pub work_ns: u64,
     metas: Vec<BodyMeta>,
     wire_blocks: Vec<Arc<Block>>,
 }
 
-/// IBD **lookup** stage: structure + stamp create_fk only (no denserels pin).
+/// IBD **lookup** stage: structure + stamp create_fk + parent body ranges.
 ///
+/// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
 /// cloning full `Block` payloads into stamp.
 pub fn confirm_wire_lookup_stamp(
@@ -890,21 +962,160 @@ pub fn confirm_wire_lookup_stamp(
     let t0 = Instant::now();
     let (plan, metas, wire_blocks, plan_ns) =
         wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+    let ifo = pipeline.map(|p| &p.in_flight);
+    let parent_pin = match plan.as_ref() {
+        Some(p) => ParentPinStamp::from_plan(p),
+        None => stamp_parent_pin_archived(query, &metas, &wire_blocks, ifo)?,
+    };
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
     let work_ns = t0.elapsed().as_nanos() as u64;
     lookup_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
     Ok(PlanStampOutcome {
         plan,
+        parent_pin,
         work_ns,
         metas,
         wire_blocks,
     })
 }
 
-/// IBD **load** after lookup: pin denserels once (Allow) + assemble.
+/// plan=None rehydrate: stamp external parent create_fk + body_range + txid
+/// via head/idx/txid.body so load never probes those tables.
+fn stamp_parent_pin_archived(
+    query: &Query,
+    metas: &[BodyMeta],
+    wire_blocks: &[Arc<Block>],
+    in_flight: Option<&rbitcoin_query::InFlightView>,
+) -> Result<ParentPinStamp, ConsensusError> {
+    let mut same_batch: HashMap<[u8; 32], u64> = HashMap::new();
+    for m in metas {
+        for (tid, fk) in m.txids.iter().zip(m.tx_fks.iter()) {
+            if let Some(id) = fk.get() {
+                same_batch.insert(*tid, id);
+            }
+        }
+    }
+    let mut need_external: HashMap<[u8; 32], ()> = HashMap::new();
+    for (m, block) in metas.iter().zip(wire_blocks.iter()) {
+        let _ = m;
+        for tx in &block.txdata {
+            for inp in &tx.input {
+                if inp.previous_output.is_null() {
+                    continue;
+                }
+                let prev = inp.previous_output.txid.to_byte_array();
+                if same_batch.contains_key(&prev) {
+                    continue;
+                }
+                if prev != [0u8; 32] {
+                    need_external.insert(prev, ());
+                }
+            }
+        }
+    }
+    let mut stamp = ParentPinStamp::default();
+    for (tid, id) in &same_batch {
+        stamp.create_by_txid.insert(*tid, *id);
+        stamp.txids.insert(*id, *tid);
+        // same-batch denserels offline at pin — range optional
+    }
+    let mut need_head: Vec<[u8; 32]> = Vec::new();
+    for tid in need_external.keys() {
+        if let Some(ifo) = in_flight {
+            if let Some(fk) = ifo.get_create_fk(tid) {
+                if let Some(id) = fk.get() {
+                    stamp.create_by_txid.insert(*tid, id);
+                    stamp.txids.insert(id, *tid);
+                    if ifo.get_out(id).is_none() {
+                        // body on disk expected — fill range below
+                        need_head.push(*tid); // reuse batch for range via head
+                    }
+                    continue;
+                }
+            }
+        }
+        need_head.push(*tid);
+    }
+    // Dedup need_head after mixed in_flight path.
+    need_head.sort_unstable();
+    need_head.dedup();
+    // Drop txs already fully stamped with range from a prior head fill.
+    need_head.retain(|t| {
+        stamp
+            .create_by_txid
+            .get(t)
+            .map(|id| !stamp.ranges.contains_key(id))
+            .unwrap_or(true)
+    });
+    if !need_head.is_empty() {
+        need_head.sort_unstable_by_key(|txid| query.store().txs.head_primary_slot(txid));
+        let hits = query
+            .store()
+            .get_fk_by_txid_batch(&need_head)
+            .map_err(ConsensusError::Store)?;
+        for (txid, row) in hits {
+            if let Some((fk, range)) = row {
+                if let Some(id) = fk.get() {
+                    stamp.create_by_txid.insert(txid, id);
+                    stamp.txids.insert(id, txid);
+                    stamp.ranges.insert(id, range);
+                }
+            }
+        }
+    }
+    // Any create_fk without range and without offline denserels outs: idx body_range.
+    // Includes same-batch already-archived creates (plan=None has no CreatePin offline).
+    let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
+    let mut seen = HashSet::new();
+    for (&id, _) in &stamp.txids {
+        if stamp.ranges.contains_key(&id) {
+            continue;
+        }
+        if in_flight.and_then(|i| i.get_out(id)).is_some() {
+            continue;
+        }
+        if seen.insert(id) {
+            need_range.push(rbitcoin_primitives::Fk(id));
+        }
+    }
+    if !need_range.is_empty() {
+        let ranges = query
+            .store()
+            .tx_body_range_batch(&need_range)
+            .map_err(ConsensusError::Store)?;
+        for (fk, row) in need_range.into_iter().zip(ranges.into_iter()) {
+            let Some(id) = fk.get() else { continue };
+            let Some(range) = row else {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "archive: plan=None parent body_range missing after create_fk stamp",
+                )));
+            };
+            stamp.ranges.insert(id, range);
+        }
+    }
+    // Identity fallback: sidefile for any create still missing txid (should be rare).
+    for (&id, tid) in stamp.txids.iter_mut() {
+        if *tid == [0u8; 32] {
+            *tid = known_create_txid_lookup(query, id, None)?;
+        }
+        let _ = id;
+    }
+    Ok(stamp)
+}
+
+/// IBD **load** after lookup denserels ensure: pin + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.
+///
+/// **Cold policy:**
+/// - [`ColdPinMode::Forbid`] after denserels ensure when a Class A plan is present
+///   (plan-local / range denserels cover external parents).
+/// - **Already-archived** (`plan=None`): cold denserels are required (no plan-local
+///   pin material). Callers may pass Forbid, but this function **forces Allow** so
+///   rehydrate/tip+1 Class A bodies do not hard-fail with
+///   `invariant: lookup stage miss`. Parent create identity still comes from
+///   dense `txid.body` (schema-13).
 pub fn confirm_wire_load_from_plan(
     query: &Query,
     params: &ChainParams,
@@ -912,26 +1123,31 @@ pub fn confirm_wire_load_from_plan(
     stamped: PlanStampOutcome,
     pipeline: Option<&WireLoadPipeline>,
     preverified: &ScriptPreverified,
+    cold_mode: ColdPinMode,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     let t_work = Instant::now();
     let t_load = Instant::now();
     let PlanStampOutcome {
         mut plan,
+        parent_pin,
         metas,
         wire_blocks,
         ..
     } = stamped;
+
+    // Load denserels by body range from parent_pin (lookup stamped). Never head/idx.
+    let _ = cold_mode;
 
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
+        &parent_pin,
         &metas,
         &wire_blocks,
         ifo,
         parent_store,
-        ColdPinMode::Allow,
     )?;
     // Freeze plan for write: drop external staging; sparse BatchParents remains.
     if let Some(ref mut p) = plan {
@@ -1385,49 +1601,82 @@ pub mod lookup_stage_stats {
     }
 }
 
-/// Create identity already known in RAM (plan stamp reverse map only).
-/// Never reads `txid.body`.
+/// Create identity for **load** pin denserels: plan stamp reverse map only.
+///
+/// **Load never reads `txid.body`.** Lookup stamps `external_parent_txids` from
+/// wire `prev_txid` (or lookup-side `txid.body` for plan=None rehydrate). Missing
+/// identity here is a lookup miss, not a sidefile fallback.
 #[inline]
-fn known_create_txid_ram(
+fn known_create_txid_load(
     create_fk_id: u64,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-) -> [u8; 32] {
+) -> Result<[u8; 32], ConsensusError> {
     if let Some(p) = plan {
         if let Some(tid) = p.external_parent_txid(create_fk_id) {
-            return tid;
+            if tid != [0u8; 32] {
+                return Ok(tid);
+            }
         }
     }
-    [0u8; 32]
+    Err(ConsensusError::Store(StoreError::Corrupt(
+        "invariant: lookup stage miss (load parent create identity not stamped)",
+    )))
 }
 
-/// Idx denserels path: body decode has no schema-13 identity — set from RAM.
+/// Lookup-side identity fill: plan RAM first, else `txid.body` (lookup may read
+/// the sidefile; load must not call this).
 #[inline]
-fn fill_create_txid_from_ram(
+fn known_create_txid_lookup(
+    query: &Query,
+    create_fk_id: u64,
+    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+) -> Result<[u8; 32], ConsensusError> {
+    if let Some(p) = plan {
+        if let Some(tid) = p.external_parent_txid(create_fk_id) {
+            if tid != [0u8; 32] {
+                return Ok(tid);
+            }
+        }
+    }
+    let tid = query
+        .store()
+        .txs
+        .body_txid(rbitcoin_primitives::Fk(create_fk_id))
+        .map_err(ConsensusError::Store)?;
+    if tid == [0u8; 32] {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: pin parent create identity still zero after txid.body",
+        )));
+    }
+    Ok(tid)
+}
+
+/// Schema-13 denserels decode leaves zero identity — stamp from plan RAM only (load).
+#[inline]
+fn fill_create_txid_load(
     tx: &mut rbitcoin_store::TxRecord,
     create_fk_id: u64,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-) {
+) -> Result<(), ConsensusError> {
     if tx.txid != [0u8; 32] {
-        return;
+        return Ok(());
     }
-    let tid = known_create_txid_ram(create_fk_id, plan);
-    if tid != [0u8; 32] {
-        tx.txid = tid;
-    }
+    tx.txid = known_create_txid_load(create_fk_id, plan)?;
+    Ok(())
 }
 
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight packed outs (+ offline denserels) → cold denserels
-/// (when [`ColdPinMode::Allow`]). Does not pin every batch create.
+/// Sources: plan/in-flight offline denserels → **body denserels by range** from
+/// [`ParentPinStamp`] (lookup-stamped). Load never reads head/idx/txid.body.
 fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    parent_pin: &ParentPinStamp,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlightView>,
     pipeline_parent_store: Option<&std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
-    cold_mode: ColdPinMode,
 ) -> Result<
     (
         rbitcoin_query::BatchParents,
@@ -1438,7 +1687,6 @@ fn pin_for_wire_batch(
 > {
     use rbitcoin_query::confirm_load_stats;
     use rbitcoin_query::ThinInput;
-    use rbitcoin_store::IdxBodyMode;
     use std::sync::atomic::Ordering;
 
     let t_pin = Instant::now();
@@ -1508,6 +1756,7 @@ fn pin_for_wire_batch(
             batch_thin.insert(sid, edges);
         }
     } else {
+        // plan=None: create_fk from ParentPinStamp (lookup head/idx), never load head.
         for (m, block) in metas.iter().zip(wire_blocks.iter()) {
             for (ti, tx) in block.txdata.iter().enumerate() {
                 let Some(sfk) = m.tx_fks.get(ti).and_then(|f| f.get()) else {
@@ -1524,16 +1773,13 @@ fn pin_for_wire_batch(
                     }
                     let prev_txid = inp.previous_output.txid.to_byte_array();
                     let vout = inp.previous_output.vout;
-                    let cfk = query.store().get_fk_by_txid(&prev_txid).ok().flatten();
-                    if let Some(fk) = cfk {
-                        if let Some(pid) = fk.get() {
-                            edges.push(ThinInput {
-                                create_fk: Some(pid),
-                                prev_index: vout,
-                            });
-                            parent_vouts.entry(pid).or_default().push(vout);
-                            continue;
-                        }
+                    if let Some(&pid) = parent_pin.create_by_txid.get(&prev_txid) {
+                        edges.push(ThinInput {
+                            create_fk: Some(pid),
+                            prev_index: vout,
+                        });
+                        parent_vouts.entry(pid).or_default().push(vout);
+                        continue;
                     }
                     edges.push(ThinInput {
                         create_fk: None,
@@ -1609,7 +1855,9 @@ fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
+                let plan_range = parent_pin.ranges.get(id).copied().or_else(|| {
+                    plan.and_then(|p| p.external_parent_ranges.get(id).copied())
+                });
                 let sparse = if !denserels.is_empty() {
                     rbitcoin_query::sparse_spender_rels(denserels, need)
                 } else {
@@ -1627,7 +1875,11 @@ fn pin_for_wire_batch(
                     } else {
                         None
                     };
-                    let plan_range = plan.external_parent_ranges.get(id).copied();
+                    let plan_range = parent_pin
+                        .ranges
+                        .get(id)
+                        .copied()
+                        .or_else(|| plan.external_parent_ranges.get(id).copied());
                     let sparse: Vec<(u32, u32)> = sparse_all
                         .iter()
                         .copied()
@@ -1670,7 +1922,11 @@ fn pin_for_wire_batch(
                     } else {
                         None
                     };
-                    let plan_range = plan.external_parent_ranges.get(id).copied();
+                    let plan_range = parent_pin
+                        .ranges
+                        .get(id)
+                        .copied()
+                        .or_else(|| plan.external_parent_ranges.get(id).copied());
                     let sparse: Vec<(u32, u32)> = if need.is_empty() {
                         sparse_all.clone()
                     } else {
@@ -1713,7 +1969,9 @@ fn pin_for_wire_batch(
             } else {
                 None
             };
-            let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
+            let plan_range = parent_pin.ranges.get(id).copied().or_else(|| {
+                plan.and_then(|p| p.external_parent_ranges.get(id).copied())
+            });
             let (body_range, sparse) = if !denserels.is_empty() {
                 (
                     plan_range,
@@ -1733,15 +1991,27 @@ fn pin_for_wire_batch(
     let mut cold_range_batch_ns = 0u64;
     let mut n_range_new = 0u64;
 
-    // 2b) Cold range denserels for still_need with plan body_range (sparse need_vouts).
-    if let Some(plan) = plan {
+    // 2b) Body denserels by range for still_need (lookup-stamped ranges only).
+    {
         let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
         for (id, need) in &still_need {
-            if let Some(&range) = plan.external_parent_ranges.get(id) {
-                let tid = known_create_txid_ram(*id, Some(plan));
-                range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
-            }
+            let range = parent_pin.ranges.get(id).copied().or_else(|| {
+                plan.and_then(|p| p.external_parent_ranges.get(id).copied())
+            });
+            let Some(range) = range else {
+                continue;
+            };
+            let tid = parent_pin.create_txid(*id).or_else(|| {
+                plan.and_then(|p| p.external_parent_txid(*id))
+                    .filter(|t| *t != [0u8; 32])
+            });
+            let Some(tid) = tid else {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: lookup stage miss (load parent create identity not stamped)",
+                )));
+            };
+            range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
         }
         if !range_jobs.is_empty() {
             let n_range = range_jobs.len() as u64;
@@ -1770,11 +2040,23 @@ fn pin_for_wire_batch(
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                let Some((tx, live, sparse)) = row else {
-                    continue;
+                let Some((mut tx, live, sparse)) = row else {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: load denserels by range returned none for stamped parent",
+                    )));
                 };
                 if live.len() != need.len() {
-                    continue; // leave in still_need for idx cold
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: load denserels by range incomplete outs for need_vouts",
+                    )));
+                }
+                // Schema-13 decode leaves zero identity — stamp from parent_pin only.
+                if tx.txid == [0u8; 32] {
+                    tx.txid = parent_pin.create_txid(id).ok_or_else(|| {
+                        ConsensusError::Store(StoreError::Corrupt(
+                            "invariant: lookup stage miss (load parent create identity not stamped)",
+                        ))
+                    })?;
                 }
                 let cb = if tx.input_count != 1 {
                     Some(false)
@@ -1792,98 +2074,15 @@ fn pin_for_wire_batch(
         }
     }
 
-    // Cold denserels once for still_need parents.
-    let mut n_cold = 0u64;
-    let mut cold_io_ns = 0u64;
-    let mut cold_decode_ns = 0u64;
+    // Load IO contract: denserels only via body-by-range (above) or plan/in-flight
+    // offline pins. **Never** `tx.idx` / head cold denserels on load (idx is lookup).
+    let n_cold = 0u64;
+    let cold_io_ns = 0u64;
+    let cold_decode_ns = 0u64;
     if !still_need.is_empty() {
-        let cold = still_need.clone();
-        if !cold.is_empty() {
-            if cold_mode == ColdPinMode::Forbid {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: lookup stage miss (load cold denserels forbidden)",
-                )));
-            }
-            let t_io = Instant::now();
-            let fks: Vec<rbitcoin_primitives::Fk> =
-                cold.keys().map(|id| rbitcoin_primitives::Fk(*id)).collect();
-            n_cold = fks.len() as u64;
-            let loaded =
-                rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::OutsDenserels)
-                    .map_err(ConsensusError::Store)?;
-            cold_io_ns = t_io.elapsed().as_nanos() as u64;
-            if cold_io_ns > 0 {
-                confirm_load_stats::COLD_IDX_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
-            }
-            if n_cold > 0 {
-                confirm_load_stats::COLD_IDX_N.fetch_add(n_cold, Ordering::Relaxed);
-            }
-
-            let t_dec = Instant::now();
-            for c in loaded {
-                let Some(id) = c.fk.get() else {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: wire pin cold denserels null create_fk",
-                    )));
-                };
-                let need = cold.get(&id).cloned().unwrap_or_default();
-                // Prefer single-decode from load_creates_once; raw is second chance only.
-                let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
-                    dec
-                } else {
-                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                        &c.raw,
-                        Some(query.store().txs.store_secret()),
-                    )
-                    .map_err(|_| {
-                        ConsensusError::Store(StoreError::Corrupt(
-                            "invariant: wire pin cold denserels decode failed",
-                        ))
-                    })?
-                };
-                // RAM identity only (plan stamp reverse map) — no sidefile.
-                fill_create_txid_from_ram(&mut tx, id, plan);
-                let mut need = need;
-                need.sort_unstable();
-                need.dedup();
-                if need.is_empty() {
-                    need = (0..outs.len() as u32).collect();
-                }
-                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                    .iter()
-                    .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                    .collect();
-                if live.len() != need.len() {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: wire pin cold denserels incomplete outs for need_vouts",
-                    )));
-                }
-                let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
-                if !rbitcoin_query::layout_covers_need(Some(c.body_range), &sparse, &need) {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: wire pin cold denserels incomplete for need_vouts",
-                    )));
-                }
-                let cb = if tx.input_count != 1 {
-                    Some(false)
-                } else {
-                    None
-                };
-                batch_parents.insert_owned(c.fk, tx, live, need, cb, Some(c.body_range), sparse);
-            }
-            cold_decode_ns = t_dec.elapsed().as_nanos() as u64;
-            confirm_load_stats::BODY_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
-            confirm_load_stats::FULL_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
-            // Every cold parent must have been loaded — silent miss is a load/store bug.
-            for id in cold.keys() {
-                let fk = rbitcoin_primitives::Fk(*id);
-                if !batch_parents.contains(fk) {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: wire pin cold denserels missing parent after load",
-                    )));
-                }
-            }
-        }
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: lookup stage miss (load parent without body_range denserels)",
+        )));
     }
 
     // Pin contract: every spent parent is in BatchParents with need outs.
@@ -2645,8 +2844,8 @@ fn ensure_spend_abs_layouts(
                         ))
                     })?
             };
-            // Ensure path: identity from plan RAM only (no sidefile required for layout).
-            fill_create_txid_from_ram(&mut tx, id, None);
+            // Write ensure may read txid.body (not load stage).
+            tx.txid = known_create_txid_lookup(query, id, None)?;
             if batch_parents.contains(c.fk) {
                 // Layout-only publish with already_covers short-circuit (batched style).
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
@@ -3313,7 +3512,9 @@ mod write_idempotent_tests {
     /// External parents land in plan-local map only.
     #[test]
     fn plan_ensure_denserels_then_forbid_skips_cold_io() {
-        use super::{ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode};
+        use super::{
+            ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ParentPinStamp,
+        };
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::Query;
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3413,7 +3614,16 @@ mod write_idempotent_tests {
 
         // Pin Forbid hits plan-local (no extra cold).
         let (parents, _thin, _warm) =
-            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid).unwrap();
+            pin_for_wire_batch(
+                &q,
+                Some(&plan),
+                &ParentPinStamp::from_plan(&plan),
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
         assert!(parents.contains(pfk));
         assert_eq!(
             rbitcoin_query::body_ok_reads(),
@@ -3427,7 +3637,7 @@ mod write_idempotent_tests {
     /// Wire pin: spend parent not loadable → hard invariant (no silent skip).
     #[test]
     fn pin_for_wire_missing_parent_is_invariant_error() {
-        use super::pin_for_wire_batch;
+        use super::{pin_for_wire_batch, ParentPinStamp};
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::{ArchiveWritePlan, Query};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3491,16 +3701,17 @@ mod write_idempotent_tests {
         let err = pin_for_wire_batch(
             &q,
             Some(&plan),
+            &ParentPinStamp::from_plan(&plan),
             &[],
             &[],
             None,
             None,
-            super::ColdPinMode::Allow,
         )
         .expect_err("missing parent must hard-fail pin");
         let msg = format!("{err}");
         assert!(
-            msg.contains("invariant") && msg.contains("wire pin"),
+            msg.contains("invariant")
+                && (msg.contains("wire pin") || msg.contains("lookup stage miss")),
             "unexpected err: {msg}"
         );
         let _ = std::fs::remove_dir_all(&path);
@@ -3509,7 +3720,7 @@ mod write_idempotent_tests {
     /// Wire pin: in-flight outs shorter than need → cold miss → hard invariant.
     #[test]
     fn pin_for_wire_incomplete_outs_is_invariant_error() {
-        use super::pin_for_wire_batch;
+        use super::{pin_for_wire_batch, ParentPinStamp};
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::{ArchiveWritePlan, Query};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3595,16 +3806,17 @@ mod write_idempotent_tests {
         let err = pin_for_wire_batch(
             &q,
             Some(&plan),
+            &ParentPinStamp::from_plan(&plan),
             &[],
             &[],
             Some(&ifo),
             None,
-            super::ColdPinMode::Allow,
         )
         .expect_err("incomplete outs must hard-fail pin");
         let msg = format!("{err}");
         assert!(
-            msg.contains("invariant") && msg.contains("wire pin"),
+            msg.contains("invariant")
+                && (msg.contains("wire pin") || msg.contains("lookup stage miss")),
             "unexpected err: {msg}"
         );
         let _ = std::fs::remove_dir_all(&path);
@@ -3614,7 +3826,7 @@ mod write_idempotent_tests {
     /// Pin uses Arc::clone of SparseExternalPin (no deep outs clone).
     #[test]
     fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
-        use super::pin_for_wire_batch;
+        use super::{pin_for_wire_batch, ParentPinStamp};
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query, SparseExternalPin};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3709,13 +3921,13 @@ mod write_idempotent_tests {
         let (parents, _thin, _warm) = pin_for_wire_batch(
             &q,
             Some(&plan),
+            &ParentPinStamp::from_plan(&plan),
             &[],
             &[],
             None,
             None,
-            super::ColdPinMode::Forbid,
         )
-        .expect("pin external via SparseExternalPin Arc (Forbid — no cold denserels)");
+        .expect("pin external via SparseExternalPin Arc (body denserels by range only)");
         assert!(parents.contains(Fk(parent_id)));
         assert!(
             parents.get_parent_out(Fk(parent_id), 0).is_some(),
@@ -3741,7 +3953,9 @@ mod write_idempotent_tests {
     /// Multi-out parent: ensure/pin keep only spent need-vouts (no n_out expand).
     #[test]
     fn ensure_external_sparse_need_not_full_output_count() {
-        use super::{ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode};
+        use super::{
+            ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ParentPinStamp,
+        };
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::Query;
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3829,10 +4043,263 @@ mod write_idempotent_tests {
             "sparse denserels only for need"
         );
 
-        let (parents, _, _) =
-            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid).unwrap();
+        let (parents, _, _) = pin_for_wire_batch(
+            &q,
+            Some(&plan),
+            &ParentPinStamp::from_plan(&plan),
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 3).is_some());
         assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 0).is_none());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Store start states: S0 new Class A and S1 already-archived both confirm
+    /// via shipped lookup→load (body denserels by range; no load head/idx).
+    #[test]
+    fn store_start_states_lookup_load_confirm() {
+        use super::{
+            confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
+            confirm_write_phase, ColdPinMode, ScriptPreverified,
+        };
+        use crate::{accept_and_archive_block, accept_and_connect_block};
+        use crate::milestone::Milestone;
+        use crate::params::ChainParams;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::blockdata::transaction::{
+            OutPoint, Transaction, TxIn, TxOut, Version as TxVersion,
+        };
+        use bitcoin::hashes::Hash;
+        use bitcoin::locktime::absolute::LockTime;
+        use bitcoin::script::PushBytesBuf;
+        use bitcoin::CompactTarget;
+        use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Sequence, TxMerkleNode, Witness};
+        use rbitcoin_primitives::Height;
+        use rbitcoin_query::Query;
+        use std::sync::{Arc, Once};
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-start-states-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.set_spend_index(true);
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+        let maturity = params.coinbase_maturity();
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut script = ScriptBuf::new();
+            let pb = PushBytesBuf::try_from(height.to_le_bytes().to_vec()).unwrap();
+            script.push_slice(pb);
+            script.push_opcode(bitcoin::opcodes::all::OP_CHECKSIG);
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: script,
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn mine_cb(prev: BlockHash, time: u32, h: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(h)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = bitcoin::Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+        fn mine_with(prev: BlockHash, time: u32, h: u32, extra: Vec<Transaction>) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut txs = vec![coinbase(h)];
+            txs.extend(extra);
+            let mut block = Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: txs,
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = bitcoin::Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+        fn spend(prev: bitcoin::Txid, vout: u32, val: Amount) -> Transaction {
+            Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: prev, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: val,
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let b1 = mine_cb(tip, tip_time + 600, 1);
+        let c1 = b1.txdata[0].compute_txid();
+        accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+        tip = b1.block_hash();
+        tip_time = b1.header.time;
+        for h in 2..=maturity + 1 {
+            let b = mine_cb(tip, tip_time + 600, h);
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        // S0: new Class A plan — stamp must fill parent body_range; load Forbid ok.
+        let h_s0 = maturity + 2;
+        let b_s0 = mine_with(
+            tip,
+            tip_time + 600,
+            h_s0,
+            vec![spend(c1, 0, Amount::from_sat(49_0000_0000))],
+        );
+        {
+            let arcs = [(Height(h_s0), Arc::new(b_s0.clone()))];
+            let stamped =
+                confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S0 lookup");
+            assert!(stamped.plan.is_some(), "S0 must plan Class A");
+            assert!(
+                !stamped.parent_pin.ranges.is_empty(),
+                "S0 lookup must stamp external parent body ranges"
+            );
+            let mat = confirm_wire_load_from_plan(
+                &q,
+                &params,
+                ms,
+                stamped,
+                None,
+                &ScriptPreverified::new(),
+                ColdPinMode::Forbid,
+            )
+            .expect("S0 load denserels by range");
+            let ok = confirm_scripts_phase(mat.batch).expect("S0 scripts");
+            confirm_write_phase(&q, &params, ms, ok.batch).expect("S0 write");
+        }
+        assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
+        tip = b_s0.block_hash();
+        tip_time = b_s0.header.time;
+
+        // S1: already-archived (plan=None) — lookup stamps parent pin; load by range.
+        let h_s1 = h_s0 + 1;
+        let b_s1 = mine_cb(tip, tip_time + 600, h_s1);
+        accept_and_archive_block(&q, &params, Height(h_s1), &b_s1, ms).unwrap();
+        assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
+        {
+            let arcs = [(Height(h_s1), Arc::new(b_s1.clone()))];
+            let stamped =
+                confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S1 lookup");
+            assert!(stamped.plan.is_none(), "S1 already-archived → plan=None");
+            let mat = confirm_wire_load_from_plan(
+                &q,
+                &params,
+                ms,
+                stamped,
+                None,
+                &ScriptPreverified::new(),
+                ColdPinMode::Forbid,
+            )
+            .expect("S1 plan=None load");
+            let ok = confirm_scripts_phase(mat.batch).expect("S1 scripts");
+            confirm_write_phase(&q, &params, ms, ok.batch).expect("S1 write");
+        }
+        assert_eq!(q.tip_height().map(|h| h.0), Some(h_s1));
+
+        // Structural: lookup stage source must not denserels-decode body on stamp path.
+        let src = include_str!("confirm_run.rs");
+        let stamp_fn = src
+            .split("pub fn confirm_wire_lookup_stamp")
+            .nth(1)
+            .and_then(|s| s.split("pub fn confirm_wire_load_from_plan").next())
+            .expect("stamp fn slice");
+        assert!(
+            !stamp_fn.contains("get_outs_denserels_by_range_batch"),
+            "lookup stamp must never body denserels-decode"
+        );
+        assert!(
+            !stamp_fn.contains("IdxBodyMode::OutsDenserels"),
+            "lookup stamp must never idx denserels body"
+        );
+        let load_pin = src
+            .split("fn pin_for_wire_batch")
+            .nth(1)
+            .and_then(|s| s.split("pub fn confirm_scripts_phase").next())
+            .expect("pin fn slice");
+        assert!(
+            !load_pin.contains("get_fk_by_txid("),
+            "load pin must not probe head"
+        );
+        assert!(
+            !load_pin.contains(".body_txid("),
+            "load pin must not read txid.body"
+        );
+        assert!(
+            !load_pin.contains("load_creates_once"),
+            "load pin must not idx denserels via load_creates_once"
+        );
+        assert!(
+            load_pin.contains("get_outs_denserels_by_range_batch"),
+            "load pin must denserels by known body range"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }

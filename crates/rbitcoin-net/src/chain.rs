@@ -337,7 +337,11 @@ impl ChainHub {
         Ok(Some(out))
     }
 
-    /// IBD **load** after lookup: pin denserels + assemble (does not re-lookup).
+    /// IBD **load** after lookup denserels ensure: pin + assemble (does not re-lookup).
+    ///
+    /// Passes [`ColdPinMode::Forbid`] for planned Class A (denserels via plan-local /
+    /// ranges). When `stamped.plan` is `None` (already-archived rehydrate), consensus
+    /// load forces Allow cold denserels with `txid.body` parent identity.
     pub fn confirm_wire_load_from_plan(
         &self,
         stamped: PlanStampOutcome,
@@ -350,6 +354,7 @@ impl ChainHub {
             stamped,
             pipeline,
             &ScriptPreverified::new(),
+            rbitcoin_consensus::ColdPinMode::Forbid,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))
     }

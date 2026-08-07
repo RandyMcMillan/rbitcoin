@@ -46,8 +46,29 @@ impl InFlightLayer {
         }
     }
 
+    /// Creates-only layer (txid→fk) for already-archived packs without denserels pins.
+    ///
+    /// Lookup tip-ahead needs parent create_fk resolution while Class A of prior
+    /// heights is already on disk but may still be mid-head-insert; publishing
+    /// txid→fk here bridges the gap without requiring full CreatePin outs.
+    pub fn from_txid_fks(pairs: impl IntoIterator<Item = ([u8; 32], Fk)>) -> Self {
+        let mut creates = HashMap::new();
+        let mut max_fk = 0u64;
+        for (txid, fk) in pairs {
+            if let Some(id) = fk.get() {
+                max_fk = max_fk.max(id);
+            }
+            creates.insert(txid, fk);
+        }
+        Self {
+            creates,
+            outs: HashMap::new(),
+            max_fk,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.outs.is_empty()
+        self.creates.is_empty() && self.outs.is_empty()
     }
 
     pub fn max_fk(&self) -> u64 {
@@ -71,8 +92,11 @@ impl InFlightLog {
     }
 
     /// Publish one pack. Does not mutate existing layers.
+    ///
+    /// A layer with only `creates` (no outs) is still published — plan=None
+    /// archived packs use creates-only for tip-ahead parent resolve.
     pub fn note_layer(&mut self, layer: InFlightLayer) {
-        if layer.is_empty() {
+        if layer.creates.is_empty() && layer.outs.is_empty() {
             return;
         }
         self.layers.push(Arc::new(layer));
@@ -232,6 +256,17 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
             vec![0u32],
         ))
+    }
+
+    #[test]
+    fn creates_only_layer_resolves_txid() {
+        let mut log = InFlightLog::new();
+        let mut tid = [0u8; 32];
+        tid[0] = 0xab;
+        log.note_layer(InFlightLayer::from_txid_fks([(tid, Fk(42))]));
+        let v = log.snapshot();
+        assert_eq!(v.get_create_fk(&tid), Some(Fk(42)));
+        assert!(v.get_out(42).is_none(), "creates-only has no denserels pin");
     }
 
     #[test]

@@ -127,6 +127,56 @@ impl LoadAheadState {
         self.publish_mem_stats();
     }
 
+    /// Publish already-archived create txid→fk for tip-ahead stamp (plan=None packs).
+    ///
+    /// Without this, lookup(N+k) cannot resolve parents in N..N+k-1 that already
+    /// have Class A body but are mid-head-insert / not yet head-probeable, and
+    /// stamp fails with `parent create_fk unresolved` (permanent tip blacklist).
+    fn note_archived_creates(
+        &mut self,
+        hub: &ChainHub,
+        heights_hashes: &[(u32, BlockHash)],
+    ) {
+        let mut pairs: Vec<([u8; 32], rbitcoin_primitives::Fk)> = Vec::new();
+        let mut max_fk = 0u64;
+        for &(h, hash) in heights_hashes {
+            let Ok(Some((hfk, _))) = hub.query.get_header_by_hash(&hash.to_byte_array()) else {
+                continue;
+            };
+            let Ok(Some(fks)) = hub.query.store().header_txs.get_list(hfk) else {
+                continue;
+            };
+            for fk in fks {
+                let Some(id) = fk.get() else { continue };
+                max_fk = max_fk.max(id);
+                let Ok(tid) = hub.query.store().txs.body_txid(fk) else {
+                    continue;
+                };
+                if tid != [0u8; 32] {
+                    pairs.push((tid, fk));
+                }
+            }
+            let _ = h;
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        if let Some((_, last_id)) = pairs
+            .iter()
+            .filter_map(|(_, f)| f.get().map(|id| ((), id)))
+            .max_by_key(|(_, id)| *id)
+        {
+            self.next_tx_start = last_id.saturating_add(1).max(1);
+        }
+        let _ = max_fk;
+        self.in_flight
+            .note_layer(rbitcoin_query::InFlightLayer::from_txid_fks(pairs));
+        if let Some(&(h, hash)) = heights_hashes.last() {
+            self.last_loaded = Some((h, hash.to_byte_array()));
+        }
+        self.publish_mem_stats();
+    }
+
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
         // Arc-swap store so in-flight load/write batches keep their Arcs.
@@ -1696,8 +1746,15 @@ pub(crate) fn spawn_confirm_engine(
                             {
                                 lookup_ahead.note_lookup_ok(&hub, p, lh, raw);
                             }
-                        } else if let Some((lh, ha, _)) = wire_batch.last() {
-                            lookup_ahead.last_loaded = Some((*lh, ha.to_byte_array()));
+                        } else {
+                            // plan=None: Class A already on disk — still publish
+                            // create txid→fk so tip-ahead packs can resolve parents
+                            // before head probe catches up.
+                            let hh: Vec<(u32, BlockHash)> = wire_batch
+                                .iter()
+                                .map(|(h, ha, _)| (*h, *ha))
+                                .collect();
+                            lookup_ahead.note_archived_creates(&hub, &hh);
                         }
                         // Pipeline after note_lookup_ok: load pin sees prior+this offline denserels.
                         let pipe_for_prep = lookup_ahead.pipeline_for(expect_h, store_path_lo);
@@ -1805,7 +1862,11 @@ pub(crate) fn spawn_confirm_engine(
                                 .collect();
                             feed.requeue_wire(&tail);
                         }
+                        // Permanent reject path: wipe tip-ahead HWM so the next
+                        // ordered claim does not inherit a poisoned next_tx_start.
                         lookup_ahead.clear_all(&hub);
+                        // Requeue height for claim only until reject event blacklists.
+                        feed.requeue_wire(&[(expect, hash, None)]);
                         feed.finish(std::iter::once(expect));
                         loop_stats
                             .confirm_reject_stops

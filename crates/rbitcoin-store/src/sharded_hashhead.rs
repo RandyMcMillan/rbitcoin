@@ -10,7 +10,7 @@
 //! - Legacy: single file `name` (one logical shard) still opens.
 
 use crate::error::StoreError;
-use crate::hashhead::{initial_slots_for, HeadRole, HeadScale, HashHead};
+use crate::hashhead::{initial_slots_for, HashHead, HeadRole, HeadScale};
 use rbitcoin_primitives::Fk;
 use std::path::PathBuf;
 
@@ -66,10 +66,7 @@ pub struct ShardedHashHead {
 }
 
 impl ShardedHashHead {
-    pub fn create_for_role(
-        path: impl Into<PathBuf>,
-        role: HeadRole,
-    ) -> Result<Self, StoreError> {
+    pub fn create_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
         Self::create_sharded(
             path,
             shard_count_for_role(role),
@@ -116,10 +113,7 @@ impl ShardedHashHead {
     }
 
     /// Open a legacy single-file head **or** a sharded directory.
-    pub fn open_for_role(
-        path: impl Into<PathBuf>,
-        _role: HeadRole,
-    ) -> Result<Self, StoreError> {
+    pub fn open_for_role(path: impl Into<PathBuf>, _role: HeadRole) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             let mut names: Vec<String> = std::fs::read_dir(&path)
@@ -219,9 +213,6 @@ impl ShardedHashHead {
         }
         Ok(())
     }
-
-
-
 
     pub fn flush(&self) -> Result<(), StoreError> {
         for s in &self.shards {

@@ -68,7 +68,12 @@ fn main() {
             .enumerate()
             .map(|(ii, p)| {
                 let spk = p.script_pubkey.as_bytes();
-                (ii, p.value.to_sat(), spk.len(), spk[..spk.len().min(8)].to_vec())
+                (
+                    ii,
+                    p.value.to_sat(),
+                    spk.len(),
+                    spk[..spk.len().min(8)].to_vec(),
+                )
             })
             .collect();
         let job = JobBytes::new(prevouts, tx.clone());

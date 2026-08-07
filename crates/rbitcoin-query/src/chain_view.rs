@@ -71,13 +71,14 @@ impl Query {
 
     /// Wire header for a confirmed height (resolves prev hash from archive).
     pub fn wire_header_at_height(&self, height: Height) -> Result<BlockHeader, QueryError> {
-        let (_fk, rec) = self
-            .header_at_height(height)?
-            .ok_or(StoreError::NotFound)?;
+        let (_fk, rec) = self.header_at_height(height)?.ok_or(StoreError::NotFound)?;
         self.wire_header_from_record(&rec)
     }
 
-    pub(crate) fn wire_header_from_record(&self, rec: &HeaderRecord) -> Result<BlockHeader, QueryError> {
+    pub(crate) fn wire_header_from_record(
+        &self,
+        rec: &HeaderRecord,
+    ) -> Result<BlockHeader, QueryError> {
         self.wire_header_from_record_prev(rec, None)
     }
 

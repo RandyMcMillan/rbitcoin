@@ -133,9 +133,7 @@ fn verify_script_path(
 
     // BIP341: recompute merkle root from leaf + path, apply TapTweak to internal
     // key, and check it matches the prevout output key (with claimed parity).
-    let ok = crypto::SECP.with(|secp| {
-        control.verify_taproot_commitment(secp, output_key, script)
-    });
+    let ok = crypto::SECP.with(|secp| control.verify_taproot_commitment(secp, output_key, script));
     if !ok {
         return Err(ConsensusError::Script("p2tr bip341 tweak mismatch".into()));
     }
@@ -165,14 +163,12 @@ fn verify_script_path(
 #[cfg(test)]
 mod bip341_tests {
     use super::*;
+    use crate::script;
     use bitcoin::absolute::LockTime;
     use bitcoin::key::{TapTweak, TweakedKeypair};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use bitcoin::taproot::{LeafVersion, TaprootBuilder};
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
-    use crate::script;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
     fn p2tr_spk(output_key: XOnlyPublicKey) -> ScriptBuf {
         let mut b = vec![0x51, 0x20];
@@ -224,9 +220,9 @@ mod bip341_tests {
             tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
-        bip66_active: true,
-        bip16_active: true,
-        taproot_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
         };
         (job, control)
     }
@@ -348,9 +344,9 @@ mod bip341_tests {
             tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
-        bip66_active: true,
-        bip16_active: true,
-        taproot_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
     }
@@ -422,13 +418,7 @@ mod bip341_tests {
             let annex = Annex::new(annex_bytes).unwrap();
             let mut cache = SighashCache::new(&tx);
             let sh = cache
-                .taproot_signature_hash(
-                    0,
-                    &prevouts,
-                    Some(annex),
-                    None,
-                    TapSighashType::Default,
-                )
+                .taproot_signature_hash(0, &prevouts, Some(annex), None, TapSighashType::Default)
                 .unwrap();
             let sig = secp.sign_schnorr_no_aux_rand(
                 &Message::from_digest(sh.to_byte_array()),
@@ -572,10 +562,7 @@ mod bip341_tests {
                 TapSighashType::Default,
             )
             .unwrap();
-        let sig = secp.sign_schnorr_no_aux_rand(
-            &Message::from_digest(sh.to_byte_array()),
-            &kp,
-        );
+        let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(sh.to_byte_array()), &kp);
         let ctrl = control.serialize();
         let sig_v = sig.as_ref().to_vec();
         let leaf_v = leaf.as_bytes().to_vec();
@@ -665,9 +652,9 @@ mod bip341_tests {
             tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
-        bip66_active: true,
-        bip16_active: true,
-        taproot_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("two-leaf script path");
     }
@@ -677,9 +664,9 @@ mod bip341_tests {
     #[test]
     fn script_path_codeseparator_checksig_chain() {
         use bitcoin::secp256k1::Message;
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
         use bitcoin::taproot::LeafVersion;
         use bitcoin::TapLeafHash;
-        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 
         let secp = Secp256k1::new();
         let sk1 = SecretKey::from_slice(&[11u8; 32]).unwrap();
@@ -774,9 +761,9 @@ mod bip341_tests {
             tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
-        bip66_active: true,
-        bip16_active: true,
-        taproot_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("CODESEPARATOR chain must verify");
     }
@@ -814,9 +801,9 @@ mod bip341_tests {
             tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
-        bip66_active: true,
-        bip16_active: true,
-        taproot_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
         };
         assert!(script::verify_job_all_inputs(&job).is_err());
     }

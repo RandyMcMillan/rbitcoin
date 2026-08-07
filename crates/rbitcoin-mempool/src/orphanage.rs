@@ -197,9 +197,9 @@ impl Orphanage {
 mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-    use bitcoin::hashes::Hash;
 
     fn txid_n(n: u8) -> Txid {
         Txid::from_byte_array([n; 32])
@@ -220,9 +220,9 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(1000 + salt as u64),
-                script_pubkey: ScriptBuf::new_p2wpkh(
-                    &bitcoin::WPubkeyHash::from_byte_array([salt; 20]),
-                ),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [salt; 20],
+                )),
             }],
         }
     }

@@ -8,9 +8,7 @@ use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
 use super::status::LoopStats;
-use super::{
-    CONTIG_DENSIFY_AHEAD, MAX_ORDERED_HEADERS, MAX_PEER_POOL, ORDERED_HEADERS_SOFT_CAP,
-};
+use super::{CONTIG_DENSIFY_AHEAD, MAX_ORDERED_HEADERS, MAX_PEER_POOL, ORDERED_HEADERS_SOFT_CAP};
 use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
@@ -129,9 +127,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     loop_stats
         .drain_ns
         .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    loop_stats
-        .drain_events
-        .fetch_add(events, Ordering::Relaxed);
+    loop_stats.drain_events.fetch_add(events, Ordering::Relaxed);
     Ok(true)
 }
 
@@ -242,13 +238,8 @@ pub(crate) fn apply_peer_event(
                     && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
                 {
                     let tips = work_path_tips(st);
-                    let _ = request_headers_from(
-                        &st.slots,
-                        peer,
-                        hub,
-                        &mut st.header_req_seq,
-                        &tips,
-                    );
+                    let _ =
+                        request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
                 }
             } else if batch_len == 0 {
                 // True empty headers message only — not "already known" batches.
@@ -303,13 +294,8 @@ pub(crate) fn apply_peer_event(
                         || need_ready_headroom)
                 {
                     let tips = work_path_tips(st);
-                    let _ = request_headers_from(
-                        &st.slots,
-                        peer,
-                        hub,
-                        &mut st.header_req_seq,
-                        &tips,
-                    );
+                    let _ =
+                        request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
                 }
             }
         }
@@ -509,9 +495,7 @@ pub(crate) fn apply_confirm_reject(
             let _ = q.block_queue_dequeue_height(height);
         }
         st.body.mark_missing(hash);
-        warn!(
-            "ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)"
-        );
+        warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
         return;
     }
     if let Some(q) = query {
@@ -524,16 +508,14 @@ pub(crate) fn apply_confirm_reject(
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n % 50 == 0 {
-        warn!(
-            "ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})"
-        );
+        warn!("ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})");
     }
 }
 
 #[cfg(test)]
 mod confirm_reject_tests {
-    use super::apply_confirm_reject;
     use super::super::state::IbdWorkState;
+    use super::apply_confirm_reject;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
 
@@ -569,7 +551,9 @@ mod confirm_reject_tests {
             &mut st,
             51,
             hash,
-            "consensus: script verification failed: script false", None);
+            "consensus: script verification failed: script false",
+            None,
+        );
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
 
@@ -583,7 +567,9 @@ mod confirm_reject_tests {
             &mut st,
             219_562,
             hash,
-            "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs", None);
+            "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs",
+            None,
+        );
         assert!(
             st.body.is_rejected(&hash),
             "denserels layout miss is permanent (fix pipeline, not soft-reget)"
@@ -615,7 +601,9 @@ mod confirm_reject_tests {
             &mut st,
             125_653,
             hash,
-            "consensus: unexpected previous header", None);
+            "consensus: unexpected previous header",
+            None,
+        );
         assert!(
             !st.body.is_rejected(&hash),
             "bad wire must soft re-getdata, not permanent-blacklist tip+1"
@@ -653,7 +641,9 @@ mod confirm_reject_tests {
             &mut st,
             362_595,
             hash,
-            "consensus: prevout already spent on best chain", None);
+            "consensus: prevout already spent on best chain",
+            None,
+        );
         assert!(
             st.body.is_rejected(&hash),
             "prevout-spent is permanent at reject layer (write skip-if-committed)"
@@ -664,9 +654,9 @@ mod confirm_reject_tests {
     /// **and** on soft prevout-spent (write emits Reject when has_block is false;
     #[test]
     fn apply_peer_event_body_and_control_surface() {
-        use super::{apply_peer_event, inject_learned_addrs, drain_ready_peer_and_archive_events};
         use super::super::peer_io::{PeerEvent, PeerSlot};
         use super::super::state::InflightReq;
+        use super::{apply_peer_event, drain_ready_peer_and_archive_events, inject_learned_addrs};
         use crate::seeds::AddrMan;
         use bitcoin::block::{Header, Version};
         use bitcoin::CompactTarget;
@@ -739,7 +729,11 @@ mod confirm_reject_tests {
         apply_peer_event(
             &mut st,
             &hub,
-            PeerEvent::BlockFramed { peer: 1, hash: h(9), payload: vec![0u8; 80] },
+            PeerEvent::BlockFramed {
+                peer: 1,
+                hash: h(9),
+                payload: vec![0u8; 80],
+            },
             &write_next,
             &mut book,
             local,
@@ -820,7 +814,11 @@ mod confirm_reject_tests {
         inject_learned_addrs(&mut book, &[], local, 1);
         inject_learned_addrs(
             &mut book,
-            &[addr(2), local, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)],
+            &[
+                addr(2),
+                local,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1),
+            ],
             local,
             1,
         );
@@ -870,10 +868,8 @@ mod confirm_reject_tests {
     /// Raw BlockFramed → body queue; redelivery keeps one rec; far horizon skipped.
     #[test]
     fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
-        use super::{
-            apply_peer_event, drain_ready_peer_and_archive_events, inject_learned_addrs,
-        };
         use super::super::peer_io::{PeerEvent, PeerSlot};
+        use super::{apply_peer_event, drain_ready_peer_and_archive_events, inject_learned_addrs};
         use crate::seeds::AddrMan;
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version};
@@ -1096,17 +1092,22 @@ mod confirm_reject_tests {
             None,
         )
         .unwrap();
-        assert!(stats.drain_events.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        assert!(
+            stats
+                .drain_events
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Single BlockFramed with raw payload offers BQ + notes ConfirmFeed.
     #[test]
     fn block_framed_raw_offers_body_queue_with_confirm_feed() {
-        use super::apply_peer_event;
         use super::super::confirm::ConfirmFeed;
         use super::super::peer_io::{PeerEvent, PeerSlot};
         use super::super::state::InflightReq;
+        use super::apply_peer_event;
         use crate::seeds::AddrMan;
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version};
@@ -1257,11 +1258,10 @@ mod confirm_reject_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-
     #[test]
     fn known_headers_re_admit_to_ordered_after_tip_drain() {
-        use super::apply_peer_event;
         use super::super::peer_io::{PeerEvent, PeerSlot};
+        use super::apply_peer_event;
         use crate::seeds::AddrMan;
         use bitcoin::block::{Header, Version};
         use bitcoin::hashes::Hash;
@@ -1373,7 +1373,6 @@ mod confirm_reject_tests {
     }
 }
 
-
 /// Seed ordered path + body cache from durable Class A after process restart.
 ///
 /// Headers and bodies persist in the store; only the IBD work queue was RAM-only.
@@ -1396,4 +1395,3 @@ pub(crate) fn parent_height(
     }
     None
 }
-

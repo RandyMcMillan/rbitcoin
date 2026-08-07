@@ -113,8 +113,7 @@ impl TxidBody {
         }
         self.file.write_at_pwrite(start, &blob)?;
         let new = base_count + txids.len() as u64;
-        self.count
-            .store(new, std::sync::atomic::Ordering::Release);
+        self.count.store(new, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -276,8 +275,10 @@ mod tests {
         let dir = tmp();
         let t = TxidBody::create(&dir).unwrap();
         assert!(!t.dontcache_for_fk(1));
-        t.count
-            .store(TXID_DONTCACHE_FROM_TAIL + 10, std::sync::atomic::Ordering::Release);
+        t.count.store(
+            TXID_DONTCACHE_FROM_TAIL + 10,
+            std::sync::atomic::Ordering::Release,
+        );
         assert!(!t.dontcache_for_fk(1));
         assert!(!t.dontcache_for_fk(TXID_DONTCACHE_FROM_TAIL + 5));
         let _ = std::fs::remove_dir_all(&dir);

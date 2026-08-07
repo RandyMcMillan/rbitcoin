@@ -33,10 +33,7 @@ fn main() {
         "./datadir-signet/store",
         "/home/agent/workspace/datadir-signet/store",
     ];
-    let path = candidates
-        .iter()
-        .map(Path::new)
-        .find(|p| p.exists());
+    let path = candidates.iter().map(Path::new).find(|p| p.exists());
     let Some(path) = path else {
         println!("no signet store found — synthetic only");
         synthetic();

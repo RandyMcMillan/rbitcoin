@@ -58,7 +58,6 @@ pub fn head_table_access_from_env() -> TableAccess {
     TableAccess::FdOnly
 }
 
-
 /// In-page slot index width (1024 slots / page @ any entry width).
 pub const PAGE_SLOT_BITS: u32 = 10;
 /// Slots per page (`2^PAGE_SLOT_BITS`).
@@ -179,7 +178,9 @@ impl HeadLayout {
             return Err(StoreError::Corrupt("address head bits out of range"));
         }
         if entry_bytes != 4 && entry_bytes != 8 {
-            return Err(StoreError::Corrupt("address head entry_bytes must be 4 or 8"));
+            return Err(StoreError::Corrupt(
+                "address head entry_bytes must be 4 or 8",
+            ));
         }
         // BITS ≥ 33 requires 8 B (u32 fk space insufficient at 0.80 load).
         if bits >= 33 && entry_bytes != 8 {
@@ -425,7 +426,9 @@ pub fn insert_fk_into_page_buf(
     }
     if !scan.hit_empty {
         note_probe_exhausted();
-        return Err(StoreError::Corrupt("address head probe exhausted on insert"));
+        return Err(StoreError::Corrupt(
+            "address head probe exhausted on insert",
+        ));
     }
     store_entry_in_page_buf(page_buf, scan.empty_local, entry_bytes, new_u)?;
     Ok(InsertPageOutcome {
@@ -634,8 +637,7 @@ impl AddressHead {
         }
         // Layout is in the trailing footer (v5). Sidecar-only or older footers fail
         // here → TxTable recreates + rebuilds from Class A.
-        let (file, ext) =
-            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
+        let (file, ext) = TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
         let (layout, generation) = decode_layout_ext(&ext)?;
         let expect_body = layout.body_bytes();
         let body = file.data_len();
@@ -1018,9 +1020,7 @@ impl AddressHead {
 
         // Fixed pool — never one buffer per unique page in the stamp.
         let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
-        let mut bufs: Vec<Vec<u8>> = (0..pool_n)
-            .map(|_| vec![0u8; PROBE_REGION_BYTES])
-            .collect();
+        let mut bufs: Vec<Vec<u8>> = (0..pool_n).map(|_| vec![0u8; PROBE_REGION_BYTES]).collect();
         // Which unique page index each pool slot is loading (or None if free).
         let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
@@ -1140,8 +1140,6 @@ impl AddressHead {
         self.probe_fks(txid)
     }
 
-
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
     }
@@ -1218,7 +1216,6 @@ mod tests {
         assert_eq!(MAINNET_BITS, 25);
         assert!(PROBE_REGION_BYTES as u64 >= PAGE_SLOTS * 8);
     }
-
 
     #[test]
     fn probe_stable() {
@@ -1329,8 +1326,7 @@ mod tests {
             assert!(cands.contains(&Fk(i)), "fk={i} cands={cands:?}");
         }
         drop(h);
-        let h2 =
-            AddressHead::open_with_table_access(&path, TableAccess::FdOnly).unwrap();
+        let h2 = AddressHead::open_with_table_access(&path, TableAccess::FdOnly).unwrap();
         assert_eq!(h2.table_access(), TableAccess::FdOnly);
         assert_eq!(h2.occupied(), 500);
         let mut txid = [0u8; 32];
@@ -1466,9 +1462,7 @@ mod tests {
         let path = tmp("bigu32");
         let h = AddressHead::create_with_bits(&path, 12).unwrap();
         let txid = [1u8; 32];
-        let err = h
-            .insert(&txid, Fk(u64::from(u32::MAX) + 1))
-            .unwrap_err();
+        let err = h.insert(&txid, Fk(u64::from(u32::MAX) + 1)).unwrap_err();
         assert!(matches!(err, StoreError::InvalidFk));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
@@ -1592,10 +1586,7 @@ mod tests {
         // Slot region must not extend into trailing footer.
         // Probe path still finds inserts.
         for (txid, fk) in &entries {
-            assert!(
-                h.probe_fks(txid).unwrap().contains(fk),
-                "missing {fk:?}"
-            );
+            assert!(h.probe_fks(txid).unwrap().contains(fk), "missing {fk:?}");
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
@@ -1621,7 +1612,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }
-
 
     /// Many inserts spanning multiple pages (page-coalesced; call order within page).
     #[test]
@@ -1670,11 +1660,7 @@ mod tests {
         // order within this page for the two same-txid inserts.
         let mut other = [0xcd; 32];
         other[0] = 0x11;
-        let entries = [
-            (txid, Fk(1)),
-            (other, Fk(99)),
-            (txid, Fk(2)),
-        ];
+        let entries = [(txid, Fk(1)), (other, Fk(99)), (txid, Fk(2))];
         h.insert_many(&entries).unwrap();
         assert_eq!(h.occupied(), 3);
         let cands = h.probe_fks(&txid).unwrap();
@@ -1795,7 +1781,6 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
-
     #[test]
     fn mainnet_default_bits_is_26() {
         assert_eq!(MAINNET_BITS, 25);
@@ -1862,5 +1847,4 @@ mod tests {
             None => std::env::remove_var("RBITCOIN_TX_HEAD_BITS"),
         }
     }
-
 }

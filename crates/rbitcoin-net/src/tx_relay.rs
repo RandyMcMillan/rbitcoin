@@ -479,7 +479,9 @@ mod tests {
         assert_eq!(hub.scripthash_unconfirmed_delta(&[0u8; 32]), 0);
         assert!(hub.list_live().is_empty());
         assert!(!hub.contains_wtxid(&Wtxid::from_byte_array([0u8; 32])));
-        assert!(hub.get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32])).is_none());
+        assert!(hub
+            .get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32]))
+            .is_none());
         assert_eq!(hub.remove_for_block(&[]), 0);
         assert_eq!(hub.reorg_reaccept(&[]), 0);
         hub.flush().unwrap();

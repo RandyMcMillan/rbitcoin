@@ -12,9 +12,9 @@
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
 #[cfg(test)]
 use crate::file::TableAccess;
+use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
 use crate::scripthash_layout::{
     head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
@@ -282,7 +282,12 @@ impl ScriptHashHead {
             state.slots
         };
         let body_bytes = SH_HEAD_SLOT_SIZE as u64 * slots;
-        let zero = vec![0u8; (1024 * 1024).min(body_bytes as usize).max(SH_HEAD_SLOT_SIZE)];
+        let zero = vec![
+            0u8;
+            (1024 * 1024)
+                .min(body_bytes as usize)
+                .max(SH_HEAD_SLOT_SIZE)
+        ];
         let mut off = 0u64;
         while off < body_bytes {
             let n = ((body_bytes - off) as usize).min(zero.len());
@@ -883,23 +888,19 @@ impl LiveShardTable {
         let mut slot = open_address::primary_slot(&key, self.slots);
         for _ in 0..self.slots {
             let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
-            let slot_key: ShHeadKey = self.table[off..off + SH_HEAD_KEY_LEN]
-                .try_into()
-                .unwrap();
+            let slot_key: ShHeadKey = self.table[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
             let slot_v: [u8; SH_HEAD_VALUE_LEN] = self.table
                 [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
                 .try_into()
                 .unwrap();
             if is_empty_slot(&slot_key, &slot_v) {
                 self.table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(&key);
-                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
-                    .copy_from_slice(enc);
+                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(enc);
                 self.occupied = self.occupied.saturating_add(1);
                 return Ok(());
             }
             if slot_key == key {
-                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
-                    .copy_from_slice(enc);
+                self.table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(enc);
                 return Ok(());
             }
             slot = (slot + 1) & (self.slots - 1);
@@ -920,8 +921,7 @@ impl LiveShardTable {
         for s in 0..old_slots {
             let off = (s as usize) * SH_HEAD_SLOT_SIZE;
             let k: ShHeadKey = old[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
-            let v: [u8; SH_HEAD_VALUE_LEN] = old
-                [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+            let v: [u8; SH_HEAD_VALUE_LEN] = old[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
                 .try_into()
                 .unwrap();
             if !is_empty_slot(&k, &v) {
@@ -1008,11 +1008,7 @@ impl ShardedScriptHashHead {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| {
-                    n.len() == 2
-                        && n.chars()
-                            .all(|c| c.is_ascii_hexdigit())
-                })
+                .filter(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit()))
                 .collect();
             names.sort();
             if names.is_empty() {
@@ -1096,11 +1092,7 @@ impl ShardedScriptHashHead {
     }
 
     /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
-    pub fn install_live_shard(
-        &self,
-        shard: usize,
-        live: LiveShardTable,
-    ) -> Result<(), StoreError> {
+    pub fn install_live_shard(&self, shard: usize, live: LiveShardTable) -> Result<(), StoreError> {
         if shard >= self.shards.len() {
             return Err(StoreError::Corrupt(
                 "scripthash install_live_shard: shard out of range",
@@ -1283,10 +1275,7 @@ mod tests {
             "open without .occ must skip full scan (took {open_ms}ms)"
         );
         // Lookups still work (probe, not occupancy).
-        assert_eq!(
-            h2.get(&key).unwrap().unwrap().inline_fks(),
-            vec![Fk(1)]
-        );
+        assert_eq!(h2.get(&key).unwrap().unwrap().inline_fks(), vec![Fk(1)]);
         // Reinit seals known empty + sidecar for cold path.
         h2.reinit_empty().unwrap();
         assert!(h2.is_known_empty());
@@ -1454,8 +1443,11 @@ mod tests {
         for i in 0u8..16 {
             let mut key = [0u8; 32];
             key[0] = i.wrapping_mul(0x40); // spread high bits
-            h.insert(&key, &ShHeadValue::inline_one(ShEntry::new(Fk(i as u64 + 1))))
-                .unwrap();
+            h.insert(
+                &key,
+                &ShHeadValue::inline_one(ShEntry::new(Fk(i as u64 + 1))),
+            )
+            .unwrap();
             assert_eq!(h.shard_index(&key), prefix_shard_of(&key, 4));
         }
         h.flush().unwrap();
@@ -1480,11 +1472,9 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         // open missing
-        assert!(ShardedScriptHashHead::open_for_role(
-            base.join("nope"),
-            HeadRole::ScriptHash
-        )
-        .is_err());
+        assert!(
+            ShardedScriptHashHead::open_for_role(base.join("nope"), HeadRole::ScriptHash).is_err()
+        );
         // open single file via open_for_role
         let h3 = ShardedScriptHashHead::open_for_role(&single, HeadRole::ScriptHash).unwrap();
         assert_eq!(h3.shard_count(), 1);

@@ -114,7 +114,7 @@ pub fn init_from_env() -> bool {
 /// Extract a [`Level`] from env-style specs (`debug`, `info,rbitcoin=trace`, …).
 pub fn parse_level_spec(spec: &str) -> Option<Level> {
     let mut found = None;
-    for part in spec.split(|c: char| c == ',' || c == ';') {
+    for part in spec.split([',', ';']) {
         let part = part.trim();
         if part.is_empty() {
             continue;

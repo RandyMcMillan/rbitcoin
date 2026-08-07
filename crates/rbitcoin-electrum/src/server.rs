@@ -129,11 +129,7 @@ pub async fn run_electrum(
             if shutdown_c.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            let accept = tokio::time::timeout(
-                Duration::from_millis(200),
-                listener.accept(),
-            )
-            .await;
+            let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
             match accept {
                 Ok(Ok((stream, peer))) => {
                     // Cap concurrent clients — refuse when saturated (DoS).
@@ -447,11 +443,11 @@ fn dispatch(
         }
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
-            let u = query.scripthash_listunspent(&sh).map_err(|e| e.to_string())?;
+            let u = query
+                .scripthash_listunspent(&sh)
+                .map_err(|e| e.to_string())?;
             // Outpoints spent by mempool txs (confirmed or other mempool parents).
-            let spent = mempool
-                .map(|m| m.spent_outpoints())
-                .unwrap_or_default();
+            let spent = mempool.map(|m| m.spent_outpoints()).unwrap_or_default();
             let mut arr: Vec<Value> = u
                 .iter()
                 .filter(|x| {
@@ -594,7 +590,9 @@ fn dispatch(
             let tx: bitcoin::Transaction =
                 bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
             let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-            let r = mp.accept_tx(&tx).map_err(|e| format!("broadcast reject: {e}"))?;
+            let r = mp
+                .accept_tx(&tx)
+                .map_err(|e| format!("broadcast reject: {e}"))?;
             let _ = chain.network;
             Ok(json!(format!("{}", r.txid)))
         }
@@ -604,7 +602,9 @@ fn dispatch(
             let fks = query
                 .block_tx_fks(Height(height))
                 .map_err(|e| e.to_string())?;
-            let fk = fks.get(tx_pos).ok_or_else(|| "pos out of range".to_string())?;
+            let fk = fks
+                .get(tx_pos)
+                .ok_or_else(|| "pos out of range".to_string())?;
             let tx = query.get_tx(*fk).map_err(|e| e.to_string())?;
             Ok(json!(txid_hex(&tx.txid)))
         }
@@ -722,11 +722,7 @@ fn scripthash_status(hist: &[rbitcoin_query::ScriptHashHistoryItem]) -> String {
     rbitcoin_primitives::hex_encode(hash.to_byte_array())
 }
 
-fn scripthash_status_full(
-    query: &Query,
-    mp: &MempoolHub,
-    sh: &[u8; 32],
-) -> Result<String, String> {
+fn scripthash_status_full(query: &Query, mp: &MempoolHub, sh: &[u8; 32]) -> Result<String, String> {
     let mut hist = query.scripthash_history(sh).map_err(|e| e.to_string())?;
     for item in mp.scripthash_mempool(sh) {
         hist.push(rbitcoin_query::ScriptHashHistoryItem {
@@ -1086,10 +1082,13 @@ mod tests {
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut stream);
         let mut resp = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
-            .await
-            .expect("timeout")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 1);
         assert!(v.get("result").is_some());
@@ -1106,10 +1105,13 @@ mod tests {
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(stream);
         resp.clear();
-        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
-            .await
-            .expect("timeout")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 2);
 
@@ -1413,10 +1415,13 @@ mod tests {
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut stream);
         let mut resp = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         // Push tip notify.
         tip_tx
             .send(TipNotify {
@@ -1425,10 +1430,13 @@ mod tests {
             })
             .unwrap();
         resp.clear();
-        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let push: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(
             push["method"].as_str(),
@@ -1653,8 +1661,8 @@ mod tests {
         use bitcoin::script::ScriptBuf;
         use bitcoin::transaction::Version as TxVersion;
         use bitcoin::{
-            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
-            TxMerkleNode, Witness,
+            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
+            TxMerkleNode, TxOut, Witness,
         };
         use rbitcoin_consensus::{accept_and_connect_block, Milestone};
         use rbitcoin_net::MempoolHub;

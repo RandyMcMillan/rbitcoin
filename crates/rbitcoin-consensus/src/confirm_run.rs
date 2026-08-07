@@ -25,11 +25,11 @@ use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
     ScriptCheckJob, ValidationContext,
 };
+use crate::confirm_phase_stats;
 use crate::error::ConsensusError;
 use crate::header::{median_time_past_times, validate_header};
 use crate::milestone::Milestone;
 use crate::params::{genesis_block, ChainParams};
-use crate::confirm_phase_stats;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
@@ -230,10 +230,8 @@ pub fn confirm_load_phase_preverified(
 
     let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks)?;
-    confirm_phase_stats::RESOLVE_NS.fetch_add(
-        t_resolve.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
+    confirm_phase_stats::RESOLVE_NS
+        .fetch_add(t_resolve.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Wire rebuild needs full create Class A; free it before assemble so the
     // queued LoadedBatch does not retain create full-bodies (only wire blocks).
@@ -467,11 +465,7 @@ pub fn confirm_wire_load_phase_pipelined(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_batch_from(
-                    &mut need,
-                    p.next_tx_start.max(1),
-                    &p.in_flight,
-                )
+                .archive_plan_batch_from(&mut need, p.next_tx_start.max(1), &p.in_flight)
                 .map_err(ConsensusError::Store)?,
             None => query
                 .archive_plan_batch_owned(&mut need)
@@ -486,7 +480,8 @@ pub fn confirm_wire_load_phase_pipelined(
                 .position(|f| *f == first)
                 .unwrap_or(0);
             let n = n as usize;
-            let slice = plan.planned_fks[start..start.saturating_add(n).min(plan.planned_fks.len())]
+            let slice = plan.planned_fks
+                [start..start.saturating_add(n).min(plan.planned_fks.len())]
                 .to_vec();
             by_header.insert(hid, slice);
         }
@@ -535,10 +530,7 @@ pub fn confirm_wire_load_phase_pipelined(
         p.freeze_after_pin();
     }
 
-    confirm_phase_stats::LOAD_NS.fetch_add(
-        t_load.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
+    confirm_phase_stats::LOAD_NS.fetch_add(t_load.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if ns_wire_arc > 0 {
         confirm_phase_stats::PREP_WIRE_ARC_NS.fetch_add(ns_wire_arc, Ordering::Relaxed);
     }
@@ -716,12 +708,8 @@ pub fn ensure_external_parent_denserels_from_plan(
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
         // Prefer plan stamp body ranges (skip tx.idx) — sparse need denserels.
-        let mut by_range: Vec<(
-            rbitcoin_primitives::Fk,
-            (u64, u64),
-            [u8; 32],
-            Vec<u32>,
-        )> = Vec::new();
+        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
+            Vec::new();
         let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
@@ -807,7 +795,10 @@ pub fn ensure_external_parent_denserels_from_plan(
                 // Sparse need only — drop full dense outs after selecting need vouts.
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 let live: Vec<(u32, rbitcoin_store::OutputRecord)> = if need.is_empty() {
-                    outs.into_iter().enumerate().map(|(i, o)| (i as u32, o)).collect()
+                    outs.into_iter()
+                        .enumerate()
+                        .map(|(i, o)| (i as u32, o))
+                        .collect()
                 } else {
                     need.iter()
                         .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
@@ -947,10 +938,7 @@ pub fn confirm_wire_load_from_plan(
         p.freeze_after_pin();
     }
 
-    confirm_phase_stats::LOAD_NS.fetch_add(
-        t_load.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
+    confirm_phase_stats::LOAD_NS.fetch_add(t_load.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let prepared = assemble_run(
         query,
@@ -983,8 +971,14 @@ pub fn confirm_wire_lookup_and_ensure_denserels(
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WireLoadPipeline>,
-) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, DenserelsWarmStats, u64), ConsensusError>
-{
+) -> Result<
+    (
+        Option<rbitcoin_query::ArchiveWritePlan>,
+        DenserelsWarmStats,
+        u64,
+    ),
+    ConsensusError,
+> {
     let t0 = Instant::now();
     let (mut plan, _metas, _wire, plan_ns) =
         wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
@@ -1152,11 +1146,7 @@ fn wire_lookup_phase(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_batch_from(
-                    &mut need,
-                    p.next_tx_start.max(1),
-                    &p.in_flight,
-                )
+                .archive_plan_batch_from(&mut need, p.next_tx_start.max(1), &p.in_flight)
                 .map_err(ConsensusError::Store)?,
             None => query
                 .archive_plan_batch_owned(&mut need)
@@ -1171,7 +1161,8 @@ fn wire_lookup_phase(
                 .position(|f| *f == first)
                 .unwrap_or(0);
             let n = n as usize;
-            let slice = plan.planned_fks[start..start.saturating_add(n).min(plan.planned_fks.len())]
+            let slice = plan.planned_fks
+                [start..start.saturating_add(n).min(plan.planned_fks.len())]
                 .to_vec();
             by_header.insert(hid, slice);
         }
@@ -1252,7 +1243,13 @@ pub mod plan_stamp_sub_stats {
     }
 
     /// Record last stamp sub-walls for one plan batch (slow-plan logs).
-    pub fn note_last(n_blocks: u64, struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
+    pub fn note_last(
+        n_blocks: u64,
+        struct_ns: u64,
+        prepare_ns: u64,
+        filter_ns: u64,
+        batch_ns: u64,
+    ) {
         note(struct_ns, prepare_ns, filter_ns, batch_ns);
         LAST_N_BLOCKS.store(n_blocks, Ordering::Relaxed);
         LAST_STRUCT_NS.store(struct_ns, Ordering::Relaxed);
@@ -1431,8 +1428,14 @@ fn pin_for_wire_batch(
     in_flight: Option<&rbitcoin_query::InFlightView>,
     pipeline_parent_store: Option<&std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
     cold_mode: ColdPinMode,
-) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin, DenserelsWarmStats), ConsensusError>
-{
+) -> Result<
+    (
+        rbitcoin_query::BatchParents,
+        rbitcoin_query::BatchThin,
+        DenserelsWarmStats,
+    ),
+    ConsensusError,
+> {
     use rbitcoin_query::confirm_load_stats;
     use rbitcoin_query::ThinInput;
     use rbitcoin_store::IdxBodyMode;
@@ -1521,11 +1524,7 @@ fn pin_for_wire_batch(
                     }
                     let prev_txid = inp.previous_output.txid.to_byte_array();
                     let vout = inp.previous_output.vout;
-                    let cfk = query
-                        .store()
-                        .get_fk_by_txid(&prev_txid)
-                        .ok()
-                        .flatten();
+                    let cfk = query.store().get_fk_by_txid(&prev_txid).ok().flatten();
                     if let Some(fk) = cfk {
                         if let Some(pid) = fk.get() {
                             edges.push(ThinInput {
@@ -1578,9 +1577,10 @@ fn pin_for_wire_batch(
     }
 
     let mut batch_parents = match pipeline_parent_store {
-        Some(store) => {
-            rbitcoin_query::BatchParents::with_store(std::sync::Arc::clone(store), parent_vouts.len())
-        }
+        Some(store) => rbitcoin_query::BatchParents::with_store(
+            std::sync::Arc::clone(store),
+            parent_vouts.len(),
+        ),
         None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
     };
     // One store lock: adopt live shared pins (writeq / peer load overlap) so free
@@ -1722,15 +1722,7 @@ fn pin_for_wire_batch(
             } else {
                 (plan_range, Vec::new())
             };
-            batch_parents.insert_owned(
-                fk,
-                tx.clone(),
-                live,
-                need.clone(),
-                cb,
-                body_range,
-                sparse,
-            );
+            batch_parents.insert_owned(fk, tx.clone(), live, need.clone(), cb, body_range, sparse);
             n_plan_pin = n_plan_pin.saturating_add(1);
         } else {
             still_need.insert(*id, need.clone());
@@ -1743,12 +1735,8 @@ fn pin_for_wire_batch(
 
     // 2b) Cold range denserels for still_need with plan body_range (sparse need_vouts).
     if let Some(plan) = plan {
-        let mut range_jobs: Vec<(
-            rbitcoin_primitives::Fk,
-            (u64, u64),
-            [u8; 32],
-            Vec<u32>,
-        )> = Vec::new();
+        let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
+            Vec::new();
         for (id, need) in &still_need {
             if let Some(&range) = plan.external_parent_ranges.get(id) {
                 let tid = known_create_txid_ram(*id, Some(plan));
@@ -1778,9 +1766,7 @@ fn pin_for_wire_batch(
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
             n_range_new = n_range_new.saturating_add(n_range);
             let t_range_fill = Instant::now();
-            for ((fk, range, _tid, need), row) in
-                range_jobs.into_iter().zip(decoded.into_iter())
-            {
+            for ((fk, range, _tid, need), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
                 let Some(id) = fk.get() else {
                     continue;
                 };
@@ -1795,22 +1781,13 @@ fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                batch_parents.insert_owned(
-                    fk,
-                    tx,
-                    live,
-                    need,
-                    cb,
-                    Some(range),
-                    sparse,
-                );
+                batch_parents.insert_owned(fk, tx, live, need, cb, Some(range), sparse);
                 still_need.remove(&id);
                 n_plan_pin = n_plan_pin.saturating_add(1);
             }
             let range_fill_ns = t_range_fill.elapsed().as_nanos() as u64;
             if range_fill_ns > 0 {
-                confirm_load_stats::PIN_RANGE_FILL_NS
-                    .fetch_add(range_fill_ns, Ordering::Relaxed);
+                confirm_load_stats::PIN_RANGE_FILL_NS.fetch_add(range_fill_ns, Ordering::Relaxed);
             }
         }
     }
@@ -1828,17 +1805,12 @@ fn pin_for_wire_batch(
                 )));
             }
             let t_io = Instant::now();
-            let fks: Vec<rbitcoin_primitives::Fk> = cold
-                .keys()
-                .map(|id| rbitcoin_primitives::Fk(*id))
-                .collect();
+            let fks: Vec<rbitcoin_primitives::Fk> =
+                cold.keys().map(|id| rbitcoin_primitives::Fk(*id)).collect();
             n_cold = fks.len() as u64;
-            let loaded = rbitcoin_query::load_creates_once(
-                query.store(),
-                &fks,
-                IdxBodyMode::OutsDenserels,
-            )
-            .map_err(ConsensusError::Store)?;
+            let loaded =
+                rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::OutsDenserels)
+                    .map_err(ConsensusError::Store)?;
             cold_io_ns = t_io.elapsed().as_nanos() as u64;
             if cold_io_ns > 0 {
                 confirm_load_stats::COLD_IDX_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
@@ -1897,15 +1869,7 @@ fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                batch_parents.insert_owned(
-                    c.fk,
-                    tx,
-                    live,
-                    need,
-                    cb,
-                    Some(c.body_range),
-                    sparse,
-                );
+                batch_parents.insert_owned(c.fk, tx, live, need, cb, Some(c.body_range), sparse);
             }
             cold_decode_ns = t_dec.elapsed().as_nanos() as u64;
             confirm_load_stats::BODY_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
@@ -2003,9 +1967,7 @@ fn pin_for_wire_batch(
 
     let warm = DenserelsWarmStats {
         // External parents only (unique spent creates not same-batch offline).
-        parents: parent_vouts
-            .len()
-            .saturating_sub(n_same_batch as usize) as u32,
+        parents: parent_vouts.len().saturating_sub(n_same_batch as usize) as u32,
         already: n_plan_pin.saturating_sub(n_same_batch as u64) as u32,
         cold: n_cold as u32,
         same_batch: n_same_batch,
@@ -2136,15 +2098,12 @@ pub fn confirm_scripts_feed_ahead(
     let mut next = iter.next().map(confirm_scripts_phase_async);
     loop {
         // Keep offering the following batch while joining current.
-        let outcome = join_scripts_polling(
-            &current,
-            std::time::Duration::from_micros(200),
-            || {
+        let outcome =
+            join_scripts_polling(&current, std::time::Duration::from_micros(200), || {
                 if next.is_none() {
                     next = iter.next().map(confirm_scripts_phase_async);
                 }
-            },
-        )?;
+            })?;
         out.push(outcome);
         match next.take() {
             Some(h) => current = h,
@@ -2193,19 +2152,15 @@ pub fn scripts_stage_from_load_channel(
             Some(c) => c,
             None => break,
         };
-        let result = join_scripts_polling(
-            &handle,
-            std::time::Duration::from_micros(200),
-            || {
-                if lookahead.is_none() {
-                    if let Ok((batch, mat_ns)) = mat_rx.try_recv() {
-                        if !should_stop() {
-                            lookahead = Some(start(batch, mat_ns));
-                        }
+        let result = join_scripts_polling(&handle, std::time::Duration::from_micros(200), || {
+            if lookahead.is_none() {
+                if let Ok((batch, mat_ns)) = mat_rx.try_recv() {
+                    if !should_stop() {
+                        lookahead = Some(start(batch, mat_ns));
                     }
                 }
-            },
-        );
+            }
+        });
         match result {
             Ok(outcome) => {
                 let cont = on_ok(outcome, meta);
@@ -2386,16 +2341,15 @@ pub fn confirm_write_phase(
             // Shared CreatePin Arcs only (refcount) for post-commit layout fill —
             // no whole-plan packed deep clone of outs.
             let planned_fks = plan.planned_fks.clone();
-            let pins: Vec<rbitcoin_query::CreatePin> = if plan.batch_pin.len()
-                == plan.planned_fks.len()
-            {
-                plan.batch_pin.iter().map(std::sync::Arc::clone).collect()
-            } else {
-                plan.packed
-                    .iter()
-                    .map(|(pin, _)| std::sync::Arc::clone(pin))
-                    .collect()
-            };
+            let pins: Vec<rbitcoin_query::CreatePin> =
+                if plan.batch_pin.len() == plan.planned_fks.len() {
+                    plan.batch_pin.iter().map(std::sync::Arc::clone).collect()
+                } else {
+                    plan.packed
+                        .iter()
+                        .map(|(pin, _)| std::sync::Arc::clone(pin))
+                        .collect()
+                };
             write_create_pins.reserve(planned_fks.len());
             for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
                 write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
@@ -2516,7 +2470,10 @@ fn fill_planned_create_layout_after_commit(
         .store()
         .tx_body_range_batch(&need_fks)
         .map_err(ConsensusError::Store)?;
-    for ((&fk, range), &pi) in need_fks.iter().zip(ranges.into_iter()).zip(need_pin_i.iter())
+    for ((&fk, range), &pi) in need_fks
+        .iter()
+        .zip(ranges.into_iter())
+        .zip(need_pin_i.iter())
     {
         let Some((off, len)) = range else {
             continue;
@@ -2661,12 +2618,9 @@ fn ensure_spend_abs_layouts(
             .collect();
         confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
         // Structural denserels fill for pin gaps (cold Class A).
-        let loaded = rbitcoin_query::load_creates_once(
-            query.store(),
-            &fks,
-            IdxBodyMode::OutsDenserels,
-        )
-        .map_err(ConsensusError::Store)?;
+        let loaded =
+            rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::OutsDenserels)
+                .map_err(ConsensusError::Store)?;
         let secret = query.store().txs.store_secret();
         for c in loaded {
             let Some(id) = c.fk.get() else {
@@ -2679,15 +2633,12 @@ fn ensure_spend_abs_layouts(
                 dec
             } else {
                 // load_creates_once OutsDenserels should always fill decoded_outs.
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                    &c.raw,
-                    Some(secret),
-                )
-                .map_err(|_| {
-                    ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: ensure denserels decode failed",
-                    ))
-                })?
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
+                    .map_err(|_| {
+                        ConsensusError::Store(StoreError::Corrupt(
+                            "invariant: ensure denserels decode failed",
+                        ))
+                    })?
             };
             // Ensure path: identity from plan RAM only (no sidefile required for layout).
             fill_create_txid_from_ram(&mut tx, id, None);
@@ -2722,15 +2673,7 @@ fn ensure_spend_abs_layouts(
             } else {
                 None
             };
-            batch_parents.insert_owned(
-                c.fk,
-                tx,
-                live,
-                checked,
-                cb,
-                Some(c.body_range),
-                sparse,
-            );
+            batch_parents.insert_owned(c.fk, tx, live, checked, cb, Some(c.body_range), sparse);
         }
     }
 
@@ -2753,10 +2696,7 @@ fn ensure_spend_abs_layouts(
 impl LoadedBatch {
     /// Heights and header hashes in this batch (for events / feed scrub).
     pub fn heights_hashes(&self) -> Vec<(u32, [u8; 32])> {
-        self.prepared
-            .iter()
-            .map(|p| (p.height.0, p.hash))
-            .collect()
+        self.prepared.iter().map(|p| (p.height.0, p.hash)).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -2781,10 +2721,7 @@ impl LoadedBatch {
 impl ScriptOkBatch {
     /// Heights and header hashes in this batch (for events / feed scrub).
     pub fn heights_hashes(&self) -> Vec<(u32, [u8; 32])> {
-        self.prepared
-            .iter()
-            .map(|p| (p.height.0, p.hash))
-            .collect()
+        self.prepared.iter().map(|p| (p.height.0, p.hash)).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -2974,11 +2911,8 @@ mod write_idempotent_tests {
         assert!(o1.batch.is_empty());
 
         // Ordered helper: two batches both ok, returned in input order.
-        let outs = confirm_scripts_feed_ahead([
-            empty_loaded_batch(),
-            empty_loaded_batch(),
-        ])
-        .expect("feed-ahead two");
+        let outs = confirm_scripts_feed_ahead([empty_loaded_batch(), empty_loaded_batch()])
+            .expect("feed-ahead two");
         assert_eq!(outs.len(), 2);
         assert!(outs[0].batch.is_empty());
         assert!(outs[1].batch.is_empty());
@@ -3032,9 +2966,7 @@ mod write_idempotent_tests {
         });
 
         // Enqueue A; stage claims it (channel free). Hold keeps A's phase open.
-        mat_tx
-            .send((empty_loaded_batch(), 0))
-            .expect("send A");
+        mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
         let deadline = Instant::now() + Duration::from_secs(3);
         while scripts_feed_test_sync::submit_count() < 1 {
             assert!(Instant::now() < deadline, "A never submitted to rayon");
@@ -3065,15 +2997,15 @@ mod write_idempotent_tests {
     #[test]
     fn check_bip34_helper_and_expected_bits_no_retarget() {
         use super::{check_bip34, expected_bits_extending};
+        use crate::params::ChainParams;
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version};
         use bitcoin::hashes::Hash;
         use bitcoin::script::ScriptBuf;
         use bitcoin::{
-            Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
-            TxMerkleNode, Witness,
+            Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn,
+            TxMerkleNode, TxOut, Witness,
         };
-        use crate::params::ChainParams;
         use rbitcoin_primitives::Height;
 
         let height = 17u32;
@@ -3197,8 +3129,7 @@ mod write_idempotent_tests {
 
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
-            .unwrap();
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         use bitcoin::hashes::Hash;
         let hash = genesis.block_hash().to_byte_array();
         // No header plan in cache → store fallback in resolve_body_metas
@@ -3236,18 +3167,10 @@ mod write_idempotent_tests {
         std::fs::create_dir_all(&path).unwrap();
         let q = Query::open_or_create(&path).unwrap();
         let params = ChainParams::regtest();
-        let gbits = expected_bits_extending(
-            &q,
-            &params,
-            Height(0),
-            CompactTarget::from_consensus(0),
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            gbits,
-            crate::params::genesis_block(&params).header.bits
-        );
+        let gbits =
+            expected_bits_extending(&q, &params, Height(0), CompactTarget::from_consensus(0), 0)
+                .unwrap();
+        assert_eq!(gbits, crate::params::genesis_block(&params).header.bits);
         // No-pow-retargeting: any height returns prev_bits.
         let prev = CompactTarget::from_consensus(0x207f_ffff);
         let b = expected_bits_extending(&q, &params, Height(2016), prev, 100).unwrap();
@@ -3276,7 +3199,7 @@ mod write_idempotent_tests {
         use bitcoin::hashes::Hash;
         use bitcoin::script::ScriptBuf;
         use bitcoin::{
-            Amount, Block, BlockHash, OutPoint, Sequence, Transaction, TxIn, TxOut, TxMerkleNode,
+            Amount, Block, BlockHash, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
             Witness,
         };
         let cb = Transaction {
@@ -3355,16 +3278,7 @@ mod write_idempotent_tests {
         let mut pre = ScriptPreverified::new();
         pre.insert(tid);
 
-        let job = ScriptCheckJob::with_txid(
-            tid,
-            prevouts,
-            tx,
-            true,
-            true,
-            true,
-            true,
-            true,
-        );
+        let job = ScriptCheckJob::with_txid(tid, prevouts, tx, true, true, true, true, true);
         let prepared = Prepared {
             height: Height(1),
             header_fk: Fk(1),
@@ -3394,9 +3308,7 @@ mod write_idempotent_tests {
     /// External parents land in plan-local map only.
     #[test]
     fn plan_ensure_denserels_then_forbid_skips_cold_io() {
-        use super::{
-            ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode,
-        };
+        use super::{ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode};
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::Query;
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -3464,7 +3376,10 @@ mod write_idempotent_tests {
 
         rbitcoin_query::reset_body_ok_reads();
         let st = ensure_external_parent_denserels_from_plan(&q, Some(&mut plan), None).unwrap();
-        assert!(st.cold >= 1, "parent missing denserels must cold-load: {st:?}");
+        assert!(
+            st.cold >= 1,
+            "parent missing denserels must cold-load: {st:?}"
+        );
         assert!(
             plan.external_parent_outs
                 .get(&pfk.get().unwrap())
@@ -3493,8 +3408,7 @@ mod write_idempotent_tests {
 
         // Pin Forbid hits plan-local (no extra cold).
         let (parents, _thin, _warm) =
-            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid)
-                .unwrap();
+            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid).unwrap();
         assert!(parents.contains(pfk));
         assert_eq!(
             rbitcoin_query::body_ok_reads(),
@@ -3578,7 +3492,7 @@ mod write_idempotent_tests {
             None,
             super::ColdPinMode::Allow,
         )
-            .expect_err("missing parent must hard-fail pin");
+        .expect_err("missing parent must hard-fail pin");
         let msg = format!("{err}");
         assert!(
             msg.contains("invariant") && msg.contains("wire pin"),
@@ -3682,7 +3596,7 @@ mod write_idempotent_tests {
             None,
             super::ColdPinMode::Allow,
         )
-            .expect_err("incomplete outs must hard-fail pin");
+        .expect_err("incomplete outs must hard-fail pin");
         let msg = format!("{err}");
         assert!(
             msg.contains("invariant") && msg.contains("wire pin"),
@@ -3697,7 +3611,7 @@ mod write_idempotent_tests {
     fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         use super::pin_for_wire_batch;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{ArchiveWritePlan, CreatePin, SparseExternalPin, Query};
+        use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query, SparseExternalPin};
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
         use std::sync::{Arc, Once};
 
@@ -3736,8 +3650,11 @@ mod write_idempotent_tests {
             &[parent_out.clone()],
         );
         let sparse_rel = dens.first().copied().unwrap_or(0);
-        let external: SparseExternalPin =
-            Arc::new((parent_tx.clone(), vec![(0, parent_out)], vec![(0, sparse_rel)]));
+        let external: SparseExternalPin = Arc::new((
+            parent_tx.clone(),
+            vec![(0, parent_out)],
+            vec![(0, sparse_rel)],
+        ));
 
         let spend_tx = TxRecord {
             txid: [0x22u8; 32],
@@ -3908,8 +3825,7 @@ mod write_idempotent_tests {
         );
 
         let (parents, _, _) =
-            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid)
-                .unwrap();
+            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid).unwrap();
         assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 3).is_some());
         assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 0).is_none());
 
@@ -4010,11 +3926,8 @@ mod write_idempotent_tests {
         };
         let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
         let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
-        let dens = rbitcoin_store::denserels_from_packed_records(
-            &parent_tx,
-            &parent_ins,
-            &parent_outs,
-        );
+        let dens =
+            rbitcoin_store::denserels_from_packed_records(&parent_tx, &parent_ins, &parent_outs);
         let fks = q
             .store()
             .put_tx_full_batch_indexed(
@@ -4034,7 +3947,10 @@ mod write_idempotent_tests {
             vec![0],
             Some(true),
             None,
-            dens.iter().enumerate().map(|(i, r)| (i as u32, *r)).collect(),
+            dens.iter()
+                .enumerate()
+                .map(|(i, r)| (i as u32, *r))
+                .collect(),
         );
         assert!(bp.has_spender_rels(parent_fk));
         assert!(!bp.has_abs_layout(parent_fk));
@@ -4056,7 +3972,10 @@ mod write_idempotent_tests {
         let _ = confirm_phase_stats::ENSURE_RES_HIT.swap(0, Ordering::Relaxed);
         ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("range-only ensure");
         let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-        assert_eq!(cold, 0, "must not denserels-body cold when pin has denserels");
+        assert_eq!(
+            cold, 0,
+            "must not denserels-body cold when pin has denserels"
+        );
         assert!(bp.has_abs_layout(parent_fk));
         assert_eq!(
             bp.get_spender_abs(parent_fk, 0),
@@ -4205,7 +4124,7 @@ mod write_idempotent_tests {
             vec![(0, out)],
             vec![0],
             Some(false),
-            None, // no body_range
+            None,   // no body_range
             vec![], // no denserels
         );
 
@@ -4234,10 +4153,7 @@ mod write_idempotent_tests {
         );
         let _ = std::fs::remove_dir_all(&path);
     }
-
 }
-
-
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
@@ -4503,12 +4419,8 @@ fn assemble_run(
             }
         }
 
-        let bip16_active = crate::block::bip16_active_from_prev_mtp(
-            params,
-            height.0,
-            &block_hash,
-            prev_mtp,
-        );
+        let bip16_active =
+            crate::block::bip16_active_from_prev_mtp(params, height.0, &block_hash, prev_mtp);
 
         let t_connect = Instant::now();
         let (script_jobs, spends, fees) = assemble_block_prevouts(
@@ -4590,8 +4502,7 @@ fn structural_run(
         tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
     }
     // Window counters (may race with sampler; last-write uses `tot` instead).
-    confirm_phase_stats::STRUCTURAL_NS
-        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_SPENT_NS.fetch_add(tot.spent_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_SPENT_ABS_NS.fetch_add(tot.spent_abs_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_SPENT_STRONG_NS
@@ -4599,8 +4510,7 @@ fn structural_run(
     confirm_phase_stats::STRUCTURAL_SPENT_COLD_NS.fetch_add(tot.spent_cold_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_SPENT_PENDING_NS
         .fetch_add(tot.spent_pending_ns, Ordering::Relaxed);
-    confirm_phase_stats::STRUCTURAL_CREATE_H_NS
-        .fetch_add(tot.create_h_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_CREATE_H_NS.fetch_add(tot.create_h_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_BIP68_NS.fetch_add(tot.bip68_ns, Ordering::Relaxed);
     Ok(tot)
 }
@@ -4680,12 +4590,8 @@ fn post_commit(
     // denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        let mut abs_edges: Vec<(
-            u64,
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-        )> = Vec::new();
+        let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk)> =
+            Vec::new();
         let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::new();
         let mut n_skip = 0u64;
         for p in prepared {
@@ -4723,8 +4629,7 @@ fn post_commit(
             }
             let ann_ns = t_ann.elapsed().as_nanos() as u64;
             confirm_phase_stats::SPEND_ANN_NS.fetch_add(ann_ns, Ordering::Relaxed);
-            confirm_phase_stats::SPEND_ANN_N
-                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+            confirm_phase_stats::SPEND_ANN_N.fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
             let _ = backend;
             confirm_phase_stats::SPEND_ANNOTATE_RANGED
                 .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
@@ -4753,10 +4658,7 @@ fn post_commit(
             .collect();
         let _ = query.unpin_spent_parent_outs(&all_spends);
     }
-    confirm_phase_stats::UNPIN_NS.fetch_add(
-        t_unpin.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
+    confirm_phase_stats::UNPIN_NS.fetch_add(t_unpin.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Prune confirm-parent cache for heights at/below new tip.
     let mut tip_gc_ns = 0u64;

@@ -3,11 +3,11 @@
 //! Run with:
 //!   cargo test -p rbitcoin-net freeze_bench --release -- --nocapture --test-threads=1
 
-use rbitcoin_net::ChainHub;
 use bitcoin::block::{Header, Version};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, CompactTarget, Network};
 use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_net::ChainHub;
 use rbitcoin_query::Query;
 use rbitcoin_store::Store;
 use std::collections::{HashMap, HashSet, VecDeque};

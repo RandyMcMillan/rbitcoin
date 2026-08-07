@@ -92,9 +92,7 @@ impl TxIdx {
             // FdOnly: multi‑GiB idx segments use pread/pwrite (no full MAP_SHARED).
             let file =
                 TableFile::open_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
-            let slot_bytes = file
-                .logical_len()
-                .saturating_sub(FILE_HEADER_LEN as u64);
+            let slot_bytes = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
             if slot_bytes % 4 != 0 {
                 return Err(StoreError::Corrupt("tx.idx segment size"));
             }
@@ -140,12 +138,7 @@ impl TxIdx {
     }
 
     fn segments_snapshot(&self) -> Arc<Vec<Segment>> {
-        Arc::clone(
-            &self
-                .segments
-                .read()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+        Arc::clone(&self.segments.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn soft_span() -> u64 {
@@ -477,9 +470,8 @@ impl TxIdx {
                 if rel_off + 4 > want {
                     continue;
                 }
-                let rel = u32::from_le_bytes(
-                    pages[page_i][rel_off..rel_off + 4].try_into().unwrap(),
-                );
+                let rel =
+                    u32::from_le_bytes(pages[page_i][rel_off..rel_off + 4].try_into().unwrap());
                 if let Ok(a) = decode_abs(seg, rel) {
                     out[oi] = Some(a);
                 }
@@ -508,7 +500,9 @@ impl TxIdx {
             // Ensure tail segment can take starts[i].
             self.ensure_tail_for(base_count + 1 + i as u64, starts[i], soft)?;
             let segs = self.segments_snapshot();
-            let tail = segs.last().ok_or(StoreError::Corrupt("tx.idx no segment"))?;
+            let tail = segs
+                .last()
+                .ok_or(StoreError::Corrupt("tx.idx no segment"))?;
             let body_base = tail.body_base;
             // How many consecutive starts fit in this segment?
             let mut j = i;
@@ -570,7 +564,12 @@ impl TxIdx {
         Ok(())
     }
 
-    fn ensure_tail_for(&self, first_new_fk: u64, abs_start: u64, soft: u64) -> Result<(), StoreError> {
+    fn ensure_tail_for(
+        &self,
+        first_new_fk: u64,
+        abs_start: u64,
+        soft: u64,
+    ) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         if segs.is_empty() {
             return self.roll_segment(first_new_fk, abs_start);
@@ -605,8 +604,7 @@ impl TxIdx {
         let path = segment_path(&self.dir, &self.stem, file_id);
         // Replace if empty leftover.
         let _ = std::fs::remove_file(&path);
-        let file =
-            TableFile::create_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        let file = TableFile::create_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
         debug_assert_eq!(file.access(), TableAccess::FdOnly);
         let seg = Segment {
             first_fk,
@@ -799,13 +797,9 @@ impl BodyRangeIdxPlan {
                 end_rel,
                 end_base,
             } => {
-                let start = decode_slot_abs(
-                    page_bufs[*start_page as usize],
-                    *start_rel,
-                    *start_base,
-                )?;
-                let end =
-                    decode_slot_abs(page_bufs[*end_page as usize], *end_rel, *end_base)?;
+                let start =
+                    decode_slot_abs(page_bufs[*start_page as usize], *start_rel, *start_base)?;
+                let end = decode_slot_abs(page_bufs[*end_page as usize], *end_rel, *end_base)?;
                 if end < start {
                     return Err(StoreError::Corrupt("var record end < start"));
                 }
@@ -874,9 +868,11 @@ fn align_down(off: u64, page: u64) -> u64 {
 #[inline]
 fn decode_abs(seg: &Segment, rel: u32) -> Result<u64, StoreError> {
     seg.body_base
-        .checked_add((rel as u64).checked_mul(IDX_STRIDE).ok_or(
-            StoreError::Corrupt("tx.idx stride overflow"),
-        )?)
+        .checked_add(
+            (rel as u64)
+                .checked_mul(IDX_STRIDE)
+                .ok_or(StoreError::Corrupt("tx.idx stride overflow"))?,
+        )
         .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
@@ -1012,9 +1008,8 @@ fn ensure_idx_layout(dir: &Path, stem: &str) -> Result<(), StoreError> {
         return Ok(());
     }
     // Read flat meta before rename so we know which segment files to move.
-    let descs = read_meta_buf(
-        &std::fs::read(&flat_meta).map_err(|e| StoreError::io(&flat_meta, e))?,
-    )?;
+    let descs =
+        read_meta_buf(&std::fs::read(&flat_meta).map_err(|e| StoreError::io(&flat_meta, e))?)?;
     let mut moved = 0u32;
     for d in &descs {
         let src = flat_segment_path(dir, stem, d.file_id);

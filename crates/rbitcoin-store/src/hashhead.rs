@@ -119,9 +119,7 @@ impl HeadScale {
             Some("tiny") | Some("test") | Some("small") => HeadScale::Tiny,
             Some("mainnet") | Some("full") | Some("large") => HeadScale::Mainnet,
             Some(other) => {
-                rbitcoin_log::warn!(
-                    "store: unknown RBITCOIN_HEAD_SCALE={other:?}, using mainnet"
-                );
+                rbitcoin_log::warn!("store: unknown RBITCOIN_HEAD_SCALE={other:?}, using mainnet");
                 HeadScale::Mainnet
             }
             None => {
@@ -186,8 +184,7 @@ impl MultiList {
         let path = Self::path_for(head_path);
         // ArrayLink kind is shared with Class C; multi-list is
         // linear append like idx — always FdOnly.
-        let file =
-            TableFile::create_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        let file = TableFile::create_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
         Ok(Self {
             file,
             count: Mutex::new(0),
@@ -199,8 +196,7 @@ impl MultiList {
         if !path.exists() {
             return Self::create(head_path);
         }
-        let file =
-            TableFile::open_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        let file = TableFile::open_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % MULTI_REC_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("hash head multi-list size"));
@@ -329,10 +325,7 @@ impl HashHead {
         Ok(Self {
             file,
             multi,
-            state: Mutex::new(HashState {
-                slots,
-                occupied: 0,
-            }),
+            state: Mutex::new(HashState { slots, occupied: 0 }),
         })
     }
 
@@ -360,7 +353,9 @@ impl HashHead {
                 let base = i * SLOT_SIZE;
                 let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
+                        .try_into()
+                        .unwrap(),
                 );
                 if !is_empty_slot(&k, packed) {
                     occupied += 1;
@@ -471,7 +466,6 @@ impl HashHead {
         Ok(all.first().copied())
     }
 
-
     /// Single-key insert (convenience; batch path is [`Self::insert_many`]).
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
         debug_assert!(!fk.is_null());
@@ -527,7 +521,8 @@ impl HashHead {
             let slots = self.state.lock().unwrap().slots;
             // Re-sort remaining if a rehash changed the slot map.
             if i > 0 {
-                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots));
+                work[i..]
+                    .sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots));
             }
             let mut cache = SlotPageCache::new(self, slots);
             let mut need_rehash = false;
@@ -591,7 +586,9 @@ impl HashHead {
                 let off = (slot as usize) * SLOT_SIZE;
                 let slot_key: HeadKey = table[off..off + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE].try_into().unwrap(),
+                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
+                        .try_into()
+                        .unwrap(),
                 );
                 if is_empty_slot(&slot_key, packed) {
                     table[off..off + HEAD_KEY_LEN].copy_from_slice(&key);
@@ -607,7 +604,11 @@ impl HashHead {
                     table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
                         .copy_from_slice(&new_packed.to_le_bytes());
                     let (_, old_head) = unpack_value(packed);
-                    on_prev(if old_head.is_null() { None } else { Some(old_head) });
+                    on_prev(if old_head.is_null() {
+                        None
+                    } else {
+                        Some(old_head)
+                    });
                     placed = true;
                     break;
                 }
@@ -619,8 +620,7 @@ impl HashHead {
             }
         }
 
-        self.file
-            .write_at(FILE_HEADER_LEN as u64, &table)?;
+        self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
         self.state.lock().unwrap().occupied = occupied;
         Ok(())
     }
@@ -637,7 +637,13 @@ impl HashHead {
     }
 
     /// Note one completed rehash; TRACE always, WARN only if large/slow, DEBUG rollup.
-    fn note_rehash(path: &std::path::Path, old_slots: u64, new_slots: u64, occupied: u64, elapsed: Duration) {
+    fn note_rehash(
+        path: &std::path::Path,
+        old_slots: u64,
+        new_slots: u64,
+        occupied: u64,
+        elapsed: Duration,
+    ) {
         let new_bytes = SLOT_SIZE as u64 * new_slots;
         let ms = elapsed.as_millis();
         rbitcoin_log::trace!(
@@ -728,7 +734,9 @@ impl HashHead {
                 let base = i * SLOT_SIZE;
                 let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
+                        .try_into()
+                        .unwrap(),
                 );
                 if !is_empty_slot(&k, packed) {
                     entries.push((k, packed));
@@ -774,9 +782,6 @@ impl HashHead {
         Ok(())
     }
 
-
-
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.multi.flush()?;
         self.file.flush()
@@ -812,11 +817,7 @@ impl<'a> SlotPageCache<'a> {
     }
 
     /// Insert / merge `fk` under the 16-byte prefix of `full`.
-    fn try_insert_merge(
-        &mut self,
-        full: &[u8; 32],
-        fk: Fk,
-    ) -> Result<InsertResult, StoreError> {
+    fn try_insert_merge(&mut self, full: &[u8; 32], fk: Fk) -> Result<InsertResult, StoreError> {
         let key = head_key_prefix(full);
         let mut slot = HashHead::hash_slot(&key, self.slots);
         for _ in 0..self.slots {
@@ -847,11 +848,7 @@ impl<'a> SlotPageCache<'a> {
     }
 
     /// Place a pre-packed slot value during rehash (no multi merge).
-    fn try_place_raw(
-        &mut self,
-        key: &HeadKey,
-        packed: u64,
-    ) -> Result<InsertResult, StoreError> {
+    fn try_place_raw(&mut self, key: &HeadKey, packed: u64) -> Result<InsertResult, StoreError> {
         let mut slot = HashHead::hash_slot(key, self.slots);
         for _ in 0..self.slots {
             let (k, old) = self.read_slot(slot)?;
@@ -933,7 +930,6 @@ impl<'a> SlotPageCache<'a> {
         Ok(())
     }
 }
-
 
 fn is_empty_slot(k: &HeadKey, packed: u64) -> bool {
     packed == 0 && *k == [0u8; HEAD_KEY_LEN]
@@ -1131,7 +1127,6 @@ mod tests {
         assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
     }
 
-
     #[test]
     fn open_does_not_require_full_ram_copy() {
         let path = tmp_path();
@@ -1143,9 +1138,6 @@ mod tests {
         assert_eq!(h.get(&[1u8; 32]).unwrap(), Some(Fk(42)));
         cleanup_hh(&path);
     }
-
-
-
 
     #[test]
     fn slot_sorted_batch_matches_sequential_inserts() {
@@ -1254,15 +1246,12 @@ mod tests {
     fn head_scale_prefix_and_pack_helpers() {
         // Under unit tests default scale is Tiny.
         assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Header), DEFAULT_SLOTS);
         assert_eq!(
-            HeadScale::Mainnet.initial_slots(HeadRole::Header),
-            1 << 20
+            HeadScale::Tiny.initial_slots(HeadRole::Header),
+            DEFAULT_SLOTS
         );
-        assert_eq!(
-            HeadScale::Mainnet.initial_slots(HeadRole::Tx),
-            1 << 22
-        );
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 20);
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Tx), 1 << 22);
         assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
         let full = [0xABu8; 32];
         let p = head_key_prefix(&full);

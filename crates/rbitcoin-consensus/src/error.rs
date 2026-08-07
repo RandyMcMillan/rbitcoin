@@ -60,9 +60,15 @@ mod tests {
             (ConsensusError::BadHeader("bits"), "bad header: bits"),
             (ConsensusError::BadBlock("empty"), "bad block: empty"),
             (ConsensusError::BadTx("fee"), "bad transaction: fee"),
-            (ConsensusError::Script("sig".into()), "script verification failed: sig"),
+            (
+                ConsensusError::Script("sig".into()),
+                "script verification failed: sig",
+            ),
             (ConsensusError::MissingPrevout, "missing prevout"),
-            (ConsensusError::PrevoutSpent, "prevout already spent on best chain"),
+            (
+                ConsensusError::PrevoutSpent,
+                "prevout already spent on best chain",
+            ),
             (ConsensusError::InvalidPow, "pow invalid"),
             (ConsensusError::BadPrev, "unexpected previous header"),
         ];

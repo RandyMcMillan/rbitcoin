@@ -296,7 +296,10 @@ impl TxGraph {
                     Some(e) => e,
                     None => continue,
                 };
-                let ready = e.parents.iter().all(|p| !members.contains(p) || done.contains(p));
+                let ready = e
+                    .parents
+                    .iter()
+                    .all(|p| !members.contains(p) || done.contains(p));
                 if !ready {
                     continue;
                 }
@@ -306,7 +309,8 @@ impl TxGraph {
                 let better = match &best {
                     None => true,
                     Some((br, bf, bt)) => {
-                        rate > *br || (rate == *br && (e.fee_sat > *bf || (e.fee_sat == *bf && t < bt)))
+                        rate > *br
+                            || (rate == *br && (e.fee_sat > *bf || (e.fee_sat == *bf && t < bt)))
                     }
                 };
                 if better {

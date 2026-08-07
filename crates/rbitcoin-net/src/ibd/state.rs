@@ -223,10 +223,12 @@ impl IbdWorkState {
             self.known_headers
                 .retain(|h| live.contains(h) || inflight.contains_key(h));
             // Drop height/fk for headers we just pruned from known.
-            self.header_fks
-                .retain(|h, _| live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h));
-            self.hash_height
-                .retain(|h, _| live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h));
+            self.header_fks.retain(|h, _| {
+                live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
+            });
+            self.hash_height.retain(|h, _| {
+                live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
+            });
         }
         // Bound body presence cache to live work (rejected
         // never hygiene-pruned — see BodyPresence::hygiene_retain).
@@ -292,9 +294,13 @@ mod tests {
             st.hygiene();
         }
         // Live set only even hashes; compact should drop ghosts when bloated.
-        assert!(st.ordered.len() <= st.ordered_set.len().saturating_add(64).max(128)
-            || st.ordered.iter().all(|x| st.ordered_set.contains(x)
-                || !st.ordered_set.contains(x)));
+        assert!(
+            st.ordered.len() <= st.ordered_set.len().saturating_add(64).max(128)
+                || st
+                    .ordered
+                    .iter()
+                    .all(|x| st.ordered_set.contains(x) || !st.ordered_set.contains(x))
+        );
         let sizes = st.structure_sizes();
         assert_eq!(sizes.ordered, st.ordered.len());
         assert_eq!(sizes.ordered_set, st.ordered_set.len());

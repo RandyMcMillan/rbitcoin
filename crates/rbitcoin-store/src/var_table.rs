@@ -150,10 +150,7 @@ impl VarTable {
     /// Output order matches `fks`. Null / OOB ids yield `None` (not an error).
     /// Contiguous id runs use page-aligned sequential loads; sparse ids use
     /// OS-page-coalesced bulk pread (`record_starts_batch_bulk`).
-    pub fn record_range_batch(
-        &self,
-        fks: &[Fk],
-    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+    pub fn record_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         if fks.is_empty() {
             return Ok(Vec::new());
         }
@@ -185,10 +182,9 @@ impl VarTable {
         start_ids.sort_unstable();
         start_ids.dedup();
 
-        let starts = self.idx.record_starts_batch_bulk(
-            &start_ids,
-            crate::io_backend::pin_io_backend(),
-        )?;
+        let starts = self
+            .idx
+            .record_starts_batch_bulk(&start_ids, crate::io_backend::pin_io_backend())?;
         let mut start_map: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::with_capacity(start_ids.len());
         for (id, s) in start_ids.iter().zip(starts.iter()) {
@@ -297,7 +293,8 @@ impl VarTable {
             return self.body.write_at_pwrite(start, body_blob);
         }
         // Bytes on disk; advance HWM / dirty like write_at_pwrite.
-        self.body.set_logical_len(end.max(self.body.logical_len()))?;
+        self.body
+            .set_logical_len(end.max(self.body.logical_len()))?;
         Ok(())
     }
 
@@ -651,10 +648,7 @@ mod tests {
                 continue;
             }
             let start = t.record_start(c, c).unwrap();
-            assert!(
-                end >= start + 64,
-                "end={end} start={start} c={c}"
-            );
+            assert!(end >= start + 64, "end={end} start={start} c={c}");
             // 64-byte aligned records: last length is exactly 64 until next pad.
             assert_eq!(
                 end - start,
@@ -881,18 +875,9 @@ mod tests {
             t.record_range(Fk::NULL),
             Err(StoreError::InvalidFk)
         ));
-        assert!(matches!(
-            t.record_range(Fk(99)),
-            Err(StoreError::NotFound)
-        ));
-        assert!(matches!(
-            t.record_ranges(0, 1),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            t.record_ranges(1, 99),
-            Err(StoreError::NotFound)
-        ));
+        assert!(matches!(t.record_range(Fk(99)), Err(StoreError::NotFound)));
+        assert!(matches!(t.record_ranges(0, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.record_ranges(1, 99), Err(StoreError::NotFound)));
         assert!(matches!(t.get_raw(Fk::NULL), Err(StoreError::InvalidFk)));
         t.flush().unwrap();
         t.flush_async().unwrap();

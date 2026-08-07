@@ -5,19 +5,19 @@ use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction, Work};
-use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_lookup_stamp,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
     confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
-    confirm_write_phase, genesis_block, header_to_record, ChainParams, Milestone, PlanStampOutcome,
-    ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
+    confirm_wire_lookup_stamp, confirm_write_phase, genesis_block, header_to_record, ChainParams,
+    Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 use tokio::sync::{broadcast, Notify};
 
 /// Emitted when the best-chain tip advances (extension or reorg).
@@ -331,14 +331,9 @@ impl ChainHub {
         let Some(contig) = self.confirm_wire_contig_arc(blocks, pipeline) else {
             return Ok(None);
         };
-        let out = confirm_wire_lookup_stamp(
-            &self.query,
-            &self.params,
-            self.milestone,
-            &contig,
-            pipeline,
-        )
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
+        let out =
+            confirm_wire_lookup_stamp(&self.query, &self.params, self.milestone, &contig, pipeline)
+                .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(out))
     }
 
@@ -458,10 +453,7 @@ impl ChainHub {
     }
 
     /// Confirm a contiguous tip-extension run (sync script + write).
-    pub fn confirm_run(
-        &self,
-        blocks: &[(u32, BlockHash)],
-    ) -> Result<Vec<AcceptOutcome>, NetError> {
+    pub fn confirm_run(&self, blocks: &[(u32, BlockHash)]) -> Result<Vec<AcceptOutcome>, NetError> {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
@@ -505,8 +497,7 @@ impl ChainHub {
     fn note_confirmed_tip(&self, need_meta: &[(u32, BlockHash)]) -> Result<(), NetError> {
         if let Some(mp) = self.mempool() {
             for &(_height, hash) in need_meta {
-                if let Ok(Some(block)) =
-                    self.query.reconstruct_block_by_hash(&hash.to_byte_array())
+                if let Ok(Some(block)) = self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                 {
                     let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
                     let n = mp.remove_for_block(&ids);
@@ -580,16 +571,16 @@ impl ChainHub {
                     if block.header.work() > cur.header.work() {
                         self.disconnect_to(parent_h.0)?;
                         self.connect_at(new_height, block)?;
-                        return Ok(AcceptOutcome::Accepted {
-                            height: new_height,
-                        });
+                        return Ok(AcceptOutcome::Accepted { height: new_height });
                     }
                     return Ok(AcceptOutcome::IgnoredWeaker);
                 }
 
                 // Extends an ancestor — single block cannot beat a longer chain alone.
                 // Caller should use accept_branch with the full better path.
-                Err(NetError::Protocol("side block; use accept_branch for reorg"))
+                Err(NetError::Protocol(
+                    "side block; use accept_branch for reorg",
+                ))
             }
         }
     }
@@ -1048,10 +1039,7 @@ mod tests {
         let h2 = b2.block_hash();
 
         // Batch 1 at store tip+1 (path_lo=1).
-        let batch1 = [(
-            rbitcoin_primitives::Height(1),
-            b1.clone(),
-        )];
+        let batch1 = [(rbitcoin_primitives::Height(1), b1.clone())];
         let mut pipe = WireLoadPipeline {
             path_lo: 1,
             parent_hash: None,
@@ -1065,7 +1053,11 @@ mod tests {
             .expect("prep1 some");
         assert_eq!(mat1.batch.len(), 1);
         assert!(mat1.batch.archive_plan.is_some());
-        assert_eq!(hub.tip_height(), Some(0), "tip must not advance on load alone");
+        assert_eq!(
+            hub.tip_height(),
+            Some(0),
+            "tip must not advance on load alone"
+        );
 
         // Update pipeline caches from plan (lookup-thread note_lookup_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
@@ -1280,8 +1272,7 @@ mod tests {
             let target = Target::from_compact(side.header.bits);
             for nonce in 0..u32::MAX {
                 side.header.nonce = nonce;
-                if side.header.validate_pow(target).is_ok()
-                    && side.block_hash() != b1.block_hash()
+                if side.header.validate_pow(target).is_ok() && side.block_hash() != b1.block_hash()
                 {
                     break;
                 }

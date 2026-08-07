@@ -226,8 +226,7 @@ impl Mempool {
             let off = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
             new_slots[off] = SLOT_LIVE;
             new_slots[off + 4..off + 12].copy_from_slice(&body_off.to_le_bytes());
-            new_slots[off + 12..off + 16]
-                .copy_from_slice(&(payload_len as u32).to_le_bytes());
+            new_slots[off + 12..off + 16].copy_from_slice(&(payload_len as u32).to_le_bytes());
             new_slots[off + 16..off + 48].copy_from_slice(tx.compute_txid().as_byte_array());
             next_slot += 1;
         }
@@ -252,8 +251,7 @@ impl Mempool {
             if self.slots[off] != SLOT_LIVE {
                 continue;
             }
-            let body_off =
-                u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
             let body_len =
                 u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
             if body_off as usize + body_len > logical || body_len < BODY_TX_PREFIX {
@@ -261,8 +259,7 @@ impl Mempool {
             }
             let start = body_off as usize;
             let fee_sat = u64::from_le_bytes(self.body[start..start + 8].try_into().unwrap());
-            let weight =
-                u64::from_le_bytes(self.body[start + 8..start + 16].try_into().unwrap());
+            let weight = u64::from_le_bytes(self.body[start + 8..start + 16].try_into().unwrap());
             let raw = &self.body[start + BODY_TX_PREFIX..start + body_len];
             let tx: Transaction =
                 deserialize(raw).map_err(|_| MempoolError::Corrupt("tx deserialize"))?;
@@ -395,7 +392,8 @@ fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32), MempoolError>
             .map_err(|e| MempoolError::io(path, e))?;
         let mut buf = [0u8; META_LEN];
         write_meta_bytes(&mut buf, 0, DEFAULT_SLOT_CAP, 0);
-        file.write_all(&buf).map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(&buf)
+            .map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, 0, DEFAULT_SLOT_CAP, 0))
     }
@@ -418,7 +416,10 @@ fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>), Mem
             .write(true)
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        let len = file.metadata().map_err(|e| MempoolError::io(path, e))?.len() as usize;
+        let len = file
+            .metadata()
+            .map_err(|e| MempoolError::io(path, e))?
+            .len() as usize;
         if len < need {
             return Err(MempoolError::Corrupt("slots file short"));
         }
@@ -440,7 +441,8 @@ fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>), Mem
         buf[0..4].copy_from_slice(&MEM_MAGIC);
         buf[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
         buf[8..12].copy_from_slice(&slot_cap.to_le_bytes());
-        file.write_all(&buf).map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(&buf)
+            .map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, buf))
     }
@@ -454,7 +456,10 @@ fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
             .write(true)
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        let len = file.metadata().map_err(|e| MempoolError::io(path, e))?.len() as usize;
+        let len = file
+            .metadata()
+            .map_err(|e| MempoolError::io(path, e))?
+            .len() as usize;
         if len < BODY_HEADER {
             return Err(MempoolError::Corrupt("body too short"));
         }

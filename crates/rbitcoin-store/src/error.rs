@@ -10,7 +10,10 @@ pub enum StoreError {
     },
     BadMagic,
     BadSchema(u16),
-    BadKind { expected: u16, got: u16 },
+    BadKind {
+        expected: u16,
+        got: u16,
+    },
     NotFound,
     InvalidFk,
     NotDirectory(PathBuf),
@@ -40,10 +43,7 @@ impl fmt::Display for StoreError {
             StoreError::BadMagic => f.write_str("invalid store magic"),
             StoreError::BadSchema(v) => write!(f, "unsupported schema version {v}"),
             StoreError::BadKind { expected, got } => {
-                write!(
-                    f,
-                    "unexpected table kind (expected {expected}, got {got})"
-                )
+                write!(f, "unexpected table kind (expected {expected}, got {got})")
             }
             StoreError::NotFound => f.write_str("record not found"),
             StoreError::InvalidFk => f.write_str("invalid foreign key"),

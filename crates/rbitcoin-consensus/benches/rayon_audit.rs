@@ -19,13 +19,11 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use rayon::prelude::*;
 use rbitcoin_consensus::script_bench::{self, JobBytes};
 use rbitcoin_consensus::{block_to_apply, genesis_block, ChainParams};
 use rbitcoin_query::Query;
-use rayon::prelude::*;
 
 fn timed(name: &str, iters: u32, mut f: impl FnMut()) -> Duration {
     // Warmup
@@ -121,7 +119,12 @@ fn p2wpkh_job(seed: u32) -> JobBytes {
     };
     let mut cache = SighashCache::new(&tx);
     let sighash = cache
-        .p2wpkh_signature_hash(0, &prevout.script_pubkey, prevout.value, EcdsaSighashType::All)
+        .p2wpkh_signature_hash(
+            0,
+            &prevout.script_pubkey,
+            prevout.value,
+            EcdsaSighashType::All,
+        )
         .unwrap();
     let msg = Message::from_digest(sighash.to_byte_array());
     let sig = secp.sign_ecdsa(&msg, &sk);
@@ -285,7 +288,10 @@ fn audit_wire_rebuild(workers: usize) {
     let mut items = Vec::with_capacity(N);
     // Include genesis as first reconstruct target.
     {
-        let (hfk, rec) = q.get_header_by_hash(&prev.to_byte_array()).unwrap().unwrap();
+        let (hfk, rec) = q
+            .get_header_by_hash(&prev.to_byte_array())
+            .unwrap()
+            .unwrap();
         let tx_fks = q.store().header_txs.get_list(hfk).unwrap().unwrap();
         items.push((rec, tx_fks));
     }
@@ -296,11 +302,17 @@ fn audit_wire_rebuild(workers: usize) {
         let (rec, txs) = block_to_apply(&q, &b.header, &b.txdata).unwrap();
         q.archive_block(&rec, &txs).unwrap();
         prev = b.header.block_hash();
-        let (hfk, rec2) = q.get_header_by_hash(&prev.to_byte_array()).unwrap().unwrap();
+        let (hfk, rec2) = q
+            .get_header_by_hash(&prev.to_byte_array())
+            .unwrap()
+            .unwrap();
         let tx_fks = q.store().header_txs.get_list(hfk).unwrap().unwrap();
         items.push((rec2, tx_fks));
     }
-    println!("archived {N} blocks × ~{} txs each for reconstruct\n", 1 + EXTRA_TX);
+    println!(
+        "archived {N} blocks × ~{} txs each for reconstruct\n",
+        1 + EXTRA_TX
+    );
 
     for (label, n, iters) in [
         ("1 block", 1usize, 40u32),
@@ -345,9 +357,7 @@ fn audit_wire_rebuild(workers: usize) {
             } else {
                 "NO — overhead ≥ gain"
             };
-            println!(
-                "  → speedup={su:.2}× ({eff:.0}% of ideal {workers}-way)  {material}"
-            );
+            println!("  → speedup={su:.2}× ({eff:.0}% of ideal {workers}-way)  {material}");
         }
     }
 

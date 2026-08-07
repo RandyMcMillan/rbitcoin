@@ -30,10 +30,7 @@ pub(crate) fn remove_from_ordered(
 /// Rebuild `ordered` to match `ordered_set` (drop middle ghosts).
 ///
 /// Cheap no-op when the deque is not much larger than the live set.
-pub(crate) fn compact_ordered(
-    ordered: &mut VecDeque<BlockHash>,
-    ordered_set: &HashSet<BlockHash>,
-) {
+pub(crate) fn compact_ordered(ordered: &mut VecDeque<BlockHash>, ordered_set: &HashSet<BlockHash>) {
     let len = ordered.len();
     if len <= 64 {
         return;
@@ -102,7 +99,6 @@ mod tests {
         assert_eq!(far_slots_per_peer(16, true), 2);
         assert_eq!(far_slots_per_peer(16, false), 8);
         assert_eq!(far_slots_per_peer(8, false), 4);
-
 
         // Sparse: 4k claim-ready of 120k live → no bypass
         assert!(!want_headers_beyond_soft_cap(120_000, 4_000, 100, 2048));

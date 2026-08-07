@@ -47,10 +47,7 @@ mod tests {
 
     #[test]
     fn display_and_source_all_variants() {
-        let io_err = MempoolError::io(
-            "/tmp/mp",
-            io::Error::new(io::ErrorKind::NotFound, "nope"),
-        );
+        let io_err = MempoolError::io("/tmp/mp", io::Error::new(io::ErrorKind::NotFound, "nope"));
         assert!(format!("{io_err}").contains("io /tmp/mp"));
         assert!(io_err.source().is_some());
 

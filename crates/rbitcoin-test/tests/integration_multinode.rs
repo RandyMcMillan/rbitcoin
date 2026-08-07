@@ -72,10 +72,7 @@ async fn two_node_header_and_block_sync() {
 
     // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
     assert_eq!(peer.query.tip_height(), Some(Height(8)));
-    assert_eq!(
-        peer.hub.tip_hash().unwrap(),
-        seed.hub.tip_hash().unwrap()
-    );
+    assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
 
     seed.shutdown().await;
     peer.shutdown().await;
@@ -189,10 +186,7 @@ async fn ibd_two_peers() {
 
     let client = start_node(&peer_dir).await;
     let n = client
-        .sync(
-            &[seed.local_addr, mid.local_addr],
-            IbdConfig::for_test(),
-        )
+        .sync(&[seed.local_addr, mid.local_addr], IbdConfig::for_test())
         .await
         .expect("ibd");
     assert!(n >= 40, "accepted {n}");
@@ -201,10 +195,7 @@ async fn ibd_two_peers() {
         .await
         .expect("tip");
     assert_eq!(client.query.tip_height(), Some(Height(48)));
-    assert_eq!(
-        client.hub.tip_hash().unwrap(),
-        seed.hub.tip_hash().unwrap()
-    );
+    assert_eq!(client.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
 
     seed.shutdown().await;
     mid.shutdown().await;
@@ -228,9 +219,7 @@ async fn ibd_skips_dead_peer() {
         .await
         .expect("ibd with bad+good");
     assert!(n >= 4, "downloaded {n}");
-    peer.wait_height(4, Duration::from_secs(5))
-        .await
-        .unwrap();
+    peer.wait_height(4, Duration::from_secs(5)).await.unwrap();
 
     seed.shutdown().await;
     peer.shutdown().await;

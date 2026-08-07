@@ -178,17 +178,11 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         // truncated multi-byte uleb128
-        assert!(matches!(
-            read_uleb128(&[0x80]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(read_uleb128(&[0x80]), Err(StoreError::Corrupt(_))));
         // overflow: more than 10 continuation groups
         let mut over = vec![0x80u8; 10];
         over.push(0x01);
-        assert!(matches!(
-            read_uleb128(&over),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(read_uleb128(&over), Err(StoreError::Corrupt(_))));
         // happy truncated-size boundaries still parse when full
         let (v, n) = read_compact_size(&[253, 0, 1]).unwrap();
         assert_eq!((v, n), (256, 3));

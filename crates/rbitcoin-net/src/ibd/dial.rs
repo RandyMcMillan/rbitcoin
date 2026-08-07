@@ -29,7 +29,9 @@ pub(crate) enum DialFailKind {
 fn classify_dial_err(e: &NetError) -> DialFailKind {
     match e {
         NetError::V1Peer | NetError::Bip324(_) => DialFailKind::Incompatible,
-        NetError::Protocol(s) if s.contains("v2") || s.contains("verack") || s.contains("version") => {
+        NetError::Protocol(s)
+            if s.contains("v2") || s.contains("verack") || s.contains("version") =>
+        {
             DialFailKind::Incompatible
         }
         _ => DialFailKind::Network,
@@ -264,9 +266,7 @@ pub(crate) fn disconnect_stalled_block_peers(
     let stalled_peers: Vec<(usize, usize, SocketAddr)> = slots
         .iter()
         .filter(|s| s.alive && !s.in_flight.is_empty())
-        .filter(|s| {
-            now_ms.saturating_sub(s.block_progress_ms.load(Ordering::Relaxed)) > stall_ms
-        })
+        .filter(|s| now_ms.saturating_sub(s.block_progress_ms.load(Ordering::Relaxed)) > stall_ms)
         .map(|s| (s.id, s.in_flight.len(), s.addr))
         .collect();
     for (id, n_work, addr) in stalled_peers {
@@ -339,10 +339,7 @@ mod tests {
             classify_dial_err(&NetError::Protocol("version too old")),
             DialFailKind::Incompatible
         );
-        assert_eq!(
-            classify_dial_err(&NetError::Timeout),
-            DialFailKind::Network
-        );
+        assert_eq!(classify_dial_err(&NetError::Timeout), DialFailKind::Network);
         assert_eq!(
             classify_dial_err(&NetError::Disconnected),
             DialFailKind::Network

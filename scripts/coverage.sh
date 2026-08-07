@@ -80,14 +80,29 @@ PY
     echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%)"
   fi
   # `coverage/` is gitignored — need --no-ignore or rg finds nothing (false 0).
-  UNCOV="$(rg --no-ignore -c 'uncovered-line' "$ROOT/coverage" --glob '*.html' 2>/dev/null || true)"
-  UNCOV_TOTAL=0
-  if [[ -n "$UNCOV" ]]; then
-    UNCOV_TOTAL="$(echo "$UNCOV" | awk -F: '{s+=$2} END {print s+0}')"
-  fi
+  # llvm-cov HTML uses class='uncovered-line' (single quotes) with count 0.
   HTML_PRESENT=0
-  if find "$ROOT/coverage" -name '*.html' 2>/dev/null | head -1 | grep -q .; then
+  if compgen -G "$ROOT/coverage/**/*.html" > /dev/null \
+    || compgen -G "$ROOT/coverage/*.html" > /dev/null \
+    || find "$ROOT/coverage" -name '*.html' -print -quit | grep -q .; then
     HTML_PRESENT=1
+  fi
+  # Count only real uncovered source rows (td class uncovered-line), not legend JS.
+  UNCOV_TOTAL=0
+  if [[ "$HTML_PRESENT" -eq 1 ]]; then
+    UNCOV_TOTAL="$(
+      python3 - <<'PY'
+from pathlib import Path
+import re
+root = Path("coverage")
+n = 0
+for p in root.rglob("*.html"):
+    t = p.read_text(errors="replace")
+    # Match both quote styles; only count cells that report zero hits.
+    n += len(re.findall(r"class=['\"]uncovered-line['\"]", t))
+print(n)
+PY
+    )"
   fi
   # Prefer HTML uncovered-line (COVERAGE.md) when report exists; LCOV is backup
   # when HTML is missing (some llvm-cov versions). LCOV also counts region-
@@ -97,7 +112,6 @@ PY
     echo "HTML uncovered-line markers: ${UNCOV_TOTAL}"
     if [[ "$UNCOV_TOTAL" -ne 0 ]]; then
       echo "FAIL: $UNCOV_TOTAL uncovered executable line(s) in HTML report (need 0)" >&2
-      echo "$UNCOV" | head -40 >&2
       cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
       exit 1
     fi

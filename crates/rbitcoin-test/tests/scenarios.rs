@@ -85,7 +85,10 @@ fn node_cli_and_surface_smoke() {
     assert!(ring.is_empty());
     assert!(!Milestone::NONE.skips_scripts_at(0));
     assert!(Milestone { height: 10 }.skips_scripts_at(5));
-    assert_eq!(outbound_for_ibd(true), rbitcoin_net::DEFAULT_IBD_TARGET_PEERS);
+    assert_eq!(
+        outbound_for_ibd(true),
+        rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
+    );
     assert_eq!(outbound_for_ibd(true), 16);
     assert_eq!(outbound_for_ibd(false), 8);
     assert_eq!(
@@ -138,13 +141,13 @@ fn node_cli_and_surface_smoke() {
     for net in ["mainnet", "testnet", "signet", "regtest"] {
         let d = td.path().join(net);
         assert!(exit_success(node_cli_main([
-                "rbitcoin-node",
-                "--datadir",
-                d.to_str().unwrap(),
-                "--network",
-                net,
-                "--smoke",
-            ])));
+            "rbitcoin-node",
+            "--datadir",
+            d.to_str().unwrap(),
+            "--network",
+            net,
+            "--smoke",
+        ])));
     }
     let _ = node_cli_main(["rbitcoin-node", "--help"]);
     let _ = node_cli_main(["rbitcoin-node", "--version"]);
@@ -152,71 +155,136 @@ fn node_cli_and_surface_smoke() {
     let _ = cli_cli_main(["rbitcoin-cli", "--version"]);
     assert!(exit_success(cli_cli_main(["rbitcoin-cli", "help"])));
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli"])));
-    assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "getblockchaininfo"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--not-a-real-option"])));
+    assert!(!exit_success(cli_cli_main([
+        "rbitcoin-cli",
+        "getblockchaininfo"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--not-a-real-option"
+    ])));
     assert!(!exit_success(node_cli_main(["rbitcoin-node", "--datadir"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--network", "nope"])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--network",
+        "nope"
+    ])));
     assert!(!exit_success(node_cli_main(["rbitcoin-node", "--listen"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--listen", "not-an-addr"])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--listen",
+        "not-an-addr"
+    ])));
     assert!(!exit_success(node_cli_main(["rbitcoin-node", "--connect"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--connect", "bad"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--milestone", "x"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound", "0"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound", "nope"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb", "0"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb", "x"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-run-secs"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-run-secs", "x"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--log-level"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--log-level", "loud"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--electrum-listen"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--electrum-listen", "bad"])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--milestone"])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--connect",
+        "bad"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--milestone",
+        "x"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--max-outbound",
+        "0"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--max-outbound"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--max-outbound",
+        "nope"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--mempool-size-mb"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--mempool-size-mb",
+        "0"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--mempool-size-mb",
+        "x"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--max-run-secs"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--max-run-secs",
+        "x"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--log-level"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--log-level",
+        "loud"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--electrum-listen"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--electrum-listen",
+        "bad"
+    ])));
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--milestone"
+    ])));
     // Happy-path flag combinations (smoke exits after open).
     let flags_ok = td.path().join("flags-ok");
     assert!(exit_success(node_cli_main([
-            "rbitcoin-node",
-            "--datadir",
-            flags_ok.to_str().unwrap(),
-            "--network",
-            "regtest",
-            "--no-seeds",
-            "--milestone",
-            "0",
-            "--max-outbound",
-            "2",
-            "--mempool-size-mb",
-            "32",
-            "--max-run-secs",
-            "1",
-            "--log-level",
-            "warn",
-            "--listen",
-            "127.0.0.1:0",
-            "--connect",
-            "127.0.0.1:1",
-            "--electrum-listen",
-            "127.0.0.1:0",
-            "--inhibit-suspend",
-            "--smoke",
-        ])));
+        "rbitcoin-node",
+        "--datadir",
+        flags_ok.to_str().unwrap(),
+        "--network",
+        "regtest",
+        "--no-seeds",
+        "--milestone",
+        "0",
+        "--max-outbound",
+        "2",
+        "--mempool-size-mb",
+        "32",
+        "--max-run-secs",
+        "1",
+        "--log-level",
+        "warn",
+        "--listen",
+        "127.0.0.1:0",
+        "--connect",
+        "127.0.0.1:1",
+        "--electrum-listen",
+        "127.0.0.1:0",
+        "--inhibit-suspend",
+        "--smoke",
+    ])));
     let flags_off = td.path().join("flags-log-off");
     assert!(exit_success(node_cli_main([
-            "rbitcoin-node",
-            "--datadir",
-            flags_off.to_str().unwrap(),
-            "--network",
-            "regtest",
-            "--log-level",
-            "off",
-            "--smoke",
-        ])));
-    let _ = node_cli_main([
         "rbitcoin-node",
-        "--help",
-    ]);
+        "--datadir",
+        flags_off.to_str().unwrap(),
+        "--network",
+        "regtest",
+        "--log-level",
+        "off",
+        "--smoke",
+    ])));
+    let _ = node_cli_main(["rbitcoin-node", "--help"]);
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "a", "b"])));
 
     // Serialize process-wide env mutation (parallel `cargo test` races).
@@ -616,8 +684,7 @@ fn ibd_parallel_archive_idempotent_confirm_direct() {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
         accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
         accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
-        confirm_archived_at(&q, &params, Height(h), &b.block_hash().to_byte_array(), ms)
-            .unwrap();
+        confirm_archived_at(&q, &params, Height(h), &b.block_hash().to_byte_array(), ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
     }
@@ -652,10 +719,7 @@ fn ibd_parallel_archive_idempotent_confirm_direct() {
     let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
     // v10: create_fk stamped at archive; soft prev_txid zero until wire rebuild.
     assert!(!inp.create_fk.is_null());
-    assert_eq!(
-        q.resolve_prev_txid(&inp).unwrap(),
-        *cb1.as_byte_array()
-    );
+    assert_eq!(q.resolve_prev_txid(&inp).unwrap(), *cb1.as_byte_array());
     assert_eq!(inp.prev_index, 0);
 }
 
@@ -1223,7 +1287,10 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     let split = split_anyone_can_spend(
         cb1,
         0,
-        &[Amount::from_sat(20_0000_0000), Amount::from_sat(29_0000_0000)],
+        &[
+            Amount::from_sat(20_0000_0000),
+            Amount::from_sat(29_0000_0000),
+        ],
     );
     let b_split = mine_regtest_block(tip, tip_time + 600, split_h, vec![split]);
     let parent_txid = b_split.txdata[1].compute_txid();
@@ -1273,10 +1340,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
         Amount::from_sat(47_0000_0000),
     );
     let t2_txid = t2.compute_txid();
-    let t3 = spend_many_anyone_can_spend(
-        &[(t2_txid, 0)],
-        Amount::from_sat(46_0000_0000),
-    );
+    let t3 = spend_many_anyone_can_spend(&[(t2_txid, 0)], Amount::from_sat(46_0000_0000));
     let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![t1, t2, t3]);
     accept_and_archive_block(&q, &params, Height(merge_h), &b_merge, ms).unwrap();
 
@@ -1299,10 +1363,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     tip_time = b_merge.header.time;
     let t3_txid = b_merge.txdata[3].compute_txid();
     let next_h = merge_h + 1;
-    let spend = spend_many_anyone_can_spend(
-        &[(t3_txid, 0)],
-        Amount::from_sat(45_0000_0000),
-    );
+    let spend = spend_many_anyone_can_spend(&[(t3_txid, 0)], Amount::from_sat(45_0000_0000));
     let b_next = mine_regtest_block(tip, tip_time + 600, next_h, vec![spend]);
     accept_and_archive_block(&q, &params, Height(next_h), &b_next, ms).unwrap();
     confirm_archived_at(
@@ -1398,7 +1459,10 @@ fn consensus_mature_chain_spend_and_reconstruct() {
 
     // External prev_txid on Class A + reconstruct.
     let spend_txid = spend_block.txdata[1].compute_txid().to_byte_array();
-    let (_spend_fk, rec) = q.get_tx_by_txid(&spend_txid).unwrap().expect("spend indexed");
+    let (_spend_fk, rec) = q
+        .get_tx_by_txid(&spend_txid)
+        .unwrap()
+        .expect("spend indexed");
     let inp = q.tx_input(&rec, 0).unwrap();
     assert_eq!(
         q.resolve_prev_txid(&inp).unwrap(),
@@ -1425,7 +1489,11 @@ fn consensus_mature_chain_spend_and_reconstruct() {
     );
     assert_reconstruct_eq(&q, chain.spend_height, spend_block);
     let cbin = q
-        .tx_input(&q.get_tx(q.block_tx_fks(Height(chain.spend_height)).unwrap()[0]).unwrap(), 0)
+        .tx_input(
+            &q.get_tx(q.block_tx_fks(Height(chain.spend_height)).unwrap()[0])
+                .unwrap(),
+            0,
+        )
         .unwrap();
     assert!(cbin.is_coinbase());
 
@@ -1470,10 +1538,7 @@ fn consensus_mature_chain_spend_and_reconstruct() {
         assert_reconstruct_eq(&q, h, &chain.blocks[h as usize]);
     }
 
-    assert!(q
-        .reconstruct_block_by_hash(&[0xab; 32])
-        .unwrap()
-        .is_none());
+    assert!(q.reconstruct_block_by_hash(&[0xab; 32]).unwrap().is_none());
     assert!(q.reconstruct_block_at_height(Height(9999)).is_err());
 
     let loc = q.locator_hashes().unwrap();
@@ -1522,11 +1587,9 @@ fn scripthash_index_history_balance_and_reorg() {
     let utxos = q.scripthash_listunspent(&sh).unwrap();
     assert!(!utxos.is_empty());
     // Spent coinbase from h1 must not be listed.
-    assert!(
-        !utxos
-            .iter()
-            .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0)
-    );
+    assert!(!utxos
+        .iter()
+        .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0));
 
     // Reorg: disconnect tip (spend block) → coinbase UTXO returns, history drops spend.
     q.disconnect_tip().unwrap();
@@ -1778,8 +1841,7 @@ fn consensus_reject_bad_structure_and_milestone() {
 fn three_stage_confirm_and_parent_pin_surface() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
-        confirm_script_phase, confirm_scripts_phase, confirm_write_phase, ChainParams,
-        Milestone,
+        confirm_script_phase, confirm_scripts_phase, confirm_write_phase, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -1956,7 +2018,11 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
     let mat_a = confirm_load_phase(&q, &params, ms, &batch_a)
         .expect("load 1..=10 must assemble with tip=0");
     assert_eq!(mat_a.batch.len(), 10);
-    assert_eq!(q.tip_height(), Some(Height::GENESIS), "load must not advance tip");
+    assert_eq!(
+        q.tip_height(),
+        Some(Height::GENESIS),
+        "load must not advance tip"
+    );
 
     // Batch B: load 11..=20 while tip still genesis (IBD load queue depth ≥ 2).
     // Regression: used to permanent-BadPrev on height 11 (prev not in confirmed[]).
@@ -2107,8 +2173,9 @@ fn block_cache_and_mempool_hub_surface() {
 
     // MempoolHub: accept a real mature coinbase spend via Query UTXO provider.
     let q_arc = Arc::new(q);
-    let hub = MempoolHub::open_with_weight(td.path().join("mempool"), Arc::clone(&q_arc), 50_000_000)
-        .unwrap();
+    let hub =
+        MempoolHub::open_with_weight(td.path().join("mempool"), Arc::clone(&q_arc), 50_000_000)
+            .unwrap();
     assert!(!hub.relay_enabled());
     hub.set_relay_enabled(true);
     assert!(hub.relay_enabled());
@@ -2133,10 +2200,7 @@ fn block_cache_and_mempool_hub_surface() {
     assert!(hub.get_tx(&r.txid).is_some());
     assert_eq!(hub.live_count(), 1);
     assert!(!hub.list_live().is_empty());
-    assert!(
-        !hub.scripthash_mempool(&sh).is_empty()
-            || hub.scripthash_unconfirmed_delta(&sh) != 0
-    );
+    assert!(!hub.scripthash_mempool(&sh).is_empty() || hub.scripthash_unconfirmed_delta(&sh) != 0);
     hub.flush().unwrap();
     let _ = hub.compact();
     assert_eq!(hub.remove_for_block(&[r.txid]), 1);
@@ -2206,7 +2270,8 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     assert_eq!(q.tip_height(), Some(Height(4)));
     for (h, b) in &batch {
         assert!(
-            q.is_block_archived(&b.block_hash().to_byte_array()).unwrap(),
+            q.is_block_archived(&b.block_hash().to_byte_array())
+                .unwrap(),
             "h={} archived after unified commit",
             h.0
         );
@@ -2255,13 +2320,8 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
     );
     let b_split = mine_regtest_block(tip, tip_time + 600, h_split, vec![split]);
     let parent_txid = b_split.txdata[1].compute_txid();
-    rbitcoin_consensus::confirm_wire_run(
-        &q,
-        &params,
-        ms,
-        &[(Height(h_split), b_split.clone())],
-    )
-    .unwrap();
+    rbitcoin_consensus::confirm_wire_run(&q, &params, ms, &[(Height(h_split), b_split.clone())])
+        .unwrap();
     tip = b_split.block_hash();
     tip_time = b_split.header.time;
 
@@ -2312,8 +2372,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
 fn wire_prep_already_archived_bodies_spend_annotate() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
-        confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone,
-        ScriptPreverified,
+        confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
 
     let td = TestDatadir::new().unwrap();
@@ -2360,7 +2419,12 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
     let mat = confirm_wire_load_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
         .expect("wire prep already-archived");
     assert!(
-        mat.batch.archive_plan.is_none() || mat.batch.archive_plan.as_ref().is_some_and(|p| p.is_empty()),
+        mat.batch.archive_plan.is_none()
+            || mat
+                .batch
+                .archive_plan
+                .as_ref()
+                .is_some_and(|p| p.is_empty()),
         "bodies already archived → no Class A plan (or empty)"
     );
     let ok = confirm_scripts_phase(mat.batch).expect("scripts");
@@ -2498,9 +2562,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     // fails: "structural spentness missing pin denserels/abs".
     let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
     confirm_write_phase(&q, &params, ms, ok_b.batch).unwrap_or_else(|e| {
-        panic!(
-            "write B after load-ahead must fill parent denserels from committed A (got {e})"
-        );
+        panic!("write B after load-ahead must fill parent denserels from committed A (got {e})");
     });
     assert_eq!(q.tip_height(), Some(Height(hb)));
 }
@@ -2508,9 +2570,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
 /// Structural double-spend still rejects on the wire path.
 #[test]
 fn unified_wire_pipeline_rejects_double_spend() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, confirm_wire_run, ChainParams, Milestone,
-    };
+    use rbitcoin_consensus::{accept_and_connect_block, confirm_wire_run, ChainParams, Milestone};
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();

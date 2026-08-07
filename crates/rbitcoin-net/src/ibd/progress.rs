@@ -205,8 +205,8 @@ impl TipRateTracker {
                 self.rate_ema = Some(match self.rate_ema {
                     None => inst,
                     Some(prev) => {
-                        let alpha = 1.0
-                            - (-std::f64::consts::LN_2 * dt / ETA_RATE_HALF_LIFE_SECS).exp();
+                        let alpha =
+                            1.0 - (-std::f64::consts::LN_2 * dt / ETA_RATE_HALF_LIFE_SECS).exp();
                         let alpha = alpha.clamp(0.02, 0.5);
                         alpha * inst + (1.0 - alpha) * prev
                     }
@@ -295,8 +295,8 @@ pub(crate) fn tip_hole_from_claim_ready(claim_ready_flags: &[bool]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_claim_ready,
-        ProgressLineInput, TipRateTracker,
+        format_duration_short, format_progress_line, format_rate, ibd_pct,
+        tip_hole_from_claim_ready, ProgressLineInput, TipRateTracker,
     };
     use rbitcoin_query::{
         soft_assign_restricted, soft_confirm_window_n, soft_densify_band_hi, BQ_SOFT_FREE_BYTES,
@@ -329,9 +329,15 @@ mod tests {
         assert!(line.contains(" hole="), "{line}");
         assert!(line.contains(" soft="), "{line}");
         assert!(line.contains(" RAM="), "{line}");
-        assert!(!line.contains(" bq n="), "count lives in soft= only: {line}");
+        assert!(
+            !line.contains(" bq n="),
+            "count lives in soft= only: {line}"
+        );
         assert!(!line.contains(" disk="), "queue is RAM not disk: {line}");
-        assert!(!line.contains("pending_ram="), "no RAM overflow meter: {line}");
+        assert!(
+            !line.contains("pending_ram="),
+            "no RAM overflow meter: {line}"
+        );
         assert!(line.contains("loadq"), "{line}");
         assert!(line.contains("scriptq"), "{line}");
         // Retired dual-track progress tokens forbidden.
@@ -339,7 +345,10 @@ mod tests {
             !line.contains("arch_hwm"),
             "must not report retired arch_hwm: {line}"
         );
-        assert!(!line.contains("lead="), "must not report retired lead=: {line}");
+        assert!(
+            !line.contains("lead="),
+            "must not report retired lead=: {line}"
+        );
         assert!(
             !line.contains("arch="),
             "must not report retired arch= rate token: {line}"
@@ -365,7 +374,10 @@ mod tests {
         });
         assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
         assert!(slow.contains("bq soft=0/256 RAM=0MiB"), "{slow}");
-        assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
+        assert!(
+            !slow.contains("arch_hwm") && !slow.contains("lead="),
+            "{slow}"
+        );
     }
 
     #[test]
@@ -421,13 +433,16 @@ mod tests {
         let mut done = TipRateTracker::new();
         let t0 = Instant::now();
         done.push(t0, 100);
-        assert_eq!(done.eta_string(t0 + Duration::from_secs(30), 100, 100), "done");
+        assert_eq!(
+            done.eta_string(t0 + Duration::from_secs(30), 100, 100),
+            "done"
+        );
     }
 
     #[test]
     fn work_chain_progress_fetch_hole_pending_is_ready() {
-        use super::work_chain_progress;
         use super::super::body::BodyPresence;
+        use super::work_chain_progress;
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
         use rbitcoin_consensus::{ChainParams, Milestone};

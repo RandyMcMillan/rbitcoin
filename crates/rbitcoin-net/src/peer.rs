@@ -5,12 +5,9 @@ use crate::chain::{AcceptOutcome, ChainHub};
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
-use crate::peer_dos::{
-    PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
-};
-use crate::v2::{
-    open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer,
-};
+use crate::peer_dos::{PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE};
+use crate::v2::{open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer};
+use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
@@ -18,7 +15,6 @@ use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
-use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
 use bitcoin::{Block, BlockHash, Transaction};
 use rbitcoin_query::Query;
 use std::collections::HashMap;
@@ -86,9 +82,16 @@ pub async fn connect_and_handshake(
     inbound: bool,
 ) -> Result<(VersionMessage, V2Reader, V2Writer), NetError> {
     let (mut reader, mut writer) = open_v2(stream, magic, inbound).await?;
-    let their_version =
-        application_handshake(&mut reader, &mut writer, magic, our_addr, their_addr, start_height, inbound)
-            .await?;
+    let their_version = application_handshake(
+        &mut reader,
+        &mut writer,
+        magic,
+        our_addr,
+        their_addr,
+        start_height,
+        inbound,
+    )
+    .await?;
     Ok((their_version, reader, writer))
 }
 
@@ -177,8 +180,7 @@ fn rand_nonce() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    tick
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
@@ -448,12 +450,7 @@ struct PendingCmpct {
 /// Snapshot live mempool txs for short-id fill (owned so map can borrow them).
 fn mempool_live_txs(hub: &ChainHub) -> Vec<Transaction> {
     hub.mempool()
-        .map(|mp| {
-            mp.list_live()
-                .into_iter()
-                .map(|(_, _, _, tx)| tx)
-                .collect()
-        })
+        .map(|mp| mp.list_live().into_iter().map(|(_, _, _, tx)| tx).collect())
         .unwrap_or_default()
 }
 
@@ -463,8 +460,7 @@ fn try_fill_cmpct(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> Opti
         return None;
     }
     let live = mempool_live_txs(hub);
-    let avail =
-        crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
+    let avail = crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
     crate::compact::try_reconstruct(hsi, &avail, version).ok()
 }
 
@@ -478,8 +474,7 @@ fn try_cmpct_missing(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> O
         return None;
     }
     let live = mempool_live_txs(hub);
-    let avail =
-        crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
+    let avail = crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
     match crate::compact::try_reconstruct(hsi, &avail, version) {
         Ok(_) => Some(Vec::new()),
         Err(m) => Some(m),
@@ -493,12 +488,8 @@ fn apply_cmpct_blocktxn(
     bt: &BlockTransactions,
 ) -> Result<Block, ()> {
     let live = mempool_live_txs(hub);
-    let avail = crate::compact::shortid_map_from_txs(
-        &pc.hsi.header,
-        pc.hsi.nonce,
-        pc.version,
-        live.iter(),
-    );
+    let avail =
+        crate::compact::shortid_map_from_txs(&pc.hsi.header, pc.hsi.nonce, pc.version, live.iter());
     crate::compact::apply_block_transactions(&pc.hsi, &pc.missing, bt, &avail, pc.version)
         .map_err(|_| ())
 }
@@ -561,15 +552,12 @@ async fn handle_peer_frame(
                             {
                                 queue_out(
                                     out_tx,
-                                    NetworkMessage::CmpctBlock(CmpctBlock {
-                                        compact_block: hsi,
-                                    }),
+                                    NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
                                 )?;
                             }
                         }
                     }
-                    Inventory::Transaction(txid)
-                    | Inventory::WitnessTransaction(txid) => {
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx(txid) {
                                 queue_out(out_tx, NetworkMessage::Tx(tx))?;
@@ -628,8 +616,7 @@ async fn handle_peer_frame(
                             want.push(Inventory::WitnessBlock(*h));
                         }
                     }
-                    Inventory::Transaction(txid)
-                    | Inventory::WitnessTransaction(txid) => {
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains(txid) {
@@ -1086,7 +1073,10 @@ mod tests {
 
         // headers_for_peer empty store after genesis still returns (tip exists).
         use bitcoin::p2p::message_blockdata::GetHeadersMessage;
-        let gh = GetHeadersMessage::new(vec![hub.tip_hash().unwrap()], BlockHash::from_byte_array([0u8; 32]));
+        let gh = GetHeadersMessage::new(
+            vec![hub.tip_hash().unwrap()],
+            BlockHash::from_byte_array([0u8; 32]),
+        );
         let hdrs = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &gh).unwrap();
         // Beyond tip: empty headers is fine.
         assert!(hdrs.is_empty() || !hdrs.is_empty());
@@ -1535,7 +1525,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(out_rx.try_recv().unwrap(), NetworkMessage::Block(_)));
+            assert!(matches!(
+                out_rx.try_recv().unwrap(),
+                NetworkMessage::Block(_)
+            ));
 
             // Full Block message path: pending + drain_pending (AlreadyHave for tip).
             let gen_block2 = hub
@@ -1630,9 +1623,7 @@ mod tests {
         use bitcoin::hashes::Hash as _;
         use bitcoin::script::ScriptBuf;
         use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{
-            Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
-        };
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
         use tokio::runtime::Builder;
 
         fn frame_for(msg: NetworkMessage) -> FramedMessage {
@@ -1874,5 +1865,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
-
-

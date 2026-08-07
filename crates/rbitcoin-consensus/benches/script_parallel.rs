@@ -17,11 +17,9 @@ use bitcoin::hashes::{hash160, Hash};
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
-use rbitcoin_consensus::script_bench::{self, JobBytes};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use rayon::prelude::*;
+use rbitcoin_consensus::script_bench::{self, JobBytes};
 
 fn p2wpkh_job(seed: u8) -> JobBytes {
     let secp = Secp256k1::new();
@@ -161,16 +159,14 @@ fn par_steal_batches(jobs: &[ScriptCheckJob], batch: usize) {
     // Use rayon join tree only to populate workers once.
     rayon::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|_| {
-                loop {
-                    let start = next.fetch_add(batch, Ordering::Relaxed);
-                    if start >= n {
-                        break;
-                    }
-                    let end = (start + batch).min(n);
-                    for j in &jobs[start..end] {
-                        script_bench::verify_one_job(j).unwrap();
-                    }
+            s.spawn(|_| loop {
+                let start = next.fetch_add(batch, Ordering::Relaxed);
+                if start >= n {
+                    break;
+                }
+                let end = (start + batch).min(n);
+                for j in &jobs[start..end] {
+                    script_bench::verify_one_job(j).unwrap();
                 }
             });
         }
@@ -193,7 +189,10 @@ fn adaptive_chunk(n: usize, workers: usize) -> usize {
 
 fn main() {
     let workers = rayon::current_num_threads();
-    println!("rayon threads={workers}  available_parallelism={:?}\n", std::thread::available_parallelism());
+    println!(
+        "rayon threads={workers}  available_parallelism={:?}\n",
+        std::thread::available_parallelism()
+    );
 
     // Build owned job sets (production shape after connect).
     let p2tr_64: Vec<_> = (0..64u8).map(|i| p2tr_job(i.wrapping_add(1))).collect();
@@ -225,14 +224,14 @@ fn main() {
         });
     }
     for c in [1, 2, 4, 8, 16, 32] {
-        bench(&format!("par_chunks({c})"), iters, || par_chunks(&p2tr_64, c));
+        bench(&format!("par_chunks({c})"), iters, || {
+            par_chunks(&p2tr_64, c)
+        });
     }
     let ac = adaptive_chunk(64, workers);
-    bench(
-        &format!("par_chunks(adaptive={ac})"),
-        iters,
-        || par_chunks(&p2tr_64, ac),
-    );
+    bench(&format!("par_chunks(adaptive={ac})"), iters, || {
+        par_chunks(&p2tr_64, ac)
+    });
     for b in [1, 4, 8, 16] {
         bench(&format!("steal batch={b}"), iters, || {
             par_steal_batches(&p2tr_64, b)
@@ -241,7 +240,9 @@ fn main() {
 
     println!("\n=== 64 × 1-input P2WPKH ===");
     bench("sequential", iters, || seq(&p2wpkh_64));
-    bench("rayon par_iter (no min_len)", iters, || par_today(&p2wpkh_64));
+    bench("rayon par_iter (no min_len)", iters, || {
+        par_today(&p2wpkh_64)
+    });
     bench("production verify_owned_pool", iters, || {
         script_bench::verify_owned_pool(&p2wpkh_64).unwrap();
     });
@@ -250,7 +251,9 @@ fn main() {
     println!("\n=== 128 × P2TR (16-block confirm wave) ===");
     let iters_b = 20u32;
     bench("sequential", iters_b, || seq(&p2tr_128));
-    bench("rayon par_iter (no min_len)", iters_b, || par_today(&p2tr_128));
+    bench("rayon par_iter (no min_len)", iters_b, || {
+        par_today(&p2tr_128)
+    });
     bench("production verify_owned_pool", iters_b, || {
         script_bench::verify_owned_pool(&p2tr_128).unwrap();
     });

@@ -32,10 +32,7 @@ impl MatureRegtestChain {
 ///
 /// Mines and accepts **once**. Callers should reuse `blocks` for reconstruct / spend
 /// assertions instead of rebuilding parallel 100-block chains.
-pub fn build_mature_regtest_with_spend(
-    query: &Query,
-    params: &ChainParams,
-) -> MatureRegtestChain {
+pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> MatureRegtestChain {
     let ms = Milestone::NONE;
     let maturity = params.coinbase_maturity();
 
@@ -67,11 +64,7 @@ pub fn build_mature_regtest_with_spend(
 
     // Spend at height maturity + 2
     let spend_height = last_pad + 1;
-    let spend = spend_anyone_can_spend(
-        matured_coinbase_txid,
-        0,
-        Amount::from_sat(49_0000_0000),
-    );
+    let spend = spend_anyone_can_spend(matured_coinbase_txid, 0, Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_height, vec![spend]);
     accept_and_connect_block(query, params, Height(spend_height), &b_spend, ms).unwrap();
     blocks.push(b_spend);
@@ -115,7 +108,11 @@ pub fn assert_reconstruct_eq(query: &Query, height: u32, original: &Block) {
     let recon = query
         .reconstruct_block_at_height(Height(height))
         .unwrap_or_else(|e| panic!("reconstruct height {height}: {e}"));
-    assert_eq!(recon.block_hash(), original.block_hash(), "hash height {height}");
+    assert_eq!(
+        recon.block_hash(),
+        original.block_hash(),
+        "hash height {height}"
+    );
     assert_eq!(recon.header, original.header, "header height {height}");
     assert_eq!(recon.txdata.len(), original.txdata.len());
     for (i, (a, b)) in recon.txdata.iter().zip(original.txdata.iter()).enumerate() {

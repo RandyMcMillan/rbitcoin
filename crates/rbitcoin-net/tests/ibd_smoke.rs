@@ -127,19 +127,13 @@ async fn short_regtest_ibd_two_node() {
     let mut cfg = IbdConfig::for_test();
     cfg.target_peers = 1;
     cfg.window = 16;
-    let n = peer
-        .sync(&[seed.local_addr], cfg)
-        .await
-        .expect("ibd sync");
+    let n = peer.sync(&[seed.local_addr], cfg).await.expect("ibd sync");
     assert!(n >= 6, "accepted={n}");
     peer.wait_height(6, Duration::from_secs(15))
         .await
         .expect("tip height");
     assert_eq!(peer.query.tip_height(), Some(Height(6)));
-    assert_eq!(
-        peer.hub.tip_hash().unwrap(),
-        seed.hub.tip_hash().unwrap()
-    );
+    assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
 
     seed.shutdown().await;
     peer.shutdown().await;
@@ -231,10 +225,7 @@ async fn short_regtest_ibd_twelve_blocks() {
     peer.wait_height(12, Duration::from_secs(30))
         .await
         .expect("tip 12");
-    assert_eq!(
-        peer.hub.tip_hash().unwrap(),
-        seed.hub.tip_hash().unwrap()
-    );
+    assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
 
     seed.shutdown().await;
     peer.shutdown().await;

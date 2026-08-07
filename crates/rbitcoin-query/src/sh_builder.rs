@@ -17,7 +17,7 @@
 
 use super::run_builder_core::{
     clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count, runs_dir_io, spawn_worker,
-    RunControl, RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
+    RunControl, RunMemtable, AFTER_WORK, FAMILY_SH, IDLE_POLL,
 };
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
@@ -25,9 +25,9 @@ use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
     merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
-    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy,
-    ColdProgress, RunWritePolicy, ScriptHashEntry, ScriptHashRecord, Store, StoreError,
-    SortedRunPath, FANIN_TARGET_STREAM_RUNS,
+    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
+    RunWritePolicy, ScriptHashEntry, ScriptHashRecord, SortedRunPath, Store, StoreError,
+    FANIN_TARGET_STREAM_RUNS,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -163,9 +163,13 @@ pub enum ShPreMaterializeAction {
     /// Empty head cannot be cold-loaded from current runs — SEAL=0 + clear runs.
     ResetCatalogFullRecollect,
     /// Durable head: write `include_hwm = seal` (legacy missing file).
-    BootstrapIncludeHwm { seal: u64 },
+    BootstrapIncludeHwm {
+        seal: u64,
+    },
     /// Durable head: lower SEAL to authoritative HWM for gap recollect.
-    ClampSealTo { floor: u64 },
+    ClampSealTo {
+        floor: u64,
+    },
     Noop,
 }
 
@@ -183,11 +187,7 @@ pub fn plan_sh_pre_materialize(
             // Sticky FORCE must never nuclear-wipe a live durable head. Fall through
             // to durable maintenance (bootstrap HWM / clamp SEAL / Noop). Gap recollect
             // after this plan fills any floor↔tip lag via WarmOnly residual.
-        } else if empty_head_needs_full_class_a_recollect(
-            seal,
-            tip_max_create_fk,
-            run_records,
-        ) {
+        } else if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
             // Stale high SEAL + tiny tail, or empty/consumed catalog with no head.
             return ShPreMaterializeAction::ForceFullRebuild;
         } else {
@@ -236,11 +236,7 @@ pub fn should_defer_direct_recollect(seal: u64, tip_max: u64) -> bool {
 }
 
 /// Empty head: full Class A recollect when catalog cannot seed a complete cold load.
-fn empty_head_needs_full_class_a_recollect(
-    seal: u64,
-    tip_max: u64,
-    run_records: u64,
-) -> bool {
+fn empty_head_needs_full_class_a_recollect(seal: u64, tip_max: u64, run_records: u64) -> bool {
     if tip_max == 0 {
         return false;
     }
@@ -673,9 +669,7 @@ impl ShRunBuilder {
     /// Used by `RBITCOIN_SH_FORCE_REBUILD=1` when catalog is unusable so tip
     /// recollects **all** Class A creates (SEAL=0).
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
-        info!(
-            "node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head"
-        );
+        info!("node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head");
         self.stop_and_clear_memtable()?;
         self.wipe_catalog_and_seal()?;
         Self::clear_cold_progress_and_hwm(store);
@@ -998,8 +992,7 @@ impl ShRunBuilder {
                 );
                 stream_inputs = {
                     let _io = runs_io.lock().unwrap();
-                    let out =
-                        reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, 0, cancel)?;
+                    let out = reduce_runs_to_fanin_cancellable(&claimed, &merge_dir, 0, cancel)?;
                     commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
                     out
                 };
@@ -1181,10 +1174,7 @@ impl ShRunBuilder {
                         session.put_chain(prev, &chain)?;
                         chain.clear();
                         long_seen = None;
-                        if cancel
-                            .map(|c| c.load(Ordering::Relaxed))
-                            .unwrap_or(false)
-                        {
+                        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                             return Err(StoreError::Cancelled("scripthash materialize stream"));
                         }
                         let due = match last_log {
@@ -1328,11 +1318,8 @@ fn apply_runs_to_live_sh(
         return Ok(0);
     }
     let total_recs: u64 = runs.iter().map(|r| r.count).sum();
-    let body_mib: f64 = runs
-        .iter()
-        .map(|r| run_body_bytes(r) as f64)
-        .sum::<f64>()
-        / (1024.0 * 1024.0);
+    let body_mib: f64 =
+        runs.iter().map(|r| run_body_bytes(r) as f64).sum::<f64>() / (1024.0 * 1024.0);
     let include_hwm = store.scripthash.include_hwm();
     info!(
         "node: scripthash deferred warm apply start runs={} records≈{total_recs} body≈{body_mib:.1}MiB \
@@ -1348,43 +1335,44 @@ fn apply_runs_to_live_sh(
     let mut recs_skipped_hwm = 0u64;
     let mut batch_i = 0u32;
 
-    let flush_batch = |batch: &mut Vec<ScriptHashRecord>,
-                       heads: &mut std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue>,
-                       n: &mut u64,
-                       batch_i: &mut u32,
-                       recs_seen: u64,
-                       t0: Instant|
-     -> Result<(), StoreError> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        *batch_i = batch_i.saturating_add(1);
-        let bi = *batch_i;
-        let batch_n = batch.len();
-        let tb = Instant::now();
-        let (w, timing) = store.scripthash.put_create_batch_append(batch, heads)?;
-        *n = n.saturating_add(w as u64);
-        let pct = if total_recs > 0 {
-            (100.0 * recs_seen as f64 / total_recs as f64).clamp(0.0, 99.9)
-        } else {
-            0.0
-        };
-        let secs = t0.elapsed().as_secs_f64().max(1e-3);
-        info!(
-            "node: scripthash deferred warm apply batch={bi} recs={batch_n} written+={w} \
+    let flush_batch =
+        |batch: &mut Vec<ScriptHashRecord>,
+         heads: &mut std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue>,
+         n: &mut u64,
+         batch_i: &mut u32,
+         recs_seen: u64,
+         t0: Instant|
+         -> Result<(), StoreError> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            *batch_i = batch_i.saturating_add(1);
+            let bi = *batch_i;
+            let batch_n = batch.len();
+            let tb = Instant::now();
+            let (w, timing) = store.scripthash.put_create_batch_append(batch, heads)?;
+            *n = n.saturating_add(w as u64);
+            let pct = if total_recs > 0 {
+                (100.0 * recs_seen as f64 / total_recs as f64).clamp(0.0, 99.9)
+            } else {
+                0.0
+            };
+            let secs = t0.elapsed().as_secs_f64().max(1e-3);
+            info!(
+                "node: scripthash deferred warm apply batch={bi} recs={batch_n} written+={w} \
              total_written≈{n} stream≈{recs_seen}/{total_recs} pct≈{pct:.1}% \
              rate≈{:.0}rec/s batch_wall={:?} seed={:?} body={:?} head={:?} elapsed={:?}",
-            recs_seen as f64 / secs,
-            tb.elapsed(),
-            Duration::from_nanos(timing.seed_ns),
-            Duration::from_nanos(timing.body_ns),
-            Duration::from_nanos(timing.head_ns),
-            t0.elapsed()
-        );
-        batch.clear();
-        heads.clear();
-        Ok(())
-    };
+                recs_seen as f64 / secs,
+                tb.elapsed(),
+                Duration::from_nanos(timing.seed_ns),
+                Duration::from_nanos(timing.body_ns),
+                Duration::from_nanos(timing.head_ns),
+                t0.elapsed()
+            );
+            batch.clear();
+            heads.clear();
+            Ok(())
+        };
 
     for_each_merged_rec_opts(runs, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
@@ -1405,25 +1393,11 @@ fn apply_runs_to_live_sh(
         }
         batch.push(ScriptHashRecord::from_fk(sh, tx_fk));
         if batch.len() >= DEFERRED_APPLY_BATCH {
-            flush_batch(
-                &mut batch,
-                &mut heads,
-                &mut n,
-                &mut batch_i,
-                recs_seen,
-                t0,
-            )?;
+            flush_batch(&mut batch, &mut heads, &mut n, &mut batch_i, recs_seen, t0)?;
         }
         Ok(())
     })?;
-    flush_batch(
-        &mut batch,
-        &mut heads,
-        &mut n,
-        &mut batch_i,
-        recs_seen,
-        t0,
-    )?;
+    flush_batch(&mut batch, &mut heads, &mut n, &mut batch_i, recs_seen, t0)?;
     store.scripthash.flush()?;
     info!(
         "node: scripthash deferred warm apply done written≈{n} recs≈{recs_seen} \
@@ -1494,8 +1468,7 @@ fn coalesce_l0_to_catalog(
             // max create_fk tracked while streaming (no second full-body read).
             // Tip fan-in uses unpaced CATALOG via merge_runs_to_file — do not pace
             // that path (tens of GiB multi-pass reduce).
-            let merged =
-                merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
+            let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
             let max_fk = merged.max_u64_at_32;
             let merged = merged.run;
             // Promote is steady IBD traffic — debug only; ~10s recollect/materialize
@@ -1532,16 +1505,9 @@ fn coalesce_l0_to_catalog(
 }
 
 /// Merge into an L0 path without parent catalog MANIFEST / fsync / DONTNEED.
-fn merge_runs_to_l0(
-    inputs: &[SortedRunPath],
-    out: &Path,
-) -> Result<SortedRunPath, StoreError> {
-    let merged = rbitcoin_store::merge_runs_to_file_with_policy(
-        inputs,
-        out,
-        RunWritePolicy::L0,
-        false,
-    )?;
+fn merge_runs_to_l0(inputs: &[SortedRunPath], out: &Path) -> Result<SortedRunPath, StoreError> {
+    let merged =
+        rbitcoin_store::merge_runs_to_file_with_policy(inputs, out, RunWritePolicy::L0, false)?;
     for r in inputs {
         let _ = std::fs::remove_file(&r.path);
     }
@@ -1567,8 +1533,7 @@ pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 ///
 /// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so ~128 MiB spills are never
 /// candidates. Tip direct k-way can open thousands of FDs without rewriting them.
-pub const CATALOG_COMPACT_FLOOR_BYTES: u64 =
-    RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4; // 96 MiB
+pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4; // 96 MiB
 
 /// True if a catalog run body should be eligible for undersized compact.
 ///
@@ -1629,8 +1594,7 @@ fn compact_catalog_undersized(
         let out = next_run_path(runs_dir, *next_seq);
         *next_seq += 1;
         // Crumb compact is IBD-worker-only (confirm hot) — paced like promotes.
-        let merged =
-            merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
+        let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
         let max_fk = merged.max_u64_at_32;
         let merged = merged.run;
         info!(
@@ -1689,8 +1653,7 @@ fn sh_worker_loop(
             // force_all: tip/finalize drain — promote L0 only, no catalog compact.
             // Steady IBD: single-thread crumb compact only when flag is on.
             let force_all = g.ctrl.finalize;
-            let allow_compact = !force_all
-                && ibd_catalog_compact.load(Ordering::Acquire);
+            let allow_compact = !force_all && ibd_catalog_compact.load(Ordering::Acquire);
             let l0 = std::mem::take(&mut g.l0);
             g.l0_bytes = 0;
             let runs_io = Arc::clone(&g.ctrl.runs_io);
@@ -2043,11 +2006,7 @@ mod tests {
         assert!(sh_catalog_looks_complete(0, 0, 0));
         // Post-success state: high SEAL, zero runs — incomplete for *empty* head only.
         assert!(sh_catalog_is_stale_tail(1_411_000_000, 0));
-        assert!(!sh_catalog_looks_complete(
-            1_411_000_000,
-            1_411_000_000,
-            0
-        ));
+        assert!(!sh_catalog_looks_complete(1_411_000_000, 1_411_000_000, 0));
     }
 
     #[test]
@@ -2076,7 +2035,10 @@ mod tests {
             let _g = b.pause_ibd_catalog_compact();
             assert!(!b.ibd_catalog_compact());
         }
-        assert!(!b.ibd_catalog_compact(), "drop must restore prior compact=false");
+        assert!(
+            !b.ibd_catalog_compact(),
+            "drop must restore prior compact=false"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2105,7 +2067,10 @@ mod tests {
             target
         ));
         // Tiny target: floor still bounds.
-        assert!(!catalog_run_is_compact_candidate(50 * 1024 * 1024, 64 * 1024 * 1024));
+        assert!(!catalog_run_is_compact_candidate(
+            50 * 1024 * 1024,
+            64 * 1024 * 1024
+        ));
     }
 
     #[test]
@@ -2339,5 +2304,4 @@ mod tests {
         std::env::remove_var("RBITCOIN_SH_MEMTABLE_CAP");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

@@ -174,9 +174,8 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
 fn command_from_header(cmd12: &[u8]) -> CommandString {
     let end = cmd12.iter().position(|&b| b == 0).unwrap_or(12);
     let s = std::str::from_utf8(&cmd12[..end]).unwrap_or("unknown");
-    CommandString::try_from(s).unwrap_or_else(|_| {
-        CommandString::try_from("unknown").expect("literal command string")
-    })
+    CommandString::try_from(s)
+        .unwrap_or_else(|_| CommandString::try_from("unknown").expect("literal command string"))
 }
 
 #[cfg(test)]
@@ -320,7 +319,9 @@ mod tests {
         )]);
         assert!(!encode_is_cpu_heavy(&small));
         let large = NetworkMessage::Inv(vec![
-            Inventory::Block(bitcoin::BlockHash::from_byte_array([0; 32]));
+            Inventory::Block(bitcoin::BlockHash::from_byte_array(
+                [0; 32]
+            ));
             65
         ]);
         assert!(encode_is_cpu_heavy(&large));

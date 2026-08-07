@@ -22,7 +22,10 @@ fn fetch_tx_hex(txid: &str) -> String {
         return s.trim().to_string();
     }
     let out = Command::new("curl")
-        .args(["-sL", &format!("https://blockstream.info/api/tx/{txid}/hex")])
+        .args([
+            "-sL",
+            &format!("https://blockstream.info/api/tx/{txid}/hex"),
+        ])
         .output()
         .unwrap();
     let s = String::from_utf8(out.stdout).unwrap().trim().to_string();
@@ -45,7 +48,11 @@ fn main() {
         if script_bench::verify_job(&job).is_ok() {
             continue;
         }
-        println!("FAIL tx{i} {} nIn={}", spend.compute_txid(), spend.input.len());
+        println!(
+            "FAIL tx{i} {} nIn={}",
+            spend.compute_txid(),
+            spend.input.len()
+        );
         let cache = SighashCache::new(spend);
         for (ii, vin) in spend.input.iter().enumerate() {
             let mut items = Vec::new();
@@ -55,7 +62,11 @@ fn main() {
                     Instruction::Op(op) => println!("  op {op:?}"),
                 }
             }
-            println!("in{ii} pushes={} ss_len={}", items.len(), vin.script_sig.len());
+            println!(
+                "in{ii} pushes={} ss_len={}",
+                items.len(),
+                vin.script_sig.len()
+            );
             if items.len() != 2 {
                 // dump all push lens
                 for (k, it) in items.iter().enumerate() {

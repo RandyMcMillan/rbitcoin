@@ -13,9 +13,9 @@ mod p2wpkh;
 mod p2wsh;
 
 #[cfg(test)]
-mod core_vectors;
-#[cfg(test)]
 mod core_tx_vectors;
+#[cfg(test)]
+mod core_vectors;
 #[cfg(test)]
 mod tests_verify;
 
@@ -46,8 +46,7 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
     }
     let mut cache = SighashCache::new(tx);
     if n == 1 {
-        return verify_input(job, 0, tx, &mut cache)
-            .map_err(|e| annotate_script_err(e, tx, 0));
+        return verify_input(job, 0, tx, &mut cache).map_err(|e| annotate_script_err(e, tx, 0));
     }
     for ii in 0..n {
         verify_input(job, ii, tx, &mut cache).map_err(|e| annotate_script_err(e, tx, ii))?;
@@ -56,7 +55,11 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
 }
 
 /// Append `txid=… vin=…` to script errors for operator diagnosis.
-fn annotate_script_err(err: ConsensusError, tx: &Transaction, input_index: usize) -> ConsensusError {
+fn annotate_script_err(
+    err: ConsensusError,
+    tx: &Transaction,
+    input_index: usize,
+) -> ConsensusError {
     match err {
         ConsensusError::Script(msg) if !msg.contains("txid=") => {
             let txid = tx.compute_txid();
@@ -504,17 +507,13 @@ pub(crate) mod crypto {
             let neg = vec![0x30, 0x07, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01, 0x01];
             assert!(!is_valid_signature_encoding(&neg));
             // excess leading zero on R
-            let pad = vec![
-                0x30, 0x08, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01, 0x01,
-            ];
+            let pad = vec![0x30, 0x08, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01, 0x01];
             assert!(!is_valid_signature_encoding(&pad));
             // S high bit
             let sneg = vec![0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x80, 0x01];
             assert!(!is_valid_signature_encoding(&sneg));
             // excess leading zero on S
-            let spad = vec![
-                0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x01, 0x01,
-            ];
+            let spad = vec![0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x01, 0x01];
             assert!(!is_valid_signature_encoding(&spad));
             // zero-length S
             assert!(!is_valid_signature_encoding(&[
@@ -523,8 +522,8 @@ pub(crate) mod crypto {
             // S marker wrong
             let mut sm = valid_der_sig();
             sm[4] = 0x03; // after R len=1 at [3]=1, S tag at index 4
-            // structure: [0]=30 [1]=06 [2]=02 [3]=01 [4]=R [5]=02 [6]=01 [7]=S [8]=ht
-            // Actually valid_der is 30 06 02 01 01 02 01 01 01 so S tag at [5]
+                          // structure: [0]=30 [1]=06 [2]=02 [3]=01 [4]=R [5]=02 [6]=01 [7]=S [8]=ht
+                          // Actually valid_der is 30 06 02 01 01 02 01 01 01 so S tag at [5]
             let mut sm = valid_der_sig();
             sm[5] = 0x03;
             assert!(!is_valid_signature_encoding(&sm));
@@ -546,12 +545,10 @@ pub(crate) mod crypto {
 #[cfg(test)]
 mod verify_routing_tests {
     use super::*;
+    use crate::block::ScriptCheckJob;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
-    use crate::block::ScriptCheckJob;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
     #[test]
     fn empty_prevouts_and_index_errors() {
@@ -683,7 +680,9 @@ mod verify_routing_tests {
         assert!(!p2pkh_scriptsig_shape_error(&ConsensusError::Script(
             "p2pkh ecdsa".into()
         )));
-        assert!(!p2pkh_scriptsig_shape_error(&ConsensusError::MissingPrevout));
+        assert!(!p2pkh_scriptsig_shape_error(
+            &ConsensusError::MissingPrevout
+        ));
     }
 
     #[test]
@@ -751,14 +750,10 @@ mod verify_routing_tests {
         // Non-standard raw type 0x65 → slow path for p2wsh.
         let mut cache = bitcoin::sighash::SighashCache::new(&tx);
         let wscript = Script::from_bytes(&[0x51]);
-        let h_fast = crypto::bip143_p2wsh_signature_hash(
-            &tx, 0, wscript, amt, 0x01, &mut cache,
-        )
-        .unwrap();
-        let h_slow = crypto::bip143_p2wsh_signature_hash(
-            &tx, 0, wscript, amt, 0x65, &mut cache,
-        )
-        .unwrap();
+        let h_fast =
+            crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &mut cache).unwrap();
+        let h_slow =
+            crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x65, &mut cache).unwrap();
         assert_ne!(h_fast, [0u8; 32]);
         assert_ne!(h_slow, [0u8; 32]);
         // Standard and non-standard types must differ (raw_ty in digest).

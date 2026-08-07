@@ -119,7 +119,11 @@ impl OutputRecord {
         }
         out.push(flags);
         // Non-negative sats as uleb128 (Bitcoin values are ≥ 0).
-        let v = if self.value < 0 { 0u64 } else { self.value as u64 };
+        let v = if self.value < 0 {
+            0u64
+        } else {
+            self.value as u64
+        };
         write_uleb128(out, v);
         if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) == 0 {
             write_compact_size(out, self.script.len() as u64);
@@ -489,7 +493,12 @@ impl InputRecord {
     /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
         // flags + create_fk(8) + vout + sequence + script + witness (upper bound)
-        1 + 8 + 9 + 4 + 9 + self.script_sig.len() + 9
+        1 + 8
+            + 9
+            + 4
+            + 9
+            + self.script_sig.len()
+            + 9
             + self.witness.iter().map(|i| 9 + i.len()).sum::<usize>()
     }
 
@@ -587,7 +596,10 @@ fn xor_script_regions_in_input(
             if off + ilen > buf.len() {
                 return;
             }
-            secret.xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, &mut buf[off..off + ilen]);
+            secret.xor_bytes(
+                u64::from(wi as u32).saturating_add(1) << 16,
+                &mut buf[off..off + ilen],
+            );
             off += ilen;
         }
     }
@@ -862,9 +874,7 @@ fn deobfuscate_decoded_inputs_outputs(
 /// Packed meta + input create edges only (skip scripts, witnesses, and outputs).
 ///
 /// Each edge is `(create_fk, vout)`; coinbase → `(Fk::NULL, u32::MAX)`.
-pub fn scan_packed_meta_and_prevouts(
-    raw: &[u8],
-) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
+pub fn scan_packed_meta_and_prevouts(raw: &[u8]) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
     if raw.len() < TxRecord::BODY_META_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
@@ -881,9 +891,7 @@ pub fn scan_packed_meta_and_prevouts(
 }
 
 /// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
-pub fn decode_packed_tx_outs_only(
-    raw: &[u8],
-) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+pub fn decode_packed_tx_outs_only(raw: &[u8]) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
     let (meta, outs, _rels) = decode_packed_tx_outs_with_spender_rels(raw)?;
     Ok((meta, outs))
 }
@@ -973,8 +981,7 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
             return Err(StoreError::Corrupt("packed outputs short"));
         }
         let rel = off as u32;
-        let want = take_all
-            || (need_i < need_vouts.len() && need_vouts[need_i] == vout);
+        let want = take_all || (need_i < need_vouts.len() && need_vouts[need_i] == vout);
         if want {
             let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
             off += used;
@@ -1190,9 +1197,7 @@ impl TxTable {
         }
         let keys: Vec<u64> = txids
             .iter()
-            .map(|txid| {
-                crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid))
-            })
+            .map(|txid| crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid)))
             .collect();
         self.head.replace_open_keys(keys)?;
         rbitcoin_log::info!(
@@ -1200,7 +1205,6 @@ impl TxTable {
         );
         Ok(())
     }
-
 
     pub fn count(&self) -> u64 {
         self.body.count()
@@ -1221,25 +1225,10 @@ impl TxTable {
         self.body.record_range(fk)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
     /// Used by load: discover parents without full parse into RAM.
-    pub fn get_meta_and_prevouts(
-        &self,
-        fk: Fk,
-    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
+    pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         let (mut tx, prevs) = self
             .body
             .with_raw(fk, |raw| scan_packed_meta_and_prevouts(raw))?;
@@ -1290,20 +1279,18 @@ impl TxTable {
         self.put_batch_indexed(recs, true)
     }
 
-    pub fn put_batch_indexed(
-        &self,
-        recs: &[TxRecord],
-        index: bool,
-    ) -> Result<Vec<Fk>, StoreError> {
+    pub fn put_batch_indexed(&self, recs: &[TxRecord], index: bool) -> Result<Vec<Fk>, StoreError> {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
         // Bare-meta rows: body meta only + sidefile identity (schema 13).
         let est: usize = recs.len() * (TxRecord::BODY_META_LEN + 16);
         let base = self.body.count();
-        let fks = self.body.put_batch_encode_aligned(recs.len(), est, |i, buf| {
-            recs[i].encode_body_meta_into(buf);
-        })?;
+        let fks = self
+            .body
+            .put_batch_encode_aligned(recs.len(), est, |i, buf| {
+                recs[i].encode_body_meta_into(buf);
+            })?;
         let ids: Vec<[u8; 32]> = recs.iter().map(|r| r.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -1365,7 +1352,10 @@ impl TxTable {
     ///
     /// `vouts` need not be sorted; results are returned in ascending vout order.
     /// Missing vouts are omitted (caller treats as NotFound).
-    fn packed_output_spender_rels(raw: &[u8], vouts: &[u32]) -> Result<Vec<(u32, u64)>, StoreError> {
+    fn packed_output_spender_rels(
+        raw: &[u8],
+        vouts: &[u32],
+    ) -> Result<Vec<(u32, u64)>, StoreError> {
         if raw.len() < TxRecord::BODY_META_LEN {
             return Err(StoreError::Corrupt("short packed tx"));
         }
@@ -1494,18 +1484,14 @@ impl TxTable {
         ),
         StoreError,
     > {
-        use crate::idx_body_pipeline::{
-            run_idx_body_pipeline_backend, BodyMode, IdxBodyJob,
-        };
+        use crate::idx_body_pipeline::{run_idx_body_pipeline_backend, BodyMode, IdxBodyJob};
         use std::time::Instant;
         if items.is_empty() {
             return Ok((Vec::new(), 0, 0));
         }
         let mut jobs: Vec<IdxBodyJob> = items
             .iter()
-            .map(|(fk, range, _txid, _need)| {
-                IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range))
-            })
+            .map(|(fk, range, _txid, _need)| IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range)))
             .collect();
         let t_body = Instant::now();
         run_idx_body_pipeline_backend(
@@ -1524,11 +1510,8 @@ impl TxTable {
                 out.push(None);
                 continue;
             }
-            match decode_packed_tx_need_outs_with_spender_rels_secret(
-                &job.body,
-                need,
-                Some(secret),
-            ) {
+            match decode_packed_tx_need_outs_with_spender_rels_secret(&job.body, need, Some(secret))
+            {
                 Ok((mut tx, live, sparse)) => {
                     tx.txid = *known_txid;
                     out.push(Some((tx, live, sparse)));
@@ -1558,10 +1541,7 @@ impl TxTable {
         (
             Vec<(
                 [u8; 32],
-                Option<(
-                    Fk,
-                    Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
-                )>,
+                Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
             )>,
             u64, /* dens_ns */
         ),
@@ -1576,10 +1556,7 @@ impl TxTable {
     /// **Sorted** walk of `tx.idx` via [`VarTable::record_range_batch`] (FdOnly
     /// pread segments) —
     /// same modality as archive head-resolve idx (not scatter io_uring/pread).
-    pub fn body_range_batch(
-        &self,
-        fks: &[Fk],
-    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+    pub fn body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         self.body.record_range_batch(fks)
     }
 
@@ -1590,10 +1567,8 @@ impl TxTable {
     pub fn get_full_batch_at(
         &self,
         ranges: &[(Fk, u64, u64)],
-    ) -> Result<
-        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>,
-        StoreError,
-    > {
+    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>, StoreError>
+    {
         use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
         if ranges.is_empty() {
             return Ok(Vec::new());
@@ -1759,17 +1734,15 @@ impl TxTable {
             return Ok(Vec::new());
         }
         match backend {
-            SpendMetaBackend::Uring => {
-                match self.get_spender_meta_at_abs_batch_uring(abs_offs) {
-                    Ok(v) => Ok(v),
-                    Err(e) => {
-                        rbitcoin_log::debug!(
-                            "store: structural meta uring failed ({e}); pread fallback"
-                        );
-                        self.get_spender_meta_at_abs_batch_pread(abs_offs)
-                    }
+            SpendMetaBackend::Uring => match self.get_spender_meta_at_abs_batch_uring(abs_offs) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    rbitcoin_log::debug!(
+                        "store: structural meta uring failed ({e}); pread fallback"
+                    );
+                    self.get_spender_meta_at_abs_batch_pread(abs_offs)
                 }
-            }
+            },
             SpendMetaBackend::Pread => self.get_spender_meta_at_abs_batch_pread(abs_offs),
         }
     }
@@ -1779,10 +1752,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
-        self.get_spender_meta_at_abs_batch_fd(
-            abs_offs,
-            crate::io_backend::ReadIoBackend::Uring,
-        )
+        self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Uring)
     }
 
     /// libc pread_batch 9B peeks (no ring).
@@ -1790,10 +1760,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
-        self.get_spender_meta_at_abs_batch_fd(
-            abs_offs,
-            crate::io_backend::ReadIoBackend::Pread,
-        )
+        self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Pread)
     }
 
     fn get_spender_meta_at_abs_batch_fd(
@@ -1889,8 +1856,9 @@ impl TxTable {
         body_len: u64,
         vout: u32,
     ) -> Result<(bool, Fk), StoreError> {
-        self.body
-            .with_bytes_at(body_off, body_len, |raw| Self::spender_meta_from_raw(raw, vout))
+        self.body.with_bytes_at(body_off, body_len, |raw| {
+            Self::spender_meta_from_raw(raw, vout)
+        })
     }
 
     /// One packed body walk: spender meta for many vouts (ascending).
@@ -2015,11 +1983,13 @@ impl TxTable {
             })
             .sum();
         let base = self.body.count();
-        let fks = self.body.put_batch_encode_aligned(items.len(), est, |i, buf| {
-            let (tx, ins, outs) = &items[i];
-            // Schema 13: XOR scripts at rest; body meta without leading txid.
-            encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
-        })?;
+        let fks = self
+            .body
+            .put_batch_encode_aligned(items.len(), est, |i, buf| {
+                let (tx, ins, outs) = &items[i];
+                // Schema 13: XOR scripts at rest; body meta without leading txid.
+                encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
+            })?;
         // Identity sidefile (same create_fk order as body append).
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
@@ -2057,11 +2027,13 @@ impl TxTable {
             })
             .sum();
         let base = self.body.count();
-        let fks = self.body.put_batch_encode_aligned(items.len(), est, |i, buf| {
-            let (pin, ins) = &items[i];
-            let (tx, outs, _dens) = pin.as_ref();
-            encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
-        })?;
+        let fks = self
+            .body
+            .put_batch_encode_aligned(items.len(), est, |i, buf| {
+                let (pin, ins) = &items[i];
+                let (tx, outs, _dens) = pin.as_ref();
+                encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
+            })?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.0.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -2190,10 +2162,7 @@ impl TxTable {
     /// (skips presence probes — much faster for a full rebuild).
     ///
     /// `on_progress(done_bodies, total_bodies, inserted)` is invoked periodically.
-    pub fn backfill_head(
-        &self,
-        on_progress: impl FnMut(u64, u64, u64),
-    ) -> Result<u64, StoreError> {
+    pub fn backfill_head(&self, on_progress: impl FnMut(u64, u64, u64)) -> Result<u64, StoreError> {
         self.backfill_head_inner(/* force_all */ false, on_progress)
     }
 
@@ -2413,7 +2382,6 @@ impl TxTable {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2445,9 +2413,7 @@ mod tests {
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
-        let _g = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         f()
     }
 
@@ -2539,7 +2505,7 @@ mod tests {
         let inputs = vec![
             InputRecord {
                 prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
+                create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -2547,7 +2513,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [3u8; 32],
-            create_fk: Fk(1),
+                create_fk: Fk(1),
                 prev_index: 1,
                 sequence: u32::MAX,
                 script_sig: vec![],
@@ -2880,7 +2846,7 @@ mod tests {
             assert_eq!(b.0, seq.0);
             assert_eq!(b.1.len(), seq.1.len());
             assert_eq!(b.2.len(), b.1.len()); // dense spender_rels
-            // Content-only outs (spender fields cleared for pin/FIFO).
+                                              // Content-only outs (spender fields cleared for pin/FIFO).
             for o in &b.1 {
                 assert!(o.spender_field.is_null());
                 assert!(!o.multi_spender);
@@ -3045,83 +3011,93 @@ mod tests {
     #[test]
     fn get_fk_by_txid_batch_depth_wins_with_workers() {
         with_env_lock(|| {
-        std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-batch-depth-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-batch-depth-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let t = create_tiny(&dir);
+            let txid = [0xab; 32];
+            let mk = |hint: u8| {
+                let rec = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![hint],
+                    witness: vec![],
+                }];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+                (rec, inputs, outputs)
+            };
+            let fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+            let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+            // Also resolve a few unrelated keys in the same bulk call.
+            let mut extra = Vec::new();
+            for i in 0u8..10 {
+                let mut other = [0u8; 32];
+                other[0] = i.wrapping_add(1);
+                let rec = TxRecord {
+                    txid: other,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![0x01],
+                    witness: vec![],
+                }];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+                let fk = t
+                    .put_full_batch_indexed(&[(rec, inputs, outputs)], true)
+                    .unwrap()[0];
+                extra.push((other, fk));
+            }
+            let mut keys: Vec<[u8; 32]> = extra.iter().map(|(t, _)| *t).collect();
+            keys.push(txid);
+            keys.push([0xff; 32]); // miss
+            let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+            let hit = batch
+                .iter()
+                .find(|(t, _)| *t == txid)
                 .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_tiny(&dir);
-        let txid = [0xab; 32];
-        let mk = |hint: u8| {
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![hint],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        let fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
-        let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
-        // Also resolve a few unrelated keys in the same bulk call.
-        let mut extra = Vec::new();
-        for i in 0u8..10 {
-            let mut other = [0u8; 32];
-            other[0] = i.wrapping_add(1);
-            let rec = TxRecord {
-                txid: other,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![0x01],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            let fk = t
-                .put_full_batch_indexed(&[(rec, inputs, outputs)], true)
-                .unwrap()[0];
-            extra.push((other, fk));
-        }
-        let mut keys: Vec<[u8; 32]> = extra.iter().map(|(t, _)| *t).collect();
-        keys.push(txid);
-        keys.push([0xff; 32]); // miss
-        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
-        let hit = batch.iter().find(|(t, _)| *t == txid).unwrap().1.map(|(f, _)| f);
-        assert_eq!(hit, Some(fk2));
-        assert_ne!(hit, Some(fk1));
-        for (other, fk) in &extra {
-            let h = batch.iter().find(|(t, _)| t == other).unwrap().1.map(|(f, _)| f);
-            assert_eq!(h, Some(*fk));
-        }
-        assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_BULK_IO_WORKERS");
+                .1
+                .map(|(f, _)| f);
+            assert_eq!(hit, Some(fk2));
+            assert_ne!(hit, Some(fk1));
+            for (other, fk) in &extra {
+                let h = batch
+                    .iter()
+                    .find(|(t, _)| t == other)
+                    .unwrap()
+                    .1
+                    .map(|(f, _)| f);
+                assert_eq!(h, Some(*fk));
+            }
+            assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::remove_var("RBITCOIN_BULK_IO_WORKERS");
         });
     }
 
@@ -3152,7 +3128,7 @@ mod tests {
             };
             let inputs = vec![InputRecord {
                 prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
+                create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -3414,9 +3390,7 @@ mod tests {
         let s1 = Fk(10);
         t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, Fk(20))])
             .unwrap();
-        let metas = t
-            .get_output_spender_metas_at(off, len, &[0, 1, 2])
-            .unwrap();
+        let metas = t.get_output_spender_metas_at(off, len, &[0, 1, 2]).unwrap();
         assert_eq!(metas.len(), 3);
         assert!(!metas[0].1 && metas[0].2 == s1);
         assert!(!metas[1].1 && metas[1].2.is_null());
@@ -3436,9 +3410,18 @@ mod tests {
             .collect();
         let bulk = t.get_spender_meta_at_abs_batch(&abs).unwrap();
         assert_eq!(bulk.len(), 3);
-        assert_eq!(bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((s1, false)));
-        assert_eq!(bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk::NULL, false)));
-        assert_eq!(bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk(20), false)));
+        assert_eq!(
+            bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+            Some((s1, false))
+        );
+        assert_eq!(
+            bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+            Some((Fk::NULL, false))
+        );
+        assert_eq!(
+            bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+            Some((Fk(20), false))
+        );
         // Both backends must agree.
         let mmap = t
             .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Pread)
@@ -3559,7 +3542,7 @@ mod tests {
         let run = vec![
             InputRecord {
                 prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
+                create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -3567,7 +3550,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [2u8; 32],
-            create_fk: Fk(1),
+                create_fk: Fk(1),
                 prev_index: 0,
                 sequence: 1,
                 script_sig: vec![],
@@ -3575,7 +3558,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [3u8; 32],
-            create_fk: Fk(1),
+                create_fk: Fk(1),
                 prev_index: 3,
                 sequence: u32::MAX,
                 script_sig: vec![],
@@ -3609,7 +3592,11 @@ mod tests {
         // OP_TRUE + spender_field(8) + flags + uleb value
         let mut tiny = Vec::new();
         run[0].encode_into(&mut tiny);
-        assert!(tiny.len() < 24, "op_true+value should be compact: {}", tiny.len());
+        assert!(
+            tiny.len() < 24,
+            "op_true+value should be compact: {}",
+            tiny.len()
+        );
     }
 
     #[test]
@@ -3999,7 +3986,7 @@ mod tests {
             let mut short_seq = vec![0u8];
             short_seq.extend_from_slice(&1u64.to_le_bytes());
             short_seq.push(0); // vout 0
-            // only 2 of 4 sequence bytes
+                               // only 2 of 4 sequence bytes
             short_seq.extend_from_slice(&[1, 2]);
             assert!(matches!(
                 InputRecord::decode_prevout_at(&short_seq),
@@ -4012,8 +3999,8 @@ mod tests {
             short_wit.extend_from_slice(&1u64.to_le_bytes());
             short_wit.push(0); // vout
             short_wit.push(0); // empty script via compact 0? flags don't have EMPTY_SCRIPT
-            // Actually EMPTY_SCRIPT not set → need script len
-            // Rebuild: SEQ_FINAL | no EMPTY_SCRIPT | no EMPTY_WITNESS
+                               // Actually EMPTY_SCRIPT not set → need script len
+                               // Rebuild: SEQ_FINAL | no EMPTY_SCRIPT | no EMPTY_WITNESS
             let mut short_wit = vec![input_flags::SEQ_FINAL];
             short_wit.extend_from_slice(&1u64.to_le_bytes());
             short_wit.push(0); // vout
@@ -4092,7 +4079,11 @@ mod tests {
         // input run trailing
         {
             let mut irun = Vec::new();
-            encode_input_run_secret(&[InputRecord::coinbase(u32::MAX, vec![], vec![])], &mut irun, None);
+            encode_input_run_secret(
+                &[InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                &mut irun,
+                None,
+            );
             irun.push(0);
             assert!(matches!(
                 decode_input_run(&irun, 1),
@@ -4450,7 +4441,11 @@ mod tests {
         for chunk in recs.chunks(100) {
             t.put_batch(chunk).unwrap();
         }
-        assert!(t.head_segment_count() >= 2, "segs={}", t.head_segment_count());
+        assert!(
+            t.head_segment_count() >= 2,
+            "segs={}",
+            t.head_segment_count()
+        );
         // lookup first, mid, last
         for i in [1u64, 400, 819, 820, 900] {
             let mut txid = [0u8; 32];
@@ -4490,6 +4485,4 @@ mod tests {
         assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-
 }

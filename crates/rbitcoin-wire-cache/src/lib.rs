@@ -3,11 +3,11 @@
 //! Indexed by **block hash** so competing tips and side branches at the same height
 //! are retained until they age out of the recent window (max tip height − depth).
 
-use std::sync::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 /// Crate identity for diagnostics.
 pub fn crate_name() -> &'static str {
@@ -169,7 +169,8 @@ impl WireRing {
 
     pub fn get_by_hash(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
         self.inner
-            .read().unwrap()
+            .read()
+            .unwrap()
             .by_hash
             .get(hash)
             .map(|e| e.wire.clone())
@@ -182,7 +183,8 @@ impl WireRing {
     /// All wire blocks at a given height (forks / competing tips).
     pub fn get_all_at_height(&self, height: u32) -> Vec<WireEntry> {
         self.inner
-            .read().unwrap()
+            .read()
+            .unwrap()
             .by_hash
             .values()
             .filter(|e| e.height == height)
@@ -215,7 +217,8 @@ impl WireRing {
 
     pub fn contains_height(&self, height: u32) -> bool {
         self.inner
-            .read().unwrap()
+            .read()
+            .unwrap()
             .by_hash
             .values()
             .any(|e| e.height == height)
@@ -277,9 +280,7 @@ impl WireRing {
                 f.read_to_end(&mut buf)?;
                 buf
             };
-            let (prev_hash, height, wire) = if meta_rest.len() >= 4 + 4 + 32
-                && name.len() >= 64
-            {
+            let (prev_hash, height, wire) = if meta_rest.len() >= 4 + 4 + 32 && name.len() >= 64 {
                 // Prefer new format: 32 prev + 4 height + 4 len + wire
                 if meta_rest.len() >= 40 {
                     let prev: [u8; 32] = meta_rest[0..32].try_into().unwrap();

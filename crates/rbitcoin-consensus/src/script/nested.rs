@@ -180,13 +180,11 @@ fn split_script_sig_redeem(script: &Script) -> Result<(Vec<Vec<u8>>, Vec<u8>), C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ScriptCheckJob;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::script::ScriptBuf;
-    use bitcoin::{
-        Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
-    use crate::block::ScriptCheckJob;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
     fn dummy_tx() -> Transaction {
         Transaction {

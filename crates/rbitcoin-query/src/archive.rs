@@ -42,8 +42,7 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 /// `(tx, live need outs, sparse denserels as (vout, rel))` — **not** a full
 /// `output_count`-sized outs/denserels expand. Transient on the plan until pin;
 /// sparse need then lives in [`crate::BatchParents`].
-pub type SparseExternalPin =
-    std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>;
+pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>;
 
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
@@ -167,11 +166,7 @@ impl ArchiveWritePlan {
 }
 
 impl Query {
-    pub fn archive_block(
-        &self,
-        header: &HeaderRecord,
-        txs: &[TxApply],
-    ) -> Result<Fk, QueryError> {
+    pub fn archive_block(&self, header: &HeaderRecord, txs: &[TxApply]) -> Result<Fk, QueryError> {
         // Single-block path: one clone into owned plan batch.
         let mut items = vec![(header.clone(), txs.to_vec())];
         let mut out = self.archive_prepared_owned(&mut items)?;
@@ -316,12 +311,10 @@ impl Query {
         // Pass 1: assign create fks + build batch_map (txid → create_fk).
         let t_assign = Instant::now();
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
-        let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
-            Vec::new();
+        let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        let archive_spends =
-            self.spend_index_enabled() && self.index_mode().is_tip();
+        let archive_spends = self.spend_index_enabled() && self.index_mode().is_tip();
         let index_tx = self.tx_index_enabled();
 
         for (header_fk, txs) in need.iter_mut() {
@@ -372,8 +365,7 @@ impl Query {
         // sticky_* slots kept at 0 (process pin FIFO removed; head + in-flight only).
         let sticky_ns = 0u64;
         let sticky_hit_n = 0u64;
-        let mut resolved: HashMap<[u8; 32], Fk> =
-            HashMap::with_capacity(need_vec.len() / 2);
+        let mut resolved: HashMap<[u8; 32], Fk> = HashMap::with_capacity(need_vec.len() / 2);
 
         // Prior plan batch(es) still in the write queue: not head yet.
         let t_inflight = Instant::now();
@@ -407,7 +399,9 @@ impl Query {
         let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
         let mut external_parent_txids: std::collections::HashMap<u64, [u8; 32]> =
-            std::collections::HashMap::with_capacity(resolved.len().saturating_add(need_head.len()));
+            std::collections::HashMap::with_capacity(
+                resolved.len().saturating_add(need_head.len()),
+            );
         // Reverse map for in-flight / head binds already in `resolved`.
         for (txid, fk) in &resolved {
             if let Some(id) = fk.get() {
@@ -642,7 +636,6 @@ impl Query {
     pub fn archive_epoch(&self) -> rbitcoin_store::ArchiveEpoch {
         self.store.epoch()
     }
-
 }
 
 #[cfg(test)]
@@ -780,13 +773,17 @@ mod tests {
         let empty = crate::InFlightView::empty();
         let mut next = q.tx_body_count() + 1;
         let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
-        let plan_a = q.archive_plan_batch_from(&mut need_a, next, &empty).unwrap();
+        let plan_a = q
+            .archive_plan_batch_from(&mut need_a, next, &empty)
+            .unwrap();
         assert_eq!(plan_a.planned_fks, vec![Fk(2), Fk(3)]);
         next = plan_a.planned_fks.last().unwrap().0 + 1;
         assert_eq!(next, 4);
 
         let mut need_b = vec![(Fk(20), vec![coinbase_apply(20)])];
-        let plan_b = q.archive_plan_batch_from(&mut need_b, next, &empty).unwrap();
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, next, &empty)
+            .unwrap();
         assert_eq!(plan_b.planned_fks, vec![Fk(4)]);
         // Durable count still 1 until commit.
         assert_eq!(q.tx_body_count(), 1);
@@ -901,7 +898,11 @@ mod tests {
             .store
             .txs
             .put_full_batch_indexed(
-                &[(parent.tx.clone(), parent.inputs.clone(), parent.outputs.clone())],
+                &[(
+                    parent.tx.clone(),
+                    parent.inputs.clone(),
+                    parent.outputs.clone(),
+                )],
                 true,
             )
             .unwrap();
@@ -920,7 +921,10 @@ mod tests {
             .get_outs_denserels_by_range_batch(&[(parent_fk, range, known, vec![0])])
             .unwrap();
         let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
-        assert_eq!(tx.txid, parent_txid, "API sets known_txid (RAM), not sidefile");
+        assert_eq!(
+            tx.txid, parent_txid,
+            "API sets known_txid (RAM), not sidefile"
+        );
         assert_eq!(live.len(), 1);
         assert_eq!(sparse.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

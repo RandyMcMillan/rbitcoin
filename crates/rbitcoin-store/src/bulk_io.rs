@@ -725,9 +725,7 @@ fn pread_one(op: &mut ReadOp<'_>) {
             )
         };
         if n < 0 {
-            op.result = -std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(5) as i32;
+            op.result = -std::io::Error::last_os_error().raw_os_error().unwrap_or(5) as i32;
             return;
         }
         if n == 0 {
@@ -762,9 +760,7 @@ fn pwrite_one(op: &mut WriteOp<'_>) {
             )
         };
         if n < 0 {
-            op.result = -std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(5) as i32;
+            op.result = -std::io::Error::last_os_error().raw_os_error().unwrap_or(5) as i32;
             return;
         }
         if n == 0 {
@@ -1128,14 +1124,7 @@ mod tests {
             assert!(op.result >= 50, "result={}", op.result);
         }
         let mut got = vec![0u8; 150];
-        let n = unsafe {
-            libc::pread(
-                fd,
-                got.as_mut_ptr() as *mut libc::c_void,
-                150,
-                0,
-            )
-        };
+        let n = unsafe { libc::pread(fd, got.as_mut_ptr() as *mut libc::c_void, 150, 0) };
         assert_eq!(n, 150);
         assert_eq!(&got[0..50], &d0[..]);
         assert_eq!(&got[50..100], &d1[..]);
@@ -1170,14 +1159,7 @@ mod tests {
         assert!(rmw_ok);
         drop(pages);
         let mut got2 = vec![0u8; 150];
-        let n2 = unsafe {
-            libc::pread(
-                fd,
-                got2.as_mut_ptr() as *mut libc::c_void,
-                150,
-                0,
-            )
-        };
+        let n2 = unsafe { libc::pread(fd, got2.as_mut_ptr() as *mut libc::c_void, 150, 0) };
         assert_eq!(n2, 150);
         assert_eq!(got2[0], 11);
         assert_eq!(got2[50], 12);
@@ -1231,7 +1213,10 @@ mod tests {
         pread_batch(&mut ops); // uring false → fallback still fills
         TEST_FORCE_SESSION_FALSE.with(|c| c.set(false));
         drop(ops);
-        assert_eq!(&b, b"abcd", "fallback must still serve the forced-false wave");
+        assert_eq!(
+            &b, b"abcd",
+            "fallback must still serve the forced-false wave"
+        );
         assert_eq!(
             URING_MODE.load(Ordering::Relaxed),
             1,

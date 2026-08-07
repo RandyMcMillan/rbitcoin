@@ -33,10 +33,7 @@ fn parse_args() -> (usize, u32, String, PathBuf) {
     let mut n = 100_000usize;
     let mut bits = 16u32;
     let mut access = "fd".to_string();
-    let mut dir = env::temp_dir().join(format!(
-        "rbitcoin-store-bench-{}",
-        std::process::id()
-    ));
+    let mut dir = env::temp_dir().join(format!("rbitcoin-store-bench-{}", std::process::id()));
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {

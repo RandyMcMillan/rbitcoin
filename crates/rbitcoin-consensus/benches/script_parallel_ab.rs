@@ -10,11 +10,9 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
-use rbitcoin_consensus::script_bench::{self, JobBytes};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use rayon::prelude::*;
+use rbitcoin_consensus::script_bench::{self, JobBytes};
 
 fn p2tr_job(seed: u8) -> JobBytes {
     let secp = Secp256k1::new();

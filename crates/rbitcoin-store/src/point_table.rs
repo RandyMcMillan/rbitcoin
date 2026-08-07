@@ -114,9 +114,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address_head::HeadLayout;
     use crate::spender_table::SpenderTable;
     use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
-    use crate::address_head::HeadLayout;
 
     fn tmp() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -189,7 +189,7 @@ mod tests {
         .unwrap();
         assert_eq!(visited.len(), 3);
         assert_eq!(visited[0], s3); // newest head
-        // Early stop.
+                                    // Early stop.
         let mut n = 0;
         for_each_spender_create(&txs, &spenders, create, 0, |_| {
             n += 1;
@@ -198,17 +198,13 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1);
         // Null create / missing / unspent.
-        for_each_spender_create(&txs, &spenders, Fk::NULL, 0, |_| unreachable!())
-            .unwrap();
-        for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_| unreachable!())
-            .unwrap();
-        for_each_spender_create(&txs, &spenders, create, 1, |_| unreachable!())
-            .unwrap();
+        for_each_spender_create(&txs, &spenders, Fk::NULL, 0, |_| unreachable!()).unwrap();
+        for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_| unreachable!()).unwrap();
+        for_each_spender_create(&txs, &spenders, create, 1, |_| unreachable!()).unwrap();
 
         // body_range path
         let (off, len) = txs.body_range(create).unwrap();
-        put_spend_on_create_at(&txs, &spenders, create, 1, s1, Some((off, len)))
-            .unwrap();
+        put_spend_on_create_at(&txs, &spenders, create, 1, s1, Some((off, len))).unwrap();
         let mut one = None;
         for_each_spender_create(&txs, &spenders, create, 1, |fk| {
             one = Some(fk);

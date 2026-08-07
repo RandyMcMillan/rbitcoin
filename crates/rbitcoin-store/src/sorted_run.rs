@@ -187,17 +187,11 @@ fn load_manifest(dir: &Path) -> Result<Option<Manifest>, StoreError> {
     let mut f = File::open(&path).map_err(|e| io_err(&path, e))?;
     let mut hdr = [0u8; 16];
     if f.read_exact(&mut hdr).is_err() {
-        rbitcoin_log::warn!(
-            "store: sorted-run MANIFEST truncated at {}",
-            path.display()
-        );
+        rbitcoin_log::warn!("store: sorted-run MANIFEST truncated at {}", path.display());
         return Ok(None);
     }
     if hdr[0..8] != MANIFEST_MAGIC {
-        rbitcoin_log::warn!(
-            "store: sorted-run MANIFEST bad magic at {}",
-            path.display()
-        );
+        rbitcoin_log::warn!("store: sorted-run MANIFEST bad magic at {}", path.display());
         return Ok(None);
     }
     let ver = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
@@ -438,7 +432,9 @@ fn write_sorted_run_file(
         return Err(StoreError::Corrupt("sorted run: bad key/rec len"));
     }
     if records.len() % rec_len as usize != 0 {
-        return Err(StoreError::Corrupt("sorted run: body not multiple of rec_len"));
+        return Err(StoreError::Corrupt(
+            "sorted run: body not multiple of rec_len",
+        ));
     }
     let count = (records.len() / rec_len as usize) as u64;
     let body_crc32 = crc32(records);
@@ -500,9 +496,7 @@ fn advise_file_dont_need(path: &Path) {
             Err(_) => return,
         };
         // offset=0, len=0 ⇒ entire file on Linux.
-        let rc = unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
-        };
+        let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         if rc != 0 {
             rbitcoin_log::trace!(
                 "store: sorted-run fadvise(DONTNEED) failed path={}: {}",
@@ -731,7 +725,9 @@ impl RunCursor {
         if self.next + self.rec_len > self.page_len {
             self.refill()?;
             if self.next + self.rec_len > self.page_len {
-                return Err(StoreError::Corrupt("sorted run: short read on merge cursor"));
+                return Err(StoreError::Corrupt(
+                    "sorted run: short read on merge cursor",
+                ));
             }
         }
         self.cur = self.next;
@@ -875,10 +871,7 @@ pub fn list_materialize_claims(dir: &Path) -> Result<Vec<SortedRunPath>, StoreEr
         match open_run(&p) {
             Ok(r) => out.push(r),
             Err(e) => {
-                rbitcoin_log::warn!(
-                    "store: skipping bad materialize claim {}: {e}",
-                    p.display()
-                );
+                rbitcoin_log::warn!("store: skipping bad materialize claim {}: {e}", p.display());
             }
         }
     }
@@ -1459,7 +1452,11 @@ pub fn reduce_runs_to_fanin_cancellable(
         resumed = false;
     }
 
-    let total_recs: u64 = remaining.iter().chain(done_outputs.iter()).map(|r| r.count).sum();
+    let total_recs: u64 = remaining
+        .iter()
+        .chain(done_outputs.iter())
+        .map(|r| r.count)
+        .sum();
     let total_body: u64 = remaining
         .iter()
         .chain(done_outputs.iter())
@@ -1491,10 +1488,8 @@ pub fn reduce_runs_to_fanin_cancellable(
 
     // Shared progress for parallel workers.
     use std::sync::Mutex;
-    let pending_inputs: Vec<SortedRunPath> = jobs
-        .iter()
-        .flat_map(|(c, _)| c.iter().cloned())
-        .collect();
+    let pending_inputs: Vec<SortedRunPath> =
+        jobs.iter().flat_map(|(c, _)| c.iter().cloned()).collect();
     let state = Mutex::new(FaninChunkState {
         done_outputs: done_outputs.clone(),
         pending_inputs,
@@ -1516,51 +1511,49 @@ pub fn reduce_runs_to_fanin_cancellable(
             let work_dir = work_dir;
             let fanin = fanin;
             let gen = gen;
-            scope.spawn(move || {
-                loop {
-                    if cancel_requested(cancel) {
+            scope.spawn(move || loop {
+                if cancel_requested(cancel) {
+                    let mut st = state.lock().unwrap();
+                    st.cancelled = true;
+                    break;
+                }
+                let job = {
+                    let mut q = job_list.lock().unwrap();
+                    q.pop()
+                };
+                let Some((chunk, out_path)) = job else {
+                    break;
+                };
+                let chunk_bytes: u64 = chunk.iter().map(run_body_bytes).sum();
+                match merge_runs_to_file(&chunk, &out_path) {
+                    Ok(merged) => {
+                        for r in &chunk {
+                            let _ = fs::remove_file(&r.path);
+                        }
+                        {
+                            let mut st = state.lock().unwrap();
+                            st.pending_inputs
+                                .retain(|p| !chunk.iter().any(|c| c.path == p.path));
+                            st.done_outputs.push(merged);
+                            st.chunks_finished += 1;
+                            let _ = write_fanin_checkpoint(
+                                work_dir,
+                                gen,
+                                st.seq_note,
+                                fanin,
+                                &st.pending_inputs,
+                                &st.done_outputs,
+                            );
+                        }
+                        if let Ok(mut s) = status_mu.lock() {
+                            s.on_chunk_done(chunk_bytes);
+                        }
+                    }
+                    Err(e) => {
                         let mut st = state.lock().unwrap();
                         st.cancelled = true;
+                        st.last_err = Some(e);
                         break;
-                    }
-                    let job = {
-                        let mut q = job_list.lock().unwrap();
-                        q.pop()
-                    };
-                    let Some((chunk, out_path)) = job else {
-                        break;
-                    };
-                    let chunk_bytes: u64 = chunk.iter().map(run_body_bytes).sum();
-                    match merge_runs_to_file(&chunk, &out_path) {
-                        Ok(merged) => {
-                            for r in &chunk {
-                                let _ = fs::remove_file(&r.path);
-                            }
-                            {
-                                let mut st = state.lock().unwrap();
-                                st.pending_inputs
-                                    .retain(|p| !chunk.iter().any(|c| c.path == p.path));
-                                st.done_outputs.push(merged);
-                                st.chunks_finished += 1;
-                                let _ = write_fanin_checkpoint(
-                                    work_dir,
-                                    gen,
-                                    st.seq_note,
-                                    fanin,
-                                    &st.pending_inputs,
-                                    &st.done_outputs,
-                                );
-                            }
-                            if let Ok(mut s) = status_mu.lock() {
-                                s.on_chunk_done(chunk_bytes);
-                            }
-                        }
-                        Err(e) => {
-                            let mut st = state.lock().unwrap();
-                            st.cancelled = true;
-                            st.last_err = Some(e);
-                            break;
-                        }
                     }
                 }
             });
@@ -1612,7 +1605,9 @@ struct FaninChunkState {
 ///
 /// Returns `Ok(None)` if not ready / empty. Used to resume tip materialize after
 /// claimed inputs were deleted post-reduce.
-pub fn list_fanin_reduce_outputs(work_dir: &Path) -> Result<Option<Vec<SortedRunPath>>, StoreError> {
+pub fn list_fanin_reduce_outputs(
+    work_dir: &Path,
+) -> Result<Option<Vec<SortedRunPath>>, StoreError> {
     let ready = work_dir.join(FANIN_READY_NAME);
     if !ready.is_file() {
         return Ok(None);
@@ -1743,10 +1738,7 @@ fn open_and_check_against_entry(
     expect: &ManifestEntry,
 ) -> Result<SortedRunPath, StoreError> {
     let run = open_run(path)?;
-    if run.count != expect.count
-        || run.key_len != expect.key_len
-        || run.rec_len != expect.rec_len
-    {
+    if run.count != expect.count || run.key_len != expect.key_len || run.rec_len != expect.rec_len {
         return Err(StoreError::Corrupt(
             "sorted run: header does not match MANIFEST",
         ));
@@ -1790,10 +1782,7 @@ pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
                     );
                 }
                 Err(e) => {
-                    rbitcoin_log::warn!(
-                        "store: skipping bad sorted run {}: {e}",
-                        path.display()
-                    );
+                    rbitcoin_log::warn!("store: skipping bad sorted run {}: {e}", path.display());
                 }
             }
         }
@@ -1822,13 +1811,10 @@ pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
     for p in paths {
         match open_run(&p) {
             Ok(r) => out.push(r),
-            Err(StoreError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            }
             Err(e) => {
-                rbitcoin_log::warn!(
-                    "store: skipping bad sorted run {}: {e}",
-                    p.display()
-                );
+                rbitcoin_log::warn!("store: skipping bad sorted run {}: {e}", p.display());
             }
         }
     }
@@ -2004,8 +1990,10 @@ mod tests {
         let path = d.join("000001.run");
         let run = write_sorted_run(&path, 32, 44, &rec(1, 1)).unwrap();
         let claimed = claim_run_for_materialize(&run).unwrap();
-        assert!(claimed.path.extension().and_then(|s| s.to_str()) == Some("mat")
-            || claimed.path.to_string_lossy().ends_with(".run.mat"));
+        assert!(
+            claimed.path.extension().and_then(|s| s.to_str()) == Some("mat")
+                || claimed.path.to_string_lossy().ends_with(".run.mat")
+        );
         assert!(!path.exists());
         assert!(claimed.path.exists());
         // Concurrent list_runs must not delete the claimed body.
@@ -2207,8 +2195,7 @@ mod tests {
         }
         std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        let err =
-            reduce_runs_to_fanin_cancellable(&inputs, &work, 0, Some(&cancel)).unwrap_err();
+        let err = reduce_runs_to_fanin_cancellable(&inputs, &work, 0, Some(&cancel)).unwrap_err();
         assert!(matches!(err, StoreError::Cancelled(_)), "got {err}");
         std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
         let _ = fs::remove_dir_all(&d);
@@ -2412,10 +2399,7 @@ mod tests {
     #[test]
     fn detach_remove_next_path_and_opts() {
         let d = tmp_dir();
-        assert_eq!(
-            next_run_path(&d, 1).file_name().unwrap(),
-            "000001.run"
-        );
+        assert_eq!(next_run_path(&d, 1).file_name().unwrap(), "000001.run");
         let p1 = next_run_path(&d, 1);
         let mut body = Vec::new();
         body.extend_from_slice(&rec(1, 10));
@@ -2501,15 +2485,13 @@ mod tests {
         let r2 = open_run(&p2).unwrap();
         assert_eq!(read_run_body(&r1).unwrap().len(), 40);
         let out = d.join("l0").join("000003.run");
-        let merged = merge_runs_to_file_with_policy(
-            &[r1, r2],
-            &out,
-            RunWritePolicy::L0,
-            false,
-        )
-        .unwrap();
+        let merged =
+            merge_runs_to_file_with_policy(&[r1, r2], &out, RunWritePolicy::L0, false).unwrap();
         assert_eq!(merged.run.count, 2);
-        assert_eq!(merged.max_u64_at_32, 99, "must track max create_fk while streaming");
+        assert_eq!(
+            merged.max_u64_at_32, 99,
+            "must track max create_fk while streaming"
+        );
         // L0 policy leaves file readable without catalog MANIFEST.
         assert!(out.exists());
         assert!(!manifest_path(out.parent().unwrap()).exists() || true);

@@ -134,9 +134,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let msg = rt
-            .block_on(decode_framed_offload(verack_frame()))
-            .unwrap();
+        let msg = rt.block_on(decode_framed_offload(verack_frame())).unwrap();
         assert!(matches!(msg.payload(), NetworkMessage::Verack));
 
         let done = Arc::new(Mutex::new(false));

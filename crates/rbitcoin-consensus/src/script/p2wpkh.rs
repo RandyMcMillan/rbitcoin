@@ -92,14 +92,8 @@ pub(crate) fn verify_with_keyhash(
 
     let amount = job.prevouts[input_index].value;
     let spk = bitcoin::script::Script::from_bytes(witness_program);
-    let sighash = crypto::bip143_p2wpkh_signature_hash(
-        tx,
-        input_index,
-        spk,
-        amount,
-        sighash_ty,
-        cache,
-    )?;
+    let sighash =
+        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty, cache)?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
@@ -110,10 +104,10 @@ pub(crate) fn verify_with_keyhash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ScriptCheckJob;
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
-    use crate::block::ScriptCheckJob;
 
     fn job_with_witness(items: &[&[u8]]) -> ScriptCheckJob {
         let mut spk = vec![0x00, 0x14];

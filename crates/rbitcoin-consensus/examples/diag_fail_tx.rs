@@ -41,12 +41,7 @@ fn main() {
         .enumerate()
         .find(|(_, t)| t.compute_txid().to_string() == want)
         .unwrap();
-    println!(
-        "tx#{} {} nIn={}",
-        ti,
-        tx.compute_txid(),
-        tx.input.len()
-    );
+    println!("tx#{} {} nIn={}", ti, tx.compute_txid(), tx.input.len());
     let mut prevouts = Vec::new();
     for (ii, inp) in tx.input.iter().enumerate() {
         let prev = fetch_tx(&inp.previous_output.txid.to_string());
@@ -62,11 +57,7 @@ fn main() {
             o.value.to_sat()
         );
         println!("  spk_len={} spk={:02x?}", spk.len(), spk);
-        println!(
-            "  ss_len={} ss={:02x?}",
-            ss.len(),
-            ss
-        );
+        println!("  ss_len={} ss={:02x?}", ss.len(), ss);
         print!("  ss_ops:");
         for ins in inp.script_sig.instructions() {
             match ins {

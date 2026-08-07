@@ -736,8 +736,7 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
     let (ann_ns, ann_n, ann_pread_skip, ann_pread) =
         rbitcoin_consensus::confirm_phase_stats::sample_spend_ann_and_reset();
-    let (meta_ns, meta_n) =
-        rbitcoin_consensus::confirm_phase_stats::sample_spend_meta_and_reset();
+    let (meta_ns, meta_n) = rbitcoin_consensus::confirm_phase_stats::sample_spend_meta_and_reset();
     let (ensure_res_hit, ensure_cold_n) =
         rbitcoin_consensus::confirm_phase_stats::sample_ensure_mix_and_reset();
     let (asm_prevout_ns, asm_sigop_ns, asm_final_ns, asm_job_ns) =
@@ -754,12 +753,8 @@ pub(crate) fn sample(
         asm_prev_cold_n,
         asm_prev_fk_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
-    let (
-        asm_cold_null_fk_n,
-        asm_cold_not_pin_n,
-        asm_cold_txid_mismatch_n,
-        asm_cold_vout_miss_n,
-    ) = rbitcoin_consensus::confirm_phase_stats::sample_assemble_cold_why_and_reset();
+    let (asm_cold_null_fk_n, asm_cold_not_pin_n, asm_cold_txid_mismatch_n, asm_cold_vout_miss_n) =
+        rbitcoin_consensus::confirm_phase_stats::sample_assemble_cold_why_and_reset();
     let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
@@ -1580,9 +1575,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             let dens_mib = s.arch_head_dens_bytes / (1024 * 1024);
             out.push_str(&format!(
                 " dens_wave(fks={} bytes={}MiB dens_ms={})",
-                s.arch_head_dens_fks,
-                dens_mib,
-                s.arch_prep_head_dens_ms,
+                s.arch_head_dens_fks, dens_mib, s.arch_prep_head_dens_ms,
             ));
         }
     }
@@ -1818,19 +1811,22 @@ mod tests {
         assert!(!line.contains("body_pend="), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
-        assert!(
-            line.contains("bq soft=7/180 RAM=128MiB"),
-            "{line}"
-        );
+        assert!(line.contains("bq soft=7/180 RAM=128MiB"), "{line}");
         assert!(line.contains("buf_ahead=224"), "{line}");
-        assert!(!line.contains("lead="), "schema12: no Class A lead= on perf: {line}");
+        assert!(
+            !line.contains("lead="),
+            "schema12: no Class A lead= on perf: {line}"
+        );
         assert!(!line.contains("arch_hwm"), "{line}");
         assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
         // load wall = load_ms(30)+assemble(8) = 38
         assert!(line.contains("load=38ms"), "{line}");
-        assert!(!line.contains("connect="), "assemble is inside load, not a peer stage: {line}");
+        assert!(
+            !line.contains("connect="),
+            "assemble is inside load, not a peer stage: {line}"
+        );
         // write = class_a(12)+ensure(3)+class_c(40)+spend(25)+tip_gc(5) = 85
         assert!(line.contains("write=85ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");
@@ -1957,7 +1953,10 @@ mod tests {
         assert!(line.contains("contract=25ms"), "{line}");
         assert!(line.contains("publish=12ms"), "{line}");
         // I1: total = load+connect = 5000; pin=1800; asm=3000; other=200
-        assert!(line.contains("load_budget total=5000ms pin=1800ms asm=3000ms other=200ms"), "{line}");
+        assert!(
+            line.contains("load_budget total=5000ms pin=1800ms asm=3000ms other=200ms"),
+            "{line}"
+        );
         // I3: us/in = 2500*1000/50000 = 50
         assert!(line.contains("us/in=50"), "{line}");
         assert!(line.contains("batch=2000/n=40000"), "{line}");
@@ -2044,15 +2043,15 @@ mod tests {
         assert!(line.contains("store_ms=50"), "{line}");
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
-        assert!(
-            line.contains("bq soft=3/256 RAM=64MiB"),
-            "{line}"
-        );
+        assert!(line.contains("bq soft=3/256 RAM=64MiB"), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
         assert!(line.contains("loadq"), "{line}");
-        assert!(line.contains("scriptq<0/2 writeq=1/2") || line.contains("scriptq="), "{line}");
+        assert!(
+            line.contains("scriptq<0/2 writeq=1/2") || line.contains("scriptq="),
+            "{line}"
+        );
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
@@ -2153,23 +2152,20 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("miss="), "{line}");
         assert!(!line.contains("body_soft"), "{line}");
-        assert!(
-            line.contains("bq soft=4/256 RAM=32MiB"),
-            "{line}"
-        );
+        assert!(line.contains("bq soft=4/256 RAM=32MiB"), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
-        assert!(
-            line.contains("conf_plans=80"),
-            "{line}"
-        );
+        assert!(line.contains("conf_plans=80"), "{line}");
         assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
         // parents= is pipeline total (scriptq + writeq entry counts).
         assert!(line.contains("loadq=2/5 blks=40"), "{line}");
         assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
-        assert!(line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"), "{line}");
+        assert!(
+            line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"),
+            "{line}"
+        );
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
         assert!(line.contains("txhead bits=25"), "{line}");
         assert!(line.contains("segs=3 sealed=2"), "{line}");
@@ -2178,10 +2174,7 @@ mod tests {
             line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB"),
             "{line}"
         );
-        assert!(
-            line.contains("pstore weak=20000/live=8000≈16MiB"),
-            "{line}"
-        );
+        assert!(line.contains("pstore weak=20000/live=8000≈16MiB"), "{line}");
         assert!(line.contains("accounted≈"), "{line}");
         assert!(line.contains("residual≈"), "{line}");
         assert!(!line.contains("shadow"), "{line}");
@@ -2207,7 +2200,10 @@ mod tests {
     fn read_proc_rss_returns_nonzero_on_linux() {
         let r = read_proc_rss();
         // Agent VM is Linux with /proc; RSS should be readable for this process.
-        assert!(r.rss_kb > 0, "expected VmRSS from /proc/self/status, got {r:?}");
+        assert!(
+            r.rss_kb > 0,
+            "expected VmRSS from /proc/self/status, got {r:?}"
+        );
         // Modern kernels expose RssAnon/RssFile on status; at least one side
         // of the split should be non-zero for a running process with heap+.text.
         assert!(
@@ -2239,19 +2235,19 @@ mod tests {
         let rss = read_proc_rss();
         let s = sample(
             &loop_stats,
-            4,   // inflight
-            256, // cap
+            4,           // inflight
+            256,         // cap
             (0, 0, 256), // bq bytes/count/soft_stop
-            100, // arch_ahead
-            1,   // hole
-            8,   // peers
-            true, // headers_done
+            100,         // arch_ahead
+            1,           // hole
+            8,           // peers
+            true,        // headers_done
             (50, 10, 0, 0, 0),
-            0, // loadq
-            0, // load_q
-            0, // write_q
+            0,         // loadq
+            0,         // load_q
+            0,         // write_q
             (0, 0, 0), // q hwm
-            1, // sh_runs
+            1,         // sh_runs
             work,
             owned,
             conf_pipe,

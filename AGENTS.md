@@ -69,12 +69,50 @@ land the simplification as a drive-by cleanup.
 | IBD sizes | **`conf_plans=`** + body-queue / pipeline meters (no `residency creates=`) |
 
 
+## GitHub CI must stay green (every commit)
+
+CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
+`master`/`main`). **Do not push or leave a commit that would fail the required
+`test` job.** A red CI on `master` is incomplete work.
+
+### Required before each code commit (`test` job)
+
+From `nix-shell` (or the same **rustc 1.82** class CI pins):
+
+```bash
+cargo fmt --all -- --check          # if dirty: cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+| Gate | Expectation |
+|------|-------------|
+| `cargo fmt --all -- --check` | Clean |
+| `clippy … -D warnings` | Clean under `[workspace.lints.clippy]` allows in root `Cargo.toml` |
+| `cargo test --workspace` | All non-ignored tests pass |
+
+**Toolchain:** CI pins **rustc 1.82.0** (same class as `nix-shell` / crane). Do not
+rely on host “latest stable” alone. Expand clippy allows only for real noise
+after a toolchain bump — prefer fixing the code.
+
+### Coverage job
+
+`./scripts/coverage.sh` enforces **100% first-party HTML uncovered-line** (see
+`COVERAGE.md`). It runs as a separate CI job (slow). Prefer running it when
+touching store/query/consensus hot paths. **Do not land new uncovered production
+lines.** The coverage job may be `continue-on-error` while historical gaps are
+closed — that is temporary; required `test` must still pass.
+
+If a change cannot pass required gates, **do not commit it as done** — fix, split,
+or get explicit user approval for a temporary exception (prefer none).
+
 ## Commit + static musl release after code changes
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
-1. **Commit** the working tree with a clear message (what + why). Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-2. **Rebuild and install the portable static musl release** so
+1. **Pass CI gates** (fmt / clippy / tests — see above). A commit that fails GitHub Actions is incomplete work.
+2. **Commit** the working tree with a clear message (what + why). Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
+3. **Rebuild and install the portable static musl release** so
    `./target/release/rbitcoin-node` matches the tree. This is **mandatory every
    code-changing turn** — not optional after tests.
 

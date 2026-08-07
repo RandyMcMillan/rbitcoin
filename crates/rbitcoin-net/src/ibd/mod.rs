@@ -31,32 +31,33 @@ use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
 
+use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
 use dial::{
     apply_dial_result, dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers,
     expire_addr_cooldown, request_headers,
 };
-use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
+use events::{
+    apply_confirm_reject, apply_peer_event, disconnect_all_peers,
+    drain_ready_peer_and_archive_events, update_confirm_lag,
+};
 use exit::{
     all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
     peer_caught_up, AllPeersDead,
 };
+use path::{seed_work_path_from_store, work_path_tips};
+use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
 use progress::{
     claim_ready, format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput,
     TipRateTracker,
 };
 use state::IbdWorkState;
-use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
-use events::{
-    apply_confirm_reject, apply_peer_event, disconnect_all_peers,
-    drain_ready_peer_and_archive_events, update_confirm_lag,
-};
-use path::{seed_work_path_from_store, work_path_tips};
 use status::LoopStats;
 
 use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
 use bitcoin::p2p::Magic;
+use rbitcoin_log::{info, info_bold, warn};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -64,7 +65,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use rbitcoin_log::{info, info_bold, warn};
 
 /// Default max **concurrent** unique block downloads (in-flight getdata).
 ///
@@ -213,7 +213,6 @@ impl Drop for PeerBookSession {
     }
 }
 
-
 pub async fn ibd(
     hub: Arc<ChainHub>,
     magic: Magic,
@@ -308,7 +307,11 @@ pub async fn ibd_cancellable(
     if initial_slots.is_empty() {
         return Err(NetError::Protocol("no peers connected"));
     }
-    let init_peer_tip = initial_slots.iter().map(|s| s.peer_height).max().unwrap_or(0);
+    let init_peer_tip = initial_slots
+        .iter()
+        .map(|s| s.peer_height)
+        .max()
+        .unwrap_or(0);
     info!(
         "ibd: {} / {} peers ready (target={}, book={}, max_peer_height={})",
         initial_slots.len(),
@@ -394,9 +397,7 @@ pub async fn ibd_cancellable(
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
-    info!(
-        "ibd: confirm pipeline lookup+load+scripts+write (raw BQ wire; single Class A commit)"
-    );
+    info!("ibd: confirm pipeline lookup+load+scripts+write (raw BQ wire; single Class A commit)");
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
     // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
     let (confirm_ev_tx, confirm_ev_rx) = std::sync::mpsc::channel::<ConfirmEvent>();
@@ -452,13 +453,7 @@ pub async fn ibd_cancellable(
                     st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(
-                        &mut st,
-                        height,
-                        hash,
-                        &err,
-                        Some(hub.query.as_ref()),
-                    );
+                    apply_confirm_reject(&mut st, height, hash, &err, Some(hub.query.as_ref()));
                 }
             }
         }
@@ -482,10 +477,7 @@ pub async fn ibd_cancellable(
         let tip_now = hub.tip_height().unwrap_or(0);
         while let Some(&front) = st.ordered.front() {
             let past = hub.has_block(&front)
-                || st
-                    .hash_height
-                    .get(&front)
-                    .is_some_and(|&ht| ht <= tip_now);
+                || st.hash_height.get(&front).is_some_and(|&ht| ht <= tip_now);
             if past {
                 st.ordered.pop_front();
                 st.ordered_set.remove(&front);
@@ -505,11 +497,8 @@ pub async fn ibd_cancellable(
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let _ = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
         let (_bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
-        let bq_window_covered = rbitcoin_query::soft_confirm_window_covered(
-            bq_count as u32,
-            bq_bytes,
-            tip_rate_opt,
-        );
+        let bq_window_covered =
+            rbitcoin_query::soft_confirm_window_covered(bq_count as u32, bq_bytes, tip_rate_opt);
         let archive_can_assign = archive_queued.can_assign();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
@@ -563,13 +552,7 @@ pub async fn ibd_cancellable(
                     st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(
-                        &mut st,
-                        height,
-                        hash,
-                        &err,
-                        Some(hub.query.as_ref()),
-                    );
+                    apply_confirm_reject(&mut st, height, hash, &err, Some(hub.query.as_ref()));
                 }
             }
         }
@@ -596,11 +579,8 @@ pub async fn ibd_cancellable(
             let tip_rate2 = tip_rate_tracker.eta_rate(Instant::now());
             let _ = hub.query.block_queue_update_soft_pressure(tip_rate2);
             let (_b2, bq_bytes2, bq_count2) = hub.query.block_queue_stats();
-            let covered2 = rbitcoin_query::soft_confirm_window_covered(
-                bq_count2 as u32,
-                bq_bytes2,
-                tip_rate2,
-            );
+            let covered2 =
+                rbitcoin_query::soft_confirm_window_covered(bq_count2 as u32, bq_bytes2, tip_rate2);
             let archive_can2 = archive_queued.can_assign();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
             let depth2 = if archive_pipeline_saturated(
@@ -635,9 +615,7 @@ pub async fn ibd_cancellable(
         {
             let live = st.ordered_set.len();
             let known_ready = st.body.known_len();
-            let ready_gap = st
-                .max_ordered_height
-                .saturating_sub(st.max_ready_height);
+            let ready_gap = st.max_ordered_height.saturating_sub(st.max_ready_height);
             let need_ready_headroom = want_headers_beyond_soft_cap(
                 live,
                 known_ready,
@@ -777,12 +755,8 @@ pub async fn ibd_cancellable(
                             // (tip=0 / mid-chain peer death wiped slots before responses).
                             if st.ordered.is_empty() && !st.headers_done {
                                 let tips = work_path_tips(&st);
-                                let _ = request_headers(
-                                    &st.slots,
-                                    &hub,
-                                    &mut st.header_req_seq,
-                                    &tips,
-                                );
+                                let _ =
+                                    request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
                             }
                         } else {
                             dark_redial_empty = dark_redial_empty.saturating_add(1);
@@ -828,15 +802,7 @@ pub async fn ibd_cancellable(
             let cancel_c = cancel.as_ref().map(Arc::clone);
             redial_handle = Some(tokio::spawn(async move {
                 dial_batch(
-                    &book,
-                    &next_id,
-                    want,
-                    already,
-                    magic,
-                    local_addr,
-                    tip_h,
-                    sinks_r,
-                    cto,
+                    &book, &next_id, want, already, magic, local_addr, tip_h, sinks_r, cto,
                     cancel_c,
                 )
                 .await
@@ -972,9 +938,7 @@ pub async fn ibd_cancellable(
                     .map(|h| claim_ready(hub.as_ref(), &mut st.body, expect, &h))
                     .unwrap_or(false);
                 let has = hth.map(|h| hub.has_block(&h)).unwrap_or(false);
-                let in_set = hth
-                    .map(|h| st.ordered_set.contains(&h))
-                    .unwrap_or(false);
+                let in_set = hth.map(|h| st.ordered_set.contains(&h)).unwrap_or(false);
                 let noted = offer_confirm_ready(
                     &confirm_feed,
                     &st.height_to_hash,
@@ -1190,10 +1154,7 @@ pub async fn ibd_cancellable(
     if let Some(h) = redial_handle.take() {
         h.abort();
     }
-    info!(
-        "ibd: peers disconnected in {:?}",
-        t_teardown.elapsed()
-    );
+    info!("ibd: peers disconnected in {:?}", t_teardown.elapsed());
 
     // 2) Signal cooperative stops. Confirm cancel aborts load so
     //    the engine can exit; we **always join** it before returning (no ghost
@@ -1215,10 +1176,7 @@ pub async fn ibd_cancellable(
     loop {
         match tokio::time::timeout(Duration::from_secs(5), &mut confirm_join).await {
             Ok(Ok(())) => {
-                info!(
-                    "ibd: confirm engine stopped ({:?})",
-                    t_teardown.elapsed()
-                );
+                info!("ibd: confirm engine stopped ({:?})", t_teardown.elapsed());
                 break;
             }
             Ok(Err(e)) => {
@@ -1321,7 +1279,11 @@ mod tip_hole_race_tests {
             TIP_HOLE_MAX_PEERS
         );
         assert_eq!(
-            tip_hole_peer_target(TIP_HOLE_MAX_PEERS + 5, Some(t0), t0 + Duration::from_secs(60)),
+            tip_hole_peer_target(
+                TIP_HOLE_MAX_PEERS + 5,
+                Some(t0),
+                t0 + Duration::from_secs(60)
+            ),
             TIP_HOLE_MAX_PEERS
         );
     }
@@ -1340,4 +1302,3 @@ mod archive_sat_tests {
         assert!(archive_pipeline_saturated(200, 15, true, 0.0));
     }
 }
-

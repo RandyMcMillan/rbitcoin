@@ -75,218 +75,53 @@ pub fn put_spend_batch_by_abs_meta_uring(
     }
 
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-    // Pending edge indices not yet started.
-    let mut pending: VecDeque<usize> = (0..work.len()).collect();
-    // Abs offsets with an RMW in flight (serialize same-outpoint).
-    let mut abs_busy: HashSet<u64> = HashSet::new();
-    // Optional FIFO of waiters when abs is busy: abs → edge indices.
-    let mut abs_wait: HashMap<u64, VecDeque<usize>> = HashMap::new();
+        // Pending edge indices not yet started.
+        let mut pending: VecDeque<usize> = (0..work.len()).collect();
+        // Abs offsets with an RMW in flight (serialize same-outpoint).
+        let mut abs_busy: HashSet<u64> = HashSet::new();
+        // Optional FIFO of waiters when abs is busy: abs → edge indices.
+        let mut abs_wait: HashMap<u64, VecDeque<usize>> = HashMap::new();
 
-    let mut free_slots: Vec<usize> = (0..MAX_SLOTS).collect();
-    let mut slots: Vec<Option<Slot>> = (0..MAX_SLOTS).map(|_| None).collect();
-    let mut in_flight = 0usize;
+        let mut free_slots: Vec<usize> = (0..MAX_SLOTS).collect();
+        let mut slots: Vec<Option<Slot>> = (0..MAX_SLOTS).map(|_| None).collect();
+        let mut in_flight = 0usize;
 
-    let arm = |session: &mut UringSession,
-               free_slots: &mut Vec<usize>,
-               slots: &mut [Option<Slot>],
-               pending: &mut VecDeque<usize>,
-               abs_busy: &mut HashSet<u64>,
-               abs_wait: &mut HashMap<u64, VecDeque<usize>>,
-               work: &[(u64, Fk, u32, Fk)],
-               in_flight: &mut usize,
-               body_fd: RawFd|
-     -> Result<(), StoreError> {
-        while *in_flight < MAX_SLOTS && session.free_sq() > 0 && !free_slots.is_empty() {
-            // Prefer a waiter whose abs is free, else next pending with free abs.
-            let edge_i = if let Some(ei) = next_ready(pending, abs_busy, abs_wait, work) {
-                ei
-            } else {
-                break;
-            };
-            let abs = work[edge_i].0;
-            abs_busy.insert(abs);
-            let slot = free_slots.pop().unwrap();
-            slots[slot] = Some(Slot {
-                edge_i,
-                phase: Phase::Reading,
-                buf: [0u8; META_LEN],
-            });
-            {
-                let s = slots[slot].as_mut().unwrap();
-                // RMW fallback pread: Full mode may DONTCACHE; spend-write mode keeps
-                // pages for the following pwrite (drop only on write).
-                let flags = crate::dontcache_policy::body_sqe_read_flags();
-                session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
-            }
-            *in_flight += 1;
-        }
-        Ok(())
-    };
-
-    arm(
-        session,
-        &mut free_slots,
-        &mut slots,
-        &mut pending,
-        &mut abs_busy,
-        &mut abs_wait,
-        &work,
-        &mut in_flight,
-        body_fd,
-    )?;
-    session.sync_submission();
-    let _ = session.submit();
-
-    while in_flight > 0 {
-        let mut cqes = session.harvest_ready();
-        if cqes.is_empty() {
-            session.submit_and_wait_one()?;
-            cqes = session.harvest_ready();
-        }
-
-        for (ud, res) in cqes {
-            let slot = ud as usize;
-            if slot >= slots.len() {
-                return Err(StoreError::Corrupt("spend annotate bad user_data"));
-            }
-            let mut st = slots[slot]
-                .take()
-                .ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
-            in_flight = in_flight.saturating_sub(1);
-            let edge_i = st.edge_i;
-            let (abs, create_fk, vout, spend_fk) = work[edge_i];
-
-            match st.phase {
-                Phase::Reading => {
-                    if res < 0 {
-                        // ENOTSUP on RWF_DONTCACHE: demote and retry read once.
-                        if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                            crate::bulk_io::note_rwf_dontcache_unsupported();
-                            slots[slot] = Some(st);
-                            {
-                                let s = slots[slot].as_mut().unwrap();
-                                session.push_pread_flags(
-                                    body_fd,
-                                    abs,
-                                    &mut s.buf,
-                                    slot as u64,
-                                    0,
-                                )?;
-                            }
-                            in_flight += 1;
-                            continue;
-                        }
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                        return Err(StoreError::io(
-                            &body_path,
-                            std::io::Error::from_raw_os_error(-res),
-                        ));
-                    }
-                    if res as usize != META_LEN {
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                        cold.push((create_fk, vout, spend_fk));
-                        continue;
-                    }
-
-                    let field = Fk(u64::from_le_bytes(st.buf[0..8].try_into().unwrap()));
-                    let flags0 = st.buf[8];
-                    let multi = flags0 & output_flags::MULTI_SPENDER != 0;
-
-                    let (new_multi, new_field, skip_write) =
-                        if !multi && field.is_null() {
-                            (false, spend_fk, false)
-                        } else if !multi && field == spend_fk {
-                            (false, field, true) // idempotent
-                        } else if !multi {
-                            // Promote sole → multi (reorg / second annotate).
-                            let e1 = spenders.append(field, Fk::NULL)?;
-                            let e2 = spenders.append(spend_fk, e1)?;
-                            (true, e2, false)
-                        } else {
-                            // Already multi: prepend list node.
-                            let e = spenders.append(spend_fk, field)?;
-                            (true, e, false)
-                        };
-
-                    if skip_write {
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                        // Release waiter for this abs.
-                        if let Some(q) = abs_wait.get_mut(&abs) {
-                            if let Some(next_ei) = q.pop_front() {
-                                pending.push_front(next_ei);
-                            }
-                            if q.is_empty() {
-                                abs_wait.remove(&abs);
-                            }
-                        }
-                        continue;
-                    }
-
-                    st.buf[0..8].copy_from_slice(&new_field.0.to_le_bytes());
-                    if new_multi {
-                        st.buf[8] = flags0 | output_flags::MULTI_SPENDER;
-                    } else {
-                        st.buf[8] = flags0 & !output_flags::MULTI_SPENDER;
-                    }
-                    st.phase = Phase::Writing;
-                    // Keep slot occupied for write buffer stability.
-                    slots[slot] = Some(st);
-                    {
-                        let s = slots[slot].as_mut().unwrap();
-                        // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
-                        let flags = crate::dontcache_policy::body_sqe_write_flags();
-                        session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, flags)?;
-                    }
-                    in_flight += 1;
+        let arm = |session: &mut UringSession,
+                   free_slots: &mut Vec<usize>,
+                   slots: &mut [Option<Slot>],
+                   pending: &mut VecDeque<usize>,
+                   abs_busy: &mut HashSet<u64>,
+                   abs_wait: &mut HashMap<u64, VecDeque<usize>>,
+                   work: &[(u64, Fk, u32, Fk)],
+                   in_flight: &mut usize,
+                   body_fd: RawFd|
+         -> Result<(), StoreError> {
+            while *in_flight < MAX_SLOTS && session.free_sq() > 0 && !free_slots.is_empty() {
+                // Prefer a waiter whose abs is free, else next pending with free abs.
+                let edge_i = if let Some(ei) = next_ready(pending, abs_busy, abs_wait, work) {
+                    ei
+                } else {
+                    break;
+                };
+                let abs = work[edge_i].0;
+                abs_busy.insert(abs);
+                let slot = free_slots.pop().unwrap();
+                slots[slot] = Some(Slot {
+                    edge_i,
+                    phase: Phase::Reading,
+                    buf: [0u8; META_LEN],
+                });
+                {
+                    let s = slots[slot].as_mut().unwrap();
+                    // RMW fallback pread: Full mode may DONTCACHE; spend-write mode keeps
+                    // pages for the following pwrite (drop only on write).
+                    let flags = crate::dontcache_policy::body_sqe_read_flags();
+                    session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
                 }
-                Phase::Writing => {
-                    if res < 0 {
-                        // ENOTSUP on RWF_DONTCACHE: demote and retry write once.
-                        if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                            crate::bulk_io::note_rwf_dontcache_unsupported();
-                            slots[slot] = Some(st);
-                            {
-                                let s = slots[slot].as_mut().unwrap();
-                                session.push_pwrite_flags(
-                                    body_fd,
-                                    abs,
-                                    &s.buf,
-                                    slot as u64,
-                                    0,
-                                )?;
-                            }
-                            in_flight += 1;
-                            continue;
-                        }
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                        return Err(StoreError::io(
-                            &body_path,
-                            std::io::Error::from_raw_os_error(-res),
-                        ));
-                    }
-                    if res as usize != META_LEN {
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                        cold.push((create_fk, vout, spend_fk));
-                    } else {
-                        free_slots.push(slot);
-                        abs_busy.remove(&abs);
-                    }
-                    if let Some(q) = abs_wait.get_mut(&abs) {
-                        if let Some(next_ei) = q.pop_front() {
-                            pending.push_front(next_ei);
-                        }
-                        if q.is_empty() {
-                            abs_wait.remove(&abs);
-                        }
-                    }
-                }
+                *in_flight += 1;
             }
-        }
+            Ok(())
+        };
 
         arm(
             session,
@@ -301,21 +136,185 @@ pub fn put_spend_batch_by_abs_meta_uring(
         )?;
         session.sync_submission();
         let _ = session.submit();
-    }
 
-    // Any never-started edges (shouldn't happen) → cold.
-    while let Some(ei) = pending.pop_front() {
-        let (_, cfk, vout, sfk) = work[ei];
-        cold.push((cfk, vout, sfk));
-    }
-    for q in abs_wait.into_values() {
-        for ei in q {
+        while in_flight > 0 {
+            let mut cqes = session.harvest_ready();
+            if cqes.is_empty() {
+                session.submit_and_wait_one()?;
+                cqes = session.harvest_ready();
+            }
+
+            for (ud, res) in cqes {
+                let slot = ud as usize;
+                if slot >= slots.len() {
+                    return Err(StoreError::Corrupt("spend annotate bad user_data"));
+                }
+                let mut st = slots[slot]
+                    .take()
+                    .ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
+                in_flight = in_flight.saturating_sub(1);
+                let edge_i = st.edge_i;
+                let (abs, create_fk, vout, spend_fk) = work[edge_i];
+
+                match st.phase {
+                    Phase::Reading => {
+                        if res < 0 {
+                            // ENOTSUP on RWF_DONTCACHE: demote and retry read once.
+                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                                crate::bulk_io::note_rwf_dontcache_unsupported();
+                                slots[slot] = Some(st);
+                                {
+                                    let s = slots[slot].as_mut().unwrap();
+                                    session.push_pread_flags(
+                                        body_fd,
+                                        abs,
+                                        &mut s.buf,
+                                        slot as u64,
+                                        0,
+                                    )?;
+                                }
+                                in_flight += 1;
+                                continue;
+                            }
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                            return Err(StoreError::io(
+                                &body_path,
+                                std::io::Error::from_raw_os_error(-res),
+                            ));
+                        }
+                        if res as usize != META_LEN {
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                            cold.push((create_fk, vout, spend_fk));
+                            continue;
+                        }
+
+                        let field = Fk(u64::from_le_bytes(st.buf[0..8].try_into().unwrap()));
+                        let flags0 = st.buf[8];
+                        let multi = flags0 & output_flags::MULTI_SPENDER != 0;
+
+                        let (new_multi, new_field, skip_write) = if !multi && field.is_null() {
+                            (false, spend_fk, false)
+                        } else if !multi && field == spend_fk {
+                            (false, field, true) // idempotent
+                        } else if !multi {
+                            // Promote sole → multi (reorg / second annotate).
+                            let e1 = spenders.append(field, Fk::NULL)?;
+                            let e2 = spenders.append(spend_fk, e1)?;
+                            (true, e2, false)
+                        } else {
+                            // Already multi: prepend list node.
+                            let e = spenders.append(spend_fk, field)?;
+                            (true, e, false)
+                        };
+
+                        if skip_write {
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                            // Release waiter for this abs.
+                            if let Some(q) = abs_wait.get_mut(&abs) {
+                                if let Some(next_ei) = q.pop_front() {
+                                    pending.push_front(next_ei);
+                                }
+                                if q.is_empty() {
+                                    abs_wait.remove(&abs);
+                                }
+                            }
+                            continue;
+                        }
+
+                        st.buf[0..8].copy_from_slice(&new_field.0.to_le_bytes());
+                        if new_multi {
+                            st.buf[8] = flags0 | output_flags::MULTI_SPENDER;
+                        } else {
+                            st.buf[8] = flags0 & !output_flags::MULTI_SPENDER;
+                        }
+                        st.phase = Phase::Writing;
+                        // Keep slot occupied for write buffer stability.
+                        slots[slot] = Some(st);
+                        {
+                            let s = slots[slot].as_mut().unwrap();
+                            // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
+                            let flags = crate::dontcache_policy::body_sqe_write_flags();
+                            session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, flags)?;
+                        }
+                        in_flight += 1;
+                    }
+                    Phase::Writing => {
+                        if res < 0 {
+                            // ENOTSUP on RWF_DONTCACHE: demote and retry write once.
+                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                                crate::bulk_io::note_rwf_dontcache_unsupported();
+                                slots[slot] = Some(st);
+                                {
+                                    let s = slots[slot].as_mut().unwrap();
+                                    session.push_pwrite_flags(
+                                        body_fd,
+                                        abs,
+                                        &s.buf,
+                                        slot as u64,
+                                        0,
+                                    )?;
+                                }
+                                in_flight += 1;
+                                continue;
+                            }
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                            return Err(StoreError::io(
+                                &body_path,
+                                std::io::Error::from_raw_os_error(-res),
+                            ));
+                        }
+                        if res as usize != META_LEN {
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                            cold.push((create_fk, vout, spend_fk));
+                        } else {
+                            free_slots.push(slot);
+                            abs_busy.remove(&abs);
+                        }
+                        if let Some(q) = abs_wait.get_mut(&abs) {
+                            if let Some(next_ei) = q.pop_front() {
+                                pending.push_front(next_ei);
+                            }
+                            if q.is_empty() {
+                                abs_wait.remove(&abs);
+                            }
+                        }
+                    }
+                }
+            }
+
+            arm(
+                session,
+                &mut free_slots,
+                &mut slots,
+                &mut pending,
+                &mut abs_busy,
+                &mut abs_wait,
+                &work,
+                &mut in_flight,
+                body_fd,
+            )?;
+            session.sync_submission();
+            let _ = session.submit();
+        }
+
+        // Any never-started edges (shouldn't happen) → cold.
+        while let Some(ei) = pending.pop_front() {
             let (_, cfk, vout, sfk) = work[ei];
             cold.push((cfk, vout, sfk));
         }
-    }
+        for q in abs_wait.into_values() {
+            for ei in q {
+                let (_, cfk, vout, sfk) = work[ei];
+                cold.push((cfk, vout, sfk));
+            }
+        }
 
-    Ok(cold)
+        Ok(cold)
     })?
 }
 
@@ -412,9 +411,7 @@ pub fn put_spend_batch_by_abs_meta_known(
         return Ok(Vec::new());
     }
     if abs_edges.len() != known.len() {
-        return Err(StoreError::Corrupt(
-            "spend annotate known length mismatch",
-        ));
+        return Err(StoreError::Corrupt("spend annotate known length mismatch"));
     }
     for &(_, _, _, sfk) in abs_edges {
         if sfk.is_null() {
@@ -485,85 +482,36 @@ fn put_spend_batch_pure_write_uring(
     // can still use `writes` / `cold` if the ring is unavailable).
     let mut bufs: Vec<[u8; META_LEN]> = writes.iter().map(|w| w.4).collect();
     let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-    let mut pending: VecDeque<usize> = (0..writes.len()).collect();
-    let mut free_slots: Vec<usize> = (0..MAX_SLOTS.min(writes.len().max(1))).collect();
-    let mut slots: Vec<Option<usize>> = (0..free_slots.len()).map(|_| None).collect();
-    let mut in_flight = 0usize;
-    let mut cold_local = cold.clone();
+        let mut pending: VecDeque<usize> = (0..writes.len()).collect();
+        let mut free_slots: Vec<usize> = (0..MAX_SLOTS.min(writes.len().max(1))).collect();
+        let mut slots: Vec<Option<usize>> = (0..free_slots.len()).map(|_| None).collect();
+        let mut in_flight = 0usize;
+        let mut cold_local = cold.clone();
 
-    let arm = |session: &mut UringSession,
-               free_slots: &mut Vec<usize>,
-               slots: &mut [Option<usize>],
-               pending: &mut VecDeque<usize>,
-               bufs: &mut [[u8; META_LEN]],
-               writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-               in_flight: &mut usize,
-               body_fd: RawFd|
-     -> Result<(), StoreError> {
-        while *in_flight < slots.len() && session.free_sq() > 0 && !free_slots.is_empty() {
-            let Some(wi) = pending.pop_front() else {
-                break;
-            };
-            let slot = free_slots.pop().unwrap();
-            slots[slot] = Some(wi);
-            let abs = writes[wi].0;
-            // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
-            let flags = crate::dontcache_policy::body_sqe_write_flags();
-            session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, flags)?;
-            *in_flight += 1;
-        }
-        Ok(())
-    };
+        let arm = |session: &mut UringSession,
+                   free_slots: &mut Vec<usize>,
+                   slots: &mut [Option<usize>],
+                   pending: &mut VecDeque<usize>,
+                   bufs: &mut [[u8; META_LEN]],
+                   writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
+                   in_flight: &mut usize,
+                   body_fd: RawFd|
+         -> Result<(), StoreError> {
+            while *in_flight < slots.len() && session.free_sq() > 0 && !free_slots.is_empty() {
+                let Some(wi) = pending.pop_front() else {
+                    break;
+                };
+                let slot = free_slots.pop().unwrap();
+                slots[slot] = Some(wi);
+                let abs = writes[wi].0;
+                // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
+                let flags = crate::dontcache_policy::body_sqe_write_flags();
+                session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, flags)?;
+                *in_flight += 1;
+            }
+            Ok(())
+        };
 
-    arm(
-        session,
-        &mut free_slots,
-        &mut slots,
-        &mut pending,
-        &mut bufs,
-        writes,
-        &mut in_flight,
-        body_fd,
-    )?;
-    session.sync_submission();
-    let _ = session.submit();
-
-    while in_flight > 0 {
-        let mut cqes = session.harvest_ready();
-        if cqes.is_empty() {
-            session.submit_and_wait_one()?;
-            cqes = session.harvest_ready();
-        }
-        for (ud, res) in cqes {
-            let slot = ud as usize;
-            if slot >= slots.len() {
-                return Err(StoreError::Corrupt("spend pure-write bad user_data"));
-            }
-            let wi = slots[slot]
-                .take()
-                .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
-            in_flight = in_flight.saturating_sub(1);
-            if res < 0 {
-                if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                    crate::bulk_io::note_rwf_dontcache_unsupported();
-                    slots[slot] = Some(wi);
-                    let abs = writes[wi].0;
-                    session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, 0)?;
-                    in_flight += 1;
-                    continue;
-                }
-                free_slots.push(slot);
-                return Err(StoreError::io(
-                    &body_path,
-                    std::io::Error::from_raw_os_error(-res),
-                ));
-            }
-            free_slots.push(slot);
-            if res as usize != META_LEN {
-                let (_, cfk, vout, sfk, _) = writes[wi];
-                cold_local.push((cfk, vout, sfk));
-            }
-        }
         arm(
             session,
             &mut free_slots,
@@ -576,13 +524,62 @@ fn put_spend_batch_pure_write_uring(
         )?;
         session.sync_submission();
         let _ = session.submit();
-    }
 
-    while let Some(wi) = pending.pop_front() {
-        let (_, cfk, vout, sfk, _) = writes[wi];
-        cold_local.push((cfk, vout, sfk));
-    }
-    Ok(cold_local)
+        while in_flight > 0 {
+            let mut cqes = session.harvest_ready();
+            if cqes.is_empty() {
+                session.submit_and_wait_one()?;
+                cqes = session.harvest_ready();
+            }
+            for (ud, res) in cqes {
+                let slot = ud as usize;
+                if slot >= slots.len() {
+                    return Err(StoreError::Corrupt("spend pure-write bad user_data"));
+                }
+                let wi = slots[slot]
+                    .take()
+                    .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
+                in_flight = in_flight.saturating_sub(1);
+                if res < 0 {
+                    if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                        crate::bulk_io::note_rwf_dontcache_unsupported();
+                        slots[slot] = Some(wi);
+                        let abs = writes[wi].0;
+                        session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, 0)?;
+                        in_flight += 1;
+                        continue;
+                    }
+                    free_slots.push(slot);
+                    return Err(StoreError::io(
+                        &body_path,
+                        std::io::Error::from_raw_os_error(-res),
+                    ));
+                }
+                free_slots.push(slot);
+                if res as usize != META_LEN {
+                    let (_, cfk, vout, sfk, _) = writes[wi];
+                    cold_local.push((cfk, vout, sfk));
+                }
+            }
+            arm(
+                session,
+                &mut free_slots,
+                &mut slots,
+                &mut pending,
+                &mut bufs,
+                writes,
+                &mut in_flight,
+                body_fd,
+            )?;
+            session.sync_submission();
+            let _ = session.submit();
+        }
+
+        while let Some(wi) = pending.pop_front() {
+            let (_, cfk, vout, sfk, _) = writes[wi];
+            cold_local.push((cfk, vout, sfk));
+        }
+        Ok(cold_local)
     });
     match run {
         Ok(Ok(c)) => Ok(c),
@@ -610,7 +607,6 @@ fn put_spend_batch_pure_write_uring(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

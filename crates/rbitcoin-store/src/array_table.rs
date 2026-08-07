@@ -291,8 +291,7 @@ impl ArrayTable {
         }
         drop(guard);
         if !bytes.is_empty() {
-            self.file
-                .write_at(Self::offset(from), &bytes)?;
+            self.file.write_at(Self::offset(from), &bytes)?;
         }
         if n != disk {
             let logical = FILE_HEADER_LEN as u64 + n * ELEM;
@@ -357,10 +356,7 @@ mod tests {
         assert_eq!(t.get(3).unwrap(), 30);
         t.truncate(4).unwrap();
         assert_eq!(t.len(), 4);
-        assert!(matches!(
-            t.truncate(99),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(t.truncate(99), Err(StoreError::Corrupt(_))));
         t.flush().unwrap();
         {
             let mut raw = std::fs::read(&path).unwrap();

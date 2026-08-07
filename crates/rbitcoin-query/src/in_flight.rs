@@ -28,9 +28,7 @@ pub struct InFlightLayer {
 
 impl InFlightLayer {
     /// Build from planned fks + batch_pin (or packed pin half) Arc clones.
-    pub fn from_plan_pins<'a>(
-        pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>,
-    ) -> Self {
+    pub fn from_plan_pins<'a>(pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>) -> Self {
         let mut creates = HashMap::new();
         let mut outs = HashMap::new();
         let mut max_fk = 0u64;
@@ -69,9 +67,7 @@ pub struct InFlightLog {
 
 impl InFlightLog {
     pub fn new() -> Self {
-        Self {
-            layers: Vec::new(),
-        }
+        Self { layers: Vec::new() }
     }
 
     /// Publish one pack. Does not mutate existing layers.

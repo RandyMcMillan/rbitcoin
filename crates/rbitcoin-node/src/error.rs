@@ -64,10 +64,7 @@ mod tests {
         assert_eq!(format!("{cfg}"), "configuration error: bad");
         assert!(cfg.source().is_none());
 
-        let net: NodeError = ParseNetworkError {
-            input: "x".into(),
-        }
-        .into();
+        let net: NodeError = ParseNetworkError { input: "x".into() }.into();
         assert!(format!("{net}").contains("unknown network"));
         assert!(net.source().is_some());
 

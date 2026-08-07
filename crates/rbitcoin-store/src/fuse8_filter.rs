@@ -48,8 +48,8 @@ impl SealedFuse8 {
     }
 
     pub fn write_to(&self, path: &Path) -> Result<(), StoreError> {
-        let payload = bincode::serialize(&self.filter)
-            .map_err(|_| StoreError::Corrupt("fuse8 serialize"))?;
+        let payload =
+            bincode::serialize(&self.filter).map_err(|_| StoreError::Corrupt("fuse8 serialize"))?;
         let mut f = File::create(path).map_err(|e| StoreError::io(path, e))?;
         f.write_all(MAGIC).map_err(|e| StoreError::io(path, e))?;
         f.write_all(&VERSION.to_le_bytes())
@@ -64,7 +64,8 @@ impl SealedFuse8 {
     pub fn read_from(path: &Path) -> Result<Self, StoreError> {
         let mut f = File::open(path).map_err(|e| StoreError::io(path, e))?;
         let mut hdr = [0u8; 16];
-        f.read_exact(&mut hdr).map_err(|e| StoreError::io(path, e))?;
+        f.read_exact(&mut hdr)
+            .map_err(|e| StoreError::io(path, e))?;
         if &hdr[0..4] != MAGIC {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
         }
@@ -76,8 +77,8 @@ impl SealedFuse8 {
         let mut payload = vec![0u8; len];
         f.read_exact(&mut payload)
             .map_err(|e| StoreError::io(path, e))?;
-        let filter: BinaryFuse8 = bincode::deserialize(&payload)
-            .map_err(|_| StoreError::Corrupt("fuse8 deserialize"))?;
+        let filter: BinaryFuse8 =
+            bincode::deserialize(&payload).map_err(|_| StoreError::Corrupt("fuse8 deserialize"))?;
         Ok(Self { filter })
     }
 }

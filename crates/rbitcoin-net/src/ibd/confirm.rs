@@ -54,9 +54,7 @@ impl LoadAheadState {
         // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
         let head_n = hub.query.tx_head_occupied();
         self.in_flight.prune(head_n);
-        self.next_tx_start = self
-            .next_tx_start
-            .max(body_n.saturating_add(1).max(1));
+        self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
             if h <= tip {
@@ -256,9 +254,7 @@ impl ConfirmFeed {
 
 pub(crate) enum ConfirmEvent {
     /// Tip advanced; hash is the confirmed block.
-    Accepted {
-        hash: BlockHash,
-    },
+    Accepted { hash: BlockHash },
     /// Height is the attempted confirm height (for operator logs).
     Reject {
         height: u32,
@@ -267,9 +263,7 @@ pub(crate) enum ConfirmEvent {
     },
     /// Confirm saw tip+1 without durable Class A — clear optimistic `known` and
     /// drop the feed entry so offer re-probes the store (no permanent blacklist).
-    BodyMissing {
-        hash: BlockHash,
-    },
+    BodyMissing { hash: BlockHash },
 }
 
 /// Hard cap on consecutive ready heights in one confirm wave.
@@ -319,7 +313,12 @@ pub(crate) fn block_input_count(block: &bitcoin::Block) -> u32 {
 /// Whether the packed run should stop **after** accepting a block that left
 /// `sum_inputs` / `n_blocks` in this state (soft overshoot + hard block cap).
 #[inline]
-pub(crate) fn pack_stop_after(sum_inputs: u32, n_blocks: usize, soft_max_inputs: u32, hard_max_blocks: usize) -> bool {
+pub(crate) fn pack_stop_after(
+    sum_inputs: u32,
+    n_blocks: usize,
+    soft_max_inputs: u32,
+    hard_max_blocks: usize,
+) -> bool {
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
@@ -432,12 +431,8 @@ pub(crate) fn write_queue_cap() -> usize {
 /// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
-    let q = c
-        .load
-        .saturating_add(c.script)
-        .saturating_add(c.write);
-    (q.saturating_mul(3).saturating_add(1) as u32)
-        .saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
+    let q = c.load.saturating_add(c.script).saturating_add(c.write);
+    (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
 }
 
 /// Lookup-stage output: stamp + pipeline-local parent denserels for load pin.
@@ -1974,9 +1969,7 @@ mod tests {
     fn prune_inflight_keeps_body_ahead_of_head() {
         let mut log = InFlightLog::new();
         // head has 1..90; body already wrote 91..100 (seal mid head_insert_many).
-        let pins: Vec<_> = (85u64..=100)
-            .map(|id| (Fk(id), test_pin(id)))
-            .collect();
+        let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
         log.note_layer(InFlightLayer::from_plan_pins(
             pins.iter().map(|(f, p)| (*f, p)),
         ));
@@ -2154,13 +2147,7 @@ mod tests {
         assert_eq!(run.len(), 32);
         assert_eq!(run[0], 101);
         assert_eq!(*run.last().unwrap(), 132);
-        let run = claim_feed_run(
-            10,
-            32,
-            200,
-            |h| h >= 10 && h <= 50,
-            |h| h == 10 || h == 11,
-        );
+        let run = claim_feed_run(10, 32, 200, |h| h >= 10 && h <= 50, |h| h == 10 || h == 11);
         assert_eq!(run.first().copied(), Some(12));
         assert_eq!(run.len(), 32);
     }
@@ -2306,7 +2293,10 @@ mod tests {
         feed.note(100, bh(1));
         {
             let g = feed.inner.lock().unwrap();
-            assert!(g.ready.is_empty(), "inflight height must not re-enter ready");
+            assert!(
+                g.ready.is_empty(),
+                "inflight height must not re-enter ready"
+            );
             assert!(g.inflight.contains(&100));
         }
 
@@ -2458,8 +2448,8 @@ mod tests {
 
     #[test]
     fn offer_confirm_ready_walks_height_map() {
-        use super::offer_confirm_ready;
         use super::super::body::BodyPresence;
+        use super::offer_confirm_ready;
         use rbitcoin_consensus::{ChainParams, Milestone};
         use rbitcoin_query::Query;
         use std::collections::HashMap;
@@ -2530,7 +2520,10 @@ mod tests {
         feed.finish([1]);
         max_arch = 0;
         let n5 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
-        assert_eq!(n5, 0, "Class A without body queue must not note confirm feed");
+        assert_eq!(
+            n5, 0,
+            "Class A without body queue must not note confirm feed"
+        );
 
         // Pending wire (bq) is claim-ready.
         body.mark_pending(h1);

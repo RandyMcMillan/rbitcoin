@@ -35,11 +35,7 @@ impl Query {
         Ok((tx, outs, inputs))
     }
 
-    pub fn merkle_proof(
-        &self,
-        height: Height,
-        txid: &[u8; 32],
-    ) -> Result<MerkleProof, QueryError> {
+    pub fn merkle_proof(&self, height: Height, txid: &[u8; 32]) -> Result<MerkleProof, QueryError> {
         use bitcoin::hashes::{sha256d, Hash as _};
 
         let fks = self.block_tx_fks(height)?;
@@ -214,10 +210,7 @@ impl Query {
         Ok(raw)
     }
 
-    pub fn reconstruct_archived_block(
-        &self,
-        hash: &[u8; 32],
-    ) -> Result<Option<Block>, QueryError> {
+    pub fn reconstruct_archived_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
@@ -284,9 +277,7 @@ impl Query {
             txdata.push(self.reconstruct_tx(fk)?);
         }
         let block = Block { header, txdata };
-        let (_fk, stored) = self
-            .header_at_height(height)?
-            .ok_or(StoreError::NotFound)?;
+        let (_fk, stored) = self.header_at_height(height)?.ok_or(StoreError::NotFound)?;
         if block.block_hash().to_byte_array() != stored.hash {
             return Err(StoreError::Corrupt("reconstruct hash mismatch"));
         }

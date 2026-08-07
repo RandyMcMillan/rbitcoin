@@ -318,10 +318,7 @@ impl Store {
     /// Tuple: `(create_tx_fk, vout, spending_tx_fk, Option<(body_off, body_len)>)`.
     /// Sorted by create for locality. **No `tx.head`**. Uses body range when present
     /// so **no `tx.idx`** either (load-cached).
-    pub fn put_spend_batch_by_create(
-        &self,
-        edges: &[(Fk, u32, Fk)],
-    ) -> Result<(), StoreError> {
+    pub fn put_spend_batch_by_create(&self, edges: &[(Fk, u32, Fk)]) -> Result<(), StoreError> {
         let mut work: Vec<(Fk, u32, Fk)> = edges.to_vec();
         work.sort_unstable_by_key(|(c, v, _)| (c.0, *v));
         for (create_fk, vout, spend_fk) in work {
@@ -402,17 +399,10 @@ impl Store {
                 return Err(StoreError::InvalidFk);
             }
             let mut j = i + 1;
-            while j < work.len()
-                && work[j].0 == cfk
-                && work[j].3 == off
-                && work[j].4 == len
-            {
+            while j < work.len() && work[j].0 == cfk && work[j].3 == off && work[j].4 == len {
                 j += 1;
             }
-            let batch: Vec<(u32, Fk)> = work[i..j]
-                .iter()
-                .map(|(_, v, s, _, _)| (*v, *s))
-                .collect();
+            let batch: Vec<(u32, Fk)> = work[i..j].iter().map(|(_, v, s, _, _)| (*v, *s)).collect();
             self.txs
                 .put_spends_on_create_at(&self.spenders, off, len, &batch)?;
             i = j;
@@ -461,10 +451,7 @@ impl Store {
         (
             Vec<(
                 [u8; 32],
-                Option<(
-                    Fk,
-                    Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
-                )>,
+                Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
             )>,
             u64,
         ),
@@ -477,10 +464,7 @@ impl Store {
     ///
     /// Sorted walk of `tx.idx` (FdOnly pread; contiguous runs coalesced). Prefer
     /// [`Self::idx_body_pipeline`] when the caller also needs body bytes.
-    pub fn tx_body_range_batch(
-        &self,
-        fks: &[Fk],
-    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+    pub fn tx_body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         self.txs.body_range_batch(fks)
     }
 
@@ -501,10 +485,8 @@ impl Store {
     pub fn get_tx_full_batch_at(
         &self,
         ranges: &[(Fk, u64, u64)],
-    ) -> Result<
-        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>,
-        StoreError,
-    > {
+    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>, StoreError>
+    {
         self.txs.get_full_batch_at(ranges)
     }
 
@@ -565,9 +547,7 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         let (multi, field) = match body_range {
-            Some((off, len)) => self
-                .txs
-                .get_output_spender_meta_at(off, len, out_index)?,
+            Some((off, len)) => self.txs.get_output_spender_meta_at(off, len, out_index)?,
             None => self.txs.get_output_spender_meta(create_tx_fk, out_index)?,
         };
         if field.is_null() {
@@ -617,8 +597,7 @@ impl Store {
                 } else {
                     let mut out = Vec::with_capacity(vouts.len());
                     for &v in vouts {
-                        let (multi, field) =
-                            self.txs.get_output_spender_meta(create_tx_fk, v)?;
+                        let (multi, field) = self.txs.get_output_spender_meta(create_tx_fk, v)?;
                         out.push((v, multi, field));
                     }
                     out
@@ -646,25 +625,10 @@ impl Store {
         Ok(unspent)
     }
 
-
-
-
-
-
-
-
     /// Multi-list node count only (sole spends do not allocate body rows).
     pub fn spender_list_count(&self) -> u64 {
         self.spenders.count()
     }
-
-
-
-
-
-
-
-
 
     /// True if `tx_fk` is strong **and** its create height is on the confirmed tip.
     ///
@@ -679,11 +643,7 @@ impl Store {
 
     /// Like [`Self::is_confirmed_strong`] with a caller-cached tip (connect hot path).
     #[inline]
-    pub fn is_confirmed_strong_at(
-        &self,
-        tx_fk: Fk,
-        tip: Option<u32>,
-    ) -> Result<bool, StoreError> {
+    pub fn is_confirmed_strong_at(&self, tx_fk: Fk, tip: Option<u32>) -> Result<bool, StoreError> {
         if !self.strong_tx.is_strong(tx_fk)? {
             return Ok(false);
         }
@@ -921,10 +881,7 @@ impl Store {
         self.txs.flush_async()?;
         self.spenders.flush_async()?;
         self.scripthash.flush_async()?;
-        rbitcoin_log::info!(
-            "store: shutdown flush done elapsed={:?}",
-            t0.elapsed()
-        );
+        rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
     }
 
@@ -1000,7 +957,10 @@ mod tests {
         p
     }
 
-    fn coinbase_item(txid: [u8; 32], outs: Vec<OutputRecord>) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+    fn coinbase_item(
+        txid: [u8; 32],
+        outs: Vec<OutputRecord>,
+    ) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
         let n_out = outs.len() as u32;
         (
             TxRecord {
@@ -1125,10 +1085,7 @@ mod tests {
         };
         let hfk = s.put_header(&hdr).unwrap();
         assert_eq!(s.get_header(hfk).unwrap().hash, [4u8; 32]);
-        assert_eq!(
-            s.get_header_by_hash(&[4u8; 32]).unwrap().unwrap().0,
-            hfk
-        );
+        assert_eq!(s.get_header_by_hash(&[4u8; 32]).unwrap().unwrap().0, hfk);
 
         let create = coinbase_item(
             [10u8; 32],
@@ -1151,22 +1108,10 @@ mod tests {
         // Body alone has zero txid; identity is sidefile / get_tx_full.
         assert_eq!(s.get_tx_full_at(off, len).unwrap().0.txid, [0u8; 32]);
         assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
-        assert_eq!(
-            s.get_tx_meta_and_prevouts_at(off, len)
-                .unwrap()
-                .1
-                .len(),
-            1
-        );
-        assert_eq!(
-            s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(),
-            2
-        );
+        assert_eq!(s.get_tx_meta_and_prevouts_at(off, len).unwrap().1.len(), 1);
+        assert_eq!(s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(), 2);
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
-        assert_eq!(
-            s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0,
-            create_fk
-        );
+        assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
 
         // Second tx spends create vout 0.
         let spend = (
@@ -1261,9 +1206,7 @@ mod tests {
         assert!(s
             .has_confirmed_strong_spender_create(create_fk, 0, Some((off, len)))
             .unwrap());
-        assert!(s
-            .has_confirmed_strong_spender(&[10u8; 32], 0)
-            .unwrap());
+        assert!(s.has_confirmed_strong_spender(&[10u8; 32], 0).unwrap());
         let unspent = s
             .unspent_create_vouts(create_fk, &[0, 1], Some((off, len)))
             .unwrap();
@@ -1278,18 +1221,14 @@ mod tests {
         // Batch helpers
         let ranges = s.tx_body_range_batch(&[create_fk, spend_fk]).unwrap();
         assert_eq!(ranges.len(), 2);
-        let full_b = s
-            .get_tx_full_batch_at(&[(create_fk, off, len)])
-            .unwrap();
+        let full_b = s.get_tx_full_batch_at(&[(create_fk, off, len)]).unwrap();
         assert!(full_b[0].is_some());
         let outs_b = s.get_tx_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
         assert!(outs_b[0].is_some());
         let heights = s.tx_height_get_batch(&[spend_fk, create_fk]).unwrap();
         assert_eq!(heights[0], Some(0));
 
-        s.header_txs
-            .put_range(hfk, create_fk, 1)
-            .unwrap();
+        s.header_txs.put_range(hfk, create_fk, 1).unwrap();
         assert_eq!(s.archived_block_count().unwrap(), 1);
         s.flush_header_archive().unwrap();
         s.flush_index_tables().unwrap();
@@ -1328,10 +1267,7 @@ mod tests {
             let bad = tmp();
             std::fs::create_dir_all(&bad).unwrap();
             std::fs::write(bad.join("meta"), b"xx").unwrap();
-            assert!(matches!(
-                check_meta(&bad),
-                Err(StoreError::Corrupt(_))
-            ));
+            assert!(matches!(check_meta(&bad), Err(StoreError::Corrupt(_))));
             std::fs::write(bad.join("meta"), b"XXXX\x00\x00").unwrap();
             assert!(matches!(check_meta(&bad), Err(StoreError::BadMagic)));
             let mut good_magic = STORE_MAGIC.to_vec();
@@ -1339,10 +1275,7 @@ mod tests {
             // wrong schema if 0 != SCHEMA_VERSION
             if SCHEMA_VERSION != 0 {
                 std::fs::write(bad.join("meta"), &good_magic).unwrap();
-                assert!(matches!(
-                    check_meta(&bad),
-                    Err(StoreError::BadSchema(_))
-                ));
+                assert!(matches!(check_meta(&bad), Err(StoreError::BadSchema(_))));
             }
             let _ = std::fs::remove_dir_all(&bad);
         }
@@ -1481,7 +1414,9 @@ mod tests {
             "tip shrink must be durable after flush_confirmed_only"
         );
         // Strong may still mark height-1 txs; they are above tip.
-        assert!(s.strong_tx.is_strong(Fk(2)).unwrap() || s.tx_height.get(Fk(2)).unwrap() == Some(1));
+        assert!(
+            s.strong_tx.is_strong(Fk(2)).unwrap() || s.tx_height.get(Fk(2)).unwrap() == Some(1)
+        );
         let cleared = s.repair_class_c_above_tip().unwrap();
         assert!(
             cleared >= 1,
@@ -1558,10 +1493,7 @@ mod tests {
         let dir = tmp();
         {
             let s = Store::create(&dir).unwrap();
-            let create = coinbase_item(
-                [20u8; 32],
-                vec![OutputRecord::unspent(10, vec![0x51])],
-            );
+            let create = coinbase_item([20u8; 32], vec![OutputRecord::unspent(10, vec![0x51])]);
             let fk = s.put_tx_full_batch_indexed(&[create], true).unwrap()[0];
             s.flush().unwrap();
             drop(s);
@@ -1575,16 +1507,12 @@ mod tests {
             let s = Store::open(&dir).unwrap();
             assert_eq!(s.get_tx(fk).unwrap().txid, [20u8; 32]);
             // unspent without body_range
-            let u = s
-                .unspent_create_vouts(fk, &[0], None)
-                .unwrap();
+            let u = s.unspent_create_vouts(fk, &[0], None).unwrap();
             assert_eq!(u, vec![0]);
             // empty vouts
             assert!(s.unspent_create_vouts(fk, &[], None).unwrap().is_empty());
             // has_confirmed without range, no spender
-            assert!(!s
-                .has_confirmed_strong_spender_create(fk, 0, None)
-                .unwrap());
+            assert!(!s.has_confirmed_strong_spender_create(fk, 0, None).unwrap());
             assert!(!s.has_confirmed_strong_spender(&[20u8; 32], 0).unwrap());
             assert!(s.spenders_raw(&[20u8; 32], 0).unwrap().is_empty());
             assert!(s.spenders(&[9u8; 32], 0).unwrap().is_empty());

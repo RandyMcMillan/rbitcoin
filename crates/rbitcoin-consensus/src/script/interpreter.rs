@@ -46,8 +46,24 @@ pub(crate) enum SigVersion {
 fn is_op_success(code: u8) -> bool {
     matches!(
         code,
-        80 | 98 | 126 | 127 | 128 | 129 | 131 | 132 | 133 | 134 | 137 | 138
-            | 141 | 142 | 149 | 150 | 151 | 152 | 153
+        80 | 98
+            | 126
+            | 127
+            | 128
+            | 129
+            | 131
+            | 132
+            | 133
+            | 134
+            | 137
+            | 138
+            | 141
+            | 142
+            | 149
+            | 150
+            | 151
+            | 152
+            | 153
     ) || (187..=254).contains(&code)
 }
 
@@ -94,12 +110,8 @@ pub(crate) fn tapscript_has_op_success(script: &Script) -> bool {
                 if i + 4 >= bytes.len() {
                     break;
                 }
-                let n = u32::from_le_bytes([
-                    bytes[i + 1],
-                    bytes[i + 2],
-                    bytes[i + 3],
-                    bytes[i + 4],
-                ]) as usize;
+                let n = u32::from_le_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]])
+                    as usize;
                 i = i.saturating_add(5).saturating_add(n);
             }
             _ => {
@@ -273,8 +285,7 @@ pub(crate) fn eval_script(
     // Prefer instruction_indices so OP_CODESEPARATOR can set Base/WitnessV0
     // scriptCode byte offsets (BIP143 / Core pbegincodehash).
     for item in script.instruction_indices() {
-        let (byte_index, ins) =
-            item.map_err(|_| ConsensusError::Script("script parse".into()))?;
+        let (byte_index, ins) = item.map_err(|_| ConsensusError::Script("script parse".into()))?;
         let this_pos = opcode_pos;
         opcode_pos = opcode_pos.saturating_add(1);
         let executing = if_stack.iter().all(|&x| x);
@@ -363,7 +374,7 @@ pub(crate) fn eval_script(
                 }
 
                 match code {
-                    0x00 => push(stack, vec![])?, // OP_0
+                    0x00 => push(stack, vec![])?,                                    // OP_0
                     0x4f => push(stack, vec![0x81])?, // OP_1NEGATE (-1)
                     n if (0x51..=0x60).contains(&n) => push(stack, vec![n - 0x50])?, // OP_1..OP_16
 
@@ -672,9 +683,7 @@ pub(crate) fn eval_script(
                     // BIP342 OP_CHECKSIGADD (0xba) — tapscript only.
                     0xba => {
                         if ctx.sig_version != SigVersion::TapScript {
-                            return Err(ConsensusError::Script(
-                                "unknown opcode 0xba".into(),
-                            ));
+                            return Err(ConsensusError::Script("unknown opcode 0xba".into()));
                         }
                         op_checksigadd(stack, ctx)?;
                     }
@@ -810,10 +819,7 @@ fn op_checksig(
 }
 
 /// BIP342 OP_CHECKSIGADD: stack is `… sig n pubkey` → `… n` or `… n+1`.
-fn op_checksigadd(
-    stack: &mut Vec<Vec<u8>>,
-    ctx: &EvalContext<'_>,
-) -> Result<(), ConsensusError> {
+fn op_checksigadd(stack: &mut Vec<Vec<u8>>, ctx: &EvalContext<'_>) -> Result<(), ConsensusError> {
     require_n(stack, 3)?;
     let pubkey = pop(stack)?;
     let n_raw = pop(stack)?;
@@ -827,8 +833,7 @@ fn op_checksigadd(
         }
         TapSigResult::Valid => {
             push(stack, scriptnum_encode(n.saturating_add(1)))?;
-        }
-        // Invalid non-empty already failed inside tapscript_sig_result.
+        } // Invalid non-empty already failed inside tapscript_sig_result.
     }
     Ok(())
 }
@@ -925,9 +930,7 @@ fn op_checkmultisig(
     let dummy = pop(stack)?;
     // BIP147 NULLDUMMY: extra stack element must be empty. Softfork co-activated
     // with CSV on mainnet; always required for Witness v0 (segwit).
-    if !dummy.is_empty()
-        && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active)
-    {
+    if !dummy.is_empty() && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active) {
         return Err(ConsensusError::Script("NULLDUMMY".into()));
     }
 
@@ -1348,10 +1351,7 @@ mod success_and_disabled_tests {
     use bitcoin::script::ScriptBuf;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
-    fn eval(
-        script_bytes: &[u8],
-        sig_version: SigVersion,
-    ) -> Result<bool, ConsensusError> {
+    fn eval(script_bytes: &[u8], sig_version: SigVersion) -> Result<bool, ConsensusError> {
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -1481,7 +1481,7 @@ mod success_and_disabled_tests {
         script.push(0x20); // push 32
         script.extend_from_slice(&[0x02; 32]); // xonly-ish key (may fail xonly parse → false)
         script.push(0xad); // CHECKSIGVERIFY
-        // May error on empty verify or invalid key — either covers tapscript arms
+                           // May error on empty verify or invalid key — either covers tapscript arms
         let r = eval(&script, SigVersion::TapScript);
         assert!(r.is_err() || matches!(r, Ok(_)));
     }
@@ -1562,8 +1562,8 @@ mod success_and_disabled_tests {
         let mut script = vec![0x51]; // OP_TRUE
         script.resize(10_001, 0x61); // pad with OP_NOP
         script.push(0x51); // end with TRUE so cleanstack ok if executed
-        // Actually NOPs leave stack; final TRUE needed as only element — start empty,
-        // fill with NOPs, end OP_1.
+                           // Actually NOPs leave stack; final TRUE needed as only element — start empty,
+                           // fill with NOPs, end OP_1.
         let mut script = vec![0x61; 10_001];
         script.push(0x51);
         let need = eval(&script, SigVersion::TapScript).expect("tapscript large script");
@@ -1588,18 +1588,58 @@ mod success_and_disabled_tests {
         let cases: &[(&str, Vec<u8>, SigVersion)] = &[
             ("1ADD", vec![0x51, 0x8b, 0x52, 0x87], SigVersion::WitnessV0),
             ("1SUB", vec![0x52, 0x8c, 0x51, 0x87], SigVersion::WitnessV0),
-            ("NEGATE", vec![0x51, 0x8f, 0x4f, 0x87], SigVersion::WitnessV0),
+            (
+                "NEGATE",
+                vec![0x51, 0x8f, 0x4f, 0x87],
+                SigVersion::WitnessV0,
+            ),
             ("ABS", vec![0x4f, 0x90, 0x51, 0x87], SigVersion::WitnessV0),
-            ("SHA1", vec![0x00, 0xa7, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
-            ("RIPEMD160", vec![0x00, 0xa6, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
-            ("SHA256", vec![0x00, 0xa8, 0x82, 0x01, 0x20, 0x87], SigVersion::WitnessV0),
-            ("HASH160", vec![0x00, 0xa9, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
-            ("HASH256", vec![0x00, 0xaa, 0x82, 0x01, 0x20, 0x87], SigVersion::WitnessV0),
+            (
+                "SHA1",
+                vec![0x00, 0xa7, 0x82, 0x01, 0x14, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "RIPEMD160",
+                vec![0x00, 0xa6, 0x82, 0x01, 0x14, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "SHA256",
+                vec![0x00, 0xa8, 0x82, 0x01, 0x20, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "HASH160",
+                vec![0x00, 0xa9, 0x82, 0x01, 0x14, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "HASH256",
+                vec![0x00, 0xaa, 0x82, 0x01, 0x20, 0x87],
+                SigVersion::WitnessV0,
+            ),
             ("SIZE", vec![0x00, 0x82, 0x00, 0x87], SigVersion::WitnessV0),
-            ("WITHIN", vec![0x51, 0x00, 0x52, 0xa5, 0x51, 0x87], SigVersion::WitnessV0),
-            ("MIN", vec![0x51, 0x52, 0xa3, 0x51, 0x87], SigVersion::WitnessV0),
-            ("MAX", vec![0x51, 0x52, 0xa4, 0x52, 0x87], SigVersion::WitnessV0),
-            ("CHECKSIGADD", vec![0x00, 0x51, 0x01, 0xff, 0xba, 0x51, 0x87], SigVersion::TapScript),
+            (
+                "WITHIN",
+                vec![0x51, 0x00, 0x52, 0xa5, 0x51, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "MIN",
+                vec![0x51, 0x52, 0xa3, 0x51, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "MAX",
+                vec![0x51, 0x52, 0xa4, 0x52, 0x87],
+                SigVersion::WitnessV0,
+            ),
+            (
+                "CHECKSIGADD",
+                vec![0x00, 0x51, 0x01, 0xff, 0xba, 0x51, 0x87],
+                SigVersion::TapScript,
+            ),
         ];
         for (name, script, sv) in cases {
             match eval(script, *sv) {
@@ -1794,7 +1834,9 @@ mod success_and_disabled_tests {
         // Truncated pushdata — no success past end
         assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4c])));
         assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4d, 0x01])));
-        assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4e, 0x01, 0x00])));
+        assert!(!tapscript_has_op_success(Script::from_bytes(&[
+            0x4e, 0x01, 0x00
+        ])));
         let _ = (leaf, leaf2, leaf3);
     }
 
@@ -1889,7 +1931,11 @@ mod success_and_disabled_tests {
             "{err2}"
         );
         let err3 = eval(&[0x00, 0x00, 0x00, 0xaf], SigVersion::TapScript).unwrap_err();
-        assert!(format!("{err3}").to_lowercase().contains("checkmultisig") || format!("{err3}").contains("disabled"), "{err3}");
+        assert!(
+            format!("{err3}").to_lowercase().contains("checkmultisig")
+                || format!("{err3}").contains("disabled"),
+            "{err3}"
+        );
     }
 
     #[test]
@@ -1911,10 +1957,7 @@ mod success_and_disabled_tests {
         // OP_0 empty is minimal; length-1 push of 0x00 is not.
         let script = vec![0x01, 0x00, 0x63, 0x51, 0x68];
         let err = eval(&script, SigVersion::TapScript).unwrap_err();
-        assert!(
-            format!("{err}").contains("MINIMALIF"),
-            "got {err}"
-        );
+        assert!(format!("{err}").contains("MINIMALIF"), "got {err}");
         // OP_0 empty is minimal false → IF skipped → OP_TRUE after ENDIF succeeds.
         let script_ok = vec![0x00, 0x63, 0x51, 0x68, 0x51];
         assert!(eval(&script_ok, SigVersion::TapScript).expect("minimal empty if"));

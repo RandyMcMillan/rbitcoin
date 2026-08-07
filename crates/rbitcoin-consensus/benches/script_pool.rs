@@ -144,7 +144,9 @@ fn main() {
     let rounds = 400u32;
     let iters = 8u32;
     bench("seq fat", iters, || work_sequential(&fat, rounds));
-    bench("par/tx fat", iters, || work_parallel_per_tx(&fat, rounds, workers));
+    bench("par/tx fat", iters, || {
+        work_parallel_per_tx(&fat, rounds, workers)
+    });
     bench("par/input fat", iters, || {
         work_parallel_per_input(&fat, rounds, workers)
     });

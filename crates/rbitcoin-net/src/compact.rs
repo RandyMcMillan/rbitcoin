@@ -4,9 +4,7 @@
 //! built from live mempool (and optional extra txs). On incomplete fill,
 //! returns missing absolute indexes for `getblocktxn`.
 
-use bitcoin::bip152::{
-    BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId,
-};
+use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::block::Header;
 use bitcoin::{Block, BlockHash, Transaction};
 use std::collections::HashMap;
@@ -388,7 +386,9 @@ mod tests {
             short_ids: vec![],
             prefilled_txs: vec![],
         };
-        assert!(try_reconstruct(&hsi, &HashMap::new(), 2).unwrap_err().is_empty());
+        assert!(try_reconstruct(&hsi, &HashMap::new(), 2)
+            .unwrap_err()
+            .is_empty());
         assert!(apply_block_transactions(
             &hsi,
             &[],

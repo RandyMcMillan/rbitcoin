@@ -153,16 +153,10 @@ impl NodeConfig {
         }
         for sub in ["store", "mempool", "wire"] {
             let p = self.datadir.join(sub);
-            std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir {
-                path: p,
-                source,
-            })?;
+            std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir { path: p, source })?;
         }
         if created_root {
-            rbitcoin_log::info!(
-                "node: created datadir {}",
-                self.datadir.display()
-            );
+            rbitcoin_log::info!("node: created datadir {}", self.datadir.display());
         }
         Ok(())
     }
@@ -190,10 +184,9 @@ impl NodeConfig {
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
     /// `archive_queue_mb`, `log_level`, `electrum_listen`, `noseeds` / `no_seeds`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
-        let text = std::fs::read_to_string(path).map_err(|source| NodeError::Config(format!(
-            "read conf {}: {source}",
-            path.display()
-        )))?;
+        let text = std::fs::read_to_string(path).map_err(|source| {
+            NodeError::Config(format!("read conf {}: {source}", path.display()))
+        })?;
         self.conf_path = Some(path.to_path_buf());
         for (lineno, raw) in text.lines().enumerate() {
             let line = raw.trim();
@@ -227,45 +220,47 @@ impl NodeConfig {
             match key_l.as_str() {
                 "datadir" => self.datadir = PathBuf::from(val),
                 "network" | "chain" => {
-                    self.network = Network::parse(val).map_err(|e| {
-                        NodeError::Config(format!("conf network: {e}"))
-                    })?;
+                    self.network = Network::parse(val)
+                        .map_err(|e| NodeError::Config(format!("conf network: {e}")))?;
                 }
                 "listen" => {
-                    self.p2p_listen = Some(val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf listen: {e}"))
-                    })?);
+                    self.p2p_listen = Some(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?,
+                    );
                 }
                 "connect" => {
-                    self.connect.push(val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf connect: {e}"))
-                    })?);
+                    self.connect.push(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
+                    );
                 }
                 "electrum_listen" | "electrumlisten" => {
-                    self.electrum_listen = Some(val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf electrum_listen: {e}"))
-                    })?);
+                    self.electrum_listen =
+                        Some(val.parse().map_err(|e| {
+                            NodeError::Config(format!("conf electrum_listen: {e}"))
+                        })?);
                 }
                 "milestone" | "assumevalid_height" | "assumevalidheight" => {
-                    self.milestone_height = val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf milestone: {e}"))
-                    })?;
+                    self.milestone_height = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf milestone: {e}")))?;
                 }
                 "maxoutbound" | "max_outbound" => {
-                    self.max_outbound = val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf maxoutbound: {e}"))
-                    })?;
+                    self.max_outbound = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf maxoutbound: {e}")))?;
                 }
                 "maxinbound" | "max_inbound" | "maxconnections" => {
-                    self.max_inbound = val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf maxinbound: {e}"))
-                    })?;
+                    self.max_inbound = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf maxinbound: {e}")))?;
                     self.max_inbound_explicit = true;
                 }
                 "mempool_size_mb" | "maxmempool" => {
-                    let mb: u64 = val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf mempool_size_mb: {e}"))
-                    })?;
+                    let mb: u64 = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf mempool_size_mb: {e}")))?;
                     if mb == 0 {
                         return Err(NodeError::Config(
                             "conf mempool_size_mb must be >= 1".into(),
@@ -274,16 +269,14 @@ impl NodeConfig {
                     self.mempool_max_weight = mb.saturating_mul(1_000_000);
                 }
                 "archive_queue_mb" => {
-                    self.archive_queue_mb = val.parse().map_err(|e| {
-                        NodeError::Config(format!("conf archive_queue_mb: {e}"))
-                    })?;
+                    self.archive_queue_mb = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf archive_queue_mb: {e}")))?;
                     self.archive_queue_mb_explicit = true;
                 }
                 "log_level" => {
                     if val.is_empty() {
-                        return Err(NodeError::Config(
-                            "conf log_level requires a value".into(),
-                        ));
+                        return Err(NodeError::Config("conf log_level requires a value".into()));
                     }
                     self.conf_log_level = Some(val.to_string());
                 }
@@ -447,7 +440,10 @@ mod tests {
         assert_eq!(cfg.max_inbound, 42);
         assert_eq!(cfg.archive_queue_mb, 64);
         assert_eq!(NodeConfig::default().max_inbound, DEFAULT_MAX_INBOUND);
-        assert_eq!(NodeConfig::default().archive_queue_mb, DEFAULT_ARCHIVE_QUEUE_MB);
+        assert_eq!(
+            NodeConfig::default().archive_queue_mb,
+            DEFAULT_ARCHIVE_QUEUE_MB
+        );
     }
 
     #[test]

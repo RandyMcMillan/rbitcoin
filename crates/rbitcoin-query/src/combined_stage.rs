@@ -196,8 +196,7 @@ mod tests {
     fn outs_denserels_loads_parent_decode() {
         let (dir, q) = temp_query();
         let fk = put_tx(&q, 7);
-        let creates =
-            load_creates_once(q.store(), &[fk], IdxBodyMode::OutsDenserels).unwrap();
+        let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::OutsDenserels).unwrap();
         assert_eq!(creates.len(), 1);
         assert!(
             creates[0].decoded_outs.is_some(),
@@ -307,11 +306,16 @@ mod tests {
         assert!(!q.block_queue_update_soft_pressure(Some(5.0)));
         // Many tiny payloads — under free floor, unrestricted.
         for i in 0..451u32 {
-            q.block_queue_enqueue(i, {
-                let mut h = [0u8; 32];
-                h[..4].copy_from_slice(&i.to_le_bytes());
-                h
-            }, 1, b"x")
+            q.block_queue_enqueue(
+                i,
+                {
+                    let mut h = [0u8; 32];
+                    h[..4].copy_from_slice(&i.to_le_bytes());
+                    h
+                },
+                1,
+                b"x",
+            )
             .unwrap();
         }
         assert!(
@@ -445,9 +449,8 @@ mod tests {
         q.archive_block(&h1, &[cb1, child]).unwrap();
 
         reset_body_ok_reads();
-        let (st0, parents0, _thin0, bodies0) = q
-            .load_confirm_parents(&[(0, h0hash)])
-            .expect("load h0");
+        let (st0, parents0, _thin0, bodies0) =
+            q.load_confirm_parents(&[(0, h0hash)]).expect("load h0");
         assert!(st0.blocks >= 1, "h0 load blocks={}", st0.blocks);
         assert!(bodies0.len() >= 1, "h0 bodies");
         let body_reads_after_h0 = body_ok_reads();
@@ -466,9 +469,8 @@ mod tests {
 
         // Load h1: child spends parent → pin via same-batch (if multi-height) or cold.
         // Separate load of h1 only: parent is external → one denserels cold load.
-        let (st1, parents1, _thin1, bodies1) = q
-            .load_confirm_parents(&[(1, h1hash)])
-            .expect("load h1");
+        let (st1, parents1, _thin1, bodies1) =
+            q.load_confirm_parents(&[(1, h1hash)]).expect("load h1");
         assert!(st1.blocks >= 1);
         assert!(bodies1.len() >= 1);
         // Parent pin from cold denserels (or batch if multi-block load).
@@ -501,7 +503,11 @@ mod tests {
             output_start_fk: Fk::NULL,
             output_count: 1,
         };
-        let inputs = vec![InputRecord::coinbase(u32::MAX, script.clone(), vec![vec![9]])];
+        let inputs = vec![InputRecord::coinbase(
+            u32::MAX,
+            script.clone(),
+            vec![vec![9]],
+        )];
         let outs = vec![OutputRecord::unspent(1, script.clone())];
         let mut plain = Vec::new();
         rbitcoin_store::encode_packed_tx_with_secret(&tx, &inputs, &outs, &mut plain, None);

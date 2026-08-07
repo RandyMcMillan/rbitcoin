@@ -23,7 +23,10 @@ pub fn block_to_apply(
     header: &Header,
     txs: &[Transaction],
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
-    let txids: Vec<[u8; 32]> = txs.iter().map(|t| t.compute_txid().to_byte_array()).collect();
+    let txids: Vec<[u8; 32]> = txs
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
     block_to_apply_with_txids(query, header, txs, &txids)
 }
 
@@ -97,10 +100,7 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
     let outputs: Vec<OutputRecord> = tx
         .output
         .iter()
-        .map(|o| OutputRecord::unspent(
-            o.value.to_sat() as i64,
-            o.script_pubkey.to_bytes(),
-        ))
+        .map(|o| OutputRecord::unspent(o.value.to_sat() as i64, o.script_pubkey.to_bytes()))
         .collect();
 
     Ok(TxApply {
@@ -123,9 +123,7 @@ mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
     #[test]
     fn apply_with_precomputed_txid_matches_fresh_hash() {

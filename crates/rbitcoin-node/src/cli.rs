@@ -522,7 +522,9 @@ mod tests {
 
     #[test]
     fn smoke_open_and_shutdown() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -555,7 +557,9 @@ mod tests {
 
     #[test]
     fn help_lists_coreish_flags_not_only_env() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Parse accepts Core-like aliases (not env-only).
         let dir = tmp_datadir();
         let code = cli_main([
@@ -582,7 +586,9 @@ mod tests {
 
     #[test]
     fn conf_file_then_cli_override() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("node.conf");
@@ -617,7 +623,9 @@ mod tests {
     /// CLI omit of inbound/archive must not clobber pre-set advanced envs.
     #[test]
     fn cli_omit_preserves_advanced_env() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "91");
         std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "44");
         let dir = tmp_datadir();
@@ -651,7 +659,9 @@ mod tests {
 
     #[test]
     fn conf_log_level_applied_when_cli_omits() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("log.conf");

@@ -5,10 +5,12 @@ use std::process::Command;
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 || s.is_empty() { return None; }
-    let mut out = Vec::with_capacity(s.len()/2);
+    if s.len() % 2 != 0 || s.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
     for i in (0..s.len()).step_by(2) {
-        out.push(u8::from_str_radix(&s[i..i+2], 16).ok()?);
+        out.push(u8::from_str_radix(&s[i..i + 2], 16).ok()?);
     }
     Some(out)
 }
@@ -18,8 +20,14 @@ fn fetch_tx(txid: &str) -> Option<Transaction> {
         b
     } else {
         let out = Command::new("curl")
-            .args(["-sL","-m","60",&format!("https://blockstream.info/api/tx/{txid}/hex")])
-            .output().ok()?;
+            .args([
+                "-sL",
+                "-m",
+                "60",
+                &format!("https://blockstream.info/api/tx/{txid}/hex"),
+            ])
+            .output()
+            .ok()?;
         let hex = String::from_utf8(out.stdout).ok()?;
         let raw = hex_decode(&hex)?;
         let _ = std::fs::write(&cache, &raw);
@@ -29,7 +37,9 @@ fn fetch_tx(txid: &str) -> Option<Transaction> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/b290329/block.bin".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/b290329/block.bin".into());
     let block: Block = deserialize(&std::fs::read(&path).unwrap()).unwrap();
     println!("hash={} ntx={}", block.block_hash(), block.txdata.len());
     let mut n_fail = 0usize;
@@ -43,12 +53,21 @@ fn main() {
                 Some(prev) => {
                     if let Some(o) = prev.output.get(inp.previous_output.vout as usize) {
                         prevouts.push(o.clone());
-                    } else { missing = true; break; }
+                    } else {
+                        missing = true;
+                        break;
+                    }
                 }
-                None => { missing = true; break; }
+                None => {
+                    missing = true;
+                    break;
+                }
             }
         }
-        if missing { n_skip += 1; continue; }
+        if missing {
+            n_skip += 1;
+            continue;
+        }
         let mut job = JobBytes::new(prevouts, tx.clone());
         job.bip66_active = false;
         job.bip16_active = true;
@@ -57,7 +76,9 @@ fn main() {
             Err(e) => {
                 n_fail += 1;
                 println!("FAIL tx#{ti} {}: {e}", tx.compute_txid());
-                if n_fail >= 5 { break; }
+                if n_fail >= 5 {
+                    break;
+                }
             }
         }
     }

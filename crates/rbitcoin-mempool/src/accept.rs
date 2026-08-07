@@ -51,8 +51,14 @@ pub enum AcceptError {
     /// Tx parked in the orphanage waiting on missing parent(s). Not a hard reject.
     Orphaned(Txid),
     Duplicate(Txid),
-    ClusterTooLarge { count: usize, weight: u64 },
-    PackageTooLarge { count: usize, weight: u64 },
+    ClusterTooLarge {
+        count: usize,
+        weight: u64,
+    },
+    PackageTooLarge {
+        count: usize,
+        weight: u64,
+    },
     PackageEmpty,
     PackageNotTopo,
     /// Conflicting mempool txs exist and replacement does not pay enough.
@@ -104,7 +110,8 @@ fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), Accep
     }
     // `script_bench` mirrors production `ScriptCheckJob` with softfork flags on.
     let job = rbitcoin_consensus::script_bench::JobBytes::new(prevouts, tx.clone());
-    rbitcoin_consensus::script_bench::verify_job(&job).map_err(|e| AcceptError::Script(e.to_string()))
+    rbitcoin_consensus::script_bench::verify_job(&job)
+        .map_err(|e| AcceptError::Script(e.to_string()))
 }
 
 /// Mempool with RAM TxGraph layered on durable store.
@@ -318,9 +325,7 @@ impl ActiveMempool {
         // Consensus script checks (same interpreter as block connect). Policy
         // alone is not enough — invalid scripts must never enter the pool or
         // be announced / Electrum-broadcast.
-        if let Err(e) = verify_tx_scripts(tx, prevouts) {
-            return Err(e);
-        }
+        verify_tx_scripts(tx, prevouts)?;
 
         // Full RBF (Libre): replace conflicts if replacement pays enough.
         let conflict_set = if !direct_conflicts.is_empty() {
@@ -340,10 +345,7 @@ impl ActiveMempool {
             .filter(|p| !conflict_set.contains(p))
             .collect();
 
-        if self
-            .graph
-            .cluster_would_exceed(&parent_txids, 1, weight)
-        {
+        if self.graph.cluster_would_exceed(&parent_txids, 1, weight) {
             let mut members = BTreeSet::new();
             for p in &parent_txids {
                 if let Some(c) = self.graph.cluster_of(p) {
@@ -536,9 +538,12 @@ impl ActiveMempool {
     /// and best-effort re-accepts orphans whose parent just confirmed (caller must
     /// pass a UTXO view that includes the new tip — use [`remove_for_block_with_utxo`]).
     pub fn remove_for_block(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
-        self.remove_for_block_with_utxo(block_txids, &MapUtxoProvider {
-            map: std::collections::HashMap::new(),
-        })
+        self.remove_for_block_with_utxo(
+            block_txids,
+            &MapUtxoProvider {
+                map: std::collections::HashMap::new(),
+            },
+        )
     }
 
     /// Like [`remove_for_block`], then promote orphans of confirmed parents via `utxos`.
@@ -762,13 +767,7 @@ mod tests {
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.accept_tx(&parent, &utxos).unwrap();
 
-        let child = spend_tx(
-            OutPoint {
-                txid: pid,
-                vout: 0,
-            },
-            80_000,
-        );
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 80_000);
         mp.accept_tx(&child, &utxos).unwrap();
         assert_eq!(mp.live_count(), 2);
         let c = mp.graph.cluster_of(&pid).unwrap();
@@ -788,7 +787,8 @@ mod tests {
             let remain = 10_000_000u64 - (i as u64 + 1) * 1_000;
             let tx = spend_tx(prev_op, remain);
             let last_txid = tx.compute_txid();
-            mp.accept_tx(&tx, &utxos).unwrap_or_else(|e| panic!("i={i}: {e}"));
+            mp.accept_tx(&tx, &utxos)
+                .unwrap_or_else(|e| panic!("i={i}: {e}"));
             prev_op = OutPoint {
                 txid: last_txid,
                 vout: 0,
@@ -822,13 +822,7 @@ mod tests {
         // Parent low fee still above min relay if weight small.
         let parent = spend_tx(op, 99_000); // fee 1000
         let pid = parent.compute_txid();
-        let child = spend_tx(
-            OutPoint {
-                txid: pid,
-                vout: 0,
-            },
-            90_000,
-        );
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 90_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let res = mp
             .accept_package(&[parent.clone(), child.clone()], &utxos)
@@ -839,9 +833,7 @@ mod tests {
         assert_eq!(c.members.len(), 2);
         // Wrong order rejected.
         let mut mp2 = ActiveMempool::open_or_create(tmp_dir()).unwrap();
-        let err = mp2
-            .accept_package(&[child, parent], &utxos)
-            .unwrap_err();
+        let err = mp2.accept_package(&[child, parent], &utxos).unwrap_err();
         assert!(matches!(err, AcceptError::PackageNotTopo));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -933,7 +925,8 @@ mod tests {
             // Vary fees so worst-chunk ordering is defined: low fee first.
             let out = 99_000u64 - u64::from(i) * 100; // higher i → higher fee
             let tx = spend_tx(op, out);
-            mp.accept_tx(&tx, &utxos).unwrap_or_else(|e| panic!("i={i}: {e}"));
+            mp.accept_tx(&tx, &utxos)
+                .unwrap_or_else(|e| panic!("i={i}: {e}"));
         }
         assert!(mp.graph.total_weight() <= mp.max_weight + 500); // allow one protected overflow
         assert!(mp.live_count() < 8, "some eviction expected");

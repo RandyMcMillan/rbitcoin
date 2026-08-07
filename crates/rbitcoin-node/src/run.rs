@@ -3,6 +3,7 @@ use crate::error::NodeError;
 use bitcoin::consensus::Encodable;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
+use rbitcoin_log::{info, warn};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
@@ -12,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
-use rbitcoin_log::{info, warn};
 
 /// Running node state (store open; optional P2P).
 pub struct NodeHandle {
@@ -310,10 +310,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // that used to drop a nested multi-thread runtime mid-async and panic
         // (`Cannot drop a runtime in an async context`), making Ctrl+C slow/noisy.
         let cancel = Some(Arc::clone(&shutdown.flag));
-        match node
-            .sync_cancellable(&ibd_targets, ibd_cfg, cancel)
-            .await
-        {
+        match node.sync_cancellable(&ibd_targets, ibd_cfg, cancel).await {
             Ok(n) => {
                 if shutdown.requested() {
                     warn!(
@@ -332,10 +329,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         );
                         catch_up_complete = false;
                     } else {
-                        info!(
-                            "ibd: catch-up accepted≈{n} tip={:?}",
-                            node.tip_height()
-                        );
+                        info!("ibd: catch-up accepted≈{n} tip={:?}", node.tip_height());
                         catch_up_complete = true;
                     }
                 }
@@ -718,10 +712,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 /// Returns `false` if SH materialize failed or was cancelled (do not treat as
 /// Electrum-ready). On SIGINT mid-reduce, a fan-in **CHECKPOINT** is left so the
 /// next process resumes from the last completed pass.
-pub(crate) fn enter_tip_mode(
-    query: &Query,
-    cancel: Option<Arc<AtomicBool>>,
-) -> bool {
+pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> bool {
     // Fast path: already materialized and watermarks cover tip (near-tip restart).
     if query.sh_is_tip_ready() {
         let _ = query.sync_sh_seal_from_include_hwm();

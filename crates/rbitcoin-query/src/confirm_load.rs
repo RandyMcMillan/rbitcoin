@@ -134,7 +134,7 @@ impl Query {
         let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
             HashMap::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
-        // parent_fk → needed prev_index (vouts) for sparse outs stash.
+                                                                      // parent_fk → needed prev_index (vouts) for sparse outs stash.
         let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut thin_by_spend: BatchThin = BatchThin::new();
         let mut batch_create_ids: HashSet<u64> = HashSet::new();
@@ -148,25 +148,35 @@ impl Query {
             // ── Header + header_txs ────────────────────────────────────────
             let t_hdr = Instant::now();
             let Some((header_fk, header_rec)) = self.store.get_header_by_hash(&hash)? else {
-                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                st.header_ns = st
+                    .header_ns
+                    .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             };
             if !self.store.header_txs.has_body(header_fk)? {
-                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                st.header_ns = st
+                    .header_ns
+                    .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             }
             let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
-                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                st.header_ns = st
+                    .header_ns
+                    .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             };
             if tx_fks.is_empty() {
-                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                st.header_ns = st
+                    .header_ns
+                    .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             }
             // Body readiness: first tx must have an idx range (no tx.head probe).
             if let Some(&first) = tx_fks.first() {
                 if self.store.tx_body_range(first).is_err() {
-                    st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                    st.header_ns = st
+                        .header_ns
+                        .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                     continue;
                 }
             }
@@ -176,8 +186,9 @@ impl Query {
                 match self.store.get_header(header_rec.prev_fk) {
                     Ok(prev) => prev.hash,
                     Err(_) => {
-                        st.header_ns =
-                            st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                        st.header_ns = st
+                            .header_ns
+                            .saturating_add(t_hdr.elapsed().as_nanos() as u64);
                         continue;
                     }
                 }
@@ -189,7 +200,9 @@ impl Query {
                 tx_fks.clone(),
                 prev_hash,
             );
-            st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+            st.header_ns = st
+                .header_ns
+                .saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
             // ── body ranges + full Class A decode ─────────────────────────
             st.blocks = st.blocks.saturating_add(1);
@@ -282,10 +295,9 @@ impl Query {
                         .copied()
                         .ok_or(StoreError::Corrupt("confirm load missing create identity"))?;
                     if tx.txid == [0u8; 32] {
-                        return Err(StoreError::Corrupt(
-                            "confirm load create identity still zero",
-                        )
-                        .into());
+                        return Err(
+                            StoreError::Corrupt("confirm load create identity still zero").into(),
+                        );
                     }
                 }
                 let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
@@ -359,7 +371,9 @@ impl Query {
                 thin_by_spend.insert(id, edges);
             }
         }
-        st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
+        st.thin_ns = st
+            .thin_ns
+            .saturating_add(t_thin.elapsed().as_nanos() as u64);
 
         // ── Pin parents into per-batch BatchParents ───────────────────────
         // Sparse spent-filtered outs live on the batch object (not tip-GCed).
@@ -398,11 +412,7 @@ impl Query {
             if let Some(body) = batch_bodies.get(fk) {
                 let sparse =
                     crate::batch_parents::sparse_spender_rels(&body.denserels, &need_vouts);
-                if crate::batch_parents::layout_covers_need(
-                    body.body_range,
-                    &sparse,
-                    &need_vouts,
-                ) {
+                if crate::batch_parents::layout_covers_need(body.body_range, &sparse, &need_vouts) {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                     st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                     let live = slim_dense_outs_to_need(&body.outputs, &need_vouts);
@@ -495,15 +505,7 @@ impl Query {
                 } else {
                     None
                 };
-                batch_parents.insert_owned(
-                    fk,
-                    tx,
-                    live,
-                    need_vouts.clone(),
-                    cb,
-                    range,
-                    sparse,
-                );
+                batch_parents.insert_owned(fk, tx, live, need_vouts.clone(), cb, range, sparse);
                 st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             }
@@ -529,10 +531,7 @@ impl Query {
     }
 
     /// No-op: sparse parents are batch-local and drop with the confirm batch.
-    pub fn unpin_spent_parent_outs(
-        &self,
-        _spends: &[(Fk, u32)],
-    ) -> Result<(), QueryError> {
+    pub fn unpin_spent_parent_outs(&self, _spends: &[(Fk, u32)]) -> Result<(), QueryError> {
         Ok(())
     }
 }
@@ -560,7 +559,10 @@ fn slim_dense_outs_to_need(
 }
 
 /// Derive coinbase flag from decoded inputs (called once at pin).
-fn is_coinbase_inputs(tx: &rbitcoin_store::TxRecord, inputs: &[rbitcoin_store::InputRecord]) -> bool {
+fn is_coinbase_inputs(
+    tx: &rbitcoin_store::TxRecord,
+    inputs: &[rbitcoin_store::InputRecord],
+) -> bool {
     if tx.input_count != 1 {
         return false;
     }
@@ -870,11 +872,11 @@ mod pin_new_invariant_tests {
         assert!(
             msg.contains("invariant")
                 && msg.contains("pin_new")
-                && (msg.contains("incomplete") || msg.contains("denserels") || msg.contains("body")),
+                && (msg.contains("incomplete")
+                    || msg.contains("denserels")
+                    || msg.contains("body")),
             "unexpected err: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-

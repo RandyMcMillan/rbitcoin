@@ -12,9 +12,7 @@ use bitcoin::hashes::{hash160, Hash};
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 fn make_p2wpkh_job(seed: u8) -> rbitcoin_consensus::script_bench::JobBytes {
     let secp = Secp256k1::new();

@@ -162,10 +162,7 @@ mod tests {
         t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
             .unwrap();
         let flags = bulk_io::test_take_last_write_dontcache();
-        assert!(
-            !flags.is_empty(),
-            "Class A append must issue bulk WriteOp"
-        );
+        assert!(!flags.is_empty(), "Class A append must issue bulk WriteOp");
         assert!(
             flags.iter().all(|&d| !d),
             "Class A append must not request DONTCACHE; got {flags:?}"

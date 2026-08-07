@@ -30,7 +30,10 @@ pub fn encode(data: impl AsRef<[u8]>) -> String {
 
 /// Decode a hex string (even length, optional `0x` prefix). Accepts a-f/A-F.
 pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if s.len() % 2 != 0 {
         return Err(HexError {
             message: "odd hex length",

@@ -282,10 +282,9 @@ impl AddrMan {
     }
 
     pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
-        self.by_addr.get(addr).map(|&flags| PeerEntry {
-            addr: *addr,
-            flags,
-        })
+        self.by_addr
+            .get(addr)
+            .map(|&flags| PeerEntry { addr: *addr, flags })
     }
 
     pub fn len(&self) -> usize {
@@ -377,10 +376,7 @@ impl AddrMan {
 
     /// Snapshot of all entries (for tests / diagnostics).
     pub fn entries(&self) -> Vec<PeerEntry> {
-        self.order
-            .iter()
-            .filter_map(|a| self.entry(a))
-            .collect()
+        self.order.iter().filter_map(|a| self.entry(a)).collect()
     }
 
     // ── Persistence ─────────────────────────────────────────────────────────
@@ -427,21 +423,36 @@ impl AddrMan {
             let addr: SocketAddr = addr_s.parse().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("peers file {}:{}: bad addr: {e}", path.display(), lineno + 1),
+                    format!(
+                        "peers file {}:{}: bad addr: {e}",
+                        path.display(),
+                        lineno + 1
+                    ),
                 )
             })?;
-            let flags_u: u8 = if let Some(hex) = flags_s.strip_prefix("0x").or_else(|| flags_s.strip_prefix("0X")) {
+            let flags_u: u8 = if let Some(hex) = flags_s
+                .strip_prefix("0x")
+                .or_else(|| flags_s.strip_prefix("0X"))
+            {
                 u8::from_str_radix(hex, 16).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
+                        format!(
+                            "peers file {}:{}: bad flags: {e}",
+                            path.display(),
+                            lineno + 1
+                        ),
                     )
                 })?
             } else {
                 flags_s.parse().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
+                        format!(
+                            "peers file {}:{}: bad flags: {e}",
+                            path.display(),
+                            lineno + 1
+                        ),
                     )
                 })?
             };
@@ -464,7 +475,10 @@ impl AddrMan {
         {
             let mut f = std::fs::File::create(&tmp)?;
             writeln!(f, "{}", Self::PEERS_FILE_MAGIC)?;
-            writeln!(f, "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)")?;
+            writeln!(
+                f,
+                "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
+            )?;
             for e in self.entries() {
                 writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
             }
@@ -556,10 +570,7 @@ mod tests {
 
     #[test]
     fn peers_file_roundtrip_preserves_flags() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-peers-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rbitcoin-peers-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("peers");
         let mut am = AddrMan::new();
@@ -706,11 +717,7 @@ mod tests {
         let bad_hex = dir.join("bad-hex");
         std::fs::write(
             &bad_hex,
-            format!(
-                "{}\n{} 0xZZ\n",
-                AddrMan::PEERS_FILE_MAGIC,
-                addr(1)
-            ),
+            format!("{}\n{} 0xZZ\n", AddrMan::PEERS_FILE_MAGIC, addr(1)),
         )
         .unwrap();
         assert!(AddrMan::load(&bad_hex).is_err());
@@ -719,11 +726,7 @@ mod tests {
         let bad_dec = dir.join("bad-dec");
         std::fs::write(
             &bad_dec,
-            format!(
-                "{}\n{} not-a-number\n",
-                AddrMan::PEERS_FILE_MAGIC,
-                addr(1)
-            ),
+            format!("{}\n{} not-a-number\n", AddrMan::PEERS_FILE_MAGIC, addr(1)),
         )
         .unwrap();
         assert!(AddrMan::load(&bad_dec).is_err());
@@ -731,11 +734,7 @@ mod tests {
         let ok_upper = dir.join("ok-upper");
         std::fs::write(
             &ok_upper,
-            format!(
-                "{}\n{} 0X01\n",
-                AddrMan::PEERS_FILE_MAGIC,
-                addr(7)
-            ),
+            format!("{}\n{} 0X01\n", AddrMan::PEERS_FILE_MAGIC, addr(7)),
         )
         .unwrap();
         let u = AddrMan::load(&ok_upper).unwrap();

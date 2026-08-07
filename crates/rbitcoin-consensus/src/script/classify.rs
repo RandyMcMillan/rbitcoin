@@ -107,7 +107,9 @@ mod tests {
         });
         assert_eq!(classify(p2sh.as_script()), ScriptKind::P2sh);
 
-        assert!(is_anyone_can_spend(ScriptBuf::from_bytes(vec![0x51]).as_script()));
+        assert!(is_anyone_can_spend(
+            ScriptBuf::from_bytes(vec![0x51]).as_script()
+        ));
         // Empty is bare consensus-eval, not anyone-can-spend (Core parity).
         assert!(!is_anyone_can_spend(ScriptBuf::new().as_script()));
         assert_eq!(classify(ScriptBuf::new().as_script()), ScriptKind::Bare);

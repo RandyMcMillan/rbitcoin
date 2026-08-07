@@ -145,9 +145,7 @@ impl SegmentedTxHead {
             let fuse = if sealed {
                 let fp = segment_fuse_path(&dir, d.file_id);
                 if !fp.exists() {
-                    return Err(StoreError::Corrupt(
-                        "tx.head sealed segment missing fuse8",
-                    ));
+                    return Err(StoreError::Corrupt("tx.head sealed segment missing fuse8"));
                 }
                 Some(SealedFuse8::read_from(&fp)?)
             } else {
@@ -171,7 +169,9 @@ impl SegmentedTxHead {
             }
         }
         for w in segs.windows(2) {
-            let a_end = w[0].first_fk.saturating_add(w[0].count.load(Ordering::Relaxed));
+            let a_end = w[0]
+                .first_fk
+                .saturating_add(w[0].count.load(Ordering::Relaxed));
             if w[1].first_fk != a_end {
                 return Err(StoreError::Corrupt("tx.head segment fk gap/overlap"));
             }
@@ -180,10 +180,7 @@ impl SegmentedTxHead {
         // Per-seg detail: `file_id@first_fk:count{s|o}` (s=sealed, o=open tail).
         let sealed_n = segs.iter().filter(|s| s.sealed).count();
         let open_n = segs.len().saturating_sub(sealed_n);
-        let creates: u64 = segs
-            .iter()
-            .map(|s| s.count.load(Ordering::Relaxed))
-            .sum();
+        let creates: u64 = segs.iter().map(|s| s.count.load(Ordering::Relaxed)).sum();
         let detail: String = segs
             .iter()
             .map(|s| {
@@ -244,10 +241,7 @@ impl SegmentedTxHead {
     }
 
     pub fn sealed_segment_count(&self) -> usize {
-        self.segments_snapshot()
-            .iter()
-            .filter(|s| s.sealed)
-            .count()
+        self.segments_snapshot().iter().filter(|s| s.sealed).count()
     }
 
     pub fn occupied(&self) -> u64 {
@@ -288,10 +282,7 @@ impl SegmentedTxHead {
                 "tx.head replace_open_keys: key count mismatch",
             ));
         }
-        *last
-            .open_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = keys;
+        *last.open_keys.lock().unwrap_or_else(|e| e.into_inner()) = keys;
         Ok(())
     }
 
@@ -608,7 +599,9 @@ impl SegmentedTxHead {
                 continue;
             }
             let rel_lists = match session.as_mut() {
-                Some(s) => seg.head.probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
+                Some(s) => seg
+                    .head
+                    .probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
                 None => seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?,
             };
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
@@ -707,10 +700,7 @@ impl SegmentedTxHead {
             return Ok(());
         }
         let t0 = Instant::now();
-        let mut keys = last
-            .open_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut keys = last.open_keys.lock().unwrap_or_else(|e| e.into_inner());
         // Completeness is on the raw append stream (one fuse key per create insert),
         // not unique keys — BIP30 same-txid pushes the same mixed key twice.
         let raw_n = keys.len();
@@ -1120,9 +1110,7 @@ mod tests {
         let batch1: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
         h.insert_many(&batch1, false).unwrap();
         assert_eq!(h.segment_count(), 1);
-        let batch2: Vec<_> = (100..150u64)
-            .map(|i| (mixed(i + 1), Fk(i + 1)))
-            .collect();
+        let batch2: Vec<_> = (100..150u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
         h.insert_many(&batch2, true).unwrap(); // force roll
         assert!(h.segment_count() >= 2);
         assert!(h.sealed_segment_count() >= 1);
@@ -1138,7 +1126,9 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("tx.head"), b"legacy").unwrap();
         let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-        let err = SegmentedTxHead::create(&dir, layout).err().expect("must refuse mono head");
+        let err = SegmentedTxHead::create(&dir, layout)
+            .err()
+            .expect("must refuse mono head");
         let s = format!("{err}");
         assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
         let _ = std::fs::remove_dir_all(&dir);

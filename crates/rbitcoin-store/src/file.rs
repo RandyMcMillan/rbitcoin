@@ -276,7 +276,9 @@ impl TableFile {
 
     pub fn set_trailing_ext(&mut self, ext: [u8; 16]) -> Result<(), StoreError> {
         if !self.trailing_header {
-            return Err(StoreError::Corrupt("set_trailing_ext on leading-header file"));
+            return Err(StoreError::Corrupt(
+                "set_trailing_ext on leading-header file",
+            ));
         }
         self.trailing_ext = ext;
         let logical = self.published_len.load(Ordering::Acquire);
@@ -776,12 +778,8 @@ mod advise_tests {
         let _ = std::fs::remove_file(&path2);
         let path3 = std::env::temp_dir().join(format!("rbitcoin-access-idx-{id}"));
         let _ = std::fs::remove_file(&path3);
-        let idx = TableFile::create_with_access(
-            &path3,
-            TableKind::ArrayLink,
-            TableAccess::FdOnly,
-        )
-        .unwrap();
+        let idx = TableFile::create_with_access(&path3, TableKind::ArrayLink, TableAccess::FdOnly)
+            .unwrap();
         assert_eq!(idx.access(), TableAccess::FdOnly);
         let payload = 42u32.to_le_bytes();
         let off = FILE_HEADER_LEN as u64;
@@ -790,12 +788,8 @@ mod advise_tests {
         idx.read_at(off, &mut got).unwrap();
         assert_eq!(got, payload);
         drop(idx);
-        let idx2 = TableFile::open_with_access(
-            &path3,
-            TableKind::ArrayLink,
-            TableAccess::FdOnly,
-        )
-        .unwrap();
+        let idx2 =
+            TableFile::open_with_access(&path3, TableKind::ArrayLink, TableAccess::FdOnly).unwrap();
         let mut got2 = [0u8; 4];
         idx2.read_at(off, &mut got2).unwrap();
         assert_eq!(got2, payload);
@@ -818,10 +812,7 @@ mod advise_tests {
 
         let seed = vec![0x11u8; 64];
         f.write_at(FILE_HEADER_LEN as u64, &seed).unwrap();
-        assert_eq!(
-            f.logical_len(),
-            FILE_HEADER_LEN as u64 + seed.len() as u64
-        );
+        assert_eq!(f.logical_len(), FILE_HEADER_LEN as u64 + seed.len() as u64);
 
         let barrier = Arc::new(Barrier::new(5));
         let mut handles = Vec::new();
@@ -908,17 +899,11 @@ mod advise_tests {
             f.load_u32_le(off32 + 1),
             Err(StoreError::Corrupt(_))
         ));
-        assert!(matches!(
-            f.load_u32_le(10_000),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(f.load_u32_le(10_000), Err(StoreError::Corrupt(_))));
         f.zero_range(0, 0).unwrap();
         f.zero_range(FILE_HEADER_LEN as u64 + 32, 16).unwrap();
         f.set_logical_len(FILE_HEADER_LEN as u64 + 48).unwrap();
-        assert!(matches!(
-            f.set_logical_len(0),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(f.set_logical_len(0), Err(StoreError::Corrupt(_))));
         assert!(matches!(
             f.with_bytes(FILE_HEADER_LEN as u64, 10_000, |_| ()),
             Err(StoreError::Corrupt(_))
@@ -928,7 +913,11 @@ mod advise_tests {
         {
             let bad = std::env::temp_dir().join(format!("rbitcoin-file-bad-{id}"));
             let _ = std::fs::remove_file(&bad);
-            std::fs::write(&bad, b"XXXX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+            std::fs::write(
+                &bad,
+                b"XXXX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            )
+            .unwrap();
             assert!(matches!(
                 TableFile::open(&bad, TableKind::Tx),
                 Err(StoreError::BadMagic)
@@ -971,8 +960,7 @@ mod advise_tests {
                 let mut footer = [0u8; TRAILING_FOOTER_LEN];
                 footer[0..4].copy_from_slice(&STORE_MAGIC);
                 footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-                footer[6..8]
-                    .copy_from_slice(&TableKind::HashHead.as_u16().to_le_bytes());
+                footer[6..8].copy_from_slice(&TableKind::HashHead.as_u16().to_le_bytes());
                 footer[8..16].copy_from_slice(&logical.to_le_bytes());
                 footer[16..32].copy_from_slice(&[0x22; 16]);
                 let mut raw = Vec::with_capacity(logical as usize);
@@ -1055,8 +1043,10 @@ mod advise_tests {
         ));
         let good = dir.join("good");
         let f = TableFile::create_trailing_header(&good, TableKind::Tx).unwrap();
-        f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
-        f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64)
+            .unwrap();
+        f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64)
+            .unwrap();
         drop(f);
         let (_f2, _ext) = TableFile::open_trailing_header_from_end(&good, TableKind::Tx).unwrap();
         assert!(matches!(
@@ -1065,8 +1055,10 @@ mod advise_tests {
         ));
         let good2 = dir.join("good2");
         let f = TableFile::create_trailing_header(&good2, TableKind::Tx).unwrap();
-        f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
-        f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64)
+            .unwrap();
+        f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64)
+            .unwrap();
         drop(f);
         let (_f3, _) = TableFile::open_trailing_header(&good2, TableKind::Tx, 1024).unwrap();
         assert!(TableFile::open_trailing_header(&good2, TableKind::Tx, 50_000).is_err());
@@ -1141,9 +1133,7 @@ mod advise_tests {
         f2.read_at(FILE_HEADER_LEN as u64, &mut got).unwrap();
         assert_eq!(got, payload);
         let mut past = [0u8; 1];
-        assert!(f2
-            .read_at(published, &mut past)
-            .is_err());
+        assert!(f2.read_at(published, &mut past).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1228,9 +1218,7 @@ pub fn ensure_nofile_budget_at_least(want_soft: u64) -> (u64, u64) {
                 );
                 return (soft, hard);
             }
-            rbitcoin_log::debug!(
-                "store: raised RLIMIT_NOFILE soft {soft}→{target} (hard={hard})"
-            );
+            rbitcoin_log::debug!("store: raised RLIMIT_NOFILE soft {soft}→{target} (hard={hard})");
             return (target, hard);
         }
         if soft < want_soft {
@@ -1274,9 +1262,7 @@ fn try_punch_hole(file: &File, offset: u64, len: u64) -> std::io::Result<()> {
     {
         use std::os::unix::io::AsRawFd;
         const PUNCH: i32 = 0x02 | 0x01;
-        let rc = unsafe {
-            libc::fallocate(file.as_raw_fd(), PUNCH, offset as i64, len as i64)
-        };
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), PUNCH, offset as i64, len as i64) };
         if rc == 0 {
             return Ok(());
         }

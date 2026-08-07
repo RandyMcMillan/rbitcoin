@@ -81,8 +81,6 @@ impl SpenderTable {
         ))
     }
 
-
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
     }
@@ -114,7 +112,10 @@ mod tests {
         assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
         assert_eq!(t.get(b).unwrap(), (Fk(11), a));
         assert_eq!(t.count(), 2);
-        assert!(matches!(t.append(Fk::NULL, Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(
+            t.append(Fk::NULL, Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
         assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
         t.flush().unwrap();

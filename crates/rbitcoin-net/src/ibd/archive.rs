@@ -105,7 +105,6 @@ impl ArchiveQueueBudget {
         (scale, pressure)
     }
 
-
     /// True while charged fill is **strictly below** budget — issue densify
     /// getdata. Soft meter (no dual-track job charges on the unified path).
     pub fn can_assign(&self) -> bool {
@@ -199,10 +198,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             let Some(&hash) = st.height_to_hash.get(&ht) else {
                 continue;
             };
-            if hub.has_block(&hash)
-                || st.body.is_known_archived(&hash)
-                || hub.is_archived(&hash)
-            {
+            if hub.has_block(&hash) || st.body.is_known_archived(&hash) || hub.is_archived(&hash) {
                 continue;
             }
             st.body.mark_missing(hash);
@@ -234,9 +230,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             );
         }
         if empty_skip > 0 {
-            warn!(
-                "ibd: rehydrate dropped {empty_skip} empty body-queue rec(s)"
-            );
+            warn!("ibd: rehydrate dropped {empty_skip} empty body-queue rec(s)");
         }
     }
     Ok(n)

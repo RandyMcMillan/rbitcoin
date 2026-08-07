@@ -75,11 +75,7 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     }
     // Also sample by max height in hash_height if ordered is empty/ghosty.
     if tips.is_empty() {
-        if let Some((&h, _)) = st
-            .hash_height
-            .iter()
-            .max_by_key(|(_, &ht)| ht)
-        {
+        if let Some((&h, _)) = st.hash_height.iter().max_by_key(|(_, &ht)| ht) {
             tips.push(h);
         }
     }
@@ -88,8 +84,8 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
 
 #[cfg(test)]
 mod tests {
-    use super::work_path_tips;
     use super::super::state::IbdWorkState;
+    use super::work_path_tips;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
 
@@ -170,11 +166,7 @@ mod tests {
         assert!(st.ordered.is_empty());
 
         hub.ensure_genesis().unwrap();
-        let mut st2 = IbdWorkState::new(
-            Vec::new(),
-            hub.tip_hash(),
-            hub.tip_height(),
-        );
+        let mut st2 = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
         seed_work_path_from_store(&mut st2, &hub);
         // Resume path after tip may be empty (no headers beyond tip).
         assert!(!st2.headers_done); // always left open for peer tip
@@ -293,4 +285,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
-

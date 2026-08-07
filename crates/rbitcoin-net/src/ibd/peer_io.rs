@@ -31,7 +31,10 @@ pub(crate) enum PeerCmd {
 }
 
 pub(crate) enum PeerEvent {
-    Headers { peer: usize, headers: Vec<Header> },
+    Headers {
+        peer: usize,
+        headers: Vec<Header>,
+    },
     /// Full `block` frame on the wire: hash from header bytes + **raw payload**.
     ///
     /// No full `Block` deserialize on the peer path — body queue stores these
@@ -43,13 +46,25 @@ pub(crate) enum PeerEvent {
         payload: Vec<u8>,
     },
     /// Framed as `block` but unusable (e.g. truncated header) — re-request.
-    BlockDecodeFailed { peer: usize, hash: BlockHash },
+    BlockDecodeFailed {
+        peer: usize,
+        hash: BlockHash,
+    },
     /// Peer answered `notfound` for these block hashes (does not have them).
-    NotFound { peer: usize, hashes: Vec<BlockHash> },
+    NotFound {
+        peer: usize,
+        hashes: Vec<BlockHash>,
+    },
     /// Addresses learned from `addr` / `addrv2` (for IBD redial pool growth).
-    Addrs { peer: usize, addrs: Vec<SocketAddr> },
+    Addrs {
+        peer: usize,
+        addrs: Vec<SocketAddr>,
+    },
     /// Peer failed or closed.
-    Dead { peer: usize, reason: String },
+    Dead {
+        peer: usize,
+        reason: String,
+    },
 }
 
 /// Dual fan-out so body delivery is never stuck behind header floods on one FIFO.
@@ -98,12 +113,9 @@ impl PeerSlot {
             return;
         }
         let now = ibd_mono_ms();
-        let _ = self.first_data_ms.compare_exchange(
-            0,
-            now,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .first_data_ms
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
         self.bytes_rx.fetch_add(n, Ordering::Relaxed);
     }
 
@@ -241,10 +253,8 @@ pub(crate) async fn spawn_peer(
                                     });
                                 }
                                 Some(hash) => {
-                                    sinks_r.send_body(PeerEvent::BlockDecodeFailed {
-                                        peer: id,
-                                        hash,
-                                    });
+                                    sinks_r
+                                        .send_body(PeerEvent::BlockDecodeFailed { peer: id, hash });
                                 }
                                 None => {
                                     // Truncated / unusable block frame — nothing to re-get by hash.
@@ -270,10 +280,7 @@ pub(crate) async fn spawn_peer(
                                         } else {
                                             h
                                         };
-                                        sinks_d.send_ctrl(PeerEvent::Headers {
-                                            peer: id,
-                                            headers,
-                                        });
+                                        sinks_d.send_ctrl(PeerEvent::Headers { peer: id, headers });
                                     }
                                     NetworkMessage::NotFound(inv) => {
                                         touch_block_progress(&progress);
@@ -295,19 +302,13 @@ pub(crate) async fn spawn_peer(
                                     NetworkMessage::Addr(list) => {
                                         let addrs = socket_addrs_from_addr(&list);
                                         if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs {
-                                                peer: id,
-                                                addrs,
-                                            });
+                                            sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
                                         }
                                     }
                                     NetworkMessage::AddrV2(list) => {
                                         let addrs = socket_addrs_from_addrv2(&list);
                                         if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs {
-                                                peer: id,
-                                                addrs,
-                                            });
+                                            sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
                                         }
                                     }
                                     NetworkMessage::SendAddrV2 => {}
@@ -552,7 +553,7 @@ mod tests {
         let mut s = dummy_slot(7);
         assert!(s.speed_sample().is_none());
         s.note_rx_bytes(0); // no-op
-        // first_data_ms==0 is treated as "no sample yet"; wait so mono ms > 0.
+                            // first_data_ms==0 is treated as "no sample yet"; wait so mono ms > 0.
         while ibd_mono_ms() == 0 {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -588,7 +589,10 @@ mod tests {
             peer: 1,
             headers: vec![],
         });
-        assert!(matches!(body_rx.try_recv().unwrap(), PeerEvent::Dead { .. }));
+        assert!(matches!(
+            body_rx.try_recv().unwrap(),
+            PeerEvent::Dead { .. }
+        ));
         assert!(matches!(
             ctrl_rx.try_recv().unwrap(),
             PeerEvent::Headers { .. }

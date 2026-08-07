@@ -81,10 +81,7 @@ impl BatchFullBodies {
     }
 
     /// Owned clone for callers that need to move into `bitcoin::Transaction`.
-    pub fn get_owned(
-        &self,
-        fk: Fk,
-    ) -> Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
+    pub fn get_owned(&self, fk: Fk) -> Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
         let b = self.get(fk)?;
         Some((b.tx.clone(), b.inputs.clone(), b.outputs.clone()))
     }

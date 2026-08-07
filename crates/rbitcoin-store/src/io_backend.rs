@@ -249,10 +249,7 @@ mod tests {
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "uring");
         std::env::set_var("RBITCOIN_PIN_IO", "pread");
-        assert_eq!(
-            resolve_read("RBITCOIN_PIN_IO"),
-            ReadIoBackend::Pread
-        );
+        assert_eq!(resolve_read("RBITCOIN_PIN_IO"), ReadIoBackend::Pread);
         clear_io_envs();
     }
 

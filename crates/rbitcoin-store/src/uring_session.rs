@@ -90,7 +90,6 @@ impl UringSession {
         (self.entries as usize).saturating_sub(self.in_flight)
     }
 
-
     /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
     pub fn push_pread(
         &mut self,
@@ -122,8 +121,8 @@ impl UringSession {
             if self.in_flight >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
-            let mut b = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
-                .offset(offset);
+            let mut b =
+                opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).offset(offset);
             if rw_flags != 0 {
                 b = b.rw_flags(rw_flags);
             }
@@ -176,8 +175,8 @@ impl UringSession {
             if self.in_flight >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
-            let mut b = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
-                .offset(offset);
+            let mut b =
+                opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32).offset(offset);
             if rw_flags != 0 {
                 b = b.rw_flags(rw_flags);
             }
@@ -368,8 +367,6 @@ pub fn with_thread_local<R>(
     }
 }
 
-
-
 // Test hook: last SQE rw_flags values from push_*_flags.
 #[cfg(test)]
 thread_local! {
@@ -470,10 +467,8 @@ mod tests {
         use std::io::Write;
         use std::os::fd::AsRawFd;
 
-        let path = std::env::temp_dir().join(format!(
-            "rbitcoin-uring-drain-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rbitcoin-uring-drain-{}", std::process::id()));
         // Need read+write: File::create is write-only and io_uring pread fails.
         let mut f = std::fs::OpenOptions::new()
             .read(true)

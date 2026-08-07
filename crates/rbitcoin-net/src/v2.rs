@@ -8,7 +8,7 @@
 //! Peers that only speak v1 are disconnected ([`NetError::V1Peer`]).
 
 use crate::codec::{
-    encode_is_cpu_heavy, command_bytes_ok, FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE,
+    command_bytes_ok, encode_is_cpu_heavy, FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE,
     MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH,
 };
 use crate::error::NetError;
@@ -280,10 +280,7 @@ pub async fn write_v2_msg_offload(
 /// Read the next genuine application frame (skips decoy packets).
 ///
 /// Cancellation-safe (delegates to `ProtocolReader::read`).
-pub async fn read_v2_frame(
-    reader: &mut V2Reader,
-    magic: Magic,
-) -> Result<FramedMessage, NetError> {
+pub async fn read_v2_frame(reader: &mut V2Reader, magic: Magic) -> Result<FramedMessage, NetError> {
     read_v2_frame_with_progress(reader, magic, |_| {}).await
 }
 
@@ -353,11 +350,7 @@ mod tests {
             ("addrv2", 28),
         ];
         for (cmd, id) in live {
-            assert_eq!(
-                short_id_for_command(cmd),
-                Some(id),
-                "short id for {cmd}"
-            );
+            assert_eq!(short_id_for_command(cmd), Some(id), "short id for {cmd}");
             assert_eq!(command_for_short_id(id), Some(cmd));
             // Round-trip through encode/parse for empty-payload or simple msgs.
         }
@@ -414,7 +407,10 @@ mod tests {
         assert_eq!(contents[0], 0); // long form
         assert_eq!(&contents[1..11], b"sendaddrv2");
         let frame = parse_v2_contents(magic, &contents).expect("digit in command ok");
-        assert!(matches!(frame.decode().payload(), NetworkMessage::SendAddrV2));
+        assert!(matches!(
+            frame.decode().payload(),
+            NetworkMessage::SendAddrV2
+        ));
     }
 
     #[test]

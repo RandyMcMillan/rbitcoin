@@ -12,8 +12,9 @@ use crate::scripthash_head::{
     SH_HEAD_SHARD_COUNT_MISMATCH,
 };
 use crate::scripthash_layout::{
-    class_for_count, payload_start, slab_bytes, slab_cap, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
-    SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_ENTRY_LEN, SH_INLINE_CAP, SH_MAX_CLASS,
+    class_for_count, payload_start, slab_bytes, slab_cap, ShEntry, ShHeadValue,
+    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_ENTRY_LEN, SH_INLINE_CAP,
+    SH_MAX_CLASS,
 };
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
@@ -292,11 +293,7 @@ pub fn has_sh_run_rebuild_source(store_dir: &Path) -> bool {
     {
         return true;
     }
-    if load_fanin_checkpoint(&merge)
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if load_fanin_checkpoint(&merge).ok().flatten().is_some() {
         return true;
     }
     // MANIFEST-less leftovers (crash mid-write).
@@ -357,7 +354,6 @@ fn migrate_legacy_sh_head_from_runs(
 }
 
 impl ScriptHashTable {
-
     pub fn entry_count(&self) -> u64 {
         self.alloc.lock().unwrap().live_count
     }
@@ -422,10 +418,7 @@ impl ScriptHashTable {
 
     /// Store directory containing `scripthash.body` / head (parent of body path).
     pub fn store_dir(&self) -> &Path {
-        self.body
-            .path()
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
+        self.body.path().parent().unwrap_or_else(|| Path::new("."))
     }
 
     /// Max create_fk known present in durable SH (see [`load_include_hwm`]).
@@ -487,10 +480,7 @@ impl ScriptHashTable {
             .into_iter()
             .map(|e| {
                 // Synthetic fk = create_tx_fk for API compat (no body row id).
-                (
-                    e.create_tx_fk,
-                    ScriptHashRecord::from_entry(*scripthash, e),
-                )
+                (e.create_tx_fk, ScriptHashRecord::from_entry(*scripthash, e))
             })
             .collect())
     }
@@ -503,15 +493,15 @@ impl ScriptHashTable {
         match val {
             ShHeadValue::Empty => Ok(Vec::new()),
             ShHeadValue::Inline { .. } => Ok(val.inline_entries().to_vec()),
-            ShHeadValue::Slab {
-                used, slab_off, ..
-            } => {
+            ShHeadValue::Slab { used, slab_off, .. } => {
                 let nbytes = *used as usize * SH_ENTRY_LEN;
                 let mut buf = vec![0u8; nbytes];
                 self.body.read_at(*slab_off, &mut buf)?;
                 let mut out = Vec::with_capacity(*used as usize);
                 for i in 0..*used as usize {
-                    out.push(ShEntry::decode(&buf[i * SH_ENTRY_LEN..(i + 1) * SH_ENTRY_LEN])?);
+                    out.push(ShEntry::decode(
+                        &buf[i * SH_ENTRY_LEN..(i + 1) * SH_ENTRY_LEN],
+                    )?);
                 }
                 Ok(out)
             }
@@ -572,7 +562,10 @@ impl ScriptHashTable {
                 if rec.create_tx_fk.is_null() {
                     return false;
                 }
-                let durable = known.get(&rec.scripthash).map(|v| v.as_slice()).unwrap_or(&[]);
+                let durable = known
+                    .get(&rec.scripthash)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 !durable.iter().any(|&c| c == rec.create_tx_fk)
             })
             .cloned()
@@ -673,11 +666,7 @@ impl ScriptHashTable {
             let add: Vec<ShEntry> = if old_live.len() <= 8 {
                 new_ents
                     .into_iter()
-                    .filter(|e| {
-                        !old_live
-                            .iter()
-                            .any(|o| o.create_tx_fk == e.create_tx_fk)
-                    })
+                    .filter(|e| !old_live.iter().any(|o| o.create_tx_fk == e.create_tx_fk))
                     .collect()
             } else {
                 let have: std::collections::HashSet<u64> =
@@ -705,8 +694,7 @@ impl ScriptHashTable {
             let t_head = std::time::Instant::now();
             // Per-shard apply; flush each shard when this batch is "large".
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
-            self.head
-                .insert_many_sharded(&head_final, flush_each)?;
+            self.head.insert_many_sharded(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((written, timing))
@@ -719,15 +707,15 @@ impl ScriptHashTable {
         match val {
             ShHeadValue::Empty => Ok(Vec::new()),
             ShHeadValue::Inline { .. } => Ok(val.inline_entries().to_vec()),
-            ShHeadValue::Slab {
-                used, slab_off, ..
-            } => {
+            ShHeadValue::Slab { used, slab_off, .. } => {
                 let nbytes = *used as usize * SH_ENTRY_LEN;
                 let mut buf = vec![0u8; nbytes];
                 self.body.read_at(*slab_off, &mut buf)?;
                 let mut out = Vec::with_capacity(*used as usize);
                 for i in 0..*used as usize {
-                    out.push(ShEntry::decode(&buf[i * SH_ENTRY_LEN..(i + 1) * SH_ENTRY_LEN])?);
+                    out.push(ShEntry::decode(
+                        &buf[i * SH_ENTRY_LEN..(i + 1) * SH_ENTRY_LEN],
+                    )?);
                 }
                 Ok(out)
             }
@@ -783,8 +771,7 @@ impl ScriptHashTable {
                     // Append-only: disk already holds live[..old_used].
                     let skip = *old_used as usize;
                     if skip < live.len() {
-                        let tail_off =
-                            *slab_off + (*old_used as u64) * SH_ENTRY_LEN as u64;
+                        let tail_off = *slab_off + (*old_used as u64) * SH_ENTRY_LEN as u64;
                         self.write_slab_entries(tail_off, &live[skip..])?;
                     }
                 } else {
@@ -843,7 +830,10 @@ impl ScriptHashTable {
     }
 
     fn free_if_slab(&self, alloc: &mut AllocState, old: &ShHeadValue) -> Result<(), StoreError> {
-        if let ShHeadValue::Slab { class, slab_off, .. } = old {
+        if let ShHeadValue::Slab {
+            class, slab_off, ..
+        } = old
+        {
             self.free_slab(alloc, *class, *slab_off)?;
         }
         Ok(())
@@ -1269,9 +1259,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
             .store(&self.progress_dir)?;
             let elapsed = t0.elapsed();
-            self.head_fill_ns = self
-                .head_fill_ns
-                .saturating_add(elapsed.as_nanos() as u64);
+            self.head_fill_ns = self.head_fill_ns.saturating_add(elapsed.as_nanos() as u64);
             self.shards_flushed = self.shards_flushed.saturating_add(1);
             rbitcoin_log::info!(
                 "store: scripthash live shard done id={si} keys={keys} occupied={occ} \
@@ -1522,9 +1510,7 @@ mod tests {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         let sh = script_hash(&[0x53]);
-        let recs: Vec<_> = (0..100u32)
-            .map(|v| rec(sh, u64::from(v) + 1, v))
-            .collect();
+        let recs: Vec<_> = (0..100u32).map(|v| rec(sh, u64::from(v) + 1, v)).collect();
         let n = t.put_create_batch(&recs).unwrap();
         assert_eq!(n, 100);
         let v = t.head_value(&sh).unwrap().unwrap();
@@ -1752,9 +1738,7 @@ mod tests {
         let mut sh = [0u8; 32];
         sh[0] = 0x7e;
         let mut session = t.bulk_session(1).unwrap();
-        session
-            .put_chain(sh, &[ShEntry::new(Fk(42))])
-            .unwrap();
+        session.put_chain(sh, &[ShEntry::new(Fk(42))]).unwrap();
         let _ = session.finish().unwrap();
         assert!(!t.head_is_empty());
         t.test_zero_live_count_keep_head().unwrap();
@@ -1766,9 +1750,7 @@ mod tests {
         assert!(t.head_is_empty());
         assert_eq!(t.entry_count(), 0);
         let mut session = t.bulk_session(2).unwrap();
-        session
-            .put_chain(sh, &[ShEntry::new(Fk(1))])
-            .unwrap();
+        session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
         let (n, _, _, _) = session.finish().unwrap();
         assert_eq!(n, 1);
         assert_eq!(t.entries(&sh).unwrap()[0].1.create_tx_fk, Fk(1));
@@ -1825,8 +1807,7 @@ mod tests {
     fn cold_progress_and_resume_skips_complete_shards() {
         // 4-way head: fill shard 0, abandon, resume from progress, fill rest.
         let dir = tmp();
-        let body =
-            TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
         let payload0 = payload_start(FILE_HEADER_LEN);
         body.ensure_capacity(payload0).unwrap();
         body.set_logical_len(payload0).unwrap();
@@ -1901,15 +1882,16 @@ mod tests {
         let mut session = t.bulk_session(1_000).unwrap();
         let mut sh = [0u8; 32];
         sh[0] = 1;
-        session
-            .put_chain(sh, &[ShEntry::new(Fk(1))])
-            .unwrap();
+        session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
         let peak = session.peak_table_bytes;
         let _ = session.finish().unwrap();
         let budget = crate::scripthash_head::sh_per_shard_key_budget(1_000, 1);
         let expect = (crate::scripthash_head::sh_slots_for_keys(budget) as usize) * 32;
         assert_eq!(peak, expect);
-        assert!(peak < 16 * 1024 * 1024, "peak {peak} looks like create-count sizing");
+        assert!(
+            peak < 16 * 1024 * 1024,
+            "peak {peak} looks like create-count sizing"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2007,11 +1989,8 @@ mod tests {
         let t = ScriptHashTable::create(&dir).unwrap();
         let sh = script_hash(&[0x51]);
         let mut heads = HashMap::new();
-        t.put_create_batch_append(
-            &[rec(sh, 1, 0), rec(sh, 2, 0), rec(sh, 3, 0)],
-            &mut heads,
-        )
-        .unwrap();
+        t.put_create_batch_append(&[rec(sh, 1, 0), rec(sh, 2, 0), rec(sh, 3, 0)], &mut heads)
+            .unwrap();
         t.unlink_create(&sh, Fk(2), 0).unwrap();
         let mut seen = Vec::new();
         t.for_each_live_create(|c| seen.push(c.0)).unwrap();

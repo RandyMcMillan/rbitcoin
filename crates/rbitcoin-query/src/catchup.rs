@@ -53,8 +53,7 @@ impl Query {
     }
 
     fn set_index_mode(&self, mode: IndexMode) {
-        self.index_mode_cell
-            .store(mode as u8, Ordering::SeqCst);
+        self.index_mode_cell.store(mode as u8, Ordering::SeqCst);
     }
 
     /// Enter **direct** IBD: durable `tx.head` on archive, spend annotations on
@@ -216,14 +215,8 @@ impl Query {
         let head_durable = self.store.scripthash.has_durable_index();
         let include_hwm = self.store.scripthash.include_hwm();
         let force = sh_force_rebuild();
-        let action = plan_sh_pre_materialize(
-            force,
-            head_durable,
-            seal,
-            tip_max,
-            run_recs,
-            include_hwm,
-        );
+        let action =
+            plan_sh_pre_materialize(force, head_durable, seal, tip_max, run_recs, include_hwm);
         let need_full_recollect = matches!(
             action,
             ShPreMaterializeAction::ForceFullRebuild
@@ -472,21 +465,14 @@ impl Query {
                         Ok(())
                     };
 
-                    let spill_and_commit =
-                        |local: &mut Vec<ScriptHashRecord>,
-                         pending: &mut Vec<usize>|
-                         -> Result<(), StoreError> {
-                            if !local.is_empty() {
-                                spill_local(
-                                    sh_run,
-                                    local,
-                                    &n_spills,
-                                    &n_creates,
-                                    &max_fk_seen,
-                                )?;
-                            }
-                            flush_pending_done(pending)
-                        };
+                    let spill_and_commit = |local: &mut Vec<ScriptHashRecord>,
+                                            pending: &mut Vec<usize>|
+                     -> Result<(), StoreError> {
+                        if !local.is_empty() {
+                            spill_local(sh_run, local, &n_spills, &n_creates, &max_fk_seen)?;
+                        }
+                        flush_pending_done(pending)
+                    };
 
                     loop {
                         if stop.load(AtomicOrdering::Relaxed)
@@ -511,17 +497,12 @@ impl Query {
                             }
                             break;
                         }
-                        let lo =
-                            work_lo.saturating_add((i as u64).saturating_mul(CHUNK_FKS));
-                        let hi = lo
-                            .saturating_add(CHUNK_FKS)
-                            .saturating_sub(1)
-                            .min(tip_max);
+                        let lo = work_lo.saturating_add((i as u64).saturating_mul(CHUNK_FKS));
+                        let hi = lo.saturating_add(CHUNK_FKS).saturating_sub(1).min(tip_max);
                         if lo > tip_max {
                             pending_done.push(i);
                             if local.len() >= thread_spill_recs {
-                                if let Err(e) = spill_and_commit(&mut local, &mut pending_done)
-                                {
+                                if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
                                     *first_err.lock().unwrap() = Some(e);
                                     stop.store(true, AtomicOrdering::Relaxed);
                                     break;
@@ -825,8 +806,7 @@ mod tests {
 
         let mut sh0 = [0u8; 32];
         sh0[0] = 0x44;
-        q.sh_run
-            .enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(3))]);
+        q.sh_run.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(3))]);
         let n0 = q.sh_run.finalize_and_bulk_materialize(&q.store).unwrap();
         assert!(n0 >= 1);
         assert!(q.store.scripthash.has_durable_index());
@@ -888,14 +868,7 @@ mod tests {
         write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
 
         assert_eq!(
-            plan_sh_pre_materialize(
-                false,
-                false,
-                high_seal,
-                high_seal + 1_000_000,
-                1,
-                0
-            ),
+            plan_sh_pre_materialize(false, false, high_seal, high_seal + 1_000_000, 1, 0),
             ShPreMaterializeAction::ResetCatalogFullRecollect
         );
 
@@ -1035,8 +1008,14 @@ mod tests {
     fn scenario_direct_enter_defers_large_recollect_gap() {
         // Pure policy (mainnet-scale gaps without building millions of txs).
         assert!(!should_defer_direct_recollect(0, 0));
-        assert!(!should_defer_direct_recollect(0, SH_DIRECT_RECOLLECT_MAX_GAP));
-        assert!(!should_defer_direct_recollect(100, 100 + SH_DIRECT_RECOLLECT_MAX_GAP));
+        assert!(!should_defer_direct_recollect(
+            0,
+            SH_DIRECT_RECOLLECT_MAX_GAP
+        ));
+        assert!(!should_defer_direct_recollect(
+            100,
+            100 + SH_DIRECT_RECOLLECT_MAX_GAP
+        ));
         assert!(should_defer_direct_recollect(
             0,
             SH_DIRECT_RECOLLECT_MAX_GAP + 1
@@ -1059,8 +1038,7 @@ mod tests {
         q.enter_direct_index_mode().unwrap();
         q.sh_run.refresh_seal();
         assert!(
-            q.sh_run.sealed_max_create_fk() >= tip_max.saturating_sub(1)
-                || tip_max == 0,
+            q.sh_run.sealed_max_create_fk() >= tip_max.saturating_sub(1) || tip_max == 0,
             "small-gap direct enter must recollect up to tip"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1107,7 +1085,9 @@ mod tests {
         );
 
         // Early-exit rebuild (SEAL already at tip) must restore too.
-        q.sh_run.set_sealed_max_for_recollect(q.store.txs.count()).unwrap();
+        q.sh_run
+            .set_sealed_max_for_recollect(q.store.txs.count())
+            .unwrap();
         q.rebuild_sh_unsealed_from_class_a().unwrap();
         assert!(
             q.sh_run.ibd_catalog_compact(),
@@ -1287,12 +1267,21 @@ mod tests {
         .unwrap();
         let recs = sh_catalog_total_records(&runs_dir);
         assert_eq!(
-            plan_sh_pre_materialize(true, false, 1_400_000_000, tip_max.max(1_410_000_000), recs, 0),
+            plan_sh_pre_materialize(
+                true,
+                false,
+                1_400_000_000,
+                tip_max.max(1_410_000_000),
+                recs,
+                0
+            ),
             ShPreMaterializeAction::ForceFullRebuild
         );
 
         std::env::set_var("RBITCOIN_SH_FORCE_REBUILD", "1");
-        let n_mat = q.finalize_sh_runs().expect("FORCE incomplete must recollect+materialize");
+        let n_mat = q
+            .finalize_sh_runs()
+            .expect("FORCE incomplete must recollect+materialize");
         std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
         assert!(n_mat > 0);
         assert!(q.store.scripthash.has_durable_index());
@@ -1413,15 +1402,17 @@ mod tests {
         store_seal(&runs_dir, tip_max.saturating_sub(10).max(1)).unwrap();
         q.sh_run.refresh_seal();
         assert!(q.sh_run.sealed_max_create_fk() < tip_max);
-        assert!(q.sh_is_tip_ready() || {
-            // Residual runs from plant empty dir — clear and recheck.
-            let _ = std::fs::remove_dir_all(&runs_dir);
-            q.sh_run.refresh_seal();
-            q.store.scripthash.note_include_hwm(tip_max).unwrap();
-            // SEAL file gone → seal 0; HWM still covers.
-            q.sync_sh_seal_from_include_hwm().unwrap();
-            q.sh_is_tip_ready()
-        });
+        assert!(
+            q.sh_is_tip_ready() || {
+                // Residual runs from plant empty dir — clear and recheck.
+                let _ = std::fs::remove_dir_all(&runs_dir);
+                q.sh_run.refresh_seal();
+                q.store.scripthash.note_include_hwm(tip_max).unwrap();
+                // SEAL file gone → seal 0; HWM still covers.
+                q.sync_sh_seal_from_include_hwm().unwrap();
+                q.sh_is_tip_ready()
+            }
+        );
         q.enter_direct_index_mode().unwrap();
         assert!(
             q.sh_run.sealed_max_create_fk() >= tip_max,

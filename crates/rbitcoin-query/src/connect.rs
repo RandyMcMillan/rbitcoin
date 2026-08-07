@@ -60,10 +60,7 @@ impl Query {
     /// When `spend_index` is on, durable spend annotations land on create outputs
     /// (schema v5+). Under Direct IBD, **confirm** batch-writes those annotations
     /// after Class C (not archive). Tip mode assumes they are already complete.
-    pub fn confirm_blocks_run(
-        &self,
-        items: &[ConfirmPrepared],
-    ) -> Result<Vec<Fk>, QueryError> {
+    pub fn confirm_blocks_run(&self, items: &[ConfirmPrepared]) -> Result<Vec<Fk>, QueryError> {
         self.confirm_blocks_run_with_create_pins(items, None)
     }
 
@@ -127,41 +124,42 @@ impl Query {
         let mut sh_tip_max_fk = 0u64;
 
         std::thread::scope(|scope| {
-            let strong_slot = scope.spawn(|| -> Result<(Vec<(Height, Fk)>, Vec<Fk>), QueryError> {
-                let t_strong = std::time::Instant::now();
-                let mut pairs = Vec::with_capacity(items.len());
-                let mut fks = Vec::with_capacity(items.len());
-                for item in items {
-                    let contiguous = item
-                        .tx_fks
-                        .windows(2)
-                        .all(|w| w[1].0 == w[0].0.saturating_add(1));
-                    if contiguous {
-                        if let Some(&first) = item.tx_fks.first() {
-                            self.store.strong_tx.set_strong_range(
-                                first,
-                                item.tx_fks.len() as u32,
-                                item.header_fk,
-                            )?;
-                            self.store.tx_height.set_range(
-                                first,
-                                item.tx_fks.len() as u32,
-                                item.height,
-                            )?;
+            let strong_slot =
+                scope.spawn(|| -> Result<(Vec<(Height, Fk)>, Vec<Fk>), QueryError> {
+                    let t_strong = std::time::Instant::now();
+                    let mut pairs = Vec::with_capacity(items.len());
+                    let mut fks = Vec::with_capacity(items.len());
+                    for item in items {
+                        let contiguous = item
+                            .tx_fks
+                            .windows(2)
+                            .all(|w| w[1].0 == w[0].0.saturating_add(1));
+                        if contiguous {
+                            if let Some(&first) = item.tx_fks.first() {
+                                self.store.strong_tx.set_strong_range(
+                                    first,
+                                    item.tx_fks.len() as u32,
+                                    item.header_fk,
+                                )?;
+                                self.store.tx_height.set_range(
+                                    first,
+                                    item.tx_fks.len() as u32,
+                                    item.height,
+                                )?;
+                            }
+                        } else {
+                            for &tx_fk in &item.tx_fks {
+                                self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
+                                self.store.tx_height.set(tx_fk, item.height)?;
+                            }
                         }
-                    } else {
-                        for &tx_fk in &item.tx_fks {
-                            self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
-                            self.store.tx_height.set(tx_fk, item.height)?;
-                        }
+                        pairs.push((item.height, item.header_fk));
+                        fks.push(item.header_fk);
                     }
-                    pairs.push((item.height, item.header_fk));
-                    fks.push(item.header_fk);
-                }
-                crate::class_c_phase_stats::STRONG_NS
-                    .fetch_add(t_strong.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                Ok((pairs, fks))
-            });
+                    crate::class_c_phase_stats::STRONG_NS
+                        .fetch_add(t_strong.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok((pairs, fks))
+                });
 
             let sh_slot = scope.spawn(|| -> Result<u64, QueryError> {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
@@ -285,10 +283,8 @@ impl Query {
                 let _ = self.sh_run.publish_seal_watermark(sh_tip_max_fk);
             }
         }
-        crate::class_c_phase_stats::TIP_NS.fetch_add(
-            t_tip.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        crate::class_c_phase_stats::TIP_NS
+            .fetch_add(t_tip.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         Ok(out)
     }
@@ -395,9 +391,7 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let fk = self
-            .lookup_tx_fk(&tx.txid)?
-            .ok_or(StoreError::NotFound)?;
+        let fk = self.lookup_tx_fk(&tx.txid)?.ok_or(StoreError::NotFound)?;
         self.tx_input_run_class_a(fk, tx)
     }
 

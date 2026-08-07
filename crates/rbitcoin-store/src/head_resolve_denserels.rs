@@ -22,7 +22,7 @@ use crate::tx_idx::BodyRangeIdxPlan;
 use crate::tx_table::{
     decode_packed_tx_outs_with_spender_rels_secret, OutputRecord, TxRecord, TxTable,
 };
-use crate::txid_body::{TXID_ENTRY_LEN, TxidBody};
+use crate::txid_body::{TxidBody, TXID_ENTRY_LEN};
 use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
 use std::os::fd::RawFd;
@@ -83,10 +83,7 @@ pub fn resolve_fk_and_denserels_batch(
     (
         Vec<(
             [u8; 32],
-            Option<(
-                Fk,
-                Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
-            )>,
+            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
         )>,
         u64,
     ),
@@ -251,10 +248,7 @@ fn resolve_denserels_pread(
     (
         Vec<(
             [u8; 32],
-            Option<(
-                Fk,
-                Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
-            )>,
+            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
         )>,
         u64,
     ),
@@ -385,11 +379,9 @@ fn resolve_fk_and_range_uring_on(
     }
     if need_cold {
         let t_probe = Instant::now();
-        let cold_cands = table.head.probe_candidates_batch_cold_on_session(
-            &mixed,
-            &active,
-            session,
-        )?;
+        let cold_cands = table
+            .head
+            .probe_candidates_batch_cold_on_session(&mixed, &active, session)?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         let cold_u64: Vec<Vec<u64>> = cold_cands
             .into_iter()
@@ -511,21 +503,8 @@ fn id_idx_wave_uring(
                     *id_ns = id_ns.saturating_add(wait_ns);
                     *body_lookups = body_lookups.saturating_add(1);
                     let outcome = on_stage_id(
-                        table,
-                        txids,
-                        &mut slots,
-                        slot,
-                        &mut ring,
-                        side,
-                        side_fd,
-                        side_path,
-                        count,
-                        res,
-                        id_ns,
-                        idx_ns,
-                        winner,
-                        &mut done,
-                        miss_peeks,
+                        table, txids, &mut slots, slot, &mut ring, side, side_fd, side_path, count,
+                        res, id_ns, idx_ns, winner, &mut done, miss_peeks,
                     )?;
                     match outcome {
                         SqeOutcome::SqePushed => in_flight += 1,
@@ -538,21 +517,8 @@ fn id_idx_wave_uring(
                 STAGE_IDX => {
                     *idx_ns = idx_ns.saturating_add(wait_ns);
                     let outcome = on_stage_idx(
-                        table,
-                        &mut slots,
-                        slot,
-                        &mut ring,
-                        side,
-                        side_fd,
-                        count,
-                        res,
-                        id_ns,
-                        idx_ns,
-                        winner,
-                        &mut done,
-                        miss_peeks,
-                        first_fks,
-                        local_age,
+                        table, &mut slots, slot, &mut ring, side, side_fd, count, res, id_ns,
+                        idx_ns, winner, &mut done, miss_peeks, first_fks, local_age,
                     )?;
                     match outcome {
                         SqeOutcome::SqePushed => in_flight += 1,
@@ -872,10 +838,7 @@ fn resolve_denserels_uring(
     (
         Vec<(
             [u8; 32],
-            Option<(
-                Fk,
-                Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
-            )>,
+            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
         )>,
         u64,
     ),
@@ -1107,7 +1070,12 @@ mod tests {
         crate::segmented_head::SegmentedTxHead::test_set_soft_span_bytes(0);
         let _ = crate::head_resolve_stats::sample_and_reset();
         let (dir, t, txids) = seed_table(16);
-        assert_eq!(t.head.segment_count(), 1, "unexpected segs={}", t.head.segment_count());
+        assert_eq!(
+            t.head.segment_count(),
+            1,
+            "unexpected segs={}",
+            t.head.segment_count()
+        );
         let first = t.head.first_fks_snapshot();
         assert_eq!(first, vec![1]);
         let got = resolve_fk_and_range_batch(&t, &txids).unwrap();

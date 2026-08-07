@@ -94,10 +94,7 @@ pub fn split_anyone_can_spend(
 }
 
 /// Spend several OP_TRUE prevouts in one tx (one output).
-pub fn spend_many_anyone_can_spend(
-    prevs: &[(bitcoin::Txid, u32)],
-    value: Amount,
-) -> Transaction {
+pub fn spend_many_anyone_can_spend(prevs: &[(bitcoin::Txid, u32)], value: Amount) -> Transaction {
     Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -187,16 +184,9 @@ mod tests {
 
         // Extra helpers: multi-vout + multi-in spends (fixture surface).
         let prev = b.txdata[0].compute_txid();
-        let split = split_anyone_can_spend(
-            prev,
-            0,
-            &[Amount::from_sat(10), Amount::from_sat(10)],
-        );
+        let split = split_anyone_can_spend(prev, 0, &[Amount::from_sat(10), Amount::from_sat(10)]);
         assert_eq!(split.output.len(), 2);
-        let many = spend_many_anyone_can_spend(
-            &[(prev, 0), (prev, 0)],
-            Amount::from_sat(1),
-        );
+        let many = spend_many_anyone_can_spend(&[(prev, 0), (prev, 0)], Amount::from_sat(1));
         assert_eq!(many.input.len(), 2);
         let single = spend_anyone_can_spend(prev, 0, Amount::from_sat(1));
         assert_eq!(single.input.len(), 1);

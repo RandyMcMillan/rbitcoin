@@ -4,21 +4,17 @@ use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_electrum::{electrum_scripthash_hex, run_electrum, ElectrumConfig};
 use rbitcoin_query::Query;
 use rbitcoin_test::build_mature_regtest_with_spend;
+use rbitcoin_test::TempDir;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use rbitcoin_test::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 
 /// Bound every Electrum line read — unbounded `read_line` hangs the suite if the
 /// server never answers (deadlock / dropped task).
-async fn read_line_timeout(
-    reader: &mut BufReader<&mut TcpStream>,
-    buf: &mut String,
-    label: &str,
-) {
+async fn read_line_timeout(reader: &mut BufReader<&mut TcpStream>, buf: &mut String, label: &str) {
     buf.clear();
     tokio::time::timeout(Duration::from_secs(5), reader.read_line(buf))
         .await
@@ -139,7 +135,10 @@ async fn electrum_server_version_history_balance() {
         push["method"].as_str(),
         Some("blockchain.headers.subscribe")
     );
-    assert_eq!(push["params"][0]["height"].as_u64(), Some((tip_h + 1) as u64));
+    assert_eq!(
+        push["params"][0]["height"].as_u64(),
+        Some((tip_h + 1) as u64)
+    );
 
     drop(reader);
     handle.shutdown().await;
@@ -164,12 +163,7 @@ async fn electrum_more_methods_and_errors() {
 
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
 
-    async fn rpc(
-        stream: &mut TcpStream,
-        id: u64,
-        method: &str,
-        params: Value,
-    ) -> Value {
+    async fn rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {
         let req = json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
@@ -341,10 +335,7 @@ fn direct_indexes_then_sh_bulk_at_tip() {
     assert_eq!(q.tip_height(), Some(Height(5)));
     assert!(q.tx_body_count() >= 6);
     // Direct writes tx.head on archive/connect path.
-    assert!(
-        q.tx_head_occupied() >= 6,
-        "head filled under Direct"
-    );
+    assert!(q.tx_head_occupied() >= 6, "head filled under Direct");
     let b1 = q.reconstruct_block_at_height(Height(1)).unwrap();
     let cb_txid = b1.txdata[0].compute_txid().to_byte_array();
     assert!(
@@ -367,5 +358,8 @@ fn direct_indexes_then_sh_bulk_at_tip() {
         script_hash(&[0x51])
     };
     let hist = q.scripthash_history(&sh).unwrap();
-    assert!(!hist.is_empty(), "scripthash history non-empty after SH bulk");
+    assert!(
+        !hist.is_empty(),
+        "scripthash history non-empty after SH bulk"
+    );
 }

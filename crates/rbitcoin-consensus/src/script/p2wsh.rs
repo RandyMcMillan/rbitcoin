@@ -71,10 +71,10 @@ pub(crate) fn verify_with_scripthash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ScriptCheckJob;
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
-    use crate::block::ScriptCheckJob;
 
     #[test]
     fn empty_witness_and_hash_mismatch() {

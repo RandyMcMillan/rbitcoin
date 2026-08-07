@@ -102,20 +102,14 @@ impl ConfirmParentCache {
         for h in drop_h {
             g.plans.remove(&h);
         }
-        let drop_hdr: Vec<u32> = g
-            .headers
-            .keys()
-            .copied()
-            .filter(|h| *h <= tip)
-            .collect();
+        let drop_hdr: Vec<u32> = g.headers.keys().copied().filter(|h| *h <= tip).collect();
         for h in drop_hdr {
             if let Some(plan) = g.headers.remove(&h) {
                 g.hash_to_height.remove(&plan.header_rec.hash);
             }
         }
         g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
+        self.ready_through.store(g.ready_through, Ordering::Relaxed);
     }
 
     /// Cache header + tx list for a cache height (tip-GCed; required for multi-block MTP).
@@ -156,10 +150,7 @@ impl ConfirmParentCache {
         );
     }
 
-    pub fn get_header_by_hash(
-        &self,
-        hash: &[u8; 32],
-    ) -> Option<(Fk, HeaderRecord)> {
+    pub fn get_header_by_hash(&self, hash: &[u8; 32]) -> Option<(Fk, HeaderRecord)> {
         let g = self.inner.lock().unwrap();
         let h = *g.hash_to_height.get(hash)?;
         let plan = g.headers.get(&h)?;
@@ -257,8 +248,7 @@ impl ConfirmParentCache {
             }
         }
         g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
+        self.ready_through.store(g.ready_through, Ordering::Relaxed);
     }
 
     pub fn plan_count(&self) -> usize {
@@ -340,7 +330,13 @@ mod tests {
         let a1 = c.get_header_plan_arc(1).expect("plan");
         assert_eq!(a1.tx_fks, vec![Fk(10)]);
         // Replace publishes a new Arc (not rewrite-in-place of the old body).
-        c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(11), Fk(12)], [0u8; 32]);
+        c.put_header_plan(
+            1,
+            Fk(1),
+            header_rec([1u8; 32]),
+            vec![Fk(11), Fk(12)],
+            [0u8; 32],
+        );
         let a2 = c.get_header_plan_arc(1).expect("replaced");
         assert_eq!(a2.tx_fks, vec![Fk(11), Fk(12)]);
         assert!(!std::sync::Arc::ptr_eq(&a1, &a2));
@@ -375,7 +371,9 @@ mod tests {
     fn put_header_plan_always_stores_for_mtp() {
         let c = ConfirmParentCache::new();
         c.put_header_plan(1, Fk(1), header_rec([9u8; 32]), vec![Fk(1)], [0u8; 32]);
-        let p = c.get_header_plan(1).expect("header plan required for multi-block MTP");
+        let p = c
+            .get_header_plan(1)
+            .expect("header plan required for multi-block MTP");
         assert_eq!(p.header_rec.hash, [9u8; 32]);
         assert_eq!(c.header_plan_count(), 1);
     }
@@ -385,7 +383,13 @@ mod tests {
     fn put_header_plan_skips_at_or_below_tip() {
         let c = ConfirmParentCache::new();
         c.advance_tip(10);
-        c.put_header_plan(10, Fk(10), header_rec([10u8; 32]), vec![Fk(1); 100], [0u8; 32]);
+        c.put_header_plan(
+            10,
+            Fk(10),
+            header_rec([10u8; 32]),
+            vec![Fk(1); 100],
+            [0u8; 32],
+        );
         c.put_header_plan(5, Fk(5), header_rec([5u8; 32]), vec![Fk(1); 100], [0u8; 32]);
         assert_eq!(c.header_plan_count(), 0);
         c.put_header_plan(11, Fk(11), header_rec([11u8; 32]), vec![Fk(1)], [0u8; 32]);

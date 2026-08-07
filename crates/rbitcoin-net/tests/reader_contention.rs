@@ -8,8 +8,6 @@
 //! Run with:
 //!   cargo test -p rbitcoin-net reader_contention -- --nocapture --test-threads=1
 
-use rbitcoin_net::MAX_PROTOCOL_MESSAGE_LENGTH;
-use rbitcoin_net::NetError;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::{deserialize, serialize};
@@ -21,11 +19,13 @@ use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{
     Amount, Block, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use rbitcoin_net::NetError;
+use rbitcoin_net::MAX_PROTOCOL_MESSAGE_LENGTH;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 // ── Test-only v1 framing (not used in production) ─────────────────────────
@@ -37,7 +37,9 @@ struct MessageStream {
 
 impl MessageStream {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(8 * 1024) }
+        Self {
+            buf: Vec::with_capacity(8 * 1024),
+        }
     }
 
     async fn read_msg<R: AsyncRead + Unpin>(
@@ -82,8 +84,6 @@ impl MessageStream {
         deserialize::<RawNetworkMessage>(&full).map_err(|e| NetError::Encode(e.to_string()))
     }
 }
-
-
 
 const WORKERS: usize = 4;
 const READERS: usize = 8;
@@ -189,7 +189,11 @@ fn uncooperative_cpu_hog_blocking(stop: Arc<AtomicBool>, spins: Arc<AtomicU64>) 
 /// Heavy cooperative work: re-deserialize a fat block, then yield (archive-prep style).
 /// Batch several deserializes per yield so we actually tax workers (single
 /// deserialize + yield is too polite to show up against short reader bursts).
-async fn cooperative_deserialize_hog(stop: Arc<AtomicBool>, payload: Arc<Vec<u8>>, spins: Arc<AtomicU64>) {
+async fn cooperative_deserialize_hog(
+    stop: Arc<AtomicBool>,
+    payload: Arc<Vec<u8>>,
+    spins: Arc<AtomicU64>,
+) {
     while !stop.load(Ordering::Relaxed) {
         for _ in 0..8 {
             let b: Block = deserialize(payload.as_ref()).expect("fat block");
@@ -270,10 +274,14 @@ async fn run_readers_with_hogs(
                 }));
             }
             HogKind::CooperativeDeserialize => {
-                hog_handles.push(tokio::spawn(cooperative_deserialize_hog(stop, payload, spins)));
+                hog_handles.push(tokio::spawn(cooperative_deserialize_hog(
+                    stop, payload, spins,
+                )));
             }
             HogKind::BlockingPool => {
-                hog_handles.push(tokio::spawn(blocking_pool_deserialize_hog(stop, payload, spins)));
+                hog_handles.push(tokio::spawn(blocking_pool_deserialize_hog(
+                    stop, payload, spins,
+                )));
             }
             // OS threads compete for CPU cores but do not occupy Tokio workers.
             HogKind::OsThreadCpu => {
@@ -697,10 +705,14 @@ fn reader_contention_sustained_coop_tax() {
                 let payload = Arc::clone(&block_bytes);
                 match hog {
                     HogKind::CooperativeDeserialize => {
-                        hogs.push(tokio::spawn(cooperative_deserialize_hog(stop, payload, spins)));
+                        hogs.push(tokio::spawn(cooperative_deserialize_hog(
+                            stop, payload, spins,
+                        )));
                     }
                     HogKind::BlockingPool => {
-                        hogs.push(tokio::spawn(blocking_pool_deserialize_hog(stop, payload, spins)));
+                        hogs.push(tokio::spawn(blocking_pool_deserialize_hog(
+                            stop, payload, spins,
+                        )));
                     }
                     HogKind::None => {}
                     _ => unreachable!(),

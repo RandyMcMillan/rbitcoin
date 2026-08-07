@@ -5,8 +5,9 @@
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash, CompactTarget};
 use rbitcoin_consensus::{
-    accept_and_connect_block, block_subsidy, expected_next_bits, median_time_past, validate_header,
-    validate_block_connect, ChainParams, Checkpoint, ConsensusError, Milestone, ValidationContext,
+    accept_and_connect_block, block_subsidy, expected_next_bits, median_time_past,
+    validate_block_connect, validate_header, ChainParams, Checkpoint, ConsensusError, Milestone,
+    ValidationContext,
 };
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -78,7 +79,7 @@ fn h3_rejects_timestamp_not_after_mtp() {
     }
     let mtp = median_time_past(&q, Height(11)).unwrap();
     let mut bad = mine_regtest_block(tip, mtp, 12, vec![]); // time == mtp → reject
-    // ensure bits match expected (regtest copies prev)
+                                                            // ensure bits match expected (regtest copies prev)
     let expected = expected_next_bits(&q, &params, Height(12)).unwrap();
     bad.header.bits = expected;
     let target = bitcoin::Target::from_compact(expected);
@@ -142,7 +143,10 @@ fn h6_target_above_pow_limit_is_detectable() {
     let main = ChainParams::mainnet();
     let too_easy = CompactTarget::from_consensus(0x2200_ffff);
     let t = bitcoin::Target::from_compact(too_easy);
-    assert!(t > main.pow_limit, "fixture target should exceed mainnet pow limit");
+    assert!(
+        t > main.pow_limit,
+        "fixture target should exceed mainnet pow limit"
+    );
 }
 
 #[test]

@@ -280,9 +280,13 @@ mod tests {
     #[test]
     fn push_only_allows_op_n_and_rejects_decode_error() {
         // OP_1NEGATE (0x4f) and OP_1 (0x51) are push-like.
-        assert!(is_push_only(ScriptBuf::from_bytes(vec![0x4f, 0x51]).as_script()));
+        assert!(is_push_only(
+            ScriptBuf::from_bytes(vec![0x4f, 0x51]).as_script()
+        ));
         // Truncated push: instruction decode fails → not push-only.
-        assert!(!is_push_only(ScriptBuf::from_bytes(vec![0x02, 0xaa]).as_script()));
+        assert!(!is_push_only(
+            ScriptBuf::from_bytes(vec![0x02, 0xaa]).as_script()
+        ));
         // OP_CHECKSIG is not push-only.
         assert!(!is_push_only(ScriptBuf::from_bytes(vec![0xac]).as_script()));
     }

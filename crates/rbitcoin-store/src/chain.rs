@@ -82,9 +82,6 @@ impl ConfirmedTable {
         }
     }
 
-
-
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.arr.flush()
     }
@@ -107,8 +104,7 @@ const TX_HEIGHT_ELEM: u64 = 4;
 
 impl TxHeightTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        let file =
-            crate::file::TableFile::create(dir.join("tx_height.body"), TableKind::TxHeight)?;
+        let file = crate::file::TableFile::create(dir.join("tx_height.body"), TableKind::TxHeight)?;
         Ok(Self {
             file,
             len: std::sync::atomic::AtomicU64::new(0),
@@ -184,8 +180,7 @@ impl TxHeightTable {
         let mut at = start;
         while left > 0 {
             let n = (left as usize).min(CHUNK);
-            self.file
-                .write_at(Self::offset(at), &blob[..n * 4])?;
+            self.file.write_at(Self::offset(at), &blob[..n * 4])?;
             at += n as u64;
             left -= n as u64;
         }
@@ -312,8 +307,7 @@ impl TxHeightTable {
         while i < n {
             let take = (n - i).min(CHUNK);
             let bytes = (take as usize) * 4;
-            self.file
-                .read_at(Self::offset(i), &mut buf[..bytes])?;
+            self.file.read_at(Self::offset(i), &mut buf[..bytes])?;
             for j in 0..take as usize {
                 let off = j * 4;
                 let v = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
@@ -326,9 +320,6 @@ impl TxHeightTable {
         }
         Ok(())
     }
-
-
-
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
@@ -436,10 +427,8 @@ impl StrongTxTable {
         drop(guard);
         if need_bytes > cur_bytes {
             let zeros = vec![0u8; (need_bytes - cur_bytes) as usize];
-            self.bits.write_at(
-                crate::file::FILE_HEADER_LEN as u64 + cur_bytes,
-                &zeros,
-            )?;
+            self.bits
+                .write_at(crate::file::FILE_HEADER_LEN as u64 + cur_bytes, &zeros)?;
         }
         self.n_bits.store(need_bits, Ordering::Release);
         Ok(())
@@ -569,10 +558,8 @@ impl StrongTxTable {
                 let n = (full_end - full_start) as usize;
                 let fill = if on { 0xffu8 } else { 0u8 };
                 let blob = vec![fill; n];
-                self.bits.write_at(
-                    crate::file::FILE_HEADER_LEN as u64 + full_start,
-                    &blob,
-                )?;
+                self.bits
+                    .write_at(crate::file::FILE_HEADER_LEN as u64 + full_start, &blob)?;
                 bit = full_end * 8;
             }
         }
@@ -645,10 +632,8 @@ impl StrongTxTable {
             let suffix = v[disk as usize..].to_vec();
             drop(guard);
             if !suffix.is_empty() {
-                self.bits.write_at(
-                    crate::file::FILE_HEADER_LEN as u64 + disk,
-                    &suffix,
-                )?;
+                self.bits
+                    .write_at(crate::file::FILE_HEADER_LEN as u64 + disk, &suffix)?;
             }
             self.disk_bytes.store(body_len, Ordering::Release);
             self.dirty.store(false, Ordering::Release);
@@ -665,10 +650,8 @@ impl StrongTxTable {
         let suffix = v[from as usize..].to_vec();
         drop(guard);
         if !suffix.is_empty() {
-            self.bits.write_at(
-                crate::file::FILE_HEADER_LEN as u64 + from,
-                &suffix,
-            )?;
+            self.bits
+                .write_at(crate::file::FILE_HEADER_LEN as u64 + from, &suffix)?;
         }
         if body_len != disk {
             let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
@@ -742,7 +725,10 @@ mod strong_tests {
         }
         let t = StrongTxTable::open(&dir).unwrap();
         assert!(t.is_strong(Fk(1)).unwrap());
-        assert!(!t.is_strong(Fk(9)).unwrap(), "unflushed strong must not survive");
+        assert!(
+            !t.is_strong(Fk(9)).unwrap(),
+            "unflushed strong must not survive"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -900,9 +886,7 @@ mod chain_table_tests {
         for i in 10..15 {
             assert_eq!(th.get(Fk(i)).unwrap(), Some(7));
         }
-        let batch = th
-            .get_batch(&[Fk::NULL, Fk(1), Fk(5), Fk(9999)])
-            .unwrap();
+        let batch = th.get_batch(&[Fk::NULL, Fk(1), Fk(5), Fk(9999)]).unwrap();
         assert_eq!(batch, vec![None, Some(0), Some(10), None]);
         assert!(th.get_batch(&[]).unwrap().is_empty());
         th.clear(Fk(1)).unwrap();
@@ -1017,7 +1001,9 @@ impl HeaderTxsTable {
             return Err(StoreError::Corrupt("empty header tx list"));
         }
         debug_assert!(
-            tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1)),
+            tx_fks
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0.saturating_add(1)),
             "header_txs must be contiguous"
         );
         if !tx_fks
@@ -1116,10 +1102,6 @@ impl HeaderTxsTable {
     pub fn has_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
         Ok(self.get_range(header_fk)?.is_some())
     }
-
-
-
-
 
     /// Number of headers that currently have a Class A body (`count > 0`).
     ///

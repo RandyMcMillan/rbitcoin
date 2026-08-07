@@ -89,10 +89,7 @@ impl PinOuts {
         ch.extend_from_slice(checked);
         ch.sort_unstable();
         ch.dedup();
-        Self {
-            outs,
-            checked: ch,
-        }
+        Self { outs, checked: ch }
     }
 }
 
@@ -111,11 +108,7 @@ impl ParentLayout {
         }
     }
 
-    fn already_covers(
-        &self,
-        body_range: Option<(u64, u64)>,
-        spender_rels: &[(u32, u32)],
-    ) -> bool {
+    fn already_covers(&self, body_range: Option<(u64, u64)>, spender_rels: &[(u32, u32)]) -> bool {
         let range_done = body_range.is_none() || self.body_range.is_some();
         let rels_done = spender_rels.is_empty()
             || spender_rels.iter().all(|(v, r)| {
@@ -129,11 +122,7 @@ impl ParentLayout {
 
     /// Compose layout overlay (new half; does not mutate `self`).
     /// First writer wins for body_range; denserels merge by vout.
-    fn compose(
-        &self,
-        body_range: Option<(u64, u64)>,
-        spender_rels: &[(u32, u32)],
-    ) -> Self {
+    fn compose(&self, body_range: Option<(u64, u64)>, spender_rels: &[(u32, u32)]) -> Self {
         let mut layout = self.clone();
         if layout.body_range.is_none() {
             layout.body_range = body_range;
@@ -143,11 +132,7 @@ impl ParentLayout {
     }
 
     /// Write-path: force body_range and merge denserels.
-    fn compose_write(
-        &self,
-        body_range: (u64, u64),
-        sparse_rels: &[(u32, u32)],
-    ) -> Self {
+    fn compose_write(&self, body_range: (u64, u64), sparse_rels: &[(u32, u32)]) -> Self {
         let mut layout = self.clone();
         layout.body_range = Some(body_range);
         merge_spender_rels_into(&mut layout.spender_rels, sparse_rels);
@@ -256,12 +241,9 @@ impl SharedParentPin {
     fn set_coinbase_if_known(&self, coinbase: Option<bool>) {
         if let Some(b) = coinbase {
             let v = if b { CB_TRUE } else { CB_FALSE };
-            let _ = self.coinbase.compare_exchange(
-                CB_UNKNOWN,
-                v,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            let _ =
+                self.coinbase
+                    .compare_exchange(CB_UNKNOWN, v, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
 
@@ -355,7 +337,9 @@ impl PipelineParentStore {
                 // SharedParentPin: outs half scripts + layout rels + shell.
                 bytes = bytes.saturating_add(96);
                 for (_v, o) in &outs.outs {
-                    bytes = bytes.saturating_add(24).saturating_add(o.script.len() as u64);
+                    bytes = bytes
+                        .saturating_add(24)
+                        .saturating_add(o.script.len() as u64);
                 }
                 bytes = bytes.saturating_add(outs.checked.len().saturating_mul(4) as u64);
                 let lay = p.load_layout();
@@ -375,7 +359,10 @@ impl PipelineParentStore {
     }
 
     /// One lock: upgrade live pins for `ids` into a map (prep batch start).
-    pub fn bulk_upgrade(&self, ids: impl IntoIterator<Item = u64>) -> HashMap<u64, Arc<SharedParentPin>> {
+    pub fn bulk_upgrade(
+        &self,
+        ids: impl IntoIterator<Item = u64>,
+    ) -> HashMap<u64, Arc<SharedParentPin>> {
         let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = HashMap::new();
         for id in ids {
@@ -711,10 +698,9 @@ impl BatchParents {
         // concurrent prep merge_outs can add peer need-vouts between load and
         // publish; replacing with a snap-built list clobbered those vouts.
         let mut need_for_sparse: Vec<u32> = e.load_outs().checked.clone();
-        let may_grow_checked = need_for_sparse.is_empty()
-            && extra_need.is_empty()
-            && !dense_rels.is_empty()
-            || !extra_need.is_empty();
+        let may_grow_checked =
+            need_for_sparse.is_empty() && extra_need.is_empty() && !dense_rels.is_empty()
+                || !extra_need.is_empty();
         if may_grow_checked {
             e.publish_outs(|cur| {
                 let mut checked = cur.checked.clone();
@@ -915,10 +901,8 @@ impl BatchParents {
                         let src_lay = src.load_layout();
                         o.get().merge_outs(src_outs.outs.clone(), &src_outs.checked);
                         o.get().set_coinbase_if_known(src.coinbase_opt());
-                        o.get().maybe_merge_layout(
-                            src_lay.body_range,
-                            &src_lay.spender_rels,
-                        );
+                        o.get()
+                            .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
                     }
                 }
             }
@@ -1231,8 +1215,24 @@ mod tests {
         let store = Arc::new(PipelineParentStore::new());
         let mut a = BatchParents::with_store(Arc::clone(&store), 2);
         let mut b = BatchParents::with_store(Arc::clone(&store), 2);
-        a.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![(0, 1)]);
-        b.insert_owned(Fk(1), tx(1), vec![(1, out(2))], vec![1], None, None, vec![(1, 2)]);
+        a.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0],
+            None,
+            None,
+            vec![(0, 1)],
+        );
+        b.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(1, out(2))],
+            vec![1],
+            None,
+            None,
+            vec![(1, 2)],
+        );
         // a publishes first (wins Weak slot).
         a.publish_to_store();
         // b publishes: must merge into a's Arc and swap handle.

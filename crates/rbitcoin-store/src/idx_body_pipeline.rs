@@ -271,8 +271,7 @@ mod tests {
             assert!(j.ok, "id={}", j.id);
             let seq = t.body.record_range(Fk(j.id)).unwrap();
             assert_eq!(j.range, Some(seq));
-            let (tx, _ins, outs, rels) =
-                decode_packed_tx_with_spender_rels(&j.body).unwrap();
+            let (tx, _ins, outs, rels) = decode_packed_tx_with_spender_rels(&j.body).unwrap();
             assert_eq!(outs.len(), rels.len());
             assert_eq!(tx.output_count as usize, outs.len());
         }
@@ -324,14 +323,12 @@ mod tests {
             assert!(j.ok, "id={}", j.id);
             let seq = t.body.record_range(Fk(j.id)).unwrap();
             assert_eq!(j.range, Some(seq));
-            let (tx, _ins, outs, rels) =
-                decode_packed_tx_with_spender_rels(&j.body).unwrap();
+            let (tx, _ins, outs, rels) = decode_packed_tx_with_spender_rels(&j.body).unwrap();
             assert_eq!(outs.len(), rels.len());
             assert_eq!(tx.output_count as usize, outs.len());
         }
         // Second wave reuses bulk_io TL ring; results stable.
-        let mut jobs2: Vec<IdxBodyJob> =
-            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let mut jobs2: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
         run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();
         for (a, b) in jobs.iter().zip(jobs2.iter()) {
             assert_eq!(a.range, b.range);
@@ -365,8 +362,7 @@ mod tests {
         let (dir, t) = temp_tx();
         let fks = put_n(&t, 64);
         // Wave 1: cold idx+body for all
-        let mut jobs: Vec<IdxBodyJob> =
-            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
         let t0 = Instant::now();
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         let cold_us = t0.elapsed().as_micros();
@@ -390,8 +386,7 @@ mod tests {
         }
 
         // Wave 3: Prefix33 head-resolve style
-        let mut jobs3: Vec<IdxBodyJob> =
-            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let mut jobs3: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
         let t2 = Instant::now();
         run_idx_body_pipeline(&t.body, &mut jobs3, BodyMode::Prefix33).unwrap();
         let prefix_us = t2.elapsed().as_micros();

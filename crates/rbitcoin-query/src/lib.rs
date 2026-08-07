@@ -3,22 +3,20 @@
 mod archive;
 mod batch_full_bodies;
 mod batch_parents;
-mod in_flight;
 mod catchup;
 mod chain_view;
 mod combined_stage;
+mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
-mod confirm_load;
+mod in_flight;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
 mod sh_builder;
 mod wave_prevout;
 
-pub use combined_stage::{
-    body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate,
-};
+pub use combined_stage::{body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -93,9 +91,7 @@ pub fn soft_densify_band_hi(
     if n == 0 {
         return path_lo.min(densify_hi);
     }
-    path_lo
-        .saturating_add(n.saturating_sub(1))
-        .min(densify_hi)
+    path_lo.saturating_add(n.saturating_sub(1)).min(densify_hi)
 }
 
 /// True when over free bytes and the queue already holds at least one confirm
@@ -194,16 +190,16 @@ pub mod process_mem_stats {
     }
 }
 
+pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
     SPENDER_REL_UNKNOWN,
 };
-pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;
-pub use connect::ConfirmPrepared;
+pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
-pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
+pub use connect::ConfirmPrepared;
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -691,10 +687,7 @@ pub mod archive_phase_stats {
         add(&PREP_INFLIGHT_NS, inflight_ns);
         add(&PREP_HEAD_FK_NS, head_fk_ns);
         add(&PREP_HEAD_DENS_NS, head_dens_ns);
-        add(
-            &PREP_HEAD_NS,
-            head_fk_ns.saturating_add(head_dens_ns),
-        );
+        add(&PREP_HEAD_NS, head_fk_ns.saturating_add(head_dens_ns));
         add(&PREP_STAMP_NS, stamp_ns);
         add(&PREP_FINISH_NS, finish_ns);
         // Last-batch (overwrite; for slow-plan diagnosis).
@@ -1016,10 +1009,7 @@ impl Query {
         }
         let store_path = store.path().to_path_buf();
         // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
-        let sh_through = store
-            .tip_height()
-            .map(|h| h.0 as u64)
-            .unwrap_or(u64::MAX);
+        let sh_through = store.tip_height().map(|h| h.0 as u64).unwrap_or(u64::MAX);
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
@@ -1027,9 +1017,7 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
-            block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
-                &store_path,
-            )?),
+            block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             block_queue_pressure: AtomicBool::new(false),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Open as Tip until IBD selects Direct.
@@ -1077,8 +1065,7 @@ impl Query {
     /// Advance SH watermark only after Class C tip commit.
     pub(crate) fn set_sh_indexed_through_height(&self, height: Option<u32>) {
         let v = height.map(|h| h as u64).unwrap_or(u64::MAX);
-        self.sh_indexed_through
-            .store(v, AtomicOrdering::Release);
+        self.sh_indexed_through.store(v, AtomicOrdering::Release);
     }
 
     /// Resolve txid → fk via durable `tx.head` (when the index is enabled).
@@ -1136,8 +1123,7 @@ impl Query {
     }
 
     pub fn spend_index_enabled(&self) -> bool {
-        self.spend_index
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.spend_index.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Host-friendly process-exit flush (durability for open tables).
@@ -1190,8 +1176,7 @@ impl Query {
     }
 
     pub fn tx_index_enabled(&self) -> bool {
-        self.tx_index
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.tx_index.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// In-RAM block queue stats: `(absolute_budget_or_max, bytes, count)`.
@@ -1522,9 +1507,7 @@ impl Query {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
         }
-        let fk = self
-            .lookup_tx_fk(&tx.txid)?
-            .ok_or(StoreError::NotFound)?;
+        let fk = self.lookup_tx_fk(&tx.txid)?.ok_or(StoreError::NotFound)?;
         self.tx_input_at_fk(fk, tx, i)
     }
 
@@ -1539,10 +1522,7 @@ impl Query {
             return Err(StoreError::NotFound);
         }
         let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
-        inputs
-            .get(i as usize)
-            .cloned()
-            .ok_or(StoreError::NotFound)
+        inputs.get(i as usize).cloned().ok_or(StoreError::NotFound)
     }
 
     /// Output `vout` of a tx row (run-addressed).
@@ -1974,11 +1954,7 @@ mod tests {
         let loc = q.locator_hashes().unwrap();
         assert!(!loc.is_empty());
         let after = q
-            .headers_after_locator(
-                &loc,
-                BlockHash::from_byte_array([0u8; 32]),
-                10,
-            )
+            .headers_after_locator(&loc, BlockHash::from_byte_array([0u8; 32]), 10)
             .unwrap();
         // After matching tip locator → empty; zero locator starts from genesis.
         let from_zero = q
@@ -2108,12 +2084,13 @@ mod tests {
         assert!(q.header_at_height(Height(1)).unwrap().is_some());
 
         // Error paths.
-        assert!(q.confirm_blocks_run(&[ConfirmPrepared {
-            height: Height(99),
-            header_fk: Fk(1),
-            tx_fks: vec![Fk(1)],
-        }])
-        .is_err());
+        assert!(q
+            .confirm_blocks_run(&[ConfirmPrepared {
+                height: Height(99),
+                header_fk: Fk(1),
+                tx_fks: vec![Fk(1)],
+            }])
+            .is_err());
         assert!(q.tx_input_at_fk(fks[0], &tx, 99).is_err());
         assert!(q.tx_output_at_fk(fks[0], &tx, 99).is_err());
         assert!(q.merkle_proof(Height(0), &[0xff; 32]).is_err());
@@ -2250,10 +2227,7 @@ mod tests {
         assert_eq!(wire_tx.input.len(), 1);
         // Synthetic header.hash is not PoW/merkle-linked; height rebuild checks mismatch.
         assert!(q.reconstruct_block_at_height(Height(0)).is_err());
-        assert!(q
-            .reconstruct_block_by_hash(&[0xde; 32])
-            .unwrap()
-            .is_none());
+        assert!(q.reconstruct_block_by_hash(&[0xde; 32]).unwrap().is_none());
         let arch = q.reconstruct_archived_block(&hashes[1]).unwrap().unwrap();
         assert_eq!(arch.txdata.len(), 3);
         // archived path does not require header.hash == wire block_hash.
@@ -2410,9 +2384,7 @@ mod tests {
             .unwrap()
             .is_empty());
         // tip at last confirmed — may return empty if no archive ahead.
-        let path = q
-            .resume_work_path_after_tip(hashes[2], 2, 5)
-            .unwrap();
+        let path = q.resume_work_path_after_tip(hashes[2], 2, 5).unwrap();
         let _ = path;
 
         // confirm_load of height above tip with archived body (archive-only ahead).
@@ -2420,20 +2392,14 @@ mod tests {
         let (h3, ta3) = coinbase_block(3, prev);
         let h3hash = h3.hash;
         q.archive_block(&h3, &[ta3]).unwrap();
-        let (st, parents, thin, bodies) = q
-            .load_confirm_parents(&[(3, h3hash)])
-            .unwrap();
+        let (st, parents, thin, bodies) = q.load_confirm_parents(&[(3, h3hash)]).unwrap();
         assert!(st.blocks >= 1 || bodies.len() >= 1 || !parents.is_empty() || thin.is_empty());
         let _ = thin;
         // Missing header / no body paths.
-        let (st2, _, _, _) = q
-            .load_confirm_parents(&[(9, [0xbb; 32])])
-            .unwrap();
+        let (st2, _, _, _) = q.load_confirm_parents(&[(9, [0xbb; 32])]).unwrap();
         let _ = st2;
         // Header without body.
-        let (st3, _, _, _) = q
-            .load_confirm_parents(&[(10, orphan.hash)])
-            .unwrap();
+        let (st3, _, _, _) = q.load_confirm_parents(&[(10, orphan.hash)]).unwrap();
         let _ = st3;
 
         let _ = q.parent_cache_ready_through();
@@ -2549,10 +2515,7 @@ mod tests {
             output_count: 0,
         };
         assert!(q.tx_input_run(&empty_tx).unwrap().is_empty());
-        assert!(q
-            .tx_input_run_class_a(Fk(1), &empty_tx)
-            .unwrap()
-            .is_empty());
+        assert!(q.tx_input_run_class_a(Fk(1), &empty_tx).unwrap().is_empty());
 
         // ArchiveWritePlan empty helper.
         let plan = ArchiveWritePlan::empty();
@@ -2697,9 +2660,7 @@ mod tests {
         assert!(q.load_confirm_parents(&[(9, [0xab; 32])]).is_err());
         q.clear_confirm_cancel();
         // Missing header hash at tip+1 → continue (no panic)
-        let (_st, bp, _, _) = q
-            .load_confirm_parents(&[(2, [0xde; 32])])
-            .unwrap();
+        let (_st, bp, _, _) = q.load_confirm_parents(&[(2, [0xde; 32])]).unwrap();
         let _ = bp;
 
         let _ = parent_txid;

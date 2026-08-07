@@ -122,10 +122,6 @@ impl HeaderTable {
         Ok(None)
     }
 
-
-
-
-
     /// Number of header rows currently stored (highest fk = this value).
     pub fn count(&self) -> u64 {
         self.count.load(std::sync::atomic::Ordering::Acquire)

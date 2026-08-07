@@ -55,7 +55,9 @@ fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), ConsensusErro
                 return Err(ConsensusError::Script("p2pkh scriptSig op".into()));
             }
             Instruction::Op(_) => {
-                return Err(ConsensusError::Script("p2pkh scriptSig unexpected op".into()));
+                return Err(ConsensusError::Script(
+                    "p2pkh scriptSig unexpected op".into(),
+                ));
             }
         }
     }
@@ -68,10 +70,10 @@ fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), ConsensusErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ScriptCheckJob;
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
-    use crate::block::ScriptCheckJob;
 
     #[test]
     fn parse_two_pushes_errors() {

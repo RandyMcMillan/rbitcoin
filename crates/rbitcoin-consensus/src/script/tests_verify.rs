@@ -4,9 +4,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 use crate::block::ScriptCheckJob;
 use crate::script;
@@ -63,9 +61,9 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     (job, true)
 }
@@ -179,9 +177,9 @@ fn anyone_can_spend_accepts() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("op_true");
 }
@@ -317,9 +315,9 @@ fn p2pkh_valid_signature_accepts() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("valid p2pkh");
 }
@@ -358,9 +356,9 @@ fn p2wsh_op_true_accepts() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("p2wsh op_true");
 }
@@ -394,9 +392,9 @@ fn p2wsh_wrong_script_hash_rejects() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     assert!(script::verify_job_all_inputs(&job).is_err());
 }
@@ -463,9 +461,9 @@ fn p2sh_p2wpkh_nested_accepts() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("p2sh-p2wpkh");
 }
@@ -512,9 +510,9 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
         tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("p2sh multi-push legacy");
 }
@@ -546,9 +544,9 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
         tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("mainnet 183 high-S P2PK must verify");
 }
@@ -584,9 +582,9 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
         tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
-    bip66_active: true,
-    bip16_active: true,
-    taproot_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
     };
     script::verify_job_all_inputs(&job).expect("hashtype 0 P2PKH must verify");
 }
@@ -615,8 +613,14 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
     let ss = spend.input[0].script_sig.as_bytes();
     let n = ss[0] as usize;
     let der = &ss[1..1 + n - 1];
-    assert!(Signature::from_der(der).is_err(), "fixture must be non-strict");
-    assert!(Signature::from_der_lax(der).is_ok(), "fixture must be lax-parseable");
+    assert!(
+        Signature::from_der(der).is_err(),
+        "fixture must be non-strict"
+    );
+    assert!(
+        Signature::from_der_lax(der).is_ok(),
+        "fixture must be lax-parseable"
+    );
 
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
@@ -641,8 +645,8 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
 /// Unit: parse_der_sig strict vs lax.
 #[test]
 fn parse_der_sig_strict_vs_lax_on_double_zero_r() {
-    use bitcoin::secp256k1::ecdsa::Signature;
     use super::crypto::{is_valid_signature_encoding, parse_der_sig};
+    use bitcoin::secp256k1::ecdsa::Signature;
     // From mainnet 124276 spend (sig push only, includes hashtype 0x01).
     let sig_raw = {
         let s = "3048022200002b83d59c1d23c08efd82ee0662fec23309c3adbcbd1f0b8695378db4b14e736602220000334a96676e58b1bb01784cb7c556dd8ce1c220171904da22e18fe1e7d1510db501";
@@ -667,8 +671,8 @@ fn parse_der_sig_strict_vs_lax_on_double_zero_r() {
 /// recovers the OpenSSL values. Preferring strict-first rejected this tip block.
 #[test]
 fn parse_der_sig_never_prefers_strict_when_lax_differs() {
-    use bitcoin::secp256k1::ecdsa::Signature;
     use super::crypto::{is_valid_signature_encoding, parse_der_sig};
+    use bitcoin::secp256k1::ecdsa::Signature;
     // scriptSig first push from mainnet tx 70f7c15c… (block 140493).
     let sig_raw = {
         let s = "304402206b5c3b1c86748dcf328b9f3a65e10085afcf5d1af5b40970d8ce3a9355e06b5b0220cdbdc23e6d3618e47056fccc60c5f73d1a542186705197e5791e97f0e6582a3201";
@@ -908,9 +912,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
     );
     let prevout = TxOut {
         value: Amount::from_sat(70_000),
-        script_pubkey: ScriptBuf::from_bytes(hx(
-            "a9143ae52dbc43c884ef43211a43082d01a0091ef1e387",
-        )),
+        script_pubkey: ScriptBuf::from_bytes(hx("a9143ae52dbc43c884ef43211a43082d01a0091ef1e387")),
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],

@@ -13,9 +13,7 @@ use bitcoin::hashes::{hash160, Hash};
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 fn encode_tx(tx: &Transaction) -> Vec<u8> {
     let mut v = Vec::new();
@@ -153,16 +151,28 @@ fn main() {
     bench("clone Transaction (connect-side job build)", 50_000, || {
         let _ = tx1.clone();
     });
-    bench("encode Transaction → wire bytes (old connect)", 50_000, || {
-        let _ = encode_tx(&tx1);
-    });
-    bench("deserialize wire → Transaction (old verify)", 50_000, || {
-        let _: Transaction = bitcoin::consensus::deserialize(&bytes).unwrap();
-    });
-    bench("encode + deserialize round-trip (old waste)", 20_000, || {
-        let b = encode_tx(&tx1);
-        let _: Transaction = bitcoin::consensus::deserialize(&b).unwrap();
-    });
+    bench(
+        "encode Transaction → wire bytes (old connect)",
+        50_000,
+        || {
+            let _ = encode_tx(&tx1);
+        },
+    );
+    bench(
+        "deserialize wire → Transaction (old verify)",
+        50_000,
+        || {
+            let _: Transaction = bitcoin::consensus::deserialize(&bytes).unwrap();
+        },
+    );
+    bench(
+        "encode + deserialize round-trip (old waste)",
+        20_000,
+        || {
+            let b = encode_tx(&tx1);
+            let _: Transaction = bitcoin::consensus::deserialize(&b).unwrap();
+        },
+    );
     bench("SighashCache + p2wpkh_signature_hash only", 20_000, || {
         let mut cache = SighashCache::new(&tx1);
         let _ = cache
@@ -236,19 +246,23 @@ fn main() {
                 .unwrap();
         }
     });
-    bench("1× SighashCache shared + 8 hashes (no ecdsa)", 2_000, || {
-        let mut cache = SighashCache::new(&tx8);
-        for i in 0..8 {
-            let _ = cache
-                .p2wpkh_signature_hash(
-                    i,
-                    po8[i].script_pubkey.as_script(),
-                    po8[i].value,
-                    EcdsaSighashType::All,
-                )
-                .unwrap();
-        }
-    });
+    bench(
+        "1× SighashCache shared + 8 hashes (no ecdsa)",
+        2_000,
+        || {
+            let mut cache = SighashCache::new(&tx8);
+            for i in 0..8 {
+                let _ = cache
+                    .p2wpkh_signature_hash(
+                        i,
+                        po8[i].script_pubkey.as_script(),
+                        po8[i].value,
+                        EcdsaSighashType::All,
+                    )
+                    .unwrap();
+            }
+        },
+    );
 
     // --- batch of 1-in jobs like signet tip ---
     println!("\n--- batch: 64 × 1-input P2TR (signet-like) ---");
@@ -260,12 +274,20 @@ fn main() {
         .collect();
     // Pre-materialize owned jobs once (production builds them at connect).
     let owned = rbitcoin_consensus::script_bench::owned_jobs(&jobs);
-    bench("verify_owned_pool 64× P2TR (rayon, no re-clone)", 50, || {
-        rbitcoin_consensus::script_bench::verify_owned_pool(&owned).unwrap();
-    });
-    bench("verify_jobs_pool 64× P2TR (rayon + clone/iter)", 50, || {
-        rbitcoin_consensus::script_bench::verify_jobs_pool(&jobs).unwrap();
-    });
+    bench(
+        "verify_owned_pool 64× P2TR (rayon, no re-clone)",
+        50,
+        || {
+            rbitcoin_consensus::script_bench::verify_owned_pool(&owned).unwrap();
+        },
+    );
+    bench(
+        "verify_jobs_pool 64× P2TR (rayon + clone/iter)",
+        50,
+        || {
+            rbitcoin_consensus::script_bench::verify_jobs_pool(&jobs).unwrap();
+        },
+    );
     bench("verify_job sequential 64× P2TR", 50, || {
         for j in &jobs {
             rbitcoin_consensus::script_bench::verify_job(j).unwrap();

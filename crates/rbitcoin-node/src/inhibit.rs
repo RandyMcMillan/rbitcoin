@@ -48,9 +48,7 @@ impl SuspendInhibit {
         std::thread::sleep(std::time::Duration::from_millis(50));
         match child.try_wait() {
             Ok(Some(status)) => {
-                warn!(
-                    "node: systemd-inhibit exited early ({status}); suspend not inhibited"
-                );
+                warn!("node: systemd-inhibit exited early ({status}); suspend not inhibited");
                 return None;
             }
             Ok(None) => {}

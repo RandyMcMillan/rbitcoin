@@ -42,9 +42,7 @@ fn main() {
         for i in 0..n_edges {
             let mut txid = [0u8; 32];
             txid[0..4].copy_from_slice(&i.to_le_bytes());
-            store
-                .put_spend(&txid, 0, Fk(1 + i as u64), 0)
-                .expect("put");
+            store.put_spend(&txid, 0, Fk(1 + i as u64), 0).expect("put");
         }
         store.flush().ok();
         drop(store);

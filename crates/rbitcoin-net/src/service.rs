@@ -103,12 +103,7 @@ impl P2PNode {
                         tokio::spawn(async move {
                             let _permit = permit; // held for full session lifetime
                             let (_ver, reader, writer) = match connect_and_handshake(
-                                stream,
-                                magic_c,
-                                our,
-                                peer_addr,
-                                height,
-                                true,
+                                stream, magic_c, our, peer_addr, height, true,
                             )
                             .await
                             {
@@ -177,11 +172,7 @@ impl P2PNode {
     /// IBD / catch-up: multi-peer download window across `peers` (libbitcoin-class).
     ///
     /// This is the only history-sync path. Tip-follow is [`Self::follow_from`].
-    pub async fn sync(
-        &self,
-        peers: &[SocketAddr],
-        cfg: IbdConfig,
-    ) -> Result<u32, NetError> {
+    pub async fn sync(&self, peers: &[SocketAddr], cfg: IbdConfig) -> Result<u32, NetError> {
         self.sync_cancellable(peers, cfg, None).await
     }
 
@@ -216,15 +207,8 @@ impl P2PNode {
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
         let stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
-        let (_ver, reader, writer) = connect_and_handshake(
-            stream,
-            self.magic,
-            self.local_addr,
-            peer,
-            height,
-            false,
-        )
-        .await?;
+        let (_ver, reader, writer) =
+            connect_and_handshake(stream, self.magic, self.local_addr, peer, height, false).await?;
         let hub = self.hub.clone();
         let tip_rx = hub.subscribe_tips();
         let magic = self.magic;
@@ -258,11 +242,7 @@ impl P2PNode {
         }
     }
 
-    pub async fn wait_tip_hash(
-        &self,
-        hash: BlockHash,
-        timeout: Duration,
-    ) -> Result<(), NetError> {
+    pub async fn wait_tip_hash(&self, hash: BlockHash, timeout: Duration) -> Result<(), NetError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.hub.tip_hash() == Some(hash) {
@@ -305,9 +285,18 @@ mod tests {
 
     #[test]
     fn magic_for_all_networks_and_regtest_config() {
-        assert_eq!(magic_for(RNetwork::Mainnet), Magic::from(bitcoin::Network::Bitcoin));
-        assert_eq!(magic_for(RNetwork::Testnet), Magic::from(bitcoin::Network::Testnet));
-        assert_eq!(magic_for(RNetwork::Signet), Magic::from(bitcoin::Network::Signet));
+        assert_eq!(
+            magic_for(RNetwork::Mainnet),
+            Magic::from(bitcoin::Network::Bitcoin)
+        );
+        assert_eq!(
+            magic_for(RNetwork::Testnet),
+            Magic::from(bitcoin::Network::Testnet)
+        );
+        assert_eq!(
+            magic_for(RNetwork::Signet),
+            Magic::from(bitcoin::Network::Signet)
+        );
         assert_eq!(magic_for(RNetwork::Regtest), Magic::REGTEST);
         let cfg = NetConfig::for_regtest(None);
         assert_eq!(cfg.magic, Magic::REGTEST);

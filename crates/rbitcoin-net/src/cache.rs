@@ -7,8 +7,8 @@
 use bitcoin::block::{Block, Header};
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use std::sync::RwLock;
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// How many recent full block bodies to retain (matches IBD horizon; hash chain
 /// is kept without bodies for locators).
@@ -72,11 +72,21 @@ impl BlockCache {
     }
 
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {
-        self.inner.read().unwrap().by_hash.get(hash).map(|b| b.header)
+        self.inner
+            .read()
+            .unwrap()
+            .by_hash
+            .get(hash)
+            .map(|b| b.header)
     }
 
     pub fn hash_at_height(&self, height: u32) -> Option<BlockHash> {
-        self.inner.read().unwrap().chain.get(height as usize).copied()
+        self.inner
+            .read()
+            .unwrap()
+            .chain
+            .get(height as usize)
+            .copied()
     }
 
     pub fn header_at_height(&self, height: u32) -> Option<Header> {
@@ -183,7 +193,12 @@ impl BlockCache {
             }
         }
         let mut out = Vec::new();
-        for h in g.chain.iter().skip(start).take(crate::codec::MAX_HEADERS_RESULTS) {
+        for h in g
+            .chain
+            .iter()
+            .skip(start)
+            .take(crate::codec::MAX_HEADERS_RESULTS)
+        {
             if let Some(b) = g.by_hash.get(h) {
                 out.push(b.header);
                 if *h == stop && stop.to_byte_array() != [0u8; 32] {
@@ -258,14 +273,12 @@ mod tests {
         assert!(c.hash_at_height(0).is_some());
         let loc = c.locator();
         assert_eq!(loc[0], tip);
-        let hdrs = c.headers_after_locator(&[g.block_hash()], BlockHash::from_byte_array([0u8; 32]));
+        let hdrs =
+            c.headers_after_locator(&[g.block_hash()], BlockHash::from_byte_array([0u8; 32]));
         // Only tip-window bodies yield headers.
         assert!(!hdrs.is_empty() || c.get_header(&tip).is_some());
         // Zero locator starts from genesis hash index.
-        let from_zero = c.headers_after_locator(
-            &[BlockHash::from_byte_array([0u8; 32])],
-            tip,
-        );
+        let from_zero = c.headers_after_locator(&[BlockHash::from_byte_array([0u8; 32])], tip);
         assert!(!from_zero.is_empty() || c.header_at_height(5).is_some());
         c.truncate_to_height(2);
         assert!(c.tip_height().unwrap() <= 2);

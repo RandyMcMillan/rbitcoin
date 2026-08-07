@@ -14,9 +14,7 @@ use crate::block::{JobTx, ScriptCheckJob};
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::script::Script;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -377,9 +375,16 @@ fn parse_flags(s: &str) -> CoreFlags {
                 f.dersig = true; // STRICTENC implies DER + pubkey type checks
                 f.extra.push("STRICTENC".into());
             }
-            "LOW_S" | "NULLFAIL" | "NULLDUMMY" | "SIGPUSHONLY" | "MINIMALDATA" | "MINIMALIF"
-            | "WITNESS_PUBKEYTYPE" | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
-            | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" | "DISCOURAGE_OP_SUCCESS"
+            "LOW_S"
+            | "NULLFAIL"
+            | "NULLDUMMY"
+            | "SIGPUSHONLY"
+            | "MINIMALDATA"
+            | "MINIMALIF"
+            | "WITNESS_PUBKEYTYPE"
+            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+            | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+            | "DISCOURAGE_OP_SUCCESS"
             | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => {
                 f.extra.push(p);
             }
@@ -418,11 +423,7 @@ fn build_credit(script_pubkey: ScriptBuf, value: Amount) -> Transaction {
     }
 }
 
-fn build_spend(
-    credit: &Transaction,
-    script_sig: ScriptBuf,
-    witness: Witness,
-) -> Transaction {
+fn build_spend(credit: &Transaction, script_sig: ScriptBuf, witness: Witness) -> Transaction {
     let credit_txid = credit.compute_txid();
     Transaction {
         version: bitcoin::transaction::Version::ONE,
@@ -472,9 +473,7 @@ fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount), String> 
                 }
                 let mut bytes = Vec::with_capacity(hex.len() / 2);
                 for j in (0..hex.len()).step_by(2) {
-                    bytes.push(
-                        u8::from_str_radix(&hex[j..j + 2], 16).map_err(|e| e.to_string())?,
-                    );
+                    bytes.push(u8::from_str_radix(&hex[j..j + 2], 16).map_err(|e| e.to_string())?);
                 }
                 stack.push(bytes);
             }
@@ -483,7 +482,10 @@ fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount), String> 
             amount = Amount::from_sat(sats.max(0) as u64);
         }
     }
-    Ok((Witness::from_slice(&stack.iter().map(|v| v.as_slice()).collect::<Vec<_>>()), amount))
+    Ok((
+        Witness::from_slice(&stack.iter().map(|v| v.as_slice()).collect::<Vec<_>>()),
+        amount,
+    ))
 }
 
 /// True if discouraged NOP1/NOP4–10 appears **outside** IF/ENDIF regions.
@@ -511,12 +513,8 @@ fn has_discouraged_nop_outside_if(script: &[u8]) -> bool {
             continue;
         }
         if op == 0x4e && i + 4 < script.len() {
-            let n = u32::from_le_bytes([
-                script[i + 1],
-                script[i + 2],
-                script[i + 3],
-                script[i + 4],
-            ]) as usize;
+            let n = u32::from_le_bytes([script[i + 1], script[i + 2], script[i + 3], script[i + 4]])
+                as usize;
             i += 5 + n;
             continue;
         }
@@ -555,11 +553,7 @@ fn run_script_row(
 
     let spk = ScriptBuf::from_bytes(script_pubkey.to_vec());
     let credit = build_credit(spk.clone(), amount);
-    let mut spend = build_spend(
-        &credit,
-        ScriptBuf::from_bytes(script_sig.to_vec()),
-        witness,
-    );
+    let mut spend = build_spend(&credit, ScriptBuf::from_bytes(script_sig.to_vec()), witness);
     let prev = TxOut {
         value: amount,
         script_pubkey: credit.output[0].script_pubkey.clone(),
@@ -926,8 +920,7 @@ fn run_all_script_rows() -> RowStats {
                     }
                     st.fail += 1;
                     if st.failures.len() < 40 {
-                        st.failures
-                            .push(format!("#{idx} witness parse: {e}"));
+                        st.failures.push(format!("#{idx} witness parse: {e}"));
                     }
                     continue;
                 }
@@ -1037,7 +1030,11 @@ fn core_script_tests_all_rows() {
         "core script_tests non-allowlisted failures: {} (see FAIL lines)",
         st.fail
     );
-    assert!(st.total > 500, "expected hundreds of Core rows, total={}", st.total);
+    assert!(
+        st.total > 500,
+        "expected hundreds of Core rows, total={}",
+        st.total
+    );
     assert_eq!(
         st.allow_skip as usize,
         st.used_allow.len(),

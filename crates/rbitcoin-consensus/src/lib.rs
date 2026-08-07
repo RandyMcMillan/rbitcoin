@@ -347,8 +347,8 @@ pub mod confirm_phase_stats {
     /// cold_ns, cold_n, fk_ns)`.
     #[inline]
     #[allow(clippy::type_complexity)]
-    pub fn sample_assemble_prevout_detail_and_reset()
-    -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn sample_assemble_prevout_detail_and_reset(
+    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             ASM_IN_N.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_NS.swap(0, Ordering::Relaxed),
@@ -468,8 +468,7 @@ pub mod confirm_phase_stats {
     /// `recon` prefers wire sub-timer, else legacy total.
     /// `connect` is **load assemble**, not write structural — see `structural`.
     #[allow(clippy::type_complexity)]
-    pub fn sample_and_reset()
-    -> (
+    pub fn sample_and_reset() -> (
         u64,
         u64,
         u64,
@@ -575,14 +574,14 @@ pub fn confirm_archived_at(
 pub use confirm_run::{
     confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
     confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_feed_ahead,
-    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_lookup_and_ensure_denserels,
-    confirm_wire_lookup_stamp, confirm_wire_load_from_plan, confirm_wire_load_phase,
-    confirm_wire_load_phase_pipelined, confirm_wire_run, confirm_wire_run_preverified,
-    confirm_write_phase, ensure_external_parent_denserels_from_plan, join_scripts_polling,
-    lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_load_channel,
-    ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
-    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
-    WireLoadPipeline,
+    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_load_from_plan,
+    confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
+    confirm_wire_lookup_and_ensure_denserels, confirm_wire_lookup_stamp, confirm_wire_run,
+    confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
+    join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
+    scripts_stage_from_load_channel, ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome,
+    DenserelsWarmStats, LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified,
+    ScriptsBatchMeta, ScriptsPhaseHandle, WireLoadPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).
@@ -624,10 +623,7 @@ pub fn accept_and_connect_block_preverified(
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
     let hash = block.block_hash().to_byte_array();
     // Already tip at this height — skip re-archive / re-confirm.
-    if let Some(h) = query
-        .height_of_hash(&hash)
-        .map_err(ConsensusError::Store)?
-    {
+    if let Some(h) = query.height_of_hash(&hash).map_err(ConsensusError::Store)? {
         if h == height {
             if let Some((fk, _)) = query
                 .get_header_by_hash(&hash)
@@ -770,7 +766,7 @@ mod coverage_tests {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{
         Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
-        TxOut, TxMerkleNode, Witness,
+        TxMerkleNode, TxOut, Witness,
     };
     use rbitcoin_primitives::Height;
     use rbitcoin_query::Query;
@@ -907,10 +903,7 @@ mod coverage_tests {
         PREP_HEADER_NS.store(5, Ordering::Relaxed);
         PREP_PREPARE_NS.store(6, Ordering::Relaxed);
         PREP_FILTER_PLAN_NS.store(7, Ordering::Relaxed);
-        assert_eq!(
-            sample_prep_residual_and_reset(),
-            (3, 4, 5, 6, 7)
-        );
+        assert_eq!(sample_prep_residual_and_reset(), (3, 4, 5, 6, 7));
         ASM_PREVOUT_NS.store(10, Ordering::Relaxed);
         ASM_SIGOP_NS.store(20, Ordering::Relaxed);
         ASM_FINAL_NS.store(30, Ordering::Relaxed);
@@ -954,7 +947,9 @@ mod coverage_tests {
 
     #[test]
     fn script_bench_helpers_on_acs_job() {
-        use script_bench::{owned_jobs, verify_job, verify_jobs_pool, verify_one_job, verify_owned_pool, JobBytes};
+        use script_bench::{
+            owned_jobs, verify_job, verify_jobs_pool, verify_one_job, verify_owned_pool, JobBytes,
+        };
         let tx = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -1000,19 +995,12 @@ mod coverage_tests {
         accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
         // already archived branch
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-        confirm_archived_at(
-            &q,
-            &params,
-            Height(1),
-            &b1.block_hash().to_byte_array(),
-            ms,
-        )
-        .unwrap();
+        confirm_archived_at(&q, &params, Height(1), &b1.block_hash().to_byte_array(), ms).unwrap();
 
         // Bad pow limit on prepare_ibd
         let mut bad = b1.clone();
         bad.header.bits = CompactTarget::from_consensus(0x1d00_ffff); // mainnet-ish, above regtest limit often
-        // May fail pow or pow limit depending on params — either is fine.
+                                                                      // May fail pow or pow limit depending on params — either is fine.
         let _ = prepare_block_for_archive_ibd(&params, &bad);
 
         let _ = std::fs::remove_dir_all(&path);

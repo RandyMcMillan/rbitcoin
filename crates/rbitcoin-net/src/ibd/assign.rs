@@ -18,8 +18,8 @@ use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, CONTIG_DENSIFY_AHEAD, FAR_SCAN_BUDGET, PENDING_STALE,
-    TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_DENSIFY_AHEAD, FAR_SCAN_BUDGET, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS,
+    TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
@@ -72,7 +72,6 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-
 /// True when soft BQ confirm window is already covered (or archive RAM full)
 /// and getdata inflight is low → Critical (tip race only, skip densify walk).
 ///
@@ -104,12 +103,7 @@ pub(crate) fn assign_work_ordered(
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
-    let alive: Vec<usize> = st
-        .slots
-        .iter()
-        .filter(|s| s.alive)
-        .map(|s| s.id)
-        .collect();
+    let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
     if alive.is_empty() {
         return;
     }
@@ -203,7 +197,9 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
         .assign_ns
         .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if issued > 0 {
-        loop_stats.assign_issued.fetch_add(issued, Ordering::Relaxed);
+        loop_stats
+            .assign_issued
+            .fetch_add(issued, Ordering::Relaxed);
     }
 }
 
@@ -244,10 +240,7 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
     if st.inflight.contains_key(&h) {
         return None;
     }
-    if st.body.is_known_archived(&h)
-        || st.body.is_pending(&h)
-        || st.body.is_rejected(&h)
-    {
+    if st.body.is_known_archived(&h) || st.body.is_pending(&h) || st.body.is_rejected(&h) {
         return None;
     }
     // Body queue already holds wire for this height.
@@ -266,9 +259,7 @@ pub(crate) fn pop_need(
     hub: &ChainHub,
 ) -> Option<BlockHash> {
     while let Some(h) = q.pop_front() {
-        if st.body.skip_download(hub, &h)
-            || st.inflight.contains_key(&h)
-        {
+        if st.body.skip_download(hub, &h) || st.inflight.contains_key(&h) {
             continue;
         }
         return Some(h);
@@ -282,7 +273,6 @@ fn peer_has_slot(st: &IbdWorkState, pid: usize, per_peer: usize) -> bool {
         .find(|s| s.id == pid && s.alive)
         .is_some_and(|s| s.in_flight.len() < per_peer)
 }
-
 
 pub(crate) fn issue_one(
     st: &mut IbdWorkState,
@@ -321,9 +311,9 @@ pub(crate) fn issue_batch(
     if empty {
         touch_block_progress(&st.slots[idx].block_progress_ms);
     }
-    let _ = st.slots[idx]
-        .cmd_tx
-        .send(PeerCmd::GetData { hashes: batch.clone() });
+    let _ = st.slots[idx].cmd_tx.send(PeerCmd::GetData {
+        hashes: batch.clone(),
+    });
     for &h in &batch {
         inflight_add_peer(&mut st.inflight, h, pid);
     }
@@ -351,7 +341,9 @@ pub(crate) fn contiguous_tip_holes(
         Some(t) => t.saturating_add(1),
     };
     let mut holes = Vec::new();
-    let limit = path_lo.saturating_add(max as u32 * 4).max(path_lo.saturating_add(max as u32));
+    let limit = path_lo
+        .saturating_add(max as u32 * 4)
+        .max(path_lo.saturating_add(max as u32));
     for ht in path_lo..=limit {
         if holes.len() >= max {
             break;
@@ -410,10 +402,7 @@ pub(crate) fn cover_tip_holes(
     let now = Instant::now();
 
     for &h in holes {
-        if hub.has_block(&h)
-            || st.body.is_pending(&h)
-            || st.body.ready(hub, &h)
-        {
+        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
             continue;
         }
         let (already, second_at) = st
@@ -463,11 +452,10 @@ pub(crate) fn cover_tip_holes(
     issued
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::status::LoopStats;
+    use super::*;
     use bitcoin::hashes::Hash;
     use rbitcoin_consensus::{ChainParams, Milestone};
     use rbitcoin_query::Query;
@@ -840,7 +828,9 @@ mod tests {
             st.body.mark_missing(hash);
         }
         st.body.mark_pending(h(5));
-        let _ = st.body.expire_stale_pending_if(std::time::Duration::ZERO, |_| true);
+        let _ = st
+            .body
+            .expire_stale_pending_if(std::time::Duration::ZERO, |_| true);
         st.body.mark_pending(h(5));
         st.body.mark_pending(h(1));
         let expired = st

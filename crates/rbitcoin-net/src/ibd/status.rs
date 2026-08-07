@@ -218,4 +218,3 @@ mod tests {
         assert_eq!(s.sample_and_reset().dominant(), "status_scan");
     }
 }
-

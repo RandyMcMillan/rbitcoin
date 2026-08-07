@@ -108,11 +108,7 @@ impl Query {
                         continue;
                     }
                     let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
-                    let spend_h = self
-                        .store
-                        .tx_height
-                        .get(p.spending_tx_fk)?
-                        .unwrap_or(0);
+                    let spend_h = self.store.tx_height.get(p.spending_tx_fk)?.unwrap_or(0);
                     by_txid
                         .entry(spend_tx.txid)
                         .and_modify(|h| *h = (*h).min(i64::from(spend_h)))
@@ -129,7 +125,10 @@ impl Query {
     }
 
     /// Confirmed balance for a scripthash.
-    pub fn scripthash_balance(&self, scripthash: &[u8; 32]) -> Result<ScriptHashBalance, QueryError> {
+    pub fn scripthash_balance(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<ScriptHashBalance, QueryError> {
         let mut confirmed = 0i64;
         for rec in self.scripthash_create_outpoints(scripthash)? {
             let spent = if self.spend_index_enabled() {

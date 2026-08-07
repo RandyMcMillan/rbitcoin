@@ -9,9 +9,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
-use bitcoin::{
-    Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
-};
+use bitcoin::{Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
 use crate::error::ConsensusError;
 use crate::script::interpreter::{self, EvalContext, SigVersion};

@@ -140,14 +140,23 @@ pub fn is_annex_standard(annex: &[u8]) -> bool {
     annex.len() == 1 || annex[1] == 0x00
 }
 
-/// Scan all inputs' witnesses for a BIP341 annex and apply Libre annex rule.
+/// Scan inputs for a BIP341 annex and apply the Libre annex rule.
+///
+/// BIP341: annex is the **last** witness stack item only when `stack.len() ≥ 2`
+/// and that item begins with `0x50`. A lone stack item (key-path signature) is
+/// never an annex even if it happens to start with `0x50`.
 pub fn check_libre_annex(tx: &Transaction) -> PolicyResult {
     for inp in &tx.input {
-        let stack = &inp.witness.to_vec();
-        if let Some(last) = stack.last() {
-            if !last.is_empty() && last[0] == 0x50 && !is_annex_standard(last) {
-                return PolicyResult::NonStandard("libre annex");
-            }
+        let stack = inp.witness.to_vec();
+        // Match consensus `bip341_annex`: need ≥2 items.
+        if stack.len() < 2 {
+            continue;
+        }
+        let Some(last) = stack.last() else {
+            continue;
+        };
+        if !last.is_empty() && last[0] == 0x50 && !is_annex_standard(last) {
+            return PolicyResult::NonStandard("libre annex");
         }
     }
     PolicyResult::Standard

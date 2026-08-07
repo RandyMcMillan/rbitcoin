@@ -1066,9 +1066,14 @@ fn write_meta(dir: &Path, stem: &str, descs: &[SegDesc]) -> Result<(), StoreErro
         buf.extend_from_slice(&d.file_id.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
     }
-    // Atomic-ish replace: write temp + rename.
-    let tmp = path.with_extension("tmp");
+    // Atomic replace: write sibling temp then rename over `meta` (never unlink first).
+    // Use an explicit sibling name so we never collide with a segment file named `tmp`.
+    let tmp = path.with_file_name("meta.tmp");
     std::fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
+    // Best-effort durability of temp before rename (crash mid-rename keeps old meta).
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        let _ = f.sync_data();
+    }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     Ok(())
 }
@@ -1088,7 +1093,16 @@ fn write_meta_from_segs(dir: &Path, stem: &str, segs: &[Segment]) -> Result<(), 
 
 fn read_meta(dir: &Path, stem: &str) -> Result<Vec<SegDesc>, StoreError> {
     let path = meta_path(dir, stem);
-    let buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
+    // One retry on ENOENT: concurrent `write_meta` renames `meta.tmp` → `meta`
+    // and a reader can briefly observe a missing path on some FS/schedulers.
+    let buf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::fs::read(&path).map_err(|e2| StoreError::io(&path, e2))?
+        }
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
     read_meta_buf(&buf)
 }
 

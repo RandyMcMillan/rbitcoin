@@ -33,6 +33,9 @@ pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 pub const DEFAULT_MAX_MEMPOOL_WEIGHT: u64 = 300_000_000;
 /// Incremental relay feerate for RBF (same as Libre min: 0.1 sat/vB = 100 sat/kvB).
 pub const INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB: u64 = 100;
+/// Pure replace-by-fee-rate ratio (Libre Relay v27.1+): **1.25×** = 5/4.
+pub const RBFR_RATIO_NUM: u64 = 5;
+pub const RBFR_RATIO_DEN: u64 = 4;
 
 /// Outcome of a successful accept.
 #[derive(Debug, Clone)]
@@ -330,12 +333,22 @@ impl ActiveMempool {
         // be announced / Electrum-broadcast.
         verify_tx_scripts(tx, prevouts)?;
 
-        // Full RBF (Libre): replace conflicts if replacement pays enough.
+        // Full RBF (Libre): BIP125-style absolute fee **or** pure replace-by-fee-rate.
         let conflict_set = if !direct_conflicts.is_empty() {
             let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
             let set = self.graph.conflict_set(&direct);
             let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
-            if !rbf_pays_for_replacement(fee_sat, weight, old_fee, old_weight) {
+            let (direct_fee, direct_weight) = self.graph.set_fee_weight(
+                &direct.iter().copied().collect::<BTreeSet<_>>(),
+            );
+            if !rbf_allows_replacement(
+                fee_sat,
+                weight,
+                old_fee,
+                old_weight,
+                direct_fee,
+                direct_weight,
+            ) {
                 return Err(AcceptError::RbfInsufficient);
             }
             set
@@ -651,10 +664,10 @@ impl ActiveMempool {
     }
 }
 
-/// Full-RBF / package-RBF fee check (Libre: no BIP125 signaling).
+/// BIP125-style full-RBF fee check (no signaling required — Libre full RBF).
 ///
-/// Requires strictly higher absolute fee, higher feerate, and pays incremental
-/// relay fee on the **replacement** vsize.
+/// Requires strictly higher absolute fee over the **conflict set** (incl.
+/// descendants), higher feerate, and incremental relay fee on replacement vsize.
 pub fn rbf_pays_for_replacement(
     new_fee: u64,
     new_weight: u64,
@@ -676,6 +689,49 @@ pub fn rbf_pays_for_replacement(
         .saturating_add(999)
         / 1000;
     new_fee.saturating_sub(old_fee) >= inc
+}
+
+/// Pure replace-by-fee-rate (Libre Relay): `new_rate ≥ 1.25 × direct_conflict_rate`.
+///
+/// Uses only **direct** conflict fee/weight (not the full descendant set), so a
+/// high-feerate replacement can unpin low-feerate descendant packages.
+///
+/// Integer form: `new_fee * DEN * direct_vsize ≥ direct_fee * NUM * new_vsize`
+/// with `NUM/DEN = 5/4`.
+pub fn pure_rbfr_pays(
+    new_fee: u64,
+    new_weight: u64,
+    direct_fee: u64,
+    direct_weight: u64,
+) -> bool {
+    if new_weight == 0 || direct_weight == 0 {
+        return false;
+    }
+    let new_v = policy::get_virtual_size(new_weight);
+    let old_v = policy::get_virtual_size(direct_weight);
+    if new_v == 0 || old_v == 0 {
+        return false;
+    }
+    // new_fee/new_v >= (NUM/DEN) * direct_fee/old_v
+    new_fee
+        .saturating_mul(RBFR_RATIO_DEN)
+        .saturating_mul(old_v)
+        >= direct_fee
+            .saturating_mul(RBFR_RATIO_NUM)
+            .saturating_mul(new_v)
+}
+
+/// Admit replacement if BIP125-style rules **or** pure RBFR (Libre).
+pub fn rbf_allows_replacement(
+    new_fee: u64,
+    new_weight: u64,
+    conflict_fee: u64,
+    conflict_weight: u64,
+    direct_fee: u64,
+    direct_weight: u64,
+) -> bool {
+    rbf_pays_for_replacement(new_fee, new_weight, conflict_fee, conflict_weight)
+        || pure_rbfr_pays(new_fee, new_weight, direct_fee, direct_weight)
 }
 
 #[cfg(test)]
@@ -994,6 +1050,106 @@ mod tests {
         assert!(rbf_pays_for_replacement(10_000, 4000, 1000, 4000));
         assert!(!rbf_pays_for_replacement(1000, 4000, 10_000, 4000));
         assert!(!rbf_pays_for_replacement(1000, 4000, 1000, 4000));
+    }
+
+    #[test]
+    fn pure_rbfr_1_25x_ratio() {
+        // Same weight: new fee ≥ 1.25× old fee.
+        // old fee 1000 @ 4000 WU → need new ≥ 1250 same weight.
+        assert!(pure_rbfr_pays(1_250, 4000, 1_000, 4000));
+        assert!(!pure_rbfr_pays(1_249, 4000, 1_000, 4000));
+        // Higher rate, lower absolute fee vs a fat conflict set still passes pure RBFR
+        // (BIP125 would fail): direct 1000@4000, conflict set pretends 50k@40k.
+        assert!(!rbf_pays_for_replacement(2_000, 4000, 50_000, 40_000));
+        assert!(pure_rbfr_pays(2_000, 4000, 1_000, 4000));
+        assert!(rbf_allows_replacement(
+            2_000, 4000, 50_000, 40_000, 1_000, 4000
+        ));
+    }
+
+    /// Regression: single large-but-standard tx (~50 kvB) must not hit cluster cap.
+    /// Pre-fix MAX_CLUSTER_WEIGHT=101_000 WU rejected these (Core allows ≤101 kvB).
+    #[test]
+    fn large_single_tx_under_cluster_vsize_limit_accepted() {
+        let dir = tmp_dir();
+        // Build a tx with many outputs so weight sits between 101k WU and 404k WU.
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let mut outs = Vec::new();
+        // ~3k OP_TRUE outs ≈ 120 kWU: above the old 101 kWU bug, under 404 kWU Core cap.
+        let n_out = 3_000u64;
+        let each = 100u64;
+        let input_val = each * n_out + 50_000; // fee headroom
+        for _ in 0..n_out {
+            outs.push(TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            });
+        }
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: outs,
+        };
+        let w = tx.weight().to_wu();
+        assert!(
+            w > 101_000 && w <= MAX_CLUSTER_WEIGHT,
+            "fixture weight {w} should be in (101k, 404k] WU"
+        );
+        let txout = TxOut {
+            value: Amount::from_sat(input_val),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let mut map = HashMap::new();
+        map.insert(op, txout);
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos)
+            .unwrap_or_else(|e| panic!("large single-tx should accept: {e} (weight={w})"));
+        assert_eq!(mp.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pure RBFR: high-feerate replacement with lower absolute fee than parent+child package.
+    #[test]
+    fn pure_rbfr_unpins_descendant_package() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(1_000_000);
+        // Parent: fee 1000 (low rate). Child spends parent: fee 1000 more → conflict set fee 2000.
+        let parent = spend_tx(op, 999_000);
+        let pid = parent.compute_txid();
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 998_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&parent, &utxos).unwrap();
+        mp.accept_tx(&child, &utxos).unwrap();
+        assert_eq!(mp.live_count(), 2);
+        // Replacement of parent only: fee 5000 on same weight class — absolute fee 5000 > 2000
+        // would pass BIP125; use fee that loses absolute vs set but wins rate vs direct.
+        // Direct parent fee ~1000; set fee ~2000. Replacement fee 1500 fails BIP125 absolute
+        // but 1500 ≥ 1.25×1000 pure RBFR if weights similar.
+        let repl = spend_tx(op, 998_500); // fee 1500
+        let rid = repl.compute_txid();
+        // If pure RBFR works: accept. (Weights of spend_tx are equal-ish.)
+        let r = mp.accept_tx(&repl, &utxos);
+        match r {
+            Ok(_) => {
+                assert!(mp.graph.contains(&rid));
+                assert!(!mp.graph.contains(&pid));
+            }
+            Err(e) => {
+                // Document failure mode if fixture fees don't hit pure path.
+                panic!("expected pure RBFR admit, got {e}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

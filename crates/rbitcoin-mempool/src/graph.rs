@@ -6,10 +6,17 @@
 use bitcoin::{OutPoint, Transaction, Txid, Wtxid};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Hard cap on txs in one cluster (Core-class default).
+/// Hard cap on txs in one cluster (Core `DEFAULT_CLUSTER_LIMIT` = 64).
 pub const MAX_CLUSTER_COUNT: usize = 64;
-/// Hard cap on total weight (WU) in one cluster (~101 kWU).
-pub const MAX_CLUSTER_WEIGHT: u64 = 101_000;
+/// Hard cap on total **virtual size** of one cluster (Core `DEFAULT_CLUSTER_SIZE_LIMIT_KVB` = 101).
+///
+/// Measured as Σ `get_virtual_size(weight)` over cluster members (= Core kvB limit in vbytes).
+pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
+/// Same limit as weight units: 101_000 vB × 4 WU/vB.
+///
+/// Kept for call sites that sum `tx.weight().to_wu()`; prefer comparing vsize when possible.
+/// **Was incorrectly 101_000 WU** (4× too tight) — mainnet logs rejected single ~25–65 kvB txs.
+pub const MAX_CLUSTER_WEIGHT: u64 = MAX_CLUSTER_VSIZE * 4;
 
 /// One live mempool entry (RAM index; body lives on disk).
 #[derive(Debug, Clone)]
@@ -280,6 +287,7 @@ impl TxGraph {
             .sum();
         let count = members.len() + extra_count;
         let weight = base_weight.saturating_add(extra_weight);
+        // Core limits are count + vsize (101 kvB). Weight is 4× vsize (WU).
         count > MAX_CLUSTER_COUNT || weight > MAX_CLUSTER_WEIGHT
     }
 
@@ -538,6 +546,21 @@ mod tests {
         // New child would exceed count.
         let parents: BTreeSet<Txid> = [last].into_iter().collect();
         assert!(g.cluster_would_exceed(&parents, 1, 100));
+    }
+
+    #[test]
+    fn cluster_weight_cap_matches_core_101kvb() {
+        // Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101_000 vB → 404_000 WU.
+        assert_eq!(MAX_CLUSTER_VSIZE, 101_000);
+        assert_eq!(MAX_CLUSTER_WEIGHT, 404_000);
+        let g = TxGraph::new();
+        let empty = BTreeSet::new();
+        // Single-tx 200 kWU (~50 kvB) is under the cap.
+        assert!(!g.cluster_would_exceed(&empty, 1, 200_000));
+        // Single-tx 405 kWU exceeds (would also fail MAX_STANDARD_TX_WEIGHT=400k).
+        assert!(g.cluster_would_exceed(&empty, 1, 405_000));
+        // Just over old wrong 101 kWU cap must still be allowed.
+        assert!(!g.cluster_would_exceed(&empty, 1, 102_790));
     }
 
     #[test]

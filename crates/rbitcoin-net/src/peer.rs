@@ -33,6 +33,21 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
 
+/// True when a session error is a missing store row (not peer malice / corrupt IO).
+///
+/// These must not tear down the TCP session: re-request or skip and keep the peer.
+pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
+    match e {
+        NetError::Consensus(s) => {
+            let l = s.to_ascii_lowercase();
+            l.contains("record not found")
+                || l.contains("not found")
+                || l.contains("storeerror::notfound")
+        }
+        _ => false,
+    }
+}
+
 /// Per-session misbehavior score that triggers disconnect (Core-like order).
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
@@ -846,6 +861,14 @@ fn drain_pending(
                     | Ok(AcceptOutcome::IgnoredWeaker) => {
                         progress = true;
                     }
+                    // Missing store rows / incomplete Class A must not kill the
+                    // TCP session — drop this block and keep the peer (re-getdata later).
+                    Err(e) if net_error_is_store_not_found(&e) => {
+                        rbitcoin_log::warn!(
+                            "p2p: accept dropped {} (store not found — keep session): {e}",
+                            h
+                        );
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -956,6 +979,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(&dir).unwrap();
         (dir, q)
+    }
+
+    #[test]
+    fn store_not_found_is_soft_session_error() {
+        assert!(net_error_is_store_not_found(&NetError::Consensus(
+            "store: record not found".into()
+        )));
+        assert!(net_error_is_store_not_found(&NetError::Consensus(
+            "consensus: store: record not found".into()
+        )));
+        assert!(!net_error_is_store_not_found(&NetError::Consensus(
+            "corrupt record: multi-spender".into()
+        )));
+        assert!(!net_error_is_store_not_found(&NetError::Protocol(
+            "unknown parent"
+        )));
     }
 
     #[test]

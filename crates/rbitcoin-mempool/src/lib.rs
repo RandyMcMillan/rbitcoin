@@ -21,7 +21,7 @@
 //! - **P1:** open / flush / reopen empty skeleton  
 //! - **P2:** TxGraph + linearization + Libre single-tx accept + durable commit  
 //! - **P3:** package accept (CPFP), durable remove, block/reorg hooks  
-//! - **P5:** full RBF + package RBF fee rules + worst-chunk eviction  
+//! - **P5:** full RBF + pure RBFR (1.25×) + package RBF + worst-chunk eviction  
 
 mod accept;
 mod error;
@@ -30,12 +30,15 @@ mod orphanage;
 mod store;
 
 pub use accept::{
-    rbf_pays_for_replacement, AcceptError, AcceptResult, ActiveMempool, MapUtxoProvider,
-    UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT, INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB,
-    MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
+    pure_rbfr_pays, rbf_allows_replacement, rbf_pays_for_replacement, AcceptError, AcceptResult,
+    ActiveMempool, MapUtxoProvider, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT,
+    INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, RBFR_RATIO_DEN,
+    RBFR_RATIO_NUM,
 };
 pub use error::MempoolError;
-pub use graph::{Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+pub use graph::{
+    Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT,
+};
 pub use orphanage::{
     Orphanage, DEFAULT_ORPHAN_MAX_COUNT, DEFAULT_ORPHAN_MAX_WEIGHT, MAX_ORPHAN_TX_WEIGHT,
     ORPHAN_PEER_BUDGET, ORPHAN_RESERVED_WEIGHT_PER_PEER,

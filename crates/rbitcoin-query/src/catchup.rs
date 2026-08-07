@@ -64,8 +64,13 @@ impl Query {
     /// Catchup datadirs. Re-collects Class A creates only for a **small** SEAL gap
     /// (crash window). Multi-hour full recollect is tip finalize only — never at
     /// Direct enter (avoids recollect-then-FORCE-wipe loops).
+    ///
+    /// When the durable SH head already covers tip creates (`include_hwm` / SEAL),
+    /// skips Class A recollect entirely (tip-follow restart must not re-scan).
     pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
-        use crate::sh_builder::{should_defer_direct_recollect, SH_DIRECT_RECOLLECT_MAX_GAP};
+        use crate::sh_builder::{
+            durable_sh_inclusion_floor, should_defer_direct_recollect, SH_DIRECT_RECOLLECT_MAX_GAP,
+        };
 
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
@@ -73,16 +78,27 @@ impl Query {
         self.sh_run.enable();
         self.drop_legacy_catchup_artifacts()?;
         self.sh_run.refresh_seal();
-        let seal = self.sh_run.sealed_max_create_fk();
+        let mut seal = self.sh_run.sealed_max_create_fk();
         let tip_max = self.store.txs.count();
-        let gap = tip_max.saturating_sub(seal);
-        if gap == 0 {
+        let include_hwm = self.store.scripthash.include_hwm();
+        // Tip-mode durable writes advance include_hwm; keep SEAL ≥ HWM so recollect
+        // does not re-scan creates already in the head.
+        if include_hwm > seal {
+            let _ = self.sh_run.publish_seal_watermark(include_hwm);
+            seal = include_hwm;
+        }
+        let floor = durable_sh_inclusion_floor(include_hwm, seal);
+        // Strict cover (not SH_SEAL_LAG_OK): lag allowance is for catalog
+        // completeness checks, not "skip crash-window recollect on SEAL=0".
+        if tip_max == 0 || floor >= tip_max {
             return Ok(());
         }
-        if should_defer_direct_recollect(seal, tip_max) {
+        let gap = tip_max.saturating_sub(floor);
+        if should_defer_direct_recollect(floor, tip_max) {
             rbitcoin_log::info!(
                 "node: scripthash defer Class A recollect to tip finalize \
-                 (gap≈{gap} creates > max_direct={SH_DIRECT_RECOLLECT_MAX_GAP}; seal={seal} tip_max={tip_max})"
+                 (gap≈{gap} creates > max_direct={SH_DIRECT_RECOLLECT_MAX_GAP}; \
+                 floor={floor} seal={seal} include_hwm={include_hwm} tip_max={tip_max})"
             );
             return Ok(());
         }
@@ -95,6 +111,44 @@ impl Query {
         self.set_index_mode(IndexMode::Tip);
         self.set_spend_index(true);
         self.set_tx_index(true);
+    }
+
+    /// True when durable SH already covers Class A through tip (safe to stay in
+    /// Tip mode on restart — no Direct recollect / bulk materialize).
+    ///
+    /// Requires a non-empty durable head, no residual on-disk runs, and
+    /// `include_hwm`/SEAL **≥** tip create HWM (strict; not memtable lag).
+    pub fn sh_is_tip_ready(&self) -> bool {
+        use crate::sh_builder::durable_sh_inclusion_floor;
+
+        let tip_max = self.store.txs.count();
+        if tip_max == 0 {
+            // Empty / genesis-only store: not "tip ready" for SH (nothing to serve).
+            return false;
+        }
+        if !self.store.scripthash.has_durable_index() {
+            return false;
+        }
+        if self.sh_run.on_disk_run_count() > 0 {
+            return false;
+        }
+        self.sh_run.refresh_seal();
+        let seal = self.sh_run.sealed_max_create_fk();
+        let include_hwm = self.store.scripthash.include_hwm();
+        let floor = durable_sh_inclusion_floor(include_hwm, seal);
+        floor >= tip_max
+    }
+
+    /// Sync SEAL up to durable `include_hwm` when the head is ahead of the run
+    /// catalog watermark (tip-follow without Direct). Idempotent.
+    pub fn sync_sh_seal_from_include_hwm(&self) -> Result<(), QueryError> {
+        self.sh_run.refresh_seal();
+        let seal = self.sh_run.sealed_max_create_fk();
+        let include_hwm = self.store.scripthash.include_hwm();
+        if include_hwm > seal {
+            self.sh_run.publish_seal_watermark(include_hwm)?;
+        }
+        Ok(())
     }
 
     /// Remove leftover Catchup artifacts (light UTXO map, point/tx run dirs).
@@ -144,6 +198,16 @@ impl Query {
             plan_sh_pre_materialize, sh_catalog_total_records, sh_force_rebuild,
             ShPreMaterializeAction, SH_SEAL_LAG_OK,
         };
+
+        // Already tip-ready and no FORCE: nothing to merge or recollect.
+        if !sh_force_rebuild() && self.sh_is_tip_ready() {
+            self.sync_sh_seal_from_include_hwm()?;
+            rbitcoin_log::info!(
+                "node: scripthash already tip-ready (durable head covers tip; no residual runs) — \
+                 skip Class A recollect and bulk materialize"
+            );
+            return Ok(0);
+        }
 
         self.sh_run.refresh_seal();
         let tip_max = self.store.txs.count();
@@ -293,7 +357,15 @@ impl Query {
         let _compact_gate = self.sh_run.pause_ibd_catalog_compact();
         self.sh_run.ensure_enabled();
 
-        let sealed0 = self.sh_run.sealed_max_create_fk();
+        // Recollect floor is max(SEAL, include_hwm): tip-mode durable writes raise
+        // HWM without always matching SEAL; never re-scan creates already in head.
+        self.sh_run.refresh_seal();
+        let mut sealed0 = self.sh_run.sealed_max_create_fk();
+        let include_hwm = self.store.scripthash.include_hwm();
+        if include_hwm > sealed0 {
+            let _ = self.sh_run.publish_seal_watermark(include_hwm);
+            sealed0 = include_hwm;
+        }
         let Some(tip) = self.store.tip_height() else {
             return Ok(());
         };
@@ -1228,6 +1300,131 @@ mod tests {
         assert!(
             q.sh_run.sealed_max_create_fk() <= tip_max + 1_000,
             "full rebuild SEAL should match Class A tip, not stale plant"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After SH materialize at tip, restart must see tip-ready and skip recollect.
+    #[test]
+    fn tip_ready_after_materialize_skips_recollect_and_finalize() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-tip-ready-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 5);
+        let n_mat = q.finalize_sh_runs().expect("materialize");
+        assert!(n_mat > 0 || q.store.scripthash.has_durable_index());
+        q.enter_tip_index_mode();
+        assert!(
+            q.sh_is_tip_ready(),
+            "durable SH after materialize must be tip-ready seal={} hwm={} tip_max={} runs={}",
+            q.sh_run.sealed_max_create_fk(),
+            q.store.scripthash.include_hwm(),
+            q.store.txs.count(),
+            q.sh_run.on_disk_run_count()
+        );
+
+        // Simulate restart: enter Direct must not recollect (floor covers tip).
+        let seal_before = q.sh_run.sealed_max_create_fk();
+        q.enter_direct_index_mode().unwrap();
+        assert_eq!(
+            q.sh_run.sealed_max_create_fk(),
+            seal_before.max(q.store.scripthash.include_hwm()),
+            "Direct enter must not reset SEAL when HWM covers tip"
+        );
+
+        // Second finalize is a no-op fast path.
+        assert_eq!(q.finalize_sh_runs().unwrap(), 0);
+        assert!(q.sh_is_tip_ready());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tip-mode durable SH writes advance include_hwm + SEAL (restart floor).
+    #[test]
+    fn tip_mode_connect_advances_sh_watermarks() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-tip-wm-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 3);
+        let _ = q.finalize_sh_runs().unwrap();
+        q.enter_tip_index_mode();
+        // finalize disables run worker → tip durable SH path.
+        assert!(!q.sh_run.is_enabled());
+        let tip_max_before = q.store.txs.count();
+        let hwm_before = q.store.scripthash.include_hwm();
+        let seal_before = q.sh_run.sealed_max_create_fk();
+
+        let tip_h = q.tip_height().unwrap().0;
+        let tip_fk = q.store.confirmed.get(Height(tip_h)).unwrap().unwrap();
+        let (header, ta) = coinbase_block(tip_h + 1, tip_fk);
+        q.connect_block(Height(tip_h + 1), &header, &[ta])
+            .expect("tip connect");
+
+        let tip_max_after = q.store.txs.count();
+        assert!(tip_max_after > tip_max_before);
+        assert!(
+            q.store.scripthash.include_hwm() >= tip_max_after
+                || q.store.scripthash.include_hwm() > hwm_before,
+            "include_hwm must advance on tip durable SH write hwm={} before={} tip_max={}",
+            q.store.scripthash.include_hwm(),
+            hwm_before,
+            tip_max_after
+        );
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= q.store.scripthash.include_hwm()
+                || q.sh_run.sealed_max_create_fk() > seal_before,
+            "SEAL must advance with tip durable writes"
+        );
+        assert!(
+            q.sh_is_tip_ready(),
+            "after tip follow block, still tip-ready (no recollect on restart)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// include_hwm alone (SEAL lagging) is enough to skip Direct recollect.
+    #[test]
+    fn include_hwm_covers_tip_without_seal_match() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-hwm-floor-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 4);
+        let _ = q.finalize_sh_runs().unwrap();
+        let tip_max = q.store.txs.count();
+        q.store.scripthash.note_include_hwm(tip_max).unwrap();
+        // Plant lagging SEAL (simulates old tip-follow without SEAL advance).
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        store_seal(&runs_dir, tip_max.saturating_sub(10).max(1)).unwrap();
+        q.sh_run.refresh_seal();
+        assert!(q.sh_run.sealed_max_create_fk() < tip_max);
+        assert!(q.sh_is_tip_ready() || {
+            // Residual runs from plant empty dir — clear and recheck.
+            let _ = std::fs::remove_dir_all(&runs_dir);
+            q.sh_run.refresh_seal();
+            q.store.scripthash.note_include_hwm(tip_max).unwrap();
+            // SEAL file gone → seal 0; HWM still covers.
+            q.sync_sh_seal_from_include_hwm().unwrap();
+            q.sh_is_tip_ready()
+        });
+        q.enter_direct_index_mode().unwrap();
+        assert!(
+            q.sh_run.sealed_max_create_fk() >= tip_max,
+            "Direct enter must raise SEAL to include_hwm covering tip"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

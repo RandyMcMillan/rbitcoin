@@ -124,6 +124,7 @@ impl Query {
         let mut out = Vec::with_capacity(items.len());
         let mut strong_err: Option<QueryError> = None;
         let mut sh_err: Option<QueryError> = None;
+        let mut sh_tip_max_fk = 0u64;
 
         std::thread::scope(|scope| {
             let strong_slot = scope.spawn(|| -> Result<(Vec<(Height, Fk)>, Vec<Fk>), QueryError> {
@@ -162,11 +163,11 @@ impl Query {
                 Ok((pairs, fks))
             });
 
-            let sh_slot = scope.spawn(|| -> Result<(), QueryError> {
+            let sh_slot = scope.spawn(|| -> Result<u64, QueryError> {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
                 // Direct runs: skip create_fks already in SEAL (durable spills).
-                // Tip durable SH: height watermark after tip commit.
+                // Tip durable SH: height + create_fk watermarks after tip commit.
                 let t_filter = std::time::Instant::now();
                 let mut sh_new_txs: Vec<u64> = Vec::new();
                 let wave_tx_n: usize = items.iter().map(|i| i.tx_fks.len()).sum();
@@ -212,12 +213,17 @@ impl Query {
                     t_collect.elapsed().as_nanos() as u64,
                 );
 
+                // Max create_fk written this wave (tip-mode durable HWM/SEAL after commit).
+                let mut tip_sh_max_fk = 0u64;
                 if !sh_creates.is_empty() {
                     if self.sh_run.is_enabled() {
                         // Catch-up: enqueue only (sequential runs + low-prio worker).
                         // No durable scripthash.head seed/head RMW on confirm.
                         self.sh_run.enqueue(&sh_creates);
                     } else {
+                        for r in &sh_creates {
+                            tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
+                        }
                         let mut heads = self.sh_heads.lock().unwrap();
                         let (_n, timing) = self
                             .store
@@ -229,8 +235,8 @@ impl Query {
                         add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
                     }
                 }
-                // Watermark advances only after tip commit (below).
-                Ok(())
+                // Height / create_fk watermarks advance only after tip commit (below).
+                Ok(tip_sh_max_fk)
             });
 
             match strong_slot.join() {
@@ -244,7 +250,7 @@ impl Query {
                 }
             }
             match sh_slot.join() {
-                Ok(Ok(())) => {}
+                Ok(Ok(mfk)) => sh_tip_max_fk = mfk,
                 Ok(Err(e)) => sh_err = Some(e),
                 Err(_) => {
                     sh_err = Some(StoreError::Corrupt("scripthash thread panicked"));
@@ -266,11 +272,17 @@ impl Query {
         // callers dequeue the body queue. Kill after this returns → tip durable;
         // kill before → BQ still holds blocks for re-drive.
         self.store.flush_class_c_tip()?;
-        // Tip-mode durable SH: height watermark only after tip commit.
+        // Tip-mode durable SH: height + create_fk watermarks only after tip commit.
+        // Advancing include_hwm + SEAL keeps restart from re-scanning Class A for
+        // creates already written to the durable head during tip follow.
         // Direct runs: durability is SEAL on cataloged spills (memtable may lag).
         if !self.sh_run.is_enabled() {
             if let Some(last) = items.last() {
                 self.set_sh_indexed_through_height(Some(last.height.0));
+            }
+            if sh_tip_max_fk > 0 {
+                let _ = self.store.scripthash.note_include_hwm(sh_tip_max_fk);
+                let _ = self.sh_run.publish_seal_watermark(sh_tip_max_fk);
             }
         }
         crate::class_c_phase_stats::TIP_NS.fetch_add(

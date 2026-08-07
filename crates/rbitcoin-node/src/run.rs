@@ -157,17 +157,27 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Direct IndexMode (IBD default):
-    // - archive batch-writes packed Class A + durable `tx.head`
-    // - confirm batch-writes spend annotations after Class C
-    // - SH: enqueue + run merge only; bulk-load at tip
-    handle
-        .query
-        .enter_direct_index_mode()
-        .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
-    info!(
-        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
-    );
+    // Index mode selection on restart:
+    // - **Tip-ready** (durable SH covers Class A tip, no residual runs): stay Tip —
+    //   tip-follow only a few blocks behind must not Class A recollect / rematerialize.
+    // - Otherwise Direct IBD: archive tx.head, confirm spends, SH runs → bulk at tip.
+    let sh_tip_ready = handle.query.sh_is_tip_ready();
+    if sh_tip_ready {
+        let _ = handle.query.sync_sh_seal_from_include_hwm();
+        handle.query.enter_tip_index_mode();
+        info!(
+            "node: durable scripthash covers tip (include_hwm/SEAL) — resume IndexMode::Tip \
+             (skip Direct Class A recollect; short catch-up uses durable SH write-through)"
+        );
+    } else {
+        handle
+            .query
+            .enter_direct_index_mode()
+            .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
+        info!(
+            "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
+        );
+    }
     let listen = config
         .p2p_listen
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_port(config.network))));
@@ -712,6 +722,19 @@ pub(crate) fn enter_tip_mode(
     query: &Query,
     cancel: Option<Arc<AtomicBool>>,
 ) -> bool {
+    // Fast path: already materialized and watermarks cover tip (near-tip restart).
+    if query.sh_is_tip_ready() {
+        let _ = query.sync_sh_seal_from_include_hwm();
+        query.enter_tip_index_mode();
+        info!(
+            "node: scripthash tip-ready — skip bulk materialize; mode={:?} rows={}",
+            query.index_mode(),
+            query.scripthash_entry_count()
+        );
+        info!("node: tip-mode complete — safe to start Electrum");
+        return true;
+    }
+
     // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
     // Retries incomplete `*.run.mat` claims / CHECKPOINT / READY from crash/SIGINT.
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");

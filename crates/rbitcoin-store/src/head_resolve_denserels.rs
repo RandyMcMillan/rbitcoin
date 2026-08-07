@@ -781,7 +781,9 @@ fn on_stage_idx(
         return Ok(SqeOutcome::SqePushed);
     }
 
-    // Decode body_range from filled pages.
+    // Decode body_range from filled pages (already on the outer ring — no nested
+    // bulk_io / record_range). Corrupt idx is a miss → next cand, or hard Err
+    // only for unexpected IO errors.
     let t0 = Instant::now();
     let page_refs: Vec<&[u8]> = w.idx_bufs.iter().map(|b| b.as_slice()).collect();
     let range = match plan.decode_range(&page_refs) {

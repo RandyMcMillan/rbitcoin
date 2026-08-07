@@ -144,6 +144,8 @@ impl VarTable {
     /// idx segments).
     ///
     /// **Last record (`id == count`):** seqlock `(count, body_end)` + start.
+    ///
+    /// Corrupt idx (`start(id+1) < start(id)`) is a hard `Corrupt` — no live heal.
     pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         if id == 0 {
@@ -393,6 +395,17 @@ impl VarTable {
         // Single appender: count must still equal base.
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
+        }
+        let (_c, body_end) = self.published_meta();
+        // Starts must land at/after the exclusive end of published body — never
+        // re-index bytes already owned by an earlier create (double-append class).
+        if let Some(&s0) = starts.first() {
+            if s0 < body_end {
+                return Err(StoreError::Corrupt(
+                    "tx body starts inside published body_end \
+                     (refusing Class A double-append)",
+                ));
+            }
         }
         // Class A body append (bulk pwrite; no RWF_DONTCACHE).
         self.write_body_blob_bulk(start, &body_blob)?;
@@ -729,6 +742,44 @@ mod tests {
                 1 + i
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Idx inversion is corrupt hard-fail — no live heal.
+    #[test]
+    fn record_range_idx_start_inversion_is_corrupt() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-inv-hard-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        t.put_batch_encode(6, 512, |i, buf| {
+            buf.extend_from_slice(&vec![0xA0 + i as u8; 32 + i * 8]);
+        })
+        .unwrap();
+        let idx_path = dir.join("tx.idx").join("000000");
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&idx_path)
+            .unwrap();
+        // slot 3 → fk 4: force start(4) << start(3)
+        let slot_off = FILE_HEADER_LEN as u64 + 3 * 4;
+        f.seek(SeekFrom::Start(slot_off)).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let err = t.record_range(Fk(3)).expect_err("inversion must hard-fail");
+        assert!(
+            format!("{err}").contains("end < start"),
+            "got {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

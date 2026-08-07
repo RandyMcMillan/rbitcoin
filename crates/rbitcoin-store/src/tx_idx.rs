@@ -537,6 +537,11 @@ impl TxIdx {
     ///
     /// `base_count` is published count **before** this batch; starts[i] is for
     /// fk = base_count + 1 + i.
+    ///
+    /// **Double-append guard:** if `base_count > 0`, `starts[0]` must be strictly
+    /// greater than `start(base_count)` (the last published create). Re-appending
+    /// a prior starts vector after count advanced (mainnet 3330-slot clone) fails
+    /// here instead of pasting idx onto already-owned body.
     pub fn append_starts(&self, base_count: u64, starts: &[u64]) -> Result<(), StoreError> {
         if starts.is_empty() {
             return Ok(());
@@ -544,6 +549,22 @@ impl TxIdx {
         for &s in starts {
             if s % IDX_STRIDE != 0 {
                 return Err(StoreError::Corrupt("tx.idx start not stride-aligned"));
+            }
+        }
+        for w in starts.windows(2) {
+            if w[1] <= w[0] {
+                return Err(StoreError::Corrupt(
+                    "tx.idx starts not strictly monotone (refusing append)",
+                ));
+            }
+        }
+        if base_count > 0 {
+            let last_pub = self.record_start(base_count)?;
+            if starts[0] <= last_pub {
+                return Err(StoreError::Corrupt(
+                    "tx.idx starts[0] <= start(last published create) \
+                     (refusing double-append of starts into already-indexed body)",
+                ));
             }
         }
         let soft = Self::soft_span();
@@ -1205,6 +1226,34 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-appending the same absolute starts after count advanced must fail
+    /// (mainnet double-write of 3330 idx slots).
+    #[test]
+    fn append_starts_rejects_double_append_into_prior_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-txidx-dbl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = TxIdx::create(&dir, "tx").unwrap();
+        let s1 = [16u64, 24, 32, 40];
+        idx.append_starts(0, &s1).unwrap();
+        // Same starts again at advanced base — clone pattern.
+        let err = idx.append_starts(4, &s1).expect_err("must refuse");
+        assert!(
+            format!("{err}").contains("double-append") || format!("{err}").contains("last published"),
+            "got {err}"
+        );
+        // Legitimate next batch is past last start.
+        idx.append_starts(4, &[48u64, 56]).unwrap();
+        assert_eq!(idx.slot_count(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn multi_segment_stride_roundtrip() {

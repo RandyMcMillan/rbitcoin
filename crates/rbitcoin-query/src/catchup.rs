@@ -266,9 +266,10 @@ impl Query {
                 self.store.scripthash.note_include_hwm(s)?;
             }
             ShPreMaterializeAction::ClampSealTo { floor } => {
+                // Only when residual runs are empty (plan already Noop if runs present).
                 rbitcoin_log::info!(
-                    "node: scripthash durable head include_hwm={floor} < seal={seal} — \
-                     clamping SEAL to HWM for gap recollect (warm residual)"
+                    "node: scripthash durable head include_hwm={floor} < seal={seal} and no \
+                     residual runs — clamping SEAL to HWM for gap recollect"
                 );
                 self.sh_run.set_sealed_max_for_recollect(floor)?;
             }

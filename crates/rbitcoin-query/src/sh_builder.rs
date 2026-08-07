@@ -209,6 +209,16 @@ pub fn plan_sh_pre_materialize(
         return ShPreMaterializeAction::BootstrapIncludeHwm { seal: floor };
     }
     if include_hwm > 0 && include_hwm < seal {
+        // SEAL ahead of HWM is normal after enter_direct recollect or IBD spills:
+        // residual runs already hold create_fk in (hwm, seal]. Clamping SEAL back
+        // to HWM and re-recollecting re-spills the same creates, then WarmOnly
+        // walks a multi-GiB head per key — mainnet tip logs showed ~295k recs
+        // pegging one core for many minutes. Warm residual only; HWM advances
+        // after apply.
+        if run_records > 0 {
+            return ShPreMaterializeAction::Noop;
+        }
+        // No runs left: creates above HWM are not on disk — recollect from HWM.
         return ShPreMaterializeAction::ClampSealTo { floor };
     }
     ShPreMaterializeAction::Noop
@@ -1298,15 +1308,17 @@ impl ShRunBuilder {
 ///
 /// Avoids per-create `put_create` (head probe + contains walk each time) which
 /// pegs one core for hours on a multi‑GiB live head after cold materialize.
-const DEFERRED_APPLY_BATCH: usize = 64_000;
-/// Wall interval for deferred-apply INFO heartbeats.
-const DEFERRED_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+/// Sized so each batch finishes in seconds (status + cancel) on a full mainnet head.
+const DEFERRED_APPLY_BATCH: usize = 8_000;
 
 /// Stream sorted-run records into the **live** SH table (batched tip-style append).
 ///
 /// Runs are already scripthash-sorted: group into batches and
 /// [`ScriptHashTable::put_create_batch_append`] (one head seed + body merge per
 /// distinct key per batch). Not the cold live-OA path — head is already full.
+///
+/// Creates with `create_tx_fk ≤ include_hwm` are skipped (already in the durable
+/// head). Logs **after each batch** so a multi-minute head walk cannot go silent.
 fn apply_runs_to_live_sh(
     store: &Store,
     runs: &[SortedRunPath],
@@ -1321,9 +1333,10 @@ fn apply_runs_to_live_sh(
         .map(|r| run_body_bytes(r) as f64)
         .sum::<f64>()
         / (1024.0 * 1024.0);
+    let include_hwm = store.scripthash.include_hwm();
     info!(
         "node: scripthash deferred warm apply start runs={} records≈{total_recs} body≈{body_mib:.1}MiB \
-         batch={DEFERRED_APPLY_BATCH}",
+         batch={DEFERRED_APPLY_BATCH} include_hwm={include_hwm}",
         runs.len()
     );
     let t0 = Instant::now();
@@ -1331,18 +1344,43 @@ fn apply_runs_to_live_sh(
     let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(DEFERRED_APPLY_BATCH);
     // Process-local head cache; cleared each batch (stream is key-sorted, no revisit).
     let mut heads = std::collections::HashMap::new();
-    let mut last_log = Instant::now();
     let mut recs_seen = 0u64;
+    let mut recs_skipped_hwm = 0u64;
+    let mut batch_i = 0u32;
 
     let flush_batch = |batch: &mut Vec<ScriptHashRecord>,
                        heads: &mut std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue>,
-                       n: &mut u64|
+                       n: &mut u64,
+                       batch_i: &mut u32,
+                       recs_seen: u64,
+                       t0: Instant|
      -> Result<(), StoreError> {
         if batch.is_empty() {
             return Ok(());
         }
-        let (w, _) = store.scripthash.put_create_batch_append(batch, heads)?;
+        *batch_i = batch_i.saturating_add(1);
+        let bi = *batch_i;
+        let batch_n = batch.len();
+        let tb = Instant::now();
+        let (w, timing) = store.scripthash.put_create_batch_append(batch, heads)?;
         *n = n.saturating_add(w as u64);
+        let pct = if total_recs > 0 {
+            (100.0 * recs_seen as f64 / total_recs as f64).clamp(0.0, 99.9)
+        } else {
+            0.0
+        };
+        let secs = t0.elapsed().as_secs_f64().max(1e-3);
+        info!(
+            "node: scripthash deferred warm apply batch={bi} recs={batch_n} written+={w} \
+             total_written≈{n} stream≈{recs_seen}/{total_recs} pct≈{pct:.1}% \
+             rate≈{:.0}rec/s batch_wall={:?} seed={:?} body={:?} head={:?} elapsed={:?}",
+            recs_seen as f64 / secs,
+            tb.elapsed(),
+            Duration::from_nanos(timing.seed_ns),
+            Duration::from_nanos(timing.body_ns),
+            Duration::from_nanos(timing.head_ns),
+            t0.elapsed()
+        );
         batch.clear();
         heads.clear();
         Ok(())
@@ -1360,31 +1398,36 @@ fn apply_runs_to_live_sh(
             return Ok(());
         }
         recs_seen = recs_seen.saturating_add(1);
+        // Already included in durable head at last materialize / tip write.
+        if include_hwm > 0 && tx_fk.0 <= include_hwm {
+            recs_skipped_hwm = recs_skipped_hwm.saturating_add(1);
+            return Ok(());
+        }
         batch.push(ScriptHashRecord::from_fk(sh, tx_fk));
         if batch.len() >= DEFERRED_APPLY_BATCH {
-            flush_batch(&mut batch, &mut heads, &mut n)?;
-        }
-        if last_log.elapsed() >= DEFERRED_STATUS_INTERVAL {
-            last_log = Instant::now();
-            let pct = if total_recs > 0 {
-                (100.0 * recs_seen as f64 / total_recs as f64).clamp(0.0, 99.9)
-            } else {
-                0.0
-            };
-            let secs = t0.elapsed().as_secs_f64().max(1e-3);
-            info!(
-                "node: scripthash deferred warm apply status recs≈{recs_seen}/{total_recs} \
-                 pct≈{pct:.1}% written≈{n} rate≈{:.0}rec/s elapsed={:?}",
-                recs_seen as f64 / secs,
-                t0.elapsed()
-            );
+            flush_batch(
+                &mut batch,
+                &mut heads,
+                &mut n,
+                &mut batch_i,
+                recs_seen,
+                t0,
+            )?;
         }
         Ok(())
     })?;
-    flush_batch(&mut batch, &mut heads, &mut n)?;
+    flush_batch(
+        &mut batch,
+        &mut heads,
+        &mut n,
+        &mut batch_i,
+        recs_seen,
+        t0,
+    )?;
     store.scripthash.flush()?;
     info!(
-        "node: scripthash deferred warm apply done written≈{n} recs≈{recs_seen} elapsed={:?}",
+        "node: scripthash deferred warm apply done written≈{n} recs≈{recs_seen} \
+         skipped_hwm≈{recs_skipped_hwm} batches={batch_i} elapsed={:?}",
         t0.elapsed()
     );
     Ok(n)
@@ -2132,12 +2175,18 @@ mod tests {
             plan_sh_pre_materialize(false, true, seal, tip, 222_511, 0),
             ShPreMaterializeAction::BootstrapIncludeHwm { seal }
         );
-        // Authoritative HWM below SEAL → clamp (never to 0).
+        // Authoritative HWM below SEAL, **no residual runs** → clamp (never to 0).
         assert_eq!(
             plan_sh_pre_materialize(false, true, seal, tip, 0, 1_400_000_000),
             ShPreMaterializeAction::ClampSealTo {
                 floor: 1_400_000_000
             }
+        );
+        // HWM below SEAL but residual runs already hold the gap → warm only (no re-recollect).
+        assert_eq!(
+            plan_sh_pre_materialize(false, true, seal, tip, 295_466, 1_400_000_000),
+            ShPreMaterializeAction::Noop,
+            "residual runs must not clamp+recollect (mainnet warm-apply peg)"
         );
         // Healthy: HWM == SEAL, empty residual runs.
         assert_eq!(

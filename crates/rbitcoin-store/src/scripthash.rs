@@ -650,14 +650,14 @@ impl ScriptHashTable {
             }
             let key = rec0.scripthash;
             let mut new_ents: Vec<ShEntry> = Vec::new();
-            let mut seen_fk: Vec<Fk> = Vec::new();
+            // HashSet: hot scripts can appear many times in one batch.
+            let mut seen_fk: std::collections::HashSet<u64> = std::collections::HashSet::new();
             while i < order.len() {
                 let rec = &recs[order[i]];
                 if rec.scripthash != key {
                     break;
                 }
-                if !rec.create_tx_fk.is_null() && !seen_fk.iter().any(|&c| c == rec.create_tx_fk) {
-                    seen_fk.push(rec.create_tx_fk);
+                if !rec.create_tx_fk.is_null() && seen_fk.insert(rec.create_tx_fk.0) {
                     new_ents.push(ShEntry::new(rec.create_tx_fk));
                 }
                 i += 1;
@@ -668,14 +668,25 @@ impl ScriptHashTable {
 
             let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
             let mut old_live = self.collect_entries_locked(&cur)?;
-            let add: Vec<ShEntry> = new_ents
-                .into_iter()
-                .filter(|e| {
-                    !old_live
-                        .iter()
-                        .any(|o| o.create_tx_fk == e.create_tx_fk)
-                })
-                .collect();
+            // Linear any() over large slabs (busy scripthashes) pegs one core on
+            // warm residual apply; HashSet is O(1) per new create.
+            let add: Vec<ShEntry> = if old_live.len() <= 8 {
+                new_ents
+                    .into_iter()
+                    .filter(|e| {
+                        !old_live
+                            .iter()
+                            .any(|o| o.create_tx_fk == e.create_tx_fk)
+                    })
+                    .collect()
+            } else {
+                let have: std::collections::HashSet<u64> =
+                    old_live.iter().map(|o| o.create_tx_fk.0).collect();
+                new_ents
+                    .into_iter()
+                    .filter(|e| !have.contains(&e.create_tx_fk.0))
+                    .collect()
+            };
             if add.is_empty() {
                 continue;
             }

@@ -848,6 +848,13 @@ pub mod class_c_phase_stats {
     /// SH collect source: cold Class A body load.
     pub static SH_COLLECT_COLD: AtomicU64 = AtomicU64::new(0);
 
+    /// Tip/window: thin create rows collected for SH (pin or cold).
+    pub static SH_CREATE_N: AtomicU64 = AtomicU64::new(0);
+    /// Tip/window: distinct scripthash keys in that create set.
+    pub static SH_UNIQUE_N: AtomicU64 = AtomicU64::new(0);
+    /// Tip/window: rows actually written by durable `put_create_batch_append`.
+    pub static SH_WRITTEN_N: AtomicU64 = AtomicU64::new(0);
+
     /// `(strong, scripthash, tip)` nanoseconds.
     ///
     /// `scripthash` is the **sum of SH substeps** (not a separate end-to-end
@@ -881,6 +888,15 @@ pub mod class_c_phase_stats {
         )
     }
 
+    /// `(creates, unique_scripts, written)` then reset.
+    pub fn sample_sh_counts_and_reset() -> (u64, u64, u64) {
+        (
+            SH_CREATE_N.swap(0, Ordering::Relaxed),
+            SH_UNIQUE_N.swap(0, Ordering::Relaxed),
+            SH_WRITTEN_N.swap(0, Ordering::Relaxed),
+        )
+    }
+
     /// Accrue a SH substep and the aggregate `SCRIPTHASH_NS` wall (same window).
     #[inline]
     pub(crate) fn add_sh_part(part: &AtomicU64, ns: u64) {
@@ -889,6 +905,62 @@ pub mod class_c_phase_stats {
         }
         part.fetch_add(ns, Ordering::Relaxed);
         SCRIPTHASH_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Snapshot for tip-follow accept logs (does **not** reset). Prefer sample_* after.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct TipShSnap {
+        pub filter_ns: u64,
+        pub collect_ns: u64,
+        pub sort_ns: u64,
+        pub seed_ns: u64,
+        pub body_ns: u64,
+        pub head_ns: u64,
+        pub pin: u64,
+        pub cold: u64,
+        pub creates: u64,
+        pub unique: u64,
+        pub written: u64,
+    }
+
+    impl TipShSnap {
+        /// Sum of durable-append substeps (sort+seed+body+head); filter+collect separate.
+        pub fn append_ns(&self) -> u64 {
+            self.sort_ns
+                .saturating_add(self.seed_ns)
+                .saturating_add(self.body_ns)
+                .saturating_add(self.head_ns)
+        }
+
+        pub fn total_sh_ns(&self) -> u64 {
+            self.filter_ns
+                .saturating_add(self.collect_ns)
+                .saturating_add(self.append_ns())
+        }
+    }
+
+    /// Sample SH subtimers + counts in one call (resets all SH_* for this module).
+    pub fn sample_tip_sh_and_reset() -> TipShSnap {
+        let (filter_ns, collect_ns, sort_ns, seed_ns, body_ns, head_ns) =
+            sample_sh_sub_and_reset();
+        let (pin, cold) = sample_sh_collect_src_and_reset();
+        let (creates, unique, written) = sample_sh_counts_and_reset();
+        // Also clear aggregate SCRIPTHASH_NS / STRONG / TIP if caller only wants SH —
+        // tip logger samples strong/tip separately. Leave STRONG/TIP alone here.
+        let _ = SCRIPTHASH_NS.swap(0, Ordering::Relaxed);
+        TipShSnap {
+            filter_ns,
+            collect_ns,
+            sort_ns,
+            seed_ns,
+            body_ns,
+            head_ns,
+            pin,
+            cold,
+            creates,
+            unique,
+            written,
+        }
     }
 }
 

@@ -211,6 +211,18 @@ impl Query {
                     t_collect.elapsed().as_nanos() as u64,
                 );
 
+                // Tip SH metering: create rows + distinct scripts (Phase 0 tip accept).
+                if !sh_creates.is_empty() {
+                    sh_stats::SH_CREATE_N
+                        .fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
+                    let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
+                    for r in &sh_creates {
+                        uniq.insert(r.scripthash);
+                    }
+                    sh_stats::SH_UNIQUE_N
+                        .fetch_add(uniq.len() as u64, Ordering::Relaxed);
+                }
+
                 // Max create_fk written this wave (tip-mode durable HWM/SEAL after commit).
                 let mut tip_sh_max_fk = 0u64;
                 if !sh_creates.is_empty() {
@@ -223,10 +235,11 @@ impl Query {
                             tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
                         }
                         let mut heads = self.sh_heads.lock().unwrap();
-                        let (_n, timing) = self
+                        let (n, timing) = self
                             .store
                             .scripthash
                             .put_create_batch_append(&sh_creates, &mut heads)?;
+                        sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
                         add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
                         add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
                         add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);

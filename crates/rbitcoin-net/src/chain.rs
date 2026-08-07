@@ -672,6 +672,9 @@ impl ChainHub {
             .mempool()
             .map(|mp| mp.script_preverified_txids())
             .unwrap_or_default();
+        // Phase 0 tip SH measure: clear window so this block's stats are clean.
+        tip_accept_stats_reset();
+        let t_wall = std::time::Instant::now();
         accept_and_connect_block_preverified(
             &self.query,
             &self.params,
@@ -681,6 +684,7 @@ impl ChainHub {
             &preverified,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
+        let wall_ns = t_wall.elapsed().as_nanos() as u64;
         if let Some(mp) = self.mempool() {
             let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
             let n = mp.remove_for_block(&ids);
@@ -696,6 +700,7 @@ impl ChainHub {
         // UpdateTip). IBD bulk confirm uses note_confirmed_tip without this line;
         // IBD retains periodic progress/perf status instead.
         log_update_tip(height, &hash, &header, n_tx);
+        log_tip_accept_sh(height, n_tx, wall_ns);
         let event = TipEvent {
             height,
             hash,
@@ -787,6 +792,116 @@ pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usiz
         "UpdateTip: new best={hash} height={height} version={ver} \
          tx={n_tx} date={time} progress=tip"
     );
+}
+
+/// Clear confirm + Class C SH meters before a tip-follow accept sample window.
+fn tip_accept_stats_reset() {
+    let _ = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
+    let _ = rbitcoin_query::class_c_phase_stats::sample_and_reset();
+    let _ = rbitcoin_query::class_c_phase_stats::sample_tip_sh_and_reset();
+}
+
+/// Inputs for pure tip-accept SH line (unit-tested).
+#[derive(Clone, Debug)]
+pub struct TipAcceptShInput {
+    pub height: u32,
+    pub n_tx: usize,
+    pub wall_ns: u64,
+    /// Load assemble wall (confirm CONNECT_NS).
+    pub load_ns: u64,
+    pub script_ns: u64,
+    pub class_a_ns: u64,
+    pub class_c_ns: u64,
+    pub spend_ns: u64,
+    pub strong_ns: u64,
+    pub tip_ns: u64,
+    pub sh: rbitcoin_query::class_c_phase_stats::TipShSnap,
+}
+
+/// Format `tip: accept …` body (no log level). Pure for tests.
+pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
+    let wall_ms = i.wall_ns / 1_000_000;
+    let load_ms = i.load_ns / 1_000_000;
+    let script_ms = i.script_ns / 1_000_000;
+    let class_a_ms = i.class_a_ns / 1_000_000;
+    let class_c_ms = i.class_c_ns / 1_000_000;
+    let spend_ms = i.spend_ns / 1_000_000;
+    let strong_ms = i.strong_ns / 1_000_000;
+    let tip_ms = i.tip_ns / 1_000_000;
+    let sh = &i.sh;
+    let sh_ms = sh.total_sh_ns() / 1_000_000;
+    let filt_ms = sh.filter_ns / 1_000_000;
+    let coll_ms = sh.collect_ns / 1_000_000;
+    let sort_ms = sh.sort_ns / 1_000_000;
+    let seed_ms = sh.seed_ns / 1_000_000;
+    let body_ms = sh.body_ns / 1_000_000;
+    let head_ms = sh.head_ns / 1_000_000;
+    let sh_ratio = if i.wall_ns == 0 {
+        0u64
+    } else {
+        (sh.total_sh_ns().saturating_mul(100)) / i.wall_ns.max(1)
+    };
+    format!(
+        "tip: accept h={h} tx={n_tx} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
+         class_a={class_a_ms}ms class_c={class_c_ms}ms strong={strong_ms}ms tip_set={tip_ms}ms \
+         spend={spend_ms}ms sh={sh_ms}ms \
+         (filter={filt_ms} collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
+         pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
+         sh/wall={sh_ratio}%",
+        h = i.height,
+        n_tx = i.n_tx,
+        pin = sh.pin,
+        cold = sh.cold,
+        creates = sh.creates,
+        unique = sh.unique,
+        written = sh.written,
+    )
+}
+
+/// Sample meters after tip accept and emit INFO `tip: accept …` (SH breakdown).
+fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
+    // confirm_phase_stats::sample_and_reset also clears class_c STRONG/SCRIPTHASH/TIP.
+    let (
+        _recon,
+        _wire,
+        connect_ns,
+        script_ns,
+        class_c_ns,
+        strong_ns,
+        _sh_sum,
+        tip_ns,
+        spend_ns,
+        _blks,
+        _resolve,
+        load_ns,
+        _unpin,
+        _cache_tip,
+        _spend_ranged,
+        _spend_idx,
+        _spend_skip,
+        _structural,
+        _struct_spent,
+        _struct_create_h,
+        _struct_bip68,
+    ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
+    // SH substeps/counts (FILTER/COLLECT/…/CREATE_N) — not cleared by sample_and_reset.
+    let sh = rbitcoin_query::class_c_phase_stats::sample_tip_sh_and_reset();
+    let ca = rbitcoin_query::archive_phase_stats::sample_and_reset();
+    let line = format_tip_accept_sh_line(&TipAcceptShInput {
+        height,
+        n_tx,
+        wall_ns,
+        // pin (LOAD_NS) + assemble (CONNECT_NS)
+        load_ns: load_ns.saturating_add(connect_ns),
+        script_ns,
+        class_a_ns: ca.write_total_ns,
+        class_c_ns,
+        spend_ns,
+        strong_ns,
+        tip_ns,
+        sh,
+    });
+    info!("{line}");
 }
 
 /// Immediate seed: genesis + tip (and tip-1) so open is O(1) at mainnet scale.
@@ -982,6 +1097,48 @@ mod tests {
         ));
         assert_eq!(hub.tip_height(), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_tip_accept_sh_line_has_sh_breakdown_tokens() {
+        let line = format_tip_accept_sh_line(&TipAcceptShInput {
+            height: 961_445,
+            n_tx: 4_959,
+            wall_ns: 2_500_000_000,
+            load_ns: 100_000_000,
+            script_ns: 200_000_000,
+            class_a_ns: 50_000_000,
+            class_c_ns: 1_800_000_000,
+            spend_ns: 80_000_000,
+            strong_ns: 5_000_000,
+            tip_ns: 2_000_000,
+            sh: rbitcoin_query::class_c_phase_stats::TipShSnap {
+                filter_ns: 1_000_000,
+                collect_ns: 20_000_000,
+                sort_ns: 5_000_000,
+                seed_ns: 800_000_000,
+                body_ns: 600_000_000,
+                head_ns: 300_000_000,
+                pin: 4_000,
+                cold: 12,
+                creates: 12_000,
+                unique: 9_500,
+                written: 9_400,
+            },
+        });
+        assert!(line.starts_with("tip: accept h=961445"), "{line}");
+        assert!(line.contains("wall=2500ms"), "{line}");
+        assert!(line.contains("sh=1726ms"), "{line}"); // 1+20+5+800+600+300
+        // Substep ms are unitless inside the paren (outer fields carry `ms`).
+        assert!(line.contains("seed=800"), "{line}");
+        assert!(line.contains("body=600"), "{line}");
+        assert!(line.contains("head=300"), "{line}");
+        assert!(line.contains("creates=12000"), "{line}");
+        assert!(line.contains("unique=9500"), "{line}");
+        assert!(line.contains("written=9400"), "{line}");
+        assert!(line.contains("pin=4000"), "{line}");
+        assert!(line.contains("cold=12"), "{line}");
+        assert!(line.contains("sh/wall=69%"), "{line}");
     }
 
     #[test]

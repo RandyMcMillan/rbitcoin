@@ -307,6 +307,14 @@ impl ScriptHashHead {
     }
 
     pub fn get(&self, full: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
+        Ok(self.get_with_chunk_loads(full)?.0)
+    }
+
+    /// Like [`Self::get`], also returns 4 KiB chunk `read_at` count (shared cache size = 1).
+    fn get_with_chunk_loads(
+        &self,
+        full: &[u8; 32],
+    ) -> Result<(Option<ShHeadValue>, u64), StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
         // 4 KiB chunk probe (128 × 32 B) — one pread per chunk under FdOnly.
@@ -315,18 +323,73 @@ impl ScriptHashHead {
         for _ in 0..slots {
             let (k, v) = cache.read_slot(slot)?;
             if is_empty_slot(&k, &v) {
-                return Ok(None);
+                return Ok((None, cache.chunk_loads));
             }
             if k == key {
                 let val = ShHeadValue::decode(&v)?;
                 if val.is_empty() {
-                    return Ok(None);
+                    return Ok((None, cache.chunk_loads));
                 }
-                return Ok(Some(val));
+                return Ok((Some(val), cache.chunk_loads));
             }
             slot = (slot + 1) & (slots - 1);
         }
-        Ok(None)
+        Ok((None, cache.chunk_loads))
+    }
+
+    /// Batch head probe for tip SH seed (one `SlotPageCache` pass, keys sorted by slot).
+    ///
+    /// Faster than N independent [`Self::get`] calls when seeding thousands of
+    /// unique scripts for `put_create_batch_append` (shared 4 KiB page cache).
+    ///
+    /// Slot + truncated key are precomputed once (sort keys are not re-hashed on
+    /// every comparison); probes walk in primary-slot order so adjacent keys share
+    /// the same 4 KiB chunk under [`SlotPageCache`].
+    pub fn get_many(&self, fulls: &[[u8; 32]]) -> Result<Vec<Option<ShHeadValue>>, StoreError> {
+        Ok(self.get_many_with_chunk_loads(fulls)?.0)
+    }
+
+    /// Like [`Self::get_many`], also returns total 4 KiB chunk `read_at` faults.
+    fn get_many_with_chunk_loads(
+        &self,
+        fulls: &[[u8; 32]],
+    ) -> Result<(Vec<Option<ShHeadValue>>, u64), StoreError> {
+        if fulls.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let slots = self.state.lock().unwrap().slots;
+        // (primary_slot, input_index, head_key) — slot first for unstable sort.
+        let mut order: Vec<(u64, usize, ShHeadKey)> = fulls
+            .iter()
+            .enumerate()
+            .map(|(i, full)| {
+                let key = Self::to_key(full);
+                let slot = Self::hash_slot(&key, slots);
+                (slot, i, key)
+            })
+            .collect();
+        order.sort_unstable_by_key(|&(slot, _, _)| slot);
+        let mut out = vec![None; fulls.len()];
+        // 4 KiB chunk probe (128 × 32 B) — one pread per chunk under FdOnly.
+        let mut cache = SlotPageCache::new(self, slots);
+        for &(primary, i, key) in &order {
+            let mut slot = primary;
+            for _ in 0..slots {
+                let (k, v) = cache.read_slot(slot)?;
+                if is_empty_slot(&k, &v) {
+                    break;
+                }
+                if k == key {
+                    let val = ShHeadValue::decode(&v)?;
+                    if !val.is_empty() {
+                        out[i] = Some(val);
+                    }
+                    break;
+                }
+                slot = (slot + 1) & (slots - 1);
+            }
+        }
+        Ok((out, cache.chunk_loads))
     }
 
     pub fn insert(&self, full: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
@@ -726,6 +789,8 @@ struct SlotPageCache<'a> {
     head: &'a ScriptHashHead,
     slots: u64,
     chunks: BTreeMap<u64, CachedChunk>,
+    /// Number of `read_at` chunk faults (for microbenches / diagnostics).
+    chunk_loads: u64,
 }
 
 struct CachedChunk {
@@ -740,6 +805,7 @@ impl<'a> SlotPageCache<'a> {
             head,
             slots,
             chunks: BTreeMap::new(),
+            chunk_loads: 0,
         }
     }
 
@@ -800,6 +866,7 @@ impl<'a> SlotPageCache<'a> {
             let len = n * SH_HEAD_SLOT_SIZE;
             let mut data = vec![0u8; len];
             self.head.file.read_at(off, &mut data)?;
+            self.chunk_loads = self.chunk_loads.saturating_add(1);
             self.chunks.insert(
                 chunk_idx,
                 CachedChunk {
@@ -1052,6 +1119,34 @@ impl ShardedScriptHashHead {
         self.shards[self.shard_of(key)].get(key)
     }
 
+    /// Batch head probe (shard-grouped + per-shard slot-ordered). Tip SH seed.
+    pub fn get_many(&self, keys: &[[u8; 32]]) -> Result<Vec<Option<ShHeadValue>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n_shards = self.shards.len();
+        if n_shards == 1 {
+            return self.shards[0].get_many(keys);
+        }
+        let mut out = vec![None; keys.len()];
+        let mut buckets: Vec<Vec<(usize, [u8; 32])>> =
+            (0..n_shards).map(|_| Vec::new()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            buckets[self.shard_of(k)].push((i, *k));
+        }
+        for (si, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let fulls: Vec<[u8; 32]> = bucket.iter().map(|(_, k)| *k).collect();
+            let vals = self.shards[si].get_many(&fulls)?;
+            for ((orig_i, _), v) in bucket.into_iter().zip(vals.into_iter()) {
+                out[orig_i] = v;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn insert(&self, key: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
         self.shards[self.shard_of(key)].insert(key, value)
     }
@@ -1235,6 +1330,143 @@ mod tests {
         let h2 = ScriptHashHead::open(&path).unwrap();
         assert!(h2.is_known_empty() || h2.occupied() >= 1); // soft-clear keeps slot
         assert!(h2.get(&key).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    }
+
+    #[test]
+    fn get_many_matches_serial_get() {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-many-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+        let h = ScriptHashHead::create_with_slots(&path, 4096).unwrap();
+        let mut keys = Vec::new();
+        for i in 0u32..200 {
+            let mut k = [0u8; 32];
+            k[0..4].copy_from_slice(&i.to_le_bytes());
+            k[4] = 0x5a;
+            h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))))
+                .unwrap();
+            keys.push(k);
+        }
+        // Mix in missing keys.
+        let mut probe = keys.clone();
+        for i in 1000u32..1100 {
+            let mut k = [0u8; 32];
+            k[0..4].copy_from_slice(&i.to_le_bytes());
+            probe.push(k);
+        }
+        let batch = h.get_many(&probe).unwrap();
+        assert_eq!(batch.len(), probe.len());
+        for (k, got) in probe.iter().zip(batch.iter()) {
+            let serial = h.get(k).unwrap();
+            assert_eq!(got, &serial, "key mismatch");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    }
+
+    /// Microbench: batch head seed (`get_many`) vs N serial `get` — tip SH seed shape.
+    ///
+    /// Serial path creates a new `SlotPageCache` per key (old seed loop) → one
+    /// 4 KiB pread per key. Batch shares one cache and visits keys in slot order
+    /// → one pread per unique page. Asserts **chunk-load** speedup (deterministic)
+    /// and prints wall-time; release builds also require a wall-time win.
+    #[test]
+    fn microbench_get_many_faster_than_serial_seed() {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-bench-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+        // 64 Ki slots → 512 × 4 KiB pages. ~4k keys ⇒ expected unique pages
+        // ≪ N, so shared cache cuts preads by multi-×.
+        let h = ScriptHashHead::create_with_slots(&path, 1 << 16).unwrap();
+        const N: u32 = 4_000;
+        let mut keys = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let mut k = [0u8; 32];
+            k[0..4].copy_from_slice(&i.to_le_bytes());
+            k[8] = (i % 251) as u8;
+            h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))))
+                .unwrap();
+            keys.push(k);
+        }
+
+        // --- Chunk-load arm (the optimization’s real unit of work) ---
+        let mut serial_loads = 0u64;
+        for k in &keys {
+            let (_, n) = h.get_with_chunk_loads(k).unwrap();
+            serial_loads = serial_loads.saturating_add(n);
+        }
+        let (batch_vals, batch_loads) = h.get_many_with_chunk_loads(&keys).unwrap();
+        assert_eq!(batch_vals.len(), keys.len());
+        for (k, got) in keys.iter().zip(batch_vals.iter()) {
+            assert_eq!(got, &h.get(k).unwrap());
+        }
+        let load_speedup = serial_loads as f64 / batch_loads.max(1) as f64;
+        eprintln!(
+            "sh head seed microbench (chunk loads): serial={serial_loads} batch={batch_loads} \
+             speedup={load_speedup:.2}× (keys={N})"
+        );
+        // Unique pages among 4k keys on 512 pages is ≪ 4k; require a clear cut.
+        assert!(
+            batch_loads * 3 < serial_loads && load_speedup >= 2.0,
+            "get_many should cut 4 KiB preads by ≥2× vs serial get: \
+             batch_loads={batch_loads} serial_loads={serial_loads} speedup={load_speedup:.2}×"
+        );
+
+        // --- Wall-time arm (release: prove end-to-end; debug: report only) ---
+        let _ = h.get_many(&keys).unwrap();
+        const ROUNDS: u32 = 8;
+        let mut serial_ns = 0u128;
+        let mut batch_ns = 0u128;
+        for r in 0..ROUNDS {
+            if r % 2 == 0 {
+                let t0 = Instant::now();
+                for k in &keys {
+                    let _ = h.get(k).unwrap();
+                }
+                serial_ns += t0.elapsed().as_nanos();
+                let t0 = Instant::now();
+                let _ = h.get_many(&keys).unwrap();
+                batch_ns += t0.elapsed().as_nanos();
+            } else {
+                let t0 = Instant::now();
+                let _ = h.get_many(&keys).unwrap();
+                batch_ns += t0.elapsed().as_nanos();
+                let t0 = Instant::now();
+                for k in &keys {
+                    let _ = h.get(k).unwrap();
+                }
+                serial_ns += t0.elapsed().as_nanos();
+            }
+        }
+        let wall_speedup = serial_ns as f64 / batch_ns.max(1) as f64;
+        eprintln!(
+            "sh head seed microbench (wall): serial={serial_ns}ns batch={batch_ns}ns \
+             speedup={wall_speedup:.2}× (keys={N} rounds={ROUNDS})"
+        );
+        if !cfg!(debug_assertions) {
+            // Optimized builds: shared cache + slot order should beat N× get.
+            assert!(
+                wall_speedup >= 1.3,
+                "get_many wall should be ≥1.3× serial get in release: \
+                 batch={batch_ns}ns serial={serial_ns}ns speedup={wall_speedup:.2}×"
+            );
+        }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
     }

@@ -617,10 +617,11 @@ impl ScriptHashTable {
                     }
                 }
             }
-            // Seed in key order (same as body apply) for probe locality.
+            // One slot-ordered / shard-grouped probe pass (not N independent gets).
             missing.sort_unstable();
-            for key in missing {
-                if let Some(v) = self.head.get(&key)? {
+            let seeded = self.head.get_many(&missing)?;
+            for (key, v) in missing.into_iter().zip(seeded.into_iter()) {
+                if let Some(v) = v {
                     heads.insert(key, v);
                 }
             }

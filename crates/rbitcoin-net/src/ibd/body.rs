@@ -140,23 +140,11 @@ impl BodyPresence {
         self.is_pending_hash(h)
     }
 
-    /// True if Class A body is present (confirmable). Does not treat pending as ready.
-    pub(crate) fn ready(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
-        if self.rejected.contains(h) {
-            return false;
-        }
-        if self.known.contains(h) {
-            return true;
-        }
-        if hub.has_block(h) {
-            self.known.insert(*h);
-            return true;
-        }
-        false
-    }
-
     /// Hot path: local sets first. Do **not** call `has_block` before checking
     /// `missing` — assign walks tens of thousands of known-missing far hashes.
+    ///
+    /// Does **not** treat `known` (Class A cache) as skip — that set is densify
+    /// bookkeeping; tip-hole re-get after resume still needs peer wire into BQ.
     pub(crate) fn skip_download(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
         if self.rejected.contains(h) || self.is_pending_hash(h) {
             return true;

@@ -309,10 +309,11 @@ pub(crate) fn apply_peer_event(
             let wire_bytes = payload.len();
             note_block_rx(&mut st.slots, peer, wire_bytes);
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-            if st.body.is_rejected(&hash)
-                || st.body.is_known_archived(&hash)
-                || hub.has_block(&hash)
-            {
+            // Drop only permanent reject / already-confirmed. Class A
+            // `is_known_archived` alone is **not** claim-ready (confirm needs BQ
+            // wire). Resume seed marks Class A known without BQ — still accept
+            // peer wire so tip can claim after re-getdata.
+            if st.body.is_rejected(&hash) || hub.has_block(&hash) {
                 return;
             }
             // Prefer RAM-cached fk from getheaders (no store lock on hot path).
@@ -741,6 +742,41 @@ mod confirm_reject_tests {
         );
         assert!(st.inflight.is_empty());
         assert!(!st.body.is_pending(&h(9)));
+
+        // Class A known (resume seed) without BQ: still accept peer wire into the
+        // body queue so claim_ready can become true after tip-hole re-getdata.
+        let class_a_hash = h(0xca);
+        st.body.mark_archived(class_a_hash);
+        st.record_height(class_a_hash, 1);
+        st.height_to_hash.insert(1, class_a_hash);
+        st.header_fks
+            .insert(class_a_hash, rbitcoin_primitives::Fk(1));
+        st.slots[0].in_flight.insert(class_a_hash);
+        st.inflight.insert(class_a_hash, InflightReq::new(1));
+        // Minimal framed payload (header prefix + empty body is enough for offer).
+        let mut payload = vec![0u8; 81];
+        payload[0..4].copy_from_slice(&1u32.to_le_bytes()); // version-ish
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlockFramed {
+                peer: 1,
+                hash: class_a_hash,
+                payload,
+            },
+            &write_next,
+            &mut book,
+            local,
+            None,
+        );
+        assert!(
+            st.body.is_pending(&class_a_hash),
+            "Class A known must still land in pending after wire offer"
+        );
+        assert!(
+            hub.query.block_queue_has_height(1),
+            "Class A known must still enter body queue (claim intake)"
+        );
 
         // Decode fail → missing so re-getdata allowed.
         st.body.mark_pending(h(9));

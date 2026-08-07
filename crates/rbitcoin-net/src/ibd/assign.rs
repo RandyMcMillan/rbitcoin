@@ -402,7 +402,19 @@ pub(crate) fn cover_tip_holes(
     let now = Instant::now();
 
     for &h in holes {
-        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
+        // Skip only when **claim-ready** (confirmed / pending / body-queue wire).
+        // Class A alone (`is_known_archived`) is **not** enough — sole confirm
+        // intake is BQ wire. Resume seed marks Class A as known so densify does
+        // not re-walk the whole band; tip-hole race must still re-get so
+        // claim_ready can become true (restart BQ is empty by design).
+        if hub.has_block(&h) || st.body.is_pending(&h) {
+            continue;
+        }
+        if st
+            .hash_height
+            .get(&h)
+            .is_some_and(|&ht| hub.query.block_queue_has_height(ht))
+        {
             continue;
         }
         let (already, second_at) = st
@@ -584,6 +596,52 @@ mod tests {
         assert_eq!(far_slots_per_peer(16, true), 2);
         assert!(far_slots_per_peer(16, true) < 16);
         assert_eq!(far_slots_per_peer(16, false), 8);
+    }
+
+    /// Resume seed marks Class A tip+1 as known without BQ wire. Confirm intake is
+    /// BQ-only → hole must still race getdata (mainnet stall: hole=1, known=1,
+    /// feed ready only ahead of tip, inflight→0 forever).
+    #[test]
+    fn cover_tip_holes_regets_class_a_without_body_queue() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(1001);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.height_to_hash.insert(ht, hole);
+        st.hash_height.insert(hole, ht);
+        st.record_height(hole, ht);
+        // Class A seed path: known, not pending, not in body queue.
+        st.body.mark_archived(hole);
+        assert!(st.body.is_known_archived(&hole));
+        assert!(!st.body.is_pending(&hole));
+        assert!(!hub.query.block_queue_has_height(ht));
+        assert!(
+            !super::super::progress::claim_ready(&hub, &mut st.body, ht, &hole),
+            "Class A alone must not be claim-ready"
+        );
+
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert_eq!(holes, vec![hole], "tip+1 Class A without BQ is a fetch hole");
+
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        assert!(
+            issued >= 1,
+            "must re-getdata Class A tip hole (got issued={issued})"
+        );
+        assert!(
+            st.inflight.contains_key(&hole),
+            "tip hole must be inflight after cover"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -899,8 +957,10 @@ mod tests {
         );
         assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
 
+        // Claim-ready path (pending/BQ), not Class A alone — archived-without-wire
+        // must still re-get tip holes (see cover_tip_holes_regets_class_a_*).
         for ht in 1u32..=12 {
-            st.body.mark_archived(h(ht));
+            st.body.mark_pending(h(ht));
         }
         st.inflight.clear();
         st.slots.iter_mut().for_each(|s| s.in_flight.clear());

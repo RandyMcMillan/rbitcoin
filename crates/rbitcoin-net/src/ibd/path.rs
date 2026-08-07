@@ -41,8 +41,10 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             st.ordered.push_back(hash);
         }
         if e.has_body {
-            // Class A on disk: remember for densify bookkeeping. Confirm still
-            // needs body-queue wire (rehydrate or re-getdata) — not claim-ready alone.
+            // Class A on disk: densify may skip re-walking the whole band via
+            // `is_known_archived`, but confirm still needs body-queue wire
+            // (restart BQ is empty — re-getdata). Tip-hole race intentionally
+            // does **not** treat Class A alone as covered; see cover_tip_holes.
             st.body.mark_archived(hash);
             with_body = with_body.saturating_add(1);
             if ready_prefix {

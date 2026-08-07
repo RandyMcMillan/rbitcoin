@@ -191,14 +191,19 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
     }
 
     // Tip+1..bq_min gap: wire was dequeued/never filled while tip lagged → densify.
-    // Skip heights already claimable from confirmed set or Class A (resume seed).
+    // Skip only **claim-ready** heights (confirmed / pending / BQ). Class A alone
+    // (resume seed `mark_archived`) is not claimable — still mark_missing so
+    // tip-hole race / densify re-getdata into the body queue.
     let mut gap_marked = 0u32;
     if n > 0 && h_min > path_lo {
         for ht in path_lo..h_min {
             let Some(&hash) = st.height_to_hash.get(&ht) else {
                 continue;
             };
-            if hub.has_block(&hash) || st.body.is_known_archived(&hash) || hub.is_archived(&hash) {
+            if hub.has_block(&hash)
+                || st.body.is_pending(&hash)
+                || hub.query.block_queue_has_height(ht)
+            {
                 continue;
             }
             st.body.mark_missing(hash);

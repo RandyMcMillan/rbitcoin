@@ -14,6 +14,7 @@ relational archive** and a **pure-Rust consensus/script** path.
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
 | **Version** | 0.1.0 experimental ([`CHANGELOG.md`](./CHANGELOG.md)) |
+| **Platform** | **Linux first** (io_uring + map-free fd store; other OSes unproven) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 
@@ -21,17 +22,32 @@ relational archive** and a **pure-Rust consensus/script** path.
 
 Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electrum
 backends are **external indexers** of another node. rbitcoin does neither:
+**no UTXO set** (libbitcoin-class archive), **Electrum + txindex in-process**.
+
+Operator-order facts (mainnet tip moves; treat as ballpark, not a warranty):
+
+- **~886 GiB** full archive including **txindex** and **Electrum scripthash**
+  (fits ~1 TB-class disks) — see [`SCHEMA.md`](./SCHEMA.md)
+- **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`** (full scripts)
+- **Modest RAM** during sync — no multi‑GiB `dbcache`, no long “flush the cache”
+  pauses (confirm is lookup → load → scripts → write)
+- **Segmented `tx.head`** — **newer** txs resolve hottest (tip-local traffic wins)
+- **Pure-Rust** consensus/scripts on rust-bitcoin (**no** `libbitcoinconsensus`)
+- **Reproducible static musl** builds for ordinary Linux hosts
 
 1. **On-disk archive** — **map-free** Class A/B/C tables (pread/pwrite + fallocate
    grow; kernel page cache as L0): packed txs, keyless `tx.head`, spend
    annotations, native scripthash. Historical blocks are **reconstructed** from
    the archive; tip keeps a **wire ring** and Class C tip durability after catch-up.
-   Layout: [`SCHEMA.md`](./SCHEMA.md); IO modality: [`docs/io-modality.md`](./docs/io-modality.md);
-   concurrency: [`docs/concurrency.md`](./docs/concurrency.md).
+   Confirm/mempool prevouts use the archive (and in-mempool parents), not a
+   separate UTXO hash table. Layout: [`SCHEMA.md`](./SCHEMA.md); IO:
+   [`docs/io-modality.md`](./docs/io-modality.md); concurrency:
+   [`docs/concurrency.md`](./docs/concurrency.md).
 2. **Concurrent IBD / IO** — fixed writer roles (one Class A appender),
    allocate-then-publish HWMs (no map epochs), confirm as **lookup → load →
    scripts → write**, bulk **io_uring** where available (pread/pwrite fallback).
-   Map: [`docs/concurrency.md`](./docs/concurrency.md).
+   Linux-shaped IO; porting needs work. Map:
+   [`docs/concurrency.md`](./docs/concurrency.md).
 3. **Pure-Rust consensus** — structure, connect, and **script verification in
    Rust**; only **secp256k1** (via rust-bitcoin) as the crypto primitive — **no**
    `libbitcoinconsensus` dual-eval. Tests: [`docs/consensus-tests.md`](./docs/consensus-tests.md).
@@ -142,6 +158,8 @@ mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 - Wallet, mining, GUI, or pruning
 - Full Core JSON-RPC surface
 - A claim of complete mainnet script validation under the **default** milestone
+  (use `--milestone 0` for full scripts)
+- A multi-OS port — **Linux is the supported IO target** today
 
 ## License
 

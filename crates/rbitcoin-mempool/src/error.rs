@@ -4,10 +4,15 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum MempoolError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     BadMagic,
     BadSchema(u16),
     Corrupt(&'static str),
+    /// Slot table at capacity after grow/evict attempts — not disk corruption.
+    Full,
 }
 
 impl fmt::Display for MempoolError {
@@ -17,6 +22,7 @@ impl fmt::Display for MempoolError {
             MempoolError::BadMagic => f.write_str("mempool bad magic"),
             MempoolError::BadSchema(v) => write!(f, "mempool bad schema {v}"),
             MempoolError::Corrupt(s) => write!(f, "mempool corrupt: {s}"),
+            MempoolError::Full => f.write_str("mempool full (no free slots)"),
         }
     }
 }
@@ -62,5 +68,9 @@ mod tests {
         let corrupt = MempoolError::Corrupt("slot OOB");
         assert_eq!(format!("{corrupt}"), "mempool corrupt: slot OOB");
         assert!(corrupt.source().is_none());
+
+        let full = MempoolError::Full;
+        assert_eq!(format!("{full}"), "mempool full (no free slots)");
+        assert!(full.source().is_none());
     }
 }

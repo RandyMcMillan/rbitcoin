@@ -98,7 +98,10 @@ impl std::error::Error for AcceptError {}
 
 impl From<MempoolError> for AcceptError {
     fn from(e: MempoolError) -> Self {
-        AcceptError::Durable(e.to_string())
+        match e {
+            MempoolError::Full => AcceptError::Policy("mempool full"),
+            other => AcceptError::Durable(other.to_string()),
+        }
     }
 }
 
@@ -370,6 +373,10 @@ impl ActiveMempool {
             let _ = self.remove_txid(c);
         }
 
+        // Free a slot before durable write: weight eviction alone used to run
+        // *after* append, so a full LIVE slot table failed as "corrupt".
+        self.ensure_free_slot(Some(txid))?;
+
         // Durable write.
         let raw = serialize(tx);
         let slot = self.store.append_live_tx(&raw, &txid, fee_sat, weight)?;
@@ -418,6 +425,55 @@ impl ActiveMempool {
             // accept_tx re-parks if still missing other parents; ignores soft errors.
             let _ = self.accept_tx(&child, utxos);
         }
+    }
+
+    /// Ensure the durable slot table has a FREE/DEAD entry for the next append.
+    ///
+    /// Order: if full of LIVE, **grow** the slot table first (weight may still have
+    /// headroom — mainnet 4k-slot stall); if at max cap, **evict** worst chunks.
+    /// Never surface as store corruption.
+    fn ensure_free_slot(&mut self, protect: Option<Txid>) -> Result<(), AcceptError> {
+        if self.store.has_free_slot() {
+            return Ok(());
+        }
+        // Prefer grow when under max (legacy 4k / mid-grow full under weight budget).
+        match self.store.grow_slots() {
+            Ok(()) => {
+                if self.store.has_free_slot() {
+                    return Ok(());
+                }
+            }
+            Err(MempoolError::Full) => {}
+            Err(e) => return Err(e.into()),
+        }
+        // At MAX_SLOT_CAP or grow failed to free: evict worst chunks.
+        let mut guard = 0u32;
+        while !self.store.has_free_slot() && guard < 10_000 {
+            guard += 1;
+            let Some((_rep, chunk)) = self.graph.worst_chunk() else {
+                break;
+            };
+            if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
+                break;
+            }
+            let mut removed = 0usize;
+            for t in &chunk.txids {
+                if protect == Some(*t) {
+                    continue;
+                }
+                if self.graph.contains(t) {
+                    self.remove_txid(t)?;
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                break;
+            }
+        }
+        if self.store.has_free_slot() {
+            return Ok(());
+        }
+        Err(AcceptError::Policy("mempool full"))
     }
 
     /// Remove lowest-feerate chunks until `total_weight <= max_weight`.
@@ -1001,6 +1057,8 @@ mod tests {
         // From MempoolError.
         let from_io: AcceptError = MempoolError::BadMagic.into();
         assert!(from_io.to_string().contains("durable"));
+        let from_full: AcceptError = MempoolError::Full.into();
+        assert!(matches!(from_full, AcceptError::Policy("mempool full")));
 
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
@@ -1175,5 +1233,85 @@ mod tests {
         assert_eq!(mp.orphan_count(), 0);
         assert_eq!(mp.live_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slot table growth under accept: legacy tiny sidecar must not fail as Durable corrupt.
+    #[test]
+    fn accept_grows_legacy_tiny_slot_table() {
+        use std::fs;
+        let dir = tmp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        // 4-slot meta/slots/body (same layout as store unit test).
+        {
+            let mut meta = [0u8; 64];
+            meta[0..4].copy_from_slice(b"rBMP");
+            meta[4..6].copy_from_slice(&1u16.to_le_bytes());
+            meta[16..20].copy_from_slice(&4u32.to_le_bytes());
+            fs::write(dir.join("meta"), meta).unwrap();
+            let mut slots = vec![0u8; 16 + 4 * 48];
+            slots[0..4].copy_from_slice(b"rBMP");
+            slots[4..6].copy_from_slice(&1u16.to_le_bytes());
+            slots[8..12].copy_from_slice(&4u32.to_le_bytes());
+            fs::write(dir.join("slots"), &slots).unwrap();
+            let mut body = vec![0u8; 16];
+            body[0..4].copy_from_slice(b"rBMP");
+            body[4..6].copy_from_slice(&1u16.to_le_bytes());
+            body[8..16].copy_from_slice(&16u64.to_le_bytes());
+            fs::write(dir.join("tx.body"), &body).unwrap();
+        }
+        // Large weight budget so eviction is not the free-slot path.
+        let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 300_000_000).unwrap();
+        assert_eq!(mp.store.meta().slot_cap, 4);
+        // Four independent chain utxos → four live slots.
+        for i in 0..4u8 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array({
+                    let mut b = [0xab; 32];
+                    b[0] = i;
+                    b
+                }),
+                vout: 0,
+            };
+            let mut map = HashMap::new();
+            map.insert(
+                op,
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+            );
+            let utxos = MapUtxoProvider { map };
+            let tx = spend_tx(op, 99_000);
+            mp.accept_tx(&tx, &utxos)
+                .unwrap_or_else(|e| panic!("accept {i}: {e}"));
+        }
+        assert_eq!(mp.live_count(), 4);
+        // Fifth must grow slots, not Durable(corrupt: slot table full).
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xcd; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        map.insert(
+            op,
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let utxos = MapUtxoProvider { map };
+        let tx = spend_tx(op, 99_000);
+        let r = mp.accept_tx(&tx, &utxos);
+        assert!(
+            r.is_ok(),
+            "expected free-slot (evict or grow), got {:?}",
+            r.err().map(|e| e.to_string())
+        );
+        // Evict-for-slot may keep cap=4; grow path raises it. Either is fine —
+        // must never be Durable(corrupt: slot table full).
+        assert_eq!(mp.live_count(), 5.min(mp.store.meta().slot_cap as usize));
+        // Graph and store agree we still hold a full-ish set.
+        assert!(mp.live_count() >= 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

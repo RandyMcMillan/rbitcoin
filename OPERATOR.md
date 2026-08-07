@@ -250,8 +250,14 @@ page cache.
 | Cluster caps | 64 txs / 101 kWU |
 | Eviction | worst linearization **chunk** when over weight budget |
 | Compaction | DEAD slots reclaimed when wasteful (auto after confirm removes) |
+| Slot table | **131 072** initial records (grows by doubling to 1 048 576); free-slot ensure **before** append |
 
 Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block connect.
+
+**Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
+is damaged or an old 4k-slot table was left wedged, stop the node and delete that
+directory — the next start recreates it empty and redownloads unconfirmed txs.
+Do **not** wipe `store/` for mempool slot/full errors.
 
 ## P2P transport
 

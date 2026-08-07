@@ -28,7 +28,13 @@ pub const MEM_SCHEMA: u16 = 1;
 
 const META_LEN: usize = 64;
 /// Initial slot table capacity (records).
-const DEFAULT_SLOT_CAP: u32 = 4096;
+///
+/// Sized for mainnet tip mempool under a ~300 MvB weight budget: many small
+/// txs fit weight-wise long before 4k slots fill (overnight tip stall). Fixed
+/// constant — no env. Existing datadirs with smaller caps grow on demand.
+const DEFAULT_SLOT_CAP: u32 = 131_072;
+/// Hard ceiling when doubling the slot table (DoS / RAM bound).
+const MAX_SLOT_CAP: u32 = 1_048_576;
 /// Slot record: status(1) + pad(3) + body_off(8) + body_len(4) + txid(32) = 48.
 const SLOT_REC: usize = 48;
 const SLOTS_HEADER: usize = 16;
@@ -268,14 +274,54 @@ impl Mempool {
         Ok(out)
     }
 
-    fn alloc_slot(&self) -> Result<u32, MempoolError> {
+    /// True if at least one FREE or DEAD slot can be reused.
+    pub fn has_free_slot(&self) -> bool {
+        self.find_free_slot().is_some()
+    }
+
+    fn find_free_slot(&self) -> Option<u32> {
         for slot in 0..self.slot_cap {
             let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
             if self.slots[off] == SLOT_FREE || self.slots[off] == SLOT_DEAD {
-                return Ok(slot);
+                return Some(slot);
             }
         }
-        Err(MempoolError::Corrupt("slot table full"))
+        None
+    }
+
+    fn alloc_slot(&mut self) -> Result<u32, MempoolError> {
+        if let Some(s) = self.find_free_slot() {
+            return Ok(s);
+        }
+        // Grow once so a full live set under a small legacy cap is not a hard fail.
+        self.grow_slots()?;
+        self.find_free_slot().ok_or(MempoolError::Full)
+    }
+
+    /// Double slot capacity (up to [`MAX_SLOT_CAP`]) and extend the slots image with FREE records.
+    pub fn grow_slots(&mut self) -> Result<(), MempoolError> {
+        if self.slot_cap >= MAX_SLOT_CAP {
+            return Err(MempoolError::Full);
+        }
+        let new_cap = self
+            .slot_cap
+            .saturating_mul(2)
+            .max(self.slot_cap.saturating_add(DEFAULT_SLOT_CAP.min(16_384)))
+            .min(MAX_SLOT_CAP);
+        if new_cap <= self.slot_cap {
+            return Err(MempoolError::Full);
+        }
+        let old_cap = self.slot_cap;
+        let need = SLOTS_HEADER + (new_cap as usize) * SLOT_REC;
+        self.slots.resize(need, 0); // new records are FREE (0)
+        self.slots[8..12].copy_from_slice(&new_cap.to_le_bytes());
+        self.slot_cap = new_cap;
+        self.persist_all()?;
+        rbitcoin_log::info!(
+            "mempool: grew slot table {old_cap} → {new_cap} (live={})",
+            self.live_count
+        );
+        Ok(())
     }
 
     fn write_slot(
@@ -521,7 +567,7 @@ mod tests {
             let m = mp.meta();
             assert_eq!(m.generation, 0);
             assert_eq!(m.live_count, 0);
-            assert!(m.slot_cap >= 1024);
+            assert_eq!(m.slot_cap, DEFAULT_SLOT_CAP);
             mp.flush().expect("flush");
             assert_eq!(mp.generation(), 1);
         }
@@ -592,5 +638,52 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// Legacy tiny slot table must grow instead of returning Corrupt("slot table full").
+    #[test]
+    fn full_live_table_grows_not_corrupt() {
+        let dir = tmp_dir();
+        // Seed a 4-slot sidecar (legacy mainnet shape).
+        fs::create_dir_all(&dir).unwrap();
+        let tiny = 4u32;
+        {
+            let mut meta = [0u8; META_LEN];
+            write_meta_bytes(&mut meta, 0, tiny, 0);
+            fs::write(dir.join("meta"), meta).unwrap();
+            let mut slots = vec![0u8; SLOTS_HEADER + (tiny as usize) * SLOT_REC];
+            slots[0..4].copy_from_slice(&MEM_MAGIC);
+            slots[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+            slots[8..12].copy_from_slice(&tiny.to_le_bytes());
+            fs::write(dir.join("slots"), &slots).unwrap();
+            let mut body = vec![0u8; BODY_HEADER];
+            body[0..4].copy_from_slice(&MEM_MAGIC);
+            body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+            body[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
+            fs::write(dir.join("tx.body"), &body).unwrap();
+        }
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.meta().slot_cap, tiny);
+        for i in 0..tiny {
+            let mut tid = [0u8; 32];
+            tid[0] = i as u8 + 1;
+            let txid = Txid::from_byte_array(tid);
+            mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &txid, 1, 400)
+                .unwrap_or_else(|e| panic!("append {i}: {e}"));
+        }
+        assert!(!mp.has_free_slot());
+        // 5th append must grow, not Corrupt.
+        let tid5 = Txid::from_byte_array([0x55; 32]);
+        let r = mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid5, 1, 400);
+        assert!(
+            r.is_ok(),
+            "expected grow on full table, got {:?}",
+            r.err().map(|e| e.to_string())
+        );
+        assert!(mp.meta().slot_cap > tiny);
+        assert_eq!(mp.live_count(), tiny + 1);
+        // Must not be the old Corrupt message.
+        assert!(!format!("{:?}", MempoolError::Full).contains("corrupt"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

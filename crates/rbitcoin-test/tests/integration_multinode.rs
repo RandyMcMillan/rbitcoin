@@ -669,7 +669,9 @@ fn confirm_wire_idempotent_when_class_a_already_present() {
         .ensure_header(&header_to_record(g_fk, &b1.header))
         .unwrap();
     accept_and_archive_block(&q, &params, H(1), &b1, ms).unwrap();
-    assert!(q.is_block_archived(&b1.block_hash().to_byte_array()).unwrap());
+    assert!(q
+        .is_block_archived(&b1.block_hash().to_byte_array())
+        .unwrap());
     let n_before = q.tx_body_count();
 
     // Wire confirm with Class A already present — plan should be empty / no-op commit.

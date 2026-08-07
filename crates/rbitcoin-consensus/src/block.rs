@@ -1334,11 +1334,7 @@ pub(crate) fn structural_validate_spends(
                 let t_m = Instant::now();
                 let spent = query
                     .store()
-                    .has_confirmed_strong_spender_create(
-                        rbitcoin_primitives::Fk(id),
-                        vout,
-                        None,
-                    )
+                    .has_confirmed_strong_spender_create(rbitcoin_primitives::Fk(id), vout, None)
                     .map_err(ConsensusError::Store)?;
                 multi_list_ns = multi_list_ns.saturating_add(t_m.elapsed().as_nanos() as u64);
                 if spent {
@@ -1380,8 +1376,7 @@ pub(crate) fn structural_validate_spends(
         }
     }
     // Multi-list walks + null-create probes are protocol cold; sole abs path is hot.
-    let spent_cold_ns =
-        multi_list_ns.saturating_add(t_cold.elapsed().as_nanos() as u64);
+    let spent_cold_ns = multi_list_ns.saturating_add(t_cold.elapsed().as_nanos() as u64);
 
     // Order-sensitive pending double-spend + durable rejection.
     let t_pending = Instant::now();

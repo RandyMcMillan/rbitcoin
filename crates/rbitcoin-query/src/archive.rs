@@ -159,9 +159,7 @@ impl ArchiveWritePlan {
                 .iter()
                 .position(|f| *f == first)
                 .unwrap_or(0);
-            let end = start
-                .saturating_add(n as usize)
-                .min(self.planned_fks.len());
+            let end = start.saturating_add(n as usize).min(self.planned_fks.len());
             for f in &self.planned_fks[start..end] {
                 if let Some(id) = f.get() {
                     keep_fks.insert(id);
@@ -1244,10 +1242,7 @@ mod tests {
             (dummy_pin(3), Vec::new()),
         ];
         plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
-        plan.spends = vec![
-            ([0u8; 32], 0, Fk(1), 0),
-            ([0u8; 32], 0, Fk(3), 0),
-        ];
+        plan.spends = vec![([0u8; 32], 0, Fk(1), 0), ([0u8; 32], 0, Fk(3), 0)];
         // Header 10 already has body; 20 needs body.
         let keep = plan
             .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))

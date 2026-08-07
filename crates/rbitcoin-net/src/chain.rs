@@ -1135,7 +1135,7 @@ mod tests {
         assert!(line.contains("class_c=7ms"), "{line}");
         assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
         assert!(line.contains("sh=1726ms"), "{line}"); // 1+20+5+800+600+300
-        // Substep ms are unitless inside the paren (outer fields carry `ms`).
+                                                       // Substep ms are unitless inside the paren (outer fields carry `ms`).
         assert!(line.contains("seed=800"), "{line}");
         assert!(line.contains("body=600"), "{line}");
         assert!(line.contains("head=300"), "{line}");

@@ -1129,8 +1129,7 @@ impl ShardedScriptHashHead {
             return self.shards[0].get_many(keys);
         }
         let mut out = vec![None; keys.len()];
-        let mut buckets: Vec<Vec<(usize, [u8; 32])>> =
-            (0..n_shards).map(|_| Vec::new()).collect();
+        let mut buckets: Vec<Vec<(usize, [u8; 32])>> = (0..n_shards).map(|_| Vec::new()).collect();
         for (i, k) in keys.iter().enumerate() {
             buckets[self.shard_of(k)].push((i, *k));
         }
@@ -1352,8 +1351,11 @@ mod tests {
             let mut k = [0u8; 32];
             k[0..4].copy_from_slice(&i.to_le_bytes());
             k[4] = 0x5a;
-            h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))))
-                .unwrap();
+            h.insert(
+                &k,
+                &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
+            )
+            .unwrap();
             keys.push(k);
         }
         // Mix in missing keys.
@@ -1400,8 +1402,11 @@ mod tests {
             let mut k = [0u8; 32];
             k[0..4].copy_from_slice(&i.to_le_bytes());
             k[8] = (i % 251) as u8;
-            h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))))
-                .unwrap();
+            h.insert(
+                &k,
+                &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
+            )
+            .unwrap();
             keys.push(k);
         }
 

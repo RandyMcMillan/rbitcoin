@@ -941,8 +941,7 @@ pub mod class_c_phase_stats {
 
     /// Sample SH subtimers + counts in one call (resets all SH_* for this module).
     pub fn sample_tip_sh_and_reset() -> TipShSnap {
-        let (filter_ns, collect_ns, sort_ns, seed_ns, body_ns, head_ns) =
-            sample_sh_sub_and_reset();
+        let (filter_ns, collect_ns, sort_ns, seed_ns, body_ns, head_ns) = sample_sh_sub_and_reset();
         let (pin, cold) = sample_sh_collect_src_and_reset();
         let (creates, unique, written) = sample_sh_counts_and_reset();
         // Also clear aggregate SCRIPTHASH_NS / STRONG / TIP if caller only wants SH —

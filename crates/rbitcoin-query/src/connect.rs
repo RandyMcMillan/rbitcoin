@@ -213,14 +213,12 @@ impl Query {
 
                 // Tip SH metering: create rows + distinct scripts (Phase 0 tip accept).
                 if !sh_creates.is_empty() {
-                    sh_stats::SH_CREATE_N
-                        .fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
+                    sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
                     let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
                     for r in &sh_creates {
                         uniq.insert(r.scripthash);
                     }
-                    sh_stats::SH_UNIQUE_N
-                        .fetch_add(uniq.len() as u64, Ordering::Relaxed);
+                    sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
                 }
 
                 // Max create_fk written this wave (tip-mode durable HWM/SEAL after commit).

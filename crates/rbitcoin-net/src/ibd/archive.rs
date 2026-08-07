@@ -333,11 +333,7 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
             failed = failed.saturating_add(1);
             break;
         }
-        let header_fk = st
-            .header_fks
-            .get(&hash)
-            .copied()
-            .unwrap_or(Fk::NULL);
+        let header_fk = st.header_fks.get(&hash).copied().unwrap_or(Fk::NULL);
         match hub
             .query
             .block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload)

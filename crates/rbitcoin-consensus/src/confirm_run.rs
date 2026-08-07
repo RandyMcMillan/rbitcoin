@@ -4581,12 +4581,9 @@ fn class_c_commit(
     let out = query
         .confirm_blocks_run_with_create_pins(&items, pins)
         .map_err(ConsensusError::Store)?;
-    let strong_d = STRONG_NS
-        .load(QOrd::Relaxed)
-        .saturating_sub(strong0);
+    let strong_d = STRONG_NS.load(QOrd::Relaxed).saturating_sub(strong0);
     let tip_d = TIP_NS.load(QOrd::Relaxed).saturating_sub(tip0);
-    confirm_phase_stats::CLASS_C_NS
-        .fetch_add(strong_d.saturating_add(tip_d), Ordering::Relaxed);
+    confirm_phase_stats::CLASS_C_NS.fetch_add(strong_d.saturating_add(tip_d), Ordering::Relaxed);
     Ok(out)
 }
 

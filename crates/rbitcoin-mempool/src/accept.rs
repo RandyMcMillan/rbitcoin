@@ -338,9 +338,9 @@ impl ActiveMempool {
             let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
             let set = self.graph.conflict_set(&direct);
             let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
-            let (direct_fee, direct_weight) = self.graph.set_fee_weight(
-                &direct.iter().copied().collect::<BTreeSet<_>>(),
-            );
+            let (direct_fee, direct_weight) = self
+                .graph
+                .set_fee_weight(&direct.iter().copied().collect::<BTreeSet<_>>());
             if !rbf_allows_replacement(
                 fee_sat,
                 weight,
@@ -698,12 +698,7 @@ pub fn rbf_pays_for_replacement(
 ///
 /// Integer form: `new_fee * DEN * direct_vsize ≥ direct_fee * NUM * new_vsize`
 /// with `NUM/DEN = 5/4`.
-pub fn pure_rbfr_pays(
-    new_fee: u64,
-    new_weight: u64,
-    direct_fee: u64,
-    direct_weight: u64,
-) -> bool {
+pub fn pure_rbfr_pays(new_fee: u64, new_weight: u64, direct_fee: u64, direct_weight: u64) -> bool {
     if new_weight == 0 || direct_weight == 0 {
         return false;
     }
@@ -713,9 +708,7 @@ pub fn pure_rbfr_pays(
         return false;
     }
     // new_fee/new_v >= (NUM/DEN) * direct_fee/old_v
-    new_fee
-        .saturating_mul(RBFR_RATIO_DEN)
-        .saturating_mul(old_v)
+    new_fee.saturating_mul(RBFR_RATIO_DEN).saturating_mul(old_v)
         >= direct_fee
             .saturating_mul(RBFR_RATIO_NUM)
             .saturating_mul(new_v)

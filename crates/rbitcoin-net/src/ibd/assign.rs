@@ -627,7 +627,11 @@ mod tests {
         );
 
         let holes = contiguous_tip_holes(&mut st, &hub, 8);
-        assert_eq!(holes, vec![hole], "tip+1 Class A without BQ is a fetch hole");
+        assert_eq!(
+            holes,
+            vec![hole],
+            "tip+1 Class A without BQ is a fetch hole"
+        );
 
         let cfg = IbdConfig::for_test();
         let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();

@@ -1189,7 +1189,11 @@ mod tests {
     #[test]
     fn serial_record_start_sets_dontcache_by_segment_age() {
         use crate::bulk_io;
+        use crate::dontcache_policy::{self, Mode};
         use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _lock = dontcache_policy::test_mode_lock();
+        dontcache_policy::test_set_mode(Some(Mode::Full));
 
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
@@ -1214,15 +1218,17 @@ mod tests {
             idx.segment_count()
         );
 
-        // Oldest (si=0, age ≥4): DONTCACHE.
+        // Oldest (si=0, age ≥4): DONTCACHE (when capability ok).
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = idx.record_start(1).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty(), "record_start must issue bulk page load");
-        assert!(
-            flags.iter().all(|&d| d),
-            "old idx segment must set ReadOp.dontcache; got {flags:?}"
-        );
+        if bulk_io::rwf_dontcache_ok() {
+            assert!(
+                flags.iter().all(|&d| d),
+                "old idx segment must set ReadOp.dontcache; got {flags:?}"
+            );
+        }
 
         // Tip segment: no DONTCACHE.
         let _ = bulk_io::test_take_last_read_dontcache();
@@ -1235,6 +1241,7 @@ mod tests {
         );
 
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        dontcache_policy::test_set_mode(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

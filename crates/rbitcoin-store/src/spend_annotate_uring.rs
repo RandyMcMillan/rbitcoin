@@ -113,8 +113,9 @@ pub fn put_spend_batch_by_abs_meta_uring(
             });
             {
                 let s = slots[slot].as_mut().unwrap();
-                // RMW fallback pread: still drop after (not confirm pure-write path).
-                let flags = crate::dontcache_policy::body_sqe_rw_flags();
+                // RMW fallback pread: Full mode may DONTCACHE; spend-write mode keeps
+                // pages for the following pwrite (drop only on write).
+                let flags = crate::dontcache_policy::body_sqe_read_flags();
                 session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
             }
             *in_flight += 1;
@@ -235,8 +236,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
                     slots[slot] = Some(st);
                     {
                         let s = slots[slot].as_mut().unwrap();
-                        // Policy: all tx.body writes use RWF_DONTCACHE.
-                        let flags = crate::dontcache_policy::body_sqe_rw_flags();
+                        // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
+                        let flags = crate::dontcache_policy::body_sqe_write_flags();
                         session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, flags)?;
                     }
                     in_flight += 1;
@@ -506,8 +507,8 @@ fn put_spend_batch_pure_write_uring(
             let slot = free_slots.pop().unwrap();
             slots[slot] = Some(wi);
             let abs = writes[wi].0;
-            // Policy: all tx.body writes use RWF_DONTCACHE.
-            let flags = crate::dontcache_policy::body_sqe_rw_flags();
+            // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
+            let flags = crate::dontcache_policy::body_sqe_write_flags();
             session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, flags)?;
             *in_flight += 1;
         }
@@ -683,12 +684,18 @@ mod tests {
         }
     }
 
-    /// Shipped uring RMW path must push body SQEs with RWF_DONTCACHE when supported.
+    /// Shipped uring spend path must push body **write** SQEs with RWF_DONTCACHE
+    /// when supported (Full or spend mode).
     #[test]
     fn uring_rmw_body_sqe_sets_rwf_dontcache() {
+        let _lock = crate::dontcache_policy::test_mode_lock();
+        crate::dontcache_policy::test_set_mode(Some(crate::dontcache_policy::Mode::Full));
         if !crate::bulk_io::io_uring_enabled() {
-            // No ring in this environment — write path still requests DONTCACHE.
-            assert!(crate::dontcache_policy::body_write());
+            // No ring — write policy still requests DONTCACHE when capability ok.
+            if crate::bulk_io::rwf_dontcache_ok() {
+                assert!(crate::dontcache_policy::body_write_spend());
+            }
+            crate::dontcache_policy::test_set_mode(None);
             return;
         }
         let (dir, t, spenders) = temp_table();
@@ -712,19 +719,19 @@ mod tests {
             !sqe_flags.is_empty(),
             "uring spend annotate must push at least one SQE"
         );
-        let expect = crate::dontcache_policy::body_sqe_rw_flags();
+        let expect = crate::dontcache_policy::body_sqe_write_flags();
         assert!(
             sqe_flags.iter().any(|&f| f == expect),
-            "body SQE rw_flags must match body_sqe_rw_flags()={expect:#x}; got {sqe_flags:?}"
+            "body write SQE rw_flags must match body_sqe_write_flags()={expect:#x}; got {sqe_flags:?}"
         );
-        // When DONTCACHE is supported, flags must be non-zero on body ops.
         if crate::bulk_io::rwf_dontcache_ok() {
             assert!(
                 sqe_flags.iter().any(|&f| f == uring_session::RWF_DONTCACHE),
-                "expected RWF_DONTCACHE on body r/w SQEs; got {sqe_flags:?}"
+                "expected RWF_DONTCACHE on body write SQEs; got {sqe_flags:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+        crate::dontcache_policy::test_set_mode(None);
     }
 
     #[test]

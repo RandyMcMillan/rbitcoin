@@ -134,6 +134,15 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | `RBITCOIN_CLASS_C_IO` | uring \| pread | Bulk create-height 4 B slots |
 | `RBITCOIN_CLASS_C_INRAM_MAX_MB` | integer MiB (default **256**) | Cap for L2 Class C load; over → pure fd L0 |
 | `RBITCOIN_TX_HEAD_ACCESS` | ignored if `map` | Always FdOnly after phase 6 (warn once if `map`) |
+| **`RBITCOIN_RWF_DONTCACHE`** | see below | Linux io_uring page-cache drop-after-IO (kernel 6.14+) |
+
+**`RBITCOIN_RWF_DONTCACHE`** (advanced; default **full** when unset):
+
+| Value | Effect |
+|-------|--------|
+| unset / `1` / `on` / `full` / `all` | **Full** schema-13 policy: body writes (Class A + spend annotate), generic body reads, cold head/idx segs, far `txid.body` peeks |
+| `0` / `false` / `off` | **Never** set `RWF_DONTCACHE` |
+| `spend` / `annotate` / `body_spend` / `spend_write` | **Spend-write only**: only spend-annotate `tx.body` **pwrites** (after spender meta is committed). Class A append, confirm reads, head/idx/sidefile stay cacheable |
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO; `RBITCOIN_BULK_IO_WORKERS` parallelizes pread only.

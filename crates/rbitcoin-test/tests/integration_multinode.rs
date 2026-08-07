@@ -446,6 +446,111 @@ async fn reorg_to_longer_branch() {
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
 }
 
+/// Competing spends of the same coinbase on two forks promote multi-list
+/// annotations (reorg path). Extending the winning tip must resolve multi via
+/// confirmed-strong walk — not hard-fail `structural multi-spender` (mainnet
+/// tip-follow freeze at 961396 after reorg annotate near tip).
+#[test]
+fn reorg_competing_spend_extends_without_multi_fail() {
+    use bitcoin::Amount;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_net::{AcceptOutcome, ChainHub};
+    use rbitcoin_test::mine::spend_anyone_can_spend;
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create(dir.path().join("store")).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let maturity = ChainParams::regtest().coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    hub.accept_block(genesis.clone()).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut time = genesis.header.time;
+
+    // Height 1: coinbase we will double-spend across forks after maturity.
+    let b1 = mine_regtest_block(tip, time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    tip = b1.block_hash();
+    time = b1.header.time;
+    hub.accept_block(b1).unwrap();
+
+    // Pad until height-1 has `maturity` confirmations (spendable next).
+    let last_pad = maturity + 1;
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, time + 600, h, vec![]);
+        tip = b.block_hash();
+        time = b.header.time;
+        hub.accept_block(b).unwrap();
+    }
+    let fork_parent = tip;
+    let fork_time = time;
+    let fork_h = last_pad;
+
+    // Main branch: spend coinbase once at fork_h+1.
+    let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let main = mine_regtest_block(fork_parent, fork_time + 600, fork_h + 1, vec![spend_a]);
+    hub.accept_block(main).unwrap();
+    assert_eq!(hub.tip_height(), Some(fork_h + 1));
+
+    // Longer competing branch from fork_parent: different spend of same out + pad.
+    let spend_b = spend_anyone_can_spend(cb1, 0, Amount::from_sat(48_5000_0000));
+    let mut branch = Vec::new();
+    let mut p = fork_parent;
+    let mut t = fork_time;
+    for (i, h) in (fork_h + 1..=fork_h + 3).enumerate() {
+        let extra = if i == 0 {
+            vec![spend_b.clone()]
+        } else {
+            vec![]
+        };
+        // Distinct time so PoW/hash differs from main.
+        let b = mine_regtest_block(p, t + 601 + i as u32, h, extra);
+        p = b.block_hash();
+        t = b.header.time;
+        branch.push(b);
+    }
+
+    let outcome = hub.accept_branch(&branch).unwrap();
+    match outcome {
+        AcceptOutcome::Accepted { height } => {
+            assert_eq!(height, fork_h + 3, "reorg should land at fork_h+3");
+        }
+        other => panic!("expected reorg to longer competing-spend branch, got {other:?}"),
+    }
+    assert_eq!(hub.tip_height(), Some(fork_h + 3));
+
+    // Coinbase is multi-list (main spend_a + winning spend_b) with spend_b strong.
+    // A third spend must be PrevoutSpent — **not** `structural multi-spender`
+    // hard-fail (that was the mainnet tip freeze after tip-follow reorgs).
+    let spend_c = spend_anyone_can_spend(cb1, 0, Amount::from_sat(47_0000_0000));
+    let double = mine_regtest_block(p, t + 600, fork_h + 4, vec![spend_c]);
+    let err = hub
+        .accept_block(double)
+        .expect_err("double-spend of multi+strong coinbase must fail");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("multi-spender"),
+        "reorg multi-list must not hard-fail structural; got: {msg}"
+    );
+    assert!(
+        msg.to_ascii_lowercase().contains("spent")
+            || msg.to_ascii_lowercase().contains("prevout")
+            || msg.to_ascii_lowercase().contains("double"),
+        "expected prevout-spent class error, got: {msg}"
+    );
+
+    // Honest tip extension still works after multi-list exists on disk.
+    let ext = mine_regtest_block(p, t + 600, fork_h + 4, vec![]);
+    let o = hub
+        .accept_block(ext)
+        .expect("tip extension after multi-list reorg must succeed");
+    match o {
+        AcceptOutcome::Accepted { height } => assert_eq!(height, fork_h + 4),
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+    assert_eq!(hub.tip_height(), Some(fork_h + 4));
+}
+
 /// Full `run_p2p` entry: listen, connect to seeder, exit via max_run_secs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "full run_p2p entry; run via scripts/integration.sh"]

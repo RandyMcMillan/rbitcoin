@@ -48,7 +48,7 @@ wire / body-queue
 | Load body | Every published create has a body range | No sequential `get_tx_full` fallback |
 | Wire/load pin | Every spent parent in `BatchParents` with `pin_covered`; cold denserels decode fail is hard Err | Class A denserels body load **is** the pin cold tier (not a post-load fallback) |
 | Ensure (write) | Every non-null spend edge has denserels/abs after ensure returns | Residency then denserels body to **complete** load-ahead; incomplete → `invariant:` |
-| Structural spentness | Abs required when parent was pin-loaded | Cold body-range walk only if **not** pinned (unit-test empty pin) or multi-list after meta |
+| Structural spentness | Abs required when parent was pin-loaded; multi-list → confirmed-strong walk (reorg protocol) | Cold body-range walk only if **not** pinned (unit-test empty pin). Multi flag alone is **not** hard `Err` |
 | Spend annotate | Abs-only `put_spend_batch_by_abs_meta`; cold OOB/IO is hard Err | No ranged/by_create annotate tiers |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |

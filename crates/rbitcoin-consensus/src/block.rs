@@ -1222,9 +1222,10 @@ pub(crate) struct StructuralPhaseNs {
 /// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
 /// **Spentness:** pin denserels → abs + bulk 9-byte meta. Sparse durable-**spent**
-/// set (not unspent). **No cold body walk** on the write path — missing abs /
-/// multi / short meta is hard `Err`. Snapshots `(field, flags)` into
-/// `meta_by_abs` for pure-write annotate.
+/// set (not unspent). Missing abs / short meta is hard `Err`. **Multi-list** after
+/// reorg annotate is a protocol cold walk (`has_confirmed_strong_spender_create`)
+/// — not a hard fail (tip-follow reorgs leave multi flags by design). Snapshots
+/// `(field, flags)` into `meta_by_abs` for pure-write annotate.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1298,6 +1299,7 @@ pub(crate) fn structural_validate_spends(
     // Serial with create_h heights below — combined multi-fd wave was measured
     // neutral/worse (body DONTCACHE peeks + height slots).
     let mut spent_strong_ns = 0u64;
+    let mut multi_list_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
         let meta_backend = rbitcoin_store::spend_meta_backend();
@@ -1325,9 +1327,24 @@ pub(crate) fn structural_validate_spends(
             meta_by_abs.insert(abs, (field, flags));
             let multi = flags & rbitcoin_store::output_flags::MULTI_SPENDER != 0;
             if multi {
-                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: structural multi-spender (cold forbidden on write path)",
-                )));
+                // Protocol path (docs/invariants.md): reorg / second annotate leaves a
+                // multi-list. Resolve confirmed-strong via list walk — do **not**
+                // hard-fail the flag alone (that freezes tip after any tip-follow reorg
+                // that double-annotated a parent out).
+                let t_m = Instant::now();
+                let spent = query
+                    .store()
+                    .has_confirmed_strong_spender_create(
+                        rbitcoin_primitives::Fk(id),
+                        vout,
+                        None,
+                    )
+                    .map_err(ConsensusError::Store)?;
+                multi_list_ns = multi_list_ns.saturating_add(t_m.elapsed().as_nanos() as u64);
+                if spent {
+                    durable_spent.insert((id, vout));
+                }
+                continue;
             }
             if field.is_null() {
                 continue; // unspent
@@ -1340,9 +1357,12 @@ pub(crate) fn structural_validate_spends(
                 durable_spent.insert((id, vout));
             }
         }
-        spent_strong_ns = t_strong.elapsed().as_nanos() as u64;
+        spent_strong_ns = t_strong
+            .elapsed()
+            .as_nanos()
+            .saturating_sub(multi_list_ns as u128) as u64;
     }
-    // abs ≈ collect + meta pread (not strong loop).
+    // abs ≈ collect + meta pread (not strong loop / multi walk).
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
     // Null create_fk (rare): same-block / unset create — txid path, not Class A body cold.
@@ -1359,9 +1379,9 @@ pub(crate) fn structural_validate_spends(
             durable_null_spent.insert((prev_txid, vout));
         }
     }
-    // spent_cold stays 0 for Class A abs path; null-create probes are not body cold.
-    let spent_cold_ns = 0u64;
-    let _ = t_cold;
+    // Multi-list walks + null-create probes are protocol cold; sole abs path is hot.
+    let spent_cold_ns =
+        multi_list_ns.saturating_add(t_cold.elapsed().as_nanos() as u64);
 
     // Order-sensitive pending double-spend + durable rejection.
     let t_pending = Instant::now();

@@ -194,6 +194,7 @@ pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
+    U64IdentityHasher, U64Map,
     SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;

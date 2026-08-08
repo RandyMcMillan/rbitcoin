@@ -40,10 +40,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-/// Identity hasher for `u64` create_fk keys (no mixing). Pack maps are dense
-/// integer ids; std's default hasher dominated pure HashMap benches at ~8k.
+/// Identity hasher for `u64` / single-field `Fk` keys (no mixing). Pack maps are
+/// dense integer ids; at ~8k keys this beats std's default hasher on pure
+/// insert+lookup benches (confirm_stage_cpu).
 #[derive(Default, Clone, Copy)]
-pub(crate) struct U64IdentityHasher(u64);
+pub struct U64IdentityHasher(u64);
 
 impl Hasher for U64IdentityHasher {
     #[inline]
@@ -67,7 +68,8 @@ impl Hasher for U64IdentityHasher {
     }
 }
 
-type U64Map<V> = HashMap<u64, V, BuildHasherDefault<U64IdentityHasher>>;
+/// `HashMap` with [`U64IdentityHasher`] for create_fk / height integer keys.
+pub type U64Map<V> = HashMap<u64, V, BuildHasherDefault<U64IdentityHasher>>;
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -1395,6 +1397,29 @@ mod tests {
         // Second publish with no new inserts is free.
         bp.publish_to_store();
         assert_eq!(store.live_count(), 11);
+    }
+
+    /// Identity hasher for pack-scale u64 keys is the raw key (no SipHash mix).
+    /// Write/lookup structural maps depend on this for the measured CPU win.
+    #[test]
+    fn u64_identity_hasher_is_raw_key_and_map_roundtrips_pack_scale() {
+        let mut h = U64IdentityHasher::default();
+        h.write_u64(0xdead_beef_cafe_u64);
+        assert_eq!(h.finish(), 0xdead_beef_cafe_u64);
+
+        // Pack-scale create_fk map: sequential ids must insert + get without loss.
+        let n = 8_000u64;
+        let mut m: U64Map<u32> = U64Map::with_capacity_and_hasher(n as usize, Default::default());
+        for i in 1..=n {
+            m.insert(i, (i % 1_000_000) as u32);
+        }
+        assert_eq!(m.len(), n as usize);
+        for i in 1..=n {
+            assert_eq!(m.get(&i).copied(), Some((i % 1_000_000) as u32));
+        }
+        // Collisions / wrong finish would drop keys under open addressing.
+        assert_eq!(m.get(&0), None);
+        assert_eq!(m.get(&(n + 1)), None);
     }
 
     /// Free-plan insert must not require a store hit — vacant path is local only.

@@ -7,11 +7,17 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, OutPoint, Transaction, TxOut};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
+use rbitcoin_query::{Query, U64IdentityHasher, U64Map};
 use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// Pack-scale maps keyed by small integers / `Fk` (identity hasher).
+type U32Map<V> = HashMap<u32, V, BuildHasherDefault<U64IdentityHasher>>;
+type FkMap<V> = HashMap<rbitcoin_primitives::Fk, V, BuildHasherDefault<U64IdentityHasher>>;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -559,8 +565,8 @@ pub fn validate_block_connect(
     // Note: empty BatchParents → missing abs → Err (cold forbidden). Callers that
     // need connect without pin must use confirm_write_phase with full pin.
     let mut structural_pending = std::collections::HashSet::new();
-    let mut mtp_cache = std::collections::HashMap::new();
-    let mut meta_by_abs = std::collections::HashMap::new();
+    let mut mtp_cache = U32Map::default();
+    let mut meta_by_abs = U64Map::default();
     let _ = structural_validate_spends(
         query,
         block,
@@ -1239,16 +1245,16 @@ pub(crate) fn structural_validate_spends(
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     batch_parents: &rbitcoin_query::BatchParents,
     // MTP by end-height, shared across blocks in one write run.
-    mtp_cache: &mut std::collections::HashMap<u32, u32>,
+    mtp_cache: &mut U32Map<u32>,
     // Structural disk meta for pure-write annotate: abs → (field, flags).
-    meta_by_abs: &mut std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
+    meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::time::Instant;
 
     // create_fk → create height (BIP68), filled in create-height phase.
-    let mut create_height_by_fk: HashMap<rbitcoin_primitives::Fk, u32> =
-        HashMap::with_capacity(spends.len().min(256));
+    let mut create_height_by_fk: FkMap<u32> =
+        FkMap::with_capacity_and_hasher(spends.len().min(256), BuildHasherDefault::default());
     let maturity = ctx.params.coinbase_maturity();
 
     // ── Spentness (durable + same-run pending) ─────────────────────────────
@@ -1257,7 +1263,7 @@ pub(crate) fn structural_validate_spends(
     let t_spent = Instant::now();
 
     // Unique create_fk → sorted unique vouts.
-    let mut vouts_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut vouts_by_create: U64Map<Vec<u32>> = U64Map::default();
     let mut null_create_keys: Vec<([u8; 32], u32)> = Vec::new();
     for &(prev_txid, vout, _sfk, create_fk) in spends {
         if create_fk.is_null() {
@@ -1434,7 +1440,7 @@ pub(crate) fn structural_validate_spends(
         .store()
         .tx_height_get_batch(&unique_create_fks)
         .map_err(ConsensusError::Store)?;
-    let height_by_id: HashMap<u64, u32> = unique_create_fks
+    let height_by_id: U64Map<u32> = unique_create_fks
         .iter()
         .zip(durable_heights.into_iter())
         .filter_map(|(fk, h)| {
@@ -1566,7 +1572,7 @@ pub(crate) fn structural_validate_spends(
 fn mtp_at(
     query: &Query,
     height: Height,
-    cache: &mut std::collections::HashMap<u32, u32>,
+    cache: &mut U32Map<u32>,
 ) -> Result<u32, ConsensusError> {
     if let Some(&t) = cache.get(&height.0) {
         return Ok(t);
@@ -3344,18 +3350,18 @@ mod structure_rule_tests {
 
         // Structural without denserels/abs is invariant — not soft PrevoutSpent recovery.
         {
-            use super::structural_validate_spends;
+            use super::{structural_validate_spends, U32Map};
             use rbitcoin_primitives::Fk;
-            use rbitcoin_query::BatchParents;
-            use std::collections::{HashMap, HashSet};
+            use rbitcoin_query::{BatchParents, U64Map};
+            use std::collections::HashSet;
             let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
             let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
             let parents = BatchParents::new();
             let ctx =
                 ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
             let mut pending = HashSet::new();
-            let mut mtp = HashMap::new();
-            let mut meta = HashMap::new();
+            let mut mtp = U32Map::default();
+            let mut meta = U64Map::default();
             let err = structural_validate_spends(
                 &q,
                 &b_n1,

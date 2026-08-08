@@ -2590,8 +2590,8 @@ pub fn confirm_write_phase(
 
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     // Structural fills meta_by_abs for pure-write annotate (no second body pread).
-    let mut meta_by_abs: std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)> =
-        std::collections::HashMap::new();
+    let mut meta_by_abs: rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)> =
+        rbitcoin_query::U64Map::default();
     let t_struct = Instant::now();
     let struct_ph = structural_run(
         query,
@@ -4440,7 +4440,7 @@ mod write_idempotent_tests {
         }];
         // Empty BatchParents → get_spender_abs is None.
         let bp = BatchParents::new();
-        let meta = std::collections::HashMap::new();
+        let meta = rbitcoin_query::U64Map::default();
         let err = post_commit(&q, &prepared, &bp, &meta).expect_err("missing denserels");
         let msg = format!("{err}");
         assert!(
@@ -4695,8 +4695,10 @@ mod write_idempotent_tests {
         let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk)];
         let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
         let mut pending = HashSet::new();
-        let mut mtp = HashMap::new();
-        let mut meta_by_abs = HashMap::new();
+        type U32Map =
+            HashMap<u32, u32, std::hash::BuildHasherDefault<rbitcoin_query::U64IdentityHasher>>;
+        let mut mtp = U32Map::default();
+        let mut meta_by_abs = rbitcoin_query::U64Map::default();
         let err = structural_validate_spends(
             &q,
             &block,
@@ -5035,13 +5037,16 @@ fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
-    meta_by_abs: &mut std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
+    meta_by_abs: &mut rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
+    use std::hash::BuildHasherDefault;
+    use rbitcoin_query::U64IdentityHasher;
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
     // MTP of height H reused across blocks/spends in this write run.
-    let mut mtp_cache: HashMap<u32, u32> = HashMap::new();
+    type U32Map = HashMap<u32, u32, BuildHasherDefault<U64IdentityHasher>>;
+    let mut mtp_cache: U32Map = U32Map::default();
     let mut tot = StructuralPhaseNs::default();
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
@@ -5154,7 +5159,7 @@ fn post_commit(
     query: &Query,
     prepared: &[Prepared],
     batch_parents: &rbitcoin_query::BatchParents,
-    meta_by_abs: &std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
+    meta_by_abs: &rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<(u64, u64), ConsensusError> {
     // Confirm write (IBD + tip via accept_and_connect → confirm_archived_run):
     // batch durable spend annotations after Class C. Load pin must supply

@@ -6,6 +6,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::hashhead::HeadRole;
 use crate::scripthash_head::{
     sh_per_shard_key_budget, sh_unique_hint_default, LiveShardTable, ShardedScriptHashHead,
@@ -24,7 +25,7 @@ use crate::sorted_run::{
 };
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -194,11 +195,31 @@ pub struct ScriptHashTable {
     overflow: Mutex<Option<ShardedScriptHashHead>>,
     /// Main head no longer accepts **new** keys (still updates existing).
     main_sealed: std::sync::atomic::AtomicBool,
+    /// Optional main membership filter after seal (no FN for keys at build).
+    main_fuse: Mutex<Option<SealedFuse8>>,
     alloc: Mutex<AllocState>,
 }
 
 const MAIN_SEALED_NAME: &str = "scripthash.main_sealed";
 const OVERFLOW_HEAD_NAME: &str = "scripthash.ovf.head";
+const MAIN_FUSE_NAME: &str = "scripthash.head.fuse8";
+
+/// Fuse key from full Electrum scripthash (uses 16 B head prefix + zero pad).
+#[inline]
+fn sh_fuse_key(full: &[u8; 32]) -> u64 {
+    let mut pad = [0u8; 32];
+    pad[..16].copy_from_slice(&full[..16]);
+    fuse_key_from_mixed(&pad)
+}
+
+/// Load main seal fuse if a valid BF8R file exists (placeholder bytes → None).
+fn load_main_fuse(dir: &Path) -> Option<SealedFuse8> {
+    let path = dir.join(MAIN_FUSE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    SealedFuse8::read_from(&path).ok()
+}
 
 /// Where a scripthash key lives for head upsert routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +254,7 @@ impl ScriptHashTable {
             )?,
             overflow: Mutex::new(None),
             main_sealed: std::sync::atomic::AtomicBool::new(false),
+            main_fuse: Mutex::new(None),
             alloc: Mutex::new(state),
         })
     }
@@ -280,12 +302,14 @@ impl ScriptHashTable {
         } else {
             None
         };
+        let fuse = load_main_fuse(dir);
         Ok(Self {
             store_dir: dir.to_path_buf(),
             body,
             head,
             overflow: Mutex::new(overflow),
             main_sealed: std::sync::atomic::AtomicBool::new(sealed),
+            main_fuse: Mutex::new(fuse),
             alloc: Mutex::new(state),
         })
     }
@@ -327,15 +351,25 @@ impl ScriptHashTable {
         let _ = std::fs::write(&marker, b"1");
         self.main_sealed
             .store(true, std::sync::atomic::Ordering::Release);
-        // Background fuse8 for main (best-effort; probe main OA until ready).
-        let dir = self.store_dir.clone();
-        let _ = std::thread::Builder::new()
-            .name("sh-main-fuse".into())
-            .spawn(move || {
-                let fuse_path = dir.join("scripthash.head.fuse8");
-                // Durable seal marker product (full fuse8 encode is optional bg work).
-                let _ = std::fs::write(fuse_path, b"SHFUSE01");
-            });
+        // Build membership fuse from current main keys (no FN for sealed set).
+        // Until the fuse is ready, sealed routing falls back to try-upsert.
+        self.rebuild_main_fuse()?;
+        Ok(())
+    }
+
+    /// Collect main OA keys and write [`MAIN_FUSE_NAME`] + in-memory filter.
+    fn rebuild_main_fuse(&self) -> Result<(), StoreError> {
+        let mut set: HashSet<u64> = HashSet::new();
+        self.head.for_each_occupied(|full, _val| {
+            set.insert(sh_fuse_key(&full));
+            Ok(())
+        })?;
+        let mut keys: Vec<u64> = set.into_iter().collect();
+        keys.sort_unstable();
+        let fuse = SealedFuse8::build(&keys)?;
+        let path = self.store_dir.join(MAIN_FUSE_NAME);
+        fuse.write_to(&path)?;
+        *self.main_fuse.lock().unwrap() = Some(fuse);
         Ok(())
     }
 
@@ -890,73 +924,68 @@ impl ScriptHashTable {
         Ok((written, timing))
     }
 
-    /// Route head upserts: main (no rehash) for existing main keys / new keys under
-    /// seal load; overflow for new keys once main is full or sealed.
+    /// Route head upserts without get-then-insert:
+    /// - **Overflow home** → overflow only
+    /// - **Main home** → try main no-rehash (updates always apply)
+    /// - **Absent** + fuse says not on main → overflow
+    /// - **Absent** otherwise → try main no-rehash; **remainder** → overflow
+    ///
+    /// One main batch continues update-only after the first new-key miss so
+    /// later updates of keys already on main are never skipped.
     fn apply_head_upserts(
         &self,
         upserts: &[([u8; 32], ShHeadValue, KeyHome)],
         flush_each: bool,
     ) -> Result<(), StoreError> {
-        let mut main_u: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+        let mut main_try: Vec<([u8; 32], ShHeadValue)> = Vec::new();
         let mut ovf_u: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        let mut new_for_main: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+
+        let fuse = self.main_fuse.lock().unwrap().clone();
+        let sealed = self.main_is_sealed();
 
         for (key, val, home) in upserts {
             match home {
-                KeyHome::Main => main_u.push((*key, val.clone())),
                 KeyHome::Overflow => ovf_u.push((*key, val.clone())),
+                KeyHome::Main => {
+                    // Known main slot: always try main (in-place update).
+                    main_try.push((*key, val.clone()));
+                }
                 KeyHome::Absent => {
-                    if self.main_accepts_new_key() {
-                        new_for_main.push((*key, val.clone()));
+                    if sealed {
+                        if let Some(ref f) = fuse {
+                            // Fuse has no false negatives for sealed set: absent → overflow.
+                            if !f.contains(sh_fuse_key(key)) {
+                                ovf_u.push((*key, val.clone()));
+                                continue;
+                            }
+                        }
+                        // No fuse, or fuse says maybe present: try-upsert (not get-then-insert).
+                        main_try.push((*key, val.clone()));
+                    } else if self.main_accepts_new_key() {
+                        main_try.push((*key, val.clone()));
                     } else {
+                        // Load gate without sealing yet — new keys to overflow.
                         ovf_u.push((*key, val.clone()));
                     }
                 }
             }
         }
 
-        // Existing main keys (updates only — slots already occupied).
-        if !main_u.is_empty() {
-            self.head
-                .insert_many_sharded_no_rehash(&main_u, flush_each)?;
-        }
-        // New keys: try main without rehash. `insert_many_no_rehash` may commit a
-        // *prefix* of the batch then return NeedRehash — only spill keys that are
-        // still absent from main (never dual-home a key on main + overflow).
-        if !new_for_main.is_empty() {
-            match self
+        if !main_try.is_empty() {
+            // Remainder = new keys that could not place; updates already applied.
+            let rem = self
                 .head
-                .insert_many_sharded_no_rehash(&new_for_main, flush_each)
-            {
-                Ok(()) => {}
-                Err(StoreError::Corrupt(msg))
-                    if msg.contains("no rehash") || msg.contains("overflow") =>
-                {
-                    for (key, val) in new_for_main {
-                        if self.head.get(&key)?.is_some() {
-                            // Already durable on main from the partial batch.
-                            continue;
-                        }
-                        ovf_u.push((key, val));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
+                .insert_many_sharded_no_rehash(&main_try, flush_each)?;
+            ovf_u.extend(rem);
         }
         if !ovf_u.is_empty() {
             self.ensure_overflow()?;
             let g = self.overflow.lock().unwrap();
             let ovf = g.as_ref().expect("overflow just ensured");
-            // Overflow may still rehash until it seals; prefer no_rehash then fall back.
-            match ovf.insert_many_sharded_no_rehash(&ovf_u, flush_each) {
-                Ok(()) => {}
-                Err(StoreError::Corrupt(msg))
-                    if msg.contains("no rehash") || msg.contains("overflow") =>
-                {
-                    // Overflow segment growth via normal insert (rehash allowed on ovf).
-                    ovf.insert_many_sharded(&ovf_u, flush_each)?;
-                }
-                Err(e) => return Err(e),
+            // Overflow may rehash (grow). Prefer no-rehash then fall back.
+            let rem = ovf.insert_many_sharded_no_rehash(&ovf_u, flush_each)?;
+            if !rem.is_empty() {
+                ovf.insert_many_sharded(&rem, flush_each)?;
             }
         }
         Ok(())
@@ -1991,12 +2020,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Batch path that crosses main capacity must not dual-home keys on main+overflow.
-    ///
-    /// Regression for `apply_head_upserts`: mid-batch `insert_many_no_rehash` NeedRehash
-    /// used to spill the *entire* new-key set to overflow after a partial main commit.
+    /// Batch that crosses main capacity: no dual-home, and a main-key **update**
+    /// in the same batch still applies on main (update-only continues after remainder).
     #[test]
-    fn put_create_batch_across_seal_no_dual_home() {
+    fn put_create_batch_across_capacity_remainder_and_main_update() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         // 50 unique keys on main (load 50/64 ≈ 0.78 — still accepts new keys).
@@ -2006,30 +2033,43 @@ mod tests {
             t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
             main_keys.push(sh);
         }
-        // One batch of 20 new keys: some may land on main before no-rehash full, rest
-        // overflow — each key must appear on exactly one head (for_each == unique FKs).
-        let batch: Vec<_> = (0..20u32)
-            .map(|i| {
-                let sh = script_hash(&[0xc1, (i & 0xff) as u8, 0x22, 0x33]);
-                rec(sh, 10_000 + u64::from(i), 0)
-            })
-            .collect();
+        let sh_update = main_keys[0];
+        // One public batch: update an existing main key + 20 brand-new keys.
+        // insert sorts by slot; after first new-key NeedSlot, update-only must still
+        // land the main-key append on main (not skip, not dual-home on overflow).
+        let mut batch = vec![rec(sh_update, 99_999, 1)];
+        for i in 0..20u32 {
+            let sh = script_hash(&[0xc1, (i & 0xff) as u8, 0x22, 0x33]);
+            batch.push(rec(sh, 10_000 + u64::from(i), 0));
+        }
         let n = t.put_create_batch(&batch).unwrap();
-        assert_eq!(n, 20);
+        assert_eq!(n, 21, "1 update append + 20 new");
+
+        // Updated main key: both FKs, on main only.
+        assert!(t.head.get(&sh_update).unwrap().is_some());
+        assert!(t.contains_create(&sh_update, Fk(1)).unwrap());
+        assert!(t.contains_create(&sh_update, Fk(99_999)).unwrap());
+        assert_eq!(t.entries(&sh_update).unwrap().len(), 2);
+        {
+            let g = t.overflow.lock().unwrap();
+            if let Some(ovf) = g.as_ref() {
+                assert!(
+                    ovf.get(&sh_update).unwrap().is_none(),
+                    "main update must not dual-home on overflow"
+                );
+            }
+        }
 
         let mut for_each_n = 0u64;
         t.for_each_live_create(|_| for_each_n += 1).unwrap();
+        // 50 original creates + 1 update FK + 20 new = 71 unique FKs
         assert_eq!(
-            for_each_n, 70,
-            "for_each must equal unique creates (50+20); dual-home would inflate count"
+            for_each_n, 71,
+            "for_each must equal unique creates; dual-home would inflate"
         );
 
-        // Every batch key is findable once; none may sit on both main and overflow.
-        for rec in &batch {
-            assert!(
-                t.contains_create(&rec.scripthash, rec.create_tx_fk).unwrap(),
-                "batch key missing from entries"
-            );
+        for rec in batch.iter().skip(1) {
+            assert!(t.contains_create(&rec.scripthash, rec.create_tx_fk).unwrap());
             let on_main = t.head.get(&rec.scripthash).unwrap().is_some();
             let on_ovf = {
                 let g = t.overflow.lock().unwrap();
@@ -2040,21 +2080,55 @@ mod tests {
             };
             assert!(
                 on_main ^ on_ovf,
-                "key must live on exactly one of main/overflow (main={on_main} ovf={on_ovf})"
+                "new key must live on exactly one head (main={on_main} ovf={on_ovf})"
             );
         }
-        // Pre-batch main keys stay on main only.
-        for sh in &main_keys {
-            assert!(t.head.get(sh).unwrap().is_some());
-            let on_ovf = {
-                let g = t.overflow.lock().unwrap();
-                match g.as_ref() {
-                    Some(ovf) => ovf.get(sh).unwrap().is_some(),
-                    None => false,
-                }
-            };
-            assert!(!on_ovf, "pre-existing main key must not also be on overflow");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After seal, fuse excludes new keys → overflow without main get-then-insert.
+    #[test]
+    fn sealed_fuse_absent_goes_overflow_try_upsert_updates_main() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let mut main_keys = Vec::new();
+        for i in 0..52u32 {
+            let sh = script_hash(&[0xd0, (i & 0xff) as u8, 0x44, 0x55]);
+            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
+            main_keys.push(sh);
         }
+        assert!(t.main_is_sealed());
+        assert!(
+            dir.join(MAIN_FUSE_NAME).is_file(),
+            "real fuse product after seal"
+        );
+        // Valid fuse loads into process (BF8R), not placeholder.
+        assert!(
+            t.main_fuse.lock().unwrap().is_some(),
+            "in-memory fuse after seal"
+        );
+
+        let sh_new = script_hash(&[0xd1, 0xaa, 0xbb, 0xcc]);
+        t.put_create(&rec(sh_new, 7_777, 0)).unwrap();
+        assert!(
+            t.head.get(&sh_new).unwrap().is_none(),
+            "fuse-absent key must not land on main"
+        );
+        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
+        assert!(t.contains_create(&sh_new, Fk(7_777)).unwrap());
+
+        // Existing main key: try-upsert path (fuse says present) updates main.
+        let sh0 = main_keys[0];
+        t.put_create(&rec(sh0, 8_888, 1)).unwrap();
+        assert!(t.head.get(&sh0).unwrap().is_some());
+        assert_eq!(t.entries(&sh0).unwrap().len(), 2);
+        assert!(t.contains_create(&sh0, Fk(8_888)).unwrap());
+
+        drop(t);
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert!(t.main_fuse.lock().unwrap().is_some(), "fuse reloads on open");
+        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
+        assert_eq!(t.entries(&sh0).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

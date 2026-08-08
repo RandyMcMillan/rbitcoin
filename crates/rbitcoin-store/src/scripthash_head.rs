@@ -461,7 +461,7 @@ impl ScriptHashHead {
             while i < work.len() {
                 let (key, ref val) = work[i];
                 let enc = val.encode();
-                match cache.try_insert(&key, &enc)? {
+                match cache.try_insert(&key, &enc, true)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
                             let mut state = self.state.lock().unwrap();
@@ -473,7 +473,7 @@ impl ScriptHashHead {
                         }
                         i += 1;
                     }
-                    InsertResult::NeedRehash => {
+                    InsertResult::NeedSlot => {
                         need_rehash = true;
                         break;
                     }
@@ -485,7 +485,7 @@ impl ScriptHashHead {
                     let state = self.state.lock().unwrap();
                     (state.slots, state.occupied, state.occ_known)
                 };
-                // NeedRehash with unknown occupancy: double slots via rehash scan.
+                // NeedSlot with unknown occupancy: double slots via rehash scan.
                 let remain = (work.len() - i) as u64;
                 let need = if occ_known {
                     Self::slots_for_keys(occupied.saturating_add(remain))
@@ -508,32 +508,58 @@ impl ScriptHashHead {
         Ok(())
     }
 
-    /// Like [`insert_many`] but **never rehashes** — returns error if a new key
-    /// cannot fit under the current load ceiling (caller should use overflow).
+    /// Like [`insert_many`] but **never rehashes**.
+    ///
+    /// Applies every in-place **update** it can. When a **new** key cannot be
+    /// placed (no empty slot / load would require grow), that key is pushed to
+    /// the returned **remainder** and the rest of the batch continues in
+    /// **update-only** mode (existing keys still get their new values; further
+    /// new keys join the remainder). Caller routes remainder to overflow.
+    ///
+    /// Empty remainder means the full batch landed on this head.
     pub fn insert_many_no_rehash(
         &self,
         upserts: &[(ShHeadKey, ShHeadValue)],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<(ShHeadKey, ShHeadValue)>, StoreError> {
         if upserts.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        // Known-empty + all fit: one sequential fill (no remainder).
         if self.is_known_empty() {
-            return self.bulk_fill_empty(upserts);
+            let slots = self.state.lock().unwrap().slots;
+            let max_fit = slots
+                .saturating_mul(MAX_LOAD_NUM)
+                .checked_div(MAX_LOAD_DEN)
+                .unwrap_or(slots);
+            if (upserts.len() as u64) <= max_fit && (upserts.len() as u64) <= slots {
+                self.bulk_fill_empty(upserts)?;
+                return Ok(Vec::new());
+            }
         }
-        let mut work = upserts.to_vec();
+
+        let mut work: Vec<(ShHeadKey, ShHeadValue, usize)> = upserts
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, (k, v))| (k, v, i))
+            .collect();
         let slots_now = self.state.lock().unwrap().slots;
-        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
+        work.sort_unstable_by_key(|(k, _, _)| Self::hash_slot(k, slots_now));
+
+        let mut remainder: Vec<(ShHeadKey, ShHeadValue)> = Vec::new();
+        // After the first new-key placement failure, only in-place updates apply.
+        let mut allow_new = true;
         let mut i = 0usize;
         while i < work.len() {
             let slots = self.state.lock().unwrap().slots;
             if i > 0 {
-                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots));
+                work[i..].sort_unstable_by_key(|(k, _, _)| Self::hash_slot(k, slots));
             }
             let mut cache = SlotPageCache::new(self, slots);
             while i < work.len() {
-                let (key, ref val) = work[i];
+                let (key, ref val, _) = work[i];
                 let enc = val.encode();
-                match cache.try_insert(&key, &enc)? {
+                match cache.try_insert(&key, &enc, allow_new)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
                             let mut state = self.state.lock().unwrap();
@@ -543,11 +569,11 @@ impl ScriptHashHead {
                         }
                         i += 1;
                     }
-                    InsertResult::NeedRehash => {
-                        cache.flush()?;
-                        return Err(StoreError::Corrupt(
-                            "scripthash head full (no rehash; use overflow)",
-                        ));
+                    InsertResult::NeedSlot => {
+                        // New key cannot place — keep applying updates for the rest.
+                        allow_new = false;
+                        remainder.push((key, val.clone()));
+                        i += 1;
                     }
                 }
             }
@@ -561,7 +587,7 @@ impl ScriptHashHead {
                 self.persist_occ(occ);
             }
         }
-        Ok(())
+        Ok(remainder)
     }
 
     /// occupied/slots when occupancy is known (`None` if unknown).
@@ -780,9 +806,9 @@ impl ScriptHashHead {
         let n_entries = entries.len() as u64;
         let mut cache = SlotPageCache::new(self, new_slots);
         for (k, v) in &entries {
-            match cache.try_insert(k, v)? {
+            match cache.try_insert(k, v, true)? {
                 InsertResult::Done(_) => {}
-                InsertResult::NeedRehash => {
+                InsertResult::NeedSlot => {
                     cache.flush()?;
                     return Err(StoreError::Corrupt("scripthash head rehash failed"));
                 }
@@ -851,8 +877,11 @@ fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
 }
 
 enum InsertResult {
+    /// Wrote the slot. `true` = filled a previously empty slot (new key).
     Done(bool),
-    NeedRehash,
+    /// Key is not present and a new slot is required (or `allow_new` is false at
+    /// the first empty / end of probe). Caller may rehash or spill to overflow.
+    NeedSlot,
 }
 
 struct SlotPageCache<'a> {
@@ -879,15 +908,23 @@ impl<'a> SlotPageCache<'a> {
         }
     }
 
+    /// Probe-insert. When `allow_new` is false, only in-place updates of an
+    /// existing key succeed; empty slot (key absent under open addressing) or a
+    /// full probe without a match returns [`InsertResult::NeedSlot`].
     fn try_insert(
         &mut self,
         key: &ShHeadKey,
         value: &[u8; SH_HEAD_VALUE_LEN],
+        allow_new: bool,
     ) -> Result<InsertResult, StoreError> {
         let mut slot = ScriptHashHead::hash_slot(key, self.slots);
         for _ in 0..self.slots {
             let (k, old_v) = self.read_slot(slot)?;
             if is_empty_slot(&k, &old_v) {
+                if !allow_new {
+                    // Empty ends the open-address probe: key is not present.
+                    return Ok(InsertResult::NeedSlot);
+                }
                 self.write_slot(slot, key, value)?;
                 return Ok(InsertResult::Done(true));
             }
@@ -897,7 +934,7 @@ impl<'a> SlotPageCache<'a> {
             }
             slot = (slot + 1) & (self.slots - 1);
         }
-        Ok(InsertResult::NeedRehash)
+        Ok(InsertResult::NeedSlot)
     }
 
     fn read_slot(&mut self, slot: u64) -> Result<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN]), StoreError> {
@@ -1304,24 +1341,43 @@ impl ShardedScriptHashHead {
         Some(occ as f64 / slots as f64)
     }
 
-    /// Insert without rehash; fails if any shard would need to grow.
+    /// Insert without rehash. Returns **remainder** full keys that need overflow
+    /// (new keys that could not be placed). In-place updates always apply; after
+    /// the first new-key miss each shard continues update-only.
     pub fn insert_many_sharded_no_rehash(
         &self,
         entries: &[([u8; 32], ShHeadValue)],
         flush_each_shard: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let n = self.shards.len();
+        let mut remainder: Vec<([u8; 32], ShHeadValue)> = Vec::new();
         if n == 1 {
             let mapped: Vec<_> = entries
                 .iter()
                 .map(|(k, v)| (head_key_from_full(k), v.clone()))
                 .collect();
-            return self.shards[0].insert_many_no_rehash(&mapped);
+            let rem = self.shards[0].insert_many_no_rehash(&mapped)?;
+            // Map 16 B head keys back to full inputs (prefix match).
+            if !rem.is_empty() {
+                for (hk, hv) in rem {
+                    if let Some((full, _)) = entries.iter().find(|(f, _)| {
+                        head_key_from_full(f) == hk
+                    }) {
+                        remainder.push((*full, hv));
+                    } else {
+                        // Reconstruct padded full from head key (seed/get uses same).
+                        let mut full = [0u8; 32];
+                        full[..SH_HEAD_KEY_LEN].copy_from_slice(&hk);
+                        remainder.push((full, hv));
+                    }
+                }
+            }
+            return Ok(remainder);
         }
-        let mut buckets: Vec<Vec<( [u8; 32], ShHeadValue)>> =
+        let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> =
             (0..n).map(|_| Vec::new()).collect();
         for (k, v) in entries {
             buckets[self.shard_of(k)].push((*k, v.clone()));
@@ -1334,12 +1390,22 @@ impl ShardedScriptHashHead {
                 .iter()
                 .map(|(k, v)| (head_key_from_full(k), v.clone()))
                 .collect();
-            self.shards[si].insert_many_no_rehash(&mapped)?;
+            let rem = self.shards[si].insert_many_no_rehash(&mapped)?;
+            for (hk, hv) in rem {
+                if let Some((full, _)) = bucket.iter().find(|(f, _)| head_key_from_full(f) == hk)
+                {
+                    remainder.push((*full, hv));
+                } else {
+                    let mut full = [0u8; 32];
+                    full[..SH_HEAD_KEY_LEN].copy_from_slice(&hk);
+                    remainder.push((full, hv));
+                }
+            }
             if flush_each_shard {
                 self.shards[si].flush()?;
             }
         }
-        Ok(())
+        Ok(remainder)
     }
 
     pub fn insert_many_sharded(
@@ -1677,6 +1743,80 @@ mod tests {
         h2.reinit_empty().unwrap();
         assert!(h2.is_known_empty());
         assert!(load_occ_sidecar(&path) == Some(0));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    }
+
+    /// No-rehash batch returns remainder for new keys after full; still applies
+    /// later in-place updates (update-only mode) without a get-scan.
+    #[test]
+    fn insert_many_no_rehash_remainder_keeps_updates() {
+        use crate::scripthash_layout::head_key_from_full;
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-norem-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        // Tiny table: 8 slots. Seed via no_rehash so `insert` does not rehash to 64.
+        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
+        let mut existing = Vec::new();
+        let mut seed = Vec::new();
+        for i in 0..6u8 {
+            let mut full = [0u8; 32];
+            full[0] = i;
+            full[1] = 0x11;
+            seed.push((
+                head_key_from_full(&full),
+                ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
+            ));
+            existing.push(full);
+        }
+        assert!(h.insert_many_no_rehash(&seed).unwrap().is_empty());
+        assert_eq!(h.slots(), 8);
+        assert_eq!(h.occupied(), 6);
+        // Batch: update first existing key + 6 brand-new keys (more than free slots).
+        let mut batch: Vec<(crate::scripthash_layout::ShHeadKey, ShHeadValue)> = Vec::new();
+        batch.push((
+            head_key_from_full(&existing[0]),
+            ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(99))),
+        ));
+        for i in 0..6u8 {
+            let mut full = [0u8; 32];
+            full[0] = 0xa0 + i;
+            full[1] = 0x22;
+            batch.push((
+                head_key_from_full(&full),
+                ShHeadValue::inline_one(ShEntry::new(Fk(100 + u64::from(i)))),
+            ));
+        }
+        let rem = h.insert_many_no_rehash(&batch).unwrap();
+        assert!(
+            !rem.is_empty(),
+            "some new keys must remainder; occupied={} slots={} rem={} batch={}",
+            h.occupied(),
+            h.slots(),
+            rem.len(),
+            batch.len(),
+        );
+        assert_eq!(h.slots(), 8, "no-rehash must not grow");
+        // Update applied on the existing key.
+        let v = h.get(&existing[0]).unwrap().unwrap();
+        assert_eq!(v.inline_fks(), vec![Fk(1), Fk(99)]);
+        // Remainder keys are not on this head.
+        for (hk, _) in &rem {
+            let mut full = [0u8; 32];
+            full[..16].copy_from_slice(hk);
+            assert!(
+                h.get(&full).unwrap().is_none(),
+                "remainder key must not be on head"
+            );
+        }
+        // Update key must not appear in remainder.
+        let upd_hk = head_key_from_full(&existing[0]);
+        assert!(!rem.iter().any(|(k, _)| k == &upd_hk));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
     }

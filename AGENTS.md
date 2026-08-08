@@ -154,11 +154,62 @@ Skip commit/build only when the turn was pure discussion with no
 compile-affecting edits. If you cannot commit (hooks, secrets, user said not
 to), still do the static musl install and say the tree was **not** committed.
 
-## Tests required for code changes
+## Test-driven development (required for behavioral changes)
 
-- **Always ship test coverage with behavioral code changes.** Prefer unit tests next to the code (`#[cfg(test)]` in the same crate) or focused integration tests in `rbitcoin-test` / crate `tests/`. Pure docs/comments need no tests.
-- **Bug fixes must include a regression test** that fails without the fix and passes with it. Do not land a “fix” that only re-describes production logs; encode the failing case (fixture block, synthetic store, prevout/script edge) so it cannot silently come back.
-- Run the new/related tests before commit (e.g. `cargo test -p <crate> …` or the scenario that covers the change). If a full-store mainnet case cannot run in this VM (see datadir notes), still add a synthetic/unit regression that pins the logic.
+**Default: no production code change without a test that fails first and pins
+exactly the contract you are fixing or adding.** “When practical” is not an
+escape hatch for bugfixes or hot-path behavior. Pure docs/comments/formatting
+need no tests. If a full mainnet case cannot run in this VM (see datadir notes),
+still encode a synthetic/scenario regression that drives the **shipped** path.
+
+Thrashing (heal → unheal, soft-requeue → permanent, walk-seed → plan-lookup)
+comes from coding to logs instead of a failing assertion. A precise failing
+test forces a **surgical** fix and leaves permanent suite coverage.
+
+### Order of work (bugs and features)
+
+| Step | Required |
+|------|----------|
+| 1. Reproduce | Name the failing contract in one sentence (error string, invariant, observable outcome). Prefer static proof of the code path from production entry → bug when the failure is non-obvious. |
+| 2. Red | Add or extend a test that **fails without the change** and would pass only if that contract holds. Run it; capture the fail. |
+| 3. Green | Implement the **smallest** production change that makes that test pass. Do not expand scope mid-fix. |
+| 4. Re-run | Run the new/related tests before commit (`cargo test -p <crate> …` / scenario). |
+
+For **performance**, prefer a before/after benchmark or metered scenario that
+shows the win; do not land “perf” rewrites with only correctness tests.
+
+### What the test must assert
+
+| Do | Do not |
+|----|--------|
+| Assert the **exact** bug/feature contract (e.g. `expected_bits` with period-start **only** on header plan; pin identity mismatch → invariant, not soft spentness) | Vague “does not panic” / “returns Ok” without encoding the failure mode |
+| Drive the **shipped** function or pipeline stage under test | Local helpers that re-implement production and then assert the helper |
+| Fail with the **same class of error** (or wrong result) seen in prod when the bug is present | Comment-only or log-narrative “tests” with no executable pin |
+| Keep fixtures minimal and synthetic (`/tmp`, tiny head scale) | Require full mainnet datadir open in the agent VM |
+
+### Scenario vs unit — prefer scenarios, balance cost
+
+**Prefer scenario / integration tests** (`rbitcoin-test`, multi-stage confirm
+scenarios, store open→append→read) when they exercise the real entry point
+cheaply enough. They catch IO-split, tip-ahead, and stage-boundary bugs unit
+tests miss.
+
+**Also keep focused unit tests** next to the code (`#[cfg(test)]` in the same
+crate) when:
+
+- the scenario would be **slow**, multi-GB, or hard to set up for one branch;
+- the bug lives in a **pure helper** on the hot path (bits, range decode, append guards);
+- you need a **fast red/green loop** while iterating the fix.
+
+| Goal | How |
+|------|-----|
+| Quick CI / agent loop | Unit or slim scenario; avoid full-store opens and duplicate suites for the same lines |
+| Good practical coverage | One scenario at the entry that mattered in prod **or** one unit on the exact shipped fn — not both for the same lines unless the scenario cannot reach the branch |
+| Cheap later refactors | Assert **behavior/contracts**, not private layout trivia; collapse twin unit+integration for the same entry (see lean-code rules) |
+
+Do **not** grow a second full-store suite “for completeness” when a tighter test
+already pins the fix. Do **not** skip the failing test because “we’ll add
+coverage later.”
 
 ## Simplification / lean-code rules (apply while editing)
 
@@ -195,18 +246,6 @@ Do not leave dead code around. Delete it. Don't silence warnings unless there
 is bulletproof justification
 
 Same goes for #[cfg(test)].
-
-## Do test-driven development when practical
-
-Always for bugs, make sure to create a test the replicates the bug, run it to
-see it fail, then fix the bug and run the test to see it pass.
-
-For features, ideally we'd write a scenario test that fails without the
-required feature before beginning and then implement the feature and see the
-test pass.
-
-For performance, ideally we'd have a benchmark before we begin development
-that shows a clear change after.
 
 ## IBD / process memory leak prevention
 

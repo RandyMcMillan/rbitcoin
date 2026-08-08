@@ -175,6 +175,13 @@ Aligned with AGENTS.md TDD + suite speed:
 we must keep each Red thin. A plan that multiplies multi-second full-store opens
 is a bad plan even if slices are “vertical.”
 
+Concrete anti-pattern (see [`TESTING.md`](../TESTING.md) budgets): default-suite
+unit tests that set fixture size to **production** constants (`FANIN_TARGET_STREAM_RUNS`,
+mainnet head scale, full coinbase-maturity remine loops) when a **tiny** N still
+enters the same branch. Keep production geometry in pure helpers; drive IO paths
+with small targets. A step that adds a default test routinely **&gt;2 s** wall must
+justify the cost in the step / PR.
+
 ---
 
 ## Simple design under continuous refactor
@@ -246,6 +253,8 @@ Before accepting a plan:
 - [ ] No step larger than one Red→Green→Refactor without a spike  
 - [ ] Vertical slices; horizontal deps called out as prior steps  
 - [ ] Test budget: suite stays fast; no unjustified full-store twins  
+- [ ] No production-scale default fixtures when tiny N still hits the branch (see TESTING.md)  
+
 - [ ] Constraints cite project invariants (concurrency, IO split, no live heal, …)  
 - [ ] Out of scope is explicit  
 

@@ -48,11 +48,34 @@ cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
 | **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | All P2P IBD (2-node, multi-hop, tip-follow, 12-block smoke, mesh, `run_p2p`) |
 | **Ignored benches** | `cargo test -p rbitcoin-net --test freeze_benches -- --ignored` etc. | Optional perf / contention probes |
 
-Target: default suite wall **well under a few minutes** (stretch &lt;2 min on a warm tree).
+### Suite speed budgets (default tier)
+
+**Target:** warm default suite wall **≤3 min** (stretch **&lt;2 min**) on a Linux host comparable to CI / agent VM with a warm `target/`.
+
+**Baseline (agent VM, warm test profile, 2026-08-07):** full `cargo test --workspace` was **~1000 s (~17 min)** before store fan-in scale fixes. After parameterizing fan-in targets and shrinking SH head default benches (`6588b62` era): `rbitcoin-store --lib` serial **~26 s** (was **~498 s**); `sorted_run` module **~1 s** (was **~191 s**). Re-measure package walls when claiming further suite-speed work — do **not** re-run multi-minute full-suite timing loops as a planning spike.
+
+| Package / binary (warm, order-of-magnitude) | Budget | Notes |
+|---------------------------------------------|-------:|-------|
+| `rbitcoin-store --lib` | **&lt;45 s** | Fan-in reduce tests must use a **tiny** stream target, not production 4096 |
+| `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops when the branch allows |
+| `rbitcoin-query --lib` | **&lt;20 s** | |
+| `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
+| **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min**; ignore-tier IBD stays out |
+
+**New default-suite test rule:** if a new or expanded default test routinely takes **&gt;2 s wall** on a warm tree, the PR must **justify** it (what contract needs that cost, why a smaller N / unit cannot hit the branch). Prefer `#[ignore]` + reason string for true microbenches / host-only forensics.
+
+**Do not pin production-scale constants in default unit fixtures** when a smaller N still exercises the code path:
+
+| Anti-pattern | Prefer |
+|--------------|--------|
+| `n = FANIN_TARGET_STREAM_RUNS + ε` (~4k run files) | Pass a tiny `target_stream_runs` into reduce; keep 4096 geometry in pure math tests only |
+| Multi‑GiB / mainnet head scale under `cargo test` | `RBITCOIN_HEAD_SCALE=tiny` / `cfg(test)` default; force mainnet only for explicit scale tests |
+| Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` once per store |
+| Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
 **Hang note:** full IBD paths (`P2PNode::sync` → confirm lookup claim) can stall for many minutes under parallel `cargo test --workspace` load on this host (loadq full, claim ~5 s loops). They stay `#[ignore]` until that is fixed; still covered by `scripts/integration.sh` / `--ignored`.
 
-**Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios).
+**Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
 ### Coverage notes
 

@@ -275,6 +275,7 @@ coverage later.”
 | **No re-implemented oracles in tests** | A test must drive the **shipped** function. Local helpers that re-code the unit under test and then “assert” that helper are test theater — delete them. |
 | **Collapse same-entry duplicates** | Prefer one unit test next to the shipped path over twin unit+integration suites covering the same lines. Keep the closer entry-point test; drop the other only when coverage remains. |
 | **Compile/test lean** | Prefer fewer full-store opens, less fixture copy-paste, and no giant dual test modules for the same slim/filter helper. Measure before claiming wall-time wins. |
+| **No production-scale fixtures in default unit tests** | Do **not** pin production constants as test IO size when a smaller N still hits the branch: e.g. `FANIN_TARGET_STREAM_RUNS` (4096) run files, multi‑GiB / mainnet heads under `cargo test`, or remine 100-block maturity pads with `confirm_wire_run`. Use tiny stream targets / `RBITCOIN_HEAD_SCALE=tiny` / `pad_empty_from`. Pure math may still assert production geometry. See [`TESTING.md`](TESTING.md) suite-speed budgets; new default tests **&gt;2 s** wall need PR justification. |
 
 ## Datadir / store on this workspace (do not open in the agent VM)
 

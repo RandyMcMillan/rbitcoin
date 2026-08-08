@@ -2230,7 +2230,7 @@ impl ScriptsPhaseHandle {
     pub fn join(self) -> Result<ConfirmScriptOutcome, ConsensusError> {
         self.rx.recv().unwrap_or_else(|_| {
             Err(ConsensusError::BadBlock(
-                "scripts phase: rayon worker disconnected before result",
+                "scripts phase: worker disconnected before result",
             ))
         })
     }
@@ -2246,7 +2246,7 @@ impl ScriptsPhaseHandle {
     }
 }
 
-/// Submit [`confirm_scripts_phase`] onto the **rayon global pool** without
+/// Submit [`confirm_scripts_phase`] on a detached worker thread without
 /// blocking the caller.
 ///
 /// The OS scripts thread must keep claiming N+1 **while** waiting on N’s
@@ -2254,7 +2254,7 @@ impl ScriptsPhaseHandle {
 pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     scripts_feed_test_sync::on_async_submit();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    rayon::spawn(move || {
+    crate::script_pool::spawn_detached(move || {
         let r = confirm_scripts_phase(batch);
         let _ = tx.send(r);
     });
@@ -2280,7 +2280,7 @@ where
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(ConsensusError::BadBlock(
-                    "scripts phase: rayon worker disconnected before result",
+                    "scripts phase: worker disconnected before result",
                 ));
             }
         }

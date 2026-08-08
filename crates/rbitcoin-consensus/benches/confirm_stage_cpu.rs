@@ -17,7 +17,7 @@ use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-use rayon::prelude::*;
+
 use rbitcoin_consensus::script_bench::{self, JobBytes};
 
 const N_INPUTS: usize = 8000;
@@ -288,26 +288,10 @@ fn bench_scripts_pack() {
             let _ = black_box(script_bench::verify_job(j));
         }
     });
-    bench(
-        &format!("scripts rayon par_iter verify x{n_jobs}"),
-        8,
-        || {
-            jobs.par_iter().for_each(|j| {
-                let _ = black_box(script_bench::verify_job(j));
-            });
-        },
-    );
-    bench(
-        &format!("scripts rayon par_chunks(32) verify x{n_jobs}"),
-        8,
-        || {
-            jobs.par_chunks(32).for_each(|chunk| {
-                for j in chunk {
-                    let _ = black_box(script_bench::verify_job(j));
-                }
-            });
-        },
-    );
+    let owned = script_bench::owned_jobs(&jobs);
+    bench(&format!("scripts script_pool verify x{n_jobs}"), 8, || {
+        let _ = black_box(script_bench::verify_owned_pool(&owned));
+    });
 }
 
 fn main() {

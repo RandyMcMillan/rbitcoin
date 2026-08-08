@@ -492,7 +492,7 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 /// Pipeline (optimistic scripts, assumevalid-shaped):
 /// 1. **Assemble** — resolve prevout *content*, intra-block doubles, fees; build jobs
 ///    (no durable spentness / maturity).
-/// 2. **Scripts** — above milestone, rayon pool (CPU; needs prevout values only).
+/// 2. **Scripts** — above milestone, script_pool (CPU; needs prevout values only).
 /// 3. **Structural** — durable spentness, maturity, coinbase subsidy (order-sensitive).
 ///
 /// Class C tip updates (`confirm_block`) stay outside this function.
@@ -1653,24 +1653,15 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).
 ///
-/// Uses the **rayon global pool** for all non-empty waves. One job = one
+/// Uses the in-crate [`crate::script_pool`] (not rayon). One job = one
 /// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
 pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    use rayon::prelude::*;
-    jobs.par_iter().try_for_each(verify_one_script_job)
+    crate::script_pool::try_for_each_parallel(jobs, verify_one_script_job)
 }
 
 /// Parallel script checks across borrowed jobs (multi-block wave).
 pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    use rayon::prelude::*;
-    jobs.par_iter()
-        .try_for_each(|job| verify_one_script_job(*job))
+    crate::script_pool::try_for_each_parallel(jobs, |job| verify_one_script_job(*job))
 }
 
 /// Whether this job can skip `verify_job_all_inputs`.

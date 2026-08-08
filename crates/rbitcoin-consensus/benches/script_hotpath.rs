@@ -275,14 +275,14 @@ fn main() {
     // Pre-materialize owned jobs once (production builds them at connect).
     let owned = rbitcoin_consensus::script_bench::owned_jobs(&jobs);
     bench(
-        "verify_owned_pool 64× P2TR (rayon, no re-clone)",
+        "verify_owned_pool 64× P2TR (script_pool, no re-clone)",
         50,
         || {
             rbitcoin_consensus::script_bench::verify_owned_pool(&owned).unwrap();
         },
     );
     bench(
-        "verify_jobs_pool 64× P2TR (rayon + clone/iter)",
+        "verify_jobs_pool 64× P2TR (script_pool + clone/iter)",
         50,
         || {
             rbitcoin_consensus::script_bench::verify_jobs_pool(&jobs).unwrap();

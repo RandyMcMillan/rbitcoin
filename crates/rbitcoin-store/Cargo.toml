@@ -18,11 +18,7 @@ libc = "0.2"
 io-uring = "0.7"
 # Datadir store.secret CSPRNG.
 getrandom = "0.2"
-# Sealed segment binary fuse8 (~9 bits/key).
-xorf = { workspace = true }
-bincode = { workspace = true }
-# Product bin only (store_bench); library tests keep the platform allocator.
-mimalloc = { workspace = true }
+# Sealed segment fuse8 is in-tree (`binary_fuse8` + `fuse8_filter`); no xorf/bincode.
 
 [[bin]]
 name = "rbitcoin-store-bench"

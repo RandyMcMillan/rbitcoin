@@ -19,8 +19,9 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Platform allocator: this bin is operator-only microbench host tooling.
+// Product node/cli keep mimalloc; the store *library* must not pull it in so
+// `cargo test -p rbitcoin-store` does not compile libmimalloc-sys/cc.
 
 fn usage() {
     eprintln!(

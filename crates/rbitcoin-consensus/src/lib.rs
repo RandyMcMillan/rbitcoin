@@ -9,6 +9,7 @@ mod milestone;
 mod params;
 pub mod policy;
 mod script;
+mod script_pool;
 mod signet;
 
 /// Thin public helpers for `script_verify` benches (no UTXO; explicit prevouts only).

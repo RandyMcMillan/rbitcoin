@@ -1,13 +1,25 @@
 # Testing guide
 
-## Preference order
+## Preference order (dev-cycle aware)
 
-1. **Multi-process / full node** — binary + datadir + RPC/CLI/P2P
-2. **Subsystem integration** — store+query+consensus; net harness with mock peers
-3. **Fault injection** through public APIs / `integration-testing` features
-4. **Unit tests** — last resort only
+| Prefer | Avoid |
+|--------|--------|
+| **Journey scenarios**: one `/tmp` store, one mature pad, then a **sequence** of asserts (spend, reject, reconstruct, scripthash, …) | Many skinny scenarios that each remine maturity and re-open the store |
+| **Pure units** on pure helpers (scriptnum, bits, fuse8, open-hash) with **no store** | Units that re-implement confirm and only paint lines a journey already hits |
+| **One entry** per production path (scenario **or** unit next to the shipped fn) | Twin unit + scenario for the same reject string |
+| Core JSON corpora for **script engine** breadth | A second parallel script suite |
+
+**Fewer scenario functions / store opens, not less coverage** — put more asserts on one carefully designed multi-stage journey.
 
 Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
+
+### Third-party deps and compile cost (2026-08)
+
+| Change | Why it helps the cycle |
+|--------|------------------------|
+| **mimalloc** only on product bins (`rbitcoin-node`, `rbitcoin-cli`) | Store **lib** tests no longer compile `libmimalloc-sys`/`cc`. Production still uses mimalloc on node/cli. |
+| **rayon removed** from consensus | Parallel scripts use in-crate `script_pool` (`std::thread`). Drops rayon + crossbeam from the consensus graph. |
+| **xorf + bincode + serde** removed from store | Sealed fuse8 is in-tree (`binary_fuse8` + hand LE layout). Drops a serde-heavy path from store rebuilds. |
 
 ## Diagnostic examples (ad-hoc, not CI)
 

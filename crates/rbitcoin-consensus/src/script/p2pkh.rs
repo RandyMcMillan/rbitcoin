@@ -118,6 +118,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         let err = verify(&job, 0, &*job.tx, &mut cache).unwrap_err();

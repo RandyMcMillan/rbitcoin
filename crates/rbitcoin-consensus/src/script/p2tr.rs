@@ -153,7 +153,8 @@ fn verify_script_path(
         job.bip65_active,
         job.bip112_active,
         job.bip66_active,
-    );
+    )
+    .apply_job_flags(job);
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }
@@ -223,6 +224,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         (job, control)
     }
@@ -289,6 +299,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
@@ -347,6 +366,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
     }
@@ -405,6 +433,15 @@ mod bip341_tests {
                 bip66_active: true,
                 bip16_active: true,
                 taproot_active: true,
+                minimal_if: false,
+                nullfail: false,
+                low_s: false,
+                strictenc: false,
+                null_dummy: false,
+                minimal_data: false,
+                witness_pubkeytype: false,
+                witness_active: true,
+                discourage_upgradable_witness: false,
             };
             let err = script::verify_job_all_inputs(&job).unwrap_err();
             assert!(
@@ -436,6 +473,15 @@ mod bip341_tests {
                 bip66_active: true,
                 bip16_active: true,
                 taproot_active: true,
+                minimal_if: false,
+                nullfail: false,
+                low_s: false,
+                strictenc: false,
+                null_dummy: false,
+                minimal_data: false,
+                witness_pubkeytype: false,
+                witness_active: true,
+                discourage_upgradable_witness: false,
             };
             script::verify_job_all_inputs(&job).expect("key path + annex");
         }
@@ -497,6 +543,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         script::verify_job_all_inputs(&job).expect("empty annex payload");
     }
@@ -582,6 +637,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         script::verify_job_all_inputs(&job).expect("script path + annex CHECKSIG");
     }
@@ -655,6 +719,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         script::verify_job_all_inputs(&job).expect("two-leaf script path");
     }
@@ -764,6 +837,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         script::verify_job_all_inputs(&job).expect("CODESEPARATOR chain must verify");
     }
@@ -804,6 +886,15 @@ mod bip341_tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(script::verify_job_all_inputs(&job).is_err());
     }

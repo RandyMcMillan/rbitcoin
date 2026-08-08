@@ -717,6 +717,24 @@ pub struct ScriptCheckJob {
     pub(crate) bip16_active: bool,
     /// BIP341/342 taproot active (false → v1 witness program is anyone-can-spend).
     pub(crate) taproot_active: bool,
+    /// SCRIPT_VERIFY_MINIMALIF (standardness / fixture flag; TapScript always on).
+    pub(crate) minimal_if: bool,
+    /// SCRIPT_VERIFY_NULLFAIL.
+    pub(crate) nullfail: bool,
+    /// SCRIPT_VERIFY_LOW_S.
+    pub(crate) low_s: bool,
+    /// SCRIPT_VERIFY_STRICTENC.
+    pub(crate) strictenc: bool,
+    /// SCRIPT_VERIFY_NULLDUMMY (also implied by bip112 on mainnet).
+    pub(crate) null_dummy: bool,
+    /// SCRIPT_VERIFY_MINIMALDATA.
+    pub(crate) minimal_data: bool,
+    /// SCRIPT_VERIFY_WITNESS_PUBKEYTYPE: witness keys must be compressed.
+    pub(crate) witness_pubkeytype: bool,
+    /// SCRIPT_VERIFY_WITNESS active (fixture flag / post-segwit production).
+    pub(crate) witness_active: bool,
+    /// SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM.
+    pub(crate) discourage_upgradable_witness: bool,
 }
 
 impl ScriptCheckJob {
@@ -766,6 +784,17 @@ impl ScriptCheckJob {
             bip66_active,
             bip16_active,
             taproot_active,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            // Production post-segwit path always has witness rules; pre-segwit
+            // txs have empty witnesses so checks are no-ops.
+            witness_active: true,
+            discourage_upgradable_witness: false,
         }
     }
 
@@ -791,6 +820,15 @@ impl ScriptCheckJob {
             bip66_active,
             bip16_active,
             taproot_active,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         }
     }
 }

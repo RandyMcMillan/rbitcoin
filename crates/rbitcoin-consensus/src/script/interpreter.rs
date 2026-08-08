@@ -150,6 +150,11 @@ pub(crate) struct EvalContext<'a> {
     pub strictenc: bool,
     /// Core `SCRIPT_VERIFY_NULLDUMMY` (BIP147): CMS dummy must be empty.
     pub null_dummy: bool,
+    /// Core `SCRIPT_VERIFY_MINIMALIF`: IF/NOTIF argument must be empty or exact 0x01.
+    /// Always on for TapScript; optional flag for legacy/v0.
+    pub minimal_if: bool,
+    /// Core `SCRIPT_VERIFY_WITNESS_PUBKEYTYPE`: only compressed keys in witness scripts.
+    pub witness_pubkeytype: bool,
     /// BIP342: instruction index of last executed OP_CODESEPARATOR, or `0xFFFFFFFF`.
     ///
     /// Counted like Core's `opcode_pos` (one per GetOp/instruction, not byte offset).
@@ -211,10 +216,27 @@ impl<'a> EvalContext<'a> {
             low_s: false,
             strictenc: false,
             null_dummy: false,
+            minimal_if: false,
+            witness_pubkeytype: false,
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(SighashCache::new(tx)),
         }
+    }
+
+    /// Copy standardness / fixture flags from a [`crate::block::ScriptCheckJob`].
+    pub(crate) fn apply_job_flags(mut self, job: &crate::block::ScriptCheckJob) -> Self {
+        self.minimal_data = job.minimal_data;
+        self.nullfail = job.nullfail;
+        self.low_s = job.low_s;
+        self.strictenc = job.strictenc;
+        self.null_dummy = job.null_dummy;
+        self.minimal_if = job.minimal_if;
+        self.witness_pubkeytype = job.witness_pubkeytype;
+        if job.low_s || job.strictenc {
+            self.bip66_active = true;
+        }
+        self
     }
 }
 
@@ -295,7 +317,10 @@ pub(crate) fn eval_script(
     let mut if_stack: Vec<bool> = Vec::new(); // whether this branch is executing
     let mut op_count = 0usize;
     let enforce_op_limit = ctx.sig_version != SigVersion::TapScript;
-    let minimal_if = ctx.sig_version == SigVersion::TapScript;
+    // TapScript always MINIMALIF. SCRIPT_VERIFY_MINIMALIF applies to witness v0
+    // (and tapscript); bare/Base scripts ignore the flag (Core fixture #1197).
+    let minimal_if = ctx.sig_version == SigVersion::TapScript
+        || (ctx.minimal_if && ctx.sig_version == SigVersion::WitnessV0);
     // BIP342 / Core: instruction index for codeseparator_pos (not byte offset).
     let mut opcode_pos: u32 = 0;
     // Prefer instruction_indices so OP_CODESEPARATOR can set Base/WitnessV0
@@ -327,6 +352,16 @@ pub(crate) fn eval_script(
             }
             Instruction::Op(op) => {
                 let code = op.to_u8();
+
+                // Legacy / v0: opcodes > OP_16 count toward 201 even when skipped,
+                // including OP_IF / NOTIF / ELSE / ENDIF (Core nOpCount).
+                if enforce_op_limit && code > 0x60 {
+                    op_count += 1;
+                    if op_count > MAX_OPS_LEGACY {
+                        return Err(ConsensusError::Script("op count".into()));
+                    }
+                }
+
                 // OP_IF / NOTIF / ELSE / ENDIF always process structure.
                 match code {
                     0x63 => {
@@ -383,14 +418,6 @@ pub(crate) fn eval_script(
                     return Err(ConsensusError::Script(format!(
                         "disabled opcode 0x{code:02x}"
                     )));
-                }
-
-                // Legacy / v0: non-push opcodes count toward 201 even when skipped.
-                if enforce_op_limit && code > 0x60 {
-                    op_count += 1;
-                    if op_count > MAX_OPS_LEGACY {
-                        return Err(ConsensusError::Script("op count".into()));
-                    }
                 }
 
                 if !executing {
@@ -1191,6 +1218,13 @@ fn checksig_legacy(
     }
     if ctx.strictenc && !crypto::is_compressed_or_uncompressed_pubkey(pubkey) {
         return Err(ConsensusError::Script("PUBKEYTYPE".into()));
+    }
+    // WITNESS_PUBKEYTYPE: only compressed keys in witness/v0 scripts.
+    if ctx.witness_pubkeytype
+        && ctx.sig_version == SigVersion::WitnessV0
+        && !crypto::is_compressed_pubkey(pubkey)
+    {
+        return Err(ConsensusError::Script("WITNESS_PUBKEYTYPE".into()));
     }
 
     let (ecdsa_sig, sighash_ty) = match crypto::parse_der_sig(sig, false) {
@@ -2426,5 +2460,78 @@ mod minimal_data_tests {
         let mut stack = Vec::new();
         let err = eval_script(sc, &mut stack, &ctx).unwrap_err();
         assert!(format!("{err}").contains("NULLFAIL"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod p2sh_redeem_parse_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    #[test]
+    fn eval_op1_redeem_alone() {
+        let script = [0x51u8];
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let sc = Script::from_bytes(&script);
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
+        let mut stack = Vec::new();
+        let r = eval_script(sc, &mut stack, &ctx);
+        eprintln!("op1 alone: {r:?} stack={stack:?}");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn eval_sig_then_p2sh_style() {
+        // scriptSig 00 01 51 → stack [[],[0x51]]
+        let ss = [0x00u8, 0x01, 0x51];
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let sc = Script::from_bytes(&ss);
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
+        let mut stack = Vec::new();
+        eval_script(sc, &mut stack, &ctx).expect("scriptSig");
+        eprintln!("after sig stack={stack:?}");
+        let redeem = stack.pop().unwrap();
+        eprintln!("redeem={redeem:02x?}");
+        let rs = Script::from_bytes(&redeem);
+        let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, rs, SigVersion::Base);
+        let r = eval_script(rs, &mut stack, &ctx2);
+        eprintln!("redeem eval: {r:?} stack={stack:?}");
+        assert!(r.is_ok(), "{r:?}");
     }
 }

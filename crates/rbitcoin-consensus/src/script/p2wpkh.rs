@@ -39,6 +39,9 @@ pub(crate) fn verify(
         return Err(ConsensusError::Script("p2wpkh pubkey hash".into()));
     }
 
+    if job.witness_pubkeytype && !crypto::is_compressed_pubkey(pubkey_raw) {
+        return Err(ConsensusError::Script("WITNESS_PUBKEYTYPE".into()));
+    }
     // Segwit activates after BIP66 on mainnet; always require strict DER.
     let (sig, sighash_ty) = crypto::parse_der_sig(sig_raw, true)?;
     let pubkey = crypto::parse_pubkey(pubkey_raw)?;
@@ -87,6 +90,9 @@ pub(crate) fn verify_with_keyhash(
         return Err(ConsensusError::Script("p2wpkh pubkey hash".into()));
     }
 
+    if job.witness_pubkeytype && !crypto::is_compressed_pubkey(pubkey_raw) {
+        return Err(ConsensusError::Script("WITNESS_PUBKEYTYPE".into()));
+    }
     let (sig, sighash_ty) = crypto::parse_der_sig(sig_raw, true)?;
     let pubkey = crypto::parse_pubkey(pubkey_raw)?;
 
@@ -137,6 +143,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         }
     }
 

@@ -61,7 +61,8 @@ pub(crate) fn verify_with_scripthash(
         job.bip65_active,
         job.bip112_active,
         job.bip66_active,
-    );
+    )
+    .apply_job_flags(job);
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }
@@ -105,6 +106,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(verify(&job, 0, &*job.tx).is_err());
 

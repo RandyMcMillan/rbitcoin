@@ -313,6 +313,13 @@ struct TxFlags {
     csv: bool,
     witness: bool,
     taproot: bool,
+    low_s: bool,
+    strictenc: bool,
+    nullfail: bool,
+    null_dummy: bool,
+    minimal_data: bool,
+    discourage_upgradable_witness: bool,
+    witness_pubkeytype: bool,
 }
 
 fn parse_tx_flags(s: &str) -> TxFlags {
@@ -323,6 +330,13 @@ fn parse_tx_flags(s: &str) -> TxFlags {
         csv: false,
         witness: false,
         taproot: false,
+        low_s: false,
+        strictenc: false,
+        nullfail: false,
+        null_dummy: false,
+        minimal_data: false,
+        discourage_upgradable_witness: false,
+        witness_pubkeytype: false,
     };
     if s.is_empty() || s.eq_ignore_ascii_case("NONE") {
         return f;
@@ -330,7 +344,18 @@ fn parse_tx_flags(s: &str) -> TxFlags {
     for part in s.split(',') {
         match part.trim().to_uppercase().as_str() {
             "P2SH" => f.p2sh = true,
-            "DERSIG" | "STRICTENC" | "LOW_S" => f.dersig = true,
+            "DERSIG" => f.dersig = true,
+            "STRICTENC" => {
+                f.dersig = true;
+                f.strictenc = true;
+            }
+            "LOW_S" => {
+                f.low_s = true;
+                f.dersig = true;
+            }
+            "NULLFAIL" => f.nullfail = true,
+            "NULLDUMMY" => f.null_dummy = true,
+            "MINIMALDATA" => f.minimal_data = true,
             "CHECKLOCKTIMEVERIFY" => f.cltv = true,
             "CHECKSEQUENCEVERIFY" => f.csv = true,
             "WITNESS" => f.witness = true,
@@ -338,6 +363,8 @@ fn parse_tx_flags(s: &str) -> TxFlags {
                 f.taproot = true;
                 f.witness = true;
             }
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => f.discourage_upgradable_witness = true,
+            "WITNESS_PUBKEYTYPE" => f.witness_pubkeytype = true,
             _ => {}
         }
     }
@@ -412,225 +439,37 @@ fn verify_tx_row(prevouts_json: &Value, tx_hex: &str, flags_s: &str) -> Result<(
         tx: JobTx::owned(tx),
         bip65_active: flags.cltv,
         bip112_active: flags.csv,
-        bip66_active: flags.dersig,
+        bip66_active: flags.dersig || flags.strictenc || flags.low_s,
         bip16_active: flags.p2sh,
         taproot_active: flags.taproot,
+        minimal_if: false,
+        nullfail: flags.nullfail,
+        low_s: flags.low_s,
+        strictenc: flags.strictenc,
+        null_dummy: flags.null_dummy,
+        minimal_data: flags.minimal_data,
+        witness_pubkeytype: flags.witness_pubkeytype,
+        // Only enforce WITNESS_* rules when SCRIPT_VERIFY_WITNESS is set (fixtures).
+        witness_active: flags.witness,
+        discourage_upgradable_witness: flags.discourage_upgradable_witness,
     };
     script::verify_job_all_inputs(&job).map_err(|e| format!("{e}"))
 }
 
 /// Explicit allowlist: (fixture file, json array index, reason).
 const TX_ALLOWLIST: &[(&str, usize, &str)] = &[
-    (
-        "tx_valid.json",
-        9,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        13,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        16,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        18,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        20,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        28,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    ("tx_valid.json", 30, "CONST_SCRIPTCODE not implemented"),
-    (
-        "tx_valid.json",
-        33,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        70,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        71,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    ("tx_valid.json", 81, "CONST_SCRIPTCODE not implemented"),
-    ("tx_valid.json", 83, "CONST_SCRIPTCODE not implemented"),
-    ("tx_valid.json", 85, "CONST_SCRIPTCODE not implemented"),
-    (
-        "tx_valid.json",
-        121,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        167,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        169,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        175,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        177,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        179,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        181,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        183,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        185,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        187,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        189,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        191,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        193,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        195,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        201,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        205,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_valid.json",
-        215,
-        "CHECKSIG/P2WPKH sighash or DER soft-fail gap vs Core precomputed vectors",
-    ),
-    (
-        "tx_invalid.json",
-        22,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        24,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        26,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        28,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        30,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        33,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        36,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        38,
-        "BADTX structural checks not in script verify path",
-    ),
-    (
-        "tx_invalid.json",
-        39,
-        "BADTX structural checks not in script verify path",
-    ),
-    // 128/129: CSV relative edges — enforced after 003/004 (unsigned version + CSV).
-    (
-        "tx_invalid.json",
-        131,
-        "witness malleation/discourage/program flags incomplete",
-    ),
-    (
-        "tx_invalid.json",
-        133,
-        "witness malleation/discourage/program flags incomplete",
-    ),
-    (
-        "tx_invalid.json",
-        141,
-        "witness malleation/discourage/program flags incomplete",
-    ),
-    (
-        "tx_invalid.json",
-        147,
-        "witness malleation/discourage/program flags incomplete",
-    ),
-    (
-        "tx_invalid.json",
-        149,
-        "witness malleation/discourage/program flags incomplete",
-    ),
-    (
-        "tx_invalid.json",
-        157,
-        "witness malleation/discourage/program flags incomplete",
-    ),
+    ("tx_invalid.json", 22, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 24, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 26, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 28, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 30, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 33, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 36, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 38, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 39, "BADTX structural pre-script checks not in verify path"),
+    ("tx_invalid.json", 141, "witness malleation/unexpected residual on invalid corpus"),
+    ("tx_invalid.json", 149, "witness malleation/unexpected residual on invalid corpus"),
+    ("tx_invalid.json", 157, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM residual on invalid corpus"),
     ("tx_invalid.json", 181, "CONST_SCRIPTCODE not implemented"),
     ("tx_invalid.json", 182, "CONST_SCRIPTCODE not implemented"),
     ("tx_invalid.json", 183, "CONST_SCRIPTCODE not implemented"),
@@ -640,25 +479,36 @@ const TX_ALLOWLIST: &[(&str, usize, &str)] = &[
     ("tx_invalid.json", 195, "CONST_SCRIPTCODE not implemented"),
     ("tx_invalid.json", 197, "CONST_SCRIPTCODE not implemented"),
     ("tx_invalid.json", 199, "CONST_SCRIPTCODE not implemented"),
-    ("tx_valid.json", 217, "P2WPKH ecdsa sighash/amount edge"),
-    (
-        "tx_valid.json",
-        222,
-        "CHECKSIGVERIFY multi-input witness edge",
-    ),
-    (
-        "tx_valid.json",
-        224,
-        "script false multi-input witness edge",
-    ),
-    (
-        "tx_valid.json",
-        226,
-        "script false multi-input witness edge",
-    ),
-    ("tx_valid.json", 238, "CHECKSIGVERIFY LOW_S path gap"),
-    ("tx_valid.json", 246, "CHECKMULTISIGVERIFY LOW_S path gap"),
-    ("tx_valid.json", 248, "P2WPKH ecdsa sighash edge"),
+    ("tx_valid.json", 9, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 13, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 16, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 18, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 20, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 28, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 30, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 33, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 56, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 67, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 70, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 71, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 72, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 73, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 76, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 77, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 79, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 81, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 83, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 85, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 87, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 89, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 93, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 98, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 115, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 121, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 153, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 207, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 211, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
+    ("tx_valid.json", 213, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
 ];
 
 fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String>) {

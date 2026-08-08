@@ -26,7 +26,22 @@ pub(crate) fn try_p2sh_p2wpkh(
 ) -> Option<Result<(), ConsensusError>> {
     let redeem = match single_push_script_sig(&tx.input[input_index].script_sig) {
         Ok(Some(r)) => r,
-        Ok(None) => return None, // multi-push / non-push — not nested-segwit shape
+        Ok(None) => {
+            // Multi-push scriptSig wrapping a witness program → malleated P2SH.
+            if job.witness_active {
+                if let Ok(items) = push_only_items(&tx.input[input_index].script_sig) {
+                    if items.len() >= 2 {
+                        let last = items.last().unwrap();
+                        if last.len() == 22 && last[0] == 0x00 && last[1] == 0x14 {
+                            return Some(Err(ConsensusError::Script(
+                                "WITNESS_MALLEATED_P2SH".into(),
+                            )));
+                        }
+                    }
+                }
+            }
+            return None; // multi-push / non-push — not nested-segwit shape
+        }
         Err(e) => return Some(Err(e)), // malformed scriptSig
     };
     if redeem.len() != 22 || redeem[0] != 0x00 || redeem[1] != 0x14 {
@@ -117,12 +132,34 @@ pub(crate) fn verify_p2sh_legacy(
         job.bip65_active,
         job.bip112_active,
         job.bip66_active,
-    );
+    )
+    .apply_job_flags(job);
     if interpreter::eval_script(redeem_script, &mut stack, &ctx)? {
         // BIP16: true top only. Witness nested paths use cleanstack separately.
         interpreter::require_true_top(&stack)?;
     }
     Ok(())
+}
+
+/// Collect push-only items from scriptSig (OP_0 / OP_1..16 / PushBytes). Non-push → Err.
+fn push_only_items(script_sig: &bitcoin::script::ScriptBuf) -> Result<Vec<Vec<u8>>, ConsensusError> {
+    let mut items = Vec::new();
+    for ins in script_sig.instructions() {
+        match ins.map_err(|_| ConsensusError::Script("p2sh scriptSig".into()))? {
+            Instruction::PushBytes(b) => items.push(b.as_bytes().to_vec()),
+            Instruction::Op(op) => {
+                let n = op.to_u8();
+                if n == 0x00 {
+                    items.push(vec![]);
+                } else if (0x51..=0x60).contains(&n) {
+                    items.push(vec![n - 0x50]);
+                } else {
+                    return Err(ConsensusError::Script("p2sh scriptSig op".into()));
+                }
+            }
+        }
+    }
+    Ok(items)
 }
 
 /// Parse scriptSig as a **single** data push (nested P2SH-P2W*).
@@ -267,6 +304,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         let r = try_p2sh_p2wpkh(&job, 0, &*job.tx, &mut cache);
@@ -285,6 +331,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut cache2 = SighashCache::new(&*job2.tx);
         assert!(matches!(
@@ -314,6 +369,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(matches!(try_p2sh_p2wsh(&job3, 0, &*job3.tx), Some(Err(_))));
         // wrong hash
@@ -329,6 +393,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(matches!(try_p2sh_p2wsh(&job4, 0, &*job4.tx), Some(Err(_))));
 
@@ -347,6 +420,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut c5 = SighashCache::new(&*job5.tx);
         assert!(try_p2sh_p2wpkh(&job5, 0, &*job5.tx, &mut c5).is_none());
@@ -368,6 +450,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(verify_p2sh_legacy(&job_e, 0, &*job_e.tx).is_err());
         // Hash mismatch on legacy
@@ -385,6 +476,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(verify_p2sh_legacy(&job_h, 0, &*job_h.tx).is_err());
     }
@@ -413,6 +513,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         // Empty witness → p2wsh fails, but try_p2sh_p2wsh reached scripthash copy + call.
         assert!(matches!(try_p2sh_p2wsh(&job, 0, &*job.tx), Some(Err(_))));
@@ -438,6 +547,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         let mut cache = SighashCache::new(&*job2.tx);
         assert!(matches!(
@@ -464,6 +582,15 @@ mod tests {
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
         };
         assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_ok());
 

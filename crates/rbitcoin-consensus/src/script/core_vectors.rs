@@ -425,6 +425,10 @@ struct CoreFlags {
     strictenc: bool,
     /// Core `SCRIPT_VERIFY_NULLDUMMY` (BIP147).
     null_dummy: bool,
+    /// Core `SCRIPT_VERIFY_MINIMALIF`.
+    minimal_if: bool,
+    /// Core `SCRIPT_VERIFY_SIGPUSHONLY`.
+    sig_push_only: bool,
     /// Other named flags we do not yet implement (for allowlist diagnostics).
     extra: Vec<String>,
 }
@@ -454,10 +458,10 @@ fn parse_flags(s: &str) -> CoreFlags {
             }
             "NULLFAIL" => f.nullfail = true,
             "NULLDUMMY" => f.null_dummy = true,
-            "SIGPUSHONLY"
-            | "MINIMALIF"
-            | "WITNESS_PUBKEYTYPE"
-            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+            "MINIMALIF" => f.minimal_if = true,
+            "SIGPUSHONLY" => f.sig_push_only = true,
+            "WITNESS_PUBKEYTYPE" => f.extra.push(p), // also read via apply → job.witness_pubkeytype
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
             | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
             | "DISCOURAGE_OP_SUCCESS"
             | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => {
@@ -485,6 +489,7 @@ fn apply_eval_flags(ctx: &mut EvalContext<'_>, flags: &CoreFlags) {
     ctx.low_s = flags.low_s;
     ctx.strictenc = flags.strictenc;
     ctx.null_dummy = flags.null_dummy;
+    ctx.minimal_if = flags.minimal_if;
     // STRICTENC/LOW_S also force DER encoding checks via bip66_active in checksig.
     if flags.dersig || flags.strictenc || flags.low_s {
         ctx.bip66_active = true;
@@ -532,16 +537,30 @@ fn build_spend(credit: &Transaction, script_sig: ScriptBuf, witness: Witness) ->
     }
 }
 
-fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount), String> {
+/// Core script_tests witness cell: hex items + optional `#SCRIPT#` / `#CONTROLBLOCK#`,
+/// ending with nValue (BTC). Returns optional Taproot output key for `#TAPROOTOUTPUT#`.
+fn parse_witness_and_amount(
+    first: &Value,
+) -> Result<(Witness, Amount, Option<[u8; 32]>), String> {
     // Core: [wit_hex..., amount_number] inside first array element when present.
     let arr = first
         .as_array()
         .ok_or_else(|| "witness cell not array".to_string())?;
     if arr.is_empty() {
-        return Ok((Witness::new(), Amount::ZERO));
+        return Ok((Witness::new(), Amount::ZERO, None));
     }
     let mut amount = Amount::ZERO;
     let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut taproot_output: Option<[u8; 32]> = None;
+    // Core KeyData::key0 secret: 31 zero bytes + 0x01 (script_tests.cpp vchKey0).
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 1;
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes)
+        .map_err(|e| format!("taproot internal sk: {e}"))?;
+    let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (internal_xonly, _) = kp.x_only_public_key();
+
     for (i, cell) in arr.iter().enumerate() {
         if let Some(n) = cell.as_f64() {
             // Last numeric is nValue in BTC (Core uses double).
@@ -554,17 +573,47 @@ fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount), String> 
         if let Some(s) = cell.as_str() {
             if s.is_empty() {
                 stack.push(vec![]);
-            } else {
-                let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-                if hex.len() % 2 != 0 {
-                    return Err(format!("odd witness hex: {s}"));
-                }
-                let mut bytes = Vec::with_capacity(hex.len() / 2);
-                for j in (0..hex.len()).step_by(2) {
-                    bytes.push(u8::from_str_radix(&hex[j..j + 2], 16).map_err(|e| e.to_string())?);
-                }
-                stack.push(bytes);
+                continue;
             }
+            // Core: `#SCRIPT# <asm>` → assemble leaf, push as witness element.
+            if let Some(rest) = s.strip_prefix("#SCRIPT#") {
+                let script_bytes = assemble(rest.trim())?;
+                stack.push(script_bytes);
+                continue;
+            }
+            // Core: `#CONTROLBLOCK#` — single-leaf tree with key0 internal key.
+            if s == "#CONTROLBLOCK#" {
+                let leaf = stack
+                    .last()
+                    .ok_or_else(|| "#CONTROLBLOCK# without leaf script".to_string())?
+                    .clone();
+                let leaf_script = ScriptBuf::from_bytes(leaf);
+                let builder = bitcoin::taproot::TaprootBuilder::new()
+                    .add_leaf(0, leaf_script.clone())
+                    .map_err(|e| format!("taproot add_leaf: {e:?}"))?;
+                let spend_info = builder
+                    .finalize(&secp, internal_xonly)
+                    .map_err(|e| format!("taproot finalize: {e:?}"))?;
+                let control = spend_info
+                    .control_block(&(leaf_script, bitcoin::taproot::LeafVersion::TapScript))
+                    .ok_or_else(|| "taproot control_block missing".to_string())?;
+                stack.push(control.serialize());
+                taproot_output = Some(spend_info.output_key().to_x_only_public_key().serialize());
+                continue;
+            }
+            let hex = s.trim_start_matches("0x").trim_start_matches("0X");
+            if hex.len() % 2 != 0 {
+                return Err(format!("odd witness hex: {s}"));
+            }
+            // Non-hex tokens (that are not special flags) are hard errors in Core.
+            if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("witness is not hex: {s}"));
+            }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for j in (0..hex.len()).step_by(2) {
+                bytes.push(u8::from_str_radix(&hex[j..j + 2], 16).map_err(|e| e.to_string())?);
+            }
+            stack.push(bytes);
         } else if let Some(n) = cell.as_f64() {
             let sats = (n * 100_000_000.0).round() as i64;
             amount = Amount::from_sat(sats.max(0) as u64);
@@ -573,6 +622,7 @@ fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount), String> 
     Ok((
         Witness::from_slice(&stack.iter().map(|v| v.as_slice()).collect::<Vec<_>>()),
         amount,
+        taproot_output,
     ))
 }
 
@@ -638,6 +688,12 @@ fn run_script_row(
     {
         return Err("DISCOURAGE_UPGRADABLE_NOPS".into());
     }
+    // SCRIPT_VERIFY_SIGPUSHONLY, and BIP16 P2SH always requires push-only scriptSig.
+    if flags.sig_push_only || (flags.p2sh && is_p2sh_script(script_pubkey)) {
+        let mut tmp = Vec::new();
+        interpreter::eval_script_sig_pushes(Script::from_bytes(script_sig), &mut tmp)
+            .map_err(|_| "SIG_PUSHONLY".to_string())?;
+    }
 
     let spk = ScriptBuf::from_bytes(script_pubkey.to_vec());
     let credit = build_credit(spk.clone(), amount);
@@ -671,12 +727,22 @@ fn run_script_row(
         bip65_active: flags.cltv,
         bip112_active: flags.csv,
         // STRICTENC/DERSIG → strict DER (bip66).
-        bip66_active: flags.dersig || flags.extra.iter().any(|e| e == "STRICTENC"),
+        bip66_active: flags.dersig || flags.strictenc || flags.low_s,
         bip16_active: flags.p2sh,
         taproot_active: flags.taproot,
+        minimal_if: flags.minimal_if,
+        nullfail: flags.nullfail,
+        low_s: flags.low_s,
+        strictenc: flags.strictenc,
+        null_dummy: flags.null_dummy,
+        minimal_data: flags.minimal_data,
+        witness_pubkeytype: flags.extra.iter().any(|e| e == "WITNESS_PUBKEYTYPE"),
+        witness_active: flags.witness,
+        discourage_upgradable_witness: flags
+            .extra
+            .iter()
+            .any(|e| e == "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"),
     };
-    // When STRICTENC is only in extra, still set bip66 if DERSIG or STRICTENC in flags string.
-    let _ = flags;
     verify_job_all_inputs(&job).map_err(|e| format!("{e}"))
 }
 
@@ -710,6 +776,10 @@ fn eval_bare_pair(
         apply_eval_flags(&mut ctx, flags);
         let _ = interpreter::eval_script(ss, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
     }
+    // Core BIP16: keep a copy of the stack after scriptSig so P2SH can restore
+    // the redeemScript (scriptPubKey HASH160/EQUAL would otherwise consume it).
+    let stack_copy = stack.clone();
+
     let spk = Script::from_bytes(script_pubkey);
     let mut ctx = EvalContext::new_with_flags(
         spend,
@@ -728,8 +798,11 @@ fn eval_bare_pair(
         return Ok(()); // OP_SUCCESS-like
     }
 
-    // BIP16 P2SH: if flag set and scriptPubKey is P2SH, eval redeemScript.
+    // BIP16 P2SH: if flag set and scriptPubKey is P2SH, restore stack and eval redeem.
     if flags.p2sh && is_p2sh_script(script_pubkey) {
+        // scriptPubKey must have left a true top (serialized).
+        interpreter::require_true_top(&stack).map_err(|e| format!("{e}"))?;
+        stack = stack_copy;
         if stack.is_empty() {
             return Err("P2SH empty stack".into());
         }
@@ -779,51 +852,8 @@ fn is_p2sh_script(spk: &[u8]) -> bool {
 /// Keep reasons concrete. Grow by fixing the engine, not by adding skips.
 /// Indices are into Core `script_tests.json` (refreshed from bitcoin/bitcoin master).
 const ALLOWLIST: &[(usize, &str)] = &[
-    (458, "P2SH redeem with OP_1 minimal push parse edge"),
-    (459, "P2SH redeem with OP_PUSHDATA1 empty then OP_1 parse edge"),
-    (830, "OP_COUNT in unexecuted branch: long NOP run boundary"),
-    (1023, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
-    (1024, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
-    (1025, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
-    (1026, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
-    (1034, "P2SH-P2PK redeem: instruction parse of compressed-key CHECKSIG redeem"),
-    (1035, "P2SH-P2PK wrong redeem: expect EVAL_FALSE, soft-ok path"),
-    (1036, "P2SH-P2PKH redeem parse of legacy scriptPubKey redeem body"),
-    (1041, "P2SH multisig redeem via PUSHDATA1 body parse"),
     // Revealed when assembler used OP_1..OP_16: prior soft EVAL_FALSE masked Ok vs named code.
-    (1104, "SIGPUSHONLY not enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
-    (1108, "SIGPUSHONLY is policy-adjacent; not fully enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
-    (1112, "P2SH-P2PK redeem with OP_1 prefix stack item parse"),
-    (1114, "P2SH-P2PK + CLEANSTACK redeem parse"),
-    (1126, "P2SH-P2WSH redeem (witness program as redeem) without WITNESS flag"),
-    (1127, "P2SH-P2WPKH redeem without WITNESS flag"),
-    (1132, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM not enforced"),
-    (1133, "WITNESS_PROGRAM_WRONG_LENGTH not enforced as hard fail"),
-    (1137, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
-    (1138, "WITNESS_MALLEATED_P2SH not enforced"),
-    (1139, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
-    (1146, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1147, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1148, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1149, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1159, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1160, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1163, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1164, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1171, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1172, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
     // 1189/1193 CSV residual: cleared after 003/004 (stale audit 2026-08-08).
-    (1227, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1228, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1243, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1253, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1254, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1269, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
-    (1273, "tapscript witness #SCRIPT# token not assembled"),
-    (1274, "tapscript witness non-hex stack element"),
-    (1275, "tapscript witness non-hex stack element"),
-    (1276, "tapscript witness #SCRIPT# token not assembled"),
-    (1277, "tapscript witness #SCRIPT# token not assembled"),
 ];
 
 /// Map our error / Ok to whether it matches Core's expected result code.
@@ -890,8 +920,8 @@ fn run_all_script_rows() -> RowStats {
             continue;
         }
 
-        let (witness, amount, sig_s, pk_s, flags_s, expect_s) = if is_witness_form {
-            let (w, amt) = match parse_witness_and_amount(&cells[0]) {
+        let (witness, amount, sig_s, pk_s, flags_s, expect_s, tap_out) = if is_witness_form {
+            let (w, amt, tout) = match parse_witness_and_amount(&cells[0]) {
                 Ok(v) => v,
                 Err(e) => {
                     st.total += 1;
@@ -914,6 +944,7 @@ fn run_all_script_rows() -> RowStats {
                 cells[2].as_str().unwrap_or(""),
                 cells[3].as_str().unwrap_or(""),
                 cells[4].as_str().unwrap_or(""),
+                tout,
             )
         } else {
             (
@@ -923,6 +954,7 @@ fn run_all_script_rows() -> RowStats {
                 cells[1].as_str().unwrap_or(""),
                 cells[2].as_str().unwrap_or(""),
                 cells[3].as_str().unwrap_or(""),
+                None,
             )
         };
 
@@ -947,9 +979,9 @@ fn run_all_script_rows() -> RowStats {
                 continue;
             }
         };
-        let pk_bytes = match assemble(pk_s) {
-            Ok(b) => b,
-            Err(e) => {
+        // Core: `0x51 0x20 #TAPROOTOUTPUT#` → OP_1 + 32-byte tweaked output key.
+        let pk_bytes = if pk_s.trim() == "0x51 0x20 #TAPROOTOUTPUT#" {
+            let Some(out) = tap_out else {
                 if allow_idx.contains(&idx) {
                     st.allow_skip += 1;
                     st.used_allow.insert(idx);
@@ -959,9 +991,30 @@ fn run_all_script_rows() -> RowStats {
                 st.fail += 1;
                 if st.failures.len() < 40 {
                     st.failures
-                        .push(format!("#{idx} assemble scriptPubKey: {e} pk={pk_s:?}"));
+                        .push(format!("#{idx} #TAPROOTOUTPUT# without control block"));
                 }
                 continue;
+            };
+            let mut b = vec![0x51, 0x20];
+            b.extend_from_slice(&out);
+            b
+        } else {
+            match assemble(pk_s) {
+                Ok(b) => b,
+                Err(e) => {
+                    if allow_idx.contains(&idx) {
+                        st.allow_skip += 1;
+                        st.used_allow.insert(idx);
+                        continue;
+                    }
+                    st.ran += 1;
+                    st.fail += 1;
+                    if st.failures.len() < 40 {
+                        st.failures
+                            .push(format!("#{idx} assemble scriptPubKey: {e} pk={pk_s:?}"));
+                    }
+                    continue;
+                }
             }
         };
 
@@ -1013,8 +1066,8 @@ fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
     if is_witness_form && cells.len() < 5 {
         return None;
     }
-    let (witness, amount, sig_s, pk_s, flags_s, expect_s) = if is_witness_form {
-        let (w, amt) = parse_witness_and_amount(&cells[0]).ok()?;
+    let (witness, amount, sig_s, pk_s, flags_s, expect_s, tap_out) = if is_witness_form {
+        let (w, amt, tout) = parse_witness_and_amount(&cells[0]).ok()?;
         (
             w,
             amt,
@@ -1022,6 +1075,7 @@ fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
             cells[2].as_str().unwrap_or(""),
             cells[3].as_str().unwrap_or(""),
             cells[4].as_str().unwrap_or(""),
+            tout,
         )
     } else {
         (
@@ -1031,11 +1085,19 @@ fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
             cells[1].as_str().unwrap_or(""),
             cells[2].as_str().unwrap_or(""),
             cells[3].as_str().unwrap_or(""),
+            None,
         )
     };
     let flags = parse_flags(flags_s);
     let sig_bytes = assemble(sig_s).ok()?;
-    let pk_bytes = assemble(pk_s).ok()?;
+    let pk_bytes = if pk_s.trim() == "0x51 0x20 #TAPROOTOUTPUT#" {
+        let out = tap_out?;
+        let mut b = vec![0x51, 0x20];
+        b.extend_from_slice(&out);
+        b
+    } else {
+        assemble(pk_s).ok()?
+    };
     let got = run_script_row(&sig_bytes, &pk_bytes, witness, amount, &flags);
     Some(outcome_matches(expect_s, &got))
 }
@@ -1132,3 +1194,7 @@ fn core_script_spot_invalid_false() {
     let got = run_script_row(&sig, &pk, Witness::new(), Amount::ZERO, &flags);
     assert!(got.is_err(), "0 EQUAL should reject, got {got:?}");
 }
+
+
+
+

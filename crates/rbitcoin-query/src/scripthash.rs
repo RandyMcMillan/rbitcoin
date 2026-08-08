@@ -27,6 +27,124 @@ pub struct ScriptHashHistoryItem {
     pub txid: [u8; 32],
 }
 
+/// Sort order for [`apply_history_filter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HistoryOrder {
+    /// Electrum: ascending height.
+    #[default]
+    HeightAsc,
+    /// Esplora chain pages: newest first (height desc, then txid desc for stability).
+    NewestFirst,
+}
+
+/// Immutable filter for history lists (Electrum windows + Esplora paging).
+///
+/// Height window: confirmed rows with `height ∈ [from_height, to_height)` when
+/// `to_height` is `Some`. `to_height: None` means no upper bound. Callers that
+/// need BCH `to_height=-1` (include mempool) handle mempool separately and pass
+/// `to_height: None` for the confirmed slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryFilter {
+    /// Inclusive lower bound on `item.height` (default 0).
+    pub from_height: u32,
+    /// Exclusive upper bound on `item.height`, or open.
+    pub to_height: Option<i64>,
+    /// Max items after window / cursor (Esplora uses 25).
+    pub limit: Option<usize>,
+    /// Esplora `last_seen_txid`: after sort, drop through this txid (inclusive), keep following.
+    pub after_txid: Option<[u8; 32]>,
+    pub order: HistoryOrder,
+}
+
+impl Default for HistoryFilter {
+    fn default() -> Self {
+        Self {
+            from_height: 0,
+            to_height: None,
+            limit: None,
+            after_txid: None,
+            order: HistoryOrder::HeightAsc,
+        }
+    }
+}
+
+impl HistoryFilter {
+    pub fn open() -> Self {
+        Self::default()
+    }
+
+    /// Electrum Cash-style window (`to_height` exclusive; `None` = open).
+    pub fn height_window(from_height: u32, to_height: Option<i64>) -> Self {
+        Self {
+            from_height,
+            to_height,
+            limit: None,
+            after_txid: None,
+            order: HistoryOrder::HeightAsc,
+        }
+    }
+
+    /// Esplora confirmed chain page (newest first, 25, optional cursor).
+    pub fn esplora_chain_page(after_txid: Option<[u8; 32]>) -> Self {
+        Self {
+            from_height: 0,
+            to_height: None,
+            limit: Some(25),
+            after_txid,
+            order: HistoryOrder::NewestFirst,
+        }
+    }
+}
+
+/// Apply [`HistoryFilter`] to an already-built history list (no store I/O).
+///
+/// Does not re-sort input beyond the filter's [`HistoryOrder`]. Window is applied
+/// first, then order, then `after_txid`, then `limit`.
+pub fn apply_history_filter(
+    items: &[ScriptHashHistoryItem],
+    filter: &HistoryFilter,
+) -> Vec<ScriptHashHistoryItem> {
+    let from = i64::from(filter.from_height);
+    let mut out: Vec<ScriptHashHistoryItem> = items
+        .iter()
+        .filter(|i| {
+            if i.height < from {
+                return false;
+            }
+            if let Some(to) = filter.to_height {
+                if i.height >= to {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+
+    match filter.order {
+        HistoryOrder::HeightAsc => {
+            out.sort_by(|a, b| a.height.cmp(&b.height).then_with(|| a.txid.cmp(&b.txid)));
+        }
+        HistoryOrder::NewestFirst => {
+            out.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| b.txid.cmp(&a.txid)));
+        }
+    }
+
+    if let Some(after) = filter.after_txid {
+        if let Some(pos) = out.iter().position(|i| i.txid == after) {
+            out = out.split_off(pos.saturating_add(1));
+        }
+        // If after_txid not found, Esplora-like behavior: return from start (no skip).
+    }
+
+    if let Some(lim) = filter.limit {
+        if out.len() > lim {
+            out.truncate(lim);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptHashBalance {
     pub confirmed: i64,
@@ -89,13 +207,37 @@ impl Query {
     }
 
     /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs.
+    ///
+    /// Equivalent to [`Self::scripthash_history_filtered`] with [`HistoryFilter::open`].
     pub fn scripthash_history(
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        self.scripthash_history_filtered(scripthash, &HistoryFilter::open())
+    }
+
+    /// Confirmed history for a scripthash, filtered by height window / limit / cursor.
+    ///
+    /// Assembles the full confirmed history (creates + confirmed spenders), then
+    /// applies [`apply_history_filter`]. When `filter.to_height` is set, create
+    /// outpoints with `create_height >= to_height` are skipped during expand
+    /// (spends of those creates are also ≥ create height, so they cannot fall
+    /// inside the window).
+    pub fn scripthash_history_filtered(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let creates = self.scripthash_create_outpoints(scripthash)?;
         let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+        let to_excl = filter.to_height;
         for rec in creates {
+            // Upper-bound early-out: create and any of its spends sit at height ≥ create.
+            if let Some(to) = to_excl {
+                if i64::from(rec.create_height) >= to {
+                    continue;
+                }
+            }
             by_txid
                 .entry(rec.txid)
                 .and_modify(|h| *h = (*h).min(i64::from(rec.create_height)))
@@ -109,6 +251,11 @@ impl Query {
                     }
                     let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
                     let spend_h = self.store.tx_height.get(p.spending_tx_fk)?.unwrap_or(0);
+                    if let Some(to) = to_excl {
+                        if i64::from(spend_h) >= to {
+                            continue;
+                        }
+                    }
                     by_txid
                         .entry(spend_tx.txid)
                         .and_modify(|h| *h = (*h).min(i64::from(spend_h)))
@@ -116,12 +263,11 @@ impl Query {
                 }
             }
         }
-        let mut items: Vec<ScriptHashHistoryItem> = by_txid
+        let items: Vec<ScriptHashHistoryItem> = by_txid
             .into_iter()
             .map(|(txid, height)| ScriptHashHistoryItem { height, txid })
             .collect();
-        items.sort_by_key(|i| i.height);
-        Ok(items)
+        Ok(apply_history_filter(&items, filter))
     }
 
     /// Confirmed balance for a scripthash.
@@ -171,5 +317,116 @@ impl Query {
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod history_filter_tests {
+    use super::*;
+
+    fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {
+        let mut txid = [0u8; 32];
+        txid[0] = txid0;
+        ScriptHashHistoryItem { height, txid }
+    }
+
+    #[test]
+    fn open_filter_keeps_all_height_asc() {
+        let items = vec![item(10, 1), item(5, 2), item(20, 3)];
+        let got = apply_history_filter(&items, &HistoryFilter::open());
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].height, 5);
+        assert_eq!(got[1].height, 10);
+        assert_eq!(got[2].height, 20);
+    }
+
+    #[test]
+    fn height_window_inclusive_from_exclusive_to() {
+        let items = vec![item(1, 1), item(5, 2), item(10, 3), item(15, 4)];
+        let f = HistoryFilter::height_window(5, Some(15));
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(
+            got.iter().map(|i| i.height).collect::<Vec<_>>(),
+            vec![5, 10]
+        );
+    }
+
+    #[test]
+    fn height_window_open_upper() {
+        let items = vec![item(1, 1), item(100, 2)];
+        let f = HistoryFilter::height_window(50, None);
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].height, 100);
+    }
+
+    #[test]
+    fn newest_first_order() {
+        let items = vec![item(1, 1), item(3, 2), item(2, 3)];
+        let mut f = HistoryFilter::open();
+        f.order = HistoryOrder::NewestFirst;
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(
+            got.iter().map(|i| i.height).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn after_txid_skips_through_cursor_then_limit() {
+        // Newest first: h=30,20,10 with distinct txids
+        let items = vec![item(10, 1), item(20, 2), item(30, 3)];
+        let mut after = [0u8; 32];
+        after[0] = 3; // tip (height 30)
+        let f = HistoryFilter {
+            from_height: 0,
+            to_height: None,
+            limit: Some(1),
+            after_txid: Some(after),
+            order: HistoryOrder::NewestFirst,
+        };
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].height, 20);
+        assert_eq!(got[0].txid[0], 2);
+    }
+
+    #[test]
+    fn after_txid_unknown_does_not_skip() {
+        let items = vec![item(10, 1), item(20, 2)];
+        let f = HistoryFilter {
+            from_height: 0,
+            to_height: None,
+            limit: Some(1),
+            after_txid: Some([0xff; 32]),
+            order: HistoryOrder::NewestFirst,
+        };
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].height, 20);
+    }
+
+    #[test]
+    fn esplora_chain_page_defaults() {
+        let f = HistoryFilter::esplora_chain_page(None);
+        assert_eq!(f.limit, Some(25));
+        assert_eq!(f.order, HistoryOrder::NewestFirst);
+        assert!(f.after_txid.is_none());
+    }
+
+    #[test]
+    fn limit_truncates_after_window() {
+        let items: Vec<_> = (1..=10).map(|h| item(h, h as u8)).collect();
+        let f = HistoryFilter {
+            from_height: 0,
+            to_height: None,
+            limit: Some(3),
+            after_txid: None,
+            order: HistoryOrder::HeightAsc,
+        };
+        let got = apply_history_filter(&items, &f);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].height, 1);
+        assert_eq!(got[2].height, 3);
     }
 }

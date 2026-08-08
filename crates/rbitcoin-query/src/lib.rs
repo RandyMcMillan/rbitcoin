@@ -193,8 +193,8 @@ pub mod process_mem_stats {
 pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
-    layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
-    FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
+    layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
+    SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
 pub use confirm_load::BatchThin;
@@ -202,7 +202,8 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::ConfirmPrepared;
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
-    ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
+    apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashHistoryItem,
+    ScriptHashOutpoint, ScriptHashUtxo,
 };
 pub use wave_prevout::ThinInput;
 
@@ -1991,6 +1992,70 @@ mod tests {
         confirm_load_stats::COLD_IDX_NS.store(2_000_000, AtomicOrdering::Relaxed);
         confirm_load_stats::COLD_IDX_N.store(5, AtomicOrdering::Relaxed);
         let _ = confirm_load_stats::sample_and_reset();
+    }
+
+    #[test]
+    fn scripthash_history_filtered_open_and_window() {
+        let (dir, q) = temp_query("sh-hist-filt");
+        assert!(q.index_mode().is_tip());
+
+        let mut prev = Fk::NULL;
+        for h in 0..4u32 {
+            let (header, ta) = coinbase_block(h, prev);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        // Four OP_TRUE coinbases → four confirmed history rows for that SH.
+        let sh = script_hash(&[0x51]);
+        let full = q.scripthash_history(&sh).unwrap();
+        assert_eq!(full.len(), 4);
+        assert_eq!(
+            full.iter().map(|i| i.height).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        let open = q
+            .scripthash_history_filtered(&sh, &HistoryFilter::open())
+            .unwrap();
+        assert_eq!(open, full);
+
+        // Inclusive from, exclusive to: heights 1 and 2 only.
+        let window = q
+            .scripthash_history_filtered(&sh, &HistoryFilter::height_window(1, Some(3)))
+            .unwrap();
+        assert_eq!(
+            window.iter().map(|i| i.height).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(window.len() < full.len());
+
+        // Open upper bound from height 2.
+        let from_only = q
+            .scripthash_history_filtered(&sh, &HistoryFilter::height_window(2, None))
+            .unwrap();
+        assert_eq!(
+            from_only.iter().map(|i| i.height).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        // Esplora-style newest-first page of 2.
+        let page = q
+            .scripthash_history_filtered(
+                &sh,
+                &HistoryFilter {
+                    from_height: 0,
+                    to_height: None,
+                    limit: Some(2),
+                    after_txid: None,
+                    order: HistoryOrder::NewestFirst,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].height, 3);
+        assert_eq!(page[1].height, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

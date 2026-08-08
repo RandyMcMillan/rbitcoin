@@ -25,6 +25,8 @@ use crate::error::ConsensusError;
 
 /// Core-aligned stack element count (main + alt).
 const MAX_STACK_SIZE: usize = 1000;
+/// Core `MAX_SCRIPT_ELEMENT_SIZE` (push / witness stack item cap).
+pub(crate) const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 /// Legacy / witness-v0 script size cap (BIP16 / BIP141). **Not** applied in tapscript
 /// (BIP342: size only bounded by block weight).
 const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
@@ -242,6 +244,37 @@ impl<'a> EvalContext<'a> {
         }
         self
     }
+
+    /// Build an eval context from a script job: activation + standardness flags in one place.
+    ///
+    /// Prefer this over `new_with_flags(...).apply_job_flags(job)` at production call sites
+    /// so flag wiring cannot drift between typed paths.
+    #[inline]
+    pub(crate) fn from_job(
+        job: &'a crate::block::ScriptCheckJob,
+        tx: &'a Transaction,
+        input_index: usize,
+        script_code: &'a Script,
+        sig_version: SigVersion,
+    ) -> Self {
+        let amount = job
+            .prevouts
+            .get(input_index)
+            .map(|p| p.value)
+            .unwrap_or(Amount::ZERO);
+        Self::new_with_flags(
+            tx,
+            input_index,
+            amount,
+            &job.prevouts,
+            script_code,
+            sig_version,
+            job.bip65_active,
+            job.bip112_active,
+            job.bip66_active,
+        )
+        .apply_job_flags(job)
+    }
 }
 
 /// BIP141 / BIP342: exactly one true value on the stack (witness / tapscript).
@@ -339,7 +372,7 @@ pub(crate) fn eval_script(
             Instruction::PushBytes(b) => {
                 // Core: MAX_SCRIPT_ELEMENT_SIZE even in unexecuted branches.
                 let data = b.as_bytes();
-                if data.len() > 520 {
+                if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
                     return Err(ConsensusError::Script("push too large".into()));
                 }
                 // Core MINIMALDATA: CheckMinimalPush only when the push executes

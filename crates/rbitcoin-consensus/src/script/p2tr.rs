@@ -143,18 +143,7 @@ fn verify_script_path(
         return Err(ConsensusError::Script("p2tr leaf version".into()));
     }
 
-    let ctx = EvalContext::new_with_flags(
-        tx,
-        input_index,
-        job.prevouts[input_index].value,
-        &job.prevouts,
-        script,
-        SigVersion::TapScript,
-        job.bip65_active,
-        job.bip112_active,
-        job.bip66_active,
-    )
-    .apply_job_flags(job);
+    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript);
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }

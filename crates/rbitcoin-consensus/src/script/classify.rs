@@ -83,14 +83,7 @@ pub(crate) fn classify(script: &Script) -> ScriptKind {
     if b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87 {
         return ScriptKind::P2sh;
     }
-    // Empty: bare EvalScript(scriptSig)+EvalScript(empty spk) — not ACS.
-    if b.is_empty() {
-        return ScriptKind::Bare;
-    }
-    // Bare P2PK or other: treat as bare if it looks like a script (not witness program).
-    if b[0] > 0x51 && b[0] < 0x60 {
-        // OP_2..OP_16 alone is not a useful bare spend without more context
-    }
+    // Empty / non-template: bare EvalScript(scriptSig)+EvalScript(spk).
     ScriptKind::Bare
 }
 

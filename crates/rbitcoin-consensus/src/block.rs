@@ -777,29 +777,16 @@ impl ScriptCheckJob {
         bip16_active: bool,
         taproot_active: bool,
     ) -> Self {
-        Self {
+        Self::from_parts(
             txid,
             prevouts,
-            tx: JobTx::owned(tx),
+            JobTx::owned(tx),
             bip65_active,
             bip112_active,
             bip66_active,
             bip16_active,
             taproot_active,
-            minimal_if: false,
-            nullfail: false,
-            low_s: false,
-            strictenc: false,
-            // BIP147 co-activated with CSV on mainnet (bip112 height).
-            null_dummy: bip112_active,
-            minimal_data: false,
-            witness_pubkeytype: false,
-            // Production post-segwit path always has witness rules; pre-segwit
-            // txs have empty witnesses so checks are no-ops.
-            witness_active: true,
-            discourage_upgradable_witness: false,
-            const_scriptcode: false,
-        }
+        )
     }
 
     /// Confirm assemble: share the wire [`Arc<Block>`] (no `Transaction` clone).
@@ -815,10 +802,34 @@ impl ScriptCheckJob {
         bip16_active: bool,
         taproot_active: bool,
     ) -> Self {
+        Self::from_parts(
+            txid,
+            prevouts,
+            JobTx::shared(block, tx_index),
+            bip65_active,
+            bip112_active,
+            bip66_active,
+            bip16_active,
+            taproot_active,
+        )
+    }
+
+    /// Single construction site for activation + production standardness defaults.
+    #[inline]
+    fn from_parts(
+        txid: [u8; 32],
+        prevouts: Vec<TxOut>,
+        tx: JobTx,
+        bip65_active: bool,
+        bip112_active: bool,
+        bip66_active: bool,
+        bip16_active: bool,
+        taproot_active: bool,
+    ) -> Self {
         Self {
             txid,
             prevouts,
-            tx: JobTx::shared(block, tx_index),
+            tx,
             bip65_active,
             bip112_active,
             bip66_active,
@@ -832,6 +843,8 @@ impl ScriptCheckJob {
             null_dummy: bip112_active,
             minimal_data: false,
             witness_pubkeytype: false,
+            // Production post-segwit path always has witness rules; pre-segwit
+            // txs have empty witnesses so checks are no-ops.
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,

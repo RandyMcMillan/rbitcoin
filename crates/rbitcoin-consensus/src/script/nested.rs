@@ -12,13 +12,15 @@ use super::p2wsh;
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
 
-/// P2SH-P2WPKH: scriptSig is **exactly one** push of 22-byte redeem `00 14 <20>`;
-/// witness like P2WPKH.
+/// Nested P2SH-P2WPKH / P2SH-P2WSH: scriptSig is **exactly one** push of a v0
+/// witness program redeem (`00 14 <20>` or `00 20 <32>`).
 ///
 /// Returns `None` when scriptSig is multi-push (legacy P2SH multisig, etc.) so the
 /// caller can fall through to [`verify_p2sh_legacy`]. Do **not** hard-fail multi-push
 /// here — that rejected valid signet blocks (e.g. height 204802).
-pub(crate) fn try_p2sh_p2wpkh(
+///
+/// Multi-push wrapping a P2WPKH-shaped last item → `WITNESS_MALLEATED_P2SH`.
+pub(crate) fn try_p2sh_nested_segwit(
     job: &ScriptCheckJob,
     input_index: usize,
     tx: &Transaction,
@@ -44,62 +46,38 @@ pub(crate) fn try_p2sh_p2wpkh(
         }
         Err(e) => return Some(Err(e)), // malformed scriptSig
     };
-    if redeem.len() != 22 || redeem[0] != 0x00 || redeem[1] != 0x14 {
-        return None;
-    }
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
-    if spk.len() != 23 {
-        return Some(Err(ConsensusError::Script("p2sh spk".into())));
-    }
-    let expected_hash = &spk[2..22];
-    let actual = crypto::hash160(&redeem);
-    if actual.as_slice() != expected_hash {
-        return Some(Err(ConsensusError::Script("p2sh redeem hash".into())));
-    }
-    let mut keyhash = [0u8; 20];
-    keyhash.copy_from_slice(&redeem[2..22]);
-    Some(p2wpkh::verify_with_keyhash(
-        job,
-        input_index,
-        tx,
-        &keyhash,
-        &redeem,
-        cache,
-    ))
-}
 
-/// P2SH-P2WSH: scriptSig is **exactly one** push of 34-byte redeem `00 20 <32>`;
-/// witness like P2WSH. Multi-push → `None` (legacy path).
-pub(crate) fn try_p2sh_p2wsh(
-    job: &ScriptCheckJob,
-    input_index: usize,
-    tx: &Transaction,
-) -> Option<Result<(), ConsensusError>> {
-    let redeem = match single_push_script_sig(&tx.input[input_index].script_sig) {
-        Ok(Some(r)) => r,
-        Ok(None) => return None,
-        Err(e) => return Some(Err(e)),
-    };
-    if redeem.len() != 34 || redeem[0] != 0x00 || redeem[1] != 0x20 {
+    let is_wpkh = redeem.len() == 22 && redeem[0] == 0x00 && redeem[1] == 0x14;
+    let is_wsh = redeem.len() == 34 && redeem[0] == 0x00 && redeem[1] == 0x20;
+    if !is_wpkh && !is_wsh {
         return None;
     }
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
-    if spk.len() != 23 {
-        return Some(Err(ConsensusError::Script("p2sh spk".into())));
+    if let Err(e) =
+        check_p2sh_redeem_hash(job.prevouts[input_index].script_pubkey.as_bytes(), &redeem)
+    {
+        return Some(Err(e));
     }
-    let expected_hash = &spk[2..22];
-    let actual = crypto::hash160(&redeem);
-    if actual.as_slice() != expected_hash {
-        return Some(Err(ConsensusError::Script("p2sh redeem hash".into())));
+    if is_wpkh {
+        let mut keyhash = [0u8; 20];
+        keyhash.copy_from_slice(&redeem[2..22]);
+        Some(p2wpkh::verify_with_keyhash(
+            job,
+            input_index,
+            tx,
+            &keyhash,
+            &redeem,
+            cache,
+        ))
+    } else {
+        let mut scripthash = [0u8; 32];
+        scripthash.copy_from_slice(&redeem[2..34]);
+        Some(p2wsh::verify_with_scripthash(
+            job,
+            input_index,
+            tx,
+            &scripthash,
+        ))
     }
-    let mut scripthash = [0u8; 32];
-    scripthash.copy_from_slice(&redeem[2..34]);
-    Some(p2wsh::verify_with_scripthash(
-        job,
-        input_index,
-        tx,
-        &scripthash,
-    ))
 }
 
 /// Legacy P2SH: scriptSig is `<…data pushes…> <redeemScript>`; evaluate redeem.
@@ -110,33 +88,27 @@ pub(crate) fn verify_p2sh_legacy(
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
     let (mut stack, redeem) = split_script_sig_redeem(input.script_sig.as_script())?;
+    check_p2sh_redeem_hash(job.prevouts[input_index].script_pubkey.as_bytes(), &redeem)?;
 
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
+    let redeem_script = Script::from_bytes(&redeem);
+    let ctx = EvalContext::from_job(job, tx, input_index, redeem_script, SigVersion::Base);
+    if interpreter::eval_script(redeem_script, &mut stack, &ctx)? {
+        // BIP16: true top only. Witness nested paths use cleanstack separately.
+        interpreter::require_true_top(&stack)?;
+    }
+    Ok(())
+}
+
+/// P2SH spk shape + HASH160(redeem) match (shared by nested and legacy paths).
+#[inline]
+fn check_p2sh_redeem_hash(spk: &[u8], redeem: &[u8]) -> Result<(), ConsensusError> {
     if spk.len() != 23 {
         return Err(ConsensusError::Script("p2sh spk".into()));
     }
     let expected_hash = &spk[2..22];
-    let actual = crypto::hash160(&redeem);
+    let actual = crypto::hash160(redeem);
     if actual.as_slice() != expected_hash {
         return Err(ConsensusError::Script("p2sh redeem hash".into()));
-    }
-
-    let redeem_script = Script::from_bytes(&redeem);
-    let ctx = EvalContext::new_with_flags(
-        tx,
-        input_index,
-        job.prevouts[input_index].value,
-        &job.prevouts,
-        redeem_script,
-        SigVersion::Base,
-        job.bip65_active,
-        job.bip112_active,
-        job.bip66_active,
-    )
-    .apply_job_flags(job);
-    if interpreter::eval_script(redeem_script, &mut stack, &ctx)? {
-        // BIP16: true top only. Witness nested paths use cleanstack separately.
-        interpreter::require_true_top(&stack)?;
     }
     Ok(())
 }
@@ -318,7 +290,7 @@ mod tests {
             const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_p2wpkh(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
         assert!(matches!(r, Some(Err(_))));
 
         // Wrong redeem hash
@@ -347,7 +319,7 @@ mod tests {
         };
         let mut cache2 = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_p2wpkh(&job2, 0, &*job2.tx, &mut cache2),
+            try_p2sh_nested_segwit(&job2, 0, &*job2.tx, &mut cache2),
             Some(Err(_))
         ));
 
@@ -384,7 +356,10 @@ mod tests {
             discourage_upgradable_witness: false,
             const_scriptcode: false,
         };
-        assert!(matches!(try_p2sh_p2wsh(&job3, 0, &*job3.tx), Some(Err(_))));
+        assert!(matches!(
+            try_p2sh_nested_segwit(&job3, 0, &*job3.tx, &mut SighashCache::new(&*job3.tx)),
+            Some(Err(_))
+        ));
         // wrong hash
         let job4 = ScriptCheckJob {
             txid: [0u8; 32],
@@ -409,7 +384,10 @@ mod tests {
             discourage_upgradable_witness: false,
             const_scriptcode: false,
         };
-        assert!(matches!(try_p2sh_p2wsh(&job4, 0, &*job4.tx), Some(Err(_))));
+        assert!(matches!(
+            try_p2sh_nested_segwit(&job4, 0, &*job4.tx, &mut SighashCache::new(&*job4.tx)),
+            Some(Err(_))
+        ));
 
         // Multi-push → None (fallthrough)
         let mut tx5 = dummy_tx();
@@ -438,8 +416,7 @@ mod tests {
             const_scriptcode: false,
         };
         let mut c5 = SighashCache::new(&*job5.tx);
-        assert!(try_p2sh_p2wpkh(&job5, 0, &*job5.tx, &mut c5).is_none());
-        assert!(try_p2sh_p2wsh(&job5, 0, &*job5.tx).is_none());
+        assert!(try_p2sh_nested_segwit(&job5, 0, &*job5.tx, &mut c5).is_none());
 
         // Legacy wrong spk / hash / empty
         assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_err());
@@ -533,8 +510,11 @@ mod tests {
             discourage_upgradable_witness: false,
             const_scriptcode: false,
         };
-        // Empty witness → p2wsh fails, but try_p2sh_p2wsh reached scripthash copy + call.
-        assert!(matches!(try_p2sh_p2wsh(&job, 0, &*job.tx), Some(Err(_))));
+        // Empty witness → p2wsh fails, but nested path reached scripthash copy + call.
+        assert!(matches!(
+            try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut SighashCache::new(&*job.tx)),
+            Some(Err(_))
+        ));
 
         let redeem_wpkh = {
             let mut r = vec![0x00, 0x14];
@@ -570,7 +550,7 @@ mod tests {
         };
         let mut cache = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_p2wpkh(&job2, 0, &*job2.tx, &mut cache),
+            try_p2sh_nested_segwit(&job2, 0, &*job2.tx, &mut cache),
             Some(Err(_))
         ));
 

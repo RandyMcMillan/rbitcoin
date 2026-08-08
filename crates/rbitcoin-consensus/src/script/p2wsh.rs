@@ -31,13 +31,12 @@ pub(crate) fn verify_with_scripthash(
         return Err(ConsensusError::Script("p2wsh empty witness".into()));
     }
     // BIP141: every witness stack element (incl. script) ≤ MAX_SCRIPT_ELEMENT_SIZE.
-    const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
     for i in 0..input.witness.len() {
         let item = input
             .witness
             .nth(i)
             .ok_or_else(|| ConsensusError::Script("p2wsh witness".into()))?;
-        if item.len() > MAX_SCRIPT_ELEMENT_SIZE {
+        if item.len() > interpreter::MAX_SCRIPT_ELEMENT_SIZE {
             return Err(ConsensusError::Script("PUSH_SIZE".into()));
         }
     }
@@ -62,18 +61,7 @@ pub(crate) fn verify_with_scripthash(
     }
 
     let script = Script::from_bytes(script_bytes);
-    let ctx = EvalContext::new_with_flags(
-        tx,
-        input_index,
-        job.prevouts[input_index].value,
-        &job.prevouts,
-        script,
-        SigVersion::WitnessV0,
-        job.bip65_active,
-        job.bip112_active,
-        job.bip66_active,
-    )
-    .apply_job_flags(job);
+    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::WitnessV0);
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }

@@ -69,7 +69,13 @@ fn annotate_script_err(
     }
 }
 
-/// Verify one input: classify `scriptPubKey`, then typed path or interpreter.
+/// Verify one input: native witness programs first, then legacy kind dispatch.
+///
+/// Layout (one classify, no dual typed/bare routes for the same program):
+/// 1. If `witness_active` and spk is a BIP141 program → typed/unknown-version path
+///    (malleation / wrong length / discourage / ACS). Never EvalScript as bare.
+/// 2. Else classify once → P2PKH / P2SH / bare. Pre-segwit (`!witness_active`),
+///    v0/v1 program templates fall through to bare EvalScript like Core.
 #[inline]
 pub(crate) fn verify_input(
     job: &ScriptCheckJob,
@@ -85,59 +91,21 @@ pub(crate) fn verify_input(
     let input = &tx.input[input_index];
     let has_witness = !input.witness.is_empty();
 
-    // SCRIPT_VERIFY_WITNESS: BIP141 native witness programs (any version).
-    // Must run before bare/ACS paths so unknown versions are not EvalScript'd
-    // as legacy and non-empty scriptSig is always WITNESS_MALLEATED.
     if job.witness_active {
         if let Some((version, program)) = classify::witness_program(spk) {
-            if !input.script_sig.is_empty() {
-                return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
-            }
-            match (version, program.len()) {
-                (0, 20) => return p2wpkh::verify(job, input_index, tx, cache),
-                (0, 32) => return p2wsh::verify(job, input_index, tx),
-                (0, _) => {
-                    return Err(ConsensusError::Script(
-                        "WITNESS_PROGRAM_WRONG_LENGTH".into(),
-                    ));
-                }
-                (1, 32) if job.taproot_active => {
-                    return p2tr::verify(job, input_index, tx, cache);
-                }
-                _ => {
-                    // Unknown version (incl. pre-taproot v1, v2..v16, v1 wrong len).
-                    if job.discourage_upgradable_witness {
-                        return Err(ConsensusError::Script(
-                            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
-                        ));
-                    }
-                    // BIP141: unknown version is anyone-can-spend (witness ignored).
-                    return Ok(());
-                }
-            }
-        }
-        let kind = classify::classify(spk);
-        if matches!(kind, ScriptKind::P2sh) && job.bip16_active {
-            // Nested P2SH-witness: handled in P2SH branch below.
-        } else if has_witness {
-            // Non-witness program with non-empty witness.
-            return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
+            return verify_native_witness(job, input_index, tx, cache, version, program);
         }
     }
 
-    // Without SCRIPT_VERIFY_WITNESS, v0/v1 programs are bare scripts (OP_0/OP_1 + push).
-    // OP_TRUE is *not* short-circuited: Core still EvalScript(scriptSig) first (CLTV/CSV).
-    let kind = if job.witness_active {
-        classify::classify(spk)
-    } else {
-        match classify::classify(spk) {
-            ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr => ScriptKind::Bare,
-            other => other,
-        }
-    };
+    // Single classify for non-program (or witness flag off) path.
+    let kind = classify::classify(spk);
+    if job.witness_active && has_witness && !(matches!(kind, ScriptKind::P2sh) && job.bip16_active)
+    {
+        // Non-witness program with non-empty witness (P2SH nested still allowed).
+        return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
+    }
 
     match kind {
-        ScriptKind::P2wpkh => p2wpkh::verify(job, input_index, tx, cache),
         ScriptKind::P2pkh => {
             // Fast path: exact `<sig> <pubkey>` scriptSig. Historical mainnet has
             // non-standard P2PKH scriptSigs that still leave a valid stack for
@@ -158,11 +126,7 @@ pub(crate) fn verify_input(
             if !job.bip16_active {
                 return verify_bare(job, input_index, tx, prevout);
             }
-            // Nested P2SH-P2WPKH / P2SH-P2WSH, or bare redeem via interpreter.
-            if let Some(res) = nested::try_p2sh_p2wpkh(job, input_index, tx, cache) {
-                return res;
-            }
-            if let Some(res) = nested::try_p2sh_p2wsh(job, input_index, tx) {
+            if let Some(res) = nested::try_p2sh_nested_segwit(job, input_index, tx, cache) {
                 return res;
             }
             // Witness non-empty on non-nested P2SH → unexpected if witness active.
@@ -171,21 +135,43 @@ pub(crate) fn verify_input(
             }
             nested::verify_p2sh_legacy(job, input_index, tx)
         }
-        ScriptKind::P2wsh => p2wsh::verify(job, input_index, tx),
-        ScriptKind::P2tr => {
-            // Pre-activation path is handled above via witness_program when
-            // witness_active; without witness flag, treat as bare.
-            if !job.taproot_active {
-                if job.discourage_upgradable_witness {
-                    return Err(ConsensusError::Script(
-                        "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
-                    ));
-                }
-                return Ok(());
-            }
-            p2tr::verify(job, input_index, tx, cache)
+        // Bare + (when !witness_active) native program templates as ordinary scripts.
+        // When witness_active, P2wpkh/P2wsh/P2tr were already handled above.
+        ScriptKind::Bare | ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr => {
+            verify_bare(job, input_index, tx, prevout)
         }
-        ScriptKind::Bare => verify_bare(job, input_index, tx, prevout),
+    }
+}
+
+/// BIP141 native witness program (any version). `scriptSig` must be empty.
+#[inline]
+fn verify_native_witness(
+    job: &ScriptCheckJob,
+    input_index: usize,
+    tx: &Transaction,
+    cache: &mut bitcoin::sighash::SighashCache<&Transaction>,
+    version: u8,
+    program: &[u8],
+) -> Result<(), ConsensusError> {
+    if !tx.input[input_index].script_sig.is_empty() {
+        return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
+    }
+    match (version, program.len()) {
+        (0, 20) => p2wpkh::verify(job, input_index, tx, cache),
+        (0, 32) => p2wsh::verify(job, input_index, tx),
+        (0, _) => Err(ConsensusError::Script(
+            "WITNESS_PROGRAM_WRONG_LENGTH".into(),
+        )),
+        (1, 32) if job.taproot_active => p2tr::verify(job, input_index, tx, cache),
+        _ => {
+            // Unknown version (pre-taproot v1, v2..v16, v1 wrong length).
+            if job.discourage_upgradable_witness {
+                return Err(ConsensusError::Script(
+                    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -218,33 +204,24 @@ fn verify_bare(
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let ss = input.script_sig.as_script();
     if !ss.as_bytes().is_empty() {
-        let ctx_sig = interpreter::EvalContext::new_with_flags(
+        let ctx_sig = interpreter::EvalContext::from_job(
+            job,
             tx,
             input_index,
-            prevout.value,
-            &job.prevouts,
             ss,
             interpreter::SigVersion::Base,
-            job.bip65_active,
-            job.bip112_active,
-            job.bip66_active,
-        )
-        .apply_job_flags(job);
+        );
         let _ = interpreter::eval_script(ss, &mut stack, &ctx_sig)?;
     }
-    let ctx = interpreter::EvalContext::new_with_flags(
+    let spk = prevout.script_pubkey.as_script();
+    let ctx = interpreter::EvalContext::from_job(
+        job,
         tx,
         input_index,
-        prevout.value,
-        &job.prevouts,
-        prevout.script_pubkey.as_script(),
+        spk,
         interpreter::SigVersion::Base,
-        job.bip65_active,
-        job.bip112_active,
-        job.bip66_active,
-    )
-    .apply_job_flags(job);
-    if interpreter::eval_script(prevout.script_pubkey.as_script(), &mut stack, &ctx)? {
+    );
+    if interpreter::eval_script(spk, &mut stack, &ctx)? {
         // Legacy bare: true top (not witness cleanstack).
         interpreter::require_true_top(&stack)?;
     }

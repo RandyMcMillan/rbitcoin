@@ -43,6 +43,7 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 - **No open-ended flag-category soft-skips.** Every mismatch that is not a hard fail is inventoried by id; the harness asserts `allow_skip ≤ ALLOWLIST.len()` and every used skip id is in the inventory.
 - Unknown failures fail the test. Grow coverage by **removing** allowlist entries and fixing the engine.
 - **History:** Allowlists were introduced deliberately (`1f6d703`, refined `28d0c82`) so Core corpora could land with an honest inventory instead of soft majority gates. Goal is empty inventory, not a permanent skip list.
+- **Status (2026-08):** `script_tests.json` **ALLOWLIST is empty** (`allow_skip=0`, all rows match Core). `TX_ALLOWLIST` still inventories residual precomputed-tx gaps (historical CMS DER/NULLDUMMY/LOW_S, CONST_SCRIPTCODE/sighash, BADTX structural).
 
 ### rust-bitcoin vs our allowlist
 

@@ -279,10 +279,14 @@ Do **not** wipe `store/` for mempool slot/full errors.
 
 ## Electrum
 
-Internet-facing Electrum is supported as a **wallet backend**: bind plain TCP
-(public or loopback), terminate **TLS at a reverse proxy**, and rely on the
-node’s **app DoS limits** always being on. A loopback-only bind is convenient
-with a local proxy, but it is **not** the security model by itself.
+Internet-facing Electrum is supported as a **wallet-client backend** (Electrum,
+Sparrow, similar): bind plain TCP (public or loopback), terminate **TLS at a
+reverse proxy**, and rely on the node’s **app DoS limits** always being on. A
+loopback-only bind is convenient with a local proxy, but it is **not** the
+security model by itself.
+
+**Not a graphical explorer.** We serve clients that already know their
+scripthashes / txids; we do **not** aim to back block-explorer search UIs.
 
 ```bash
 ./target/release/rbitcoin-node \
@@ -324,8 +328,13 @@ Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See
 
 ## Esplora REST
 
-Blockstream-compatible **plain HTTP** API for explorers/wallets. Same internet-facing
-model as Electrum: app DoS limits always on; terminate TLS at a reverse proxy.
+Blockstream-**compatible** **plain HTTP** API for **wallet clients and APIs**
+(exact address/scripthash, tx/block by id, broadcast)—**not** a graphical
+block-explorer backend. Same internet-facing model as Electrum: app DoS limits
+always on; terminate TLS at a reverse proxy.
+
+**Explicit non-goals:** explorer search/`address-prefix`, Liquid, mining
+templates, mempool.space-style catalogue UI APIs.
 
 ```bash
 ./target/release/rbitcoin-node \
@@ -345,7 +354,7 @@ Conf: `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 | Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`), `/txs/mempool`; complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503** |
-| Unknown / deferred | **404** (Liquid, mining template, address-prefix) |
+| Unknown / non-goal | **404** (explorer-only APIs e.g. address-prefix; Liquid; mining template) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.  
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.

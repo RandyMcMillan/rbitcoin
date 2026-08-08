@@ -1,6 +1,9 @@
-//! Esplora-compatible REST HTTP server (plain HTTP; TLS via reverse proxy).
+//! Esplora-compatible REST HTTP for **wallet clients and APIs** (plain HTTP;
+//! TLS via reverse proxy).
 //!
-//! Tip, block header, and tx projection (incl. documented asm/type/address).
+//! Serves exact address/scripthash history, tx/block by id, and broadcast—not a
+//! graphical block-explorer product (no address-prefix search / explorer UI
+//! catalogue APIs).
 
 mod handlers;
 mod script_fields;

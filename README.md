@@ -1,9 +1,10 @@
 # rbitcoin
 
 Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
-IBD, tip follow, block/tx relay (tip mode), and in-process Electrum for **wallet
-backends** and similar infrastructure — built around a **libbitcoin-class
-relational archive** and a **pure-Rust consensus/script** path.
+IBD, tip follow, block/tx relay (tip mode), and in-process **Electrum + optional
+Esplora REST for wallet clients** (not a graphical block-explorer stack) — built
+around a **libbitcoin-class relational archive** and a **pure-Rust
+consensus/script** path.
 
 > **0.x:** on-disk format and APIs are **unstable until 1.0**. Prefer a **signet
 > soak** before first mainnet cutover; treat early mainnet as high-scrutiny.
@@ -58,10 +59,15 @@ Product surface: [`COMPAT.md`](./COMPAT.md).
 ## Status
 
 Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash,
-Electrum, libre mempool) for the **server-side / wallet-backend** role. **0.x
-mainnet** is early production: run **signet first**, then mainnet with
-monitoring ([`OPERATOR.md`](./OPERATOR.md)). Finishing any one operator’s first
-full mainnet sync is **not** a gate for using or packaging this tree.
+Electrum, Esplora REST, libre mempool) for the **server-side / wallet-client
+backend** role. **0.x mainnet** is early production: run **signet first**, then
+mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). Finishing any one
+operator’s first full mainnet sync is **not** a gate for using or packaging
+this tree.
+
+**Non-goal:** powering a **graphical block explorer** (search boxes,
+address-prefix autocomplete, explorer-only catalogue APIs). Product surface:
+[`COMPAT.md`](./COMPAT.md).
 
 **Authorship:** first-party code is **AI-written** (Grok / xAI) under
 **Brandon Black** ([@reardencode](https://github.com/reardencode)) prompting —

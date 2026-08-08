@@ -46,16 +46,17 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   mitigations are intentional operator surface: max inbound sessions
   (`--maxinbound` / `--maxconnections`, default 125), per-session message/byte
   rate windows, misbehavior score disconnect.
-- **Electrum and Esplora:** plain TCP/HTTP; TLS is an operator reverse-proxy
-  concern. The node is **internet-facing capable**: application DoS limits
-  (`ServeLimits` — max connections, request size, idle timeout, plus Electrum
-  scripthash-sub / broadcast-hex caps) are **always enforced**, not only when
-  bound to localhost. Excess connections are refused without hanging; oversize
-  lines/bodies fail closed. Esplora is opt-in (`--esplora-listen`). Edge TLS,
-  multi-tenant metering, and API keys are still out of process (see
-  [`OPERATOR.md`](./OPERATOR.md)).
+- **Electrum and Esplora (wallet-client backends):** plain TCP/HTTP; TLS is an
+  operator reverse-proxy concern. Intended for **wallet software**, not as a
+  graphical explorer product. The node is **internet-facing capable**:
+  application DoS limits (`ServeLimits` — max connections, request size, idle
+  timeout, plus Electrum scripthash-sub / broadcast-hex caps) are **always
+  enforced**, not only when bound to localhost. Excess connections are refused
+  without hanging; oversize lines/bodies fail closed. Esplora is opt-in
+  (`--esplora-listen`). Edge TLS, multi-tenant metering, and API keys are still
+  out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
-  mislead a wallet backend are in scope.
+  mislead a **wallet** backend are in scope.
 - **No wallet keys in this repository:** do **not** send seed phrases or private
   keys in reports.
 

@@ -1,4 +1,8 @@
-//! Electrum protocol 1.4+ server (confirmed + optional mempool / libre-relay-class).
+//! Electrum protocol 1.4+ server for **wallet clients** (confirmed + optional
+//! mempool / libre-relay-class).
+//!
+//! Not a graphical block-explorer backend: clients are expected to already
+//! know their scripthashes / txids.
 
 mod server;
 

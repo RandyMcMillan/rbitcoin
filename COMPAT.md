@@ -9,9 +9,23 @@ contrasts: [`docs/architecture.md`](./docs/architecture.md). Lab mainnet:
 
 ## Active product track
 
-Full **P2P participant** (blocks + tip-mode tx relay) and **Electrum** backend
-(confirmed + unconfirmed, libre-relay-class admission). Not full Core JSON-RPC /
-wallet / mining parity.
+Full **P2P participant** (blocks + tip-mode tx relay) and **wallet-client
+backends**: in-process **Electrum** (confirmed + unconfirmed, libre-relay-class
+admission) and optional **Esplora-compatible REST** for the same role (history,
+UTXO, broadcast, block/tx fetch by id). Not full Core JSON-RPC / Core wallet /
+mining parity.
+
+### Query surface intent: wallet clients, not graphical explorers
+
+**Goal:** serve **wallet software** (Electrum, Sparrow, custom wallets, light
+clients that already know their addresses/scripthashes or exact txids/block
+ids).
+
+**Non-goal:** power a **graphical block explorer** product (search boxes,
+address-prefix autocomplete, “browse everything” UX, Liquid/mining template
+surfaces). Those need reverse indexes and explorer-only APIs we deliberately
+omit. Block/tx **by full id** and address/**exact** scripthash history exist so
+wallets and APIs can verify and sync—not so we become mempool.space.
 
 ## Intentional differences
 
@@ -59,7 +73,7 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
 | Unknown path | 404 | plain body |
-| Deferred | 404 | Liquid/assets, mining `block-template`, `address-prefix` search (no reverse index) |
+| **Non-goal / never** | — | Graphical explorer features: `address-prefix` search, Liquid/assets, mining `block-template`, explorer UI-only APIs |
 
 ## BIP324 v2 short-ID surface (live paths)
 
@@ -89,3 +103,6 @@ are deferred.
 
 Core wallet RPC, mining GBT, fee-estimator research quality, BIP331 native wire
 enum, durable orphans: **out of scope** for this plan.
+
+**Permanent non-goals for Electrum/Esplora:** graphical explorer backends
+(address-prefix autocomplete, global search, explorer-only catalogue APIs).

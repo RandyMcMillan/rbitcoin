@@ -628,11 +628,11 @@ pub fn accept_and_connect_block_preverified(
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
     let hash = block.block_hash().to_byte_array();
     // Already tip at this height — skip re-archive / re-confirm.
-    if let Some(h) = query.height_of_hash(&hash).map_err(ConsensusError::Store)? {
+    if let Some(h) = query.height_of_hash(&hash).map_err(ConsensusError::from)? {
         if h == height {
             if let Some((fk, _)) = query
                 .get_header_by_hash(&hash)
-                .map_err(ConsensusError::Store)?
+                .map_err(ConsensusError::from)?
             {
                 return Ok(fk);
             }
@@ -654,7 +654,7 @@ pub fn accept_and_connect_block_preverified(
     // Write skipped heights ≤ tip (idempotent race).
     query
         .get_header_by_hash(&hash)
-        .map_err(ConsensusError::Store)?
+        .map_err(ConsensusError::from)?
         .map(|(fk, _)| fk)
         .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::NotFound))
 }
@@ -671,7 +671,7 @@ pub fn accept_and_archive_block(
     let (header_rec, txs) = prepare_block_for_archive(query, params, block)?;
     query
         .archive_block(&header_rec, &txs)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     Ok(())
 }
 
@@ -684,7 +684,7 @@ pub fn prepare_block_for_archive(
     let hash = block.block_hash().to_byte_array();
     if query
         .is_block_archived(&hash)
-        .map_err(ConsensusError::Store)?
+        .map_err(ConsensusError::from)?
     {
         // Standalone archive helper (not confirm pipeline): one hash pass here.
         return block_to_apply(query, &block.header, &block.txdata);
@@ -712,7 +712,7 @@ pub fn prepare_block_for_archive_new(
     if prev.to_byte_array() != [0u8; 32]
         && query
             .get_header_by_hash(prev.as_byte_array())
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
             .is_none()
     {
         return Err(ConsensusError::BadPrev);

@@ -41,7 +41,15 @@ impl std::error::Error for ConsensusError {
 
 impl From<StoreError> for ConsensusError {
     fn from(e: StoreError) -> Self {
-        ConsensusError::Store(e)
+        // Peer / untrusted blocks can hit archive stamp when a parent is simply
+        // missing (invalid block). That is consensus MissingPrevout, not store
+        // corruption — see docs/external_findings/002-store-corrupt-record-on-invalid-block.md.
+        match &e {
+            StoreError::Corrupt(m) if m.contains("parent create_fk unresolved") => {
+                ConsensusError::MissingPrevout
+            }
+            _ => ConsensusError::Store(e),
+        }
     }
 }
 
@@ -76,6 +84,18 @@ mod tests {
             assert_eq!(err.to_string(), *needle);
             assert!(err.source().is_none());
         }
+    }
+
+    #[test]
+    fn archive_unresolved_parent_is_missing_prevout_not_corrupt() {
+        let e = ConsensusError::from(StoreError::Corrupt(
+            "archive: parent create_fk unresolved (contiguous batch required)",
+        ));
+        assert!(
+            matches!(e, ConsensusError::MissingPrevout),
+            "got {e:?}"
+        );
+        assert!(!e.to_string().contains("corrupt"));
     }
 
     #[test]

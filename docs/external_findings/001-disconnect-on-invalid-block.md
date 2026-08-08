@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-net` (P2P peer session)
 **Commit:** `1ec7e42` (2026-08-07)
 **Severity:** medium — remotely triggerable peer eviction; no crash, no consensus split
-**Status:** disconnect reproduced deterministically (9/9 archived testcases)
+**Status:** fixed — `drain_pending` keeps the session on accept failure (no disconnect/score)
 **Found by:** fuzzamoto differential campaign (Bitcoin Core primary vs rbitcoin reference,
 `oracle_consensus`)
 

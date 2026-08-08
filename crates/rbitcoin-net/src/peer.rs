@@ -861,15 +861,23 @@ fn drain_pending(
                     | Ok(AcceptOutcome::IgnoredWeaker) => {
                         progress = true;
                     }
-                    // Missing store rows / incomplete Class A must not kill the
-                    // TCP session — drop this block and keep the peer (re-getdata later).
+                    // Invalid or unconnectable body: reject the block, keep the
+                    // peer. BIP-152 high-bandwidth (and getdata we solicited) can
+                    // deliver PoW-valid-but-invalid blocks from honest Core peers
+                    // that have not validated yet — never disconnect or ban-score
+                    // for that (docs/external_findings/001-disconnect-on-invalid-block.md).
                     Err(e) if net_error_is_store_not_found(&e) => {
                         rbitcoin_log::warn!(
                             "p2p: accept dropped {} (store not found — keep session): {e}",
                             h
                         );
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        rbitcoin_log::warn!(
+                            "p2p: accept dropped {} (invalid/unconnectable — keep session): {e}",
+                            h
+                        );
+                    }
                 }
             }
         }
@@ -1136,6 +1144,75 @@ mod tests {
         let mut ph = HashMap::new();
         drain_pending(&hub, &mut pb, &mut ph).unwrap();
         try_reorg_from_pending(&hub, &mut pb, &mut ph).unwrap();
+
+        // Invalid tip-extending body must not kill the session (001).
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        let tip = hub.tip_hash().unwrap();
+        let tip_block = hub
+            .query
+            .reconstruct_block_by_hash(&tip.to_byte_array())
+            .unwrap()
+            .expect("tip body");
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        // Second tx spends a nonexistent prevout → consensus reject.
+        let junk = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut bad = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: tip,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+                time: tip_block.header.time + 600,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, junk],
+        };
+        bad.header.merkle_root = bad.compute_merkle_root().unwrap();
+        let target = bitcoin::Target::from_compact(bad.header.bits);
+        for nonce in 0..200_000u32 {
+            bad.header.nonce = nonce;
+            if bad.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let bh = bad.block_hash();
+        pb.insert(bh, bad);
+        drain_pending(&hub, &mut pb, &mut ph).expect("invalid block must not end session");
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -1031,12 +1031,12 @@ fn assemble_block_prevouts_mode(
                         query
                             .store()
                             .has_confirmed_strong_spender_create(cfk, op.vout, None)
-                            .map_err(ConsensusError::Store)?
+                            .map_err(ConsensusError::from)?
                     } else {
                         query
                             .store()
                             .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
-                            .map_err(ConsensusError::Store)?
+                            .map_err(ConsensusError::from)?
                     };
                     if spent {
                         return Err(ConsensusError::PrevoutSpent);
@@ -1329,7 +1329,7 @@ pub(crate) fn structural_validate_spends(
         let metas = query
             .store()
             .get_spender_meta_at_abs_batch_backend(&abs_offs, meta_backend)
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
         let meta_ns = t_meta.elapsed().as_nanos() as u64;
         confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
         confirm_phase_stats::SPEND_META_N.fetch_add(abs_offs.len() as u64, Ordering::Relaxed);
@@ -1357,7 +1357,7 @@ pub(crate) fn structural_validate_spends(
                 let spent = query
                     .store()
                     .has_confirmed_strong_spender_create(rbitcoin_primitives::Fk(id), vout, None)
-                    .map_err(ConsensusError::Store)?;
+                    .map_err(ConsensusError::from)?;
                 multi_list_ns = multi_list_ns.saturating_add(t_m.elapsed().as_nanos() as u64);
                 if spent {
                     durable_spent.insert((id, vout));
@@ -1370,7 +1370,7 @@ pub(crate) fn structural_validate_spends(
             let strong = query
                 .store()
                 .is_confirmed_strong_at(field, tip)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             if !strong {
                 continue;
             }
@@ -1383,12 +1383,12 @@ pub(crate) fn structural_validate_spends(
                 .store()
                 .tx_height
                 .get(rbitcoin_primitives::Fk(id))
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             let spend_h = query
                 .store()
                 .tx_height
                 .get(field)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             if let (Some(ch), Some(sh)) = (create_h, spend_h) {
                 if sh < ch {
                     continue;
@@ -1454,7 +1454,7 @@ pub(crate) fn structural_validate_spends(
     let durable_heights = query
         .store()
         .tx_height_get_batch(&unique_create_fks)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     let height_by_id: U64Map<u32> = unique_create_fks
         .iter()
         .zip(durable_heights.into_iter())
@@ -1471,7 +1471,7 @@ pub(crate) fn structural_validate_spends(
     let coinbase_fk_by_height = query
         .store()
         .coinbase_fk_at_heights(&height_list)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
 
     let mut seen_create: rbitcoin_query::U64Set = rbitcoin_query::U64Set::with_capacity_and_hasher(vouts_by_create.len(), Default::default());
     for &(_ptid, _vout, _sfk, create_fk) in spends {
@@ -1874,7 +1874,7 @@ fn resolve_prevout(
     let t_fk = Instant::now();
     let head_fk = query
         .tx_fk_by_txid(&prev_txid)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     confirm_phase_stats::ASM_PREV_FK_NS
         .fetch_add(t_fk.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let candidates = [prev_fk_hint, head_fk];
@@ -1961,7 +1961,7 @@ fn create_height_for_fk(
         .store()
         .tx_height
         .get(prev_fk)
-        .map_err(ConsensusError::Store)?
+        .map_err(ConsensusError::from)?
         .unwrap_or(0))
 }
 
@@ -1994,7 +1994,7 @@ fn coinbase_height_for_maturity(
         .store()
         .tx_height
         .get(prev_fk)
-        .map_err(ConsensusError::Store)?)
+        .map_err(ConsensusError::from)?)
 }
 
 /// `(is_coinbase, create_height if coinbase and confirmed)`.
@@ -2024,7 +2024,7 @@ fn coinbase_info(
             .store()
             .tx_height
             .get(prev_fk)
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
         if h.is_some() {
             cache.insert(prev_fk, h);
         }
@@ -2040,7 +2040,7 @@ fn coinbase_info(
             .store()
             .tx_height
             .get(prev_fk)
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
     } else {
         None
     };
@@ -2061,7 +2061,7 @@ fn is_coinbase_tx_record(
     // Key by create fk so packed Class A works with `tx.head` off (catch-up).
     let inp = query
         .tx_input_at_fk(prev_fk, rec, 0)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     Ok(inp.is_coinbase() || (inp.prev_txid == [0u8; 32] && inp.prev_index == 0xffff_ffff))
 }
 
@@ -2077,7 +2077,7 @@ fn find_output(
     // Cold path: always use create fk (packed body + head-off catch-up).
     query
         .tx_output_at_fk_attributed(prev_fk, prev_rec, vout, true)
-        .map_err(ConsensusError::Store)
+        .map_err(ConsensusError::from)
 }
 
 fn is_anyone_can_spend(script: &Script) -> bool {

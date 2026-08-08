@@ -11,4 +11,4 @@ rbitcoin reference). Numbered reports live beside this index.
 | [004](./004-csv-nop-and-scriptnum-width.md) | high | CSV v1 no-op; CLTV/CSV 4-byte scriptnum |
 | [005](./005-non-topological-block-accepted.md) | high | Non-topological same-block spends accepted |
 
-Remediation tracks these documents; update **Status** when fixed.
+Remediation (2026-08): 001–005 fixed in-tree; see each file **Status** line.

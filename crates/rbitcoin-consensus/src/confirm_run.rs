@@ -407,14 +407,14 @@ pub fn confirm_wire_load_phase_pipelined(
         let t = Instant::now();
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
         {
             fk
         } else {
             query
                 .store()
                 .put_header(&header_rec)
-                .map_err(ConsensusError::Store)?
+                .map_err(ConsensusError::from)?
         };
         let prev_bytes = block.header.prev_blockhash.to_byte_array();
         query.confirm_parent_cache().put_header_plan(
@@ -440,14 +440,14 @@ pub fn confirm_wire_load_phase_pipelined(
     let t_fp = Instant::now();
     let (_header_fks, mut need) = query
         .archive_filter_need_bodies(&mut with_fk)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     let mut plan = if need.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
                 .store()
                 .header_txs
                 .get_list(m.header_fk)
-                .map_err(ConsensusError::Store)?
+                .map_err(ConsensusError::from)?
             {
                 m.tx_fks = list;
             }
@@ -466,10 +466,10 @@ pub fn confirm_wire_load_phase_pipelined(
         let plan = match pipeline {
             Some(p) => query
                 .archive_plan_batch_from(&mut need, p.next_tx_start.max(1), &p.in_flight)
-                .map_err(ConsensusError::Store)?,
+                .map_err(ConsensusError::from)?,
             None => query
                 .archive_plan_batch_owned(&mut need)
-                .map_err(ConsensusError::Store)?,
+                .map_err(ConsensusError::from)?,
         };
         let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
         for &(hfk, first, n) in &plan.per_header_ranges {
@@ -496,7 +496,7 @@ pub fn confirm_wire_load_phase_pipelined(
                     .store()
                     .header_txs
                     .get_list(m.header_fk)
-                    .map_err(ConsensusError::Store)?
+                    .map_err(ConsensusError::from)?
                 {
                     m.tx_fks = list;
                 }
@@ -763,7 +763,7 @@ pub fn ensure_external_parent_denserels_from_plan(
             let (decoded, body_ns, dec_ns) = query
                 .store()
                 .get_outs_denserels_by_range_batch(&by_range)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             let rng_ns = body_ns.saturating_add(dec_ns);
             if rng_ns > 0 {
                 confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
@@ -799,7 +799,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                 &need_idx,
                 IdxBodyMode::OutsDenserels,
             )
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
             let idx_ns = t_idx.elapsed().as_nanos() as u64;
             let n_idx = loaded.len() as u64;
             if idx_ns > 0 {
@@ -1055,7 +1055,7 @@ fn stamp_parent_pin_archived(
         let hits = query
             .store()
             .get_fk_by_txid_batch(&need_head)
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
         for (txid, row) in hits {
             if let Some((fk, range)) = row {
                 if let Some(id) = fk.get() {
@@ -1085,7 +1085,7 @@ fn stamp_parent_pin_archived(
         let ranges = query
             .store()
             .tx_body_range_batch(&need_range)
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
         for (fk, row) in need_range.into_iter().zip(ranges.into_iter()) {
             let Some(id) = fk.get() else { continue };
             let Some(range) = row else {
@@ -1304,14 +1304,14 @@ fn wire_lookup_phase(
             crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
         {
             fk
         } else {
             query
                 .store()
                 .put_header(&header_rec)
-                .map_err(ConsensusError::Store)?
+                .map_err(ConsensusError::from)?
         };
         let prev_bytes = block.header.prev_blockhash.to_byte_array();
         query.confirm_parent_cache().put_header_plan(
@@ -1337,7 +1337,7 @@ fn wire_lookup_phase(
     let t_filter = Instant::now();
     let (_header_fks, mut need) = query
         .archive_filter_need_bodies(&mut with_fk)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_batch = Instant::now();
     let plan = if need.is_empty() {
@@ -1346,7 +1346,7 @@ fn wire_lookup_phase(
                 .store()
                 .header_txs
                 .get_list(m.header_fk)
-                .map_err(ConsensusError::Store)?
+                .map_err(ConsensusError::from)?
             {
                 m.tx_fks = list;
             }
@@ -1365,10 +1365,10 @@ fn wire_lookup_phase(
         let plan = match pipeline {
             Some(p) => query
                 .archive_plan_batch_from(&mut need, p.next_tx_start.max(1), &p.in_flight)
-                .map_err(ConsensusError::Store)?,
+                .map_err(ConsensusError::from)?,
             None => query
                 .archive_plan_batch_owned(&mut need)
-                .map_err(ConsensusError::Store)?,
+                .map_err(ConsensusError::from)?,
         };
         let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
         for &(hfk, first, n) in &plan.per_header_ranges {
@@ -1395,7 +1395,7 @@ fn wire_lookup_phase(
                     .store()
                     .header_txs
                     .get_list(m.header_fk)
-                    .map_err(ConsensusError::Store)?
+                    .map_err(ConsensusError::from)?
                 {
                     m.tx_fks = list;
                 }
@@ -1644,7 +1644,7 @@ fn known_create_txid_lookup(
         .store()
         .txs
         .body_txid(rbitcoin_primitives::Fk(create_fk_id))
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     if tid == [0u8; 32] {
         return Err(ConsensusError::Store(StoreError::Corrupt(
             "invariant: pin parent create identity still zero after txid.body",
@@ -2018,7 +2018,7 @@ fn pin_for_wire_batch(
             let (decoded, body_ns, dec_ns) = query
                 .store()
                 .get_outs_denserels_by_range_batch(&range_jobs)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             let rng_ns = body_ns.saturating_add(dec_ns);
             cold_range_batch_ns = cold_range_batch_ns.saturating_add(rng_ns);
             if rng_ns > 0 {
@@ -2551,7 +2551,7 @@ pub fn confirm_write_phase(
             let t_ca = Instant::now();
             let committed = query
                 .archive_commit_plan(plan)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             class_a_ns = t_ca.elapsed().as_nanos() as u64;
             // Layout + SH pins only after a real append. Idempotent skip (Class A
             // already present) uses store denserels via ensure / class_c cold pins.
@@ -2672,7 +2672,7 @@ fn fill_planned_create_layout_after_commit(
     let ranges = query
         .store()
         .tx_body_range_batch(&need_fks)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     for ((&fk, range), &pi) in need_fks
         .iter()
         .zip(ranges.into_iter())
@@ -2786,7 +2786,7 @@ fn ensure_spend_abs_layouts(
         let ranges = query
             .store()
             .tx_body_range_batch(&range_only)
-            .map_err(ConsensusError::Store)?;
+            .map_err(ConsensusError::from)?;
         for (fk, opt) in range_only.iter().zip(ranges.into_iter()) {
             let Some(range) = opt else {
                 // No idx range yet (e.g. parent not committed) — hard fail at post-condition
@@ -2822,7 +2822,7 @@ fn ensure_spend_abs_layouts(
         // Structural denserels fill for pin gaps (cold Class A).
         let loaded =
             rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::OutsDenserels)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
         let secret = query.store().txs.store_secret();
         for c in loaded {
             let Some(id) = c.fk.get() else {
@@ -4742,7 +4742,7 @@ fn load_confirm_batch(
     }
     let (_st, batch_parents, batch_thin, batch_bodies) = query
         .load_confirm_parents(items)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     Ok((batch_parents, batch_thin, batch_bodies))
 }
 
@@ -4770,11 +4770,11 @@ fn resolve_body_metas(
         // Store fallback (load miss / hash mismatch).
         let (header_fk, header_rec) = query
             .get_header_by_hash(&hash)
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
             .ok_or(ConsensusError::Store(StoreError::NotFound))?;
         let tx_fks = query
             .header_tx_fks(header_fk, Some(&hash))
-            .map_err(ConsensusError::Store)?
+            .map_err(ConsensusError::from)?
             .ok_or(ConsensusError::Store(StoreError::Corrupt(
                 "confirm without archived body",
             )))?;
@@ -4814,7 +4814,7 @@ fn wire_rebuild(
                     prev_hash,
                     Some(batch_bodies),
                 )
-                .map_err(ConsensusError::Store)?,
+                .map_err(ConsensusError::from)?,
         ));
     }
     let ns = t0.elapsed().as_nanos() as u64;
@@ -4870,7 +4870,7 @@ fn assemble_run(
                         }
                     } else if let Some((_fk, rec)) = query
                         .header_at_height(Height(h))
-                        .map_err(ConsensusError::Store)?
+                        .map_err(ConsensusError::from)?
                     {
                         // Confirmed (plan tip-GC'd or never cached) — store wins.
                         times.push(rec.timestamp);
@@ -4894,7 +4894,7 @@ fn assemble_run(
                 // Bits / PoW / checkpoint: store when parent is confirmed; else plan.
                 if query
                     .header_at_height(prev_h)
-                    .map_err(ConsensusError::Store)?
+                    .map_err(ConsensusError::from)?
                     .is_some()
                 {
                     validate_header(query, params, height, &block.header)?;
@@ -5137,7 +5137,7 @@ fn class_c_commit(
     };
     let out = query
         .confirm_blocks_run_with_create_pins(&items, pins)
-        .map_err(ConsensusError::Store)?;
+        .map_err(ConsensusError::from)?;
     let strong_d = STRONG_NS.load(QOrd::Relaxed).saturating_sub(strong0);
     let tip_d = TIP_NS.load(QOrd::Relaxed).saturating_sub(tip0);
     confirm_phase_stats::CLASS_C_NS.fetch_add(strong_d.saturating_add(tip_d), Ordering::Relaxed);
@@ -5190,7 +5190,7 @@ fn post_commit(
             let cold = query
                 .store()
                 .put_spend_batch_by_abs_meta_known(&abs_edges, &known, backend)
-                .map_err(ConsensusError::Store)?;
+                .map_err(ConsensusError::from)?;
             if !cold.is_empty() {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: spend annotate abs cold (OOB or IO); load/layout bug",
@@ -5270,7 +5270,7 @@ fn expected_bits_extending(
     let first_height = Height(height.0 - interval);
     let first_ts = if let Some((_fk, rec)) = query
         .header_at_height(first_height)
-        .map_err(ConsensusError::Store)?
+        .map_err(ConsensusError::from)?
     {
         rec.timestamp
     } else if let Some(plan) = query

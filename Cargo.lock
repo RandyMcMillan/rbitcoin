@@ -686,6 +686,7 @@ dependencies = [
  "bitcoin",
  "rbitcoin-electrum",
  "rbitcoin-log",
+ "rbitcoin-net",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",

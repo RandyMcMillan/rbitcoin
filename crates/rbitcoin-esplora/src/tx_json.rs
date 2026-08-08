@@ -102,8 +102,14 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
 
     let weight = wire.weight().to_wu();
     let size = wire.total_size();
+    // Prefer Class A stored txid so history cursors and /tx routes share identity
+    // (reconstructed wire hash matches in production; fixtures may differ).
+    let stored_txid = query
+        .get_tx(tx_fk)
+        .map(|t| t.txid)
+        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     let mut obj = json!({
-        "txid": format!("{}", wire.compute_txid()),
+        "txid": block_hash_hex(&stored_txid),
         "version": wire.version.0,
         "locktime": wire.lock_time.to_consensus_u32(),
         "size": size,

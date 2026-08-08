@@ -43,6 +43,22 @@ wallet / mining parity.
 | TLS | external | terminate at reverse proxy; node is plain TCP |
 | DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
 
+## Esplora REST surface
+
+Plain HTTP via `--esplora-listen` / conf `esplora_listen` (default **off**). TLS
+via reverse proxy; app `ServeLimits` always on (same model as Electrum).
+
+| Endpoint group | Status | Notes |
+|----------------|--------|-------|
+| Tip | done | `/blocks/tip/height`, `/blocks/tip/hash` |
+| Block | done | `/block-height/:h`, `/block/:hash/header`, `/txids`, `/txs` (25-page, start%25==0) |
+| Tx | done | `/tx/:txid` (full JSON incl. asm/type/address), `/hex`, `/status`, Electrum-style `/merkle-proof`, `/outspend(s)` |
+| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/chain[/:last_seen_txid]` (25 newest-first); needs SH finalize |
+| Mempool / fees | done | `/mempool`, `/fee-estimates`; empty defaults without hub |
+| `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
+| Unknown path | 404 | plain body |
+| Deferred | 404 | Liquid, mining template, address-prefix, merkleblock-proof, full block raw, etc. |
+
 ## BIP324 v2 short-ID surface (live paths)
 
 Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.rs`).

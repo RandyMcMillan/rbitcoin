@@ -506,10 +506,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             let max_conn = ecfg.limits.max_connections;
             let max_body = ecfg.limits.max_request_bytes;
             let idle_secs = ecfg.limits.idle_timeout.as_secs();
-            match run_esplora(ecfg, q).await {
+            match run_esplora(ecfg, q, Some(mempool.clone())).await {
                 Ok(h) => {
                     info!(
-                        "esplora HTTP on {} (tx/block/tip; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
+                        "esplora HTTP on {} (full REST; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
                         h.local_addr, max_conn, max_body, idle_secs
                     );
                     esplora_handles.push(h);

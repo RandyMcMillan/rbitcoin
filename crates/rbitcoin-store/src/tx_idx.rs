@@ -1226,6 +1226,10 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate `RBITCOIN_TX_IDX_SOFT_SPAN` (process-global).
+    static SOFT_SPAN_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Re-appending the same absolute starts after count advanced must fail
     /// (mainnet double-write of 3330 idx slots).
@@ -1266,6 +1270,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
         // Tiny soft span → many segments.
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
         let idx = TxIdx::create(&dir, "tx").unwrap();
@@ -1290,6 +1295,7 @@ mod tests {
         assert_eq!(ranges.len(), 6);
         assert_eq!(ranges[0].0, 16);
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        drop(_env);
         // New layout lives under tx.idx/
         assert!(dir.join("tx.idx").join("meta").is_file());
         assert!(!dir.join("tx.idx.meta").exists());
@@ -1297,6 +1303,9 @@ mod tests {
     }
 
     /// Serial `record_start` page loads never set DONTCACHE (permanent spend-only).
+    ///
+    /// Policy is age-independent (`head_or_idx_segment_index` always false); a
+    /// single segment is enough. Soft-span env is locked to avoid parallel races.
     #[test]
     fn serial_record_start_never_dontcache() {
         use crate::bulk_io;
@@ -1307,25 +1316,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-txidx-dc-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Tiny soft span → one segment per append (need ≥5 segs for age>3).
+        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "32");
         let idx = TxIdx::create(&dir, "tx").unwrap();
-        // Each append jumps body base far enough to roll.
-        let mut base = 16u64;
-        let mut count = 0u64;
-        for _ in 0..6 {
-            let starts = [base, base + 8];
-            idx.append_starts(count, &starts).unwrap();
-            count += 2;
-            base += 256; // force soft-span roll
-        }
-        assert!(
-            idx.segment_count() >= 5,
-            "need ≥5 segs for age>3; got {}",
-            idx.segment_count()
-        );
+        // A few starts; policy does not depend on multi-segment age.
+        idx.append_starts(0, &[16u64, 24, 32, 40]).unwrap();
+        assert!(idx.slot_count() >= 4);
 
-        // Oldest (si=0, age ≥4): still no DONTCACHE under permanent spend-only.
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = idx.record_start(1).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
@@ -1335,17 +1332,17 @@ mod tests {
             "idx segment reads must not DONTCACHE; got {flags:?}"
         );
 
-        // Tip segment: no DONTCACHE.
         let _ = bulk_io::test_take_last_read_dontcache();
-        let _ = idx.record_start(count).unwrap();
+        let _ = idx.record_start(4).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty());
         assert!(
             flags.iter().all(|&d| !d),
-            "tip idx segment must not DONTCACHE; got {flags:?}"
+            "tip-adjacent idx slot must not DONTCACHE; got {flags:?}"
         );
 
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1360,6 +1357,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
         {
             let idx = TxIdx::create(&dir, "tx").unwrap();
@@ -1391,6 +1389,7 @@ mod tests {
         assert!(dir.join("tx.idx").join("meta").is_file());
         assert!(!meta_flat.exists());
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

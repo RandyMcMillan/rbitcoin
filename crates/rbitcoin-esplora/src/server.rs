@@ -1,15 +1,17 @@
 //! Esplora HTTP listener (axum + tower limits).
 
+use crate::handlers;
 use crate::tx_json::{build_tx_json, tx_status_json};
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
+use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
@@ -62,18 +64,23 @@ impl EsploraHandle {
 }
 
 #[derive(Clone)]
-struct AppState {
-    query: Arc<Query>,
-    network: Network,
+pub(crate) struct AppState {
+    pub(crate) query: Arc<Query>,
+    pub(crate) network: Network,
+    pub(crate) mempool: Option<Arc<MempoolHub>>,
+    pub(crate) max_body: usize,
 }
 
 /// Start Esplora **plain HTTP** on `config.listen`.
 ///
 /// TLS is external (reverse proxy). App [`ServeLimits`] always apply (concurrency,
 /// body size, request timeout) — same floor as Electrum.
+///
+/// Optional `mempool` enables fee estimates, mempool summary, and `POST /tx`.
 pub async fn run_esplora(
     config: EsploraConfig,
     query: Arc<Query>,
+    mempool: Option<Arc<MempoolHub>>,
 ) -> Result<EsploraHandle, std::io::Error> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -89,15 +96,45 @@ pub async fn run_esplora(
     let state = AppState {
         query,
         network: config.network,
+        mempool,
+        max_body,
     };
     let app = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/block-height/:height", get(block_height))
         .route("/block/:hash/header", get(block_header))
+        .route("/block/:hash/txids", get(handlers::block_txids))
+        .route("/block/:hash/txs", get(handlers::block_txs_0))
+        .route("/block/:hash/txs/:start", get(handlers::block_txs_start))
         .route("/tx/:txid", get(tx_full))
         .route("/tx/:txid/hex", get(tx_hex))
         .route("/tx/:txid/status", get(tx_status))
+        .route("/tx/:txid/merkle-proof", get(handlers::tx_merkle_proof))
+        .route("/tx/:txid/outspend/:vout", get(handlers::tx_outspend))
+        .route("/tx/:txid/outspends", get(handlers::tx_outspends))
+        .route("/tx", post(handlers::post_tx))
+        .route("/address/:addr", get(handlers::address_info))
+        .route("/address/:addr/utxo", get(handlers::address_utxo))
+        .route("/address/:addr/txs", get(handlers::address_txs))
+        .route("/address/:addr/txs/chain", get(handlers::address_txs_chain))
+        .route(
+            "/address/:addr/txs/chain/:last",
+            get(handlers::address_txs_chain_cursor),
+        )
+        .route("/scripthash/:hash", get(handlers::scripthash_info))
+        .route("/scripthash/:hash/utxo", get(handlers::scripthash_utxo))
+        .route("/scripthash/:hash/txs", get(handlers::scripthash_txs))
+        .route(
+            "/scripthash/:hash/txs/chain",
+            get(handlers::scripthash_txs_chain),
+        )
+        .route(
+            "/scripthash/:hash/txs/chain/:last",
+            get(handlers::scripthash_txs_chain_cursor),
+        )
+        .route("/mempool", get(handlers::mempool_info))
+        .route("/fee-estimates", get(handlers::fee_estimates))
         .fallback(fallback_404)
         .layer(TimeoutLayer::new(timeout))
         .layer(RequestBodyLimitLayer::new(max_body))
@@ -217,7 +254,7 @@ async fn fallback_404() -> Response {
     not_found()
 }
 
-fn plain_ok(body: String) -> Response {
+pub(crate) fn plain_ok(body: String) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -226,11 +263,11 @@ fn plain_ok(body: String) -> Response {
         .into_response()
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
-fn store_err(e: rbitcoin_query::QueryError) -> Response {
+pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
     // QueryError is StoreError.
     match e {
         StoreError::NotFound => not_found(),
@@ -239,14 +276,14 @@ fn store_err(e: rbitcoin_query::QueryError) -> Response {
 }
 
 /// Esplora / Core display order (internal hash bytes reversed).
-fn block_hash_hex(hash: &[u8; 32]) -> String {
+pub(crate) fn block_hash_hex(hash: &[u8; 32]) -> String {
     let mut rev = *hash;
     rev.reverse();
     rbitcoin_primitives::hex_encode(rev)
 }
 
 /// Parse 32-byte hash/txid hex (display order) → internal byte order.
-fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
+pub(crate) fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
     let mut bytes = rbitcoin_primitives::hex_decode(s).map_err(|_| ())?;
     if bytes.len() != 32 {
         return Err(());
@@ -361,7 +398,7 @@ mod tests {
 
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let addr = handle.local_addr;
 
         let (st, body) = http_get(addr, "/blocks/tip/height").await;
@@ -386,7 +423,7 @@ mod tests {
         let (dir, q) = temp_query("empty");
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let (st, _) = http_get(handle.local_addr, "/blocks/tip/height").await;
         assert_eq!(st, 503);
         let (st, _) = http_get(handle.local_addr, "/blocks/tip/hash").await;
@@ -418,7 +455,9 @@ mod tests {
 
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q)).await.expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
+            .await
+            .expect("listen");
         let addr = handle.local_addr;
 
         // /block-height/1
@@ -503,6 +542,135 @@ mod tests {
         let st_json = tx_status_json(&q, fk).unwrap();
         assert_eq!(st_json["confirmed"], true);
         assert_eq!(st_json["block_height"], 0);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Steps 8–11: txids, merkle-proof, outspends, scripthash stats/utxo/pages, mempool empty.
+    #[tokio::test]
+    async fn remaining_routes_fixture() {
+        use rbitcoin_store::script_hash;
+
+        let (dir, q) = temp_query("remain");
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        let mut coinbase_txids = Vec::new();
+        for h in 0..4u32 {
+            let (header, ta) = coinbase(h, prev);
+            hashes.push(header.hash);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let hash0 = block_hash_hex(&hashes[0]);
+        let (st, body) = http_get(addr, &format!("/block/{hash0}/txids")).await;
+        assert_eq!(st, 200, "{body}");
+        let ids: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], block_hash_hex(&coinbase_txids[0]));
+
+        let (st, body) = http_get(addr, &format!("/block/{hash0}/txs")).await;
+        assert_eq!(st, 200, "{body}");
+        let txs: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(txs.len(), 1);
+        assert!(txs[0].get("txid").is_some());
+
+        // start not multiple of 25 → 400
+        let (st, _) = http_get(addr, &format!("/block/{hash0}/txs/1")).await;
+        assert_eq!(st, 400);
+
+        let txid0 = block_hash_hex(&coinbase_txids[0]);
+        let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkle-proof")).await;
+        assert_eq!(st, 200, "{body}");
+        let mp: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(mp["block_height"], 0);
+        assert_eq!(mp["pos"], 0);
+        assert!(mp.get("merkle").is_some());
+
+        let (st, body) = http_get(addr, &format!("/tx/{txid0}/outspend/0")).await;
+        assert_eq!(st, 200, "{body}");
+        let os: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(os["spent"], false);
+
+        let (st, body) = http_get(addr, &format!("/tx/{txid0}/outspends")).await;
+        assert_eq!(st, 200, "{body}");
+        let oss: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(oss.len(), 1);
+
+        // Scripthash for OP_TRUE
+        let sh = script_hash(&[0x51]);
+        let sh_hex = block_hash_hex(&sh);
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}")).await;
+        assert_eq!(st, 200, "{body}");
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(info["chain_stats"]["tx_count"].as_u64().unwrap() >= 4);
+        assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 4);
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
+        assert_eq!(st, 200, "{body}");
+        let utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(!utxos.is_empty());
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/chain")).await;
+        assert_eq!(st, 200, "{body}");
+        let page1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(page1.len() <= 25);
+        assert!(!page1.is_empty());
+        // Newest first: tip coinbase first.
+        assert_eq!(page1[0]["status"]["block_height"], 3);
+
+        // Cursor uses Class A / history txids (fixture synthetic ids), not recomputed wire txids.
+        use rbitcoin_query::HistoryFilter;
+        let full = q
+            .scripthash_history_filtered(&sh, &HistoryFilter::esplora_chain_page(None))
+            .unwrap();
+        assert_eq!(full.len(), 4);
+        let after = full[0].txid;
+        let page2_items = q
+            .scripthash_history_filtered(&sh, &HistoryFilter::esplora_chain_page(Some(after)))
+            .unwrap();
+        assert_eq!(page2_items.len(), 3);
+        assert!(!page2_items.iter().any(|i| i.txid == after));
+        let last = block_hash_hex(&after);
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/chain/{last}")).await;
+        assert_eq!(st, 200, "{body}");
+        let page2: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(page2.len(), page2_items.len());
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs")).await;
+        assert_eq!(st, 200, "{body}");
+        let combined: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(!combined.is_empty());
+
+        // No mempool hub: empty-ish mempool, fee estimates still 200, POST 503.
+        let (st, body) = http_get(addr, "/mempool").await;
+        assert_eq!(st, 200, "{body}");
+        let mem: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(mem["count"], 0);
+
+        let (st, body) = http_get(addr, "/fee-estimates").await;
+        assert_eq!(st, 200, "{body}");
+        let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(fees.get("1").is_some());
+
+        // POST /tx without hub
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab";
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("503") || text.contains("mempool"),
+            "expected 503 without hub: {text}"
+        );
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

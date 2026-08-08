@@ -202,8 +202,8 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::ConfirmPrepared;
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
-    apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashHistoryItem,
-    ScriptHashOutpoint, ScriptHashUtxo,
+    apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashChainStats,
+    ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
 pub use wave_prevout::ThinInput;
 

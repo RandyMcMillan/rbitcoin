@@ -316,6 +316,32 @@ and idle clients fail closed.
 Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See
 [`SECURITY.md`](./SECURITY.md).
 
+## Esplora REST
+
+Blockstream-compatible **plain HTTP** API for explorers/wallets. Same internet-facing
+model as Electrum: app DoS limits always on; terminate TLS at a reverse proxy.
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir ./datadir-mainnet \
+  --network mainnet \
+  --esplora-listen 127.0.0.1:3000 \
+  --log-level info
+```
+
+Conf: `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
+
+| Feature | Behavior |
+|---------|----------|
+| Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
+| Tip / block / tx | height, hash, header hex, full tx JSON, hex, status, merkle-proof, outspends |
+| Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`); complete after SH tip finalize |
+| Mempool | `/mempool`, `/fee-estimates`, `POST /tx` when mempool hub is open (normal `run_p2p`) |
+| Without mempool | mempool routes empty/safe; `POST /tx` → **503** |
+| Unknown / deferred | **404** |
+
+DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
+
 ## Signet lab
 
 ```bash

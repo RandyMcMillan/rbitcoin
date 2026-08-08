@@ -13,6 +13,7 @@ rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-electrum = { workspace = true }
+rbitcoin-net = { workspace = true }
 bitcoin = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

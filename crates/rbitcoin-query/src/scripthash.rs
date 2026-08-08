@@ -159,6 +159,16 @@ pub struct ScriptHashUtxo {
     pub value: i64,
 }
 
+/// Esplora-style confirmed chain stats for a scripthash.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ScriptHashChainStats {
+    pub tx_count: u32,
+    pub funded_txo_count: u32,
+    pub funded_txo_sum: i64,
+    pub spent_txo_count: u32,
+    pub spent_txo_sum: i64,
+}
+
 impl Query {
     /// Expand one create_tx_fk into outpoints for each output matching `scripthash`.
     fn expand_create_to_outpoints(
@@ -317,6 +327,40 @@ impl Query {
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
         Ok(out)
+    }
+
+    /// Confirmed chain_stats for Esplora address/scripthash routes.
+    pub fn scripthash_chain_stats(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<ScriptHashChainStats, QueryError> {
+        let hist = self.scripthash_history(scripthash)?;
+        let creates = self.scripthash_create_outpoints(scripthash)?;
+        let mut funded_n = 0u32;
+        let mut funded_sum = 0i64;
+        let mut spent_n = 0u32;
+        let mut spent_sum = 0i64;
+        for rec in creates {
+            funded_n = funded_n.saturating_add(1);
+            funded_sum = funded_sum.saturating_add(rec.value);
+            let spent = if self.spend_index_enabled() {
+                self.store
+                    .has_confirmed_strong_spender(&rec.txid, rec.vout)?
+            } else {
+                self.is_outpoint_spent(&rec.txid, rec.vout)?
+            };
+            if spent {
+                spent_n = spent_n.saturating_add(1);
+                spent_sum = spent_sum.saturating_add(rec.value);
+            }
+        }
+        Ok(ScriptHashChainStats {
+            tx_count: hist.len() as u32,
+            funded_txo_count: funded_n,
+            funded_txo_sum: funded_sum,
+            spent_txo_count: spent_n,
+            spent_txo_sum: spent_sum,
+        })
     }
 }
 

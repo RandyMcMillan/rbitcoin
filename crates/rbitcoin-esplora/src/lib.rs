@@ -2,6 +2,7 @@
 //!
 //! Tip, block header, and tx projection (incl. documented asm/type/address).
 
+mod handlers;
 mod script_fields;
 mod server;
 mod tx_json;

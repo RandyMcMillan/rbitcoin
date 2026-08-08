@@ -340,11 +340,15 @@ Conf: `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
-| Tip / block / tx | height, hash, header hex, full tx JSON, hex, status, merkle-proof, outspends |
-| Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`); complete after SH tip finalize |
-| Mempool | `/mempool`, `/fee-estimates`, `POST /tx` when mempool hub is open (normal `run_p2p`) |
-| Without mempool | mempool routes empty/safe; `POST /tx` → **503** |
-| Unknown / deferred | **404** |
+| Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
+| Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
+| Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`), `/txs/mempool`; complete after SH tip finalize |
+| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
+| Without mempool | mempool routes empty/safe; POST broadcast → **503** |
+| Unknown / deferred | **404** (Liquid, mining template, address-prefix) |
+
+**Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.  
+**Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
 

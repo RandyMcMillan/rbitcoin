@@ -51,13 +51,15 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Endpoint group | Status | Notes |
 |----------------|--------|-------|
 | Tip | done | `/blocks/tip/height`, `/blocks/tip/hash` |
-| Block | done | `/block-height/:h`, `/block/:hash/header`, `/txids`, `/txs` (25-page, start%25==0) |
-| Tx | done | `/tx/:txid` (full JSON incl. asm/type/address), `/hex`, `/status`, Electrum-style `/merkle-proof`, `/outspend(s)` |
-| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/chain[/:last_seen_txid]` (25 newest-first); needs SH finalize |
-| Mempool / fees | done | `/mempool`, `/fee-estimates`; empty defaults without hub |
+| Blocks list | done | `/blocks`, `/blocks/:start_height` (10 summaries, newest-first) |
+| Block | done | `/block/:hash` JSON, `/raw`, `/status`, `/header`, `/txids`, `/txid/:i`, `/txs[/:start]` |
+| Tx | done | `/tx/:txid` full JSON, `/hex`, `/raw`, `/status`, Electrum `/merkle-proof`, BIP37 `/merkleblock-proof`, `/outspend(s)` |
+| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; needs SH finalize |
+| Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates` |
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
+| `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
 | Unknown path | 404 | plain body |
-| Deferred | 404 | Liquid, mining template, address-prefix, merkleblock-proof, full block raw, etc. |
+| Deferred | 404 | Liquid/assets, mining `block-template`, `address-prefix` search (no reverse index) |
 
 ## BIP324 v2 short-ID surface (live paths)
 

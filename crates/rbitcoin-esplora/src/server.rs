@@ -102,21 +102,37 @@ pub async fn run_esplora(
     let app = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
+        .route("/blocks", get(handlers::blocks_tip))
+        .route("/blocks/:start", get(handlers::blocks_from_height))
         .route("/block-height/:height", get(block_height))
+        .route("/block/:hash", get(handlers::block_json))
         .route("/block/:hash/header", get(block_header))
+        .route("/block/:hash/status", get(handlers::block_status))
+        .route("/block/:hash/raw", get(handlers::block_raw))
         .route("/block/:hash/txids", get(handlers::block_txids))
+        .route("/block/:hash/txid/:index", get(handlers::block_txid_at))
         .route("/block/:hash/txs", get(handlers::block_txs_0))
         .route("/block/:hash/txs/:start", get(handlers::block_txs_start))
         .route("/tx/:txid", get(tx_full))
         .route("/tx/:txid/hex", get(tx_hex))
+        .route("/tx/:txid/raw", get(handlers::tx_raw))
         .route("/tx/:txid/status", get(tx_status))
         .route("/tx/:txid/merkle-proof", get(handlers::tx_merkle_proof))
+        .route(
+            "/tx/:txid/merkleblock-proof",
+            get(handlers::tx_merkleblock_proof),
+        )
         .route("/tx/:txid/outspend/:vout", get(handlers::tx_outspend))
         .route("/tx/:txid/outspends", get(handlers::tx_outspends))
         .route("/tx", post(handlers::post_tx))
+        .route("/txs/package", post(handlers::post_tx_package))
         .route("/address/:addr", get(handlers::address_info))
         .route("/address/:addr/utxo", get(handlers::address_utxo))
         .route("/address/:addr/txs", get(handlers::address_txs))
+        .route(
+            "/address/:addr/txs/mempool",
+            get(handlers::address_txs_mempool),
+        )
         .route("/address/:addr/txs/chain", get(handlers::address_txs_chain))
         .route(
             "/address/:addr/txs/chain/:last",
@@ -126,6 +142,10 @@ pub async fn run_esplora(
         .route("/scripthash/:hash/utxo", get(handlers::scripthash_utxo))
         .route("/scripthash/:hash/txs", get(handlers::scripthash_txs))
         .route(
+            "/scripthash/:hash/txs/mempool",
+            get(handlers::scripthash_txs_mempool),
+        )
+        .route(
             "/scripthash/:hash/txs/chain",
             get(handlers::scripthash_txs_chain),
         )
@@ -134,6 +154,8 @@ pub async fn run_esplora(
             get(handlers::scripthash_txs_chain_cursor),
         )
         .route("/mempool", get(handlers::mempool_info))
+        .route("/mempool/txids", get(handlers::mempool_txids))
+        .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
         .fallback(fallback_404)
         .layer(TimeoutLayer::new(timeout))
@@ -671,6 +693,133 @@ mod tests {
             text.contains("503") || text.contains("mempool"),
             "expected 503 without hub: {text}"
         );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0 gaps: block JSON/raw/status/txid-index/blocks list, tx raw, merkleblock, mempool lists.
+    #[tokio::test]
+    async fn block_raw_summary_status_and_mempool_routes() {
+        use bitcoin::consensus::encode::deserialize;
+        use bitcoin::{Block, MerkleBlock};
+
+        let (dir, q) = temp_query("p0-block");
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        let mut coinbase_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase(h, prev);
+            hashes.push(header.hash);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let h1 = block_hash_hex(&hashes[1]);
+        let (st, body) = http_get(addr, &format!("/block/{h1}")).await;
+        assert_eq!(st, 200, "block json {body}");
+        let bj: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(bj["height"], 1);
+        assert_eq!(bj["id"], h1);
+        assert_eq!(bj["tx_count"], 1);
+        assert!(bj["size"].as_u64().unwrap() > 80);
+        assert!(bj["weight"].as_u64().unwrap() > 0);
+        assert!(bj.get("difficulty").is_some());
+        assert!(bj.get("mediantime").is_some());
+        assert_eq!(bj["previousblockhash"], block_hash_hex(&hashes[0]));
+
+        // Raw block binary (HTTP body after headers — use binary-aware read).
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /block/{h1}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let sep = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http headers");
+        let raw = &buf[sep + 4..];
+        assert!(
+            String::from_utf8_lossy(&buf[..sep]).contains("200"),
+            "raw status"
+        );
+        let block: Block = deserialize(raw).expect("decode raw block");
+        // Fixture headers use lab hashes; wire block still has 1 coinbase.
+        assert_eq!(block.txdata.len(), 1);
+        assert!(raw.len() > 80);
+
+        let (st, body) = http_get(addr, &format!("/block/{h1}/status")).await;
+        assert_eq!(st, 200, "{body}");
+        let stj: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(stj["in_best_chain"], true);
+        assert_eq!(stj["height"], 1);
+        assert_eq!(stj["next_best"], block_hash_hex(&hashes[2]));
+
+        let (st, body) = http_get(addr, &format!("/block/{h1}/txid/0")).await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body, block_hash_hex(&coinbase_txids[1]));
+        let (st, _) = http_get(addr, &format!("/block/{h1}/txid/9")).await;
+        assert_eq!(st, 404);
+
+        let (st, body) = http_get(addr, "/blocks").await;
+        assert_eq!(st, 200, "{body}");
+        let list: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0]["height"], 2);
+        assert_eq!(list[2]["height"], 0);
+
+        let (st, body) = http_get(addr, "/blocks/1").await;
+        assert_eq!(st, 200, "{body}");
+        let list1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(list1[0]["height"], 1);
+        assert_eq!(list1.len(), 2);
+
+        let txid0 = block_hash_hex(&coinbase_txids[0]);
+        // Binary raw tx
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /tx/{txid0}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let raw_tx = &buf[sep + 4..];
+        let (st, hex_body) = http_get(addr, &format!("/tx/{txid0}/hex")).await;
+        assert_eq!(st, 200);
+        let hex_bytes = rbitcoin_primitives::hex_decode(&hex_body).unwrap();
+        assert_eq!(raw_tx, hex_bytes.as_slice());
+
+        let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkleblock-proof")).await;
+        assert_eq!(st, 200, "{body}");
+        let mb_bytes = rbitcoin_primitives::hex_decode(&body).unwrap();
+        let mb: MerkleBlock = deserialize(&mb_bytes).expect("merkleblock");
+        let mut matches = Vec::new();
+        let mut indexes = Vec::new();
+        mb.extract_matches(&mut matches, &mut indexes).unwrap();
+        assert_eq!(indexes, vec![0]); // coinbase at pos 0
+        assert_eq!(matches.len(), 1);
+
+        let (st, body) = http_get(addr, "/mempool/txids").await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body, "[]");
+        let (st, body) = http_get(addr, "/mempool/recent").await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body, "[]");
+
+        let sh = rbitcoin_store::script_hash(&[0x51]);
+        let sh_hex = block_hash_hex(&sh);
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body, "[]");
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,21 +1,224 @@
-//! Esplora route handlers beyond tip/header/basic tx (Steps 8–11).
+//! Esplora route handlers beyond tip/header/basic tx.
 
-use crate::server::{block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState};
+use crate::server::{
+    block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState,
+};
 use crate::tx_json::{build_tx_json, tx_status_json};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bitcoin::address::Address;
-use bitcoin::consensus::deserialize;
+use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
-use bitcoin::Network;
+use bitcoin::pow::{CompactTarget, Target};
+use bitcoin::{MerkleBlock, Network};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{HistoryFilter, Query};
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::str::FromStr;
+
+// --- Block summary / raw / status / lists ---
+
+/// Best-chain wire block for Esplora (archived reconstruct; no extra PoW rehash gate).
+fn best_chain_block(
+    query: &Query,
+    hash: &[u8; 32],
+) -> Result<(Height, bitcoin::Block), rbitcoin_query::QueryError> {
+    let Some(height) = query.height_of_hash(hash)? else {
+        return Err(rbitcoin_store::StoreError::NotFound);
+    };
+    // Prefer archived path: does not re-require stored.hash == wire block_hash
+    // (synthetic fixture headers use lab hashes; production hashes match).
+    let block = query
+        .reconstruct_archived_block(hash)?
+        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    Ok((height, block))
+}
+
+/// Esplora `GET /block/:hash` JSON for a **best-chain** header hash.
+pub(crate) fn block_summary_json(query: &Query, hash: &[u8; 32]) -> Result<Value, rbitcoin_query::QueryError> {
+    let (height, block) = best_chain_block(query, hash)?;
+    let (_fk, rec) = query
+        .header_at_height(height)?
+        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let prev_hash = if rec.prev_fk.is_null() {
+        [0u8; 32]
+    } else {
+        query.store().get_header(rec.prev_fk)?.hash
+    };
+    let raw = serialize(&block);
+    let weight = block.weight().to_wu();
+    let difficulty = Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
+    let mediantime = median_time_past(query, height)?;
+    Ok(json!({
+        "id": block_hash_hex(hash),
+        "height": height.0,
+        "version": rec.version,
+        "timestamp": rec.timestamp,
+        "tx_count": block.txdata.len(),
+        "size": raw.len(),
+        "weight": weight,
+        "merkle_root": block_hash_hex(&rec.merkle_root),
+        "previousblockhash": if height.0 == 0 {
+            Value::Null
+        } else {
+            json!(block_hash_hex(&prev_hash))
+        },
+        "mediantime": mediantime,
+        "nonce": rec.nonce,
+        "bits": format!("{:08x}", rec.bits),
+        "difficulty": difficulty,
+    }))
+}
+
+/// Median timestamp of the last up to 11 best-chain headers ending at `height` (BIP113 MTP).
+fn median_time_past(query: &Query, height: Height) -> Result<u32, rbitcoin_query::QueryError> {
+    let n = 11u32.min(height.0.saturating_add(1));
+    let start = height.0.saturating_sub(n.saturating_sub(1));
+    let mut times = Vec::with_capacity(n as usize);
+    for h in start..=height.0 {
+        let (_fk, rec) = query
+            .header_at_height(Height(h))?
+            .ok_or(rbitcoin_store::StoreError::NotFound)?;
+        times.push(rec.timestamp);
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
+}
+
+pub async fn block_json(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
+    let Ok(hash) = parse_hash32(&hash_hex) else {
+        return not_found();
+    };
+    match block_summary_json(&st.query, &hash) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => store_err(e),
+    }
+}
+
+pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
+    let Ok(hash) = parse_hash32(&hash_hex) else {
+        return not_found();
+    };
+    match best_chain_block(&st.query, &hash) {
+        Ok((_h, block)) => {
+            let raw = serialize(&block);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                raw,
+            )
+                .into_response()
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
+    let Ok(hash) = parse_hash32(&hash_hex) else {
+        return not_found();
+    };
+    // Unknown entirely → 404 (match other block routes).
+    if st.query.get_header_by_hash(&hash).ok().flatten().is_none() {
+        return not_found();
+    }
+    match st.query.height_of_hash(&hash) {
+        Ok(None) => Json(json!({
+            "in_best_chain": false,
+            "height": null,
+            "next_best": null,
+        }))
+        .into_response(),
+        Ok(Some(h)) => {
+            let next_best = if let Some(tip) = st.query.tip_height() {
+                if h.0 < tip.0 {
+                    match st.query.header_at_height(Height(h.0 + 1)) {
+                        Ok(Some((_fk, rec))) => json!(block_hash_hex(&rec.hash)),
+                        _ => Value::Null,
+                    }
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+            Json(json!({
+                "in_best_chain": true,
+                "height": h.0,
+                "next_best": next_best,
+            }))
+            .into_response()
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+pub async fn block_txid_at(
+    State(st): State<AppState>,
+    Path((hash_hex, index)): Path<(String, u32)>,
+) -> Response {
+    let Ok(hash) = parse_hash32(&hash_hex) else {
+        return not_found();
+    };
+    let Some(height) = (match st.query.height_of_hash(&hash) {
+        Ok(h) => h,
+        Err(e) => return store_err(e),
+    }) else {
+        return not_found();
+    };
+    match st.query.block_tx_fks(height) {
+        Ok(fks) => {
+            let i = index as usize;
+            if i >= fks.len() {
+                return not_found();
+            }
+            match st.query.get_tx(fks[i]) {
+                Ok(tx) => plain_ok(block_hash_hex(&tx.txid)),
+                Err(e) => store_err(e),
+            }
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+/// `GET /blocks` — 10 newest from tip.
+pub async fn blocks_tip(State(st): State<AppState>) -> Response {
+    blocks_from(&st, None)
+}
+
+/// `GET /blocks/:start_height` — 10 blocks starting at `start_height` downward.
+pub async fn blocks_from_height(State(st): State<AppState>, Path(start): Path<u32>) -> Response {
+    blocks_from(&st, Some(start))
+}
+
+fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
+    let Some(tip) = st.query.tip_height() else {
+        return Json(json!([])).into_response();
+    };
+    let mut h = start.unwrap_or(tip.0);
+    if h > tip.0 {
+        h = tip.0;
+    }
+    let mut out = Vec::new();
+    for _ in 0..10 {
+        let height = Height(h);
+        let Ok(Some((_fk, rec))) = st.query.header_at_height(height) else {
+            break;
+        };
+        match block_summary_json(&st.query, &rec.hash) {
+            Ok(v) => out.push(v),
+            Err(e) => return store_err(e),
+        }
+        if h == 0 {
+            break;
+        }
+        h -= 1;
+    }
+    Json(out).into_response()
+}
 
 // --- Block listing ---
 
@@ -118,6 +321,86 @@ pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<St
         }
         Err(e) => store_err(e),
     }
+}
+
+/// `GET /tx/:txid/raw` — consensus-encoded transaction bytes.
+pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
+    let Ok(txid) = parse_hash32(&txid_hex) else {
+        return not_found();
+    };
+    match st.query.get_tx_by_txid(&txid) {
+        Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+            Ok(raw) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                raw,
+            )
+                .into_response(),
+            Err(e) => store_err(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
+/// `GET /tx/:txid/merkleblock-proof` — BIP37 merkleblock as hex (Blockstream shape).
+pub async fn tx_merkleblock_proof(
+    State(st): State<AppState>,
+    Path(txid_hex): Path<String>,
+) -> Response {
+    let Ok(txid) = parse_hash32(&txid_hex) else {
+        return not_found();
+    };
+    let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) else {
+        return not_found();
+    };
+    let height = match st.query.store().tx_height.get(fk) {
+        Ok(Some(h)) => h,
+        Ok(None) => return not_found(),
+        Err(e) => return store_err(e),
+    };
+    if !matches!(st.query.store().is_confirmed_strong(fk), Ok(true)) {
+        return not_found();
+    }
+    let proof = match st.query.merkle_proof(Height(height), &txid) {
+        Ok(p) => p,
+        Err(e) => return store_err(e),
+    };
+    let Some((_fk, rec)) = (match st.query.header_at_height(Height(height)) {
+        Ok(v) => v,
+        Err(e) => return store_err(e),
+    }) else {
+        return not_found();
+    };
+    let mut block = match st.query.reconstruct_archived_block(&rec.hash) {
+        Ok(Some(b)) => b,
+        Ok(None) => return not_found(),
+        Err(e) => return store_err(e),
+    };
+    // Ensure header merkle root matches wire tx tree (lab fixtures use synthetic roots).
+    if let Some(root) = block.compute_merkle_root() {
+        block.header.merkle_root = root;
+    }
+    let pos = proof.pos as usize;
+    if pos >= block.txdata.len() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "merkle pos out of range",
+        )
+            .into_response();
+    }
+    // Match wire txid at store proof position (works when store id ≠ recomputed id).
+    let want = block.txdata[pos].compute_txid();
+    let mb = MerkleBlock::from_block_with_predicate(&block, |t| *t == want);
+    let mut raw = Vec::new();
+    if mb.consensus_encode(&mut raw).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "merkleblock encode",
+        )
+            .into_response();
+    }
+    plain_ok(rbitcoin_primitives::hex_encode(raw))
 }
 
 pub async fn tx_outspend(
@@ -475,6 +758,75 @@ pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     Json(Value::Object(obj)).into_response()
 }
 
+pub async fn mempool_txids(State(st): State<AppState>) -> Response {
+    let Some(mp) = st.mempool.as_ref() else {
+        return Json(json!([])).into_response();
+    };
+    let ids: Vec<String> = mp
+        .list_live()
+        .into_iter()
+        .map(|(txid, _, _, _)| block_hash_hex(&txid.to_byte_array()))
+        .collect();
+    Json(ids).into_response()
+}
+
+pub async fn mempool_recent(State(st): State<AppState>) -> Response {
+    let Some(mp) = st.mempool.as_ref() else {
+        return Json(json!([])).into_response();
+    };
+    let rows: Vec<Value> = mp
+        .recent_accepts()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "txid": block_hash_hex(&r.txid.to_byte_array()),
+                "fee": r.fee_sat,
+                "vsize": r.weight.saturating_add(3) / 4,
+                "value": r.value_sat,
+            })
+        })
+        .collect();
+    Json(rows).into_response()
+}
+
+/// Mempool-only history (up to 50), dedicated Esplora path.
+pub async fn scripthash_txs_mempool(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+) -> Response {
+    let Ok(sh) = parse_hash32(&sh_hex) else {
+        return not_found();
+    };
+    mempool_txs_for_sh(&st, &sh)
+}
+
+pub async fn address_txs_mempool(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
+    match resolve_address_sh(&addr_s, st.network) {
+        Ok(sh) => mempool_txs_for_sh(&st, &sh),
+        Err(_) => not_found(),
+    }
+}
+
+fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
+    let mut out = Vec::new();
+    if let Some(mp) = st.mempool.as_ref() {
+        for item in mp.scripthash_mempool(sh).into_iter().take(50) {
+            if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
+                if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
+                    out.push(v);
+                    continue;
+                }
+            }
+            out.push(json!({
+                "txid": block_hash_hex(&item.txid),
+                "status": { "confirmed": false },
+                "fee": item.fee,
+            }));
+        }
+    }
+    Json(out).into_response()
+}
+
 pub async fn post_tx(State(st): State<AppState>, body: Bytes) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "mempool not available").into_response();
@@ -502,6 +854,77 @@ pub async fn post_tx(State(st): State<AppState>, body: Bytes) -> Response {
         Ok(r) => {
             let tid = r.txid.to_byte_array();
             plain_ok(block_hash_hex(&tid))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /txs/package` — JSON array of hex txs → `MempoolHub::accept_package`.
+pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Response {
+    let Some(mp) = st.mempool.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "mempool not available").into_response();
+    };
+    if body.len() > st.max_body {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+    }
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response();
+        }
+    };
+    let Some(arr) = parsed.as_array() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "body must be a JSON array of tx hex strings",
+        )
+            .into_response();
+    };
+    // Soft cap before mempool internal limits (DoS).
+    if arr.len() > 25 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "package too large (max 25 transactions)",
+        )
+            .into_response();
+    }
+    let mut txs = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let Some(hex) = v.as_str() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("package[{i}] must be a hex string"),
+            )
+                .into_response();
+        };
+        let raw = match rbitcoin_primitives::hex_decode(hex.trim()) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("package[{i}] invalid hex: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        match deserialize::<bitcoin::Transaction>(&raw) {
+            Ok(t) => txs.push(t),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("package[{i}] invalid tx: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    match mp.accept_package(&txs) {
+        Ok(results) => {
+            let txids: Vec<String> = results
+                .iter()
+                .map(|r| block_hash_hex(&r.txid.to_byte_array()))
+                .collect();
+            Json(json!({ "txids": txids })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }

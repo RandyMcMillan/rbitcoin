@@ -38,6 +38,19 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
     }
 }
 
+/// Cap for Esplora `/mempool/recent` (newest accepts, process-local).
+pub const MEMPOOL_RECENT_CAP: usize = 32;
+
+/// One recently accepted mempool tx (for explorer "recent" strips).
+#[derive(Clone, Debug)]
+pub struct RecentAccept {
+    pub txid: Txid,
+    pub fee_sat: u64,
+    pub weight: u64,
+    /// Sum of output values (sats).
+    pub value_sat: u64,
+}
+
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
     inner: Mutex<ActiveMempool>,
@@ -46,6 +59,8 @@ pub struct MempoolHub {
     relay_enabled: AtomicBool,
     /// Broadcast accepted txids so sessions can inv (origin exclusion is per-session).
     announce: broadcast::Sender<Txid>,
+    /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
+    recent: Mutex<std::collections::VecDeque<RecentAccept>>,
 }
 
 impl MempoolHub {
@@ -67,7 +82,34 @@ impl MempoolHub {
             query,
             relay_enabled: AtomicBool::new(false),
             announce,
+            recent: Mutex::new(std::collections::VecDeque::with_capacity(MEMPOOL_RECENT_CAP)),
         }))
+    }
+
+    fn push_recent(&self, tx: &Transaction, r: &AcceptResult) {
+        let value_sat: u64 = tx
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .fold(0u64, |a, b| a.saturating_add(b));
+        let entry = RecentAccept {
+            txid: r.txid,
+            fee_sat: r.fee_sat,
+            weight: r.weight,
+            value_sat,
+        };
+        let mut q = self.recent.lock().unwrap();
+        q.push_back(entry);
+        while q.len() > MEMPOOL_RECENT_CAP {
+            q.pop_front();
+        }
+    }
+
+    /// Newest-first snapshot of recent accepts (at most 10 for Esplora `/mempool/recent`).
+    pub fn recent_accepts(&self) -> Vec<RecentAccept> {
+        const ESPLORA_RECENT: usize = 10;
+        let q = self.recent.lock().unwrap();
+        q.iter().rev().take(ESPLORA_RECENT).cloned().collect()
     }
 
     /// Compact durable mempool files (reclaim DEAD slots / body holes).
@@ -152,6 +194,8 @@ impl MempoolHub {
         };
         let mut g = self.inner.lock().unwrap();
         let r = g.accept_tx(tx, &utxo)?;
+        drop(g);
+        self.push_recent(tx, &r);
         let _ = self.announce.send(r.txid);
         Ok(r)
     }
@@ -163,7 +207,9 @@ impl MempoolHub {
         };
         let mut g = self.inner.lock().unwrap();
         let res = g.accept_package(txs, &utxo)?;
-        for r in &res {
+        drop(g);
+        for (tx, r) in txs.iter().zip(res.iter()) {
+            self.push_recent(tx, r);
             let _ = self.announce.send(r.txid);
         }
         Ok(res)
@@ -576,6 +622,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    #[test]
+    fn recent_accepts_ring_newest_first() {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        // Empty store: still can accept nothing without parents — just open hub.
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        assert!(hub.recent_accepts().is_empty());
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// Accept live spends of confirmed OP_TRUE coinbases via QueryUtxoProvider —
     /// covers fee histogram, estimate percentiles, scripthash mempool/delta,
     /// wtxid lookup, package announce, and spent outpoints.
@@ -696,6 +757,10 @@ mod tests {
         let pr = hub.accept_tx(&parent).expect("accept parent");
         assert_eq!(pr.txid, parent.compute_txid());
         assert!(matches!(ann_rx.try_recv(), Ok(_)));
+        let recent = hub.recent_accepts();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].txid, parent.compute_txid());
+        assert_eq!(recent[0].fee_sat, 1_000);
 
         // Child of mempool parent (height=-1 scripthash path) + second chain spend.
         let child = Transaction {

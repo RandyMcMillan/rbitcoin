@@ -1,5 +1,26 @@
 # Agent notes
 
+## Plain technical language
+
+This is an engineering project. Write **clear, concrete technical English** in
+code, comments, docs, commits, and PR text. Do **not** inject moralizing,
+political framing, or performative “sensitivity” language. Prefer words that
+describe the mechanism or policy accurately.
+
+- **OK:** precise domain terms, plain failures (“reject”, “invalid”, “permanent
+  blacklist” for a hash we never re-request, Core-aligned vocabulary where we
+  are matching Bitcoin Core).
+- **Also OK when clearer:** `allowlist` / `denylist` for sets of permitted or
+  blocked names — they read better than color metaphors. Use them for clarity,
+  not as a ritual rename of everything.
+- **Not OK:** rewriting technical prose to satisfy fashion, adding equity
+  disclaimers, or soft-pedaling consensus/security language so it sounds
+  “inclusive.” Correctness and operator honesty first.
+
+If you are unsure whether a wording change is engineering clarity or cultural
+noise, keep the existing technical term (especially if it matches Core or our
+logs) and move on.
+
 ## Prefer composition over inheritance in data models
 
 Composition (has-a) is typically more clear and less error prone than

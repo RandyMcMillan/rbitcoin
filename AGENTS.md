@@ -107,10 +107,23 @@ or get explicit user approval for a temporary exception (prefer none).
 
 ## Commit + static musl release after code changes
 
+### Public commit hygiene (required)
+
+This tree is **public**. Every commit must:
+
+| Rule | Detail |
+|------|--------|
+| **One logical change** | One concern per commit (one bug fix, one feature slice, one docs rule, one refactor). Do not bundle unrelated edits. |
+| **Small** | Prefer a sequence of small commits over one mega-commit. Checkpoint before risky follow-ons so rollback is easy. |
+| **Clear message** | Subject + body state **what** changed and **why** in complete sentences. Assume readers have no chat context. |
+| **Not** | “WIP”, “misc”, “fix stuff”, drive-by renames mixed with behavior, or multi-hour experiments left as one opaque blob. |
+
+Green-then-refactor is fine as **two** commits when each stands alone (tests still pass at each).
+
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
 1. **Pass CI gates** (fmt / clippy / tests — see above). A commit that fails GitHub Actions is incomplete work.
-2. **Commit** the working tree with a clear message (what + why). Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
+2. **Commit** following the public hygiene table above. Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
 3. **Rebuild and install the portable static musl release** so
    `./target/release/rbitcoin-node` matches the tree. This is **mandatory every
    code-changing turn** — not optional after tests.

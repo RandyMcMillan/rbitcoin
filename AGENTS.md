@@ -164,7 +164,30 @@ still encode a synthetic/scenario regression that drives the **shipped** path.
 
 Thrashing (heal → unheal, soft-requeue → permanent, walk-seed → plan-lookup)
 comes from coding to logs instead of a failing assertion. A precise failing
-test forces a **surgical** fix and leaves permanent suite coverage.
+test forces a **surgical** green, then a clean **refactor** under green tests
+instead of leaving one-off patches everywhere.
+
+### Virtuous cycle: Red → Green → Refactor (agile TDD)
+
+Do not stop at “tests pass.” The suite is the safety net that lets you
+**integrate** the fix into the design without re-breaking the contract.
+
+| Phase | Goal | Rules |
+|-------|------|--------|
+| **Red** | Encode the contract | Failing test only. No production edit yet. Prove the path if non-obvious. |
+| **Green** | Make it pass | **Smallest surgical** production change. One-offs and local branches are OK *temporarily* to get green. Do not refactor and invent design in the same breath as the first fix. |
+| **Refactor** | Remove the one-off | With **all** relevant tests still green, fold the fix into the real shape: shared helper, right stage (lookup vs load), one policy site, delete dead dual paths. Re-run tests after each refactor step. |
+
+| Anti-pattern | Prefer |
+|--------------|--------|
+| Ship the first green hunk forever (copy-paste guards, “if mainnet retarget…” special cases next to every caller) | One production implementation at the **lowest owner** of the concept; callers stay dumb |
+| Big redesign before any green test | Green first, then refactor under the suite |
+| “Refactor” that weakens or deletes the red test | Keep the contract pin; only collapse **duplicate** tests of the same entry (lean-code rules) |
+| New soft path / heal beside the real path so tests pass | Fix the protocol; invariants over silent fallbacks |
+
+Commit after green when the checkpoint is useful (especially before a risky
+refactor). Prefer the refactored form in the final commit of the change when
+it stays small; otherwise green commit then refactor commit — both must stay green.
 
 ### Order of work (bugs and features)
 
@@ -173,10 +196,13 @@ test forces a **surgical** fix and leaves permanent suite coverage.
 | 1. Reproduce | Name the failing contract in one sentence (error string, invariant, observable outcome). Prefer static proof of the code path from production entry → bug when the failure is non-obvious. |
 | 2. Red | Add or extend a test that **fails without the change** and would pass only if that contract holds. Run it; capture the fail. |
 | 3. Green | Implement the **smallest** production change that makes that test pass. Do not expand scope mid-fix. |
-| 4. Re-run | Run the new/related tests before commit (`cargo test -p <crate> …` / scenario). |
+| 4. Refactor | Still green: integrate the fix into shared structure / the correct stage; delete one-offs and dual paths introduced only to get green. Re-run the new and related tests. |
+| 5. Before commit | `cargo test -p <crate> …` (or scenario) for everything touched; do not land known red. |
 
 For **performance**, prefer a before/after benchmark or metered scenario that
-shows the win; do not land “perf” rewrites with only correctness tests.
+shows the win; do not land “perf” rewrites with only correctness tests. Same
+cycle: red (or baseline bench) → green (measured win) → refactor without
+losing the win.
 
 ### What the test must assert
 

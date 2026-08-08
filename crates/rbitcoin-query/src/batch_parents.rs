@@ -36,8 +36,38 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// Identity hasher for `u64` create_fk keys (no mixing). Pack maps are dense
+/// integer ids; std's default hasher dominated pure HashMap benches at ~8k.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct U64IdentityHasher(u64);
+
+impl Hasher for U64IdentityHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback if a key type uses raw bytes; fold little-endian u64 chunks.
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x1000_0000_01b3).wrapping_add(u64::from(b));
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type U64Map<V> = HashMap<u64, V, BuildHasherDefault<U64IdentityHasher>>;
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -308,13 +338,13 @@ impl SharedParentPin {
 /// per-parent insert hot path.
 #[derive(Debug, Default)]
 pub struct PipelineParentStore {
-    by_fk: Mutex<HashMap<u64, Weak<SharedParentPin>>>,
+    by_fk: Mutex<U64Map<Weak<SharedParentPin>>>,
 }
 
 impl PipelineParentStore {
     pub fn new() -> Self {
         Self {
-            by_fk: Mutex::new(HashMap::new()),
+            by_fk: Mutex::new(U64Map::default()),
         }
     }
 
@@ -359,12 +389,12 @@ impl PipelineParentStore {
     }
 
     /// One lock: upgrade live pins for `ids` into a map (prep batch start).
-    pub fn bulk_upgrade(
+    pub(crate) fn bulk_upgrade(
         &self,
         ids: impl IntoIterator<Item = u64>,
-    ) -> HashMap<u64, Arc<SharedParentPin>> {
+    ) -> U64Map<Arc<SharedParentPin>> {
         let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = HashMap::new();
+        let mut out = U64Map::default();
         for id in ids {
             if let Some(p) = g.get(&id).and_then(|w| w.upgrade()) {
                 out.insert(id, p);
@@ -373,15 +403,31 @@ impl PipelineParentStore {
         out
     }
 
-    /// One lock: publish batch pins as Weaks. On Arc identity conflict (peer
-    /// batch won the slot), merge local sparse fields into the existing Arc and
-    /// replace the batch handle so both batches share one payload.
-    pub fn bulk_publish(&self, pins: &mut HashMap<u64, Arc<SharedParentPin>>) {
+    /// One lock: publish **selected** batch pins as Weaks (new Arc registrations).
+    ///
+    /// `publish_ids` should list create_fks whose local Arc is new to the store
+    /// (typically vacant `insert_owned` results). Pure adopt hits already have a
+    /// Weak and need not be re-walked — full-map publish was O(all parents).
+    ///
+    /// On Arc identity conflict (peer batch won the slot), merge local sparse
+    /// fields into the existing Arc and replace the batch handle so both batches
+    /// share one payload.
+    pub(crate) fn bulk_publish_ids(
+        &self,
+        pins: &mut U64Map<Arc<SharedParentPin>>,
+        publish_ids: &[u64],
+    ) {
+        if publish_ids.is_empty() {
+            return;
+        }
         // Phase 1 under lock: insert vacant Weaks; collect conflicts to merge outside.
         let mut conflicts: Vec<(u64, Arc<SharedParentPin>, Arc<SharedParentPin>)> = Vec::new();
         {
             let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-            for (&id, pin) in pins.iter() {
+            for &id in publish_ids {
+                let Some(pin) = pins.get(&id) else {
+                    continue;
+                };
                 match g.get(&id).and_then(|w| w.upgrade()) {
                     Some(existing) if !Arc::ptr_eq(&existing, pin) => {
                         conflicts.push((id, existing, Arc::clone(pin)));
@@ -409,6 +455,7 @@ impl PipelineParentStore {
             pins.insert(id, existing);
         }
     }
+
 }
 
 /// Per-batch handle map: `create_fk → Arc` shared pin (refcount only on clone).
@@ -418,7 +465,10 @@ impl PipelineParentStore {
 pub struct BatchParents {
     /// Optional pipeline store for sharing across concurrent batches.
     store: Option<Arc<PipelineParentStore>>,
-    pins: HashMap<u64, Arc<SharedParentPin>>,
+    pins: U64Map<Arc<SharedParentPin>>,
+    /// create_fks that need Weak registration (new Arc from this batch).
+    /// Pure adopt hits are omitted — already published by a prior batch.
+    publish_ids: Vec<u64>,
     /// Last outs Arc loaded for assemble (`get_parent_txout_parts`).
     sticky_outs: RefCell<Option<(u64, Arc<PinOuts>)>>,
 }
@@ -428,6 +478,8 @@ impl Clone for BatchParents {
         Self {
             store: self.store.clone(),
             pins: self.pins.clone(),
+            // Cloned batch is a new handle map; re-publish if store-attached.
+            publish_ids: self.pins.keys().copied().collect(),
             sticky_outs: RefCell::new(None),
         }
     }
@@ -437,7 +489,8 @@ impl BatchParents {
     pub fn new() -> Self {
         Self {
             store: None,
-            pins: HashMap::new(),
+            pins: U64Map::default(),
+            publish_ids: Vec::new(),
             sticky_outs: RefCell::new(None),
         }
     }
@@ -445,7 +498,8 @@ impl BatchParents {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             store: None,
-            pins: HashMap::with_capacity(n),
+            pins: U64Map::with_capacity_and_hasher(n, BuildHasherDefault::default()),
+            publish_ids: Vec::with_capacity(n),
             sticky_outs: RefCell::new(None),
         }
     }
@@ -458,7 +512,8 @@ impl BatchParents {
     pub fn with_store(store: Arc<PipelineParentStore>, capacity: usize) -> Self {
         Self {
             store: Some(store),
-            pins: HashMap::with_capacity(capacity),
+            pins: U64Map::with_capacity_and_hasher(capacity, BuildHasherDefault::default()),
+            publish_ids: Vec::with_capacity(capacity),
             sticky_outs: RefCell::new(None),
         }
     }
@@ -494,12 +549,21 @@ impl BatchParents {
         }
     }
 
-    /// Bulk-publish local pins into the pipeline store (one store lock). Call after pin fill.
+    /// Bulk-publish **new** local pins into the pipeline store (one store lock).
+    /// Call after pin fill. Adopted Arcs are already registered and skipped.
     pub fn publish_to_store(&mut self) {
         let Some(store) = &self.store else {
+            self.publish_ids.clear();
             return;
         };
-        store.bulk_publish(&mut self.pins);
+        if self.publish_ids.is_empty() {
+            return;
+        }
+        // Dedup in case the same id was vacant-inserted twice (should not happen).
+        self.publish_ids.sort_unstable();
+        self.publish_ids.dedup();
+        store.bulk_publish_ids(&mut self.pins, &self.publish_ids);
+        self.publish_ids.clear();
     }
 
     /// Layout / coinbase only when outs already cover need (cross-batch share hit).
@@ -578,6 +642,8 @@ impl BatchParents {
                     body_range,
                     spender_rels,
                 )));
+                // New Arc — must register Weak on publish (adopt hits skip this).
+                self.publish_ids.push(id);
             }
         }
     }
@@ -1245,6 +1311,50 @@ mod tests {
         assert!(b.has_parent_out(Fk(1), 0));
         assert!(b.has_parent_out(Fk(1), 1));
         assert_eq!(store.live_count(), 1);
+    }
+
+    /// Adopted pins are already Weak-registered; publish only registers vacant inserts.
+    #[test]
+    fn publish_registers_only_new_not_pure_adopt() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut seed = BatchParents::with_store(Arc::clone(&store), 16);
+        for i in 1..=10u64 {
+            seed.insert_owned(
+                Fk(i),
+                tx(i as u8),
+                vec![(0, out(i as i64))],
+                vec![0],
+                Some(false),
+                Some((i * 8, 16)),
+                vec![(0, 4)],
+            );
+        }
+        seed.publish_to_store();
+        assert_eq!(store.live_count(), 10);
+
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 16);
+        bp.adopt_from_store(1..=10);
+        assert_eq!(bp.len(), 10);
+        // Pure adopt: publish is a no-op (no new Arcs).
+        bp.publish_to_store();
+        assert_eq!(store.live_count(), 10);
+
+        // Vacant insert of a new fk registers on publish.
+        bp.insert_owned(
+            Fk(99),
+            tx(99),
+            vec![(0, out(99))],
+            vec![0],
+            Some(false),
+            Some((99 * 8, 16)),
+            vec![(0, 4)],
+        );
+        bp.publish_to_store();
+        assert_eq!(store.live_count(), 11);
+        assert!(bp.contains(Fk(99)));
+        // Second publish with no new inserts is free.
+        bp.publish_to_store();
+        assert_eq!(store.live_count(), 11);
     }
 
     /// Free-plan insert must not require a store hit — vacant path is local only.

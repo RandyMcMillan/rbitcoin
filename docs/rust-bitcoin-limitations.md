@@ -11,7 +11,7 @@ requires something else.
 `core_tx_vectors.rs` — those track **our** incomplete interpreter/harness vs
 Core fixtures. See [`consensus-tests.md`](./consensus-tests.md). When a gap is
 “do not use this rust-bitcoin helper,” put it **here**; when it is “we have not
-implemented MINIMALDATA yet,” keep it on the allowlist until fixed.
+implemented DERSIG hard-fail yet,” keep it on the allowlist until fixed.
 
 ## Process
 

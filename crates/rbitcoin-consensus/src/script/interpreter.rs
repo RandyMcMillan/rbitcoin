@@ -139,6 +139,9 @@ pub(crate) struct EvalContext<'a> {
     pub bip112_active: bool,
     /// When true, ECDSA signatures must be strict DER (BIP66).
     pub bip66_active: bool,
+    /// Core `SCRIPT_VERIFY_MINIMALDATA`: minimal push opcodes + minimal scriptnums.
+    /// Not always consensus (standard flag); enabled when fixture/job requests it.
+    pub minimal_data: bool,
     /// BIP342: instruction index of last executed OP_CODESEPARATOR, or `0xFFFFFFFF`.
     ///
     /// Counted like Core's `opcode_pos` (one per GetOp/instruction, not byte offset).
@@ -195,6 +198,7 @@ impl<'a> EvalContext<'a> {
             bip65_active,
             bip112_active,
             bip66_active,
+            minimal_data: false,
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(SighashCache::new(tx)),
@@ -297,7 +301,15 @@ pub(crate) fn eval_script(
                 if data.len() > 520 {
                     return Err(ConsensusError::Script("push too large".into()));
                 }
+                // Core MINIMALDATA: CheckMinimalPush only when the push executes
+                // (unexecuted IF branches ignore non-minimal encodings).
                 if executing {
+                    if ctx.minimal_data {
+                        let opcode = bytes.get(byte_index).copied().unwrap_or(0);
+                        if !check_minimal_push(data, opcode) {
+                            return Err(ConsensusError::Script("MINIMALDATA".into()));
+                        }
+                    }
                     push(stack, data.to_vec())?;
                 }
             }
@@ -373,6 +385,7 @@ pub(crate) fn eval_script(
                     continue;
                 }
 
+                let rm = ctx.minimal_data;
                 match code {
                     0x00 => push(stack, vec![])?,                                    // OP_0
                     0x4f => push(stack, vec![0x81])?, // OP_1NEGATE (-1)
@@ -499,7 +512,7 @@ pub(crate) fn eval_script(
                     }
                     0x79 => {
                         // OP_PICK
-                        let n = scriptnum_decode(&pop(stack)?)?;
+                        let n = scriptnum_decode(&pop(stack)?, rm)?;
                         if n < 0 || n as usize >= stack.len() {
                             return Err(ConsensusError::Script("OP_PICK".into()));
                         }
@@ -508,7 +521,7 @@ pub(crate) fn eval_script(
                     }
                     0x7a => {
                         // OP_ROLL
-                        let n = scriptnum_decode(&pop(stack)?)?;
+                        let n = scriptnum_decode(&pop(stack)?, rm)?;
                         if n < 0 || n as usize >= stack.len() {
                             return Err(ConsensusError::Script("OP_ROLL".into()));
                         }
@@ -565,79 +578,79 @@ pub(crate) fn eval_script(
                     // Numeric unary — full set (1ADD/1SUB/NEGATE/ABS).
                     0x8b => {
                         // OP_1ADD
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.saturating_add(1)))?;
                     }
                     0x8c => {
                         // OP_1SUB
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.saturating_sub(1)))?;
                     }
                     0x8f => {
                         // OP_NEGATE
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(-v))?;
                     }
                     0x90 => {
                         // OP_ABS
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.abs()))?;
                     }
                     0x91 => {
                         // OP_NOT
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(v == 0))?;
                     }
                     0x92 => {
                         // OP_0NOTEQUAL
-                        let v = scriptnum_decode(&pop(stack)?)?;
+                        let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(v != 0))?;
                     }
-                    0x93 => bin_arith(stack, |a, b| a + b)?,
-                    0x94 => bin_arith(stack, |a, b| a - b)?,
+                    0x93 => bin_arith(stack, rm, |a, b| a + b)?,
+                    0x94 => bin_arith(stack, rm, |a, b| a - b)?,
                     0x9a => {
                         // OP_BOOLAND
-                        let b = scriptnum_decode(&pop(stack)?)?;
-                        let a = scriptnum_decode(&pop(stack)?)?;
+                        let b = scriptnum_decode(&pop(stack)?, rm)?;
+                        let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(a != 0 && b != 0))?;
                     }
                     0x9b => {
                         // OP_BOOLOR
-                        let b = scriptnum_decode(&pop(stack)?)?;
-                        let a = scriptnum_decode(&pop(stack)?)?;
+                        let b = scriptnum_decode(&pop(stack)?, rm)?;
+                        let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(a != 0 || b != 0))?;
                     }
-                    0x9c => bin_cmp(stack, |a, b| a == b)?,
+                    0x9c => bin_cmp(stack, rm, |a, b| a == b)?,
                     0x9d => {
                         // OP_NUMEQUALVERIFY
-                        let b = scriptnum_decode(&pop(stack)?)?;
-                        let a = scriptnum_decode(&pop(stack)?)?;
+                        let b = scriptnum_decode(&pop(stack)?, rm)?;
+                        let a = scriptnum_decode(&pop(stack)?, rm)?;
                         if a != b {
                             return Err(ConsensusError::Script("OP_NUMEQUALVERIFY".into()));
                         }
                     }
-                    0x9e => bin_cmp(stack, |a, b| a != b)?,
-                    0x9f => bin_cmp(stack, |a, b| a < b)?,
-                    0xa0 => bin_cmp(stack, |a, b| a > b)?,
-                    0xa1 => bin_cmp(stack, |a, b| a <= b)?,
-                    0xa2 => bin_cmp(stack, |a, b| a >= b)?,
+                    0x9e => bin_cmp(stack, rm, |a, b| a != b)?,
+                    0x9f => bin_cmp(stack, rm, |a, b| a < b)?,
+                    0xa0 => bin_cmp(stack, rm, |a, b| a > b)?,
+                    0xa1 => bin_cmp(stack, rm, |a, b| a <= b)?,
+                    0xa2 => bin_cmp(stack, rm, |a, b| a >= b)?,
                     0xa3 => {
                         // OP_MIN
-                        let b = scriptnum_decode(&pop(stack)?)?;
-                        let a = scriptnum_decode(&pop(stack)?)?;
+                        let b = scriptnum_decode(&pop(stack)?, rm)?;
+                        let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(a.min(b)))?;
                     }
                     0xa4 => {
                         // OP_MAX
-                        let b = scriptnum_decode(&pop(stack)?)?;
-                        let a = scriptnum_decode(&pop(stack)?)?;
+                        let b = scriptnum_decode(&pop(stack)?, rm)?;
+                        let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(a.max(b)))?;
                     }
                     0xa5 => {
                         // OP_WITHIN
-                        let max = scriptnum_decode(&pop(stack)?)?;
-                        let min = scriptnum_decode(&pop(stack)?)?;
-                        let x = scriptnum_decode(&pop(stack)?)?;
+                        let max = scriptnum_decode(&pop(stack)?, rm)?;
+                        let min = scriptnum_decode(&pop(stack)?, rm)?;
+                        let x = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(x >= min && x < max))?;
                     }
                     0xa6 => {
@@ -711,7 +724,7 @@ pub(crate) fn eval_script(
                         }
                         require_n(stack, 1)?;
                         // Core: CScriptNum(..., fRequireMinimal, 5) for locktime.
-                        let locktime = scriptnum_decode_width(stack.last().unwrap(), 5)?;
+                        let locktime = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
                         if locktime < 0 {
                             return Err(ConsensusError::Script("CLTV negative".into()));
                         }
@@ -737,7 +750,7 @@ pub(crate) fn eval_script(
                             continue;
                         }
                         require_n(stack, 1)?;
-                        let csv = scriptnum_decode_width(stack.last().unwrap(), 5)?;
+                        let csv = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
                         if csv < 0 {
                             return Err(ConsensusError::Script("CSV negative".into()));
                         }
@@ -831,7 +844,7 @@ fn op_checksigadd(stack: &mut Vec<Vec<u8>>, ctx: &EvalContext<'_>) -> Result<(),
     let n_raw = pop(stack)?;
     let sig = pop(stack)?;
     // CScriptNum n must be ≤4 bytes (scriptnum_decode enforces).
-    let n = scriptnum_decode(&n_raw)?;
+    let n = scriptnum_decode(&n_raw, ctx.minimal_data)?;
     match tapscript_sig_result(&sig, &pubkey, ctx)? {
         TapSigResult::EmptySig => {
             // Push n unchanged.
@@ -910,7 +923,7 @@ fn op_checkmultisig(
     op_count: &mut usize,
 ) -> Result<(), ConsensusError> {
     // Pop order matches Core: n, n keys (top=last), m, m sigs (top=last), dummy.
-    let n = scriptnum_decode(&pop(stack)?)?;
+    let n = scriptnum_decode(&pop(stack)?, ctx.minimal_data)?;
     if n < 0 || n > MAX_PUBKEYS_PER_MULTISIG {
         return Err(ConsensusError::Script("multisig n".into()));
     }
@@ -924,7 +937,7 @@ fn op_checkmultisig(
     }
     // Reverse so index 0 is deepest (first pushed) — Core match order.
     pubkeys.reverse();
-    let m = scriptnum_decode(&pop(stack)?)?;
+    let m = scriptnum_decode(&pop(stack)?, ctx.minimal_data)?;
     if m < 0 || m > n {
         return Err(ConsensusError::Script("multisig m".into()));
     }
@@ -1319,17 +1332,51 @@ fn scriptnum_encode(mut n: i64) -> Vec<u8> {
     out
 }
 
+/// Core `CheckMinimalPush`: data must use the shortest opcode form.
+fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
+    if data.is_empty() {
+        // Should use OP_0.
+        return opcode == 0x00;
+    }
+    if data.len() == 1 && data[0] >= 1 && data[0] <= 16 {
+        // OP_1 .. OP_16
+        return opcode == 0x50 + data[0];
+    }
+    if data.len() == 1 && data[0] == 0x81 {
+        // OP_1NEGATE
+        return opcode == 0x4f;
+    }
+    if data.len() <= 75 {
+        // Direct push: opcode == length
+        return opcode as usize == data.len();
+    }
+    if data.len() <= 255 {
+        return opcode == 0x4c; // OP_PUSHDATA1
+    }
+    if data.len() <= 65535 {
+        return opcode == 0x4d; // OP_PUSHDATA2
+    }
+    true
+}
+
 /// Decode a script number with Core's general 4-byte limit (arithmetic).
-fn scriptnum_decode(v: &[u8]) -> Result<i64, ConsensusError> {
-    scriptnum_decode_width(v, 4)
+fn scriptnum_decode(v: &[u8], require_minimal: bool) -> Result<i64, ConsensusError> {
+    scriptnum_decode_width(v, 4, require_minimal)
 }
 
 /// Decode a script number with explicit max byte length.
 /// CLTV/CSV use `max_len = 5` so full u32 locktime/sequence ranges encode as
 /// positive script numbers (Core `CScriptNum(..., 5)`).
-fn scriptnum_decode_width(v: &[u8], max_len: usize) -> Result<i64, ConsensusError> {
+fn scriptnum_decode_width(
+    v: &[u8],
+    max_len: usize,
+    require_minimal: bool,
+) -> Result<i64, ConsensusError> {
     if v.len() > max_len {
         return Err(ConsensusError::Script("scriptnum overflow".into()));
+    }
+    if require_minimal && !scriptnum_is_minimal(v) {
+        return Err(ConsensusError::Script("SCRIPTNUM".into()));
     }
     if v.is_empty() {
         return Ok(0);
@@ -1346,15 +1393,38 @@ fn scriptnum_decode_width(v: &[u8], max_len: usize) -> Result<i64, ConsensusErro
     Ok(result)
 }
 
-fn bin_arith(stack: &mut Vec<Vec<u8>>, f: impl Fn(i64, i64) -> i64) -> Result<(), ConsensusError> {
-    let b = scriptnum_decode(&pop(stack)?)?;
-    let a = scriptnum_decode(&pop(stack)?)?;
+/// Core `CScriptNum` fRequireMinimal encoding check.
+fn scriptnum_is_minimal(vch: &[u8]) -> bool {
+    if vch.is_empty() {
+        return true;
+    }
+    // If the most-significant-byte (excluding sign bit) is zero, not minimal —
+    // unless the second-most-significant-byte has the high bit set (±255 edge).
+    if vch[vch.len() - 1] & 0x7f == 0 {
+        if vch.len() <= 1 || (vch[vch.len() - 2] & 0x80) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn bin_arith(
+    stack: &mut Vec<Vec<u8>>,
+    require_minimal: bool,
+    f: impl Fn(i64, i64) -> i64,
+) -> Result<(), ConsensusError> {
+    let b = scriptnum_decode(&pop(stack)?, require_minimal)?;
+    let a = scriptnum_decode(&pop(stack)?, require_minimal)?;
     push(stack, scriptnum_encode(f(a, b)))
 }
 
-fn bin_cmp(stack: &mut Vec<Vec<u8>>, f: impl Fn(i64, i64) -> bool) -> Result<(), ConsensusError> {
-    let b = scriptnum_decode(&pop(stack)?)?;
-    let a = scriptnum_decode(&pop(stack)?)?;
+fn bin_cmp(
+    stack: &mut Vec<Vec<u8>>,
+    require_minimal: bool,
+    f: impl Fn(i64, i64) -> bool,
+) -> Result<(), ConsensusError> {
+    let b = scriptnum_decode(&pop(stack)?, require_minimal)?;
+    let a = scriptnum_decode(&pop(stack)?, require_minimal)?;
     push(stack, bool_encode(f(a, b)))
 }
 
@@ -2060,5 +2130,131 @@ mod success_and_disabled_tests {
         let out = find_and_delete(&short, &[0xff]);
         assert!(!out.is_empty() || out.is_empty());
         assert_eq!(out[0], 0x4e);
+    }
+}
+
+#[cfg(test)]
+mod minimal_data_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    fn eval_md(script_bytes: &[u8], md: bool) -> Result<(), String> {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let script = Script::from_bytes(script_bytes);
+        let mut ctx = EvalContext::new(
+            &tx,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            script,
+            SigVersion::Base,
+        );
+        ctx.minimal_data = md;
+        let mut stack = Vec::new();
+        eval_script(script, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
+        require_true_top(&stack).map_err(|e| format!("{e}"))
+    }
+
+    #[test]
+    fn check_minimal_push_table() {
+        assert!(check_minimal_push(&[], 0x00));
+        assert!(!check_minimal_push(&[], 0x4c)); // empty must be OP_0
+        assert!(check_minimal_push(&[5], 0x55)); // OP_5
+        assert!(!check_minimal_push(&[5], 0x01)); // direct push of 5 non-minimal
+        assert!(check_minimal_push(&[0x81], 0x4f)); // OP_1NEGATE
+        assert!(!check_minimal_push(&[0x81], 0x01));
+        assert!(check_minimal_push(&[0x00], 0x01)); // one zero byte is fine
+        assert!(check_minimal_push(&[0x11], 0x01)); // 17 as direct push
+        assert!(check_minimal_push(&vec![0u8; 76], 0x4c)); // PUSHDATA1 for 76
+        assert!(!check_minimal_push(&vec![0u8; 76], 0x4d));
+    }
+
+    #[test]
+    fn scriptnum_minimal_encoding() {
+        assert!(scriptnum_is_minimal(&[]));
+        assert!(!scriptnum_is_minimal(&[0x00])); // zero pad
+        assert!(!scriptnum_is_minimal(&[0x80])); // negative zero
+        assert!(scriptnum_is_minimal(&[0x01]));
+        assert!(!scriptnum_is_minimal(&[0x01, 0x00])); // leading zero
+        assert!(scriptnum_is_minimal(&[0xff, 0x00])); // +255 needs high-bit pad
+        assert!(scriptnum_is_minimal(&[0xff, 0x80])); // -255
+    }
+
+    #[test]
+    fn executed_nonminimal_push_rejects_when_flag_on() {
+        // PUSHDATA1 empty (0x4c 0x00) then DROP OP_1
+        let script = vec![0x4c, 0x00, 0x75, 0x51];
+        let err = eval_md(&script, true).unwrap_err();
+        assert!(err.contains("MINIMALDATA"), "{err}");
+        // Same script OK without the flag.
+        eval_md(&script, false).expect("without MINIMALDATA");
+    }
+
+    #[test]
+    fn unexecuted_nonminimal_push_ignored() {
+        // OP_0 IF PUSHDATA1-empty ENDIF OP_1 — Core ignores non-minimal in false branch.
+        let script = vec![0x00, 0x63, 0x4c, 0x00, 0x68, 0x51];
+        eval_md(&script, true).expect("unexecuted non-minimal push OK");
+    }
+
+    #[test]
+    fn nonminimal_scriptnum_rejects_when_flag_on() {
+        // Push 0x00 (one zero byte) then NOT DROP OP_1 → SCRIPTNUM under flag.
+        let script = vec![0x01, 0x00, 0x91, 0x75, 0x51];
+        let err = eval_md(&script, true).unwrap_err();
+        assert!(err.contains("SCRIPTNUM"), "{err}");
+        // Without flag the zero-pad is accepted as 0; NOT → true; DROP; OP_1 → OK.
+        eval_md(&script, false).expect("without require_minimal");
+    }
+
+    #[test]
+    fn production_default_minimal_data_off() {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let script = Script::from_bytes(&[0x51]);
+        let ctx = EvalContext::new(
+            &tx,
+            0,
+            Amount::from_sat(1),
+            &prevouts,
+            script,
+            SigVersion::Base,
+        );
+        assert!(!ctx.minimal_data);
     }
 }

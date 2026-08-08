@@ -63,9 +63,17 @@ fn assemble_edges_string_hex_push_and_errors() {
                             // Opcode token mixed case / known names.
     let b = assemble("OP_DUP OP_HASH160").expect("ops named");
     assert!(!b.is_empty());
-    // Zero token.
+    // Zero token → OP_0.
     let b = assemble("0").expect("zero");
-    assert!(!b.is_empty());
+    assert_eq!(b, vec![0x00]);
+    // Small ints use opcode forms (MINIMALDATA-safe), not data pushes.
+    assert_eq!(assemble("1").unwrap(), vec![0x51]);
+    assert_eq!(assemble("16").unwrap(), vec![0x60]);
+    assert_eq!(assemble("-1").unwrap(), vec![0x4f]);
+    // Larger ints use minimal CScriptNum push.
+    let b = assemble("17").unwrap();
+    assert_eq!(b[0], 1); // direct push length
+    assert_eq!(&b[1..], &[17]);
 }
 
 // ── Core script language assembler ──────────────────────────────────────────
@@ -120,9 +128,20 @@ fn assemble(src: &str) -> Result<Vec<u8>, String> {
         if tok.is_empty() {
             continue;
         }
+        // Core ParseScript: -1, 0, 1..16 are single opcodes (OP_1NEGATE / OP_0 /
+        // OP_1..OP_16). Other integers use minimal push of CScriptNum bytes.
+        // Using raw pushes for 1..16 would fail SCRIPT_VERIFY_MINIMALDATA.
         if let Ok(n) = tok.parse::<i64>() {
-            let enc = encode_scriptnum(n);
-            push_data(&mut out, &enc);
+            if n == 0 {
+                out.push(0x00); // OP_0
+            } else if n == -1 {
+                out.push(0x4f); // OP_1NEGATE
+            } else if (1..=16).contains(&n) {
+                out.push(0x50 + n as u8); // OP_1 .. OP_16
+            } else {
+                let enc = encode_scriptnum(n);
+                push_data(&mut out, &enc);
+            }
             continue;
         }
         let op = opcode_byte(tok).ok_or_else(|| format!("unknown token {tok}"))?;
@@ -396,6 +415,8 @@ struct CoreFlags {
     taproot: bool,
     cleanstack: bool,
     discourage_upgradable_nops: bool,
+    /// Core `SCRIPT_VERIFY_MINIMALDATA`.
+    minimal_data: bool,
     /// Other named flags we do not yet implement (for allowlist diagnostics).
     extra: Vec<String>,
 }
@@ -417,11 +438,11 @@ fn parse_flags(s: &str) -> CoreFlags {
                 f.dersig = true; // STRICTENC implies DER + pubkey type checks
                 f.extra.push("STRICTENC".into());
             }
+            "MINIMALDATA" => f.minimal_data = true,
             "LOW_S"
             | "NULLFAIL"
             | "NULLDUMMY"
             | "SIGPUSHONLY"
-            | "MINIMALDATA"
             | "MINIMALIF"
             | "WITNESS_PUBKEYTYPE"
             | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
@@ -650,7 +671,7 @@ fn eval_bare_pair(
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let ss = Script::from_bytes(script_sig);
     if !script_sig.is_empty() {
-        let ctx = EvalContext::new_with_flags(
+        let mut ctx = EvalContext::new_with_flags(
             spend,
             0,
             amount,
@@ -661,10 +682,11 @@ fn eval_bare_pair(
             flags.csv,
             flags.dersig,
         );
+        ctx.minimal_data = flags.minimal_data;
         let _ = interpreter::eval_script(ss, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
     }
     let spk = Script::from_bytes(script_pubkey);
-    let ctx = EvalContext::new_with_flags(
+    let mut ctx = EvalContext::new_with_flags(
         spend,
         0,
         amount,
@@ -675,6 +697,7 @@ fn eval_bare_pair(
         flags.csv,
         flags.dersig,
     );
+    ctx.minimal_data = flags.minimal_data;
     let need = interpreter::eval_script(spk, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
     if !need {
         return Ok(()); // OP_SUCCESS-like
@@ -691,7 +714,7 @@ fn eval_bare_pair(
         }
         let redeem_script = Script::from_bytes(&redeem);
         // Redeem is evaluated as scriptCode for sighash.
-        let ctx_r = EvalContext::new_with_flags(
+        let mut ctx_r = EvalContext::new_with_flags(
             spend,
             0,
             amount,
@@ -702,6 +725,7 @@ fn eval_bare_pair(
             flags.csv,
             flags.dersig,
         );
+        ctx_r.minimal_data = flags.minimal_data;
         let need_r = interpreter::eval_script(redeem_script, &mut stack, &ctx_r)
             .map_err(|e| format!("P2SH redeem: {e}"))?;
         if !need_r {
@@ -733,81 +757,6 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (458, "P2SH redeem with OP_1 minimal push parse edge"),
     (459, "P2SH redeem with OP_PUSHDATA1 empty then OP_1 parse edge"),
     (830, "OP_COUNT in unexecuted branch: long NOP run boundary"),
-    (924, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (925, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (926, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (927, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (928, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (929, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (930, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (931, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (932, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (933, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (934, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (935, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (936, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (937, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (938, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (939, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (940, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (941, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (942, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (943, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (944, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=MINIMALDATA)"),
-    (946, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (947, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (948, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (949, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (950, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (951, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (952, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (953, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (954, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (955, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (956, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (957, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (959, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (960, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (961, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (962, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (963, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (964, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (965, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (966, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (967, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (968, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (969, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (970, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (971, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (972, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (973, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (974, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (975, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (976, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (977, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (978, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (979, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (980, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (981, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (982, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (983, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (984, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (985, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (986, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (987, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (988, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (989, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (990, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (991, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (992, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (993, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (994, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (995, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (996, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (997, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (998, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (999, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
-    (1000, "MINIMALDATA/SCRIPTNUM not fully enforced in interpreter (flags=MINIMALDATA expect=SCRIPTNUM)"),
     (1004, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
     (1005, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_DER)"),
     (1006, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
@@ -826,29 +775,25 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (1034, "P2SH-P2PK redeem: instruction parse of compressed-key CHECKSIG redeem"),
     (1035, "P2SH-P2PK wrong redeem: expect EVAL_FALSE, soft-ok path"),
     (1036, "P2SH-P2PKH redeem parse of legacy scriptPubKey redeem body"),
-    (1039, "CHECKMULTISIG 3-of-3 sighash template mismatch on credit/spend"),
     (1041, "P2SH multisig redeem via PUSHDATA1 body parse"),
     (1050, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1052, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1056, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1063, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
     (1067, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1068, "CHECKMULTISIG 2-of-2 sighash template mismatch"),
-    (1070, "CHECKMULTISIG NOT expect EVAL_FALSE soft-ok vs hard false"),
     (1071, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1075, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1083, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=LOW_S expect=SIG_HIGH_S)"),
     (1085, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
     (1091, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
-    (1092, "CHECKMULTISIG hybrid compressed/uncompressed sighash"),
-    (1093, "CHECKMULTISIG hybrid + STRICTENC sighash"),
+    // Revealed when assembler used OP_1..OP_16: prior soft EVAL_FALSE masked Ok vs named code.
+    (1094, "STRICTENC hybrid pubkey type not enforced (flags=STRICTENC expect=PUBKEYTYPE)"),
     (1096, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
     (1098, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
-    (1099, "CHECKMULTISIG 3-of-3 with OP_1 dummy sighash"),
+    (1100, "NULLDUMMY not enforced (flags=NULLDUMMY expect=SIG_NULLDUMMY)"),
+    (1104, "SIGPUSHONLY not enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
     (1102, "NULLDUMMY (BIP147) not fully enforced on all paths (flags=NULLDUMMY expect=SIG_NULLDUMMY)"),
-    (1103, "CHECKMULTISIG with DUP in scriptSig sighash"),
     (1108, "SIGPUSHONLY is policy-adjacent; not fully enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
-    (1109, "CHECKMULTISIG + SIGPUSHONLY sighash"),
     (1112, "P2SH-P2PK redeem with OP_1 prefix stack item parse"),
     (1114, "P2SH-P2PK + CLEANSTACK redeem parse"),
     (1126, "P2SH-P2WSH redeem (witness program as redeem) without WITNESS flag"),
@@ -1104,9 +1049,8 @@ fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
 fn script_allowlist_has_no_stale_entries() {
     let mut stale = Vec::new();
     for &(idx, reason) in ALLOWLIST {
-        match script_row_matches_core_without_skip(idx) {
-            Some(true) => stale.push((idx, reason)),
-            Some(false) | None => {}
+        if let Some(true) = script_row_matches_core_without_skip(idx) {
+            stale.push((idx, reason));
         }
     }
     for (idx, reason) in &stale {

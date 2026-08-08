@@ -1,5 +1,6 @@
 //! Esplora HTTP listener (axum + tower limits).
 
+use crate::tx_json::{build_tx_json, tx_status_json};
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -7,11 +8,11 @@ use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use bitcoin::consensus::Encodable;
+use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
-use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,13 +29,20 @@ pub struct EsploraConfig {
     pub listen: SocketAddr,
     /// Shared with Electrum ([`ServeLimits::for_public_proxy`] defaults).
     pub limits: ServeLimits,
+    /// Address encoding network (mainnet/testnet/signet/regtest).
+    pub network: Network,
 }
 
 impl EsploraConfig {
     pub fn new(listen: SocketAddr) -> Self {
+        Self::with_network(listen, Network::Bitcoin)
+    }
+
+    pub fn with_network(listen: SocketAddr, network: Network) -> Self {
         Self {
             listen,
             limits: ServeLimits::for_public_proxy(),
+            network,
         }
     }
 }
@@ -56,6 +64,7 @@ impl EsploraHandle {
 #[derive(Clone)]
 struct AppState {
     query: Arc<Query>,
+    network: Network,
 }
 
 /// Start Esplora **plain HTTP** on `config.listen`.
@@ -77,12 +86,16 @@ pub async fn run_esplora(
     // Floor for request timeout: at least 1s so unit tests with short idle still work.
     let timeout = idle.max(Duration::from_secs(1));
 
-    let state = AppState { query };
+    let state = AppState {
+        query,
+        network: config.network,
+    };
     let app = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/block-height/:height", get(block_height))
         .route("/block/:hash/header", get(block_header))
+        .route("/tx/:txid", get(tx_full))
         .route("/tx/:txid/hex", get(tx_hex))
         .route("/tx/:txid/status", get(tx_status))
         .fallback(fallback_404)
@@ -155,6 +168,21 @@ async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<String>) 
     }
 }
 
+/// `GET /tx/:txid` → full Esplora transaction JSON (incl. asm/type/address).
+async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
+    let Ok(txid) = parse_hash32(&txid_hex) else {
+        return not_found();
+    };
+    match st.query.get_tx_by_txid(&txid) {
+        Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
 /// `GET /tx/:txid/hex` → raw consensus-encoded transaction hex.
 async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
@@ -187,29 +215,6 @@ async fn tx_status(State(st): State<AppState>, Path(txid_hex): Path<String>) -> 
 
 async fn fallback_404() -> Response {
     not_found()
-}
-
-// --- shared helpers (status builder reused by full tx JSON in later steps) ---
-
-/// Esplora `status` object for a Class A tx fk (confirmed or not).
-pub(crate) fn tx_status_json(
-    query: &Query,
-    tx_fk: rbitcoin_primitives::Fk,
-) -> Result<Value, rbitcoin_query::QueryError> {
-    let confirmed = query.store().is_confirmed_strong(tx_fk)?;
-    if !confirmed {
-        return Ok(json!({ "confirmed": false }));
-    }
-    let height = query.store().tx_height.get(tx_fk)?.unwrap_or(0);
-    let mut out = json!({
-        "confirmed": true,
-        "block_height": height,
-    });
-    if let Some((_fk, rec)) = query.header_at_height(Height(height))? {
-        out["block_hash"] = Value::String(block_hash_hex(&rec.hash));
-        out["block_time"] = json!(rec.timestamp);
-    }
-    Ok(out)
 }
 
 fn plain_ok(body: String) -> Response {
@@ -412,7 +417,7 @@ mod tests {
         assert_eq!(q.tip_height(), Some(Height(2)));
 
         let q = Arc::new(q);
-        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
         let handle = run_esplora(cfg, Arc::clone(&q)).await.expect("listen");
         let addr = handle.local_addr;
 
@@ -453,16 +458,45 @@ mod tests {
         // /tx/:txid/status
         let (st, body) = http_get(addr, &format!("/tx/{txid_disp}/status")).await;
         assert_eq!(st, 200, "status body={body}");
-        let v: Value = serde_json::from_str(&body).expect("status json");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("status json");
         assert_eq!(v["confirmed"], true);
         assert_eq!(v["block_height"], 0);
         assert_eq!(v["block_hash"], block_hash_hex(&hashes[0]));
         assert!(v.get("block_time").is_some());
 
+        // /tx/:txid full projection (asm/type keys present)
+        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}")).await;
+        assert_eq!(st, 200, "tx full body={body}");
+        let full: serde_json::Value = serde_json::from_str(&body).expect("tx json");
+        assert!(full.get("txid").is_some());
+        assert!(full.get("vin").is_some());
+        assert!(full.get("vout").is_some());
+        assert!(full.get("status").is_some());
+        assert!(full.get("size").is_some());
+        assert!(full.get("weight").is_some());
+        assert_eq!(full["fee"], 0); // coinbase
+        let v0 = &full["vout"][0];
+        assert!(v0.get("scriptpubkey").is_some());
+        assert!(v0.get("scriptpubkey_asm").is_some());
+        assert!(v0.get("scriptpubkey_type").is_some());
+        // OP_TRUE coinbase → unknown type, no address
+        assert_eq!(v0["scriptpubkey_type"], "unknown");
+        assert!(v0
+            .get("scriptpubkey_asm")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("OP_"));
+        let vin0 = &full["vin"][0];
+        assert_eq!(vin0["is_coinbase"], true);
+        assert!(vin0.get("scriptsig_asm").is_some());
+
         // missing tx
         let (st, _) = http_get(addr, &format!("/tx/{miss}/hex")).await;
         assert_eq!(st, 404);
         let (st, _) = http_get(addr, &format!("/tx/{miss}/status")).await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, &format!("/tx/{miss}")).await;
         assert_eq!(st, 404);
 
         // status helper unit

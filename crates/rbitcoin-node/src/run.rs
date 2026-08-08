@@ -496,14 +496,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(addr) = config.esplora_listen {
         if !shutdown.requested() {
             let q = node.hub.query.clone();
-            let ecfg = EsploraConfig::new(addr);
+            let btc_net = match config.network {
+                rbitcoin_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
+                rbitcoin_primitives::Network::Testnet => bitcoin::Network::Testnet,
+                rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
+                rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
+            };
+            let ecfg = EsploraConfig::with_network(addr, btc_net);
             let max_conn = ecfg.limits.max_connections;
             let max_body = ecfg.limits.max_request_bytes;
             let idle_secs = ecfg.limits.idle_timeout.as_secs();
             match run_esplora(ecfg, q).await {
                 Ok(h) => {
                     info!(
-                        "esplora HTTP on {} (tip routes; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
+                        "esplora HTTP on {} (tx/block/tip; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
                         h.local_addr, max_conn, max_body, idle_secs
                     );
                     esplora_handles.push(h);

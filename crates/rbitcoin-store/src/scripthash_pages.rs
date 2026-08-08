@@ -34,12 +34,14 @@
 //! Chain is **singly linked** first → … → last. Head stores first+last for O(1)
 //! walk start and O(1) append target.
 //!
-//! Helpers are unit-tested here; production `put_create` / `entries` wiring lands
-//! in later plan steps — allow until then (not a permanent silence).
+//! Page buffer helpers (Step 1): append / decode / next link. Head packing from
+//! Step 0. Production `put_create` / `entries` wiring lands in Steps 2–3 —
+//! allow unused until then (not a permanent silence).
 
-#![allow(dead_code)] // Step 0 layout pin; consumed by Steps 1–3 SH rewire
+#![allow(dead_code)] // Page/head helpers; consumed by Steps 2–3 SH rewire
 
 use crate::error::StoreError;
+use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
 use rbitcoin_primitives::Fk;
 
 /// Disk page size for SH FK chains (aligned allocations).
@@ -47,7 +49,7 @@ pub const SH_PAGE_SIZE: usize = 4096;
 /// Bytes before the FK array in a page.
 pub const SH_PAGE_HEADER_LEN: usize = 16;
 /// Max create_tx_fks that fit in one page after the header.
-pub const SH_PAGE_FK_CAP: usize = (SH_PAGE_SIZE - SH_PAGE_HEADER_LEN) / 8;
+pub const SH_PAGE_FK_CAP: usize = (SH_PAGE_SIZE - SH_PAGE_HEADER_LEN) / SH_ENTRY_LEN;
 
 /// Bit 63: mode / reserved flag on head words and (must be clear on) offsets.
 pub const SH_FLAG_BIT: u64 = 1u64 << 63;
@@ -63,8 +65,25 @@ pub const SH_PAGE_OFF_FKS: usize = SH_PAGE_HEADER_LEN;
 
 const _: () = assert!(SH_PAGE_SIZE == 4096);
 const _: () = assert!(SH_PAGE_HEADER_LEN == 16);
+const _: () = assert!(SH_ENTRY_LEN == 8);
 const _: () = assert!(SH_PAGE_FK_CAP == 510);
-const _: () = assert!(SH_PAGE_OFF_FKS + SH_PAGE_FK_CAP * 8 == SH_PAGE_SIZE);
+const _: () = assert!(SH_PAGE_OFF_FKS + SH_PAGE_FK_CAP * SH_ENTRY_LEN == SH_PAGE_SIZE);
+
+/// Require a full 4 KiB page buffer (rejects unaligned / short slices).
+#[inline]
+pub fn sh_page_as_array(buf: &[u8]) -> Result<&[u8; SH_PAGE_SIZE], StoreError> {
+    buf.try_into().map_err(|_| {
+        StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes")
+    })
+}
+
+/// Mutable full-page view (rejects wrong length).
+#[inline]
+pub fn sh_page_as_array_mut(buf: &mut [u8]) -> Result<&mut [u8; SH_PAGE_SIZE], StoreError> {
+    buf.try_into().map_err(|_| {
+        StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes")
+    })
+}
 
 /// True if bit 63 is set.
 #[inline]
@@ -214,30 +233,48 @@ fn sh_page_set_n_fks(page: &mut [u8; SH_PAGE_SIZE], n: u16) {
     page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].copy_from_slice(&n.to_le_bytes());
 }
 
-/// FKs currently stored in the page (oldest → newest within page).
-pub fn sh_page_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<Fk>, StoreError> {
+/// Entries currently stored in the page (oldest → newest within page).
+///
+/// Uses [`ShEntry`] encode/decode (same 8 B layout as slab body entries).
+pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreError> {
     let n = sh_page_n_fks(page)? as usize;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let off = SH_PAGE_OFF_FKS + i * 8;
-        let fk = Fk(u64::from_le_bytes(page[off..off + 8].try_into().unwrap()));
-        if fk.is_null() {
+        let off = SH_PAGE_OFF_FKS + i * SH_ENTRY_LEN;
+        let e = ShEntry::decode(&page[off..off + SH_ENTRY_LEN])?;
+        if e.is_null() {
             return Err(StoreError::Corrupt("scripthash page null fk"));
         }
-        if fk.0 & SH_FLAG_BIT != 0 {
+        if e.create_tx_fk.0 & SH_FLAG_BIT != 0 {
             return Err(StoreError::Corrupt("scripthash page fk has flag bit set"));
         }
-        out.push(fk);
+        out.push(e);
     }
     Ok(out)
 }
 
-/// Append one FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
+/// FKs currently stored in the page (oldest → newest within page).
+pub fn sh_page_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<Fk>, StoreError> {
+    Ok(sh_page_entries(page)?
+        .into_iter()
+        .map(|e| e.create_tx_fk)
+        .collect())
+}
+
+/// Append one create FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
 pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool, StoreError> {
-    if fk.is_null() {
+    sh_page_try_append_entry(page, ShEntry::new(fk))
+}
+
+/// Append one [`ShEntry`] to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
+pub fn sh_page_try_append_entry(
+    page: &mut [u8; SH_PAGE_SIZE],
+    entry: ShEntry,
+) -> Result<bool, StoreError> {
+    if entry.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    if fk.0 & SH_FLAG_BIT != 0 {
+    if entry.create_tx_fk.0 & SH_FLAG_BIT != 0 {
         return Err(StoreError::Corrupt(
             "scripthash: create_fk must have bit63 clear",
         ));
@@ -246,10 +283,17 @@ pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool,
     if n >= SH_PAGE_FK_CAP {
         return Ok(false);
     }
-    let off = SH_PAGE_OFF_FKS + n * 8;
-    page[off..off + 8].copy_from_slice(&fk.0.to_le_bytes());
+    let off = SH_PAGE_OFF_FKS + n * SH_ENTRY_LEN;
+    let enc = entry.encode();
+    page[off..off + SH_ENTRY_LEN].copy_from_slice(&enc);
     sh_page_set_n_fks(page, (n + 1) as u16);
     Ok(true)
+}
+
+/// Decode page fields from an arbitrary slice (rejects len ≠ 4096).
+pub fn sh_page_decode_slice(buf: &[u8]) -> Result<(u64, Vec<ShEntry>), StoreError> {
+    let page = sh_page_as_array(buf)?;
+    Ok((sh_page_next(page)?, sh_page_entries(page)?))
 }
 
 #[cfg(test)]
@@ -312,12 +356,16 @@ mod tests {
         assert_eq!(sh_page_n_fks(&page).unwrap(), 0);
         assert_eq!(sh_page_next(&page).unwrap(), 0);
         assert!(sh_page_try_append(&mut page, Fk(1)).unwrap());
-        assert!(sh_page_try_append(&mut page, Fk(2)).unwrap());
+        assert!(sh_page_try_append_entry(&mut page, ShEntry::new(Fk(2))).unwrap());
         assert_eq!(sh_page_fks(&page).unwrap(), vec![Fk(1), Fk(2)]);
+        assert_eq!(
+            sh_page_entries(&page).unwrap(),
+            vec![ShEntry::new(Fk(1)), ShEntry::new(Fk(2))]
+        );
         sh_page_set_next(&mut page, 8192).unwrap();
         assert_eq!(sh_page_next(&page).unwrap(), 8192);
 
-        // Fill to capacity
+        // Fill to capacity then refuse one more (needs new page).
         let mut full = [0u8; SH_PAGE_SIZE];
         sh_page_init_empty(&mut full);
         for i in 1..=SH_PAGE_FK_CAP as u64 {
@@ -329,6 +377,9 @@ mod tests {
         assert_eq!(sh_page_n_fks(&full).unwrap() as usize, SH_PAGE_FK_CAP);
         assert!(!sh_page_try_append(&mut full, Fk(99_999)).unwrap());
         assert_eq!(sh_page_fks(&full).unwrap().len(), SH_PAGE_FK_CAP);
+        // ShEntry bytes match layout encode.
+        let e = ShEntry::new(Fk(0xabc));
+        assert_eq!(e.encode(), e.create_tx_fk.0.to_le_bytes());
     }
 
     #[test]
@@ -337,5 +388,33 @@ mod tests {
         sh_page_init_empty(&mut page);
         assert!(sh_page_try_append(&mut page, Fk::NULL).is_err());
         assert!(sh_page_try_append(&mut page, Fk(SH_FLAG_BIT | 1)).is_err());
+    }
+
+    #[test]
+    fn page_slice_must_be_exactly_4k() {
+        let short = [0u8; 100];
+        assert!(sh_page_as_array(&short).is_err());
+        assert!(sh_page_decode_slice(&short).is_err());
+        let mut long = vec![0u8; SH_PAGE_SIZE + 1];
+        assert!(sh_page_as_array(&long).is_err());
+        assert!(sh_page_as_array_mut(&mut long[..SH_PAGE_SIZE - 1]).is_err());
+
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        sh_page_try_append(&mut page, Fk(7)).unwrap();
+        let (next, ents) = sh_page_decode_slice(&page).unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(ents, vec![ShEntry::new(Fk(7))]);
+    }
+
+    #[test]
+    fn page_corrupt_n_fks_over_capacity() {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        // Force illegal n_fks
+        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
+            .copy_from_slice(&((SH_PAGE_FK_CAP + 1) as u16).to_le_bytes());
+        assert!(sh_page_n_fks(&page).is_err());
+        assert!(sh_page_fks(&page).is_err());
     }
 }

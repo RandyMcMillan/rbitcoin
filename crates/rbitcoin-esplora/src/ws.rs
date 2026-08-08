@@ -502,40 +502,31 @@ async fn on_mempool_announce(
 ) -> Result<(), ()> {
     let mp = st.mempool.as_ref();
 
-    // Wallet-scoped RBF: only when replaced/new intersects this connection's tracks.
+    // Wallet-scoped RBF: notify if tracked old txid **or** watchlist intersects
+    // replaced bodies' scripthashes (plumbed before eviction on AcceptResult).
     if !ann.replaced.is_empty() {
-        let mut replaced_for_client = Vec::new();
-        for old in &ann.replaced {
-            let track_tx = conn.txids.contains(old);
-            // Body is usually gone after replace; always notify tracked old txids.
-            // Address-only hits for replaced txs without body are best-effort via new tx
-            // (client still sees replacement as address-transactions below).
-            if track_tx {
-                replaced_for_client.push(json!({
-                    "txid": txid_display_hex(old),
-                    "replaced-by": txid_display_hex(&ann.txid),
-                }));
-            }
-        }
-        // Also notify if the *replacement* touches a watched address (wallet receive RBF).
+        let addr_hit_old = !conn.addresses.is_empty()
+            && ann
+                .replaced_scripthashes
+                .iter()
+                .any(|sh| conn.addresses.contains_key(sh));
+        // Also if the *replacement* pays a watched script (receive RBF to same watchlist).
+        let mut addr_hit_new = false;
         if !conn.addresses.is_empty() {
             if let Some(m) = mp {
                 if let Some(tx) = m.get_tx(&ann.txid) {
                     let shs = scripts_touched_full(&st.query, Some(m.as_ref()), &tx);
-                    if shs.iter().any(|s| conn.addresses.contains_key(s)) {
-                        for old in &ann.replaced {
-                            let hex = txid_display_hex(old);
-                            if !replaced_for_client.iter().any(|v| {
-                                v.get("txid").and_then(|t| t.as_str()) == Some(hex.as_str())
-                            }) {
-                                replaced_for_client.push(json!({
-                                    "txid": hex,
-                                    "replaced-by": txid_display_hex(&ann.txid),
-                                }));
-                            }
-                        }
-                    }
+                    addr_hit_new = shs.iter().any(|s| conn.addresses.contains_key(s));
                 }
+            }
+        }
+        let mut replaced_for_client = Vec::new();
+        for old in &ann.replaced {
+            if conn.txids.contains(old) || addr_hit_old || addr_hit_new {
+                replaced_for_client.push(json!({
+                    "txid": txid_display_hex(old),
+                    "replaced-by": txid_display_hex(&ann.txid),
+                }));
             }
         }
         if !replaced_for_client.is_empty() {

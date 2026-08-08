@@ -976,18 +976,455 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regtest P2WPKH address + scriptPubKey for wallet-style track-address tests.
+    fn regtest_p2wpkh() -> (String, bitcoin::ScriptBuf) {
+        use bitcoin::key::CompressedPublicKey;
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use bitcoin::{Address, Network, PrivateKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[7u8; 32]).expect("sk");
+        let pk = PrivateKey::new(sk, Network::Regtest);
+        let cpk = CompressedPublicKey::from_private_key(&secp, &pk).expect("cpk");
+        let addr = Address::p2wpkh(&cpk, Network::Regtest);
+        let spk = addr.script_pubkey();
+        (addr.to_string(), spk)
+    }
+
+    fn display_txid(txid: bitcoin::Txid) -> String {
+        use bitcoin::hashes::Hash;
+        let mut rev = txid.to_byte_array();
+        rev.reverse();
+        rbitcoin_primitives::hex_encode(rev)
+    }
+
+    async fn ws_recv_json(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout_secs: u64,
+    ) -> serde_json::Value {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let frame = tokio::time::timeout(Duration::from_secs(timeout_secs), ws.next())
+            .await
+            .expect("timeout")
+            .expect("closed")
+            .expect("err");
+        match frame {
+            WsMsg::Text(t) => serde_json::from_str(&t).expect("json"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Track real regtest address → mempool address-transactions + tip block-transactions.
     #[tokio::test]
-    async fn ws_track_address_mempool_and_tx_rbf() {
+    async fn ws_track_address_mempool_and_confirm() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
         use bitcoin::transaction::Version as TxVersion;
         use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-        use futures_util::{SinkExt, StreamExt};
-        use rbitcoin_net::MempoolHub;
-        use rbitcoin_store::script_hash;
+        use futures_util::SinkExt;
+        use rbitcoin_net::{MempoolHub, TipEvent};
+        use tokio::sync::broadcast;
         use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-        let (dir, q) = temp_query("ws-track");
+        let (watch_addr, watch_spk) = regtest_p2wpkh();
+        let (dir, q) = temp_query("ws-addr");
+        let mut prev = Fk::NULL;
+        let mut coinbase_txids = Vec::new();
+        for h in 0..101u32 {
+            let (header, ta) = coinbase(h, prev);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        // Confirm a pay-to-watch address at height 101 (SH index write on connect).
+        let pay_bytes = {
+            // Deterministic synthetic txid for Class A row (store uses raw bytes).
+            let mut t = [0u8; 32];
+            t[0] = 0xaa;
+            t[31] = 0xbb;
+            t
+        };
+        let mut pay_disp = pay_bytes;
+        pay_disp.reverse();
+        let pay_hex = rbitcoin_primitives::hex_encode(pay_disp);
+
+        let ta_pay = TxApply {
+            tx: TxRecord {
+                txid: pay_bytes,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: coinbase_txids[0],
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: 0xffff_fffd,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, watch_spk.to_bytes())],
+        };
+        let (cb_header, cb) = coinbase(101, prev);
+        let _prev = q
+            .connect_block(Height(101), &cb_header, &[cb, ta_pay])
+            .expect("connect pay block");
+        let tip_hash = cb_header.hash;
+
+        let q = Arc::new(q);
+        let mp_dir = dir.join("mp");
+        std::fs::create_dir_all(&mp_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+
+        let (tip_tx, _) = broadcast::channel::<TipEvent>(16);
+        let cfg =
+            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
+        let handle = run_esplora(
+            cfg,
+            Arc::clone(&q),
+            Some(Arc::clone(&hub)),
+            Some(tip_tx.clone()),
+        )
+        .await
+        .expect("listen");
+        let addr = handle.local_addr;
+
+        let url = format!("ws://{addr}/v1/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        ws.send(WsMsg::Text(format!(
+            r#"{{"track-address":"{watch_addr}"}}"#
+        )))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Mempool path: another mature coinbase → watch address.
+        let op1 = OutPoint {
+            txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]),
+            vout: 0,
+        };
+        let mem_pay = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op1,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: watch_spk.clone(),
+            }],
+        };
+        let mem_hex = display_txid(mem_pay.compute_txid());
+        hub.accept_tx(&mem_pay).expect("mempool accept to watch");
+
+        let mut saw_addr_mp = false;
+        for _ in 0..12 {
+            let v = ws_recv_json(&mut ws, 3).await;
+            if let Some(arr) = v.get("address-transactions").and_then(|a| a.as_array()) {
+                assert!(!arr.is_empty());
+                let txids: Vec<&str> = arr
+                    .iter()
+                    .filter_map(|t| t.get("txid").and_then(|x| x.as_str()))
+                    .collect();
+                assert!(
+                    txids.iter().any(|t| *t == mem_hex),
+                    "address-transactions should include mempool pay {mem_hex}, got {txids:?}"
+                );
+                saw_addr_mp = true;
+                break;
+            }
+        }
+        assert!(saw_addr_mp, "expected address-transactions mempool push");
+
+        // Confirm path: tip at height 101 should yield block-transactions for watch.
+        let header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(1),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 102,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 101,
+        };
+        tip_tx
+            .send(TipEvent {
+                height: 101,
+                hash: bitcoin::BlockHash::from_byte_array(tip_hash),
+                header,
+            })
+            .expect("tip send");
+
+        let mut saw_block_txs = false;
+        for _ in 0..12 {
+            let v = ws_recv_json(&mut ws, 3).await;
+            if let Some(arr) = v.get("block-transactions").and_then(|a| a.as_array()) {
+                let txids: Vec<&str> = arr
+                    .iter()
+                    .filter_map(|t| t.get("txid").and_then(|x| x.as_str()))
+                    .collect();
+                assert!(
+                    txids.iter().any(|t| *t == pay_hex.as_str()),
+                    "block-transactions should include confirmed pay {pay_hex}, got {txids:?}"
+                );
+                saw_block_txs = true;
+                break;
+            }
+        }
+        assert!(saw_block_txs, "expected block-transactions at tip 101");
+
+        let _ = ws.close(None).await;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// track-tx: unconfirmed on accept, then confirmed after connect + tip.
+    #[tokio::test]
+    async fn ws_track_tx_status_confirm_transition() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use futures_util::SinkExt;
+        use rbitcoin_net::{MempoolHub, TipEvent};
+        use tokio::sync::broadcast;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let (dir, q) = temp_query("ws-tx-conf");
+        let mut prev = Fk::NULL;
+        let mut coinbase_txids = Vec::new();
+        for h in 0..101u32 {
+            let (header, ta) = coinbase(h, prev);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        let op0 = OutPoint {
+            txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
+            vout: 0,
+        };
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let pending = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op0,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let pending_id = pending.compute_txid();
+        let pending_hex = display_txid(pending_id);
+        let pending_bytes = pending_id.to_byte_array();
+
+        let q = Arc::new(q);
+        let mp_dir = dir.join("mp");
+        std::fs::create_dir_all(&mp_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+
+        let (tip_tx, _) = broadcast::channel::<TipEvent>(16);
+        let cfg =
+            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
+        let handle = run_esplora(
+            cfg,
+            Arc::clone(&q),
+            Some(Arc::clone(&hub)),
+            Some(tip_tx.clone()),
+        )
+        .await
+        .expect("listen");
+        let addr = handle.local_addr;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{pending_hex}"}}"#)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        hub.accept_tx(&pending).expect("accept");
+        let mut saw_unconf = false;
+        for _ in 0..10 {
+            let v = ws_recv_json(&mut ws, 3).await;
+            if v.get("tx").is_some() {
+                assert_eq!(v["tx"]["txid"], pending_hex);
+                assert_eq!(v["tx"]["status"]["confirmed"], false);
+                saw_unconf = true;
+                break;
+            }
+        }
+        assert!(saw_unconf, "unconfirmed track-tx push");
+
+        // Confirm the same txid via connect_block, then tip.
+        let tip_fk = q.header_at_height(Height(100)).unwrap().unwrap().0;
+        let (h_hdr, cb) = coinbase(101, tip_fk);
+        let ta = TxApply {
+            tx: TxRecord {
+                txid: pending_bytes,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: coinbase_txids[0],
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: 0xffff_fffd,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        q.connect_block(Height(101), &h_hdr, &[cb, ta])
+            .expect("confirm pending");
+        tip_tx
+            .send(TipEvent {
+                height: 101,
+                hash: bitcoin::BlockHash::from_byte_array(h_hdr.hash),
+                header: bitcoin::block::Header {
+                    version: bitcoin::block::Version::from_consensus(1),
+                    prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time: 102,
+                    bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                    nonce: 101,
+                },
+            })
+            .unwrap();
+
+        let mut saw_conf = false;
+        for _ in 0..12 {
+            let v = ws_recv_json(&mut ws, 3).await;
+            if v.get("tx").is_some() {
+                assert_eq!(v["tx"]["txid"], pending_hex);
+                if v["tx"]["status"]["confirmed"] == true {
+                    saw_conf = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_conf, "expected confirmed track-tx status after tip");
+
+        let _ = ws.close(None).await;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = prev;
+    }
+
+    /// Caps: honest error frames for max_track_addresses and max_track_txs.
+    #[tokio::test]
+    async fn ws_track_caps_error_frames() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let (dir, q) = temp_query("ws-caps");
+        let q = Arc::new(q);
+        let mut cfg =
+            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
+        cfg.max_track_addresses = 1;
+        cfg.max_track_txs = 1;
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/v1/ws", handle.local_addr))
+                .await
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (a1, _) = regtest_p2wpkh();
+        // Second distinct address.
+        let a2 = {
+            use bitcoin::key::CompressedPublicKey;
+            use bitcoin::secp256k1::{Secp256k1, SecretKey};
+            use bitcoin::{Address, Network, PrivateKey};
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+            let pk = PrivateKey::new(sk, Network::Regtest);
+            let cpk = CompressedPublicKey::from_private_key(&secp, &pk).unwrap();
+            Address::p2wpkh(&cpk, Network::Regtest).to_string()
+        };
+
+        ws.send(WsMsg::Text(format!(r#"{{"track-address":"{a1}"}}"#)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ws.send(WsMsg::Text(format!(r#"{{"track-address":"{a2}"}}"#)))
+            .await
+            .unwrap();
+        let mut saw_addr_cap = false;
+        for _ in 0..6 {
+            let v = ws_recv_json(&mut ws, 2).await;
+            if v.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|s| s.contains("max_track_addresses"))
+            {
+                saw_addr_cap = true;
+                break;
+            }
+        }
+        assert!(saw_addr_cap, "expected max_track_addresses error frame");
+
+        let t1 = "11".repeat(32);
+        let t2 = "22".repeat(32);
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{t1}"}}"#)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{t2}"}}"#)))
+            .await
+            .unwrap();
+        let mut saw_tx_cap = false;
+        for _ in 0..6 {
+            let v = ws_recv_json(&mut ws, 2).await;
+            if v.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|s| s.contains("max_track_txs"))
+            {
+                saw_tx_cap = true;
+                break;
+            }
+        }
+        assert!(saw_tx_cap, "expected max_track_txs error frame");
+
+        let _ = ws.close(None).await;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RBF: track-tx replace + address-only replace (old pays watch, new does not).
+    #[tokio::test]
+    async fn ws_rbf_track_tx_and_address_only() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use futures_util::SinkExt;
+        use rbitcoin_net::MempoolHub;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let (watch_addr, watch_spk) = regtest_p2wpkh();
+        let (dir, q) = temp_query("ws-rbf");
         let mut prev = Fk::NULL;
         let mut coinbase_txids = Vec::new();
         for h in 0..101u32 {
@@ -1001,25 +1438,22 @@ mod tests {
         let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
         hub.set_relay_enabled(true);
 
-        let mut cfg =
+        let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        cfg.max_track_addresses = 2;
-        cfg.max_track_txs = 2;
         let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
             .await
             .expect("listen");
-        let addr = handle.local_addr;
-
-        let url = format!("ws://{addr}/v1/ws");
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/v1/ws", handle.local_addr))
+                .await
+                .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // Spend mature coinbase with RBF sequence.
+        // --- track-tx RBF ---
         let op0 = OutPoint {
             txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
             vout: 0,
         };
-        let spk = ScriptBuf::from_bytes(vec![0x51]);
         let low = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -1031,41 +1465,27 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(50_0000_0000 - 1_000),
-                script_pubkey: spk.clone(),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let low_id = low.compute_txid();
-        let mut rev = low_id.to_byte_array();
-        rev.reverse();
-        let low_hex = rbitcoin_primitives::hex_encode(rev);
-
+        let low_hex = display_txid(low.compute_txid());
         ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{low_hex}"}}"#)))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        hub.accept_tx(&low).expect("accept low");
-
-        let mut saw_unconf = false;
-        for _ in 0..10 {
-            let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
-                .await
-                .expect("timeout")
-                .expect("closed")
-                .expect("err");
-            if let WsMsg::Text(t) = frame {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        hub.accept_tx(&low).unwrap();
+        // drain unconf
+        for _ in 0..5 {
+            if let Ok(v) =
+                tokio::time::timeout(Duration::from_millis(400), ws_recv_json(&mut ws, 1)).await
+            {
                 if v.get("tx").is_some() {
-                    assert_eq!(v["tx"]["txid"], low_hex);
-                    assert_eq!(v["tx"]["status"]["confirmed"], false);
-                    saw_unconf = true;
                     break;
                 }
+            } else {
+                break;
             }
         }
-        assert!(saw_unconf, "expected unconfirmed track-tx push");
-
-        // RBF with higher fee.
         let high = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -1077,62 +1497,97 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(50_0000_0000 - 10_000),
-                script_pubkey: spk,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let high_id = high.compute_txid();
-        let mut rev_h = high_id.to_byte_array();
-        rev_h.reverse();
-        let high_hex = rbitcoin_primitives::hex_encode(rev_h);
-        hub.accept_tx(&high).expect("accept high rbf");
-
-        let mut saw_replace = false;
+        let high_hex = display_txid(high.compute_txid());
+        hub.accept_tx(&high).unwrap();
+        let mut saw = false;
         for _ in 0..10 {
-            let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
-                .await
-                .expect("timeout")
-                .expect("closed")
-                .expect("err");
-            if let WsMsg::Text(t) = frame {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-                if let Some(arr) = v.get("replaced-transactions").and_then(|a| a.as_array()) {
-                    assert!(!arr.is_empty());
-                    assert_eq!(arr[0]["txid"], low_hex);
-                    assert_eq!(arr[0]["replaced-by"], high_hex);
-                    saw_replace = true;
-                    break;
-                }
+            let v = ws_recv_json(&mut ws, 2).await;
+            if let Some(arr) = v.get("replaced-transactions").and_then(|a| a.as_array()) {
+                assert_eq!(arr[0]["txid"], low_hex);
+                assert_eq!(arr[0]["replaced-by"], high_hex);
+                saw = true;
+                break;
             }
         }
-        assert!(
-            saw_replace,
-            "expected replaced-transactions for tracked old tx"
-        );
+        assert!(saw, "track-tx RBF replace frame");
 
-        // Cap on track-tx.
+        // --- address-only RBF: old pays watch, new pays OP_TRUE ---
+        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
+            .await
+            .unwrap();
         ws.send(WsMsg::Text(format!(
-            r#"{{"track-txs":["{high_hex}","{}"]}}"#,
-            "11".repeat(32)
+            r#"{{"track-address":"{watch_addr}"}}"#
         )))
         .await
         .unwrap();
-        // already have low tracked = 1, adding 2 more may exceed max 2.
-        let mut saw_cap = false;
-        for _ in 0..5 {
-            if let Ok(Some(Ok(WsMsg::Text(t)))) =
-                tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let op1 = OutPoint {
+            txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]),
+            vout: 0,
+        };
+        let old_to_watch = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op1,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: watch_spk,
+            }],
+        };
+        let old_hex = display_txid(old_to_watch.compute_txid());
+        hub.accept_tx(&old_to_watch).unwrap();
+        // drain address-transactions
+        for _ in 0..8 {
+            if let Ok(v) =
+                tokio::time::timeout(Duration::from_millis(400), ws_recv_json(&mut ws, 1)).await
             {
-                if t.contains("max_track_txs") {
-                    saw_cap = true;
+                if v.get("address-transactions").is_some() {
                     break;
                 }
             } else {
                 break;
             }
         }
-        // Cap may or may not fire depending on whether low still counted; not hard fail.
-        let _ = saw_cap;
-        let _ = script_hash;
+        let repl_away = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op1,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(48_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let repl_hex = display_txid(repl_away.compute_txid());
+        hub.accept_tx(&repl_away).expect("rbf away from watch");
+
+        let mut saw_addr_rbf = false;
+        for _ in 0..12 {
+            let v = ws_recv_json(&mut ws, 2).await;
+            if let Some(arr) = v.get("replaced-transactions").and_then(|a| a.as_array()) {
+                assert_eq!(arr[0]["txid"], old_hex);
+                assert_eq!(arr[0]["replaced-by"], repl_hex);
+                saw_addr_rbf = true;
+                break;
+            }
+        }
+        assert!(
+            saw_addr_rbf,
+            "address-only RBF: old paid watch, new does not"
+        );
 
         let _ = ws.close(None).await;
         handle.shutdown().await;

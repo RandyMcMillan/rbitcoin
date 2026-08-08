@@ -46,6 +46,10 @@ pub struct AcceptResult {
     pub slot: u32,
     /// Mempool txids removed by full-RBF / RBFR when admitting this tx (empty if no conflict).
     pub replaced: Vec<Txid>,
+    /// Electrum scripthashes (SHA256 of output scriptPubKeys) of **replaced** bodies,
+    /// collected **before** RBF removal so wallet address tracks can drop zombie unconfs
+    /// even when the old body is gone from the hub.
+    pub replaced_scripthashes: Vec<[u8; 32]>,
 }
 
 /// Why accept failed (policy / graph / durable / consensus script).
@@ -382,6 +386,19 @@ impl ActiveMempool {
             });
         }
 
+        // Snapshot replaced bodies' output scripthashes **before** removal (WS address RBF).
+        let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
+        for c in &conflict_set {
+            if let Some(old_tx) = self.bodies.get(c) {
+                for o in &old_tx.output {
+                    replaced_scripthashes
+                        .push(Self::electrum_scripthash(o.script_pubkey.as_bytes()));
+                }
+            }
+        }
+        replaced_scripthashes.sort_unstable();
+        replaced_scripthashes.dedup();
+
         // Apply RBF removals first.
         for c in conflict_set.iter().rev() {
             // Descendants first not required if we remove all independently.
@@ -431,7 +448,14 @@ impl ActiveMempool {
             weight,
             slot,
             replaced: conflict_set.into_iter().collect(),
+            replaced_scripthashes,
         })
+    }
+
+    /// Electrum scripthash = SHA256(scriptPubKey) (same as store `script_hash`).
+    fn electrum_scripthash(script: &[u8]) -> [u8; 32] {
+        use bitcoin::hashes::{sha256, Hash};
+        *sha256::Hash::hash(script).as_byte_array()
     }
 
     /// Re-try orphans that listed `parent` as missing (recursive via accept_tx).
@@ -998,6 +1022,10 @@ mod tests {
             r.replaced.contains(&low_id),
             "replaced should list conflict {:?}",
             r.replaced
+        );
+        assert!(
+            !r.replaced_scripthashes.is_empty(),
+            "replaced output scripthashes collected before removal"
         );
         assert!(!mp.graph.contains(&low_id));
         assert!(mp.graph.contains(&high_id));

@@ -54,12 +54,14 @@ pub struct RecentAccept {
 /// Broadcast unit for mempool accepts (P2P inv, Electrum status, Esplora WS).
 ///
 /// `replaced` lists conflict txids removed by full-RBF/RBFR when admitting `txid`
-/// (empty when there was no replacement). Subscribers that only care about new
-/// inventory can ignore `replaced`.
+/// (empty when there was no replacement). `replaced_scripthashes` are output
+/// scripthashes of those bodies **before** removal (wallet address-track RBF).
+/// Subscribers that only care about new inventory can ignore both.
 #[derive(Clone, Debug)]
 pub struct MempoolAnnounce {
     pub txid: Txid,
     pub replaced: Vec<Txid>,
+    pub replaced_scripthashes: Vec<[u8; 32]>,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -150,6 +152,7 @@ impl MempoolHub {
         let _ = self.announce.send(MempoolAnnounce {
             txid: r.txid,
             replaced: r.replaced.clone(),
+            replaced_scripthashes: r.replaced_scripthashes.clone(),
         });
     }
 

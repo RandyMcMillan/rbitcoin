@@ -955,6 +955,10 @@ impl BatchParents {
             return;
         }
         self.pins.reserve(other.pins.len());
+        // Carry forward other's unpublished Weak-registration set so a later
+        // publish_to_store still registers Arcs that only lived on `other`.
+        self.publish_ids.reserve(other.publish_ids.len());
+        self.publish_ids.extend(other.publish_ids.iter().copied());
         for (id, src) in other.pins {
             match self.pins.entry(id) {
                 std::collections::hash_map::Entry::Vacant(v) => {
@@ -1311,6 +1315,42 @@ mod tests {
         assert!(b.has_parent_out(Fk(1), 0));
         assert!(b.has_parent_out(Fk(1), 1));
         assert_eq!(store.live_count(), 1);
+    }
+
+    /// extend_from must carry publish_ids so vacant pins from `other` still register.
+    #[test]
+    fn extend_from_merges_publish_ids_for_store_registration() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut a = BatchParents::with_store(Arc::clone(&store), 8);
+        let mut b = BatchParents::with_store(Arc::clone(&store), 8);
+        a.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((8, 16)),
+            vec![(0, 4)],
+        );
+        b.insert_owned(
+            Fk(2),
+            tx(2),
+            vec![(0, out(2))],
+            vec![0],
+            Some(false),
+            Some((24, 16)),
+            vec![(0, 4)],
+        );
+        a.extend_from(b);
+        assert_eq!(a.len(), 2);
+        a.publish_to_store();
+        assert_eq!(
+            store.live_count(),
+            2,
+            "both fks must register: extend_from must merge publish_ids"
+        );
+        assert!(a.contains(Fk(1)));
+        assert!(a.contains(Fk(2)));
     }
 
     /// Adopted pins are already Weak-registered; publish only registers vacant inserts.

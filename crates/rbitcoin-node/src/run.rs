@@ -3,6 +3,7 @@ use crate::error::NodeError;
 use bitcoin::consensus::Encodable;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
+use rbitcoin_esplora::{run_esplora, EsploraConfig};
 use rbitcoin_log::{info, warn};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
@@ -490,6 +491,28 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
+    // Esplora REST (plain HTTP; TLS via reverse proxy). Shares Query; tip-only in v1 skeleton.
+    let mut esplora_handles = Vec::new();
+    if let Some(addr) = config.esplora_listen {
+        if !shutdown.requested() {
+            let q = node.hub.query.clone();
+            let ecfg = EsploraConfig::new(addr);
+            let max_conn = ecfg.limits.max_connections;
+            let max_body = ecfg.limits.max_request_bytes;
+            let idle_secs = ecfg.limits.idle_timeout.as_secs();
+            match run_esplora(ecfg, q).await {
+                Ok(h) => {
+                    info!(
+                        "esplora HTTP on {} (tip routes; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
+                        h.local_addr, max_conn, max_body, idle_secs
+                    );
+                    esplora_handles.push(h);
+                }
+                Err(e) => warn!("esplora HTTP start warning: {e}"),
+            }
+        }
+    }
+
     // Tip-follow loop until max_run (`Some(0)` = exit after catch-up + tip mode)
     // or until a shutdown signal.
     //
@@ -676,6 +699,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = electrum_bridge {
         h.abort();
         let _ = h.await;
+    }
+    for e in esplora_handles {
+        e.shutdown().await;
     }
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
@@ -897,6 +923,27 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p with electrum");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_p2p_with_esplora_listen() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-esp-{nanos}"));
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        cfg.connect.clear();
+        cfg.esplora_listen = Some("127.0.0.1:0".parse().unwrap());
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        result.unwrap().expect("run_p2p with esplora");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

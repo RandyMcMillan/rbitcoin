@@ -24,6 +24,7 @@ where
     let mut smoke = false;
     let mut listen: Option<SocketAddr> = None;
     let mut electrum_listen: Option<SocketAddr> = None;
+    let mut esplora_listen: Option<SocketAddr> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
     let mut seeds_set = false;
@@ -49,7 +50,7 @@ where
                 eprintln!(
                     "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--network NET] \\\n\
-    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n\
+    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
@@ -162,6 +163,21 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                     Ok(a) => electrum_listen = Some(a),
                     Err(e) => {
                         eprintln!("error: bad --electrum-listen: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--esplora-listen" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --esplora-listen requires a value");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<SocketAddr>() {
+                    Ok(a) => esplora_listen = Some(a),
+                    Err(e) => {
+                        eprintln!("error: bad --esplora-listen: {e}");
                         return ExitCode::from(2);
                     }
                 }
@@ -363,6 +379,9 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if let Some(a) = electrum_listen {
         config.electrum_listen = Some(a);
+    }
+    if let Some(a) = esplora_listen {
+        config.esplora_listen = Some(a);
     }
     if !connect.is_empty() {
         config.connect = connect;

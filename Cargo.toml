@@ -11,6 +11,7 @@ members = [
     "crates/rbitcoin-net",
     "crates/rbitcoin-rpc",
     "crates/rbitcoin-electrum",
+    "crates/rbitcoin-esplora",
     "crates/rbitcoin-cli",
     "crates/rbitcoin-node",
     "crates/rbitcoin-test",
@@ -35,6 +36,7 @@ rbitcoin-mempool = { path = "crates/rbitcoin-mempool" }
 rbitcoin-net = { path = "crates/rbitcoin-net" }
 rbitcoin-rpc = { path = "crates/rbitcoin-rpc" }
 rbitcoin-electrum = { path = "crates/rbitcoin-electrum" }
+rbitcoin-esplora = { path = "crates/rbitcoin-esplora" }
 rbitcoin-cli = { path = "crates/rbitcoin-cli" }
 rbitcoin-node = { path = "crates/rbitcoin-node" }
 rbitcoin-test = { path = "crates/rbitcoin-test" }
@@ -42,6 +44,10 @@ rbitcoin-test = { path = "crates/rbitcoin-test" }
 # JSON for Electrum (and tests). No other serde derives in core crates.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Esplora REST (HTTP).
+axum = "0.7"
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.5", features = ["limit", "timeout"] }
 # Sealed segment membership (binary fuse8 ≈9 bits/key, no FN).
 xorf = { version = "0.11", features = ["serde"] }
 bincode = "1.3"

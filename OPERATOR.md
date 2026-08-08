@@ -52,6 +52,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--log-level LEVEL` | | `info` |
 | `--no-seeds` | `--noseeds` | seeds on |
 | `--electrum-listen ADDR` | | disabled |
+| `--esplora-listen ADDR` | | disabled (Esplora REST; plain HTTP) |
 | `--inhibit-suspend` | | off |
 
 Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:

@@ -38,6 +38,8 @@ pub struct NodeConfig {
     /// Electrum TCP listen (`None` = disabled). Plain TCP; terminate TLS at a
     /// reverse proxy when public. App DoS limits apply regardless of bind address.
     pub electrum_listen: Option<SocketAddr>,
+    /// Esplora REST HTTP listen (`None` = disabled). Plain HTTP; TLS via proxy.
+    pub esplora_listen: Option<SocketAddr>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.
     pub milestone_height: u32,
@@ -75,6 +77,7 @@ impl Default for NodeConfig {
             smoke: false,
             max_run_secs: None,
             electrum_listen: None,
+            esplora_listen: None,
             milestone_height: 0,
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,
@@ -183,7 +186,8 @@ impl NodeConfig {
     /// Supported keys: `datadir`, `network` / `chain`, `listen`, `connect` (repeatable),
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
-    /// `archive_queue_mb`, `log_level`, `electrum_listen`, `noseeds` / `no_seeds`.
+    /// `archive_queue_mb`, `log_level`, `electrum_listen`, `esplora_listen`,
+    /// `noseeds` / `no_seeds`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -241,6 +245,12 @@ impl NodeConfig {
                         Some(val.parse().map_err(|e| {
                             NodeError::Config(format!("conf electrum_listen: {e}"))
                         })?);
+                }
+                "esplora_listen" | "esploralisten" => {
+                    self.esplora_listen = Some(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?,
+                    );
                 }
                 "milestone" | "assumevalid_height" | "assumevalidheight" => {
                     self.milestone_height = val
@@ -544,6 +554,7 @@ mod tests {
             "listen=127.0.0.1:18444\n\
              connect=127.0.0.1:18445\n\
              electrum_listen=127.0.0.1:50001\n\
+             esplora_listen=127.0.0.1:3000\n\
              milestone=100\n\
              maxoutbound=8\n\
              maxinbound=32\n\
@@ -561,6 +572,7 @@ mod tests {
         assert!(cfg.p2p_listen.is_some());
         assert_eq!(cfg.connect.len(), 1);
         assert!(cfg.electrum_listen.is_some());
+        assert!(cfg.esplora_listen.is_some());
         assert_eq!(cfg.milestone_height, 100);
         assert_eq!(cfg.max_outbound, 8);
         assert_eq!(cfg.max_inbound, 32);
@@ -575,6 +587,7 @@ mod tests {
         for (body, needle) in [
             ("listen=not-an-addr\n", "listen"),
             ("electrum_listen=bad\n", "electrum"),
+            ("esplora_listen=bad\n", "esplora"),
             ("mempool_size_mb=0\n", "mempool"),
             ("log_level=\n", "log_level"),
             ("network=notanet\n", "network"),

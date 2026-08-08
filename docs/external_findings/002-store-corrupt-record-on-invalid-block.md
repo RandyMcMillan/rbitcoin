@@ -9,6 +9,7 @@ relay. This document covers only the *misclassification*; the peer disconnect it
 [001](./001-disconnect-on-invalid-block.md).
 **Found by:** fuzzamoto (single-node rbitcoin campaign, then the Core-vs-rbitcoin
 differential campaign)
+**Status:** fixed — unresolved archive parent maps to `ConsensusError::MissingPrevout` (not corrupt)
 
 ## Summary
 

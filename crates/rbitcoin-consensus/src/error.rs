@@ -91,10 +91,7 @@ mod tests {
         let e = ConsensusError::from(StoreError::Corrupt(
             "archive: parent create_fk unresolved (contiguous batch required)",
         ));
-        assert!(
-            matches!(e, ConsensusError::MissingPrevout),
-            "got {e:?}"
-        );
+        assert!(matches!(e, ConsensusError::MissingPrevout), "got {e:?}");
         assert!(!e.to_string().contains("corrupt"));
     }
 

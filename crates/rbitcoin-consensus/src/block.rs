@@ -1681,7 +1681,8 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -
 /// BIP68 / CSV version gate: Core compares `nVersion` as **unsigned**
 /// (`uint32_t >= 2`). rust-bitcoin exposes `Version(i32)`; cast explicitly so
 /// `0xFFFFFFFF` enforces locks (not signed `-1 < 2`).
-/// See `docs/external_findings/003-bip68-version-signedness-consensus-split.md`.
+/// See **RB-001** in `docs/rust-bitcoin-limitations.md` and
+/// `docs/external_findings/003-bip68-version-signedness-consensus-split.md`.
 #[inline]
 pub fn bip68_active_for_tx(tx: &Transaction) -> bool {
     (tx.version.0 as u32) >= 2

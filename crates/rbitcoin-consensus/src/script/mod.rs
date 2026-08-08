@@ -206,14 +206,15 @@ pub(crate) mod crypto {
     /// Important: do **not** run the type through [`EcdsaSighashType::from_consensus`]
     /// before legacy `SignatureHash`. That maps `0 → SIGHASH_ALL(1)`, but mainnet
     /// has historical spends signed with hashtype **0** (block 110300 and others).
-    /// Core hashes with the raw byte; we must too.
+    /// Core hashes with the raw byte; we must too. (**RB-002** in
+    /// `docs/rust-bitcoin-limitations.md`.)
     ///
     /// Matches Bitcoin Core:
     /// - Always parse with **lax** DER (`ecdsa_signature_parse_der_lax`). Never prefer
     ///   strict `from_der` first: for some pre-BIP66 encodings (e.g. high-bit S without
     ///   `0x00` pad, mainnet block 140493) libsecp `from_der` returns `Ok` with a
     ///   **wrong** (R,S) while `from_der_lax` recovers the OpenSSL-era values that
-    ///   actually verify.
+    ///   actually verify. (**RB-004**.)
     /// - When `strict_der` (BIP66 / `SCRIPT_VERIFY_DERSIG`), enforce
     ///   [`is_valid_signature_encoding`] on the full push (DER + hashtype) *before*
     ///   the lax parse — same split as Core's `CheckSignatureEncoding` + lax verify.

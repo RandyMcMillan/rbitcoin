@@ -745,7 +745,7 @@ pub(crate) fn eval_script(
                             // disabled bit → NOP (before version gate)
                             continue;
                         }
-                        // Core CheckSequence: tx.nVersion < 2 → fail (unsigned compare).
+                        // Core CheckSequence: tx.nVersion < 2 → fail (unsigned; RB-001).
                         if (ctx.tx.version.0 as u32) < 2 {
                             return Err(ConsensusError::Script("CSV version".into()));
                         }

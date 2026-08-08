@@ -160,6 +160,9 @@ Store tables: fallocate only (no maps). Class C tip flush
 | ECDSA / Schnorr primitives | **secp256k1** via the **rust-bitcoin** dependency stack only |
 | Types / wire at edges | rust-bitcoin |
 
+Consensus workarounds where rust-bitcoin is not Core-faithful: living list
+[`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md).
+
 Workspace Cargo.toml explicitly avoids enabling bitcoin’s `bitcoinconsensus`
 feature. Script verification is a pure function of `(tx, input_index, prevout)`
 after connect resolves prevouts.

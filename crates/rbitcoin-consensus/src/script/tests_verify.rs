@@ -101,6 +101,7 @@ fn p2wpkh_bad_signature_rejects() {
 /// type byte `0x65`. Core hashes the raw `nHashType`; rust-bitcoin's
 /// `p2wpkh_signature_hash` encodes `from_consensus(0x65).to_u32() == 1`, which
 /// fails ECDSA. Fixture is consensus-valid on mainnet (confirmed).
+/// **RB-003** in `docs/rust-bitcoin-limitations.md`.
 ///
 /// Log: `p2wpkh ecdsa txid=969c4f11…d50d vin=0` (2026-07-25 mainnet IBD).
 #[test]

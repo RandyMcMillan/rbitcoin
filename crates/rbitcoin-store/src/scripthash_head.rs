@@ -510,22 +510,22 @@ impl ScriptHashHead {
 
     /// Like [`insert_many`] but **never rehashes**.
     ///
-    /// Applies every in-place **update** it can. When a **new** key cannot be
-    /// placed (no empty slot / load would require grow), that key is pushed to
-    /// the returned **remainder** and the rest of the batch continues in
-    /// **update-only** mode (existing keys still get their new values; further
-    /// new keys join the remainder). Caller routes remainder to overflow.
+    /// `allow_new`: when true, new keys may occupy empty slots until the first
+    /// miss, then the batch continues **update-only**. When false (sealed main
+    /// try-upsert), **only** in-place updates apply — not-present keys always
+    /// go to the returned remainder (even if free slots exist).
     ///
-    /// Empty remainder means the full batch landed on this head.
+    /// Caller routes remainder to overflow. Empty remainder = full batch on this head.
     pub fn insert_many_no_rehash(
         &self,
         upserts: &[(ShHeadKey, ShHeadValue)],
+        allow_new: bool,
     ) -> Result<Vec<(ShHeadKey, ShHeadValue)>, StoreError> {
         if upserts.is_empty() {
             return Ok(Vec::new());
         }
-        // Known-empty + all fit: one sequential fill (no remainder).
-        if self.is_known_empty() {
+        // Known-empty + may place new + all fit: one sequential fill (no remainder).
+        if allow_new && self.is_known_empty() {
             let slots = self.state.lock().unwrap().slots;
             let max_fit = slots
                 .saturating_mul(MAX_LOAD_NUM)
@@ -535,6 +535,10 @@ impl ScriptHashHead {
                 self.bulk_fill_empty(upserts)?;
                 return Ok(Vec::new());
             }
+        }
+        // Update-only on empty table: nothing can match → full remainder.
+        if !allow_new && self.is_known_empty() {
+            return Ok(upserts.to_vec());
         }
 
         let mut work: Vec<(ShHeadKey, ShHeadValue, usize)> = upserts
@@ -548,7 +552,7 @@ impl ScriptHashHead {
 
         let mut remainder: Vec<(ShHeadKey, ShHeadValue)> = Vec::new();
         // After the first new-key placement failure, only in-place updates apply.
-        let mut allow_new = true;
+        let mut allow_new = allow_new;
         let mut i = 0usize;
         while i < work.len() {
             let slots = self.state.lock().unwrap().slots;
@@ -1341,13 +1345,15 @@ impl ShardedScriptHashHead {
         Some(occ as f64 / slots as f64)
     }
 
-    /// Insert without rehash. Returns **remainder** full keys that need overflow
-    /// (new keys that could not be placed). In-place updates always apply; after
-    /// the first new-key miss each shard continues update-only.
+    /// Insert without rehash. Returns **remainder** full keys that need overflow.
+    ///
+    /// `allow_new`: see [`ScriptHashHead::insert_many_no_rehash`]. Sealed main
+    /// try-upsert must pass **false** so free slots are never used for new keys.
     pub fn insert_many_sharded_no_rehash(
         &self,
         entries: &[([u8; 32], ShHeadValue)],
         flush_each_shard: bool,
+        allow_new: bool,
     ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -1359,7 +1365,7 @@ impl ShardedScriptHashHead {
                 .iter()
                 .map(|(k, v)| (head_key_from_full(k), v.clone()))
                 .collect();
-            let rem = self.shards[0].insert_many_no_rehash(&mapped)?;
+            let rem = self.shards[0].insert_many_no_rehash(&mapped, allow_new)?;
             // Map 16 B head keys back to full inputs (prefix match).
             if !rem.is_empty() {
                 for (hk, hv) in rem {
@@ -1390,7 +1396,7 @@ impl ShardedScriptHashHead {
                 .iter()
                 .map(|(k, v)| (head_key_from_full(k), v.clone()))
                 .collect();
-            let rem = self.shards[si].insert_many_no_rehash(&mapped)?;
+            let rem = self.shards[si].insert_many_no_rehash(&mapped, allow_new)?;
             for (hk, hv) in rem {
                 if let Some((full, _)) = bucket.iter().find(|(f, _)| head_key_from_full(f) == hk)
                 {
@@ -1774,7 +1780,7 @@ mod tests {
             ));
             existing.push(full);
         }
-        assert!(h.insert_many_no_rehash(&seed).unwrap().is_empty());
+        assert!(h.insert_many_no_rehash(&seed, true).unwrap().is_empty());
         assert_eq!(h.slots(), 8);
         assert_eq!(h.occupied(), 6);
         // Batch: update first existing key + 6 brand-new keys (more than free slots).
@@ -1792,7 +1798,7 @@ mod tests {
                 ShHeadValue::inline_one(ShEntry::new(Fk(100 + u64::from(i)))),
             ));
         }
-        let rem = h.insert_many_no_rehash(&batch).unwrap();
+        let rem = h.insert_many_no_rehash(&batch, true).unwrap();
         assert!(
             !rem.is_empty(),
             "some new keys must remainder; occupied={} slots={} rem={} batch={}",
@@ -1817,6 +1823,20 @@ mod tests {
         // Update key must not appear in remainder.
         let upd_hk = head_key_from_full(&existing[0]);
         assert!(!rem.iter().any(|(k, _)| k == &upd_hk));
+
+        // Update-only (allow_new=false): free slots must not take brand-new keys.
+        let mut brand = [0u8; 32];
+        brand[0] = 0xfe;
+        brand[1] = 0x99;
+        let only_new = vec![(
+            head_key_from_full(&brand),
+            ShHeadValue::inline_one(ShEntry::new(Fk(555))),
+        )];
+        let rem2 = h.insert_many_no_rehash(&only_new, false).unwrap();
+        assert_eq!(rem2.len(), 1, "update-only must remainder all new keys");
+        assert!(h.get(&brand).unwrap().is_none());
+        assert_eq!(h.slots(), 8);
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
     }

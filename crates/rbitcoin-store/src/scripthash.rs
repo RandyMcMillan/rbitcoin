@@ -926,9 +926,11 @@ impl ScriptHashTable {
 
     /// Route head upserts without get-then-insert:
     /// - **Overflow home** → overflow only
-    /// - **Main home** → try main no-rehash (updates always apply)
-    /// - **Absent** + fuse says not on main → overflow
-    /// - **Absent** otherwise → try main no-rehash; **remainder** → overflow
+    /// - **Main home** → try main (update; sealed uses update-only so no new slots)
+    /// - **Absent** + sealed + fuse says not on main → overflow
+    /// - **Absent** + sealed + no fuse / fuse maybe → try main **update-only**;
+    ///   not-present → remainder → overflow (never allocate free slots on sealed main)
+    /// - **Absent** + unsealed + main accepts → try main with new slots; remainder after full
     ///
     /// One main batch continues update-only after the first new-key miss so
     /// later updates of keys already on main are never skipped.
@@ -959,7 +961,8 @@ impl ScriptHashTable {
                                 continue;
                             }
                         }
-                        // No fuse, or fuse says maybe present: try-upsert (not get-then-insert).
+                        // No fuse, or fuse says maybe present: try-upsert update-only
+                        // (not get-then-insert; free slots must not take new keys).
                         main_try.push((*key, val.clone()));
                     } else if self.main_accepts_new_key() {
                         main_try.push((*key, val.clone()));
@@ -972,10 +975,12 @@ impl ScriptHashTable {
         }
 
         if !main_try.is_empty() {
-            // Remainder = new keys that could not place; updates already applied.
+            // Sealed: never place new keys on main (free slots remain at ~0.8 load).
+            // Unsealed: allow new until first miss, then update-only for rest of batch.
+            let allow_new = !sealed;
             let rem = self
                 .head
-                .insert_many_sharded_no_rehash(&main_try, flush_each)?;
+                .insert_many_sharded_no_rehash(&main_try, flush_each, allow_new)?;
             ovf_u.extend(rem);
         }
         if !ovf_u.is_empty() {
@@ -983,7 +988,7 @@ impl ScriptHashTable {
             let g = self.overflow.lock().unwrap();
             let ovf = g.as_ref().expect("overflow just ensured");
             // Overflow may rehash (grow). Prefer no-rehash then fall back.
-            let rem = ovf.insert_many_sharded_no_rehash(&ovf_u, flush_each)?;
+            let rem = ovf.insert_many_sharded_no_rehash(&ovf_u, flush_each, true)?;
             if !rem.is_empty() {
                 ovf.insert_many_sharded(&rem, flush_each)?;
             }
@@ -2129,6 +2134,51 @@ mod tests {
         assert!(t.main_fuse.lock().unwrap().is_some(), "fuse reloads on open");
         assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sealed + try-upsert path (no fuse / fuse maybe): not-present key must
+    /// **not** take free main slots — remainder → overflow only.
+    #[test]
+    fn sealed_try_upsert_absent_key_overflows_not_main_slot() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        for i in 0..52u32 {
+            let sh = script_hash(&[0xe0, (i & 0xff) as u8, 0x66, 0x77]);
+            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
+        }
+        assert!(t.main_is_sealed());
+        // Free slots remain (~0.8 of 64); drop fuse so Absent is forced through
+        // try-upsert (not fuse-absent short-circuit).
+        *t.main_fuse.lock().unwrap() = None;
+        let _ = std::fs::remove_file(dir.join(MAIN_FUSE_NAME));
+
+        let sh_new = script_hash(&[0xe1, 0x11, 0x22, 0x33]);
+        // Public put: KeyHome::Absent, sealed, no fuse → try main update-only.
+        t.put_create(&rec(sh_new, 42_042, 0)).unwrap();
+
+        assert!(
+            t.head.get(&sh_new).unwrap().is_none(),
+            "sealed try-upsert must not allocate free main slots for absent keys"
+        );
+        assert!(
+            dir.join(OVERFLOW_HEAD_NAME).exists(),
+            "overflow head required for sealed remainder"
+        );
+        {
+            let g = t.overflow.lock().unwrap();
+            let ovf = g.as_ref().expect("overflow open");
+            assert!(
+                ovf.get(&sh_new).unwrap().is_some(),
+                "absent sealed key must live on overflow"
+            );
+        }
+        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
+        assert!(t.contains_create(&sh_new, Fk(42_042)).unwrap());
+        // for_each must not double-count (no dual-home).
+        let mut n = 0u64;
+        t.for_each_live_create(|_| n += 1).unwrap();
+        assert_eq!(n, 53, "52 main + 1 overflow only");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

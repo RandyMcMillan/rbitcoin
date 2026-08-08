@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     /// Schema 13 with empty SH is layout-compatible: open succeeds and meta
-    /// is rewritten to 14.
+    /// is rewritten to 14. Also stamps empty SHAL alloc v1 → v2 (real 13 body).
     #[test]
     fn open_schema13_empty_scripthash_upgrades_meta_to_14() {
         let dir = tmp();
@@ -1336,6 +1336,25 @@ mod tests {
             let s = Store::create(&dir).unwrap();
             assert!(!s.scripthash.has_durable_index());
             s.flush().unwrap();
+        }
+        // Real schema-13 stores have SHAL alloc v1 on scripthash.body.
+        {
+            use crate::file::{TableFile, FILE_HEADER_LEN};
+            use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
+            use rbitcoin_primitives::TableKind;
+            let body_path = dir.join("scripthash.body");
+            let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
+            let mut hdr = [0u8; 24];
+            body.read_at(FILE_HEADER_LEN as u64, &mut hdr).unwrap();
+            hdr[4..6].copy_from_slice(&1u16.to_le_bytes());
+            let mut page = vec![0u8; SH_ALLOC_HEADER_LEN];
+            page[..24].copy_from_slice(&hdr);
+            // Preserve freelist zeros already in file for rest of page.
+            body.read_at(FILE_HEADER_LEN as u64, &mut page).unwrap();
+            page[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
+            page[4..6].copy_from_slice(&1u16.to_le_bytes());
+            body.write_at(FILE_HEADER_LEN as u64, &page).unwrap();
+            body.flush().unwrap();
         }
         write_store_meta_ver(&dir, 13);
         assert_eq!(read_store_meta_ver(&dir), 13);

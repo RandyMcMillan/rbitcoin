@@ -312,12 +312,12 @@ impl ScriptHashTable {
         body: TableFile,
         head: ShardedScriptHashHead,
     ) -> Result<Self, StoreError> {
-        let state = read_alloc_header(&body)?;
+        let (state, alloc_ver) = read_alloc_header(&body)?;
         let sealed = dir.join(MAIN_SEALED_NAME).is_file();
         // Opens segmented `scripthash.ovf/`; wipes legacy full-size ovf.head.
         let overflow = ShOverflowStack::open(dir)?;
         let fuse = load_main_fuse(dir);
-        Ok(Self {
+        let table = Self {
             store_dir: dir.to_path_buf(),
             body,
             head,
@@ -325,7 +325,20 @@ impl ScriptHashTable {
             main_sealed: std::sync::atomic::AtomicBool::new(sealed),
             main_fuse: Mutex::new(fuse),
             alloc: Mutex::new(state),
-        })
+        };
+        // Alloc v1 = schema-13 geometric slabs; v2 = schema-14 page chains.
+        // Header field layout is the same; only empty v1 can upgrade silently.
+        if alloc_ver == 1 {
+            if table.has_durable_index() {
+                return Err(StoreError::Corrupt(
+                    "scripthash alloc v1 (schema-13 slab body); wipe store/scripthash* and rematerialize for schema 14",
+                ));
+            }
+            // Empty SH: rewrite header to current alloc version (silent 13→14 body stamp).
+            let g = table.alloc.lock().unwrap();
+            write_alloc_header(&table.body, &g)?;
+        }
+        Ok(table)
     }
 
     fn main_accepts_new_key(&self) -> bool {
@@ -1760,7 +1773,11 @@ fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreE
     body.write_at(FILE_HEADER_LEN as u64, &buf)
 }
 
-fn read_alloc_header(body: &TableFile) -> Result<AllocState, StoreError> {
+/// Read SHAL alloc page. Returns `(state, on_disk_version)`.
+///
+/// **v1** (schema-13 slabs) and **v2** (schema-14 page chains) share the same
+/// header field layout. Callers upgrade empty v1 → v2 or refuse durable v1.
+fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> {
     let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
     let avail = body
         .logical_len()
@@ -1778,7 +1795,8 @@ fn read_alloc_header(body: &TableFile) -> Result<AllocState, StoreError> {
         ));
     }
     let ver = u16::from_le_bytes([buf[4], buf[5]]);
-    if ver != SH_ALLOC_VERSION {
+    // v1 = geometric slabs (schema 13); v2 = page chains (schema 14). Same fields.
+    if ver != 1 && ver != SH_ALLOC_VERSION {
         return Err(StoreError::Corrupt("unsupported scripthash alloc version"));
     }
     let live_count = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -1792,11 +1810,27 @@ fn read_alloc_header(body: &TableFile) -> Result<AllocState, StoreError> {
         *h = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;
     }
-    Ok(AllocState {
-        live_count,
-        bump,
-        free_head,
-    })
+    Ok((
+        AllocState {
+            live_count,
+            bump,
+            free_head,
+        },
+        ver,
+    ))
+}
+
+/// On-disk SHAL version field (after RBT1 file header).
+#[cfg(test)]
+fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
+    let mut buf = [0u8; 6];
+    body.read_at(FILE_HEADER_LEN as u64, &mut buf)?;
+    if buf[0..4] != SH_ALLOC_MAGIC {
+        return Err(StoreError::Corrupt(
+            "scripthash body not hybrid (no SHAL magic)",
+        ));
+    }
+    Ok(u16::from_le_bytes([buf[4], buf[5]]))
 }
 
 #[cfg(test)]
@@ -2465,6 +2499,95 @@ mod tests {
         let mut n = 0u64;
         t.for_each_live_create(|_| n += 1).unwrap();
         assert_eq!(n, u64::from(n_main) + u64::from(n_force) + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty SHAL v1 (schema-13 body) opens and is rewritten to alloc v2.
+    #[test]
+    fn open_empty_alloc_v1_upgrades_to_v2() {
+        let dir = tmp();
+        {
+            let t = ScriptHashTable::create(&dir).unwrap();
+            assert!(!t.has_durable_index());
+            t.flush().unwrap();
+        }
+        // Downgrade only the version field (layout is identical).
+        let body_path = dir.join("scripthash.body");
+        let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
+        let (state, ver) = read_alloc_header(&body).unwrap();
+        assert_eq!(ver, SH_ALLOC_VERSION);
+        // Write v1 stamp with same empty state.
+        let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
+        buf[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[8..16].copy_from_slice(&state.live_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&state.bump.to_le_bytes());
+        body.write_at(FILE_HEADER_LEN as u64, &buf).unwrap();
+        body.flush().unwrap();
+        drop(body);
+        assert_eq!(
+            read_alloc_version_on_disk(
+                &TableFile::open(&body_path, TableKind::ScriptHash).unwrap()
+            )
+            .unwrap(),
+            1
+        );
+
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert!(!t.has_durable_index());
+        drop(t);
+        assert_eq!(
+            read_alloc_version_on_disk(
+                &TableFile::open(&body_path, TableKind::ScriptHash).unwrap()
+            )
+            .unwrap(),
+            SH_ALLOC_VERSION,
+            "empty v1 must be rewritten to current alloc version"
+        );
+        // Reopen stays v2.
+        let t = ScriptHashTable::open(&dir).unwrap();
+        t.put_create(&rec(script_hash(&[0x42]), 1, 0)).unwrap();
+        assert_eq!(t.entries(&script_hash(&[0x42])).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Durable SH with alloc v1 is refused (slab body incompatible with page chains).
+    #[test]
+    fn open_durable_alloc_v1_refused() {
+        let dir = tmp();
+        {
+            let t = ScriptHashTable::create(&dir).unwrap();
+            t.put_create(&rec(script_hash(&[0x99]), 7, 0)).unwrap();
+            assert!(t.has_durable_index());
+            t.flush().unwrap();
+        }
+        let body_path = dir.join("scripthash.body");
+        let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
+        let (state, _) = read_alloc_header(&body).unwrap();
+        let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
+        buf[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[8..16].copy_from_slice(&state.live_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&state.bump.to_le_bytes());
+        let mut off = 24usize;
+        for h in &state.free_head {
+            buf[off..off + 8].copy_from_slice(&h.to_le_bytes());
+            off += 8;
+        }
+        body.write_at(FILE_HEADER_LEN as u64, &buf).unwrap();
+        body.flush().unwrap();
+        drop(body);
+
+        match ScriptHashTable::open(&dir) {
+            Ok(_) => panic!("expected refuse for durable alloc v1"),
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("alloc v1") || m.contains("slab") || m.contains("rematerialize"),
+                    "{m}"
+                );
+            }
+            Err(e) => panic!("expected Corrupt, got {e}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

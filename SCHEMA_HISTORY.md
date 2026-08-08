@@ -40,8 +40,9 @@ See [`SCHEMA.md`](./SCHEMA.md).
 - Cold bulk materialize writes paged layout only (same put routing spirit as tip).
 - **Open path:** schema **13** stores with **no materialized scripthash head** open
   on this binary and **silently rewrite** store `meta` to 14 (Class A layout matches).
-  A schema-13 store that already has a durable SH index is **refused** — wipe
-  `store/scripthash*` (or full datadir) and rematerialize; no dual-read of slab values.
+  Empty SH body with **SHAL alloc v1** is rewritten to **alloc v2** (page-chain era).
+  A schema-13 store that already has a durable SH index (or non-empty alloc v1) is
+  **refused** — wipe `store/scripthash*` (or full datadir) and rematerialize; no dual-read of slab values.
 - Interim full-size single-file `scripthash.ovf.head` (if any) is **wiped on open**;
   segmented `scripthash.ovf/` is the only live overflow layout (schema still **14**).
 

@@ -1069,7 +1069,7 @@ fn stamp_parent_pin_archived(
     // Any create_fk without range and without offline denserels outs: idx body_range.
     // Includes same-batch already-archived creates (plan=None has no CreatePin offline).
     let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = U64Set::default();
     for (&id, _) in &stamp.txids {
         if stamp.ranges.contains_key(&id) {
             continue;

@@ -35,13 +35,12 @@ use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 // Re-export store identity maps for confirm/query call sites (single source in store).
-pub use rbitcoin_store::{FkMap, U32Map, U64IdentityHasher, U64Map, U64Set};
+pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -1023,7 +1022,7 @@ fn merge_spender_rels_into(dst: &mut Vec<(u32, u32)>, src: &[(u32, u32)]) {
         *dst = src.to_vec();
         return;
     }
-    let mut m: HashMap<u32, u32> = dst.iter().copied().collect();
+    let mut m: U32Map<u32> = dst.iter().copied().collect();
     for &(v, r) in src {
         m.insert(v, r);
     }

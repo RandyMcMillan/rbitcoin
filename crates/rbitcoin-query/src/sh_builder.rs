@@ -271,7 +271,7 @@ pub fn sh_catalog_total_records(runs_dir: &Path) -> u64 {
     }
     n
 }
-use std::collections::HashSet;
+use crate::U64Set;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1146,7 +1146,7 @@ impl ShRunBuilder {
         let t0 = Instant::now();
         let mut cur_key: Option<[u8; 32]> = None;
         let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
-        let mut long_seen: Option<HashSet<u64>> = None;
+        let mut long_seen: Option<U64Set> = None;
         let mut unique_in = 0u64;
         let mut last_log: Option<Instant> = None;
         let mut max_fk_seen = 0u64;
@@ -1216,7 +1216,8 @@ impl ShRunBuilder {
                 if let Some(ref mut set) = long_seen {
                     set.insert(tx_fk.0);
                 } else if chain.len() >= CHAIN_SET_THRESHOLD {
-                    let mut set = HashSet::with_capacity(chain.len() * 2);
+                    let mut set =
+                        U64Set::with_capacity_and_hasher(chain.len() * 2, Default::default());
                     for e in &chain {
                         set.insert(e.create_tx_fk.0);
                     }

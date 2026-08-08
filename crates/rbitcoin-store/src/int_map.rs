@@ -46,6 +46,9 @@ pub type U32Map<V> = HashMap<u32, V, BuildHasherDefault<U64IdentityHasher>>;
 /// `HashMap` with [`U64IdentityHasher`] for [`Fk`] keys (single-field u64).
 pub type FkMap<V> = HashMap<Fk, V, BuildHasherDefault<U64IdentityHasher>>;
 
+/// `HashSet` with [`U64IdentityHasher`] for [`Fk`] keys.
+pub type FkSet = HashSet<Fk, BuildHasherDefault<U64IdentityHasher>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +82,10 @@ mod tests {
         let mut fm: FkMap<u8> = FkMap::default();
         fm.insert(Fk(42), 7);
         assert_eq!(fm.get(&Fk(42)).copied(), Some(7));
+
+        let mut fs: FkSet = FkSet::default();
+        assert!(fs.insert(Fk(1)));
+        assert!(!fs.insert(Fk(1)));
+        assert!(fs.contains(&Fk(1)));
     }
 }

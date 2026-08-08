@@ -290,7 +290,7 @@ impl Query {
         let mut header_fks = Vec::with_capacity(items.len());
         let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
         // First occurrence wins inside one plan batch (duplicate peer deliveries).
-        let mut seen_headers = std::collections::HashSet::new();
+        let mut seen_headers = crate::FkSet::default();
         for (fk, _header, txs) in items.iter_mut() {
             header_fks.push(*fk);
             if !seen_headers.insert(*fk) {
@@ -323,7 +323,7 @@ impl Query {
     ) -> Result<(Vec<Fk>, Vec<(Fk, Vec<TxApply>)>), QueryError> {
         let mut header_fks = Vec::with_capacity(items.len());
         let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
-        let mut seen_headers = std::collections::HashSet::new();
+        let mut seen_headers = crate::FkSet::default();
         for (fk, _header, txs) in items.iter_mut() {
             header_fks.push(*fk);
             if !seen_headers.insert(*fk) {

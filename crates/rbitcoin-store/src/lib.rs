@@ -64,7 +64,7 @@ pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::HeaderRecord;
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
-pub use int_map::{FkMap, U32Map, U64IdentityHasher, U64Map, U64Set};
+pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use io_backend::{
     class_a_append_uses_pwrite, class_c_io_backend, head_resolve_io_backend, pin_io_backend,
     spend_ann_io_backend, spend_meta_io_backend, ReadIoBackend, WriteIoBackend,

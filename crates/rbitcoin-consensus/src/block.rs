@@ -1531,8 +1531,8 @@ pub(crate) fn structural_validate_spends(
             let tx_spends = &spends[si..si + n_in];
             si += n_in;
 
-            // v1: relative locks inactive — no height map / MTP / lock check.
-            if tx.version.0 < 2 {
+            // version < 2 (unsigned): relative locks inactive.
+            if !bip68_active_for_tx(tx) {
                 continue;
             }
 
@@ -1678,7 +1678,16 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -
     tx.input.iter().all(|i| i.sequence.is_final())
 }
 
-/// BIP68 relative locks when `tx.version >= 2`.
+/// BIP68 / CSV version gate: Core compares `nVersion` as **unsigned**
+/// (`uint32_t >= 2`). rust-bitcoin exposes `Version(i32)`; cast explicitly so
+/// `0xFFFFFFFF` enforces locks (not signed `-1 < 2`).
+/// See `docs/external_findings/003-bip68-version-signedness-consensus-split.md`.
+#[inline]
+pub fn bip68_active_for_tx(tx: &Transaction) -> bool {
+    (tx.version.0 as u32) >= 2
+}
+
+/// BIP68 relative locks when `tx.version` as u32 ≥ 2.
 ///
 /// `prev_heights[i]` / `prev_mtps[i]`: create height and MTP of the block *before*
 /// the creating block (for time-based locks; use 0 when create height is 0).
@@ -1690,7 +1699,7 @@ pub fn sequence_locks_satisfied(
     block_height: u32,
     block_prev_mtp: u32,
 ) -> bool {
-    if tx.version.0 < 2 {
+    if !bip68_active_for_tx(tx) {
         return true;
     }
     const DISABLE: u32 = 1 << 31;
@@ -2162,6 +2171,18 @@ mod finality_tests {
     fn bip68_disabled_by_version_1() {
         let tx = bare_tx(1, LockTime::ZERO, Sequence::from_consensus(10));
         assert!(sequence_locks_satisfied(&tx, &[100], &[0], 50, 0));
+    }
+
+    /// Core treats nVersion as unsigned: 0xFFFFFFFF ≥ 2 → BIP68 enforced
+    /// (`docs/external_findings/003-bip68-version-signedness-consensus-split.md`).
+    #[test]
+    fn bip68_enforced_when_version_high_bit_set() {
+        // rust-bitcoin Version(i32): -1 is wire 0xFFFFFFFF.
+        let tx = bare_tx(-1, LockTime::ZERO, Sequence::from_consensus(10));
+        assert!(super::bip68_active_for_tx(&tx));
+        // Same relative height lock as bip68_height_relative_lock — must fail at h=109.
+        assert!(!sequence_locks_satisfied(&tx, &[100], &[0], 109, 0));
+        assert!(sequence_locks_satisfied(&tx, &[100], &[0], 110, 0));
     }
 
     #[test]

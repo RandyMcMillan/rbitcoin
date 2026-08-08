@@ -6,7 +6,7 @@
 the other rejects what Core accepts)
 **Found by:** source audit while fixing [003](./003-bip68-version-signedness-consensus-split.md),
 prompted by "check where the tx version is used"
-**Status:** identified by code inspection and by Bitcoin Core's own vendored script vectors;
+**Status:** fixed — CSV fails below v2 after disable-flag; CLTV/CSV scriptnum width 5; allowlist 128/129 removed
 not independently reproduced by a fuzz testcase
 
 ## A. OP_CSV is a no-op below version 2; in Core it fails

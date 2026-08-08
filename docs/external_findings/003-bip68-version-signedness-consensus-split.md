@@ -6,7 +6,7 @@
 invalid.
 **Found by:** fuzzamoto differential campaign (Bitcoin Core primary vs rbitcoin reference,
 `oracle_consensus`)
-**Status:** reproduced deterministically (3/3), root cause identified in source
+**Status:** fixed — BIP68 version gate uses unsigned compare (`bip68_active_for_tx`)
 
 ## Summary
 

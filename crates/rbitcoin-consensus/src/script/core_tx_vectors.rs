@@ -600,16 +600,7 @@ const TX_ALLOWLIST: &[(&str, usize, &str)] = &[
         39,
         "BADTX structural checks not in script verify path",
     ),
-    (
-        "tx_invalid.json",
-        128,
-        "CSV relative locktime edge not fully enforced",
-    ),
-    (
-        "tx_invalid.json",
-        129,
-        "CSV relative locktime edge not fully enforced",
-    ),
+    // 128/129: CSV relative edges — enforced after 003/004 (unsigned version + CSV).
     (
         "tx_invalid.json",
         131,

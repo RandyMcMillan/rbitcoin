@@ -710,7 +710,8 @@ pub(crate) fn eval_script(
                             continue;
                         }
                         require_n(stack, 1)?;
-                        let locktime = scriptnum_decode(stack.last().unwrap())?;
+                        // Core: CScriptNum(..., fRequireMinimal, 5) for locktime.
+                        let locktime = scriptnum_decode_width(stack.last().unwrap(), 5)?;
                         if locktime < 0 {
                             return Err(ConsensusError::Script("CLTV negative".into()));
                         }
@@ -730,18 +731,23 @@ pub(crate) fn eval_script(
                     }
                     0xb2 => {
                         // OP_CHECKSEQUENCEVERIFY (BIP112). Pre-activation: NOP.
-                        // Core: also a no-op when tx.nVersion < 2 (even if softfork active).
-                        if !ctx.bip112_active || ctx.tx.version.0 < 2 {
+                        // Core order: decode (5-byte) → disable-flag NOP → version < 2 fails
+                        // (not NOP). See docs/external_findings/004-csv-nop-and-scriptnum-width.md.
+                        if !ctx.bip112_active {
                             continue;
                         }
                         require_n(stack, 1)?;
-                        let csv = scriptnum_decode(stack.last().unwrap())?;
+                        let csv = scriptnum_decode_width(stack.last().unwrap(), 5)?;
                         if csv < 0 {
                             return Err(ConsensusError::Script("CSV negative".into()));
                         }
                         if csv as u32 & (1 << 31) != 0 {
-                            // disabled bit → NOP
+                            // disabled bit → NOP (before version gate)
                             continue;
+                        }
+                        // Core CheckSequence: tx.nVersion < 2 → fail (unsigned compare).
+                        if (ctx.tx.version.0 as u32) < 2 {
+                            return Err(ConsensusError::Script("CSV version".into()));
                         }
                         let seq = ctx.tx.input[ctx.input_index].sequence;
                         if !sequence_csv_ok(seq, csv as u32) {
@@ -1313,8 +1319,16 @@ fn scriptnum_encode(mut n: i64) -> Vec<u8> {
     out
 }
 
+/// Decode a script number with Core's general 4-byte limit (arithmetic).
 fn scriptnum_decode(v: &[u8]) -> Result<i64, ConsensusError> {
-    if v.len() > 4 {
+    scriptnum_decode_width(v, 4)
+}
+
+/// Decode a script number with explicit max byte length.
+/// CLTV/CSV use `max_len = 5` so full u32 locktime/sequence ranges encode as
+/// positive script numbers (Core `CScriptNum(..., 5)`).
+fn scriptnum_decode_width(v: &[u8], max_len: usize) -> Result<i64, ConsensusError> {
+    if v.len() > max_len {
         return Err(ConsensusError::Script("scriptnum overflow".into()));
     }
     if v.is_empty() {
@@ -1682,10 +1696,11 @@ mod success_and_disabled_tests {
         eval(&script_ok, SigVersion::WitnessV0).expect("0-of-0 empty dummy");
     }
 
-    /// BIP112: OP_CSV is a no-op when tx.nVersion < 2 (even if softfork active).
+    /// BIP112: OP_CSV fails when tx.nVersion < 2 (unsigned), matching Core.
+    /// (`docs/external_findings/004-csv-nop-and-scriptnum-width.md`).
     #[test]
-    fn csv_nop_when_tx_version_below_2() {
-        // Script: push 1, CSV, DROP, OP_TRUE — fails on v2 with seq=0, succeeds as NOP on v1.
+    fn csv_fails_when_tx_version_below_2() {
+        // Script: push 1, CSV, DROP, OP_TRUE — v1 must fail CSV version gate.
         let script_bytes = [0x51u8, 0xb2, 0x75, 0x51]; // 1 CSV DROP TRUE
         let script = Script::from_bytes(&script_bytes);
         let prevouts = vec![TxOut {
@@ -1706,7 +1721,7 @@ mod success_and_disabled_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        // v1: CSV is NOP → script ends with TRUE
+        // v1: Core fails (not NOP) when BIP112 active and disable bit clear.
         let tx1 = mk(1);
         let ctx1 = EvalContext::new_with_flags(
             &tx1,
@@ -1720,8 +1735,11 @@ mod success_and_disabled_tests {
             true,
         );
         let mut stack1 = Vec::new();
-        assert!(eval_script(script, &mut stack1, &ctx1).unwrap());
-        require_true_top(&stack1).expect("v1 CSV nop leaves TRUE");
+        let err = eval_script(script, &mut stack1, &ctx1).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::Script(ref s) if s.contains("CSV")),
+            "v1 must fail CSV version gate, got {err:?}"
+        );
 
         // v2: CSV enforces → fails with seq=0 vs csv=1
         let tx2 = mk(2);

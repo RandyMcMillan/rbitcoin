@@ -94,7 +94,7 @@ pub mod script_bench {
 pub use block::ScriptCheckJob;
 
 pub use block::{
-    bip34_height_script, block_subsidy, is_final_tx, sequence_locks_satisfied,
+    bip34_height_script, bip68_active_for_tx, block_subsidy, is_final_tx, sequence_locks_satisfied,
     validate_block_connect, validate_block_structure, validate_block_structure_hashed,
     ValidationContext, LOCKTIME_THRESHOLD,
 };

@@ -417,6 +417,14 @@ struct CoreFlags {
     discourage_upgradable_nops: bool,
     /// Core `SCRIPT_VERIFY_MINIMALDATA`.
     minimal_data: bool,
+    /// Core `SCRIPT_VERIFY_NULLFAIL`.
+    nullfail: bool,
+    /// Core `SCRIPT_VERIFY_LOW_S`.
+    low_s: bool,
+    /// Core `SCRIPT_VERIFY_STRICTENC` (DER + hashtype + pubkey type).
+    strictenc: bool,
+    /// Core `SCRIPT_VERIFY_NULLDUMMY` (BIP147).
+    null_dummy: bool,
     /// Other named flags we do not yet implement (for allowlist diagnostics).
     extra: Vec<String>,
 }
@@ -435,14 +443,18 @@ fn parse_flags(s: &str) -> CoreFlags {
             "P2SH" => f.p2sh = true,
             "DERSIG" => f.dersig = true,
             "STRICTENC" => {
-                f.dersig = true; // STRICTENC implies DER + pubkey type checks
-                f.extra.push("STRICTENC".into());
+                // STRICTENC implies IsValidSignatureEncoding + hashtype + pubkey type.
+                f.dersig = true;
+                f.strictenc = true;
             }
             "MINIMALDATA" => f.minimal_data = true,
-            "LOW_S"
-            | "NULLFAIL"
-            | "NULLDUMMY"
-            | "SIGPUSHONLY"
+            "LOW_S" => {
+                f.low_s = true;
+                f.dersig = true; // Core CheckSignatureEncoding: LOW_S requires DER
+            }
+            "NULLFAIL" => f.nullfail = true,
+            "NULLDUMMY" => f.null_dummy = true,
+            "SIGPUSHONLY"
             | "MINIMALIF"
             | "WITNESS_PUBKEYTYPE"
             | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
@@ -464,6 +476,19 @@ fn parse_flags(s: &str) -> CoreFlags {
         }
     }
     f
+}
+
+/// Apply Core standardness/script flags onto an [`EvalContext`].
+fn apply_eval_flags(ctx: &mut EvalContext<'_>, flags: &CoreFlags) {
+    ctx.minimal_data = flags.minimal_data;
+    ctx.nullfail = flags.nullfail;
+    ctx.low_s = flags.low_s;
+    ctx.strictenc = flags.strictenc;
+    ctx.null_dummy = flags.null_dummy;
+    // STRICTENC/LOW_S also force DER encoding checks via bip66_active in checksig.
+    if flags.dersig || flags.strictenc || flags.low_s {
+        ctx.bip66_active = true;
+    }
 }
 
 // ── Credit / spend template (matches Core script_tests.cpp) ─────────────────
@@ -680,9 +705,9 @@ fn eval_bare_pair(
             SigVersion::Base,
             flags.cltv,
             flags.csv,
-            flags.dersig,
+            flags.dersig || flags.strictenc || flags.low_s,
         );
-        ctx.minimal_data = flags.minimal_data;
+        apply_eval_flags(&mut ctx, flags);
         let _ = interpreter::eval_script(ss, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
     }
     let spk = Script::from_bytes(script_pubkey);
@@ -695,9 +720,9 @@ fn eval_bare_pair(
         SigVersion::Base,
         flags.cltv,
         flags.csv,
-        flags.dersig,
+        flags.dersig || flags.strictenc || flags.low_s,
     );
-    ctx.minimal_data = flags.minimal_data;
+    apply_eval_flags(&mut ctx, flags);
     let need = interpreter::eval_script(spk, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
     if !need {
         return Ok(()); // OP_SUCCESS-like
@@ -723,9 +748,9 @@ fn eval_bare_pair(
             SigVersion::Base,
             flags.cltv,
             flags.csv,
-            flags.dersig,
+            flags.dersig || flags.strictenc || flags.low_s,
         );
-        ctx_r.minimal_data = flags.minimal_data;
+        apply_eval_flags(&mut ctx_r, flags);
         let need_r = interpreter::eval_script(redeem_script, &mut stack, &ctx_r)
             .map_err(|e| format!("P2SH redeem: {e}"))?;
         if !need_r {
@@ -757,17 +782,6 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (458, "P2SH redeem with OP_1 minimal push parse edge"),
     (459, "P2SH redeem with OP_PUSHDATA1 empty then OP_1 parse edge"),
     (830, "OP_COUNT in unexecuted branch: long NOP run boundary"),
-    (1004, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
-    (1005, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_DER)"),
-    (1006, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1010, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1011, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1012, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1013, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1014, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1015, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1016, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1017, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
     (1023, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_UNEXPECTED)"),
     (1024, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
     (1025, "witness malleation/unexpected flags not fully enforced (flags=P2SH,WITNESS expect=WITNESS_MALLEATED)"),
@@ -776,23 +790,8 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (1035, "P2SH-P2PK wrong redeem: expect EVAL_FALSE, soft-ok path"),
     (1036, "P2SH-P2PKH redeem parse of legacy scriptPubKey redeem body"),
     (1041, "P2SH multisig redeem via PUSHDATA1 body parse"),
-    (1050, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1052, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1056, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1063, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
-    (1067, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1071, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1075, "DERSIG hard-fail vs soft-false gap on invalid DER (flags=DERSIG expect=SIG_DER)"),
-    (1083, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=LOW_S expect=SIG_HIGH_S)"),
-    (1085, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
-    (1091, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=PUBKEYTYPE)"),
     // Revealed when assembler used OP_1..OP_16: prior soft EVAL_FALSE masked Ok vs named code.
-    (1094, "STRICTENC hybrid pubkey type not enforced (flags=STRICTENC expect=PUBKEYTYPE)"),
-    (1096, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
-    (1098, "STRICTENC/LOW_S pubkey/sighashtype checks incomplete (flags=STRICTENC expect=SIG_HASHTYPE)"),
-    (1100, "NULLDUMMY not enforced (flags=NULLDUMMY expect=SIG_NULLDUMMY)"),
     (1104, "SIGPUSHONLY not enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
-    (1102, "NULLDUMMY (BIP147) not fully enforced on all paths (flags=NULLDUMMY expect=SIG_NULLDUMMY)"),
     (1108, "SIGPUSHONLY is policy-adjacent; not fully enforced (flags=SIGPUSHONLY expect=SIG_PUSHONLY)"),
     (1112, "P2SH-P2PK redeem with OP_1 prefix stack item parse"),
     (1114, "P2SH-P2PK + CLEANSTACK redeem parse"),
@@ -825,9 +824,6 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (1275, "tapscript witness non-hex stack element"),
     (1276, "tapscript witness #SCRIPT# token not assembled"),
     (1277, "tapscript witness #SCRIPT# token not assembled"),
-    (1282, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL,NULLDUMMY expect=SIG_NULLDUMMY)"),
-    (1284, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
-    (1286, "NULLFAIL not fully enforced (flags=DERSIG,NULLFAIL expect=NULLFAIL)"),
 ];
 
 /// Map our error / Ok to whether it matches Core's expected result code.

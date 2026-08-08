@@ -296,6 +296,37 @@ pub(crate) mod crypto {
         PublicKey::from_slice(raw).map_err(|_| ConsensusError::Script("pubkey".into()))
     }
 
+    /// Core `IsLowDERSignature` S half: true when S ≤ n/2 (already low).
+    ///
+    /// Compares compact form before/after libsecp `normalize_s` (this crate's
+    /// `normalize_s` returns `()`, not a bool).
+    pub fn is_low_der_s(sig: &ecdsa::Signature) -> bool {
+        let before = sig.serialize_compact();
+        let mut n = *sig;
+        n.normalize_s();
+        before == n.serialize_compact()
+    }
+
+    /// Core `IsDefinedHashtypeSignature`: base type in {ALL,NONE,SINGLE}, optional ACP.
+    pub fn is_defined_hashtype(sig_raw: &[u8]) -> bool {
+        if sig_raw.is_empty() {
+            return false;
+        }
+        let ht = sig_raw[sig_raw.len() - 1];
+        let base = ht & !0x80; // strip SIGHASH_ANYONECANPAY
+        (1..=3).contains(&base) // ALL=1 NONE=2 SINGLE=3
+    }
+
+    /// Core `IsCompressedOrUncompressedPubKey` (STRICTENC): 02/03+32 or 04+64.
+    /// Hybrid 06/07 keys are rejected.
+    pub fn is_compressed_or_uncompressed_pubkey(pk: &[u8]) -> bool {
+        match pk.first() {
+            Some(0x02 | 0x03) if pk.len() == 33 => true,
+            Some(0x04) if pk.len() == 65 => true,
+            _ => false,
+        }
+    }
+
     /// BIP143 signature hash with **raw** `nHashType` (last byte of the sig push).
     ///
     /// `script_code` is the BIP143 scriptCode (for P2WPKH: the
@@ -482,6 +513,29 @@ pub(crate) mod crypto {
             // Minimal valid-shaped DER + SIGHASH_ALL
             // 30 06 02 01 01 02 01 01 01
             vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]
+        }
+
+        #[test]
+        fn strictenc_pubkey_and_hashtype_helpers() {
+            // Compressed / uncompressed only — hybrid 06/07 rejected.
+            assert!(is_compressed_or_uncompressed_pubkey(&[0x02; 33]));
+            assert!(is_compressed_or_uncompressed_pubkey(&[0x03; 33]));
+            let mut uncomp = vec![0x04];
+            uncomp.extend_from_slice(&[0x11; 64]);
+            assert!(is_compressed_or_uncompressed_pubkey(&uncomp));
+            let mut hybrid = vec![0x06];
+            hybrid.extend_from_slice(&[0x11; 64]);
+            assert!(!is_compressed_or_uncompressed_pubkey(&hybrid));
+            assert!(!is_compressed_or_uncompressed_pubkey(&[]));
+            assert!(!is_compressed_or_uncompressed_pubkey(&[0x02; 32]));
+
+            assert!(is_defined_hashtype(&[0x30, 0x01])); // ALL
+            assert!(is_defined_hashtype(&[0x30, 0x02])); // NONE
+            assert!(is_defined_hashtype(&[0x30, 0x03])); // SINGLE
+            assert!(is_defined_hashtype(&[0x30, 0x81])); // ALL|ACP
+            assert!(!is_defined_hashtype(&[0x30, 0x00]));
+            assert!(!is_defined_hashtype(&[0x30, 0x04]));
+            assert!(!is_defined_hashtype(&[]));
         }
 
         #[test]

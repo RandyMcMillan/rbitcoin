@@ -137,11 +137,19 @@ pub(crate) struct EvalContext<'a> {
     pub bip65_active: bool,
     /// When false, OP_CSV (0xb2) is a no-op (pre-BIP112).
     pub bip112_active: bool,
-    /// When true, ECDSA signatures must be strict DER (BIP66).
+    /// When true, ECDSA signatures must be strict DER (BIP66 / SCRIPT_VERIFY_DERSIG).
     pub bip66_active: bool,
     /// Core `SCRIPT_VERIFY_MINIMALDATA`: minimal push opcodes + minimal scriptnums.
     /// Not always consensus (standard flag); enabled when fixture/job requests it.
     pub minimal_data: bool,
+    /// Core `SCRIPT_VERIFY_NULLFAIL`: non-empty sig that fails CHECK(MULTI)SIG → hard fail.
+    pub nullfail: bool,
+    /// Core `SCRIPT_VERIFY_LOW_S`: high-S ECDSA signatures hard-fail (standardness).
+    pub low_s: bool,
+    /// Core `SCRIPT_VERIFY_STRICTENC`: DER + defined hashtype + compressed/uncompressed keys.
+    pub strictenc: bool,
+    /// Core `SCRIPT_VERIFY_NULLDUMMY` (BIP147): CMS dummy must be empty.
+    pub null_dummy: bool,
     /// BIP342: instruction index of last executed OP_CODESEPARATOR, or `0xFFFFFFFF`.
     ///
     /// Counted like Core's `opcode_pos` (one per GetOp/instruction, not byte offset).
@@ -199,6 +207,10 @@ impl<'a> EvalContext<'a> {
             bip112_active,
             bip66_active,
             minimal_data: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(SighashCache::new(tx)),
@@ -931,25 +943,28 @@ fn op_checkmultisig(
     if *op_count > MAX_OPS_LEGACY {
         return Err(ConsensusError::Script("op count".into()));
     }
+    // Pop n keys: first pop is stack top = last pushed. Core evaluates that
+    // key first (encoding + match), so keep pop order (no reverse).
     let mut pubkeys = Vec::with_capacity(n as usize);
     for _ in 0..n {
         pubkeys.push(pop(stack)?);
     }
-    // Reverse so index 0 is deepest (first pushed) — Core match order.
-    pubkeys.reverse();
     let m = scriptnum_decode(&pop(stack)?, ctx.minimal_data)?;
     if m < 0 || m > n {
         return Err(ConsensusError::Script("multisig m".into()));
     }
+    // Pop m sigs: first pop is top = last pushed = Core's first evaluated sig.
     let mut sigs = Vec::with_capacity(m as usize);
     for _ in 0..m {
         sigs.push(pop(stack)?);
     }
-    sigs.reverse();
     let dummy = pop(stack)?;
     // BIP147 NULLDUMMY: extra stack element must be empty. Softfork co-activated
-    // with CSV on mainnet; always required for Witness v0 (segwit).
-    if !dummy.is_empty() && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active) {
+    // with CSV on mainnet; always required for Witness v0 (segwit). Also when the
+    // SCRIPT_VERIFY_NULLDUMMY flag is set (fixtures / policy).
+    if !dummy.is_empty()
+        && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active || ctx.null_dummy)
+    {
         return Err(ConsensusError::Script("NULLDUMMY".into()));
     }
 
@@ -965,7 +980,9 @@ fn op_checkmultisig(
     };
     let script_override = script_code_owned.as_deref();
 
-    // Core: while (fSuccess && nSigsCount > 0) { try sigs[isig] vs pubs[ikey] }
+    // Core: start at last-pushed sig/key (index 0 after pop-order storage).
+    // Advance key always; advance sig only on match. Encoding checks run only
+    // for pairs actually tried (early exit skips unused invalid encodings).
     let mut f_success = true;
     let mut n_sigs = sigs.len();
     let mut n_keys = pubkeys.len();
@@ -982,6 +999,11 @@ fn op_checkmultisig(
         if n_sigs > n_keys {
             f_success = false;
         }
+    }
+
+    // NULLFAIL: failed CMS with any non-empty signature hard-fails.
+    if !f_success && ctx.nullfail && sigs.iter().any(|s| !s.is_empty()) {
+        return Err(ConsensusError::Script("NULLFAIL".into()));
     }
 
     if verify {
@@ -1133,7 +1155,11 @@ fn strip_op_codeseparator(script: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Legacy / witness-v0 CHECKSIG: empty or bad sig → false (does not hard-fail).
+/// Legacy / witness-v0 CHECKSIG.
+///
+/// Empty signature → soft false. Encoding failures under DERSIG / LOW_S /
+/// STRICTENC hard-fail (Core `CheckSignatureEncoding` / `CheckPubKeyEncoding`).
+/// NULLFAIL hard-fails a non-empty signature that does not verify.
 ///
 /// `script_code_override`: when `Some`, use these bytes as scriptCode for sighash
 /// (CHECKMULTISIG pre-deletes **all** stack sigs). When `None`, Base path applies
@@ -1147,13 +1173,45 @@ fn checksig_legacy(
     if sig.is_empty() {
         return Ok(false);
     }
-    let (ecdsa_sig, sighash_ty) = match crypto::parse_der_sig(sig, ctx.bip66_active) {
+    // Core: DERSIG | LOW_S | STRICTENC all require IsValidSignatureEncoding.
+    let need_der = ctx.bip66_active || ctx.low_s || ctx.strictenc;
+    if need_der && !crypto::is_valid_signature_encoding(sig) {
+        return Err(ConsensusError::Script("SIG_DER".into()));
+    }
+    if ctx.low_s {
+        // Parse lax after encoding check; high-S is a separate hard fail.
+        if let Ok((ecdsa, _)) = crypto::parse_der_sig(sig, false) {
+            if !crypto::is_low_der_s(&ecdsa) {
+                return Err(ConsensusError::Script("SIG_HIGH_S".into()));
+            }
+        }
+    }
+    if ctx.strictenc && !crypto::is_defined_hashtype(sig) {
+        return Err(ConsensusError::Script("SIG_HASHTYPE".into()));
+    }
+    if ctx.strictenc && !crypto::is_compressed_or_uncompressed_pubkey(pubkey) {
+        return Err(ConsensusError::Script("PUBKEYTYPE".into()));
+    }
+
+    let (ecdsa_sig, sighash_ty) = match crypto::parse_der_sig(sig, false) {
         Ok(x) => x,
-        Err(_) => return Ok(false),
+        // Pre-DERSIG: malformed DER that slipped encoding → soft false (NULLFAIL if set).
+        Err(_) => {
+            if ctx.nullfail {
+                return Err(ConsensusError::Script("NULLFAIL".into()));
+            }
+            return Ok(false);
+        }
     };
     let pk = match crypto::parse_pubkey(pubkey) {
         Ok(p) => p,
-        Err(_) => return Ok(false),
+        Err(_) => {
+            // Invalid key: STRICTENC already hard-failed hybrid; other bad keys soft-false.
+            if ctx.nullfail {
+                return Err(ConsensusError::Script("NULLFAIL".into()));
+            }
+            return Ok(false);
+        }
     };
     let owned: Vec<u8>;
     let script_bytes: &[u8] = if let Some(sc) = script_code_override {
@@ -1169,9 +1227,18 @@ fn checksig_legacy(
     };
     let sighash = match sighash_for_script(ctx, sighash_ty, script_bytes) {
         Ok(h) => h,
-        Err(_) => return Ok(false),
+        Err(_) => {
+            if ctx.nullfail {
+                return Err(ConsensusError::Script("NULLFAIL".into()));
+            }
+            return Ok(false);
+        }
     };
-    Ok(crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk))
+    let ok = crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk);
+    if !ok && ctx.nullfail {
+        return Err(ConsensusError::Script("NULLFAIL".into()));
+    }
+    Ok(ok)
 }
 
 /// BIP340 Schnorr verify for a 32-byte x-only pubkey in tapscript (leaf sighash).
@@ -2256,5 +2323,108 @@ mod minimal_data_tests {
             SigVersion::Base,
         );
         assert!(!ctx.minimal_data);
+        assert!(!ctx.nullfail && !ctx.low_s && !ctx.strictenc && !ctx.null_dummy);
+    }
+
+    /// DERSIG: invalid DER encoding hard-fails; pre-BIP66 soft-fails CHECKSIG.
+    #[test]
+    fn dersig_hard_fails_invalid_encoding() {
+        // Push 0xff + OP_0 + CHECKSIG
+        let script = vec![0x01, 0xff, 0x00, 0xac];
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let sc = Script::from_bytes(&script);
+        let ctx_on = EvalContext::new_with_flags(
+            &tx,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            sc,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        let mut stack = Vec::new();
+        let err = eval_script(sc, &mut stack, &ctx_on).unwrap_err();
+        assert!(format!("{err}").contains("SIG_DER"), "{err}");
+
+        let ctx_off = EvalContext::new_with_flags(
+            &tx,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            sc,
+            SigVersion::Base,
+            true,
+            true,
+            false,
+        );
+        let mut stack = Vec::new();
+        eval_script(sc, &mut stack, &ctx_off).expect("pre-bip66 soft-false CHECKSIG");
+        assert!(!cast_to_bool(stack.last().unwrap()));
+    }
+
+    #[test]
+    fn nullfail_hard_fails_nonzero_bad_sig() {
+        // Non-empty invalid-but-DER-shaped? Use empty-key path: push minimal DER-like
+        // garbage that fails DER under bip66 is SIG_DER not NULLFAIL. Use valid-shaped
+        // non-verifying: 9-byte minimal DER + ALL with OP_0 pubkey — soft false under
+        // DERSIG only; with NULLFAIL → hard fail.
+        let sig = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
+        let mut script = vec![sig.len() as u8];
+        script.extend_from_slice(&sig);
+        script.push(0x00); // empty/invalid pubkey as OP_0
+        script.push(0xac); // CHECKSIG
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let sc = Script::from_bytes(&script);
+        let mut ctx = EvalContext::new_with_flags(
+            &tx,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            sc,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        ctx.nullfail = true;
+        let mut stack = Vec::new();
+        let err = eval_script(sc, &mut stack, &ctx).unwrap_err();
+        assert!(format!("{err}").contains("NULLFAIL"), "{err}");
     }
 }

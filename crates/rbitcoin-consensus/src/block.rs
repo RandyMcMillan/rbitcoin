@@ -7,17 +7,12 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, OutPoint, Transaction, TxOut};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{Query, U64IdentityHasher, U64Map};
+use rbitcoin_query::{FkMap, Query, U32Map, U64Map};
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-
-/// Pack-scale maps keyed by small integers / `Fk` (identity hasher).
-type U32Map<V> = HashMap<u32, V, BuildHasherDefault<U64IdentityHasher>>;
-type FkMap<V> = HashMap<rbitcoin_primitives::Fk, V, BuildHasherDefault<U64IdentityHasher>>;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -528,7 +523,7 @@ pub fn validate_block_connect(
     let mut pending_creates = std::collections::HashMap::new();
     // Unit-test path: no load pin stage (production uses confirm_archived_run).
     let batch_parents = rbitcoin_query::BatchParents::new();
-    let batch_thin = rbitcoin_query::BatchThin::new();
+    let batch_thin = rbitcoin_query::BatchThin::default();
     // Sole hash for this unit-test connect surface.
     let create_txids: Vec<[u8; 32]> = block
         .txdata
@@ -945,8 +940,8 @@ fn assemble_block_prevouts_mode(
         rbitcoin_primitives::Fk,
     )> = Vec::with_capacity(n_tx.saturating_mul(2));
     // Coinbase height cache spans the whole block (was recreated per tx).
-    let mut coinbase_height_cache: std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>> =
-        std::collections::HashMap::with_capacity(64);
+    let mut coinbase_height_cache: FkMap<Option<u32>> =
+        FkMap::with_capacity_and_hasher(64, Default::default());
 
     use crate::confirm_phase_stats;
     use std::sync::atomic::Ordering;
@@ -1458,7 +1453,7 @@ pub(crate) fn structural_validate_spends(
         .coinbase_fk_at_heights(&height_list)
         .map_err(ConsensusError::Store)?;
 
-    let mut seen_create: HashSet<u64> = HashSet::with_capacity(vouts_by_create.len());
+    let mut seen_create: rbitcoin_query::U64Set = rbitcoin_query::U64Set::with_capacity_and_hasher(vouts_by_create.len(), Default::default());
     for &(_ptid, _vout, _sfk, create_fk) in spends {
         if create_fk.is_null() {
             continue;
@@ -1716,7 +1711,7 @@ fn resolve_prevout(
     // Prefer thin create_fk from load (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: &std::collections::HashMap<[u8; 32], usize>,
-    coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
+    coinbase_height_cache: &mut FkMap<Option<u32>>,
     batch_parents: &rbitcoin_query::BatchParents,
     // Height of the block being validated (same-block BIP68 coin height).
     spend_height: u32,
@@ -1950,7 +1945,7 @@ fn coinbase_height_for_maturity(
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
     batch_parents: &rbitcoin_query::BatchParents,
-    coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
+    coinbase_height_cache: &mut FkMap<Option<u32>>,
 ) -> Result<Option<u32>, ConsensusError> {
     let (is_cb, cb_h) = coinbase_info(
         query,
@@ -1979,7 +1974,7 @@ fn coinbase_info(
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
     batch_parents: &rbitcoin_query::BatchParents,
-    cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
+    cache: &mut FkMap<Option<u32>>,
 ) -> Result<(bool, Option<u32>), ConsensusError> {
     if let Some(&h) = cache.get(&prev_fk) {
         // Cache value is coinbase create height only: `Some(h)` ⇒ coinbase,
@@ -2780,7 +2775,7 @@ mod structure_rule_tests {
         }
         let ctx = ctx_h(4);
         let parents = BatchParents::new();
-        let thin = BatchThin::new();
+        let thin = BatchThin::default();
         let mut spent = HashSet::new();
         let mut creates = HashMap::new();
         let create_txids: Vec<[u8; 32]> = block
@@ -2835,7 +2830,7 @@ mod structure_rule_tests {
         let ctx = ctx_h(1);
         let empty = block_with(vec![]);
         let parents = BatchParents::new();
-        let thin = BatchThin::new();
+        let thin = BatchThin::default();
         let mut spent = HashSet::new();
         let mut creates = HashMap::new();
         let zero = [0u8; 32];
@@ -2991,7 +2986,7 @@ mod structure_rule_tests {
         };
         let empty_block = block_with(vec![coinbase(4)]);
         let same_block: HashMap<[u8; 32], usize> = HashMap::new();
-        let mut cb_cache: HashMap<Fk, Option<u32>> = HashMap::new();
+        let mut cb_cache: rbitcoin_query::FkMap<Option<u32>> = rbitcoin_query::FkMap::default();
 
         // Thread-local N1 counters (process-global atomics race under parallel cargo test).
         let _ = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
@@ -3350,9 +3345,9 @@ mod structure_rule_tests {
 
         // Structural without denserels/abs is invariant — not soft PrevoutSpent recovery.
         {
-            use super::{structural_validate_spends, U32Map};
+            use super::structural_validate_spends;
             use rbitcoin_primitives::Fk;
-            use rbitcoin_query::{BatchParents, U64Map};
+            use rbitcoin_query::{BatchParents, U32Map, U64Map};
             use std::collections::HashSet;
             let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
             let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];

@@ -19,7 +19,8 @@ use crate::spender_table::SpenderTable;
 use crate::tx_table::TxTable;
 use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::{U64Map, U64Set};
+use std::collections::VecDeque;
 use std::os::fd::RawFd;
 
 const META_LEN: usize = 9;
@@ -78,9 +79,9 @@ pub fn put_spend_batch_by_abs_meta_uring(
         // Pending edge indices not yet started.
         let mut pending: VecDeque<usize> = (0..work.len()).collect();
         // Abs offsets with an RMW in flight (serialize same-outpoint).
-        let mut abs_busy: HashSet<u64> = HashSet::new();
+        let mut abs_busy: U64Set = U64Set::default();
         // Optional FIFO of waiters when abs is busy: abs → edge indices.
-        let mut abs_wait: HashMap<u64, VecDeque<usize>> = HashMap::new();
+        let mut abs_wait: U64Map<VecDeque<usize>> = U64Map::default();
 
         let mut free_slots: Vec<usize> = (0..MAX_SLOTS).collect();
         let mut slots: Vec<Option<Slot>> = (0..MAX_SLOTS).map(|_| None).collect();
@@ -90,8 +91,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
                    free_slots: &mut Vec<usize>,
                    slots: &mut [Option<Slot>],
                    pending: &mut VecDeque<usize>,
-                   abs_busy: &mut HashSet<u64>,
-                   abs_wait: &mut HashMap<u64, VecDeque<usize>>,
+                   abs_busy: &mut U64Set,
+                   abs_wait: &mut U64Map<VecDeque<usize>>,
                    work: &[(u64, Fk, u32, Fk)],
                    in_flight: &mut usize,
                    body_fd: RawFd|
@@ -321,8 +322,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
 /// Pick next edge that can start: abs not busy, or from wait queues.
 fn next_ready(
     pending: &mut VecDeque<usize>,
-    abs_busy: &HashSet<u64>,
-    abs_wait: &mut HashMap<u64, VecDeque<usize>>,
+    abs_busy: &U64Set,
+    abs_wait: &mut U64Map<VecDeque<usize>>,
     work: &[(u64, Fk, u32, Fk)],
 ) -> Option<usize> {
     // Drain pending: start if free, else park on wait list.

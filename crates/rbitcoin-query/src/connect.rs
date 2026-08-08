@@ -72,7 +72,7 @@ impl Query {
     pub fn confirm_blocks_run_with_create_pins(
         &self,
         items: &[ConfirmPrepared],
-        create_pins: Option<&std::collections::HashMap<Fk, CreatePin>>,
+        create_pins: Option<&crate::FkMap<CreatePin>>,
     ) -> Result<Vec<Fk>, QueryError> {
         if items.is_empty() {
             return Ok(Vec::new());

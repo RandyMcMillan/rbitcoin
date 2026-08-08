@@ -1,7 +1,7 @@
 //! Reconstruct wire blocks/txs and merkle proofs.
 
 use super::*;
-use std::collections::HashMap;
+use crate::U64Map;
 use std::time::Instant;
 
 impl Query {
@@ -105,7 +105,7 @@ impl Query {
         batch: Option<&crate::BatchFullBodies>,
     ) -> Result<Transaction, QueryError> {
         let (rec, stored_outputs, mut stored_inputs) = self.load_body_for_wire(tx_fk, batch)?;
-        let mut cache = HashMap::new();
+        let mut cache = U64Map::default();
         self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache, batch)?;
         Ok(Self::transaction_from_class_a(
             rec,
@@ -161,7 +161,7 @@ impl Query {
     pub(crate) fn fill_input_prev_txids_cached(
         &self,
         inputs: &mut [InputRecord],
-        cache: &mut HashMap<u64, [u8; 32]>,
+        cache: &mut U64Map<[u8; 32]>,
         batch: Option<&crate::BatchFullBodies>,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
@@ -247,7 +247,7 @@ impl Query {
         let header = self.wire_header_from_record_prev(&rec, prev_hash)?;
         let mut txdata = Vec::with_capacity(tx_fks.len());
         // Dedup create_fk → txid across the whole block.
-        let mut prev_txid_cache: HashMap<u64, [u8; 32]> = HashMap::new();
+        let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
         for fk in tx_fks {
             let (rec_tx, stored_outputs, mut stored_inputs) =
                 self.load_body_for_wire(fk, batch_bodies)?;

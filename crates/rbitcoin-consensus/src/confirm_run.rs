@@ -33,7 +33,7 @@ use crate::params::{genesis_block, ChainParams};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{Query, U64Map};
+use rbitcoin_query::{Query, FkMap, U32Map, U64Map, U64Set};
 use rbitcoin_store::{SpendAnnBackend, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -471,7 +471,7 @@ pub fn confirm_wire_load_phase_pipelined(
                 .archive_plan_batch_owned(&mut need)
                 .map_err(ConsensusError::Store)?,
         };
-        let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
+        let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
         for &(hfk, first, n) in &plan.per_header_ranges {
             let Some(hid) = hfk.get() else { continue };
             let start = plan
@@ -677,7 +677,7 @@ pub fn ensure_external_parent_denserels_from_plan(
     };
 
     // Same-batch create ids (offline denserels at pin — do not cold-load Class A).
-    let mut batch_create_ids: HashMap<u64, ()> = HashMap::new();
+    let mut batch_create_ids: U64Map<()> = U64Map::default();
     for fk in &plan.planned_fks {
         if let Some(id) = fk.get() {
             batch_create_ids.insert(id, ());
@@ -687,7 +687,7 @@ pub fn ensure_external_parent_denserels_from_plan(
     // Spent parent create_fk → need vouts (from stamped inputs only).
     // Also fill reverse map from wire prev_txid (lookup stamp may have omitted
     // when tests build synthetic plans).
-    let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let t_collect = Instant::now();
     for ((_pin, ins), _) in plan.packed.iter().zip(plan.planned_fks.iter()) {
         for inp in ins {
@@ -1370,7 +1370,7 @@ fn wire_lookup_phase(
                 .archive_plan_batch_owned(&mut need)
                 .map_err(ConsensusError::Store)?,
         };
-        let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
+        let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
         for &(hfk, first, n) in &plan.per_header_ranges {
             let Some(hid) = hfk.get() else { continue };
             let start = plan
@@ -1692,29 +1692,27 @@ fn pin_for_wire_batch(
     use std::sync::atomic::Ordering;
 
     let t_pin = Instant::now();
-    let mut batch_thin: rbitcoin_query::BatchThin = std::collections::HashMap::new();
-    let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut batch_thin: rbitcoin_query::BatchThin = rbitcoin_query::BatchThin::default();
+    let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let mut n_same_batch = 0u32;
 
     // id → Arc pin (tx, outs, dense denserels). Spent parents only (after thin pass).
-    let mut plan_by_id: HashMap<
-        u64,
+    let mut plan_by_id: U64Map<
         std::sync::Arc<(
             rbitcoin_store::TxRecord,
             Vec<rbitcoin_store::OutputRecord>,
             Vec<u32>,
         )>,
-    > = HashMap::new();
+    > = U64Map::default();
     // batch_pin by create id (Arc — preferred same-batch pin source).
     // packed pin half shares the same Arc; no separate outs clone.
-    let mut batch_pin_by_id: HashMap<
-        u64,
+    let mut batch_pin_by_id: U64Map<
         &std::sync::Arc<(
             rbitcoin_store::TxRecord,
             Vec<rbitcoin_store::OutputRecord>,
             Vec<u32>,
         )>,
-    > = HashMap::new();
+    > = U64Map::default();
     if let Some(plan) = plan {
         if plan.batch_pin.len() == plan.planned_fks.len() {
             for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
@@ -1838,7 +1836,7 @@ fn pin_for_wire_batch(
         batch_parents.adopt_from_store(parent_vouts.keys().copied());
     }
     let adopt_ns = t_adopt.elapsed().as_nanos() as u64;
-    let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut still_need: U64Map<Vec<u32>> = U64Map::default();
     let mut n_plan_pin = 0u64;
 
     // Plan / in-flight / same-batch free pins → BatchParents (local HashMap put;
@@ -2533,8 +2531,7 @@ pub fn confirm_write_phase(
     // Single commit era: durable Class A for this batch before spentness RMW.
     // Keep create pins for SH collect (Class C) — same Arcs as layout fill; avoid
     // re-preading Class A bodies under RES=0 when residency is empty.
-    let mut write_create_pins: HashMap<rbitcoin_primitives::Fk, rbitcoin_query::CreatePin> =
-        HashMap::new();
+    let mut write_create_pins: FkMap<rbitcoin_query::CreatePin> = FkMap::default();
     let mut class_a_ns = 0u64;
     let mut ensure_ns = 0u64;
     if let Some(plan) = batch.archive_plan.take() {
@@ -2651,7 +2648,7 @@ fn fill_planned_create_layout_after_commit(
         return Ok(());
     }
     // Only parents actually pinned for spends and still missing abs layout.
-    let missing: std::collections::HashSet<u64> = batch_parents
+    let missing: U64Set = batch_parents
         .fks_missing_layout()
         .into_iter()
         .filter_map(|f| f.get())
@@ -2718,9 +2715,8 @@ fn ensure_spend_abs_layouts(
     prepared: &[Prepared],
 ) -> Result<(), ConsensusError> {
     use rbitcoin_store::IdxBodyMode;
-    use std::collections::HashMap;
 
-    let mut need: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut need: U64Map<Vec<u32>> = U64Map::default();
     for p in prepared {
         for &(_txid, vout, sfk, cfk) in &p.spends {
             if sfk.is_null() || cfk.is_null() {
@@ -2751,7 +2747,7 @@ fn ensure_spend_abs_layouts(
 
     // 1) Pin denserels + body_range already on BatchParents — no body IO.
     let mut ensure_res = 0u64;
-    let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut still: U64Map<Vec<u32>> = U64Map::default();
     // Pin has denserels but still no body_range — idx only (not denserels IO).
     let mut range_only: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need_v) in &need {
@@ -4621,7 +4617,7 @@ mod write_idempotent_tests {
         use rbitcoin_primitives::{Fk, Height};
         use rbitcoin_query::{BatchParents, Query};
         use rbitcoin_store::{OutputRecord, TxRecord};
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         use std::sync::Once;
 
         static ONCE: Once = Once::new();
@@ -4697,9 +4693,7 @@ mod write_idempotent_tests {
         let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk)];
         let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
         let mut pending = HashSet::new();
-        type U32Map =
-            HashMap<u32, u32, std::hash::BuildHasherDefault<rbitcoin_query::U64IdentityHasher>>;
-        let mut mtp = U32Map::default();
+        let mut mtp = rbitcoin_query::U32Map::<u32>::default();
         let mut meta_by_abs = rbitcoin_query::U64Map::default();
         let err = structural_validate_spends(
             &q,
@@ -4742,7 +4736,7 @@ fn load_confirm_batch(
     if heights.is_empty() {
         return Ok((
             rbitcoin_query::BatchParents::new(),
-            rbitcoin_query::BatchThin::new(),
+            rbitcoin_query::BatchThin::default(),
             rbitcoin_query::BatchFullBodies::new(),
         ));
     }
@@ -5042,13 +5036,10 @@ fn structural_run(
     meta_by_abs: &mut rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
-    use std::hash::BuildHasherDefault;
-    use rbitcoin_query::U64IdentityHasher;
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
     // MTP of height H reused across blocks/spends in this write run.
-    type U32Map = HashMap<u32, u32, BuildHasherDefault<U64IdentityHasher>>;
-    let mut mtp_cache: U32Map = U32Map::default();
+    let mut mtp_cache: U32Map<u32> = U32Map::default();
     let mut tot = StructuralPhaseNs::default();
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
@@ -5122,7 +5113,7 @@ fn script_wave(
 fn class_c_commit(
     query: &Query,
     prepared: &mut [Prepared],
-    write_create_pins: &HashMap<rbitcoin_primitives::Fk, rbitcoin_query::CreatePin>,
+    write_create_pins: &FkMap<rbitcoin_query::CreatePin>,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     use rbitcoin_query::class_c_phase_stats::{STRONG_NS, TIP_NS};
     use std::sync::atomic::Ordering as QOrd;

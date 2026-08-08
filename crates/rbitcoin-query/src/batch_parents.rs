@@ -36,45 +36,12 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-/// Identity hasher for `u64` / single-field `Fk` keys (no mixing).
-///
-/// **Intended keys:** dense sequential create_fks / heights (Class A append ids).
-/// Those land on consecutive buckets under hashbrown's power-of-two mask → even
-/// occupancy, short probes. **Avoid** for keys that share low bits (aligned
-/// pointers, multiples of large powers of two) — that is the classic identity-
-/// hash pile-up. At pack scale (~8k) this beats SipHash on insert+lookup
-/// (`confirm_stage_cpu`); sequential IDs are not a clustering hazard here.
-#[derive(Default, Clone, Copy)]
-pub struct U64IdentityHasher(u64);
-
-impl Hasher for U64IdentityHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        // Fallback if a key type uses raw bytes; fold little-endian u64 chunks.
-        for &b in bytes {
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3).wrapping_add(u64::from(b));
-        }
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-    #[inline]
-    fn write_u32(&mut self, i: u32) {
-        self.0 = u64::from(i);
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-/// `HashMap` with [`U64IdentityHasher`] for create_fk / height integer keys.
-pub type U64Map<V> = HashMap<u64, V, BuildHasherDefault<U64IdentityHasher>>;
+// Re-export store identity maps for confirm/query call sites (single source in store).
+pub use rbitcoin_store::{FkMap, U32Map, U64IdentityHasher, U64Map, U64Set};
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -1408,6 +1375,8 @@ mod tests {
     /// Write/lookup structural maps depend on this for the measured CPU win.
     #[test]
     fn u64_identity_hasher_is_raw_key_and_map_roundtrips_pack_scale() {
+        // Shipped path: store identity maps re-exported here; drive U64Map API.
+        use std::hash::Hasher;
         let mut h = U64IdentityHasher::default();
         h.write_u64(0xdead_beef_cafe_u64);
         assert_eq!(h.finish(), 0xdead_beef_cafe_u64);

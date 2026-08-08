@@ -10,6 +10,7 @@
 //!
 //! Header plans stay **always on**. Scan watermarks (`plans`) track load readiness.
 
+use crate::U32Map;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeaderRecord;
 use std::collections::{BTreeMap, HashMap};
@@ -51,7 +52,7 @@ struct Inner {
     /// height → plan
     plans: BTreeMap<u32, HeightPlan>,
     /// height → immutable header + tx list (Arc-publish; tip GC drops Arc).
-    headers: HashMap<u32, Arc<HeaderPlanCache>>,
+    headers: U32Map<Arc<HeaderPlanCache>>,
     /// hash → height for O(1) header resolve on confirm.
     hash_to_height: HashMap<[u8; 32], u32>,
 }
@@ -73,7 +74,7 @@ impl ConfirmParentCache {
                 tip: 0,
                 ready_through: 0,
                 plans: BTreeMap::new(),
-                headers: HashMap::new(),
+                headers: U32Map::default(),
                 hash_to_height: HashMap::new(),
             }),
             ready_through: AtomicU32::new(0),

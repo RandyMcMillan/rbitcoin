@@ -2142,8 +2142,8 @@ impl TxTable {
                 }
                 Ok(out)
             })?;
-        let mut by_vout: std::collections::HashMap<u32, (u64, bool, Fk)> =
-            std::collections::HashMap::with_capacity(metas.len());
+        let mut by_vout: crate::U32Map<(u64, bool, Fk)> =
+            crate::U32Map::with_capacity_and_hasher(metas.len(), Default::default());
         for (v, rel, multi, field) in metas {
             by_vout.insert(v, (rel, multi, field));
         }

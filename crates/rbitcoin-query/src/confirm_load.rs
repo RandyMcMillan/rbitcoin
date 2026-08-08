@@ -10,11 +10,11 @@ use super::*;
 use crate::batch_full_bodies::BatchFullBodies;
 use crate::batch_parents::BatchParents;
 use crate::wave_prevout::ThinInput;
-use std::collections::{HashMap, HashSet};
+use crate::{U64Map, U64Set};
 use std::time::Instant;
 
 /// Spend-fk → thin create_fk edges for one confirm batch (assemble only).
-pub type BatchThin = HashMap<u64, Vec<ThinInput>>;
+pub type BatchThin = U64Map<Vec<ThinInput>>;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConfirmLoadStats {
@@ -99,7 +99,7 @@ impl Query {
         let t0 = Instant::now();
         let mut st = ConfirmLoadStats::default();
         let mut batch_parents = BatchParents::new();
-        let mut batch_thin = BatchThin::new();
+        let mut batch_thin = BatchThin::default();
         let mut batch_bodies = BatchFullBodies::new();
         if items.is_empty() {
             return Ok((st, batch_parents, batch_thin, batch_bodies));
@@ -131,13 +131,13 @@ impl Query {
         // Full-decoded bodies once for wire + FIFO outs (decode once).
         // (txid, edges): each edge is (create_fk_opt, soft prev_txid, vout).
         // v10: create_fk is stamped at archive; soft prev_txid may be zero.
-        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
-            HashMap::new();
-        let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
+        let mut body_prevouts: U64Map<([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
+            U64Map::default();
+        let mut parent_need: U64Map<Vec<u32>> = U64Map::default(); // parent_fk → need heights
                                                                       // parent_fk → needed prev_index (vouts) for sparse outs stash.
-        let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
-        let mut thin_by_spend: BatchThin = BatchThin::new();
-        let mut batch_create_ids: HashSet<u64> = HashSet::new();
+        let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
+        let mut thin_by_spend: BatchThin = BatchThin::default();
+        let mut batch_create_ids: U64Set = U64Set::default();
 
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
@@ -227,13 +227,14 @@ impl Query {
                 &range_fks,
                 rbitcoin_store::IdxBodyMode::Full,
             )?;
-            let mut by_fk: HashMap<u64, crate::combined_stage::CombinedCreate> =
-                HashMap::with_capacity(creates.len());
+            let mut by_fk: U64Map<crate::combined_stage::CombinedCreate> =
+                U64Map::with_capacity_and_hasher(creates.len(), Default::default());
             for c in creates {
                 by_fk.insert(c.fk.get().unwrap_or(0), c);
             }
             // Bulk stamp schema-13 create identity (one sidefile range when dense).
-            let mut id_by_fk: HashMap<u64, [u8; 32]> = HashMap::with_capacity(range_fks.len());
+            let mut id_by_fk: U64Map<[u8; 32]> =
+                U64Map::with_capacity_and_hasher(range_fks.len(), Default::default());
             if let (Some(first), Some(last)) = (
                 range_fks.first().and_then(|f| f.get()),
                 range_fks.last().and_then(|f| f.get()),
@@ -457,8 +458,8 @@ impl Query {
                 &fks,
                 rbitcoin_store::IdxBodyMode::OutsDenserels,
             )?;
-            let mut by_id: HashMap<u64, crate::combined_stage::CombinedCreate> =
-                HashMap::with_capacity(loaded.len());
+            let mut by_id: U64Map<crate::combined_stage::CombinedCreate> =
+                U64Map::with_capacity_and_hasher(loaded.len(), Default::default());
             for c in loaded {
                 by_id.insert(c.fk.get().unwrap_or(0), c);
             }

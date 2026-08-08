@@ -340,18 +340,17 @@ impl Store {
     pub fn coinbase_fk_at_heights(
         &self,
         heights: &[u32],
-    ) -> Result<std::collections::HashMap<u32, Fk>, StoreError> {
+    ) -> Result<crate::U32Map<Fk>, StoreError> {
         use rbitcoin_primitives::Height;
-        use std::collections::HashMap;
         if heights.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(crate::U32Map::default());
         }
         let mut uniq: Vec<u32> = heights.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
         let hs: Vec<Height> = uniq.iter().map(|&h| Height(h)).collect();
         let headers = self.confirmed.get_many(&hs)?;
-        let mut out = HashMap::with_capacity(uniq.len());
+        let mut out = crate::U32Map::with_capacity_and_hasher(uniq.len(), Default::default());
         for (i, &h) in uniq.iter().enumerate() {
             let Some(hfk) = headers[i] else {
                 continue;

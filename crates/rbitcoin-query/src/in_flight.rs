@@ -13,6 +13,7 @@
 //! L is bounded by pipeline queue depth.
 
 use crate::archive::CreatePin;
+use crate::U64Map;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct InFlightLayer {
     creates: HashMap<[u8; 32], Fk>,
-    outs: HashMap<u64, CreatePin>,
+    outs: U64Map<CreatePin>,
     /// Highest create fk id in this layer (whole-layer prune fast path).
     max_fk: u64,
 }
@@ -30,7 +31,7 @@ impl InFlightLayer {
     /// Build from planned fks + batch_pin (or packed pin half) Arc clones.
     pub fn from_plan_pins<'a>(pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>) -> Self {
         let mut creates = HashMap::new();
-        let mut outs = HashMap::new();
+        let mut outs = U64Map::default();
         let mut max_fk = 0u64;
         for (fk, pin) in pins {
             creates.insert(pin.0.txid, fk);
@@ -62,7 +63,7 @@ impl InFlightLayer {
         }
         Self {
             creates,
-            outs: HashMap::new(),
+            outs: U64Map::default(),
             max_fk,
         }
     }
@@ -122,7 +123,7 @@ impl InFlightLog {
                 continue;
             }
             let mut creates = HashMap::new();
-            let mut outs = HashMap::new();
+            let mut outs = U64Map::default();
             let mut max_fk = 0u64;
             for (txid, fk) in &layer.creates {
                 if fk.get().is_some_and(|id| id > head_occupied) {

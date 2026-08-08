@@ -194,8 +194,7 @@ pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
-    U64IdentityHasher, U64Map,
-    SPENDER_REL_UNKNOWN,
+    FkMap, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
 pub use confirm_load::BatchThin;
@@ -1732,7 +1731,7 @@ impl Query {
         }
 
         // prev_fk → list of (child_fk, child_hash)
-        let mut children: HashMap<u64, Vec<(Fk, [u8; 32])>> = HashMap::new();
+        let mut children: U64Map<Vec<(Fk, [u8; 32])>> = U64Map::default();
         for id in 1..=n {
             let fk = Fk(id);
             let rec = self.store.get_header(fk)?;

@@ -5,8 +5,7 @@
 //! batch only (no process create FIFO).
 
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-use std::collections::HashMap;
+use rbitcoin_store::{InputRecord, OutputRecord, TxRecord, U64Map};
 
 /// One create decoded in the load batch (wire + pin layout).
 #[derive(Debug, Clone)]
@@ -25,19 +24,19 @@ pub struct BatchBody {
 #[derive(Debug, Default, Clone)]
 pub struct BatchFullBodies {
     /// create_fk id → body
-    map: HashMap<u64, BatchBody>,
+    map: U64Map<BatchBody>,
 }
 
 impl BatchFullBodies {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: U64Map::default(),
         }
     }
 
     pub fn with_capacity(n: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(n),
+            map: U64Map::with_capacity_and_hasher(n, Default::default()),
         }
     }
 

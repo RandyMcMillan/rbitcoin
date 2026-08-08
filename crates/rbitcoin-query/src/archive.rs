@@ -144,11 +144,10 @@ impl ArchiveWritePlan {
         &mut self,
         mut has_body: impl FnMut(Fk) -> Result<bool, QueryError>,
     ) -> Result<bool, QueryError> {
-        use std::collections::HashSet;
         if self.per_header_ranges.is_empty() {
             return Ok(!self.packed.is_empty());
         }
-        let mut keep_fks: HashSet<u64> = HashSet::new();
+        let mut keep_fks: crate::U64Set = crate::U64Set::default();
         let mut new_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(self.per_header_ranges.len());
         for &(hfk, first, n) in &self.per_header_ranges {
             if has_body(hfk)? {
@@ -559,15 +558,15 @@ impl Query {
         // In-flight create_fk without prior head hit, and last-chance probes, used
         // to leave ranges empty → load Forbid / cold denserels miss (mainnet 961466).
         {
-            let mut batch_create_ids: std::collections::HashSet<u64> =
-                std::collections::HashSet::with_capacity(planned_fks.len());
+            let mut batch_create_ids: crate::U64Set =
+                crate::U64Set::with_capacity_and_hasher(planned_fks.len(), Default::default());
             for fk in &planned_fks {
                 if let Some(id) = fk.get() {
                     batch_create_ids.insert(id);
                 }
             }
             let mut need_range: Vec<Fk> = Vec::new();
-            let mut seen_range: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut seen_range: crate::U64Set = crate::U64Set::default();
             for ((_pin, ins), _) in packed.iter().zip(planned_fks.iter()) {
                 for inp in ins {
                     if inp.is_coinbase() || inp.prev_index == u32::MAX {
@@ -844,7 +843,6 @@ mod tests {
     /// batch_pin Arc denserels match encode+decode layout (PR-A/B pin handoff).
     #[test]
     fn plan_batch_pin_arc_denserels_match_layout() {
-        use std::collections::HashMap;
         use std::sync::Arc;
         let (dir, q) = temp_query("batch-pin-arc");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
@@ -863,7 +861,7 @@ mod tests {
             assert_eq!(Arc::strong_count(pin), 2);
         }
         // Simulated note_lookup_ok: Arc::clone only (strong_count rises, no deep clone).
-        let mut ifo: HashMap<u64, super::CreatePin> = HashMap::new();
+        let mut ifo: crate::U64Map<super::CreatePin> = crate::U64Map::default();
         for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
             if let Some(id) = fk.get() {
                 ifo.insert(id, Arc::clone(pin));

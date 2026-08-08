@@ -17,7 +17,10 @@ impl Hasher for U64IdentityHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3).wrapping_add(u64::from(b));
+            self.0 = self
+                .0
+                .wrapping_mul(0x1000_0000_01b3)
+                .wrapping_add(u64::from(b));
         }
     }
     #[inline]

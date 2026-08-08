@@ -33,7 +33,7 @@ use crate::params::{genesis_block, ChainParams};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{Query, FkMap, U32Map, U64Map, U64Set};
+use rbitcoin_query::{FkMap, Query, U32Map, U64Map, U64Set};
 use rbitcoin_store::{SpendAnnBackend, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -931,7 +931,10 @@ impl ParentPinStamp {
 
     #[inline]
     fn create_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
-        self.txids.get(&create_fk_id).copied().filter(|t| *t != [0u8; 32])
+        self.txids
+            .get(&create_fk_id)
+            .copied()
+            .filter(|t| *t != [0u8; 32])
     }
 }
 
@@ -1855,9 +1858,11 @@ fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                let plan_range = parent_pin.ranges.get(id).copied().or_else(|| {
-                    plan.and_then(|p| p.external_parent_ranges.get(id).copied())
-                });
+                let plan_range = parent_pin
+                    .ranges
+                    .get(id)
+                    .copied()
+                    .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
                 let sparse = if !denserels.is_empty() {
                     rbitcoin_query::sparse_spender_rels(denserels, need)
                 } else {
@@ -1969,9 +1974,11 @@ fn pin_for_wire_batch(
             } else {
                 None
             };
-            let plan_range = parent_pin.ranges.get(id).copied().or_else(|| {
-                plan.and_then(|p| p.external_parent_ranges.get(id).copied())
-            });
+            let plan_range = parent_pin
+                .ranges
+                .get(id)
+                .copied()
+                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
             let (body_range, sparse) = if !denserels.is_empty() {
                 (
                     plan_range,
@@ -1996,9 +2003,11 @@ fn pin_for_wire_batch(
         let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
         for (id, need) in &still_need {
-            let range = parent_pin.ranges.get(id).copied().or_else(|| {
-                plan.and_then(|p| p.external_parent_ranges.get(id).copied())
-            });
+            let range = parent_pin
+                .ranges
+                .get(id)
+                .copied()
+                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
             let Some(range) = range else {
                 continue;
             };
@@ -3513,11 +3522,10 @@ mod write_idempotent_tests {
         let retarget_h = Height(4032); // 2 * interval — needs first @ 2016
         assert_eq!(retarget_h.0 % interval, 0);
 
-        let got = expected_bits_extending(&q, &params, retarget_h, prev_bits, prev_time)
-            .expect(
-                "period-start on ConfirmParentCache must satisfy retarget bits \
+        let got = expected_bits_extending(&q, &params, retarget_h, prev_bits, prev_time).expect(
+            "period-start on ConfirmParentCache must satisfy retarget bits \
                  (tip-ahead multi-block); confirmed-only lookup is the mainnet bug",
-            );
+        );
         // Sanity: result is a real CompactTarget (same construction as production).
         let timespan = prev_time.saturating_sub(first_rec.timestamp) as u64;
         let expect = CompactTarget::from_next_work_required(prev_bits, timespan, &params.btc);
@@ -3703,17 +3711,16 @@ mod write_idempotent_tests {
         );
 
         // Pin Forbid hits plan-local (no extra cold).
-        let (parents, _thin, _warm) =
-            pin_for_wire_batch(
-                &q,
-                Some(&plan),
-                &ParentPinStamp::from_plan(&plan),
-                &[],
-                &[],
-                None,
-                None,
-            )
-            .unwrap();
+        let (parents, _thin, _warm) = pin_for_wire_batch(
+            &q,
+            Some(&plan),
+            &ParentPinStamp::from_plan(&plan),
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(parents.contains(pfk));
         assert_eq!(
             rbitcoin_query::body_ok_reads(),
@@ -4157,9 +4164,9 @@ mod write_idempotent_tests {
             confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
             confirm_write_phase, ColdPinMode, ScriptPreverified,
         };
-        use crate::{accept_and_archive_block, accept_and_connect_block};
         use crate::milestone::Milestone;
         use crate::params::ChainParams;
+        use crate::{accept_and_archive_block, accept_and_connect_block};
         use bitcoin::block::{Header, Version};
         use bitcoin::blockdata::transaction::{
             OutPoint, Transaction, TxIn, TxOut, Version as TxVersion,
@@ -5273,10 +5280,7 @@ fn expected_bits_extending(
         .map_err(ConsensusError::from)?
     {
         rec.timestamp
-    } else if let Some(plan) = query
-        .confirm_parent_cache()
-        .get_header_plan(first_height.0)
-    {
+    } else if let Some(plan) = query.confirm_parent_cache().get_header_plan(first_height.0) {
         plan.header_rec.timestamp
     } else {
         return Err(ConsensusError::BadHeader("missing retarget first header"));

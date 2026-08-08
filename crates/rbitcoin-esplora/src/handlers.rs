@@ -1,8 +1,6 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
-use crate::server::{
-    block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState,
-};
+use crate::server::{block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState};
 use crate::tx_json::{build_tx_json, tx_status_json};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -39,7 +37,10 @@ fn best_chain_block(
 }
 
 /// Esplora `GET /block/:hash` JSON for a **best-chain** header hash.
-pub(crate) fn block_summary_json(query: &Query, hash: &[u8; 32]) -> Result<Value, rbitcoin_query::QueryError> {
+pub(crate) fn block_summary_json(
+    query: &Query,
+    hash: &[u8; 32],
+) -> Result<Value, rbitcoin_query::QueryError> {
     let (height, block) = best_chain_block(query, hash)?;
     let (_fk, rec) = query
         .header_at_height(height)?
@@ -51,7 +52,8 @@ pub(crate) fn block_summary_json(query: &Query, hash: &[u8; 32]) -> Result<Value
     };
     let raw = serialize(&block);
     let weight = block.weight().to_wu();
-    let difficulty = Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
+    let difficulty =
+        Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
     Ok(json!({
         "id": block_hash_hex(hash),
@@ -383,22 +385,14 @@ pub async fn tx_merkleblock_proof(
     }
     let pos = proof.pos as usize;
     if pos >= block.txdata.len() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "merkle pos out of range",
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, "merkle pos out of range").into_response();
     }
     // Match wire txid at store proof position (works when store id ≠ recomputed id).
     let want = block.txdata[pos].compute_txid();
     let mb = MerkleBlock::from_block_with_predicate(&block, |t| *t == want);
     let mut raw = Vec::new();
     if mb.consensus_encode(&mut raw).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "merkleblock encode",
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, "merkleblock encode").into_response();
     }
     plain_ok(rbitcoin_primitives::hex_encode(raw))
 }
@@ -800,7 +794,10 @@ pub async fn scripthash_txs_mempool(
     mempool_txs_for_sh(&st, &sh)
 }
 
-pub async fn address_txs_mempool(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
+pub async fn address_txs_mempool(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => mempool_txs_for_sh(&st, &sh),
         Err(_) => not_found(),

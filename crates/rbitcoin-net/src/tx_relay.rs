@@ -82,7 +82,9 @@ impl MempoolHub {
             query,
             relay_enabled: AtomicBool::new(false),
             announce,
-            recent: Mutex::new(std::collections::VecDeque::with_capacity(MEMPOOL_RECENT_CAP)),
+            recent: Mutex::new(std::collections::VecDeque::with_capacity(
+                MEMPOOL_RECENT_CAP,
+            )),
         }))
     }
 

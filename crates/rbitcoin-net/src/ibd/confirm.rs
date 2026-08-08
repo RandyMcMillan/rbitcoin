@@ -132,11 +132,7 @@ impl LoadAheadState {
     /// Without this, lookup(N+k) cannot resolve parents in N..N+k-1 that already
     /// have Class A body but are mid-head-insert / not yet head-probeable, and
     /// stamp fails with `parent create_fk unresolved` (permanent tip blacklist).
-    fn note_archived_creates(
-        &mut self,
-        hub: &ChainHub,
-        heights_hashes: &[(u32, BlockHash)],
-    ) {
+    fn note_archived_creates(&mut self, hub: &ChainHub, heights_hashes: &[(u32, BlockHash)]) {
         let mut pairs: Vec<([u8; 32], rbitcoin_primitives::Fk)> = Vec::new();
         let mut max_fk = 0u64;
         for &(h, hash) in heights_hashes {

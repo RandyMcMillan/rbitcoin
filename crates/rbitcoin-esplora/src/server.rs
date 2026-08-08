@@ -736,9 +736,8 @@ mod tests {
 
         // Raw block binary (HTTP body after headers — use binary-aware read).
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = format!(
-            "GET /block/{h1}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        );
+        let req =
+            format!("GET /block/{h1}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
@@ -785,9 +784,8 @@ mod tests {
         let txid0 = block_hash_hex(&coinbase_txids[0]);
         // Binary raw tx
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = format!(
-            "GET /tx/{txid0}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        );
+        let req =
+            format!("GET /tx/{txid0}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();

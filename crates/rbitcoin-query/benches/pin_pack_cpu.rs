@@ -54,9 +54,7 @@ fn bench(name: &str, iters: u32, mut f: impl FnMut()) {
     }
     let dt = t0.elapsed();
     let per = dt / iters.max(1);
-    println!(
-        "{name:56}  {per:>12.3?} /op  ({iters} iters, {dt:.3?} total)"
-    );
+    println!("{name:56}  {per:>12.3?} /op  ({iters} iters, {dt:.3?} total)");
 }
 
 /// Shipped path: vacant `insert_owned` for N parents (cold range_fill shape).

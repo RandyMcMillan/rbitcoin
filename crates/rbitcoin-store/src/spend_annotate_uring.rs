@@ -18,8 +18,8 @@ use crate::error::StoreError;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::TxTable;
 use crate::uring_session::{self, UringSession};
-use rbitcoin_primitives::Fk;
 use crate::{U64Map, U64Set};
+use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 

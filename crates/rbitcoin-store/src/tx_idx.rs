@@ -1250,7 +1250,8 @@ mod tests {
         // Same starts again at advanced base — clone pattern.
         let err = idx.append_starts(4, &s1).expect_err("must refuse");
         assert!(
-            format!("{err}").contains("double-append") || format!("{err}").contains("last published"),
+            format!("{err}").contains("double-append")
+                || format!("{err}").contains("last published"),
             "got {err}"
         );
         // Legitimate next batch is past last start.

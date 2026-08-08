@@ -426,8 +426,7 @@ impl ScriptHashTable {
 
     /// True when main head is sealed (no new keys; overflow only).
     pub fn main_is_sealed(&self) -> bool {
-        self.main_sealed.load(std::sync::atomic::Ordering::Acquire)
-            || !self.main_accepts_new_key()
+        self.main_sealed.load(std::sync::atomic::Ordering::Acquire) || !self.main_accepts_new_key()
     }
 }
 
@@ -923,8 +922,7 @@ impl ScriptHashTable {
                     .filter(|e| !old_live.iter().any(|o| o.create_tx_fk == e.create_tx_fk))
                     .collect()
             } else {
-                let have: crate::U64Set =
-                    old_live.iter().map(|o| o.create_tx_fk.0).collect();
+                let have: crate::U64Set = old_live.iter().map(|o| o.create_tx_fk.0).collect();
                 new_ents
                     .into_iter()
                     .filter(|e| !have.contains(&e.create_tx_fk.0))
@@ -1612,7 +1610,9 @@ impl<'a> ScriptHashBulkSession<'a> {
                     break;
                 }
                 if !have {
-                    return Err(StoreError::Corrupt("scripthash bulk page full before alloc"));
+                    return Err(StoreError::Corrupt(
+                        "scripthash bulk page full before alloc",
+                    ));
                 }
                 body.write_at(last, &page)?;
                 sh_page_init_empty(&mut page);
@@ -1948,7 +1948,10 @@ mod tests {
         assert_eq!(n, 100);
         let v = t.head_value(&sh).unwrap().unwrap();
         match v {
-            ShHeadValue::Paged { first_page, last_page } => {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
                 assert!(first_page > 0 && last_page > 0);
             }
             other => panic!("expected paged, got {other:?}"),
@@ -2000,7 +2003,10 @@ mod tests {
         let (n, _) = t.put_create_batch_append(&first, &mut heads).unwrap();
         assert_eq!(n, 5);
         let first_off = match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged { first_page, last_page } => {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
                 assert_eq!(first_page, last_page);
                 first_page
             }
@@ -2010,7 +2016,10 @@ mod tests {
         let (n2, _) = t.put_create_batch_append(&more, &mut heads).unwrap();
         assert_eq!(n2, 2);
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged { first_page, last_page } => {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
                 assert_eq!(first_page, first_off, "append must keep first page");
                 assert_eq!(last_page, first_off, "still one page");
             }
@@ -2028,7 +2037,10 @@ mod tests {
         let (nm, _) = t.put_create_batch_append(&many, &mut heads2).unwrap();
         assert_eq!(nm, 600);
         match t.head_value(&sh2).unwrap().unwrap() {
-            ShHeadValue::Paged { first_page, last_page } => {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
                 assert_ne!(first_page, last_page, "600 fks need >1 page");
             }
             other => panic!("expected multi-page, got {other:?}"),
@@ -2106,7 +2118,9 @@ mod tests {
         );
 
         for rec in batch.iter().skip(1) {
-            assert!(t.contains_create(&rec.scripthash, rec.create_tx_fk).unwrap());
+            assert!(t
+                .contains_create(&rec.scripthash, rec.create_tx_fk)
+                .unwrap());
             let on_main = t.head.get(&rec.scripthash).unwrap().is_some();
             let on_ovf = {
                 let g = t.overflow.lock().unwrap();
@@ -2147,7 +2161,10 @@ mod tests {
             "bg fuse must write valid BF8R (not placeholder)"
         );
         // Pull into process via routing helper path.
-        assert!(t.main_fuse_opt().is_some(), "main_fuse_opt reloads when ready");
+        assert!(
+            t.main_fuse_opt().is_some(),
+            "main_fuse_opt reloads when ready"
+        );
 
         let sh_new = script_hash(&[0xd1, 0xaa, 0xbb, 0xcc]);
         t.put_create(&rec(sh_new, 7_777, 0)).unwrap();

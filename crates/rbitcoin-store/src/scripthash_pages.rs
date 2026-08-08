@@ -66,17 +66,15 @@ const _: () = assert!(SH_PAGE_OFF_FKS + SH_PAGE_FK_CAP * SH_ENTRY_LEN == SH_PAGE
 /// Require a full 4 KiB page buffer (rejects unaligned / short slices).
 #[inline]
 pub fn sh_page_as_array(buf: &[u8]) -> Result<&[u8; SH_PAGE_SIZE], StoreError> {
-    buf.try_into().map_err(|_| {
-        StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes")
-    })
+    buf.try_into()
+        .map_err(|_| StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes"))
 }
 
 /// Mutable full-page view (rejects wrong length).
 #[inline]
 pub fn sh_page_as_array_mut(buf: &mut [u8]) -> Result<&mut [u8; SH_PAGE_SIZE], StoreError> {
-    buf.try_into().map_err(|_| {
-        StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes")
-    })
+    buf.try_into()
+        .map_err(|_| StoreError::Corrupt("scripthash page: buffer must be exactly 4096 bytes"))
 }
 
 /// True if bit 63 is set.
@@ -162,7 +160,10 @@ pub fn sh_head_value_mode(w0: u64, w1: u64) -> Result<ShHeadValueMode, StoreErro
 
 /// Encode paged head words (first/last page file offsets).
 #[inline]
-pub fn sh_encode_paged_head(first_page_off: u64, last_page_off: u64) -> Result<[u8; 16], StoreError> {
+pub fn sh_encode_paged_head(
+    first_page_off: u64,
+    last_page_off: u64,
+) -> Result<[u8; 16], StoreError> {
     let w0 = sh_pack_flagged(first_page_off)?;
     let w1 = sh_pack_clear(last_page_off)?;
     if first_page_off == 0 || last_page_off == 0 {
@@ -196,7 +197,11 @@ pub fn sh_page_init_empty(page: &mut [u8; SH_PAGE_SIZE]) {
 /// Read `next_page_off` from a page (0 = end).
 #[inline]
 pub fn sh_page_next(page: &[u8; SH_PAGE_SIZE]) -> Result<u64, StoreError> {
-    let next = u64::from_le_bytes(page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8].try_into().unwrap());
+    let next = u64::from_le_bytes(
+        page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8]
+            .try_into()
+            .unwrap(),
+    );
     if next & SH_FLAG_BIT != 0 {
         return Err(StoreError::Corrupt(
             "scripthash page next_off has flag bit set",
@@ -216,7 +221,11 @@ pub fn sh_page_set_next(page: &mut [u8; SH_PAGE_SIZE], next_off: u64) -> Result<
 /// Number of FKs stored in this page.
 #[inline]
 pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
-    let n = u16::from_le_bytes(page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].try_into().unwrap());
+    let n = u16::from_le_bytes(
+        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
+            .try_into()
+            .unwrap(),
+    );
     if n as usize > SH_PAGE_FK_CAP {
         return Err(StoreError::Corrupt("scripthash page n_fks > capacity"));
     }
@@ -314,14 +323,8 @@ mod tests {
     #[test]
     fn head_mode_empty_inline_paged() {
         assert_eq!(sh_head_value_mode(0, 0).unwrap(), ShHeadValueMode::Empty);
-        assert_eq!(
-            sh_head_value_mode(3, 0).unwrap(),
-            ShHeadValueMode::Inline
-        );
-        assert_eq!(
-            sh_head_value_mode(3, 4).unwrap(),
-            ShHeadValueMode::Inline
-        );
+        assert_eq!(sh_head_value_mode(3, 0).unwrap(), ShHeadValueMode::Inline);
+        assert_eq!(sh_head_value_mode(3, 4).unwrap(), ShHeadValueMode::Inline);
         let enc = sh_encode_paged_head(4096, 8192).unwrap();
         let (f, l) = sh_decode_paged_head(&enc).unwrap();
         assert_eq!((f, l), (4096, 8192));
@@ -355,10 +358,7 @@ mod tests {
         let mut full = [0u8; SH_PAGE_SIZE];
         sh_page_init_empty(&mut full);
         for i in 1..=SH_PAGE_FK_CAP as u64 {
-            assert!(
-                sh_page_try_append(&mut full, Fk(i)).unwrap(),
-                "append {i}"
-            );
+            assert!(sh_page_try_append(&mut full, Fk(i)).unwrap(), "append {i}");
         }
         assert_eq!(sh_page_n_fks(&full).unwrap() as usize, SH_PAGE_FK_CAP);
         assert!(!sh_page_try_append(&mut full, Fk(99_999)).unwrap());

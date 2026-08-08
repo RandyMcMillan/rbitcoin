@@ -776,10 +776,7 @@ mod tests {
         f.sync_all().unwrap();
         drop(f);
         let err = t.record_range(Fk(3)).expect_err("inversion must hard-fail");
-        assert!(
-            format!("{err}").contains("end < start"),
-            "got {err}"
-        );
+        assert!(format!("{err}").contains("end < start"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

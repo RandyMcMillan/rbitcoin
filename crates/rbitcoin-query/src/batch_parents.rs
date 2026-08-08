@@ -428,7 +428,6 @@ impl PipelineParentStore {
             pins.insert(id, existing);
         }
     }
-
 }
 
 /// Per-batch handle map: `create_fk → Arc` shared pin (refcount only on clone).

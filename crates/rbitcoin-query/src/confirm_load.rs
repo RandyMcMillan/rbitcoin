@@ -134,7 +134,7 @@ impl Query {
         let mut body_prevouts: U64Map<([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
             U64Map::default();
         let mut parent_need: U64Map<Vec<u32>> = U64Map::default(); // parent_fk → need heights
-                                                                      // parent_fk → needed prev_index (vouts) for sparse outs stash.
+                                                                   // parent_fk → needed prev_index (vouts) for sparse outs stash.
         let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
         let mut thin_by_spend: BatchThin = BatchThin::default();
         let mut batch_create_ids: U64Set = U64Set::default();

@@ -175,9 +175,9 @@ impl ShHeadValue {
                     "scripthash: legacy slab head value (rebuild scripthash index)",
                 ));
             }
-            let arr: &[u8; 16] = buf.try_into().map_err(|_| {
-                StoreError::Corrupt("short scripthash head value")
-            })?;
+            let arr: &[u8; 16] = buf
+                .try_into()
+                .map_err(|_| StoreError::Corrupt("short scripthash head value"))?;
             let (first, last) = sh_decode_paged_head(arr)?;
             return Ok(ShHeadValue::Paged {
                 first_page: first,
@@ -201,9 +201,10 @@ impl ShHeadValue {
                 Ok(ShHeadValue::inline_two(e0, e1))
             }
             ShHeadValueMode::Paged => {
-                let (first, last) = sh_decode_paged_head(buf.try_into().map_err(|_| {
-                    StoreError::Corrupt("short scripthash head value")
-                })?)?;
+                let (first, last) = sh_decode_paged_head(
+                    buf.try_into()
+                        .map_err(|_| StoreError::Corrupt("short scripthash head value"))?,
+                )?;
                 Ok(ShHeadValue::Paged {
                     first_page: first,
                     last_page: last,

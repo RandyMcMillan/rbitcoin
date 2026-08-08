@@ -337,10 +337,7 @@ impl Store {
     /// Uses only Class C dense tables (`confirmed` + `header_txs_first`) — **no**
     /// `tx.body`. Used by confirm write `create_h` to detect coinbase without
     /// decoding create inputs.
-    pub fn coinbase_fk_at_heights(
-        &self,
-        heights: &[u32],
-    ) -> Result<crate::U32Map<Fk>, StoreError> {
+    pub fn coinbase_fk_at_heights(&self, heights: &[u32]) -> Result<crate::U32Map<Fk>, StoreError> {
         use rbitcoin_primitives::Height;
         if heights.is_empty() {
             return Ok(crate::U32Map::default());

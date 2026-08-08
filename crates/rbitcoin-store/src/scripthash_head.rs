@@ -1369,9 +1369,9 @@ impl ShardedScriptHashHead {
             // Map 16 B head keys back to full inputs (prefix match).
             if !rem.is_empty() {
                 for (hk, hv) in rem {
-                    if let Some((full, _)) = entries.iter().find(|(f, _)| {
-                        head_key_from_full(f) == hk
-                    }) {
+                    if let Some((full, _)) =
+                        entries.iter().find(|(f, _)| head_key_from_full(f) == hk)
+                    {
                         remainder.push((*full, hv));
                     } else {
                         // Reconstruct padded full from head key (seed/get uses same).
@@ -1383,8 +1383,7 @@ impl ShardedScriptHashHead {
             }
             return Ok(remainder);
         }
-        let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> =
-            (0..n).map(|_| Vec::new()).collect();
+        let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> = (0..n).map(|_| Vec::new()).collect();
         for (k, v) in entries {
             buckets[self.shard_of(k)].push((*k, v.clone()));
         }
@@ -1398,8 +1397,7 @@ impl ShardedScriptHashHead {
                 .collect();
             let rem = self.shards[si].insert_many_no_rehash(&mapped, allow_new)?;
             for (hk, hv) in rem {
-                if let Some((full, _)) = bucket.iter().find(|(f, _)| head_key_from_full(f) == hk)
-                {
+                if let Some((full, _)) = bucket.iter().find(|(f, _)| head_key_from_full(f) == hk) {
                     remainder.push((*full, hv));
                 } else {
                     let mut full = [0u8; 32];

@@ -29,7 +29,10 @@ struct U64IdentityHasher(u64);
 impl Hasher for U64IdentityHasher {
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3).wrapping_add(u64::from(b));
+            self.0 = self
+                .0
+                .wrapping_mul(0x1000_0000_01b3)
+                .wrapping_add(u64::from(b));
         }
     }
     fn write_u64(&mut self, i: u64) {
@@ -216,10 +219,7 @@ fn bench_u64_height_maps() {
         &format!("write sorted Vec u64→u32 sequential+bsearch x{N_PARENTS}"),
         ITERS * 2,
         || {
-            let v: Vec<(u64, u32)> = keys
-                .iter()
-                .map(|&k| (k, (k % 1_000_000) as u32))
-                .collect();
+            let v: Vec<(u64, u32)> = keys.iter().map(|&k| (k, (k % 1_000_000) as u32)).collect();
             // already sorted by construction
             let mut s = 0u32;
             for &k in &keys {
@@ -283,15 +283,11 @@ fn bench_scripts_pack() {
     let jobs: Vec<JobBytes> = (0..n_jobs)
         .map(|i| p2wpkh_job(((i % 200) + 1) as u8))
         .collect();
-    bench(
-        &format!("scripts sequential verify x{n_jobs}"),
-        8,
-        || {
-            for j in &jobs {
-                let _ = black_box(script_bench::verify_job(j));
-            }
-        },
-    );
+    bench(&format!("scripts sequential verify x{n_jobs}"), 8, || {
+        for j in &jobs {
+            let _ = black_box(script_bench::verify_job(j));
+        }
+    });
     bench(
         &format!("scripts rayon par_iter verify x{n_jobs}"),
         8,

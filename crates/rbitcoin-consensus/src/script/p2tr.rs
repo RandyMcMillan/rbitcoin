@@ -233,6 +233,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         (job, control)
     }
@@ -308,6 +309,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
@@ -375,6 +377,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
     }
@@ -442,6 +445,7 @@ mod bip341_tests {
                 witness_pubkeytype: false,
                 witness_active: true,
                 discourage_upgradable_witness: false,
+                const_scriptcode: false,
             };
             let err = script::verify_job_all_inputs(&job).unwrap_err();
             assert!(
@@ -482,6 +486,7 @@ mod bip341_tests {
                 witness_pubkeytype: false,
                 witness_active: true,
                 discourage_upgradable_witness: false,
+                const_scriptcode: false,
             };
             script::verify_job_all_inputs(&job).expect("key path + annex");
         }
@@ -552,6 +557,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("empty annex payload");
     }
@@ -646,6 +652,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("script path + annex CHECKSIG");
     }
@@ -728,6 +735,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("two-leaf script path");
     }
@@ -846,6 +854,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("CODESEPARATOR chain must verify");
     }
@@ -895,6 +904,7 @@ mod bip341_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(script::verify_job_all_inputs(&job).is_err());
     }

@@ -127,6 +127,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         let err = verify(&job, 0, &*job.tx, &mut cache).unwrap_err();

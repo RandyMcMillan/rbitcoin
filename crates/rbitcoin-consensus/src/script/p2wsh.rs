@@ -30,6 +30,17 @@ pub(crate) fn verify_with_scripthash(
     if input.witness.is_empty() {
         return Err(ConsensusError::Script("p2wsh empty witness".into()));
     }
+    // BIP141: every witness stack element (incl. script) ≤ MAX_SCRIPT_ELEMENT_SIZE.
+    const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+    for i in 0..input.witness.len() {
+        let item = input
+            .witness
+            .nth(i)
+            .ok_or_else(|| ConsensusError::Script("p2wsh witness".into()))?;
+        if item.len() > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err(ConsensusError::Script("PUSH_SIZE".into()));
+        }
+    }
     // Last witness element is the script; remaining are stack.
     let wit_len = input.witness.len();
     let script_bytes = input
@@ -115,6 +126,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(verify(&job, 0, &*job.tx).is_err());
 

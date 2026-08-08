@@ -735,6 +735,8 @@ pub struct ScriptCheckJob {
     pub(crate) witness_active: bool,
     /// SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM.
     pub(crate) discourage_upgradable_witness: bool,
+    /// SCRIPT_VERIFY_CONST_SCRIPTCODE: CODESEPARATOR + FindAndDelete hard-fail.
+    pub(crate) const_scriptcode: bool,
 }
 
 impl ScriptCheckJob {
@@ -788,13 +790,15 @@ impl ScriptCheckJob {
             nullfail: false,
             low_s: false,
             strictenc: false,
-            null_dummy: false,
+            // BIP147 co-activated with CSV on mainnet (bip112 height).
+            null_dummy: bip112_active,
             minimal_data: false,
             witness_pubkeytype: false,
             // Production post-segwit path always has witness rules; pre-segwit
             // txs have empty witnesses so checks are no-ops.
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         }
     }
 
@@ -824,11 +828,13 @@ impl ScriptCheckJob {
             nullfail: false,
             low_s: false,
             strictenc: false,
-            null_dummy: false,
+            // BIP147 co-activated with CSV on mainnet (bip112 height).
+            null_dummy: bip112_active,
             minimal_data: false,
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         }
     }
 }
@@ -1449,7 +1455,7 @@ pub(crate) fn structural_validate_spends(
     // can false-hit Class A rows / BIP30 siblings and reject valid same-block
     // edges (mainnet 961461 tip stall).
     let _ = null_create_keys; // same-block keys: pending only (no durable probe)
-    // Multi-list walks are protocol cold; same-block no longer probes store.
+                              // Multi-list walks are protocol cold; same-block no longer probes store.
     let spent_cold_ns = multi_list_ns;
 
     // Order-sensitive pending double-spend + durable rejection.
@@ -1511,7 +1517,8 @@ pub(crate) fn structural_validate_spends(
         .coinbase_fk_at_heights(&height_list)
         .map_err(ConsensusError::from)?;
 
-    let mut seen_create: rbitcoin_query::U64Set = rbitcoin_query::U64Set::with_capacity_and_hasher(vouts_by_create.len(), Default::default());
+    let mut seen_create: rbitcoin_query::U64Set =
+        rbitcoin_query::U64Set::with_capacity_and_hasher(vouts_by_create.len(), Default::default());
     for &(_ptid, _vout, _sfk, create_fk) in spends {
         if create_fk.is_null() {
             continue;
@@ -1622,11 +1629,7 @@ pub(crate) fn structural_validate_spends(
 }
 
 /// [`crate::header::median_time_past`] with a write-run cache keyed by end height.
-fn mtp_at(
-    query: &Query,
-    height: Height,
-    cache: &mut U32Map<u32>,
-) -> Result<u32, ConsensusError> {
+fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32, ConsensusError> {
     if let Some(&t) = cache.get(&height.0) {
         return Ok(t);
     }
@@ -1657,11 +1660,27 @@ pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), Consensu
         .try_for_each(|job| verify_one_script_job(*job))
 }
 
+/// Whether this job can skip `verify_job_all_inputs`.
+///
+/// OP_TRUE scriptPubKey alone is **not** sufficient: Core still
+/// `EvalScript(scriptSig)` (CLTV/CSV may live there). Only skip when every
+/// input is a pure ACS spend (empty scriptSig + empty witness + OP_TRUE spk).
 #[inline]
 fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
-    job.prevouts
-        .iter()
-        .any(|p| !is_anyone_can_spend(p.script_pubkey.as_script()))
+    let tx: &bitcoin::Transaction = &*job.tx;
+    for (i, prev) in job.prevouts.iter().enumerate() {
+        if !is_anyone_can_spend(prev.script_pubkey.as_script()) {
+            return true;
+        }
+        let Some(vin) = tx.input.get(i) else {
+            return true;
+        };
+        if !vin.script_sig.is_empty() || !vin.witness.is_empty() {
+            return true;
+        }
+    }
+    // All pure OP_TRUE + empty scriptSig/witness — nothing to evaluate.
+    false
 }
 
 #[inline]
@@ -1886,8 +1905,7 @@ fn resolve_prevout(
                 // (schema-13 zero identity, wrong denserels stamp) — hard fail.
                 // Do **not** soft-cold recover; fill pin identity at load instead.
                 let _ = parent_txid;
-                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N
-                    .fetch_add(1, Ordering::Relaxed);
+                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N.fetch_add(1, Ordering::Relaxed);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_txid_mismatch();
                 return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
@@ -3227,8 +3245,8 @@ mod structure_rule_tests {
             confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_write_phase,
             ColdPinMode, ScriptPreverified,
         };
-        use std::sync::Arc;
         use rbitcoin_query::Query;
+        use std::sync::Arc;
         use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
@@ -3347,12 +3365,7 @@ mod structure_rule_tests {
         let tx_a = spend_acs(c1_txid, 0, Amount::from_sat(49_0000_0000));
         let tx_a_id = tx_a.compute_txid();
         let tx_b = spend_acs(tx_a_id, 0, Amount::from_sat(48_0000_0000));
-        let b_s1 = mine_with(
-            tip,
-            tip_time + 600,
-            h_spend,
-            vec![tx_a, tx_b],
-        );
+        let b_s1 = mine_with(tip, tip_time + 600, h_spend, vec![tx_a, tx_b]);
         accept_and_archive_block(&q, &params, Height(h_spend), &b_s1, ms).unwrap();
         assert_eq!(q.tip_height().map(|h| h.0), Some(maturity + 2));
         // IBD rehydrate path: stamp → load(Forbid) must not miss denserels stage
@@ -3432,8 +3445,7 @@ mod structure_rule_tests {
             let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
             let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
             let parents = BatchParents::new();
-            let ctx =
-                ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
+            let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
             let mut pending = HashSet::new();
             let mut mtp = U32Map::default();
             let mut meta = U64Map::default();

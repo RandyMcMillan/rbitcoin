@@ -94,9 +94,18 @@ fn assemble_script(src: &str) -> Result<Vec<u8>, String> {
         if tok.is_empty() {
             continue;
         }
+        // Core ParseScript: -1, 0, 1..16 are single opcodes (MINIMALDATA-safe).
         if let Ok(n) = tok.parse::<i64>() {
-            let enc = encode_scriptnum(n);
-            push_data(&mut out, &enc);
+            if n == 0 {
+                out.push(0x00);
+            } else if n == -1 {
+                out.push(0x4f);
+            } else if (1..=16).contains(&n) {
+                out.push(0x50 + n as u8);
+            } else {
+                let enc = encode_scriptnum(n);
+                push_data(&mut out, &enc);
+            }
             continue;
         }
         let op = opcode_byte(tok).ok_or_else(|| format!("unknown token {tok}"))?;
@@ -305,7 +314,8 @@ fn opcode_byte(name: &str) -> Option<u8> {
     None
 }
 
-#[derive(Clone, Debug)]
+/// Script flags we implement for Core tx corpora.
+#[derive(Clone, Debug, Default)]
 struct TxFlags {
     p2sh: bool,
     dersig: bool,
@@ -320,24 +330,44 @@ struct TxFlags {
     minimal_data: bool,
     discourage_upgradable_witness: bool,
     witness_pubkeytype: bool,
+    /// SCRIPT_VERIFY_CONST_SCRIPTCODE: reject CODESEPARATOR / FindAndDelete hits.
+    const_scriptcode: bool,
+    /// SCRIPT_VERIFY_CLEANSTACK (witness cleanstack after eval).
+    cleanstack: bool,
+    /// SCRIPT_VERIFY_SIGPUSHONLY.
+    sig_push_only: bool,
+    /// SCRIPT_VERIFY_MINIMALIF.
+    minimal_if: bool,
+    /// Core fixture token: CheckTransaction fails (no script verify).
+    badtx: bool,
 }
 
-fn parse_tx_flags(s: &str) -> TxFlags {
-    let mut f = TxFlags {
-        p2sh: false,
-        dersig: false,
-        cltv: false,
-        csv: false,
-        witness: false,
-        taproot: false,
-        low_s: false,
-        strictenc: false,
-        nullfail: false,
-        null_dummy: false,
-        minimal_data: false,
-        discourage_upgradable_witness: false,
-        witness_pubkeytype: false,
-    };
+/// All named flags we can enable for inverted `tx_valid` semantics.
+fn all_implemented_flags() -> TxFlags {
+    TxFlags {
+        p2sh: true,
+        dersig: true,
+        cltv: true,
+        csv: true,
+        witness: true,
+        taproot: true,
+        low_s: true,
+        strictenc: true,
+        nullfail: true,
+        null_dummy: true,
+        minimal_data: true,
+        discourage_upgradable_witness: true,
+        witness_pubkeytype: true,
+        const_scriptcode: true,
+        cleanstack: true,
+        sig_push_only: true,
+        minimal_if: true,
+        badtx: false,
+    }
+}
+
+fn parse_named_flag_bits(s: &str) -> TxFlags {
+    let mut f = TxFlags::default();
     if s.is_empty() || s.eq_ignore_ascii_case("NONE") {
         return f;
     }
@@ -365,10 +395,97 @@ fn parse_tx_flags(s: &str) -> TxFlags {
             }
             "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => f.discourage_upgradable_witness = true,
             "WITNESS_PUBKEYTYPE" => f.witness_pubkeytype = true,
+            "CONST_SCRIPTCODE" => f.const_scriptcode = true,
+            "CLEANSTACK" => {
+                f.cleanstack = true;
+                // Core FillFlags: CLEANSTACK implies WITNESS (and WITNESS implies P2SH).
+                f.witness = true;
+                f.p2sh = true;
+            }
+            "SIGPUSHONLY" => f.sig_push_only = true,
+            "MINIMALIF" => f.minimal_if = true,
+            "BADTX" => f.badtx = true,
             _ => {}
         }
     }
+    // Core FillFlags: WITNESS implies P2SH.
+    if f.witness {
+        f.p2sh = true;
+    }
     f
+}
+
+/// Core `tx_valid.json`: flags string lists flags that stay **unset**; all others on.
+/// `NONE` → all implemented flags enabled.
+fn parse_tx_valid_flags(s: &str) -> TxFlags {
+    let disabled = parse_named_flag_bits(s);
+    let mut f = all_implemented_flags();
+    // Disable bits listed in the fixture string.
+    if disabled.p2sh {
+        f.p2sh = false;
+    }
+    if disabled.dersig {
+        f.dersig = false;
+    }
+    if disabled.cltv {
+        f.cltv = false;
+    }
+    if disabled.csv {
+        f.csv = false;
+    }
+    if disabled.witness {
+        f.witness = false;
+    }
+    if disabled.taproot {
+        f.taproot = false;
+    }
+    if disabled.low_s {
+        f.low_s = false;
+    }
+    if disabled.strictenc {
+        f.strictenc = false;
+    }
+    if disabled.nullfail {
+        f.nullfail = false;
+    }
+    if disabled.null_dummy {
+        f.null_dummy = false;
+    }
+    if disabled.minimal_data {
+        f.minimal_data = false;
+    }
+    if disabled.discourage_upgradable_witness {
+        f.discourage_upgradable_witness = false;
+    }
+    if disabled.witness_pubkeytype {
+        f.witness_pubkeytype = false;
+    }
+    if disabled.const_scriptcode {
+        f.const_scriptcode = false;
+    }
+    if disabled.cleanstack {
+        f.cleanstack = false;
+    }
+    if disabled.sig_push_only {
+        f.sig_push_only = false;
+    }
+    if disabled.minimal_if {
+        f.minimal_if = false;
+    }
+    // Re-apply FillFlags implications after disables.
+    if f.cleanstack {
+        f.witness = true;
+        f.p2sh = true;
+    }
+    if f.witness {
+        f.p2sh = true;
+    }
+    f
+}
+
+/// Core `tx_invalid.json`: flags string lists flags that are **set** (except BADTX).
+fn parse_tx_invalid_flags(s: &str) -> TxFlags {
+    parse_named_flag_bits(s)
 }
 
 /// Parse one prevout entry: [txid_hex, vout, scriptPubKey_scriptlang, amount?]
@@ -390,11 +507,15 @@ fn parse_prevout(cell: &Value) -> Result<(bitcoin::Txid, u32, TxOut), String> {
         .unwrap_or(0) as u32;
     let spk_s = a[2].as_str().ok_or("scriptPubKey")?;
     let spk = ScriptBuf::from_bytes(assemble_script(spk_s)?);
+    // Core tx_valid/tx_invalid amounts are integer **satoshis** (not BTC floats).
     let value = if a.len() >= 4 {
-        if let Some(n) = a[3].as_f64() {
-            Amount::from_sat((n * 100_000_000.0).round().max(0.0) as u64)
-        } else if let Some(n) = a[3].as_u64() {
+        if let Some(n) = a[3].as_u64() {
             Amount::from_sat(n)
+        } else if let Some(n) = a[3].as_i64() {
+            Amount::from_sat(n.max(0) as u64)
+        } else if let Some(n) = a[3].as_f64() {
+            // Integer-valued JSON numbers may appear as f64.
+            Amount::from_sat(n.max(0.0).round() as u64)
         } else {
             Amount::ZERO
         }
@@ -411,7 +532,59 @@ fn parse_prevout(cell: &Value) -> Result<(bitcoin::Txid, u32, TxOut), String> {
     ))
 }
 
-fn verify_tx_row(prevouts_json: &Value, tx_hex: &str, flags_s: &str) -> Result<(), String> {
+/// Core `CheckTransaction` (context-free structural consensus checks).
+fn check_transaction_struct(tx: &Transaction) -> Result<(), String> {
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    if tx.input.is_empty() {
+        return Err("BADTX: vin empty".into());
+    }
+    if tx.output.is_empty() {
+        return Err("BADTX: vout empty".into());
+    }
+    // Output value range + sum (CVE-2010-5139).
+    let mut n_value_out: u64 = 0;
+    for o in &tx.output {
+        let v = o.value.to_sat();
+        // rust-bitcoin Amount is non-negative; oversized still possible.
+        if v > MAX_MONEY {
+            return Err("BADTX: vout toolarge".into());
+        }
+        n_value_out = n_value_out
+            .checked_add(v)
+            .ok_or_else(|| "BADTX: vouttotal toolarge".to_string())?;
+        if n_value_out > MAX_MONEY {
+            return Err("BADTX: vouttotal toolarge".into());
+        }
+    }
+    // Duplicate inputs (CVE-2018-17144).
+    let mut seen = std::collections::HashSet::new();
+    for vin in &tx.input {
+        let key = (vin.previous_output.txid, vin.previous_output.vout);
+        if !seen.insert(key) {
+            return Err("BADTX: inputs duplicate".into());
+        }
+    }
+    if tx.is_coinbase() {
+        let ss = tx.input[0].script_sig.as_bytes().len();
+        if !(2..=100).contains(&ss) {
+            return Err("BADTX: bad-cb-length".into());
+        }
+    } else {
+        for vin in &tx.input {
+            if vin.previous_output.is_null() {
+                return Err("BADTX: prevout null".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_tx_row(
+    prevouts_json: &Value,
+    tx_hex: &str,
+    flags_s: &str,
+    expect_ok: bool,
+) -> Result<(), String> {
     let prev_arr = prevouts_json
         .as_array()
         .ok_or_else(|| "prevouts not array".to_string())?;
@@ -423,6 +596,13 @@ fn verify_tx_row(prevouts_json: &Value, tx_hex: &str, flags_s: &str) -> Result<(
     }
     let tx_bytes = decode_hex(tx_hex)?;
     let tx: Transaction = deserialize(&tx_bytes).map_err(|e| format!("tx deser: {e}"))?;
+
+    // Core: BADTX / CheckTransaction failures reject the tx (no script verify).
+    // Harness for expect_ok=false requires Err; for expect_ok=true requires Ok.
+    if let Err(e) = check_transaction_struct(&tx) {
+        return Err(e);
+    }
+
     let mut prevouts = Vec::with_capacity(tx.input.len());
     for vin in &tx.input {
         let key = (vin.previous_output.txid, vin.previous_output.vout);
@@ -432,7 +612,20 @@ fn verify_tx_row(prevouts_json: &Value, tx_hex: &str, flags_s: &str) -> Result<(
             .ok_or_else(|| format!("missing prevout {key:?}"))?;
         prevouts.push(po);
     }
-    let flags = parse_tx_flags(flags_s);
+    // Core: tx_valid uses ~flags; tx_invalid uses flags as enable set.
+    let flags = if expect_ok {
+        parse_tx_valid_flags(flags_s)
+    } else {
+        parse_tx_invalid_flags(flags_s)
+    };
+    // SIGPUSHONLY: enforce on scriptSigs when flag set.
+    if flags.sig_push_only {
+        for vin in &tx.input {
+            let mut tmp = Vec::new();
+            script::interpreter::eval_script_sig_pushes(vin.script_sig.as_script(), &mut tmp)
+                .map_err(|_| "SIG_PUSHONLY".to_string())?;
+        }
+    }
     let job = ScriptCheckJob {
         txid: tx.compute_txid().to_byte_array(),
         prevouts,
@@ -442,74 +635,22 @@ fn verify_tx_row(prevouts_json: &Value, tx_hex: &str, flags_s: &str) -> Result<(
         bip66_active: flags.dersig || flags.strictenc || flags.low_s,
         bip16_active: flags.p2sh,
         taproot_active: flags.taproot,
-        minimal_if: false,
+        minimal_if: flags.minimal_if,
         nullfail: flags.nullfail,
         low_s: flags.low_s,
         strictenc: flags.strictenc,
         null_dummy: flags.null_dummy,
         minimal_data: flags.minimal_data,
         witness_pubkeytype: flags.witness_pubkeytype,
-        // Only enforce WITNESS_* rules when SCRIPT_VERIFY_WITNESS is set (fixtures).
         witness_active: flags.witness,
         discourage_upgradable_witness: flags.discourage_upgradable_witness,
+        const_scriptcode: flags.const_scriptcode,
     };
     script::verify_job_all_inputs(&job).map_err(|e| format!("{e}"))
 }
 
 /// Explicit allowlist: (fixture file, json array index, reason).
-const TX_ALLOWLIST: &[(&str, usize, &str)] = &[
-    ("tx_invalid.json", 22, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 24, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 26, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 28, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 30, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 33, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 36, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 38, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 39, "BADTX structural pre-script checks not in verify path"),
-    ("tx_invalid.json", 141, "witness malleation/unexpected residual on invalid corpus"),
-    ("tx_invalid.json", 149, "witness malleation/unexpected residual on invalid corpus"),
-    ("tx_invalid.json", 157, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM residual on invalid corpus"),
-    ("tx_invalid.json", 181, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 182, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 183, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 190, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 192, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 194, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 195, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 197, "CONST_SCRIPTCODE not implemented"),
-    ("tx_invalid.json", 199, "CONST_SCRIPTCODE not implemented"),
-    ("tx_valid.json", 9, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 13, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 16, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 18, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 20, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 28, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 30, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 33, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 56, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 67, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 70, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 71, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 72, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 73, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 76, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 77, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 79, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 81, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 83, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 85, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 87, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 89, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 93, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 98, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 115, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 121, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 153, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 207, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 211, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-    ("tx_valid.json", 213, "tx residual: CMS/CHECKSIG encoding or CONST_SCRIPTCODE/sighash gap"),
-];
+const TX_ALLOWLIST: &[(&str, usize, &str)] = &[];
 
 fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String>) {
     let rows = load_array(name);
@@ -539,7 +680,7 @@ fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String
         };
         let flags_s = cells[2].as_str().unwrap_or("NONE");
         total += 1;
-        let got = verify_tx_row(&cells[0], tx_hex, flags_s);
+        let got = verify_tx_row(&cells[0], tx_hex, flags_s, expect_ok);
         let ok = if expect_ok { got.is_ok() } else { got.is_err() };
         if ok {
             pass += 1;
@@ -578,7 +719,7 @@ fn tx_allowlist_has_no_stale_entries() {
             continue;
         };
         let flags_s = cells[2].as_str().unwrap_or("NONE");
-        let got = verify_tx_row(&cells[0], tx_hex, flags_s);
+        let got = verify_tx_row(&cells[0], tx_hex, flags_s, expect_ok);
         let ok = if expect_ok { got.is_ok() } else { got.is_err() };
         if ok {
             stale.push((file, idx, reason));
@@ -645,7 +786,7 @@ fn core_tx_spot_first_valid_accepts() {
         };
         let flags = cells[2].as_str().unwrap_or("NONE");
         tried += 1;
-        if verify_tx_row(&cells[0], tx_hex, flags).is_ok() {
+        if verify_tx_row(&cells[0], tx_hex, flags, true).is_ok() {
             return;
         }
         if tried >= 40 {

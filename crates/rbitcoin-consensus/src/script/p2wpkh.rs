@@ -152,6 +152,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         }
     }
 

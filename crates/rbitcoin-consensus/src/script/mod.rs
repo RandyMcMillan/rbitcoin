@@ -85,51 +85,48 @@ pub(crate) fn verify_input(
     let input = &tx.input[input_index];
     let has_witness = !input.witness.is_empty();
 
-    // SCRIPT_VERIFY_WITNESS malleation / unexpected / program-shape rules.
+    // SCRIPT_VERIFY_WITNESS: BIP141 native witness programs (any version).
+    // Must run before bare/ACS paths so unknown versions are not EvalScript'd
+    // as legacy and non-empty scriptSig is always WITNESS_MALLEATED.
     if job.witness_active {
-        let kind = classify::classify(spk);
-        let is_wit_prog = matches!(
-            kind,
-            ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr
-        );
-        if is_wit_prog {
-            // Native witness program: scriptSig must be empty.
+        if let Some((version, program)) = classify::witness_program(spk) {
             if !input.script_sig.is_empty() {
                 return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
             }
-            // v0 length: P2WPKH=22, P2WSH=34. Wrong length → wrong program.
-            let b = spk.as_bytes();
-            if b.first() == Some(&0x00) && b.len() != 22 && b.len() != 34 {
-                return Err(ConsensusError::Script("WITNESS_PROGRAM_WRONG_LENGTH".into()));
-            }
-            // Future witness versions (not v0/v1-taproot handled paths).
-            if b.first().is_some_and(|&v| v >= 0x52 && v <= 0x60) || // OP_2..OP_16
-                (b.first() == Some(&0x51) && b.len() != 34)
-            // OP_1 but not P2TR size
-            {
-                if job.discourage_upgradable_witness {
+            match (version, program.len()) {
+                (0, 20) => return p2wpkh::verify(job, input_index, tx, cache),
+                (0, 32) => return p2wsh::verify(job, input_index, tx),
+                (0, _) => {
                     return Err(ConsensusError::Script(
-                        "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
+                        "WITNESS_PROGRAM_WRONG_LENGTH".into(),
                     ));
                 }
-                // Without discourage: unknown witness version is anyone-can-spend.
-                return Ok(());
+                (1, 32) if job.taproot_active => {
+                    return p2tr::verify(job, input_index, tx, cache);
+                }
+                _ => {
+                    // Unknown version (incl. pre-taproot v1, v2..v16, v1 wrong len).
+                    if job.discourage_upgradable_witness {
+                        return Err(ConsensusError::Script(
+                            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
+                        ));
+                    }
+                    // BIP141: unknown version is anyone-can-spend (witness ignored).
+                    return Ok(());
+                }
             }
-        } else if matches!(kind, ScriptKind::P2sh) && job.bip16_active {
-            // P2SH may wrap a witness program: scriptSig must be a *single* push of redeem.
-            // Extra items → WITNESS_MALLEATED_P2SH when redeem is a witness program.
-            // Detected after redeem is known in nested path; pre-check non-push below.
+        }
+        let kind = classify::classify(spk);
+        if matches!(kind, ScriptKind::P2sh) && job.bip16_active {
+            // Nested P2SH-witness: handled in P2SH branch below.
         } else if has_witness {
             // Non-witness program with non-empty witness.
             return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
         }
     }
 
-    if is_anyone_can_spend(spk) {
-        return Ok(());
-    }
-
     // Without SCRIPT_VERIFY_WITNESS, v0/v1 programs are bare scripts (OP_0/OP_1 + push).
+    // OP_TRUE is *not* short-circuited: Core still EvalScript(scriptSig) first (CLTV/CSV).
     let kind = if job.witness_active {
         classify::classify(spk)
     } else {
@@ -176,7 +173,8 @@ pub(crate) fn verify_input(
         }
         ScriptKind::P2wsh => p2wsh::verify(job, input_index, tx),
         ScriptKind::P2tr => {
-            // Pre-activation: witness v1 is anyone-can-spend (BIP141 unknown version).
+            // Pre-activation path is handled above via witness_program when
+            // witness_active; without witness flag, treat as bare.
             if !job.taproot_active {
                 if job.discourage_upgradable_witness {
                     return Err(ConsensusError::Script(
@@ -187,36 +185,7 @@ pub(crate) fn verify_input(
             }
             p2tr::verify(job, input_index, tx, cache)
         }
-        ScriptKind::Bare => {
-            if job.witness_active && has_witness {
-                // Bare scripts that *look* like future witness programs.
-                let b = spk.as_bytes();
-                if !b.is_empty()
-                    && ((b[0] >= 0x51 && b[0] <= 0x60) || b[0] == 0x00)
-                    && b.len() >= 2
-                    && b[1] >= 2
-                    && b[1] <= 40
-                    && b.len() == 2 + b[1] as usize
-                {
-                    // Is a witness program shape but not standard v0/v1 size we handle.
-                    if b[0] == 0x00 && b.len() != 22 && b.len() != 34 {
-                        return Err(ConsensusError::Script("WITNESS_PROGRAM_WRONG_LENGTH".into()));
-                    }
-                    if job.discourage_upgradable_witness {
-                        return Err(ConsensusError::Script(
-                            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
-                        ));
-                    }
-                    // Unknown version anyone-can-spend.
-                    if !input.script_sig.is_empty() {
-                        return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
-                    }
-                    return Ok(());
-                }
-                return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
-            }
-            verify_bare(job, input_index, tx, prevout)
-        }
+        ScriptKind::Bare => verify_bare(job, input_index, tx, prevout),
     }
 }
 
@@ -732,6 +701,7 @@ mod verify_routing_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(verify_job_all_inputs(&job).is_ok());
 
@@ -761,6 +731,7 @@ mod verify_routing_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache = bitcoin::sighash::SighashCache::new(&*job2.tx);
         assert!(verify_input(&job2, 0, &*job2.tx, &mut cache).is_err());
@@ -839,6 +810,7 @@ mod verify_routing_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         verify_job_all_inputs(&job).expect("pre-taproot v1 ACS");
     }
@@ -986,6 +958,7 @@ mod verify_routing_tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         // Bare HASH160 equal of zeros vs hash160([]) — should fail script, not p2sh redeem.
         let err = verify_job_all_inputs(&job).unwrap_err();

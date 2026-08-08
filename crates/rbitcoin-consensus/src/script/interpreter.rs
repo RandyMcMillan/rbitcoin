@@ -155,6 +155,8 @@ pub(crate) struct EvalContext<'a> {
     pub minimal_if: bool,
     /// Core `SCRIPT_VERIFY_WITNESS_PUBKEYTYPE`: only compressed keys in witness scripts.
     pub witness_pubkeytype: bool,
+    /// Core `SCRIPT_VERIFY_CONST_SCRIPTCODE`.
+    pub const_scriptcode: bool,
     /// BIP342: instruction index of last executed OP_CODESEPARATOR, or `0xFFFFFFFF`.
     ///
     /// Counted like Core's `opcode_pos` (one per GetOp/instruction, not byte offset).
@@ -218,6 +220,7 @@ impl<'a> EvalContext<'a> {
             null_dummy: false,
             minimal_if: false,
             witness_pubkeytype: false,
+            const_scriptcode: false,
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(SighashCache::new(tx)),
@@ -233,6 +236,7 @@ impl<'a> EvalContext<'a> {
         self.null_dummy = job.null_dummy;
         self.minimal_if = job.minimal_if;
         self.witness_pubkeytype = job.witness_pubkeytype;
+        self.const_scriptcode = job.const_scriptcode;
         if job.low_s || job.strictenc {
             self.bip66_active = true;
         }
@@ -418,6 +422,10 @@ pub(crate) fn eval_script(
                     return Err(ConsensusError::Script(format!(
                         "disabled opcode 0x{code:02x}"
                     )));
+                }
+                // CONST_SCRIPTCODE: OP_CODESEPARATOR rejected in Base even unexecuted.
+                if code == 0xab && ctx.const_scriptcode && ctx.sig_version == SigVersion::Base {
+                    return Err(ConsensusError::Script("OP_CODESEPARATOR".into()));
                 }
 
                 if !executing {
@@ -721,10 +729,13 @@ pub(crate) fn eval_script(
                     }
                     0xab => {
                         // OP_CODESEPARATOR:
+                        // - CONST_SCRIPTCODE: reject in Base (even unexecuted).
                         // - Tapscript (BIP342): instruction index for leaf sighash.
                         // - Base / WitnessV0: subsequent CHECKSIG* use scriptCode =
                         //   everything **after** this opcode (Core pbegincodehash).
-                        //   Signet 277442: CSV+CODESEPARATOR+P2PKH-shaped WSH leaves.
+                        if ctx.const_scriptcode && ctx.sig_version == SigVersion::Base {
+                            return Err(ConsensusError::Script("OP_CODESEPARATOR".into()));
+                        }
                         ctx.codeseparator_pos.set(this_pos);
                         // One-byte opcode; suffix starts at the next byte.
                         ctx.codeseparator_script_off
@@ -986,20 +997,23 @@ fn op_checkmultisig(
         sigs.push(pop(stack)?);
     }
     let dummy = pop(stack)?;
-    // BIP147 NULLDUMMY: extra stack element must be empty. Softfork co-activated
-    // with CSV on mainnet; always required for Witness v0 (segwit). Also when the
-    // SCRIPT_VERIFY_NULLDUMMY flag is set (fixtures / policy).
-    if !dummy.is_empty()
-        && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active || ctx.null_dummy)
-    {
+    // BIP147 NULLDUMMY: extra stack element must be empty.
+    // Always required for Witness v0; for Base when SCRIPT_VERIFY_NULLDUMMY is set.
+    // (Independent of CSV: Core treats the flags separately even though they
+    // co-activated on mainnet.)
+    if !dummy.is_empty() && (ctx.sig_version == SigVersion::WitnessV0 || ctx.null_dummy) {
         return Err(ConsensusError::Script("NULLDUMMY".into()));
     }
 
     // Core Base: FindAndDelete **all** sigs from scriptCode before the loop.
     let script_code_owned: Option<Vec<u8>> = if ctx.sig_version == SigVersion::Base {
         let mut sc = script_code_bytes(ctx).to_vec();
+        let original = sc.clone();
         for sig in &sigs {
             sc = find_and_delete(&sc, sig);
+        }
+        if ctx.const_scriptcode && sc != original {
+            return Err(ConsensusError::Script("SIG_FINDANDDELETE".into()));
         }
         Some(sc)
     } else {
@@ -1197,6 +1211,9 @@ fn checksig_legacy(
     ctx: &EvalContext<'_>,
     script_code_override: Option<&[u8]>,
 ) -> Result<bool, ConsensusError> {
+    // CMS passes script_code_override; NULLFAIL is applied after the whole
+    // multisig loop (Core), not per key attempt — so suppress here when override.
+    let apply_nullfail = ctx.nullfail && script_code_override.is_none();
     if sig.is_empty() {
         return Ok(false);
     }
@@ -1231,7 +1248,7 @@ fn checksig_legacy(
         Ok(x) => x,
         // Pre-DERSIG: malformed DER that slipped encoding → soft false (NULLFAIL if set).
         Err(_) => {
-            if ctx.nullfail {
+            if apply_nullfail {
                 return Err(ConsensusError::Script("NULLFAIL".into()));
             }
             return Ok(false);
@@ -1241,7 +1258,7 @@ fn checksig_legacy(
         Ok(p) => p,
         Err(_) => {
             // Invalid key: STRICTENC already hard-failed hybrid; other bad keys soft-false.
-            if ctx.nullfail {
+            if apply_nullfail {
                 return Err(ConsensusError::Script("NULLFAIL".into()));
             }
             return Ok(false);
@@ -1249,11 +1266,16 @@ fn checksig_legacy(
     };
     let owned: Vec<u8>;
     let script_bytes: &[u8] = if let Some(sc) = script_code_override {
+        // CMS pre-deleted scriptCode; CONST_SCRIPTCODE checked at delete site.
         sc
     } else {
         let base = script_code_bytes(ctx);
         if ctx.sig_version == SigVersion::Base {
-            owned = find_and_delete(base, sig);
+            let deleted = find_and_delete(base, sig);
+            if ctx.const_scriptcode && deleted.as_slice() != base {
+                return Err(ConsensusError::Script("SIG_FINDANDDELETE".into()));
+            }
+            owned = deleted;
             owned.as_slice()
         } else {
             base
@@ -1262,14 +1284,14 @@ fn checksig_legacy(
     let sighash = match sighash_for_script(ctx, sighash_ty, script_bytes) {
         Ok(h) => h,
         Err(_) => {
-            if ctx.nullfail {
+            if apply_nullfail {
                 return Err(ConsensusError::Script("NULLFAIL".into()));
             }
             return Ok(false);
         }
     };
     let ok = crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk);
-    if !ok && ctx.nullfail {
+    if !ok && apply_nullfail {
         return Err(ConsensusError::Script("NULLFAIL".into()));
     }
     Ok(ok)

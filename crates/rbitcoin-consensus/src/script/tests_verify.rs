@@ -73,6 +73,7 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     (job, true)
 }
@@ -161,6 +162,7 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).unwrap_or_else(|e| {
         panic!(
@@ -208,6 +210,7 @@ fn anyone_can_spend_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("op_true");
 }
@@ -253,6 +256,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("pre-taproot v1 ACS");
 }
@@ -296,6 +300,7 @@ fn empty_script_pubkey_rejects() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     assert!(
         script::verify_job_all_inputs(&job).is_err(),
@@ -373,6 +378,7 @@ fn p2pkh_valid_signature_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("valid p2pkh");
 }
@@ -423,6 +429,7 @@ fn p2wsh_op_true_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("p2wsh op_true");
 }
@@ -468,6 +475,7 @@ fn p2wsh_wrong_script_hash_rejects() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     assert!(script::verify_job_all_inputs(&job).is_err());
 }
@@ -546,6 +554,7 @@ fn p2sh_p2wpkh_nested_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("p2sh-p2wpkh");
 }
@@ -604,6 +613,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("p2sh multi-push legacy");
 }
@@ -647,6 +657,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("mainnet 183 high-S P2PK must verify");
 }
@@ -694,6 +705,7 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("hashtype 0 P2PKH must verify");
 }
@@ -749,6 +761,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("pre-BIP66 lax DER must verify");
 
@@ -910,6 +923,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("pre-BIP16 P2SH-shape must verify as bare");
 
@@ -970,6 +984,7 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job)
         .expect("bare CODESEPARATOR+CHECKMULTISIG scriptSig must verify");
@@ -1022,6 +1037,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job).expect("pre-BIP66 high-bit-S DER must verify");
 
@@ -1077,7 +1093,255 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
         witness_pubkeytype: false,
         witness_active: true,
         discourage_upgradable_witness: false,
+        const_scriptcode: false,
     };
     script::verify_job_all_inputs(&job)
         .expect("P2SH redeem with CODESEPARATOR must verify under Core scriptCode rules");
+}
+
+/// Core: OP_TRUE scriptPubKey still runs EvalScript(scriptSig). CLTV in scriptSig must fail.
+#[test]
+fn cltv_in_scriptsig_with_op_true_spk_enforced() {
+    // scriptSig: OP_1 CLTV; spk: OP_TRUE; locktime=0, seq non-final → CLTV fails (1 > 0).
+    let prevout = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51, 0xb1]), // 1 CLTV
+            sequence: Sequence::from_consensus(0),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(900),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: false,
+        bip66_active: false,
+        bip16_active: false,
+        taproot_active: false,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: false,
+        discourage_upgradable_witness: false,
+        const_scriptcode: false,
+    };
+    let err = script::verify_job_all_inputs(&job).expect_err("CLTV in scriptSig must run");
+    assert!(
+        format!("{err}").contains("CLTV"),
+        "expected CLTV failure, got {err}"
+    );
+}
+
+/// BIP141: unknown witness version is anyone-can-spend when not discouraged.
+#[test]
+fn unknown_witness_v16_accepts_without_discourage() {
+    // OP_16 + 20-byte program (same shape as Core tx_valid #197 vin1).
+    let mut spk = vec![0x60u8, 0x14];
+    spk.extend_from_slice(&[0x4cu8; 20]);
+    let prevout = TxOut {
+        value: Amount::from_sat(2_000),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[vec![0x01], vec![0x02]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: true,
+        discourage_upgradable_witness: false,
+        const_scriptcode: false,
+    };
+    script::verify_job_all_inputs(&job).expect("unknown v16 ACS without discourage");
+}
+
+/// BIP141: non-empty scriptSig on a witness program is WITNESS_MALLEATED.
+#[test]
+fn unknown_witness_v16_malleated_scriptsig() {
+    let spk = vec![0x60u8, 0x02, 0x00, 0x01];
+    let prevout = TxOut {
+        value: Amount::from_sat(2_000),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: true,
+        discourage_upgradable_witness: false,
+        const_scriptcode: false,
+    };
+    let err = script::verify_job_all_inputs(&job).expect_err("malleated");
+    assert!(
+        format!("{err}").contains("WITNESS_MALLEATED") || format!("{err}").contains("MALLEAT"),
+        "got {err}"
+    );
+}
+
+/// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM rejects unknown versions.
+#[test]
+fn unknown_witness_v16_discourage_rejects() {
+    let mut spk = vec![0x60u8, 0x21];
+    spk.extend_from_slice(&[0xffu8; 33]);
+    let prevout = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: true,
+        discourage_upgradable_witness: true,
+        const_scriptcode: false,
+    };
+    let err = script::verify_job_all_inputs(&job).expect_err("discourage");
+    assert!(format!("{err}").contains("DISCOURAGE"), "got {err}");
+}
+
+/// P2WSH witness stack elements must be ≤ MAX_SCRIPT_ELEMENT_SIZE (520).
+#[test]
+fn p2wsh_oversized_witness_element_rejected() {
+    // redeem: DROP TRUE
+    let redeem = vec![0x75u8, 0x51];
+    let hash = bitcoin::hashes::sha256::Hash::hash(&redeem);
+    let mut spk = vec![0x00u8, 0x20];
+    spk.extend_from_slice(hash.as_byte_array());
+    let prevout = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    };
+    let oversized = vec![0u8; 521];
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[oversized, redeem]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(900),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: true,
+        discourage_upgradable_witness: false,
+        const_scriptcode: false,
+    };
+    let err = script::verify_job_all_inputs(&job).expect_err("oversized element");
+    let s = format!("{err}");
+    assert!(
+        s.contains("PUSH_SIZE") || s.contains("element") || s.contains("520") || s.contains("size"),
+        "got {err}"
+    );
 }

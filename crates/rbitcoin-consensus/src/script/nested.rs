@@ -142,7 +142,9 @@ pub(crate) fn verify_p2sh_legacy(
 }
 
 /// Collect push-only items from scriptSig (OP_0 / OP_1..16 / PushBytes). Non-push → Err.
-fn push_only_items(script_sig: &bitcoin::script::ScriptBuf) -> Result<Vec<Vec<u8>>, ConsensusError> {
+fn push_only_items(
+    script_sig: &bitcoin::script::ScriptBuf,
+) -> Result<Vec<Vec<u8>>, ConsensusError> {
     let mut items = Vec::new();
     for ins in script_sig.instructions() {
         match ins.map_err(|_| ConsensusError::Script("p2sh scriptSig".into()))? {
@@ -313,6 +315,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
         let r = try_p2sh_p2wpkh(&job, 0, &*job.tx, &mut cache);
@@ -340,6 +343,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache2 = SighashCache::new(&*job2.tx);
         assert!(matches!(
@@ -378,6 +382,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(matches!(try_p2sh_p2wsh(&job3, 0, &*job3.tx), Some(Err(_))));
         // wrong hash
@@ -402,6 +407,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(matches!(try_p2sh_p2wsh(&job4, 0, &*job4.tx), Some(Err(_))));
 
@@ -429,6 +435,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut c5 = SighashCache::new(&*job5.tx);
         assert!(try_p2sh_p2wpkh(&job5, 0, &*job5.tx, &mut c5).is_none());
@@ -459,6 +466,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(verify_p2sh_legacy(&job_e, 0, &*job_e.tx).is_err());
         // Hash mismatch on legacy
@@ -485,6 +493,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(verify_p2sh_legacy(&job_h, 0, &*job_h.tx).is_err());
     }
@@ -522,6 +531,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         // Empty witness → p2wsh fails, but try_p2sh_p2wsh reached scripthash copy + call.
         assert!(matches!(try_p2sh_p2wsh(&job, 0, &*job.tx), Some(Err(_))));
@@ -556,6 +566,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job2.tx);
         assert!(matches!(
@@ -591,6 +602,7 @@ mod tests {
             witness_pubkeytype: false,
             witness_active: true,
             discourage_upgradable_witness: false,
+            const_scriptcode: false,
         };
         assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_ok());
 

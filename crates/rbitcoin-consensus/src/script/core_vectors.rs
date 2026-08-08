@@ -539,9 +539,7 @@ fn build_spend(credit: &Transaction, script_sig: ScriptBuf, witness: Witness) ->
 
 /// Core script_tests witness cell: hex items + optional `#SCRIPT#` / `#CONTROLBLOCK#`,
 /// ending with nValue (BTC). Returns optional Taproot output key for `#TAPROOTOUTPUT#`.
-fn parse_witness_and_amount(
-    first: &Value,
-) -> Result<(Witness, Amount, Option<[u8; 32]>), String> {
+fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount, Option<[u8; 32]>), String> {
     // Core: [wit_hex..., amount_number] inside first array element when present.
     let arr = first
         .as_array()
@@ -742,6 +740,7 @@ fn run_script_row(
             .extra
             .iter()
             .any(|e| e == "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"),
+        const_scriptcode: flags.extra.iter().any(|e| e == "CONST_SCRIPTCODE"),
     };
     verify_job_all_inputs(&job).map_err(|e| format!("{e}"))
 }
@@ -1194,7 +1193,3 @@ fn core_script_spot_invalid_false() {
     let got = run_script_row(&sig, &pk, Witness::new(), Amount::ZERO, &flags);
     assert!(got.is_err(), "0 EQUAL should reject, got {got:?}");
 }
-
-
-
-

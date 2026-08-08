@@ -20,8 +20,39 @@ pub(crate) enum ScriptKind {
 
 /// Core anyone-can-spend templates only. **Empty** `scriptPubKey` is **not** ACS
 /// (EvalScript leaves empty stack → fail without TRUE). Only explicit `OP_TRUE`.
+///
+/// **Not** a short-circuit past `EvalScript(scriptSig)`: Core still runs the
+/// scriptSig (CLTV/CSV may live there). Callers must evaluate scriptSig first
+/// or use the bare path.
 pub(crate) fn is_anyone_can_spend(script: &Script) -> bool {
     script.as_bytes() == [0x51] // OP_TRUE
+}
+
+/// BIP141 witness program: `OP_0`/`OP_1`..`OP_16` + a single push of 2..=40 bytes.
+/// Returns `(version, program)` where version is 0 for OP_0 and 1..=16 for OP_1..OP_16.
+pub(crate) fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
+    let b = script.as_bytes();
+    if b.len() < 4 || b.len() > 42 {
+        return None;
+    }
+    let version = match b[0] {
+        0x00 => 0u8,                 // OP_0
+        v @ 0x51..=0x60 => v - 0x50, // OP_1..OP_16 → 1..16
+        _ => return None,
+    };
+    let push_len = b[1] as usize;
+    // Direct push opcodes 0x02..0x28 only (BIP141 / Core IsWitnessProgram).
+    if !(2..=40).contains(&push_len) {
+        return None;
+    }
+    if b.len() != 2 + push_len {
+        return None;
+    }
+    // b[1] must itself be the push opcode (data length for small pushes).
+    if b[1] != push_len as u8 {
+        return None;
+    }
+    Some((version, &b[2..]))
 }
 
 pub(crate) fn classify(script: &Script) -> ScriptKind {
@@ -118,5 +149,20 @@ mod tests {
             classify(ScriptBuf::from_bytes(vec![0x52]).as_script()),
             ScriptKind::Bare
         );
+
+        // BIP141 witness programs.
+        let mut v16 = vec![0x60u8, 0x14];
+        v16.extend_from_slice(&[0x4cu8; 20]);
+        assert_eq!(
+            witness_program(ScriptBuf::from_bytes(v16).as_script()).map(|(v, p)| (v, p.len())),
+            Some((16, 20))
+        );
+        let mut v0 = vec![0x00u8, 0x14];
+        v0.extend_from_slice(&[0u8; 20]);
+        assert_eq!(
+            witness_program(ScriptBuf::from_bytes(v0).as_script()).map(|(v, p)| (v, p.len())),
+            Some((0, 20))
+        );
+        assert!(witness_program(ScriptBuf::from_bytes(vec![0x51]).as_script()).is_none());
     }
 }

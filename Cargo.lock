@@ -683,11 +683,13 @@ name = "rbitcoin-esplora"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bitcoin",
  "rbitcoin-electrum",
  "rbitcoin-log",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",
+ "serde_json",
  "tokio",
  "tower",
  "tower-http",

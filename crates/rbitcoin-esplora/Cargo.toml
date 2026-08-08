@@ -13,10 +13,12 @@ rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-electrum = { workspace = true }
+bitcoin = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

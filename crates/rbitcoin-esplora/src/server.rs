@@ -1,12 +1,17 @@
 //! Esplora HTTP listener (axum + tower limits).
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::Json;
 use axum::Router;
+use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::ServeLimits;
+use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
+use rbitcoin_store::StoreError;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -76,6 +81,10 @@ pub async fn run_esplora(
     let app = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
+        .route("/block-height/:height", get(block_height))
+        .route("/block/:hash/header", get(block_header))
+        .route("/tx/:txid/hex", get(tx_hex))
+        .route("/tx/:txid/status", get(tx_status))
         .fallback(fallback_404)
         .layer(TimeoutLayer::new(timeout))
         .layer(RequestBodyLimitLayer::new(max_body))
@@ -112,22 +121,116 @@ async fn tip_hash(State(st): State<AppState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "no chain tip").into_response();
     };
     match st.query.header_at_height(h) {
-        Ok(Some((_fk, rec))) => {
-            let hex = block_hash_hex(&rec.hash);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                hex,
-            )
-                .into_response()
-        }
+        Ok(Some((_fk, rec))) => plain_ok(block_hash_hex(&rec.hash)),
         Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, "no tip header").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
+/// `GET /block-height/:height` → display-order block hash (plain text).
+async fn block_height(State(st): State<AppState>, Path(height): Path<u32>) -> Response {
+    match st.query.header_at_height(Height(height)) {
+        Ok(Some((_fk, rec))) => plain_ok(block_hash_hex(&rec.hash)),
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
+/// `GET /block/:hash/header` → 80-byte header hex.
+async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
+    let Ok(hash) = parse_hash32(&hash_hex) else {
+        return not_found();
+    };
+    // Prefer best-chain height path (fills prev correctly for wire header).
+    match st.query.height_of_hash(&hash) {
+        Ok(Some(h)) => match st.query.wire_header_at_height(h) {
+            Ok(hdr) => match encode_header_hex(&hdr) {
+                Ok(hex) => plain_ok(hex),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            },
+            Err(e) => store_err(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
+/// `GET /tx/:txid/hex` → raw consensus-encoded transaction hex.
+async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
+    let Ok(txid) = parse_hash32(&txid_hex) else {
+        return not_found();
+    };
+    match st.query.get_tx_by_txid(&txid) {
+        Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+            Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
+            Err(e) => store_err(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
+/// `GET /tx/:txid/status` → Esplora confirmation status JSON.
+async fn tx_status(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
+    let Ok(txid) = parse_hash32(&txid_hex) else {
+        return not_found();
+    };
+    match st.query.get_tx_by_txid(&txid) {
+        Ok(Some((fk, _))) => match tx_status_json(&st.query, fk) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => store_err(e),
+    }
+}
+
 async fn fallback_404() -> Response {
+    not_found()
+}
+
+// --- shared helpers (status builder reused by full tx JSON in later steps) ---
+
+/// Esplora `status` object for a Class A tx fk (confirmed or not).
+pub(crate) fn tx_status_json(
+    query: &Query,
+    tx_fk: rbitcoin_primitives::Fk,
+) -> Result<Value, rbitcoin_query::QueryError> {
+    let confirmed = query.store().is_confirmed_strong(tx_fk)?;
+    if !confirmed {
+        return Ok(json!({ "confirmed": false }));
+    }
+    let height = query.store().tx_height.get(tx_fk)?.unwrap_or(0);
+    let mut out = json!({
+        "confirmed": true,
+        "block_height": height,
+    });
+    if let Some((_fk, rec)) = query.header_at_height(Height(height))? {
+        out["block_hash"] = Value::String(block_hash_hex(&rec.hash));
+        out["block_time"] = json!(rec.timestamp);
+    }
+    Ok(out)
+}
+
+fn plain_ok(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
+fn store_err(e: rbitcoin_query::QueryError) -> Response {
+    // QueryError is StoreError.
+    match e {
+        StoreError::NotFound => not_found(),
+        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),
+    }
 }
 
 /// Esplora / Core display order (internal hash bytes reversed).
@@ -135,6 +238,25 @@ fn block_hash_hex(hash: &[u8; 32]) -> String {
     let mut rev = *hash;
     rev.reverse();
     rbitcoin_primitives::hex_encode(rev)
+}
+
+/// Parse 32-byte hash/txid hex (display order) → internal byte order.
+fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
+    let mut bytes = rbitcoin_primitives::hex_decode(s).map_err(|_| ())?;
+    if bytes.len() != 32 {
+        return Err(());
+    }
+    bytes.reverse();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn encode_header_hex(hdr: &bitcoin::block::Header) -> Result<String, String> {
+    let mut buf = Vec::with_capacity(80);
+    hdr.consensus_encode(&mut buf)
+        .map_err(|_| "header encode".to_string())?;
+    Ok(rbitcoin_primitives::hex_encode(buf))
 }
 
 #[cfg(test)]
@@ -272,5 +394,83 @@ mod tests {
     fn config_defaults_use_public_proxy_limits() {
         let cfg = EsploraConfig::new("0.0.0.0:3000".parse().unwrap());
         assert_eq!(cfg.limits, ServeLimits::for_public_proxy());
+    }
+
+    /// Phase A: block-height, header, tx hex, tx status on one fixture store.
+    #[tokio::test]
+    async fn block_and_tx_read_path() {
+        let (dir, q) = temp_query("block-tx");
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        let mut coinbase_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase(h, prev);
+            hashes.push(header.hash);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        assert_eq!(q.tip_height(), Some(Height(2)));
+
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let handle = run_esplora(cfg, Arc::clone(&q)).await.expect("listen");
+        let addr = handle.local_addr;
+
+        // /block-height/1
+        let (st, body) = http_get(addr, "/block-height/1").await;
+        assert_eq!(st, 200, "block-height body={body}");
+        assert_eq!(body, block_hash_hex(&hashes[1]));
+
+        // missing height
+        let (st, _) = http_get(addr, "/block-height/99").await;
+        assert_eq!(st, 404);
+
+        // /block/:hash/header — 80 bytes → 160 hex chars
+        let hash_disp = block_hash_hex(&hashes[1]);
+        let (st, body) = http_get(addr, &format!("/block/{hash_disp}/header")).await;
+        assert_eq!(st, 200, "header body len={}", body.len());
+        assert_eq!(body.len(), 160);
+        // Matches Query wire encode.
+        let wire = q.wire_header_at_height(Height(1)).unwrap();
+        let expected = encode_header_hex(&wire).unwrap();
+        assert_eq!(body, expected);
+
+        // unknown hash
+        let miss = "ff".repeat(32);
+        let (st, _) = http_get(addr, &format!("/block/{miss}/header")).await;
+        assert_eq!(st, 404);
+
+        // /tx/:txid/hex
+        let txid_disp = block_hash_hex(&coinbase_txids[0]); // same display reverse helper
+        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}/hex")).await;
+        assert_eq!(st, 200, "tx hex body={body}");
+        assert!(!body.is_empty());
+        assert!(body.len() % 2 == 0);
+        let (fk, _) = q.get_tx_by_txid(&coinbase_txids[0]).unwrap().unwrap();
+        let raw = q.tx_wire_bytes(fk).unwrap();
+        assert_eq!(body, rbitcoin_primitives::hex_encode(raw));
+
+        // /tx/:txid/status
+        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}/status")).await;
+        assert_eq!(st, 200, "status body={body}");
+        let v: Value = serde_json::from_str(&body).expect("status json");
+        assert_eq!(v["confirmed"], true);
+        assert_eq!(v["block_height"], 0);
+        assert_eq!(v["block_hash"], block_hash_hex(&hashes[0]));
+        assert!(v.get("block_time").is_some());
+
+        // missing tx
+        let (st, _) = http_get(addr, &format!("/tx/{miss}/hex")).await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, &format!("/tx/{miss}/status")).await;
+        assert_eq!(st, 404);
+
+        // status helper unit
+        let st_json = tx_status_json(&q, fk).unwrap();
+        assert_eq!(st_json["confirmed"], true);
+        assert_eq!(st_json["block_height"], 0);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

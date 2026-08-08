@@ -338,3 +338,79 @@ fn c1_non_coinbase_empty_outputs_rejected() {
         "{err:?}"
     );
 }
+
+/// Core requires topological order: a same-block spend may only reference an
+/// *earlier* tx in the block. Child-before-parent is invalid
+/// (`docs/external_findings/005-non-topological-block-accepted.md`).
+#[test]
+fn c8_same_block_child_before_parent_rejected() {
+    let (_td, q, params) = regtest_q();
+    connect_genesis(&q, &params);
+    let g = regtest_genesis();
+    let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let maturity = params.coinbase_maturity();
+    let mut tip = b1.block_hash();
+    let mut time = b1.header.time;
+    let mut h = 1u32;
+    while h < maturity {
+        h += 1;
+        time += 600;
+        let b = mine_regtest_block(tip, time, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
+        tip = b.block_hash();
+    }
+    let cb_txid = b1.txdata[0].compute_txid();
+    // Parent spends matured coinbase; child spends parent.
+    let parent = spend_anyone_can_spend(cb_txid, 0, Amount::from_sat(49_0000_0000));
+    let parent_txid = parent.compute_txid();
+    let child = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
+
+    time += 600;
+    // Child first, parent second — Core: bad-txns-inputs-missingorspent.
+    let bad = mine_regtest_block(tip, time, h + 1, vec![child, parent]);
+    let err = accept_and_connect_block(&q, &params, Height(h + 1), &bad, Milestone::NONE);
+    assert!(
+        err.is_err(),
+        "child-before-parent must not become tip: {err:?}"
+    );
+    let e = err.unwrap_err();
+    // MissingPrevout / BadTx / Store misclassification are all "reject"; after
+    // 002, prefer consensus-shaped errors — any Err is enough for the 005 pin.
+    let _ = e;
+    assert_eq!(
+        q.tip_height(),
+        Some(Height(h)),
+        "tip must not advance on non-topological block"
+    );
+}
+
+/// Parent-before-child same-block spend must still connect (topo happy path).
+#[test]
+fn c8_same_block_parent_before_child_ok() {
+    let (_td, q, params) = regtest_q();
+    connect_genesis(&q, &params);
+    let g = regtest_genesis();
+    let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let maturity = params.coinbase_maturity();
+    let mut tip = b1.block_hash();
+    let mut time = b1.header.time;
+    let mut h = 1u32;
+    while h < maturity {
+        h += 1;
+        time += 600;
+        let b = mine_regtest_block(tip, time, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
+        tip = b.block_hash();
+    }
+    let cb_txid = b1.txdata[0].compute_txid();
+    let parent = spend_anyone_can_spend(cb_txid, 0, Amount::from_sat(49_0000_0000));
+    let parent_txid = parent.compute_txid();
+    let child = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
+    time += 600;
+    let good = mine_regtest_block(tip, time, h + 1, vec![parent, child]);
+    accept_and_connect_block(&q, &params, Height(h + 1), &good, Milestone::NONE)
+        .expect("parent-before-child same-block must connect");
+    assert_eq!(q.tip_height(), Some(Height(h + 1)));
+}

@@ -917,7 +917,15 @@ fn assemble_block_prevouts_mode(
     let n_tx = block.txdata.len();
     let mut block_spends: std::collections::HashSet<OutPoint> =
         std::collections::HashSet::with_capacity(n_tx.saturating_mul(2));
-    // txid → index into `block.txdata` (no script clones until a same-block spend).
+    // Full-block txid → index (create_txids, same order as block.txdata). Used to
+    // reject spends of later same-block parents (Core topological order).
+    // `same_block` below only holds *earlier* txs already walked.
+    let mut txid_index: std::collections::HashMap<[u8; 32], usize> =
+        std::collections::HashMap::with_capacity(n_tx);
+    for (i, id) in create_txids.iter().enumerate() {
+        txid_index.insert(*id, i);
+    }
+    // txid → index into `block.txdata` for txs already validated in this walk.
     let mut same_block: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     let mut fees = 0i64;
@@ -990,10 +998,22 @@ fn assemble_block_prevouts_mode(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
+                // Topological order (Core CheckTxInputs walk): a same-block
+                // parent must appear *before* this tx. Archive batch_thin stamps
+                // create_fk for the whole block at once; using that edge would
+                // accept child-before-parent
+                // (docs/external_findings/005-non-topological-block-accepted.md).
+                if let Some(&pj) = txid_index.get(&key.0) {
+                    if pj >= ti {
+                        return Err(ConsensusError::MissingPrevout);
+                    }
+                }
                 // Load pin / thin create_fk is a **promise**: pin denserels must
                 // carry identity matching wire prev_txid (resolve hard-misses
                 // wrong pin; load fills schema-13 identity from plan RAM or
                 // txid.body). Do not treat thin as a soft spentness hint.
+                // Same-block parents (pj < ti) resolve via same_block only —
+                // thin still ok if pin matches; order already enforced above.
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))

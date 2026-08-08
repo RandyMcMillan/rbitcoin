@@ -6,8 +6,7 @@
 invalid, and the two nodes fork at the same height.
 **Found by:** fuzzamoto differential campaign (Bitcoin Core primary vs rbitcoin reference,
 `oracle_consensus`)
-**Status:** reproduced; mechanism identified by inspection but **not** proven by
-instrumentation — see "Mechanism (hypothesis)"
+**Status:** fixed — reject same-block spends of later parents in assemble walk (see remediation commits)
 
 ## Summary
 

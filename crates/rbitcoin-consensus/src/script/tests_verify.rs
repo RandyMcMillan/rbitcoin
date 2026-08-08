@@ -1291,7 +1291,7 @@ fn unknown_witness_v16_discourage_rejects() {
     assert!(format!("{err}").contains("DISCOURAGE"), "got {err}");
 }
 
-/// P2WSH witness stack elements must be ≤ MAX_SCRIPT_ELEMENT_SIZE (520).
+/// P2WSH **initial stack** items (not the witnessScript) must be ≤ 520.
 #[test]
 fn p2wsh_oversized_witness_element_rejected() {
     // redeem: DROP TRUE
@@ -1311,6 +1311,7 @@ fn p2wsh_oversized_witness_element_rejected() {
             previous_output: OutPoint::null(),
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
+            // stack item oversized, then witnessScript
             witness: Witness::from_slice(&[oversized, redeem]),
         }],
         output: vec![TxOut {
@@ -1343,5 +1344,68 @@ fn p2wsh_oversized_witness_element_rejected() {
     assert!(
         s.contains("PUSH_SIZE") || s.contains("element") || s.contains("520") || s.contains("size"),
         "got {err}"
+    );
+}
+
+/// Regression: mainnet h=842472 rejected with PUSH_SIZE because we applied the
+/// 520-byte cap to the **witnessScript** (last stack item). Core pops the script
+/// first and only limits remaining stack items to 520; script size ≤ 10_000.
+#[test]
+fn p2wsh_witness_script_larger_than_520_is_valid() {
+    // Two max-size (520) pushes + DROP each + TRUE → script ≫ 520, no single
+    // push > 520, low op count. Matches Core: script size ≠ stack-item size.
+    let mut redeem = Vec::with_capacity(1100);
+    for _ in 0..2 {
+        redeem.push(0x4d); // OP_PUSHDATA2
+        redeem.extend_from_slice(&520u16.to_le_bytes());
+        redeem.extend(std::iter::repeat(0u8).take(520));
+        redeem.push(0x75); // OP_DROP
+    }
+    redeem.push(0x51); // OP_1
+    assert!(redeem.len() > 520);
+    let hash = bitcoin::hashes::sha256::Hash::hash(&redeem);
+    let mut spk = vec![0x00u8, 0x20];
+    spk.extend_from_slice(hash.as_byte_array());
+    let prevout = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            // Witness is only the large script (empty initial stack).
+            witness: Witness::from_slice(&[redeem]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(900),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        txid: [0u8; 32],
+        prevouts: vec![prevout],
+        tx: crate::block::JobTx::owned(tx),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+        minimal_if: false,
+        nullfail: false,
+        low_s: false,
+        strictenc: false,
+        null_dummy: false,
+        minimal_data: false,
+        witness_pubkeytype: false,
+        witness_active: true,
+        discourage_upgradable_witness: false,
+        const_scriptcode: false,
+    };
+    script::verify_job_all_inputs(&job).expect(
+        "P2WSH witnessScript >520 must verify (Core ExecuteWitnessScript after SpanPopBack)",
     );
 }

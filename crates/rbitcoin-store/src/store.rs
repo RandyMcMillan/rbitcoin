@@ -6,7 +6,7 @@ use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
-use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -65,7 +65,7 @@ impl Store {
         if !path.is_dir() {
             return Err(StoreError::NotDirectory(path));
         }
-        check_meta(&path)?;
+        let meta_ver = check_meta(&path)?;
         let epoch = ArchiveEpoch::load(&path)?;
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
@@ -73,6 +73,16 @@ impl Store {
         } else {
             ScriptHashTable::create(&path)?
         };
+        // Schema 13→14: Class A layout matches. Only a *materialized* SH head
+        // (slab values) is incompatible — empty / missing SH upgrades silently.
+        if meta_ver == 13 && SCHEMA_VERSION == 14 {
+            if scripthash.has_durable_index() {
+                return Err(StoreError::Corrupt(
+                    "schema 13 store has a materialized scripthash index; wipe store/scripthash* (or full datadir) and rematerialize for schema 14",
+                ));
+            }
+            rewrite_meta_current(&path)?;
+        }
         // header_txs v2: (first, count) arrays (upgrade path if missing).
         let header_txs = if path.join("header_txs_first.body").exists() {
             HeaderTxsTable::open(&path)?
@@ -919,7 +929,29 @@ fn write_meta(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn check_meta(dir: &Path) -> Result<(), StoreError> {
+/// Overwrite store `meta` with current [`SCHEMA_VERSION`] (silent 13→14 upgrade).
+fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
+    let path = dir.join("meta");
+    let tmp = path.with_extension("meta.tmp");
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.write_all(&STORE_MAGIC)
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.write_all(&SCHEMA_VERSION.to_le_bytes())
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.flush().map_err(|e| StoreError::io(&tmp, e))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
+    Ok(())
+}
+
+/// Validate store magic + schema. Returns on-disk version when openable.
+fn check_meta(dir: &Path) -> Result<u16, StoreError> {
     let path = dir.join("meta");
     let bytes = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
     if bytes.len() < 6 {
@@ -929,10 +961,10 @@ fn check_meta(dir: &Path) -> Result<(), StoreError> {
         return Err(StoreError::BadMagic);
     }
     let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if ver != SCHEMA_VERSION {
+    if !schema_file_openable(ver) {
         return Err(StoreError::BadSchema(ver));
     }
-    Ok(())
+    Ok(ver)
 }
 
 #[cfg(test)]
@@ -1273,10 +1305,80 @@ mod tests {
                 std::fs::write(bad.join("meta"), &good_magic).unwrap();
                 assert!(matches!(check_meta(&bad), Err(StoreError::BadSchema(_))));
             }
+            // schema 13 meta alone is openable at the check_meta gate
+            let mut v13 = STORE_MAGIC.to_vec();
+            v13.extend_from_slice(&13u16.to_le_bytes());
+            std::fs::write(bad.join("meta"), &v13).unwrap();
+            assert_eq!(check_meta(&bad).unwrap(), 13);
             let _ = std::fs::remove_dir_all(&bad);
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    fn write_store_meta_ver(dir: &Path, ver: u16) {
+        let mut bytes = STORE_MAGIC.to_vec();
+        bytes.extend_from_slice(&ver.to_le_bytes());
+        std::fs::write(dir.join("meta"), bytes).unwrap();
+    }
+
+    fn read_store_meta_ver(dir: &Path) -> u16 {
+        let bytes = std::fs::read(dir.join("meta")).unwrap();
+        u16::from_le_bytes([bytes[4], bytes[5]])
+    }
+
+    /// Schema 13 with empty SH is layout-compatible: open succeeds and meta
+    /// is rewritten to 14.
+    #[test]
+    fn open_schema13_empty_scripthash_upgrades_meta_to_14() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            assert!(!s.scripthash.has_durable_index());
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 13);
+        assert_eq!(read_store_meta_ver(&dir), 13);
+
+        let s = Store::open(&dir).unwrap();
+        assert!(!s.scripthash.has_durable_index());
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+
+        // Re-open stays 14.
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.header_count(), 0);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 13 with a durable SH head cannot open (slab layout incompatible).
+    #[test]
+    fn open_schema13_with_materialized_scripthash_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let sh = [0xabu8; 32];
+            s.scripthash
+                .put_create(&crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)))
+                .unwrap();
+            assert!(s.scripthash.has_durable_index());
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 13);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema 13 with durable SH"),
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("materialized scripthash") || m.contains("schema 13"),
+                    "{m}"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        // Meta left at 13 (no silent bump on refuse).
+        assert_eq!(read_store_meta_ver(&dir), 13);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Mid-barrier kill: pre-tip flush only must not advance durable tip.

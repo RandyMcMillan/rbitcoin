@@ -27,7 +27,7 @@
 //!   one annotator; N concurrent readers of published ranges.
 
 use crate::error::StoreError;
-use rbitcoin_primitives::{TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -195,7 +195,7 @@ impl TableFile {
             return Err(StoreError::BadMagic);
         }
         let ver = u16::from_le_bytes([footer[4], footer[5]]);
-        if ver != SCHEMA_VERSION {
+        if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         let got = u16::from_le_bytes([footer[6], footer[7]]);
@@ -256,7 +256,7 @@ impl TableFile {
             return Err(StoreError::BadMagic);
         }
         let ver = u16::from_le_bytes([footer[4], footer[5]]);
-        if ver != SCHEMA_VERSION {
+        if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         let got = u16::from_le_bytes([footer[6], footer[7]]);
@@ -323,7 +323,7 @@ impl TableFile {
             return Err(StoreError::BadMagic);
         }
         let ver = u16::from_le_bytes([header[4], header[5]]);
-        if ver != SCHEMA_VERSION {
+        if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         let got = u16::from_le_bytes([header[6], header[7]]);

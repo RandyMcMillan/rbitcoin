@@ -1,7 +1,7 @@
 //! Archive mode and finalization epoch (durable-archive soft/hard zones).
 
 use crate::error::StoreError;
-use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -49,7 +49,7 @@ impl ArchiveEpoch {
             return Err(StoreError::BadMagic);
         }
         let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        if ver != SCHEMA_VERSION {
+        if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         let mode = buf[6] != 0;

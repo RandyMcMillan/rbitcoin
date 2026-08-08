@@ -22,6 +22,15 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
 pub const SCHEMA_VERSION: u16 = 14;
 
+/// True if `ver` may appear in store `meta` / table headers this binary can open.
+///
+/// Schema **13** files are layout-compatible with **14** except for a **materialized**
+/// scripthash head (slab values). Empty / missing SH is upgraded silently to 14.
+#[inline]
+pub fn schema_file_openable(ver: u16) -> bool {
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 14 && ver == 13)
+}
+
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fk(pub u64);
@@ -233,5 +242,9 @@ mod tests {
         assert_eq!(STORE_MAGIC, *b"RBT1");
         assert_eq!(SCHEMA_VERSION, 14);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(14));
+        assert!(schema_file_openable(13));
+        assert!(!schema_file_openable(12));
+        assert!(!schema_file_openable(0));
     }
 }

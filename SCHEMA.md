@@ -1,7 +1,10 @@
 # On-disk schema (current)
 
 **Version:** `SCHEMA_VERSION = 14` (`rbitcoin_primitives`).  
-**Status:** unstable until 1.0 — incompatible layout changes are reindex-only (wipe store / redo IBD).  
+**Status:** unstable until 1.0 — most layout changes are reindex-only.  
+**13→14 open:** Class A matches schema 13. A store with `meta` version 13 and
+**no materialized scripthash head** opens and silently rewrites `meta` to 14.
+A schema-13 store with a durable SH index is refused (wipe SH or full datadir).  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).

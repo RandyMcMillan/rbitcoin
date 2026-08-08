@@ -24,7 +24,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableAccess, TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -1188,7 +1188,7 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
         return Err(StoreError::Corrupt("tx.idx.meta magic"));
     }
     let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-    if ver != SCHEMA_VERSION {
+    if !schema_file_openable(ver) {
         return Err(StoreError::Corrupt("tx.idx.meta schema"));
     }
     let meta_ver = u32::from_le_bytes(buf[8..12].try_into().unwrap());

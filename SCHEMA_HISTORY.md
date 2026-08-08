@@ -38,7 +38,10 @@ See [`SCHEMA.md`](./SCHEMA.md).
 - Body uses fixed **4096 B page chains** (≤510 FKs/page); geometric **slab** packing is refused on decode.
 - Main OA **does not rehash** after create size; load ≥ **~0.80** seals main (`scripthash.main_sealed` + optional fuse product); **new keys** go to **`scripthash.ovf.head`**.
 - Cold bulk materialize writes paged layout only (same put routing spirit as tip).
-- **Wipe / rematerialize SH** (or full store) from schema 13 if old slab head values are present — no dual-read.
+- **Open path:** schema **13** stores with **no materialized scripthash head** open
+  on this binary and **silently rewrite** store `meta` to 14 (Class A layout matches).
+  A schema-13 store that already has a durable SH index is **refused** — wipe
+  `store/scripthash*` (or full datadir) and rematerialize; no dual-read of slab values.
 
 ## v13
 

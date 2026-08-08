@@ -14,5 +14,9 @@ rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
 arc-swap = { workspace = true }
 
+[[bench]]
+name = "pin_pack_cpu"
+harness = false
+
 [lints]
 workspace = true

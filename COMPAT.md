@@ -35,7 +35,7 @@ wallet / mining parity.
 |--------|--------|-------|
 | server.version / banner / features | done | Banner: libre-relay-class |
 | headers / block headers | done | Tip push on subscribe |
-| scripthash history / balance / listunspent | done | Unconf when mempool attached |
+| scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full** |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce |
 | transaction.get / get_merkle | done | get falls back to mempool |
 | transaction.broadcast | done | Mempool accept + P2P inv |

@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
+use rbitcoin_query::{HistoryFilter, Query};
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -412,16 +412,22 @@ fn dispatch(
         }
         "blockchain.scripthash.get_history" => {
             let sh = param_scripthash(params, 0)?;
-            let mut hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
-            if let Some(mp) = mempool {
-                for item in mp.scripthash_mempool(&sh) {
-                    hist.push(rbitcoin_query::ScriptHashHistoryItem {
-                        height: item.height,
-                        txid: item.txid,
-                    });
+            let (filter, include_mempool) = parse_get_history_window(params)?;
+            let mut hist = query
+                .scripthash_history_filtered(&sh, &filter)
+                .map_err(|e| e.to_string())?;
+            // Confirmed rows are height-asc from the filter. Mempool (if any) is
+            // appended as a tail — Electrum Cash: only when to_height is -1/omitted.
+            if include_mempool {
+                if let Some(mp) = mempool {
+                    for item in mp.scripthash_mempool(&sh) {
+                        hist.push(rbitcoin_query::ScriptHashHistoryItem {
+                            height: item.height,
+                            txid: item.txid,
+                        });
+                    }
                 }
             }
-            hist.sort_by_key(|i| i.height);
             let arr: Vec<Value> = hist
                 .iter()
                 .map(|i| {
@@ -666,6 +672,53 @@ fn param_u32(params: &Value, idx: usize) -> Result<u32, String> {
         .ok_or_else(|| format!("param {idx} expected number"))
 }
 
+fn param_i64(params: &Value, idx: usize) -> Result<i64, String> {
+    params
+        .as_array()
+        .and_then(|a| a.get(idx))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .ok_or_else(|| format!("param {idx} expected integer"))
+}
+
+/// Electrum Cash optional height window after scripthash for `get_history`.
+///
+/// Returns `(confirmed HistoryFilter, include_mempool)`.
+/// - 1-arg / omitted heights: open confirmed window + mempool (BTC 1.4 / BCH defaults).
+/// - `to_height == -1` (or only `from_height`): open upper bound + mempool.
+/// - Finite exclusive `to_height`: confirmed `[from, to)` only — **no** mempool.
+fn parse_get_history_window(params: &Value) -> Result<(HistoryFilter, bool), String> {
+    let arr = params
+        .as_array()
+        .ok_or_else(|| "params expected array".to_string())?;
+    let from = if arr.len() >= 2 {
+        param_u32(params, 1)?
+    } else {
+        0
+    };
+    let (to_excl, include_mempool) = if arr.len() >= 3 {
+        let to = param_i64(params, 2)?;
+        if to == -1 {
+            (None, true)
+        } else if to < 0 {
+            return Err("to_height must be -1 or non-negative".into());
+        } else {
+            // BCH: from_height <= to_height (treat -1 as infinity; already handled).
+            if i64::from(from) > to {
+                return Err("from_height must be <= to_height".into());
+            }
+            (Some(to), false)
+        }
+    } else {
+        // Default to_height = -1 → tip + mempool.
+        (None, true)
+    };
+    Ok((HistoryFilter::height_window(from, to_excl), include_mempool))
+}
+
 fn param_str(params: &Value, idx: usize) -> Result<&str, String> {
     params
         .as_array()
@@ -775,6 +828,8 @@ mod tests {
         assert_eq!(param_u32(&json!([3]), 0).unwrap(), 3);
         assert_eq!(param_u32(&json!(["7"]), 0).unwrap(), 7);
         assert!(param_u32(&json!([]), 0).is_err());
+        assert_eq!(param_i64(&json!([-1]), 0).unwrap(), -1);
+        assert_eq!(param_i64(&json!(["10"]), 0).unwrap(), 10);
         assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");
         assert!(param_str(&json!([1]), 0).is_err());
 
@@ -787,6 +842,30 @@ mod tests {
 
         let tid = param_txid(&json!([sh_hex]), 0).unwrap();
         assert_eq!(tid, sh_bytes);
+
+        // get_history window: 1-arg open + mempool; finite to excludes mempool.
+        let (f, mp) = parse_get_history_window(&json!([sh_hex])).unwrap();
+        assert_eq!(f.from_height, 0);
+        assert!(f.to_height.is_none());
+        assert!(mp);
+        let (f, mp) = parse_get_history_window(&json!([sh_hex, 5])).unwrap();
+        assert_eq!(f.from_height, 5);
+        assert!(f.to_height.is_none());
+        assert!(mp);
+        let (f, mp) = parse_get_history_window(&json!([sh_hex, 2, -1])).unwrap();
+        assert_eq!(f.from_height, 2);
+        assert!(f.to_height.is_none());
+        assert!(mp);
+        let (f, mp) = parse_get_history_window(&json!([sh_hex, 1, 10])).unwrap();
+        assert_eq!(f.from_height, 1);
+        assert_eq!(f.to_height, Some(10));
+        assert!(!mp);
+        assert!(parse_get_history_window(&json!([sh_hex, 10, 5]))
+            .unwrap_err()
+            .contains("from_height"));
+        assert!(parse_get_history_window(&json!([sh_hex, 0, -2]))
+            .unwrap_err()
+            .contains("to_height"));
 
         let empty_status = scripthash_status(&[]);
         assert!(empty_status.is_empty());
@@ -1354,6 +1433,136 @@ mod tests {
         assert!(!status.as_str().unwrap().is_empty());
 
         let _ = hashes;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BCH-style optional `from_height`/`to_height` on get_history; status stays full.
+    #[test]
+    fn get_history_height_window_and_status_full() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let mut prev = Fk::NULL;
+        for h in 0..4u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&h.to_le_bytes());
+            hash[5] = 0xee;
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207fffff,
+                nonce: h,
+                merkle_root: hash,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![h as u8],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let sh = electrum_scripthash_hex(&[0x51]);
+
+        let full = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let full_arr = full.as_array().unwrap();
+        assert_eq!(full_arr.len(), 4);
+
+        // Inclusive from, exclusive to → heights 1 and 2 only.
+        let windowed = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh, 1, 3]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let w = windowed.as_array().unwrap();
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0]["height"], 1);
+        assert_eq!(w[1]["height"], 2);
+        assert!(w.len() < full_arr.len());
+
+        // to_height=-1 is open upper (same as full for confirmed-only).
+        let open_to = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh, 0, -1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(open_to.as_array().unwrap().len(), full_arr.len());
+
+        // Subscribe status is always full history, independent of windowed calls.
+        let status = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let status_s = status.as_str().unwrap();
+        assert!(!status_s.is_empty());
+        // Recompute status from full confirmed history and match.
+        let sh_bytes = {
+            let mut b = rbitcoin_primitives::hex_decode(&sh).unwrap();
+            b.reverse();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&b);
+            out
+        };
+        let full_hist = q.scripthash_history(&sh_bytes).unwrap();
+        assert_eq!(full_hist.len(), 4);
+        assert_eq!(scripthash_status(&full_hist), status_s);
+
+        let _ = prev;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

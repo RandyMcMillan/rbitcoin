@@ -915,20 +915,30 @@ impl ScriptHashTable {
             }
         }
 
-        // Existing main keys + tentative new keys: no rehash.
+        // Existing main keys (updates only — slots already occupied).
         if !main_u.is_empty() {
             self.head
                 .insert_many_sharded_no_rehash(&main_u, flush_each)?;
         }
+        // New keys: try main without rehash. `insert_many_no_rehash` may commit a
+        // *prefix* of the batch then return NeedRehash — only spill keys that are
+        // still absent from main (never dual-home a key on main + overflow).
         if !new_for_main.is_empty() {
             match self
                 .head
                 .insert_many_sharded_no_rehash(&new_for_main, flush_each)
             {
                 Ok(()) => {}
-                Err(StoreError::Corrupt(msg)) if msg.contains("no rehash") || msg.contains("overflow") => {
-                    // Main full mid-batch — spill entire new-key set to overflow.
-                    ovf_u.extend(new_for_main);
+                Err(StoreError::Corrupt(msg))
+                    if msg.contains("no rehash") || msg.contains("overflow") =>
+                {
+                    for (key, val) in new_for_main {
+                        if self.head.get(&key)?.is_some() {
+                            // Already durable on main from the partial batch.
+                            continue;
+                        }
+                        ovf_u.push((key, val));
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -1977,6 +1987,73 @@ mod tests {
         match t.head_value(&sh).unwrap().unwrap() {
             ShHeadValue::Inline { used, .. } => assert_eq!(used, 2),
             other => panic!("expected inline demote, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch path that crosses main capacity must not dual-home keys on main+overflow.
+    ///
+    /// Regression for `apply_head_upserts`: mid-batch `insert_many_no_rehash` NeedRehash
+    /// used to spill the *entire* new-key set to overflow after a partial main commit.
+    #[test]
+    fn put_create_batch_across_seal_no_dual_home() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        // 50 unique keys on main (load 50/64 ≈ 0.78 — still accepts new keys).
+        let mut main_keys = Vec::new();
+        for i in 0..50u32 {
+            let sh = script_hash(&[0xc0, (i & 0xff) as u8, (i >> 8) as u8, 0x11]);
+            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
+            main_keys.push(sh);
+        }
+        // One batch of 20 new keys: some may land on main before no-rehash full, rest
+        // overflow — each key must appear on exactly one head (for_each == unique FKs).
+        let batch: Vec<_> = (0..20u32)
+            .map(|i| {
+                let sh = script_hash(&[0xc1, (i & 0xff) as u8, 0x22, 0x33]);
+                rec(sh, 10_000 + u64::from(i), 0)
+            })
+            .collect();
+        let n = t.put_create_batch(&batch).unwrap();
+        assert_eq!(n, 20);
+
+        let mut for_each_n = 0u64;
+        t.for_each_live_create(|_| for_each_n += 1).unwrap();
+        assert_eq!(
+            for_each_n, 70,
+            "for_each must equal unique creates (50+20); dual-home would inflate count"
+        );
+
+        // Every batch key is findable once; none may sit on both main and overflow.
+        for rec in &batch {
+            assert!(
+                t.contains_create(&rec.scripthash, rec.create_tx_fk).unwrap(),
+                "batch key missing from entries"
+            );
+            let on_main = t.head.get(&rec.scripthash).unwrap().is_some();
+            let on_ovf = {
+                let g = t.overflow.lock().unwrap();
+                match g.as_ref() {
+                    Some(ovf) => ovf.get(&rec.scripthash).unwrap().is_some(),
+                    None => false,
+                }
+            };
+            assert!(
+                on_main ^ on_ovf,
+                "key must live on exactly one of main/overflow (main={on_main} ovf={on_ovf})"
+            );
+        }
+        // Pre-batch main keys stay on main only.
+        for sh in &main_keys {
+            assert!(t.head.get(sh).unwrap().is_some());
+            let on_ovf = {
+                let g = t.overflow.lock().unwrap();
+                match g.as_ref() {
+                    Some(ovf) => ovf.get(sh).unwrap().is_some(),
+                    None => false,
+                }
+            };
+            assert!(!on_ovf, "pre-existing main key must not also be on overflow");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

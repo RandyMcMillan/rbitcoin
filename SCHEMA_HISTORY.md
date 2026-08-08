@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 13`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 14`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | **Current** |
+| **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | **Current** |
+| **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
 | **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | Prior |
 | **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |
@@ -27,9 +28,19 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v13 (current)
+## v14 (current)
 
 See [`SCHEMA.md`](./SCHEMA.md).
+
+**Relative to v13:**
+
+- Class B SH head value: **Empty / Inline (≤2) / Paged** (first+last **4 KiB** page offs; bit-63 flags).
+- Body uses fixed **4096 B page chains** (≤510 FKs/page); geometric **slab** packing is refused on decode.
+- Main OA **does not rehash** after create size; load ≥ **~0.80** seals main (`scripthash.main_sealed` + optional fuse product); **new keys** go to **`scripthash.ovf.head`**.
+- Cold bulk materialize writes paged layout only (same put routing spirit as tip).
+- **Wipe / rematerialize SH** (or full store) from schema 13 if old slab head values are present — no dual-read.
+
+## v13
 
 **Relative to v12:**
 

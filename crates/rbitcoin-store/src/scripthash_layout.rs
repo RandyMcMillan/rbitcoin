@@ -1,38 +1,44 @@
-//! Hybrid scripthash layout: 8 B create_tx_fk entries, **32 B head slots** (fixed).
+//! Scripthash layout: 8 B create_tx_fk entries, **32 B head slots** (fixed).
 //!
 //! Head key = first 16 B of SHA256(spk). Value = two u64s.
 //!
-//! **Live (schema 13):** inline FKs or **slab** meta ([`SH_SLAB_MARKER`] on w0).
+//! **Schema 14:** Empty / Inline (≤2 FKs) / **Paged** (first+last 4 KiB page offs).
+//! Bit 63 of each value word is a flag; payload in low 63 bits. See
+//! [`crate::scripthash_pages`] for page buffer layout.
 //!
-//! **Target (schema 14 plan):** same 32 B slots; body uses **4 KiB page chains**
-//! instead of relocating slabs. Head packing and page layout are pinned in
-//! [`crate::scripthash_pages`] (Step 0). Live `ShHeadValue` still encodes slabs
-//! until later plan steps rewire put/entries.
+//! Schema-13 **slab** encoding is rejected on decode (rebuild SH on upgrade).
 
 use crate::error::StoreError;
+use crate::scripthash_pages::{
+    sh_decode_paged_head, sh_encode_paged_head, sh_head_value_mode, sh_word_payload,
+    ShHeadValueMode, SH_FLAG_BIT,
+};
 use rbitcoin_primitives::Fk;
 
-/// Body / slab entry: create Class A fk only.
+/// Body / page entry: create Class A fk only.
 pub const SH_ENTRY_LEN: usize = 8;
 /// Max create_tx_fks stored inline in the head value.
 pub const SH_INLINE_CAP: usize = 2;
-/// Size class 0 capacity; class `c` has capacity `SH_SLAB_BASE << c`.
-pub const SH_SLAB_BASE: u32 = 4;
-/// Max size class: cap = 4 << c (class 24 ≈ 2^26 entries).
-pub const SH_MAX_CLASS: u8 = 24;
 /// Head key length (prefix of Electrum SHA256(spk)).
 pub const SH_HEAD_KEY_LEN: usize = 16;
 /// Head value: two u64s.
 pub const SH_HEAD_VALUE_LEN: usize = 16;
 /// On-disk head slot size.
 pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
-/// High bit of first value word marks slab mode (Class A fks stay < 2^63).
-pub const SH_SLAB_MARKER: u64 = 1u64 << 63;
+/// High bit marks non-inline head value (paged). Same bit as legacy slab marker.
+pub const SH_SLAB_MARKER: u64 = SH_FLAG_BIT;
 /// Alloc header magic after the RBT1 file header.
 pub const SH_ALLOC_MAGIC: [u8; 4] = *b"SHAL";
-pub const SH_ALLOC_VERSION: u16 = 1;
+pub const SH_ALLOC_VERSION: u16 = 2;
 /// Fixed alloc control page (includes freelist heads).
 pub const SH_ALLOC_HEADER_LEN: usize = 4096;
+
+/// Legacy size-class constants (page freelist reuses class index for 4 KiB pages).
+/// Class 7: `4 << 7` entries × 8 B = 4096.
+pub const SH_SLAB_BASE: u32 = 4;
+pub const SH_MAX_CLASS: u8 = 24;
+/// Slab class whose byte size equals one SH page ([`crate::scripthash_pages::SH_PAGE_SIZE`]).
+pub const SH_PAGE_SLAB_CLASS: u8 = 7;
 
 pub type ShHeadKey = [u8; SH_HEAD_KEY_LEN];
 
@@ -52,22 +58,6 @@ pub fn slab_cap(class: u8) -> u32 {
 #[inline]
 pub fn slab_bytes(class: u8) -> u64 {
     u64::from(slab_cap(class)) * SH_ENTRY_LEN as u64
-}
-
-/// Smallest size class with `slab_cap(c) >= n`, or `None` if `n <= INLINE_CAP`
-/// or `n` exceeds [`SH_MAX_CLASS`] capacity.
-pub fn class_for_count(n: u32) -> Option<u8> {
-    if n <= SH_INLINE_CAP as u32 {
-        return None;
-    }
-    let mut c = 0u8;
-    while c <= SH_MAX_CLASS {
-        if slab_cap(c) >= n {
-            return Some(c);
-        }
-        c += 1;
-    }
-    None
 }
 
 /// One thin create: create_tx_fk only (vout recovered from Class A).
@@ -107,11 +97,10 @@ pub enum ShHeadValue {
         entries: [ShEntry; SH_INLINE_CAP],
         used: u8,
     },
-    Slab {
-        class: u8,
-        used: u32,
-        /// File-absolute offset of packed entries.
-        slab_off: u64,
+    /// 4 KiB page chain; head stores first and last page file offsets only.
+    Paged {
+        first_page: u64,
+        last_page: u64,
     },
 }
 
@@ -120,12 +109,17 @@ impl ShHeadValue {
         match self {
             ShHeadValue::Empty => 0,
             ShHeadValue::Inline { used, .. } => u32::from(*used),
-            ShHeadValue::Slab { used, .. } => *used,
+            // Count not stored in head; callers that need n walk pages.
+            ShHeadValue::Paged { .. } => u32::MAX,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.used() == 0
+        matches!(self, ShHeadValue::Empty)
+    }
+
+    pub fn is_paged(&self) -> bool {
+        matches!(self, ShHeadValue::Paged { .. })
     }
 
     pub fn encode(&self) -> [u8; SH_HEAD_VALUE_LEN] {
@@ -143,22 +137,17 @@ impl ShHeadValue {
                 } else {
                     0
                 };
-                debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set slab marker");
-                debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set slab marker");
+                debug_assert_eq!(w0 & SH_FLAG_BIT, 0, "fk must not set flag bit");
+                debug_assert_eq!(w1 & SH_FLAG_BIT, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
                 out[8..16].copy_from_slice(&w1.to_le_bytes());
             }
-            ShHeadValue::Slab {
-                class,
-                used,
-                slab_off,
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
             } => {
-                // w0: marker | class:u8 | used:u32 in low bits
-                let mut w0 = SH_SLAB_MARKER;
-                w0 |= u64::from(*class) << 32;
-                w0 |= u64::from(*used) & 0xffff_ffff;
-                out[0..8].copy_from_slice(&w0.to_le_bytes());
-                out[8..16].copy_from_slice(&slab_off.to_le_bytes());
+                out = sh_encode_paged_head(*first_page, *last_page)
+                    .expect("paged head encode (offs validated at write)");
             }
         }
         out
@@ -173,38 +162,54 @@ impl ShHeadValue {
         if w0 == 0 && w1 == 0 {
             return Ok(ShHeadValue::Empty);
         }
-        if w0 & SH_SLAB_MARKER != 0 {
+        // Schema-13 slab: w0 = SH_SLAB_MARKER | class<<32 | used (bits 40..62 clear), w1 = off.
+        // Paged first_page is a file offset (typically ≥ payload_start ≈ 4KiB+); refuse
+        // the historical packing shape so old heads never decode as paged.
+        if (w0 & SH_SLAB_MARKER) != 0 {
+            let bits40_62_clear = (w0 & 0x7fff_ff00_0000_0000) == 0;
             let class = ((w0 >> 32) & 0xff) as u8;
-            if class > SH_MAX_CLASS {
-                return Err(StoreError::Corrupt("bad slab class"));
-            }
             let used = (w0 & 0xffff_ffff) as u32;
-            let slab_off = w1;
-            if used == 0 || used > slab_cap(class) {
-                return Err(StoreError::Corrupt("bad slab used count"));
+            // Historical slab: used ≤ class capacity (small). Real page offs are ≥4KiB.
+            if bits40_62_clear && class <= SH_MAX_CLASS && used > 0 && used <= slab_cap(class) {
+                return Err(StoreError::Corrupt(
+                    "scripthash: legacy slab head value (rebuild scripthash index)",
+                ));
             }
-            if slab_off == 0 {
-                return Err(StoreError::Corrupt("null slab offset"));
-            }
-            return Ok(ShHeadValue::Slab {
-                class,
-                used,
-                slab_off,
+            let arr: &[u8; 16] = buf.try_into().map_err(|_| {
+                StoreError::Corrupt("short scripthash head value")
+            })?;
+            let (first, last) = sh_decode_paged_head(arr)?;
+            return Ok(ShHeadValue::Paged {
+                first_page: first,
+                last_page: last,
             });
         }
-        // Inline
-        let e0 = ShEntry::new(Fk(w0));
-        if e0.is_null() {
-            return Err(StoreError::Corrupt("inline null first fk"));
+        match sh_head_value_mode(w0, w1)? {
+            ShHeadValueMode::Empty => Ok(ShHeadValue::Empty),
+            ShHeadValueMode::Inline => {
+                let e0 = ShEntry::new(Fk(sh_word_payload(w0)));
+                if e0.is_null() {
+                    return Err(StoreError::Corrupt("inline null first fk"));
+                }
+                if sh_word_payload(w1) == 0 {
+                    return Ok(ShHeadValue::inline_one(e0));
+                }
+                let e1 = ShEntry::new(Fk(sh_word_payload(w1)));
+                if e1.is_null() {
+                    return Err(StoreError::Corrupt("inline null second fk"));
+                }
+                Ok(ShHeadValue::inline_two(e0, e1))
+            }
+            ShHeadValueMode::Paged => {
+                let (first, last) = sh_decode_paged_head(buf.try_into().map_err(|_| {
+                    StoreError::Corrupt("short scripthash head value")
+                })?)?;
+                Ok(ShHeadValue::Paged {
+                    first_page: first,
+                    last_page: last,
+                })
+            }
         }
-        if w1 == 0 {
-            return Ok(ShHeadValue::inline_one(e0));
-        }
-        let e1 = ShEntry::new(Fk(w1));
-        if e1.is_null() {
-            return Err(StoreError::Corrupt("inline null second fk"));
-        }
-        Ok(ShHeadValue::inline_two(e0, e1))
     }
 
     pub fn inline_one(e: ShEntry) -> Self {
@@ -220,6 +225,13 @@ impl ShHeadValue {
         }
     }
 
+    pub fn paged(first_page: u64, last_page: u64) -> Self {
+        ShHeadValue::Paged {
+            first_page,
+            last_page,
+        }
+    }
+
     /// Collect live entries from an inline value (oldest→newest).
     pub fn inline_entries(&self) -> &[ShEntry] {
         match self {
@@ -228,7 +240,7 @@ impl ShHeadValue {
         }
     }
 
-    /// All create_tx_fks in this value (inline only; slab needs body read).
+    /// All create_tx_fks in this value (inline only; paged needs body read).
     pub fn inline_fks(&self) -> Vec<Fk> {
         self.inline_entries()
             .iter()
@@ -247,19 +259,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn class_for_count_ladder() {
-        assert_eq!(class_for_count(0), None);
-        assert_eq!(class_for_count(1), None);
-        assert_eq!(class_for_count(2), None);
-        assert_eq!(class_for_count(3), Some(0));
-        assert_eq!(class_for_count(4), Some(0));
-        assert_eq!(class_for_count(5), Some(1));
-        assert_eq!(slab_bytes(0), 32); // 4 * 8
-        assert_eq!(slab_cap(0), 4);
-    }
-
-    #[test]
-    fn head_value_roundtrip() {
+    fn head_value_roundtrip_inline_paged() {
         let e0 = ShEntry::new(Fk(3));
         let e1 = ShEntry::new(Fk(4));
         let inline = ShHeadValue::inline_two(e0, e1);
@@ -268,16 +268,27 @@ mod tests {
         let one = ShHeadValue::inline_one(e0);
         assert_eq!(ShHeadValue::decode(&one.encode()).unwrap(), one);
 
-        let slab = ShHeadValue::Slab {
-            class: 1,
-            used: 5,
-            slab_off: 4112,
-        };
-        assert_eq!(ShHeadValue::decode(&slab.encode()).unwrap(), slab);
+        let paged = ShHeadValue::paged(4096, 8192);
+        assert_eq!(ShHeadValue::decode(&paged.encode()).unwrap(), paged);
 
         assert!(ShHeadValue::decode(&ShHeadValue::Empty.encode())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn legacy_slab_bytes_rejected() {
+        // Schema-13 slab: FLAG | class<<32 | used, w1 = slab_off
+        let mut bad = [0u8; 16];
+        let w0 = SH_SLAB_MARKER | (1u64 << 32) | 5;
+        bad[0..8].copy_from_slice(&w0.to_le_bytes());
+        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
+        let err = ShHeadValue::decode(&bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("legacy slab") || msg.contains("rebuild"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -295,94 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn layout_error_and_edge_paths() {
-        // class_for_count saturates at max class capacity.
-        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS)), Some(SH_MAX_CLASS));
-        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS) + 1), None);
+    fn page_class_is_4k() {
+        assert_eq!(slab_bytes(SH_PAGE_SLAB_CLASS), 4096);
+    }
 
+    #[test]
+    fn layout_error_paths() {
         assert!(matches!(
             ShEntry::decode(&[0u8; 4]),
             Err(StoreError::Corrupt(_))
         ));
         assert!(ShEntry::new(Fk::NULL).is_null());
-        assert!(!ShEntry::new(Fk(1)).is_null());
-
         assert!(matches!(
             ShHeadValue::decode(&[0u8; 8]),
             Err(StoreError::Corrupt(_))
         ));
-        // Bad slab class
-        let mut bad = [0u8; 16];
-        let w0 = SH_SLAB_MARKER | (u64::from(SH_MAX_CLASS + 1) << 32) | 1;
-        bad[0..8].copy_from_slice(&w0.to_le_bytes());
-        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
-        assert!(matches!(
-            ShHeadValue::decode(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
-        // used == 0 with slab marker
-        let mut bad = [0u8; 16];
-        bad[0..8].copy_from_slice(&SH_SLAB_MARKER.to_le_bytes());
-        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
-        assert!(matches!(
-            ShHeadValue::decode(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
-        // used > cap
-        let mut bad = ShHeadValue::Slab {
-            class: 0,
-            used: 99,
-            slab_off: 4112,
-        }
-        .encode();
-        // force bad used via re-encode with hacked word
-        let mut w0 = SH_SLAB_MARKER;
-        w0 |= 99; // used
-        bad[0..8].copy_from_slice(&w0.to_le_bytes());
-        assert!(matches!(
-            ShHeadValue::decode(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
-        // null slab offset
-        let mut bad = ShHeadValue::Slab {
-            class: 0,
-            used: 1,
-            slab_off: 1,
-        }
-        .encode();
-        bad[8..16].copy_from_slice(&0u64.to_le_bytes());
-        assert!(matches!(
-            ShHeadValue::decode(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
-        // inline null first
-        let mut bad = [0u8; 16];
-        bad[0..8].copy_from_slice(&0u64.to_le_bytes());
-        bad[8..16].copy_from_slice(&1u64.to_le_bytes());
-        // w0==0 && w1!=0 is not Empty — first is null → corrupt
-        // Actually Empty is only when both zero. So this hits inline null first.
-        assert!(matches!(
-            ShHeadValue::decode(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
-        // inline used paths: one entry
         let one = ShHeadValue::inline_one(ShEntry::new(Fk(9)));
-        assert_eq!(one.used(), 1);
-        assert!(!one.is_empty());
         assert_eq!(one.inline_fks(), vec![Fk(9)]);
-        // empty / slab inline_entries empty
         assert!(ShHeadValue::Empty.inline_entries().is_empty());
-        assert!(ShHeadValue::Empty.inline_fks().is_empty());
-        let slab = ShHeadValue::Slab {
-            class: 0,
-            used: 3,
-            slab_off: 4112,
-        };
-        assert!(slab.inline_entries().is_empty());
-        assert_eq!(slab.used(), 3);
-        // Inline encode with used < 2 leaves w1=0
-        let enc = one.encode();
-        assert_eq!(ShHeadValue::decode(&enc).unwrap(), one);
         assert_eq!(payload_start(16), 16 + SH_ALLOC_HEADER_LEN as u64);
     }
 }

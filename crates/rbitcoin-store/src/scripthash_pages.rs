@@ -1,10 +1,10 @@
-//! Schema-14 scripthash **page-chain** layout (Step 0 pin; not yet wired to put/entries).
+//! Schema-14 scripthash **page-chain** layout (wired to `put_create` / `entries`).
 //!
 //! # Head value (16 B, full slot stays **32 B** = key16 + value16)
 //!
 //! Two little-endian `u64` words `w0`, `w1`. **Bit 63** of each word is a flag;
 //! payload lives in bits `0..62` ([`SH_PAYLOAD_MASK`]). Create FKs and body
-//! offsets keep high bits zero for many years — same rule as today’s
+//! offsets keep high bits zero for many years — same rule as
 //! [`SH_SLAB_MARKER`](crate::scripthash_layout::SH_SLAB_MARKER).
 //!
 //! | Mode | `w0` | `w1` |
@@ -17,7 +17,7 @@
 //! - Inline never sets bit63 (FK payload must be `< 2^63`).
 //! - Paged always sets bit63 on `w0` only; `w1` bit63 reserved **0**.
 //! - Schema-13 **slab** encoding also set bit63 on `w0` but packed class/used
-//!   into the low half — schema 14+ refuses slab on decode (later step); rebuild SH.
+//!   into the low half — schema 14+ refuses slab on decode; rebuild SH.
 //!
 //! # Body page (exactly [`SH_PAGE_SIZE`] = 4096, disk-aligned)
 //!
@@ -33,12 +33,6 @@
 //!
 //! Chain is **singly linked** first → … → last. Head stores first+last for O(1)
 //! walk start and O(1) append target.
-//!
-//! Page buffer helpers (Step 1): append / decode / next link. Head packing from
-//! Step 0. Production `put_create` / `entries` wiring lands in Steps 2–3 —
-//! allow unused until then (not a permanent silence).
-
-#![allow(dead_code)] // Page/head helpers; consumed by Steps 2–3 SH rewire
 
 use crate::error::StoreError;
 use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
@@ -119,7 +113,7 @@ pub fn sh_pack_flagged(payload: u64) -> Result<u64, StoreError> {
     Ok(payload | SH_FLAG_BIT)
 }
 
-/// Head value mode from raw `w0`/`w1` (schema-14 design; not yet the live decoder).
+/// Head value mode from raw `w0`/`w1` (schema-14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShHeadValueMode {
     Empty,
@@ -131,9 +125,8 @@ pub enum ShHeadValueMode {
 
 /// Classify a 16-byte head value without allocating (schema-14 rules).
 ///
-/// **Note:** schema-13 slab bytes also have w0 flagged; callers on upgrade must
-/// not use this for dual-read — rebuild SH. Live `ShHeadValue::decode` still
-/// accepts slabs until a later plan step.
+/// **Note:** schema-13 slab bytes also have w0 flagged; [`ShHeadValue::decode`](crate::scripthash_layout::ShHeadValue::decode)
+/// refuses historical slab packing before treating flagged words as paged.
 #[inline]
 pub fn sh_head_value_mode(w0: u64, w1: u64) -> Result<ShHeadValueMode, StoreError> {
     if w0 == 0 && w1 == 0 {
@@ -195,6 +188,8 @@ pub fn sh_decode_paged_head(buf: &[u8; 16]) -> Result<(u64, u64), StoreError> {
 /// Zero a page buffer and write header (`next=0`, `n_fks=0`).
 #[inline]
 pub fn sh_page_init_empty(page: &mut [u8; SH_PAGE_SIZE]) {
+    // Ensure callers that pass unaligned slices go through mut view first.
+    let _ = sh_page_as_array_mut(page);
     page.fill(0);
 }
 
@@ -251,14 +246,6 @@ pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreE
         out.push(e);
     }
     Ok(out)
-}
-
-/// FKs currently stored in the page (oldest → newest within page).
-pub fn sh_page_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<Fk>, StoreError> {
-    Ok(sh_page_entries(page)?
-        .into_iter()
-        .map(|e| e.create_tx_fk)
-        .collect())
 }
 
 /// Append one create FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
@@ -357,7 +344,6 @@ mod tests {
         assert_eq!(sh_page_next(&page).unwrap(), 0);
         assert!(sh_page_try_append(&mut page, Fk(1)).unwrap());
         assert!(sh_page_try_append_entry(&mut page, ShEntry::new(Fk(2))).unwrap());
-        assert_eq!(sh_page_fks(&page).unwrap(), vec![Fk(1), Fk(2)]);
         assert_eq!(
             sh_page_entries(&page).unwrap(),
             vec![ShEntry::new(Fk(1)), ShEntry::new(Fk(2))]
@@ -376,7 +362,7 @@ mod tests {
         }
         assert_eq!(sh_page_n_fks(&full).unwrap() as usize, SH_PAGE_FK_CAP);
         assert!(!sh_page_try_append(&mut full, Fk(99_999)).unwrap());
-        assert_eq!(sh_page_fks(&full).unwrap().len(), SH_PAGE_FK_CAP);
+        assert_eq!(sh_page_entries(&full).unwrap().len(), SH_PAGE_FK_CAP);
         // ShEntry bytes match layout encode.
         let e = ShEntry::new(Fk(0xabc));
         assert_eq!(e.encode(), e.create_tx_fk.0.to_le_bytes());
@@ -415,6 +401,6 @@ mod tests {
         page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
             .copy_from_slice(&((SH_PAGE_FK_CAP + 1) as u16).to_le_bytes());
         assert!(sh_page_n_fks(&page).is_err());
-        assert!(sh_page_fks(&page).is_err());
+        assert!(sh_page_entries(&page).is_err());
     }
 }

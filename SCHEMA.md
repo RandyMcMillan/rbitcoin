@@ -1,6 +1,6 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 13` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 14` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — incompatible layout changes are reindex-only (wipe store / redo IBD).  
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -17,7 +17,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
 | Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
-| Electrum index | Thin **create_tx_fk only** (inline ≤2 or geometric slab) | Small index; expand vouts/value/height at query via Class A + Class C |
+| Electrum index | Thin **create_tx_fk only** (inline ≤2 or **4 KiB page chains**) | Small index; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
 
 ---
@@ -56,7 +56,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **13** |
+| 4 | 2 | Schema version (u16) — **14** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -264,7 +264,7 @@ Used where the key is a 32 B hash and the value is a single fk (or multi-list)
 - Identity: `get_all` candidates + **body verify**.
 - Rehash when load would exceed **7/8**.
 
-**Not** used for `tx.head` (keyless address) or for scripthash **create lists** (those use hybrid slabs).
+**Not** used for `tx.head` (keyless address) or for scripthash **create lists** (those use page chains).
 
 ---
 
@@ -275,29 +275,38 @@ Thin create index: **create_tx_fk only** (no vout in the index).
 ### Head
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
-- Slot = **32 B**: key[16] + value[16] (two u64s).
+- Slot = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
   one shard band at a time). Cold load builds one **final-sized** OA image in RAM
   then sequential-writes the shard file (~0.5–1 GiB peak).
+- **No rehash** after create/materialize size: new keys after ~**0.80** load seal main
+  and go to **`scripthash.ovf.head`** (overflow OA). Existing main keys still append
+  on main pages. Optional fuse8 product on seal (`scripthash.head.fuse8` / ovf).
 
-| Mode | When | Value |
-|------|------|--------|
-| Empty | no creates | 0, 0 |
-| Inline | ≤2 create_tx_fks | fk0, fk1 (0 = unused second) |
-| Slab | ≥3 | high bit + class/used; `w1` = absolute slab offset |
+| Mode | When | Value (`w0`, `w1`) |
+|------|------|---------------------|
+| Empty | no creates | `0`, `0` |
+| Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` |
+| **Paged** | ≥3 | bit63=1, **first** page off; bit63=0, **last** page off |
 
-### Body slabs
+Schema-13 **slab** packing (flag + class/used + slab off) is **rejected** on decode —
+rebuild / rematerialize SH (no dual-read).
 
-- After RBT1 header: 4 KiB alloc page (`SHAL`) + geometric slabs (cap 4, 8, 16, …; 8 B/entry).
-- Size-class freelist reuses free slabs.
-- Same-class growth is append-only when capacity allows; class bump copies into a larger slab.
+### Body pages (schema 14)
+
+- After RBT1 header: 4 KiB alloc page (`SHAL`) + **fixed 4096 B pages**.
+- Page layout: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to **510** create_tx_fks.
+- Chain is singly linked first→last; head stores first+last for O(1) walk start and append target.
+- Append-only growth RMW last page / link a new page (page freelist reuses class-7 4 KiB slots).
 
 ### Query join
 
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
-IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry.
+IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry (paged layout).
 
-**Decision:** hybrid inline/slab so multi-use scripts are **one contiguous slab read**, not a multi-linked-list of creates. Query cost for busy wallets is dominated by Class A + spend joins, not SH pointer chasing.
+**Decision:** inline for rare scripts; **page chains** for multi-use scripts so history is
+contiguous page walks, not relocating geometric slabs. Query cost for busy wallets is
+dominated by Class A + spend joins, not SH pointer chasing.
 
 ---
 

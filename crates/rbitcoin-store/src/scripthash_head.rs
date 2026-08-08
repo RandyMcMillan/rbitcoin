@@ -508,6 +508,71 @@ impl ScriptHashHead {
         Ok(())
     }
 
+    /// Like [`insert_many`] but **never rehashes** — returns error if a new key
+    /// cannot fit under the current load ceiling (caller should use overflow).
+    pub fn insert_many_no_rehash(
+        &self,
+        upserts: &[(ShHeadKey, ShHeadValue)],
+    ) -> Result<(), StoreError> {
+        if upserts.is_empty() {
+            return Ok(());
+        }
+        if self.is_known_empty() {
+            return self.bulk_fill_empty(upserts);
+        }
+        let mut work = upserts.to_vec();
+        let slots_now = self.state.lock().unwrap().slots;
+        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
+        let mut i = 0usize;
+        while i < work.len() {
+            let slots = self.state.lock().unwrap().slots;
+            if i > 0 {
+                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots));
+            }
+            let mut cache = SlotPageCache::new(self, slots);
+            while i < work.len() {
+                let (key, ref val) = work[i];
+                let enc = val.encode();
+                match cache.try_insert(&key, &enc)? {
+                    InsertResult::Done(was_empty) => {
+                        if was_empty {
+                            let mut state = self.state.lock().unwrap();
+                            if state.occ_known {
+                                state.occupied = state.occupied.saturating_add(1);
+                            }
+                        }
+                        i += 1;
+                    }
+                    InsertResult::NeedRehash => {
+                        cache.flush()?;
+                        return Err(StoreError::Corrupt(
+                            "scripthash head full (no rehash; use overflow)",
+                        ));
+                    }
+                }
+            }
+            cache.flush()?;
+        }
+        {
+            let state = self.state.lock().unwrap();
+            if state.occ_known {
+                let occ = state.occupied;
+                drop(state);
+                self.persist_occ(occ);
+            }
+        }
+        Ok(())
+    }
+
+    /// occupied/slots when occupancy is known (`None` if unknown).
+    pub fn load_ratio(&self) -> Option<f64> {
+        let state = self.state.lock().unwrap();
+        if !state.occ_known || state.slots == 0 {
+            return None;
+        }
+        Some(state.occupied as f64 / state.slots as f64)
+    }
+
     fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
         debug_assert!(self.is_known_empty());
         let slots = self.state.lock().unwrap().slots;
@@ -554,6 +619,11 @@ impl ScriptHashHead {
 
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
+    }
+
+    /// Slot capacity of this head file (power of two).
+    pub fn slots(&self) -> u64 {
+        self.state.lock().unwrap().slots
     }
 
     /// True when occupancy is known and zero (safe for cold bulk-fill / install).
@@ -1210,6 +1280,68 @@ impl ShardedScriptHashHead {
     /// When `flush_each_shard` is true (large materialize runs), flush the shard
     /// file after its bucket so the working set does not keep every shard dirty
     /// at once. Small runs skip the per-shard flush and rely on later table flush.
+    /// Max occupied/slots before SH main/overflow should seal (plan: 0.80).
+    pub const SH_SEAL_LOAD: f64 = 0.80;
+
+    /// Weighted load across shards (known occupancy only).
+    pub fn load_ratio(&self) -> Option<f64> {
+        let mut occ = 0u64;
+        let mut slots = 0u64;
+        for s in &self.shards {
+            // Any shard with unknown occupancy makes the aggregate unknown.
+            let _ = s.load_ratio()?;
+            let o = s.occupied();
+            let sl = s.slots();
+            if sl == 0 {
+                return None;
+            }
+            occ = occ.saturating_add(o);
+            slots = slots.saturating_add(sl);
+        }
+        if slots == 0 {
+            return None;
+        }
+        Some(occ as f64 / slots as f64)
+    }
+
+    /// Insert without rehash; fails if any shard would need to grow.
+    pub fn insert_many_sharded_no_rehash(
+        &self,
+        entries: &[([u8; 32], ShHeadValue)],
+        flush_each_shard: bool,
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let n = self.shards.len();
+        if n == 1 {
+            let mapped: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| (head_key_from_full(k), v.clone()))
+                .collect();
+            return self.shards[0].insert_many_no_rehash(&mapped);
+        }
+        let mut buckets: Vec<Vec<( [u8; 32], ShHeadValue)>> =
+            (0..n).map(|_| Vec::new()).collect();
+        for (k, v) in entries {
+            buckets[self.shard_of(k)].push((*k, v.clone()));
+        }
+        for (si, bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let mapped: Vec<_> = bucket
+                .iter()
+                .map(|(k, v)| (head_key_from_full(k), v.clone()))
+                .collect();
+            self.shards[si].insert_many_no_rehash(&mapped)?;
+            if flush_each_shard {
+                self.shards[si].flush()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn insert_many_sharded(
         &self,
         entries: &[([u8; 32], ShHeadValue)],
@@ -1623,11 +1755,7 @@ mod tests {
             } else if i % 3 == 1 {
                 ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))
             } else {
-                ShHeadValue::Slab {
-                    class: 0,
-                    used: 3,
-                    slab_off: 4112 + i,
-                }
+                ShHeadValue::paged(4112 + i * 4096, 4112 + i * 4096)
             };
             batch.push((key, val));
         }

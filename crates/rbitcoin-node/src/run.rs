@@ -466,6 +466,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }));
             let ecfg = ElectrumConfig::for_params(addr, &params);
+            let max_conn = ecfg.limits.max_connections;
+            let max_line = ecfg.limits.max_request_bytes;
+            let idle_secs = ecfg.limits.idle_timeout.as_secs();
             match run_electrum(
                 ecfg,
                 q,
@@ -477,8 +480,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             {
                 Ok(h) => {
                     info!(
-                        "electrum TCP on {} (Query + mempool; terminate TLS externally if needed)",
-                        h.local_addr
+                        "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
+                        h.local_addr, max_conn, max_line, idle_secs
                     );
                     electrum_handles.push(h);
                 }

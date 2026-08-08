@@ -46,9 +46,13 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   mitigations are intentional operator surface: max inbound sessions
   (`--maxinbound` / `--maxconnections`, default 125), per-session message/byte
   rate windows, misbehavior score disconnect.
-- **Electrum:** plain TCP; TLS is an operator reverse-proxy concern. Mitigations
-  include max connections, request line size, scripthash subscription caps, idle
-  timeout, and broadcast hex limits (see operator docs).
+- **Electrum (and future Esplora):** plain TCP/HTTP; TLS is an operator
+  reverse-proxy concern. The node is **internet-facing capable**: application
+  DoS limits (`ServeLimits` — max connections, request size, idle timeout, plus
+  Electrum scripthash-sub / broadcast-hex caps) are **always enforced**, not only
+  when bound to localhost. Excess connections are refused without hanging;
+  oversize lines fail closed. Edge TLS, multi-tenant metering, and API keys are
+  still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
   mislead a wallet backend are in scope.
 - **No wallet keys in this repository:** do **not** send seed phrases or private

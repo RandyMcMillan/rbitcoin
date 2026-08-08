@@ -272,6 +272,11 @@ Do **not** wipe `store/` for mempool slot/full errors.
 
 ## Electrum
 
+Internet-facing Electrum is supported as a **wallet backend**: bind plain TCP
+(public or loopback), terminate **TLS at a reverse proxy**, and rely on the
+node’s **app DoS limits** always being on. A loopback-only bind is convenient
+with a local proxy, but it is **not** the security model by itself.
+
 ```bash
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
@@ -281,7 +286,8 @@ Do **not** wipe `store/` for mempool slot/full errors.
 ```
 
 TLS is **not** built into the node. Terminate TLS at nginx, Caddy, HAProxy, etc.,
-and proxy plain TCP to `--electrum-listen` (e.g. `127.0.0.1:50001`).
+and proxy plain TCP to `--electrum-listen` (e.g. `127.0.0.1:50001` behind the
+proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 
 | Feature | Behavior |
 |---------|----------|
@@ -291,6 +297,23 @@ and proxy plain TCP to `--electrum-listen` (e.g. `127.0.0.1:50001`).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
+
+### App DoS floor (always on)
+
+Shared [`ServeLimits`](crates/rbitcoin-electrum) defaults (also the future Esplora
+floor). Excess connections are **rejected immediately** (no hang); oversize lines
+and idle clients fail closed.
+
+| Limit | Default | Role |
+|-------|---------|------|
+| Max connections | 256 | Concurrent Electrum TCP clients |
+| Max request line | 1 MiB | One JSON-RPC line including `\n` |
+| Idle timeout | 120 s | No complete request → disconnect |
+| Max scripthash subs / conn | 1000 | Notify fan-out cap |
+| Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
+
+Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See
+[`SECURITY.md`](./SECURITY.md).
 
 ## Signet lab
 

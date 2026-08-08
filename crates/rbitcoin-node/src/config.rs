@@ -35,7 +35,8 @@ pub struct NodeConfig {
     pub smoke: bool,
     /// Cap how long `run_p2p` idles after sync (None = forever). Used by tests.
     pub max_run_secs: Option<u64>,
-    /// Electrum TCP listen (`None` = disabled). Terminate TLS externally if needed.
+    /// Electrum TCP listen (`None` = disabled). Plain TCP; terminate TLS at a
+    /// reverse proxy when public. App DoS limits apply regardless of bind address.
     pub electrum_listen: Option<SocketAddr>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.

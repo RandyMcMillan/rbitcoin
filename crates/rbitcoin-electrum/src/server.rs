@@ -24,16 +24,55 @@ const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
 const SERVER_VERSION: &str = concat!("rbitcoin ", env!("CARGO_PKG_VERSION"));
 
-/// Max simultaneous Electrum TCP clients (DoS).
+/// Max simultaneous query-surface clients (Electrum / future Esplora).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
-/// Max JSON-RPC request line bytes including trailing `\n` (DoS / OOM).
+/// Max request payload bytes (Electrum: one JSON-RPC line incl. `\n`; Esplora: body).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576; // 1 MiB
-/// Max scripthash subscriptions per connection (notify fan-out).
+/// Alias for shared docs / Esplora body cap ([`DEFAULT_MAX_LINE_BYTES`]).
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
+/// Max scripthash subscriptions per Electrum connection (notify fan-out).
 pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 1_000;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
 pub const DEFAULT_MAX_BROADCAST_HEX: usize = 8_388_608;
+
+/// Shared application DoS bounds for internet-facing query surfaces.
+///
+/// Defaults are sized for a **public bind behind a TLS reverse proxy** (or a
+/// private LAN bind). The node always enforces these limits — binding only on
+/// localhost is **not** required for safety. TLS, rate limiting at the edge,
+/// and auth remain operator / proxy concerns.
+///
+/// Electrum uses this today; Esplora (HTTP) reuses the same type for connection
+/// / body / idle caps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServeLimits {
+    /// Max concurrent clients (TCP accept or HTTP).
+    pub max_connections: usize,
+    /// Max request payload (Electrum line or HTTP body), bytes.
+    pub max_request_bytes: usize,
+    /// Disconnect if no complete request within this duration.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self::for_public_proxy()
+    }
+}
+
+impl ServeLimits {
+    /// Defaults suitable when the listen address is reachable from untrusted
+    /// clients **behind** TLS termination / a reverse proxy.
+    pub fn for_public_proxy() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ElectrumConfig {
@@ -42,14 +81,10 @@ pub struct ElectrumConfig {
     pub donation_address: String,
     /// Genesis hash (display order hex) for features.
     pub genesis_hash_hex: String,
-    /// Max concurrent client connections.
-    pub max_connections: usize,
-    /// Max request line size (bytes).
-    pub max_line_bytes: usize,
+    /// Shared connection / request / idle bounds (also used by future Esplora).
+    pub limits: ServeLimits,
     /// Max `blockchain.scripthash.subscribe` entries per connection.
     pub max_scripthash_subs: usize,
-    /// Disconnect if no complete request line within this many seconds.
-    pub idle_timeout: Duration,
     /// Max hex length accepted by `blockchain.transaction.broadcast`.
     pub max_broadcast_hex: usize,
 }
@@ -66,12 +101,25 @@ impl ElectrumConfig {
                 .into(),
             donation_address: String::new(),
             genesis_hash_hex: rbitcoin_primitives::hex_encode(rev),
-            max_connections: DEFAULT_MAX_CONNECTIONS,
-            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            limits: ServeLimits::for_public_proxy(),
             max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
-            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
         }
+    }
+
+    /// Max concurrent Electrum clients ([`ServeLimits::max_connections`]).
+    pub fn max_connections(&self) -> usize {
+        self.limits.max_connections
+    }
+
+    /// Max JSON-RPC request line bytes ([`ServeLimits::max_request_bytes`]).
+    pub fn max_line_bytes(&self) -> usize {
+        self.limits.max_request_bytes
+    }
+
+    /// Idle read timeout ([`ServeLimits::idle_timeout`]).
+    pub fn idle_timeout(&self) -> Duration {
+        self.limits.idle_timeout
     }
 }
 
@@ -104,10 +152,12 @@ pub struct TipNotify {
 /// `transaction.get` fallback. Without it, confirmed-only behaviour remains.
 ///
 /// TLS is intentionally not built in — terminate TLS at nginx/caddy/haproxy
-/// (or similar) and proxy to this TCP port.
+/// (or similar) and proxy to this TCP port. Safe for internet-facing deployment
+/// **only with app [`ServeLimits`] always on** plus edge TLS/limits; do not treat
+/// “localhost-only bind” as the sole safety model.
 ///
-/// **DoS limits** (see [`ElectrumConfig`]): max connections, max request line
-/// size, max scripthash subscriptions per client, idle timeout, broadcast hex cap.
+/// **DoS limits:** [`ElectrumConfig::limits`] ([`ServeLimits`]) plus
+/// scripthash-sub and broadcast-hex caps on [`ElectrumConfig`].
 pub async fn run_electrum(
     config: ElectrumConfig,
     query: Arc<Query>,
@@ -119,7 +169,7 @@ pub async fn run_electrum(
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_c = shutdown.clone();
-    let max_conn = config.max_connections.max(1);
+    let max_conn = config.max_connections().max(1);
     let conn_sem = Arc::new(Semaphore::new(max_conn));
     let config = Arc::new(config);
     let params = Arc::new(params);
@@ -245,8 +295,8 @@ where
     let mut sh_subs: HashSet<[u8; 32]> = HashSet::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
-    let idle = config.idle_timeout;
-    let max_line = config.max_line_bytes;
+    let idle = config.idle_timeout();
+    let max_line = config.max_line_bytes();
 
     loop {
         tokio::select! {
@@ -2246,8 +2296,8 @@ mod tests {
         let q = Arc::new(q);
         let (tip_tx, _) = broadcast::channel(4);
         let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-        cfg.max_connections = 1;
-        cfg.idle_timeout = Duration::from_secs(30);
+        cfg.limits.max_connections = 1;
+        cfg.limits.idle_timeout = Duration::from_secs(30);
         let handle = run_electrum(cfg, q, params, tip_tx, None)
             .await
             .expect("listen");
@@ -2279,5 +2329,48 @@ mod tests {
         drop(held);
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DoS: quiet client is disconnected when idle_timeout elapses.
+    #[tokio::test]
+    async fn idle_timeout_disconnects_quiet_client() {
+        use tokio::io::AsyncReadExt;
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let q = Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        cfg.limits.idle_timeout = Duration::from_millis(80);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        // Send nothing — wait for server idle close.
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        match read {
+            Ok(Ok(0)) | Ok(Err(_)) => {} // clean EOF or error on close
+            Ok(Ok(n)) => panic!("unexpected data from idle close: {:?}", &buf[..n]),
+            Err(_) => panic!("idle timeout did not close connection within 2s"),
+        }
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_limits_public_proxy_defaults() {
+        let lim = ServeLimits::for_public_proxy();
+        assert_eq!(lim.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(lim.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(
+            lim.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("0.0.0.0:50001".parse().unwrap(), &params);
+        assert_eq!(cfg.limits, lim);
+        assert_eq!(cfg.max_connections(), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
     }
 }

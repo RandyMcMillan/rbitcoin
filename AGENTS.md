@@ -154,6 +154,19 @@ Skip commit/build only when the turn was pure discussion with no
 compile-affecting edits. If you cannot commit (hooks, secrets, user said not
 to), still do the static musl install and say the tree was **not** committed.
 
+## How we plan
+
+Multi-step work is planned as **many small vertical slices**, each roughly one
+**Red → Green → Refactor** cycle — not a few large “implement phase N” blocks.
+Prefer more steps with explicit contracts and test budgets over horizontal
+layering (all store, then all consensus, then wire). Full guide:
+
+**[`docs/how-we-plan.md`](docs/how-we-plan.md)** — XP/INVEST-inspired stories,
+step template, spikes, suite-speed as a planning constraint, anti-patterns.
+
+When writing or executing a plan/PR plan: every step should name **Contract,
+Red, Green, Refactor, Verify** before production code for that step.
+
 ## Test-driven development (required for behavioral changes)
 
 **Default: no production code change without a test that fails first and pins

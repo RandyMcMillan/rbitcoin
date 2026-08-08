@@ -42,6 +42,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     header_txs_first.body        # header_fk-1 → first_tx_fk
     header_txs_count.body        # header_fk-1 → tx count
     scripthash.body / *.head     # Class B Electrum SH (thin creates)
+    scripthash.ovf/NNNNNN[.fuse8] # mono ovf segments (1 main-shard slots; seal+roll)
     archive_epoch
     scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
   wire/                          # tip wire ring (soft zone)
@@ -283,8 +284,15 @@ Thin create index: **create_tx_fk only** (no vout in the index).
   one shard band at a time). Cold load builds one **final-sized** OA image in RAM
   then sequential-writes the shard file (~0.5–1 GiB peak).
 - **No rehash** after create/materialize size: new keys after ~**0.80** load seal main
-  and go to **`scripthash.ovf.head`** (overflow OA). Existing main keys still append
-  on main pages. Optional fuse8 product on seal (`scripthash.head.fuse8` / ovf).
+  and go to **overflow segments** under **`scripthash.ovf/`**. Existing main keys still
+  append on main pages. Optional main fuse8 (`scripthash.head.fuse8`, async).
+- **Overflow geometry:** each segment is a **mono** open-address file whose **slot count
+  equals one main shard** (`main_total_slots / n_shards` on multi-shard main — **not**
+  a second 64-way main). Paths: `scripthash.ovf/NNNNNN` + `NNNNNN.fuse8` after seal.
+  Open segment: **no_rehash only**; load ≥ ~0.80 or NeedSlot → **seal** (real BF8R
+  from 16 B head keys, sync) + **roll** next same-size empty segment. Lookups: main →
+  open ovf → sealed ovf (fuse-gated). Updates stay on the key’s home segment (no dual-home).
+  Legacy interim full-size `scripthash.ovf.head` is **wiped on open**.
 
 | Mode | When | Value (`w0`, `w1`) |
 |------|------|---------------------|

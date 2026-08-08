@@ -36,12 +36,14 @@ See [`SCHEMA.md`](./SCHEMA.md).
 
 - Class B SH head value: **Empty / Inline (≤2) / Paged** (first+last **4 KiB** page offs; bit-63 flags).
 - Body uses fixed **4096 B page chains** (≤510 FKs/page); geometric **slab** packing is refused on decode.
-- Main OA **does not rehash** after create size; load ≥ **~0.80** seals main (`scripthash.main_sealed` + optional fuse product); **new keys** go to **`scripthash.ovf.head`**.
+- Main OA **does not rehash** after create size; load ≥ **~0.80** seals main (`scripthash.main_sealed` + optional fuse product); **new keys** go to **`scripthash.ovf/`** mono segment stack (slots = one main shard; seal+roll at ~0.8 with real BF8R).
 - Cold bulk materialize writes paged layout only (same put routing spirit as tip).
 - **Open path:** schema **13** stores with **no materialized scripthash head** open
   on this binary and **silently rewrite** store `meta` to 14 (Class A layout matches).
   A schema-13 store that already has a durable SH index is **refused** — wipe
   `store/scripthash*` (or full datadir) and rematerialize; no dual-read of slab values.
+- Interim full-size single-file `scripthash.ovf.head` (if any) is **wiped on open**;
+  segmented `scripthash.ovf/` is the only live overflow layout (schema still **14**).
 
 ## v13
 

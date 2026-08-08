@@ -508,6 +508,36 @@ impl ScriptHashHead {
         Ok(())
     }
 
+    /// Full-key upsert without rehash (maps to 16 B head keys; remaps remainder).
+    pub fn insert_many_full_no_rehash(
+        &self,
+        entries: &[([u8; 32], ShHeadValue)],
+        allow_new: bool,
+    ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mapped: Vec<_> = entries
+            .iter()
+            .map(|(k, v)| (head_key_from_full(k), v.clone()))
+            .collect();
+        let rem = self.insert_many_no_rehash(&mapped, allow_new)?;
+        if rem.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(rem.len());
+        for (hk, hv) in rem {
+            if let Some((full, _)) = entries.iter().find(|(f, _)| head_key_from_full(f) == hk) {
+                out.push((*full, hv));
+            } else {
+                let mut full = [0u8; 32];
+                full[..SH_HEAD_KEY_LEN].copy_from_slice(&hk);
+                out.push((full, hv));
+            }
+        }
+        Ok(out)
+    }
+
     /// Like [`insert_many`] but **never rehashes**.
     ///
     /// `allow_new`: when true, new keys may occupy empty slots until the first
@@ -1269,6 +1299,16 @@ impl ShardedScriptHashHead {
         self.shards.len()
     }
 
+    /// Slot count of one main shard (overflow segment geometry = this size).
+    pub fn slots_per_shard(&self) -> u64 {
+        self.shards.first().map(|s| s.slots()).unwrap_or(64)
+    }
+
+    /// Total OA slots across all main shards.
+    pub fn total_slots(&self) -> u64 {
+        self.shards.iter().map(|s| s.slots()).sum()
+    }
+
     /// Shard index for a full Electrum scripthash (same as insert routing).
     #[inline]
     pub fn shard_index(&self, full: &[u8; 32]) -> usize {
@@ -1410,43 +1450,6 @@ impl ShardedScriptHashHead {
             }
         }
         Ok(remainder)
-    }
-
-    pub fn insert_many_sharded(
-        &self,
-        entries: &[([u8; 32], ShHeadValue)],
-        flush_each_shard: bool,
-    ) -> Result<(), StoreError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let n = self.shards.len();
-        if n == 1 {
-            self.shards[0].reserve_additional(entries.len() as u64)?;
-            self.shards[0].insert_many(entries)?;
-            if flush_each_shard {
-                self.shards[0].flush()?;
-            }
-            return Ok(());
-        }
-        let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> = (0..n).map(|_| Vec::new()).collect();
-        for (k, v) in entries {
-            buckets[self.shard_of(k)].push((*k, v.clone()));
-        }
-        for (i, mut bucket) in buckets.into_iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
-            }
-            // Stable order within shard for probe locality.
-            bucket.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            self.shards[i].reserve_additional(bucket.len() as u64)?;
-            self.shards[i].insert_many(&bucket)?;
-            if flush_each_shard {
-                // Release dirty pages for this shard before touching the next.
-                self.shards[i].flush()?;
-            }
-        }
-        Ok(())
     }
 
     pub fn for_each_occupied(

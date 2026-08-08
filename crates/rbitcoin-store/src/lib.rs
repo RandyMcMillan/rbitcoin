@@ -28,6 +28,7 @@ mod point_table;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
+mod scripthash_overflow;
 mod scripthash_pages;
 mod segmented_head;
 mod sharded_hashhead;

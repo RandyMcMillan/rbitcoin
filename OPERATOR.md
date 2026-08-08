@@ -226,8 +226,10 @@ opens on this binary and **silently rewrites** store `meta` to 14 (Class A is
 compatible). If schema-13 SH is already durable (occupied head / live creates),
 open is **refused** — wipe `store/scripthash*` (or full store) and rematerialize
 from `scripthash.runs` / reindex; there is **no dual-read** of old slabs as paged.
-After main load ≥ ~0.80, main seals and **new** keys land in `scripthash.ovf.head`
-(existing main keys still append on main).
+After main load ≥ ~0.80, main seals and **new** keys land in **`scripthash.ovf/`**
+mono segments sized to **one main shard** (not a second 64-way head). Open ovf
+seals at ~0.8 with a real fuse and rolls the next segment. Legacy full-size
+`scripthash.ovf.head` is removed on open. Existing main keys still append on main.
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**

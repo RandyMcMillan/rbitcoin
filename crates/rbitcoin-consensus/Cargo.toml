@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "rayon_audit"
 harness = false
+
+[[bench]]
+name = "confirm_stage_cpu"
+harness = false

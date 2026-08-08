@@ -33,7 +33,7 @@ use crate::params::{genesis_block, ChainParams};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
+use rbitcoin_query::{Query, U64Map};
 use rbitcoin_store::{SpendAnnBackend, StoreError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -904,12 +904,13 @@ pub fn ensure_external_parent_denserels_from_plan(
 ///
 /// **Lookup** fills this via `tx.head` / `tx.idx` / `txid.body` (never `tx.body`).
 /// **Load** denserels by range using only these maps (+ plan offline pins).
+/// Integer create_fk maps use [`U64Map`] (identity hasher) — pack-scale win over SipHash.
 #[derive(Debug, Default, Clone)]
 pub struct ParentPinStamp {
     /// create_fk_id → Class A body range.
-    pub ranges: HashMap<u64, (u64, u64)>,
+    pub ranges: U64Map<(u64, u64)>,
     /// create_fk_id → create txid (wire / sidefile at lookup).
-    pub txids: HashMap<u64, [u8; 32]>,
+    pub txids: U64Map<[u8; 32]>,
     /// prev_txid → create_fk_id (plan=None thin edges without head on load).
     pub create_by_txid: HashMap<[u8; 32], u64>,
 }
@@ -920,6 +921,7 @@ impl ParentPinStamp {
         for (id, tid) in &plan.external_parent_txids {
             create_by_txid.insert(*tid, *id);
         }
+        // Plan + stamp both use U64Map (identity hasher) for dense create_fk keys.
         Self {
             ranges: plan.external_parent_ranges.clone(),
             txids: plan.external_parent_txids.clone(),
@@ -3994,7 +3996,7 @@ mod write_idempotent_tests {
             spends: vec![],
             batch_creates: vec![],
             external_parent_outs: {
-                let mut m = std::collections::HashMap::new();
+                let mut m = rbitcoin_query::U64Map::default();
                 m.insert(parent_id, Arc::clone(&external));
                 m
             },

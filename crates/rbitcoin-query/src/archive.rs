@@ -63,19 +63,20 @@ pub struct ArchiveWritePlan {
     /// Filled by ensure/prep denserels (often from
     /// [`Self::external_parent_ranges`]). **Dropped after pin**
     /// ([`Self::clear_external_parent_outs`]).
-    pub external_parent_outs: std::collections::HashMap<u64, SparseExternalPin>,
+    pub external_parent_outs: crate::U64Map<SparseExternalPin>,
     /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
     ///
     /// Filled at plan stamp (fk+range short-circuit). Prep denserels-loads by
     /// offset (skip `tx.idx`) into [`Self::external_parent_outs`]. Still live —
     /// not obsolete after schema-13 `txid.body` (identity is separate from range).
-    pub external_parent_ranges: std::collections::HashMap<u64, (u64, u64)>,
+    /// Pack-scale identity hasher ([`crate::U64Map`]): dense create_fks load evenly.
+    pub external_parent_ranges: crate::U64Map<(u64, u64)>,
     /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
     ///
     /// Built when in-flight / head resolve binds `prev_txid → fk`.
     /// Prep pin fills schema-13 zero body `TxRecord.txid` from this map — **never**
     /// re-pread `txid.body` on the pin path.
-    pub external_parent_txids: std::collections::HashMap<u64, [u8; 32]>,
+    pub external_parent_txids: crate::U64Map<[u8; 32]>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_lookup_ok` only `Arc::clone`s into in-flight outs.
@@ -92,9 +93,9 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
-            external_parent_outs: std::collections::HashMap::new(),
-            external_parent_ranges: std::collections::HashMap::new(),
-            external_parent_txids: std::collections::HashMap::new(),
+            external_parent_outs: crate::U64Map::default(),
+            external_parent_ranges: crate::U64Map::default(),
+            external_parent_txids: crate::U64Map::default(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -467,13 +468,12 @@ impl Query {
         // (probe + idx + identity; no denserels body). Prep loads denserels by
         // known body_range (skip tx.idx). Identity for pin is the lookup key
         // already in RAM (`resolved`) — never re-read txid.body at prep.
-        let external_parent_outs: std::collections::HashMap<u64, SparseExternalPin> =
-            std::collections::HashMap::new();
-        let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
-            std::collections::HashMap::new();
-        let mut external_parent_txids: std::collections::HashMap<u64, [u8; 32]> =
-            std::collections::HashMap::with_capacity(
+        let external_parent_outs: crate::U64Map<SparseExternalPin> = crate::U64Map::default();
+        let mut external_parent_ranges: crate::U64Map<(u64, u64)> = crate::U64Map::default();
+        let mut external_parent_txids: crate::U64Map<[u8; 32]> =
+            crate::U64Map::with_capacity_and_hasher(
                 resolved.len().saturating_add(need_head.len()),
+                Default::default(),
             );
         // Reverse map for in-flight / head binds already in `resolved`.
         for (txid, fk) in &resolved {

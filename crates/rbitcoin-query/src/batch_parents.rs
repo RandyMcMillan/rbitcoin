@@ -40,9 +40,14 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-/// Identity hasher for `u64` / single-field `Fk` keys (no mixing). Pack maps are
-/// dense integer ids; at ~8k keys this beats std's default hasher on pure
-/// insert+lookup benches (confirm_stage_cpu).
+/// Identity hasher for `u64` / single-field `Fk` keys (no mixing).
+///
+/// **Intended keys:** dense sequential create_fks / heights (Class A append ids).
+/// Those land on consecutive buckets under hashbrown's power-of-two mask → even
+/// occupancy, short probes. **Avoid** for keys that share low bits (aligned
+/// pointers, multiples of large powers of two) — that is the classic identity-
+/// hash pile-up. At pack scale (~8k) this beats SipHash on insert+lookup
+/// (`confirm_stage_cpu`); sequential IDs are not a clustering hazard here.
 #[derive(Default, Clone, Copy)]
 pub struct U64IdentityHasher(u64);
 

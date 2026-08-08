@@ -3436,6 +3436,98 @@ mod write_idempotent_tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Multi-block tip-ahead assemble (i>0) calls [`expected_bits_extending`] on a
+    /// retarget height. Period-start (`height − interval`) may still be **above**
+    /// confirmed tip while already present as a ConfirmParentCache header plan
+    /// (put when that height was looked up/loaded earlier).
+    ///
+    /// Mainnet log 2026-08-07: batch @132992 n=92 includes retarget 133056;
+    /// first=131040; tip still ~129k → confirmed miss → "missing retarget first
+    /// header" even though the plan cache should hold 131040.
+    ///
+    /// Ship path must resolve period-start via confirmed **or** header plan.
+    #[test]
+    fn expected_bits_extending_uses_header_plan_when_period_start_above_tip() {
+        use super::expected_bits_extending;
+        use crate::params::ChainParams;
+        use bitcoin::CompactTarget;
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::Query;
+        use rbitcoin_store::HeaderRecord;
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-retarget-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        let params = ChainParams::mainnet();
+        let interval = params.difficulty_adjustment_interval();
+        assert_eq!(interval, 2016, "mainnet difficulty interval");
+
+        // Tip empty / genesis not required: period-start 2016 is above tip (None).
+        assert!(
+            q.header_at_height(Height(2016)).unwrap().is_none(),
+            "period-start must not be on confirmed[]"
+        );
+
+        // Simulate earlier tip-ahead lookup/load that put the period-start plan.
+        let mut hash_first = [0u8; 32];
+        hash_first[0..4].copy_from_slice(&2016u32.to_le_bytes());
+        hash_first[4] = 0xaa;
+        let first_rec = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1_234_567,
+            bits: 0x1d00ffff,
+            nonce: 2016,
+            merkle_root: hash_first,
+            hash: hash_first,
+        };
+        let first_fk = q.store().put_header(&first_rec).unwrap();
+        q.confirm_parent_cache().put_header_plan(
+            2016,
+            first_fk,
+            first_rec.clone(),
+            Vec::new(),
+            [0u8; 32],
+        );
+        assert!(
+            q.confirm_parent_cache().get_header_plan(2016).is_some(),
+            "plan cache holds period-start (as real put_header_plan during load does)"
+        );
+
+        // Mid-batch path: prev bits/time come from prior prepared block in RAM;
+        // only period-start is resolved from store/plan.
+        let prev_bits = CompactTarget::from_consensus(0x1d00ffff);
+        let prev_time = first_rec.timestamp.saturating_add(2015 * 600);
+        let retarget_h = Height(4032); // 2 * interval — needs first @ 2016
+        assert_eq!(retarget_h.0 % interval, 0);
+
+        let got = expected_bits_extending(&q, &params, retarget_h, prev_bits, prev_time)
+            .expect(
+                "period-start on ConfirmParentCache must satisfy retarget bits \
+                 (tip-ahead multi-block); confirmed-only lookup is the mainnet bug",
+            );
+        // Sanity: result is a real CompactTarget (same construction as production).
+        let timespan = prev_time.saturating_sub(first_rec.timestamp) as u64;
+        let expect = CompactTarget::from_next_work_required(prev_bits, timespan, &params.btc);
+        assert_eq!(got, expect);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// Mempool-preverified txids skip script_wave verify (tip follow).
     #[test]
     fn script_wave_skips_preverified_txids() {
@@ -5175,12 +5267,23 @@ fn expected_bits_extending(
     if params.no_pow_retargeting() || height.0 % interval != 0 {
         return Ok(prev_bits);
     }
+    // Period-start may still be above confirmed tip during tip-ahead multi-block
+    // load (i>0). Lookup/load already put_header_plan for that height — use it.
     let first_height = Height(height.0 - interval);
-    let (_fk, first_rec) = query
+    let first_ts = if let Some((_fk, rec)) = query
         .header_at_height(first_height)
         .map_err(ConsensusError::Store)?
-        .ok_or(ConsensusError::BadHeader("missing retarget first header"))?;
-    let timespan = prev_time.saturating_sub(first_rec.timestamp) as u64;
+    {
+        rec.timestamp
+    } else if let Some(plan) = query
+        .confirm_parent_cache()
+        .get_header_plan(first_height.0)
+    {
+        plan.header_rec.timestamp
+    } else {
+        return Err(ConsensusError::BadHeader("missing retarget first header"));
+    };
+    let timespan = prev_time.saturating_sub(first_ts) as u64;
     Ok(CompactTarget::from_next_work_required(
         prev_bits,
         timespan,

@@ -708,6 +708,40 @@ fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String
     (total, pass, fail, allow_skip, failures)
 }
 
+/// Fail if TX_ALLOWLIST lists rows that already match Core without skip.
+#[test]
+fn tx_allowlist_has_no_stale_entries() {
+    let mut stale = Vec::new();
+    for &(file, idx, reason) in TX_ALLOWLIST {
+        let expect_ok = file == "tx_valid.json";
+        let rows = load_array(file);
+        let Some(row) = rows.get(idx) else {
+            continue;
+        };
+        let Value::Array(cells) = row else {
+            continue;
+        };
+        if cells.len() < 3 || !cells[0].is_array() {
+            continue;
+        }
+        let Some(tx_hex) = cells[1].as_str() else {
+            continue;
+        };
+        let flags_s = cells[2].as_str().unwrap_or("NONE");
+        let got = verify_tx_row(&cells[0], tx_hex, flags_s);
+        let ok = if expect_ok { got.is_ok() } else { got.is_err() };
+        if ok {
+            stale.push((file, idx, reason));
+            eprintln!("stale TX_ALLOWLIST {file}#{idx}: {reason}");
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "remove {} stale TX_ALLOWLIST entries (already match Core)",
+        stale.len()
+    );
+}
+
 #[test]
 fn core_tx_valid_all_rows() {
     let (total, pass, fail, allow_skip, failures) = run_tx_corpus("tx_valid.json", true);

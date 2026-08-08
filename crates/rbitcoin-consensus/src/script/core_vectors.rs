@@ -868,8 +868,7 @@ const ALLOWLIST: &[(usize, &str)] = &[
     (1164, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
     (1171, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
     (1172, "WITNESS_PUBKEYTYPE compressed-only check incomplete (flags=P2SH,WITNESS,WITNESS_PUBKEYTYPE expect=WITNESS_PUBKEYTYPE)"),
-    (1189, "CSV NEGATIVE_LOCKTIME not hard-failed"),
-    (1193, "CSV UNSATISFIED_LOCKTIME 5-byte scriptnum edge"),
+    // 1189/1193 CSV residual: cleared after 003/004 (stale audit 2026-08-08).
     (1227, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
     (1228, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
     (1243, "MINIMALIF only fully on TapScript path (flags=P2SH,WITNESS,MINIMALIF expect=MINIMALIF)"),
@@ -1049,6 +1048,75 @@ fn run_all_script_rows() -> RowStats {
         }
     }
     st
+}
+
+/// True if this JSON index is a data row that **matches Core without** allowlist skip.
+fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
+    let root = load_json();
+    let arr = root.as_array().expect("script_tests root array");
+    let row = arr.get(idx)?;
+    let Value::Array(cells) = row else {
+        return None;
+    };
+    if cells.is_empty() {
+        return None;
+    }
+    let is_witness_form = cells[0].is_array();
+    let is_plain = cells[0].as_str().is_some();
+    if !is_witness_form && !is_plain {
+        return None;
+    }
+    if is_plain && cells.len() < 4 {
+        return None;
+    }
+    if is_witness_form && cells.len() < 5 {
+        return None;
+    }
+    let (witness, amount, sig_s, pk_s, flags_s, expect_s) = if is_witness_form {
+        let (w, amt) = parse_witness_and_amount(&cells[0]).ok()?;
+        (
+            w,
+            amt,
+            cells[1].as_str().unwrap_or(""),
+            cells[2].as_str().unwrap_or(""),
+            cells[3].as_str().unwrap_or(""),
+            cells[4].as_str().unwrap_or(""),
+        )
+    } else {
+        (
+            Witness::new(),
+            Amount::ZERO,
+            cells[0].as_str().unwrap_or(""),
+            cells[1].as_str().unwrap_or(""),
+            cells[2].as_str().unwrap_or(""),
+            cells[3].as_str().unwrap_or(""),
+        )
+    };
+    let flags = parse_flags(flags_s);
+    let sig_bytes = assemble(sig_s).ok()?;
+    let pk_bytes = assemble(pk_s).ok()?;
+    let got = run_script_row(&sig_bytes, &pk_bytes, witness, amount, &flags);
+    Some(outcome_matches(expect_s, &got))
+}
+
+/// Fail if ALLOWLIST still lists rows that already match Core (stale debt).
+#[test]
+fn script_allowlist_has_no_stale_entries() {
+    let mut stale = Vec::new();
+    for &(idx, reason) in ALLOWLIST {
+        match script_row_matches_core_without_skip(idx) {
+            Some(true) => stale.push((idx, reason)),
+            Some(false) | None => {}
+        }
+    }
+    for (idx, reason) in &stale {
+        eprintln!("stale allowlist #{idx}: {reason}");
+    }
+    assert!(
+        stale.is_empty(),
+        "remove {} stale script ALLOWLIST entries (already match Core)",
+        stale.len()
+    );
 }
 
 /// Full Core `script_tests.json` corpus: every data row via shipped verify path.

@@ -1277,19 +1277,37 @@ pub fn sh_merge_workers() -> usize {
         .clamp(1, 256)
 }
 
+/// Choose chunk width so **one** pass yields ≤ `target_stream` outputs.
+///
+/// `outputs ≈ ceil(n / fanin) ≤ TARGET` ⇒ `fanin ≥ ceil(n / TARGET)`.
+/// Production uses [`FANIN_TARGET_STREAM_RUNS`]; tests may pass a tiny target.
+pub fn dynamic_merge_fanin_for(n_runs: usize, target_stream: usize) -> usize {
+    let target = target_stream.max(1);
+    if n_runs == 0 {
+        return target;
+    }
+    if n_runs <= target {
+        return n_runs.max(1);
+    }
+    n_runs.div_ceil(target).clamp(8, FANIN_MAX_CHUNK)
+}
+
 /// Choose chunk width so **one** pass yields ≤ [`FANIN_TARGET_STREAM_RUNS`] outputs.
 ///
 /// `outputs ≈ ceil(n / fanin) ≤ TARGET` ⇒ `fanin ≥ ceil(n / TARGET)`.
+#[inline]
 pub fn dynamic_merge_fanin(n_runs: usize) -> usize {
-    if n_runs == 0 {
-        return FANIN_TARGET_STREAM_RUNS;
+    dynamic_merge_fanin_for(n_runs, FANIN_TARGET_STREAM_RUNS)
+}
+
+/// Resolve `target_stream_runs` for reduce: `0` means production default.
+#[inline]
+fn resolve_target_stream(target_stream_runs: usize) -> usize {
+    if target_stream_runs == 0 {
+        FANIN_TARGET_STREAM_RUNS
+    } else {
+        target_stream_runs
     }
-    if n_runs <= FANIN_TARGET_STREAM_RUNS {
-        return n_runs.max(1);
-    }
-    n_runs
-        .div_ceil(FANIN_TARGET_STREAM_RUNS)
-        .clamp(8, FANIN_MAX_CHUNK)
 }
 
 /// Always 0 or 1 with dynamic single-pass reduce (kept for log compatibility).
@@ -1374,23 +1392,28 @@ impl ReduceStatus {
 
 /// Reduce `inputs` to ≤ target stream runs via **one** fan-in pass.
 ///
-/// Dynamic fanin ([`dynamic_merge_fanin`]) so `ceil(n/fanin) ≤ TARGET_STREAM`.
+/// `target_stream_runs`: max stream runs after one pass. **`0` = production
+/// default** ([`FANIN_TARGET_STREAM_RUNS`]). Tests pass a small target so reduce
+/// behavior is covered without creating thousands of run files.
+///
+/// Dynamic fanin ([`dynamic_merge_fanin_for`]) so `ceil(n/fanin) ≤ target`.
 /// After each chunk: delete inputs, write CHECKPOINT (partial-pass resume).
 pub fn reduce_runs_to_fanin(
     inputs: &[SortedRunPath],
     work_dir: &Path,
-    _fanin_ignored: usize,
+    target_stream_runs: usize,
 ) -> Result<Vec<SortedRunPath>, StoreError> {
-    reduce_runs_to_fanin_cancellable(inputs, work_dir, _fanin_ignored, None)
+    reduce_runs_to_fanin_cancellable(inputs, work_dir, target_stream_runs, None)
 }
 
 /// Like [`reduce_runs_to_fanin`] with cooperative cancel.
 pub fn reduce_runs_to_fanin_cancellable(
     inputs: &[SortedRunPath],
     work_dir: &Path,
-    _fanin_ignored: usize,
+    target_stream_runs: usize,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<SortedRunPath>, StoreError> {
+    let target = resolve_target_stream(target_stream_runs);
     fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
     clear_tmp_in_work_dir(work_dir);
 
@@ -1436,12 +1459,12 @@ pub fn reduce_runs_to_fanin_cancellable(
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        fanin = dynamic_merge_fanin(inputs.len());
-        if inputs.len() <= FANIN_TARGET_STREAM_RUNS {
+        fanin = dynamic_merge_fanin_for(inputs.len(), target);
+        if inputs.len() <= target {
             rbitcoin_log::info!(
                 "store: scripthash fanin reduce skipped runs={} already≤target={}",
                 inputs.len(),
-                FANIN_TARGET_STREAM_RUNS
+                target
             );
             return Ok(inputs.to_vec());
         }
@@ -1853,6 +1876,41 @@ mod tests {
         r
     }
 
+    /// Tiny stream target so reduce runs without thousands of run files.
+    const TEST_TARGET: usize = 16;
+
+    fn write_n_runs(dir: &Path, n: u64, seq_base: u64) -> Vec<SortedRunPath> {
+        let mut inputs = Vec::with_capacity(n as usize);
+        for i in 1..=n {
+            let p = next_run_path(dir, seq_base + i);
+            write_sorted_run(&p, 32, 44, &rec(((seq_base + i) % 200) as u8, i as u8)).unwrap();
+            inputs.push(open_run(&p).unwrap());
+        }
+        inputs
+    }
+
+    /// Scope `RBITCOIN_SH_MERGE_WORKERS` for one test (restore previous value).
+    struct MergeWorkersGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl MergeWorkersGuard {
+        fn set(workers: &str) -> Self {
+            let prev = std::env::var_os("RBITCOIN_SH_MERGE_WORKERS");
+            std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", workers);
+            Self { prev }
+        }
+    }
+
+    impl Drop for MergeWorkersGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", v),
+                None => std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS"),
+            }
+        }
+    }
+
     #[test]
     fn crc32_known_vector() {
         // CRC-32/ISO-HDLC of "123456789"
@@ -2129,18 +2187,13 @@ mod tests {
     fn reduce_fanin_deletes_merged_inputs() {
         let d = tmp_dir();
         let work = d.join("merge");
-        let mut inputs = Vec::new();
-        // Must exceed FANIN_TARGET_STREAM_RUNS so reduce actually runs.
-        let n = (FANIN_TARGET_STREAM_RUNS + 64) as u64;
-        for i in 1..=n {
-            let p = next_run_path(&d, i);
-            write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
-            inputs.push(open_run(&p).unwrap());
-        }
-        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
-        let out = reduce_runs_to_fanin(&inputs, &work, 0).unwrap();
+        // Exceed tiny TEST_TARGET so reduce actually runs (not skip).
+        let n = (TEST_TARGET + 8) as u64;
+        let inputs = write_n_runs(&d, n, 0);
+        let _w = MergeWorkersGuard::set("1");
+        let out = reduce_runs_to_fanin(&inputs, &work, TEST_TARGET).unwrap();
         assert!(
-            out.len() <= FANIN_TARGET_STREAM_RUNS,
+            out.len() <= TEST_TARGET,
             "stream runs {} > target",
             out.len()
         );
@@ -2156,7 +2209,6 @@ mod tests {
         assert_eq!(total, n);
         commit_fanin_reduce_and_drop_inputs(&work, &inputs, &out).unwrap();
         assert!(work.join(FANIN_READY_NAME).is_file());
-        std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2164,35 +2216,38 @@ mod tests {
     fn dynamic_fanin_one_pass_geometry() {
         assert_eq!(dynamic_merge_fanin(10), 10);
         assert_eq!(dynamic_merge_fanin(32), 32);
-        // Under target (4096): fanin == n (direct stream; no reduce).
+        // Under production target (4096): fanin == n (direct stream; no reduce).
         assert_eq!(dynamic_merge_fanin(1000), 1000);
         assert_eq!(fanin_passes_total(1000, 1000), 0);
         assert_eq!(fanin_passes_total(10, 10), 0);
         assert_eq!(dynamic_merge_fanin(64), 64);
-        // Above target: ceil(n/TARGET) clamped.
+        // Above production target: ceil(n/TARGET) clamped (pure math; no IO).
         let n = FANIN_TARGET_STREAM_RUNS * 2 + 100;
         let f = dynamic_merge_fanin(n);
         assert!(f >= 8 && f <= FANIN_MAX_CHUNK);
         assert!(n.div_ceil(f) <= FANIN_TARGET_STREAM_RUNS);
+        // Tiny target geometry (same formula; used by IO tests).
+        let f_tiny = dynamic_merge_fanin_for(TEST_TARGET + 8, TEST_TARGET);
+        assert!(f_tiny >= 1);
+        assert!((TEST_TARGET + 8).div_ceil(f_tiny) <= TEST_TARGET);
+        assert_eq!(
+            dynamic_merge_fanin_for(TEST_TARGET, TEST_TARGET),
+            TEST_TARGET
+        );
+        assert_eq!(dynamic_merge_fanin_for(0, TEST_TARGET), TEST_TARGET);
     }
 
     /// Partial checkpoint: simulate mid-reduce then resume.
     #[test]
     fn reduce_fanin_resume_partial_checkpoint() {
         let d = tmp_dir();
-        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
+        let _w = MergeWorkersGuard::set("1");
         let work = d.join("merge");
         fs::create_dir_all(&work).unwrap();
-        let n_runs = FANIN_TARGET_STREAM_RUNS + 64;
-        let mut all = Vec::new();
-        for i in 1..=n_runs as u64 {
-            let p = next_run_path(&d, i);
-            write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
-            all.push(open_run(&p).unwrap());
-        }
-        let fanin = dynamic_merge_fanin(n_runs);
-        assert!(fanin >= 8 && fanin <= FANIN_MAX_CHUNK);
-        assert!(n_runs.div_ceil(fanin) <= FANIN_TARGET_STREAM_RUNS);
+        let n_runs = TEST_TARGET + 8;
+        let all = write_n_runs(&d, n_runs as u64, 0);
+        let fanin = dynamic_merge_fanin_for(n_runs, TEST_TARGET);
+        assert!(n_runs.div_ceil(fanin) <= TEST_TARGET);
         // Complete first chunk only.
         let chunk: Vec<_> = all[..fanin].to_vec();
         let rest: Vec<_> = all[fanin..].to_vec();
@@ -2207,12 +2262,11 @@ mod tests {
         assert_eq!(cp.remaining.len(), n_runs - fanin);
         assert_eq!(cp.done_outputs.len(), 1);
 
-        // Resume finishes remaining.
-        let out = reduce_runs_to_fanin(&[], &work, 0).unwrap();
-        assert!(out.len() <= FANIN_TARGET_STREAM_RUNS);
+        // Resume finishes remaining (target unused when checkpoint present).
+        let out = reduce_runs_to_fanin(&[], &work, TEST_TARGET).unwrap();
+        assert!(out.len() <= TEST_TARGET);
         let n: u64 = out.iter().map(|r| r.count).sum();
         assert_eq!(n, n_runs as u64);
-        std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2220,18 +2274,13 @@ mod tests {
     fn reduce_fanin_cancel_returns_cancelled() {
         let d = tmp_dir();
         let work = d.join("merge");
-        let mut inputs = Vec::new();
-        let n = (FANIN_TARGET_STREAM_RUNS + 64) as u64;
-        for i in 1..=n {
-            let p = next_run_path(&d, i);
-            write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
-            inputs.push(open_run(&p).unwrap());
-        }
-        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
+        let n = (TEST_TARGET + 8) as u64;
+        let inputs = write_n_runs(&d, n, 0);
+        let _w = MergeWorkersGuard::set("1");
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        let err = reduce_runs_to_fanin_cancellable(&inputs, &work, 0, Some(&cancel)).unwrap_err();
+        let err = reduce_runs_to_fanin_cancellable(&inputs, &work, TEST_TARGET, Some(&cancel))
+            .unwrap_err();
         assert!(matches!(err, StoreError::Cancelled(_)), "got {err}");
-        std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2239,33 +2288,26 @@ mod tests {
     #[test]
     fn reduce_fanin_parallel_preserves_count() {
         let d = tmp_dir();
-        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
-        let n = (FANIN_TARGET_STREAM_RUNS + 32) as u64;
-        let mut inputs = Vec::new();
-        for i in 1..=n {
-            let p = next_run_path(&d, i);
-            write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
-            inputs.push(open_run(&p).unwrap());
-        }
+        let n = (TEST_TARGET + 8) as u64;
+        let inputs = write_n_runs(&d, n, 0);
         let work1 = d.join("merge1");
-        let out1 = reduce_runs_to_fanin(&inputs, &work1, 0).unwrap();
-        let n1: u64 = out1.iter().map(|r| r.count).sum();
-
-        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "4");
-        let mut inputs2 = Vec::new();
-        for i in 1..=n {
-            let p = next_run_path(&d, 10_000 + i);
-            write_sorted_run(&p, 32, 44, &rec((i % 200) as u8, i as u8)).unwrap();
-            inputs2.push(open_run(&p).unwrap());
+        {
+            let _w = MergeWorkersGuard::set("1");
+            let out1 = reduce_runs_to_fanin(&inputs, &work1, TEST_TARGET).unwrap();
+            let n1: u64 = out1.iter().map(|r| r.count).sum();
+            assert_eq!(n1, n);
+            assert!(out1.len() <= TEST_TARGET);
         }
+
+        let inputs2 = write_n_runs(&d, n, 10_000);
         let work2 = d.join("merge2");
-        let out2 = reduce_runs_to_fanin(&inputs2, &work2, 0).unwrap();
-        let n2: u64 = out2.iter().map(|r| r.count).sum();
-        assert_eq!(n1, n);
-        assert_eq!(n2, n);
-        assert!(out1.len() <= FANIN_TARGET_STREAM_RUNS);
-        assert!(out2.len() <= FANIN_TARGET_STREAM_RUNS);
-        std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
+        {
+            let _w = MergeWorkersGuard::set("4");
+            let out2 = reduce_runs_to_fanin(&inputs2, &work2, TEST_TARGET).unwrap();
+            let n2: u64 = out2.iter().map(|r| r.count).sum();
+            assert_eq!(n2, n);
+            assert!(out2.len() <= TEST_TARGET);
+        }
         let _ = fs::remove_dir_all(&d);
     }
 

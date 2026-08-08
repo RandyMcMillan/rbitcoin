@@ -1375,14 +1375,68 @@ mod tests {
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
     }
 
-    /// Microbench: batch head seed (`get_many`) vs N serial `get` — tip SH seed shape.
+    /// Batch head seed (`get_many`) vs N serial `get` — tip SH seed shape.
     ///
     /// Serial path creates a new `SlotPageCache` per key (old seed loop) → one
     /// 4 KiB pread per key. Batch shares one cache and visits keys in slot order
-    /// → one pread per unique page. Asserts **chunk-load** speedup (deterministic)
-    /// and prints wall-time; release builds also require a wall-time win.
+    /// → one pread per unique page. Asserts **chunk-load** speedup (deterministic).
+    /// Wall-time multi-round probe lives under `#[ignore]` (diagnostic only).
     #[test]
-    fn microbench_get_many_faster_than_serial_seed() {
+    fn get_many_cuts_chunk_loads_vs_serial_seed() {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+        // 4 Ki slots → 32 × 4 KiB pages. 512 keys ⇒ unique pages ≪ N.
+        let h = ScriptHashHead::create_with_slots(&path, 1 << 12).unwrap();
+        const N: u32 = 512;
+        let mut keys = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let mut k = [0u8; 32];
+            k[0..4].copy_from_slice(&i.to_le_bytes());
+            k[8] = (i % 251) as u8;
+            h.insert(
+                &k,
+                &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
+            )
+            .unwrap();
+            keys.push(k);
+        }
+
+        let mut serial_loads = 0u64;
+        for k in &keys {
+            let (_, n) = h.get_with_chunk_loads(k).unwrap();
+            serial_loads = serial_loads.saturating_add(n);
+        }
+        let (batch_vals, batch_loads) = h.get_many_with_chunk_loads(&keys).unwrap();
+        assert_eq!(batch_vals.len(), keys.len());
+        for (k, got) in keys.iter().zip(batch_vals.iter()) {
+            assert_eq!(got, &h.get(k).unwrap());
+        }
+        let load_speedup = serial_loads as f64 / batch_loads.max(1) as f64;
+        eprintln!(
+            "sh head seed chunk loads: serial={serial_loads} batch={batch_loads} \
+             speedup={load_speedup:.2}× (keys={N})"
+        );
+        assert!(
+            batch_loads * 3 < serial_loads && load_speedup >= 2.0,
+            "get_many should cut 4 KiB preads by ≥2× vs serial get: \
+             batch_loads={batch_loads} serial_loads={serial_loads} speedup={load_speedup:.2}×"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    }
+
+    /// Diagnostic wall-time arm of batch seed (not default suite).
+    #[test]
+    #[ignore = "diagnostic microbench; run with --ignored --nocapture"]
+    fn microbench_get_many_wall_vs_serial_seed() {
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-bench-{}-{}",
             std::process::id(),
@@ -1393,8 +1447,6 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
-        // 64 Ki slots → 512 × 4 KiB pages. ~4k keys ⇒ expected unique pages
-        // ≪ N, so shared cache cuts preads by multi-×.
         let h = ScriptHashHead::create_with_slots(&path, 1 << 16).unwrap();
         const N: u32 = 4_000;
         let mut keys = Vec::with_capacity(N as usize);
@@ -1409,31 +1461,6 @@ mod tests {
             .unwrap();
             keys.push(k);
         }
-
-        // --- Chunk-load arm (the optimization’s real unit of work) ---
-        let mut serial_loads = 0u64;
-        for k in &keys {
-            let (_, n) = h.get_with_chunk_loads(k).unwrap();
-            serial_loads = serial_loads.saturating_add(n);
-        }
-        let (batch_vals, batch_loads) = h.get_many_with_chunk_loads(&keys).unwrap();
-        assert_eq!(batch_vals.len(), keys.len());
-        for (k, got) in keys.iter().zip(batch_vals.iter()) {
-            assert_eq!(got, &h.get(k).unwrap());
-        }
-        let load_speedup = serial_loads as f64 / batch_loads.max(1) as f64;
-        eprintln!(
-            "sh head seed microbench (chunk loads): serial={serial_loads} batch={batch_loads} \
-             speedup={load_speedup:.2}× (keys={N})"
-        );
-        // Unique pages among 4k keys on 512 pages is ≪ 4k; require a clear cut.
-        assert!(
-            batch_loads * 3 < serial_loads && load_speedup >= 2.0,
-            "get_many should cut 4 KiB preads by ≥2× vs serial get: \
-             batch_loads={batch_loads} serial_loads={serial_loads} speedup={load_speedup:.2}×"
-        );
-
-        // --- Wall-time arm (release: prove end-to-end; debug: report only) ---
         let _ = h.get_many(&keys).unwrap();
         const ROUNDS: u32 = 8;
         let mut serial_ns = 0u128;
@@ -1465,7 +1492,6 @@ mod tests {
              speedup={wall_speedup:.2}× (keys={N} rounds={ROUNDS})"
         );
         if !cfg!(debug_assertions) {
-            // Optimized builds: shared cache + slot order should beat N× get.
             assert!(
                 wall_speedup >= 1.3,
                 "get_many wall should be ≥1.3× serial get in release: \
@@ -1478,7 +1504,7 @@ mod tests {
 
     #[test]
     fn open_large_without_occ_skips_scan_not_empty() {
-        // Simulate mainnet: body > SCAN_CAP, no sidecar → no full read, not empty.
+        // Body just over OCC_SCAN_BYTE_CAP → skip full scan when .occ missing.
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-large-{}",
             std::time::SystemTime::now()
@@ -1488,8 +1514,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
-        // slots so body > 16 MiB: 16MiB/32 = 524288 slots → use 1M slots (32 MiB).
-        let slots = 1u64 << 20;
+        // body = slots * 32 B; need body > 16 MiB ⇒ slots > 16MiB/32 = 524_288.
+        let min_slots = (OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1;
+        let slots = min_slots.next_power_of_two();
+        assert!(slots * SH_HEAD_SLOT_SIZE as u64 > OCC_SCAN_BYTE_CAP);
         let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
         assert!(h.is_known_empty());
         let mut key = [0u8; 32];
@@ -1498,7 +1526,7 @@ mod tests {
             .unwrap();
         assert_eq!(h.occupied(), 1);
         drop(h);
-        // Drop sidecar only — reopen must not scan 32 MiB and must not claim empty.
+        // Drop sidecar only — reopen must not scan body and must not claim empty.
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
         let t0 = Instant::now();
         let h2 = ScriptHashHead::open(&path).unwrap();

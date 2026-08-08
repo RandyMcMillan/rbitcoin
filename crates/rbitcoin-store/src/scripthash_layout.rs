@@ -1,7 +1,13 @@
-//! Hybrid scripthash layout (schema v6): 8 B create_tx_fk entries, 32 B head slots.
+//! Hybrid scripthash layout: 8 B create_tx_fk entries, **32 B head slots** (fixed).
 //!
-//! Head key = first 16 B of SHA256(spk). Value = two u64s (inline fks or slab meta).
-//! Body slab entry = create_tx_fk only (vout expanded from Class A at query).
+//! Head key = first 16 B of SHA256(spk). Value = two u64s.
+//!
+//! **Live (schema 13):** inline FKs or **slab** meta ([`SH_SLAB_MARKER`] on w0).
+//!
+//! **Target (schema 14 plan):** same 32 B slots; body uses **4 KiB page chains**
+//! instead of relocating slabs. Head packing and page layout are pinned in
+//! [`crate::scripthash_pages`] (Step 0). Live `ShHeadValue` still encodes slabs
+//! until later plan steps rewire put/entries.
 
 use crate::error::StoreError;
 use rbitcoin_primitives::Fk;

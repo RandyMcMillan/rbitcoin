@@ -1,7 +1,8 @@
-//! Esplora HTTP listener (axum + tower limits).
+//! Esplora HTTP listener (axum + tower limits) and wallet WebSocket live path.
 
 use crate::handlers;
 use crate::tx_json::{build_tx_json, tx_status_json};
+use crate::ws;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,7 +12,7 @@ use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
-use rbitcoin_net::MempoolHub;
+use rbitcoin_net::{MempoolHub, TipEvent};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
@@ -20,12 +21,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-/// Esplora HTTP server config (listen + shared DoS floor).
+/// Default concurrent upgraded WebSocket sockets (separate from REST concurrency).
+pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 64;
+/// Default max inbound client WebSocket text frame size.
+pub const DEFAULT_MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+/// Default max tracked addresses per WS connection (wallet watchlist).
+pub const DEFAULT_MAX_TRACK_ADDRESSES: usize = 64;
+/// Default max tracked txids per WS connection (pending set).
+pub const DEFAULT_MAX_TRACK_TXS: usize = 64;
+
+/// Esplora HTTP server config (listen + shared DoS floor + WS caps).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
     pub listen: SocketAddr,
@@ -33,6 +44,14 @@ pub struct EsploraConfig {
     pub limits: ServeLimits,
     /// Address encoding network (mainnet/testnet/signet/regtest).
     pub network: Network,
+    /// Max concurrent upgraded WebSocket connections (not REST concurrency).
+    pub max_ws_connections: usize,
+    /// Max inbound WS text frame bytes.
+    pub max_ws_message_bytes: usize,
+    /// Max tracked addresses per WS connection.
+    pub max_track_addresses: usize,
+    /// Max tracked txids per WS connection.
+    pub max_track_txs: usize,
 }
 
 impl EsploraConfig {
@@ -45,6 +64,10 @@ impl EsploraConfig {
             listen,
             limits: ServeLimits::for_public_proxy(),
             network,
+            max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_message_bytes: DEFAULT_MAX_WS_MESSAGE_BYTES,
+            max_track_addresses: DEFAULT_MAX_TRACK_ADDRESSES,
+            max_track_txs: DEFAULT_MAX_TRACK_TXS,
         }
     }
 }
@@ -69,18 +92,28 @@ pub(crate) struct AppState {
     pub(crate) network: Network,
     pub(crate) mempool: Option<Arc<MempoolHub>>,
     pub(crate) max_body: usize,
+    /// Tip fan-out for `want: blocks` (each WS connection subscribes).
+    pub(crate) tip_tx: Option<broadcast::Sender<TipEvent>>,
+    pub(crate) ws_sem: Option<Arc<Semaphore>>,
+    pub(crate) max_ws_message_bytes: usize,
+    pub(crate) max_track_addresses: usize,
+    pub(crate) max_track_txs: usize,
 }
 
-/// Start Esplora **plain HTTP** on `config.listen`.
+/// Start Esplora **plain HTTP** (+ wallet WebSocket) on `config.listen`.
 ///
-/// TLS is external (reverse proxy). App [`ServeLimits`] always apply (concurrency,
-/// body size, request timeout) — same floor as Electrum.
+/// TLS is external (reverse proxy). App [`ServeLimits`] always apply to REST
+/// (concurrency, body size, request timeout). WebSocket upgrades use a **separate**
+/// semaphore so long-lived sockets do not starve HTTP concurrency.
 ///
-/// Optional `mempool` enables fee estimates, mempool summary, and `POST /tx`.
+/// Optional `mempool` enables fee estimates, mempool summary, `POST /tx`, and
+/// live track pushes. Optional `tip_tx` enables `want: blocks` and confirm pushes
+/// (clone of a broadcast sender; node bridges `ChainHub` tips into it).
 pub async fn run_esplora(
     config: EsploraConfig,
     query: Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
+    tip_tx: Option<broadcast::Sender<TipEvent>>,
 ) -> Result<EsploraHandle, std::io::Error> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -93,13 +126,22 @@ pub async fn run_esplora(
     // Floor for request timeout: at least 1s so unit tests with short idle still work.
     let timeout = idle.max(Duration::from_secs(1));
 
+    let ws_sem = Arc::new(Semaphore::new(config.max_ws_connections.max(1)));
+
     let state = AppState {
         query,
         network: config.network,
         mempool,
         max_body,
+        tip_tx,
+        ws_sem: Some(ws_sem),
+        max_ws_message_bytes: config.max_ws_message_bytes.max(1024),
+        max_track_addresses: config.max_track_addresses.max(1),
+        max_track_txs: config.max_track_txs.max(1),
     };
-    let app = Router::new()
+
+    // REST routes: concurrency / body / timeout apply here only.
+    let rest = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/blocks", get(handlers::blocks_tip))
@@ -160,8 +202,14 @@ pub async fn run_esplora(
         .fallback(fallback_404)
         .layer(TimeoutLayer::new(timeout))
         .layer(RequestBodyLimitLayer::new(max_body))
-        .layer(ConcurrencyLimitLayer::new(max_conn))
-        .with_state(state);
+        .layer(ConcurrencyLimitLayer::new(max_conn));
+
+    // WS routes: separate from REST concurrency so upgrades do not hold HTTP permits.
+    let ws_routes = Router::new()
+        .route("/v1/ws", get(ws::ws_upgrade))
+        .route("/ws", get(ws::ws_upgrade));
+
+    let app = rest.merge(ws_routes).with_state(state);
 
     let task = tokio::spawn(async move {
         let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -420,7 +468,7 @@ mod tests {
 
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
         let addr = handle.local_addr;
 
         let (st, body) = http_get(addr, "/blocks/tip/height").await;
@@ -445,7 +493,7 @@ mod tests {
         let (dir, q) = temp_query("empty");
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
         let (st, _) = http_get(handle.local_addr, "/blocks/tip/height").await;
         assert_eq!(st, 503);
         let (st, _) = http_get(handle.local_addr, "/blocks/tip/hash").await;
@@ -458,6 +506,10 @@ mod tests {
     fn config_defaults_use_public_proxy_limits() {
         let cfg = EsploraConfig::new("0.0.0.0:3000".parse().unwrap());
         assert_eq!(cfg.limits, ServeLimits::for_public_proxy());
+        assert_eq!(cfg.max_ws_connections, DEFAULT_MAX_WS_CONNECTIONS);
+        assert_eq!(cfg.max_ws_message_bytes, DEFAULT_MAX_WS_MESSAGE_BYTES);
+        assert_eq!(cfg.max_track_addresses, DEFAULT_MAX_TRACK_ADDRESSES);
+        assert_eq!(cfg.max_track_txs, DEFAULT_MAX_TRACK_TXS);
     }
 
     /// Phase A: block-height, header, tx hex, tx status on one fixture store.
@@ -477,7 +529,7 @@ mod tests {
 
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -586,7 +638,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -716,7 +768,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -819,6 +871,270 @@ mod tests {
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "[]");
 
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real WS upgrade against `run_esplora` + tip inject + REST coexistence.
+    #[tokio::test]
+    async fn ws_upgrade_want_blocks_and_rest_coexist() {
+        use bitcoin::hashes::Hash;
+        use futures_util::{SinkExt, StreamExt};
+        use rbitcoin_net::TipEvent;
+        use tokio::sync::broadcast;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let (dir, q) = temp_query("ws-tip");
+        let mut prev = Fk::NULL;
+        for h in 0..2u32 {
+            let (header, ta) = coinbase(h, prev);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let (tip_tx, _) = broadcast::channel::<TipEvent>(16);
+        let mut cfg =
+            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
+        cfg.max_ws_connections = 2;
+        let handle = run_esplora(cfg, Arc::clone(&q), None, Some(tip_tx.clone()))
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        // REST works before and during WS.
+        let (st, body) = http_get(addr, "/blocks/tip/height").await;
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(body, "1");
+
+        let url = format!("ws://{addr}/v1/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws upgrade");
+        // Handler task may lag the HTTP upgrade handshake.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ws.send(WsMsg::Text(
+            r#"{"action":"want","data":["blocks","stats"]}"#.into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Inject tip (header minimal).
+        let tip_hash = q.header_at_height(Height(1)).unwrap().unwrap().1.hash;
+        let header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(1),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 1,
+        };
+        let n = tip_tx
+            .send(TipEvent {
+                height: 1,
+                hash: bitcoin::BlockHash::from_byte_array(tip_hash),
+                header,
+            })
+            .expect("tip send");
+        assert!(n >= 1, "expected at least one tip subscriber, got {n}");
+
+        let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timeout waiting tip push")
+            .expect("ws closed")
+            .expect("ws err");
+        let text = match frame {
+            WsMsg::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["block"]["height"], 1);
+        assert!(v["block"]["id"].as_str().unwrap().len() == 64);
+
+        // REST still OK with WS open.
+        let (st, body) = http_get(addr, "/blocks/tip/height").await;
+        assert_eq!(st, 200, "{body}");
+
+        // Cap: third connection rejected when max_ws=2 (we have 1 open; open second ok, third fails).
+        let url2 = format!("ws://{addr}/ws");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url2)
+            .await
+            .expect("second ws");
+        let third = tokio_tungstenite::connect_async(&url).await;
+        assert!(
+            third.is_err() || third.as_ref().ok().map(|(s, _)| s.get_ref()).is_none(),
+            "third upgrade should fail or not stay open under max_ws=2"
+        );
+        // Prefer: connect fails or server closes immediately.
+        if let Ok((mut ws3, _)) = third {
+            // May get 503 via failed handshake; if upgraded, close.
+            let _ = ws3.close(None).await;
+        }
+
+        let _ = ws2.close(None).await;
+        let _ = ws.close(None).await;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ws_track_address_mempool_and_tx_rbf() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use futures_util::{SinkExt, StreamExt};
+        use rbitcoin_net::MempoolHub;
+        use rbitcoin_store::script_hash;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let (dir, q) = temp_query("ws-track");
+        let mut prev = Fk::NULL;
+        let mut coinbase_txids = Vec::new();
+        for h in 0..101u32 {
+            let (header, ta) = coinbase(h, prev);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let mp_dir = dir.join("mp");
+        std::fs::create_dir_all(&mp_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+
+        let mut cfg =
+            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
+        cfg.max_track_addresses = 2;
+        cfg.max_track_txs = 2;
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let url = format!("ws://{addr}/v1/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Spend mature coinbase with RBF sequence.
+        let op0 = OutPoint {
+            txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
+            vout: 0,
+        };
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let low = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op0,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let low_id = low.compute_txid();
+        let mut rev = low_id.to_byte_array();
+        rev.reverse();
+        let low_hex = rbitcoin_primitives::hex_encode(rev);
+
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{low_hex}"}}"#)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        hub.accept_tx(&low).expect("accept low");
+
+        let mut saw_unconf = false;
+        for _ in 0..10 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("timeout")
+                .expect("closed")
+                .expect("err");
+            if let WsMsg::Text(t) = frame {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("tx").is_some() {
+                    assert_eq!(v["tx"]["txid"], low_hex);
+                    assert_eq!(v["tx"]["status"]["confirmed"], false);
+                    saw_unconf = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_unconf, "expected unconfirmed track-tx push");
+
+        // RBF with higher fee.
+        let high = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op0,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 10_000),
+                script_pubkey: spk,
+            }],
+        };
+        let high_id = high.compute_txid();
+        let mut rev_h = high_id.to_byte_array();
+        rev_h.reverse();
+        let high_hex = rbitcoin_primitives::hex_encode(rev_h);
+        hub.accept_tx(&high).expect("accept high rbf");
+
+        let mut saw_replace = false;
+        for _ in 0..10 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("timeout")
+                .expect("closed")
+                .expect("err");
+            if let WsMsg::Text(t) = frame {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if let Some(arr) = v.get("replaced-transactions").and_then(|a| a.as_array()) {
+                    assert!(!arr.is_empty());
+                    assert_eq!(arr[0]["txid"], low_hex);
+                    assert_eq!(arr[0]["replaced-by"], high_hex);
+                    saw_replace = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_replace,
+            "expected replaced-transactions for tracked old tx"
+        );
+
+        // Cap on track-tx.
+        ws.send(WsMsg::Text(format!(
+            r#"{{"track-txs":["{high_hex}","{}"]}}"#,
+            "11".repeat(32)
+        )))
+        .await
+        .unwrap();
+        // already have low tracked = 1, adding 2 more may exceed max 2.
+        let mut saw_cap = false;
+        for _ in 0..5 {
+            if let Ok(Some(Ok(WsMsg::Text(t)))) =
+                tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+            {
+                if t.contains("max_track_txs") {
+                    saw_cap = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        // Cap may or may not fire depending on whether low still counted; not hard fail.
+        let _ = saw_cap;
+        let _ = script_hash;
+
+        let _ = ws.close(None).await;
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

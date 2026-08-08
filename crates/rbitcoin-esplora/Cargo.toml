@@ -20,6 +20,11 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+http = "1"
 
 [lints]
 workspace = true

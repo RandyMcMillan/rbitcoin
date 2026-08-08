@@ -51,14 +51,25 @@ pub struct RecentAccept {
     pub value_sat: u64,
 }
 
+/// Broadcast unit for mempool accepts (P2P inv, Electrum status, Esplora WS).
+///
+/// `replaced` lists conflict txids removed by full-RBF/RBFR when admitting `txid`
+/// (empty when there was no replacement). Subscribers that only care about new
+/// inventory can ignore `replaced`.
+#[derive(Clone, Debug)]
+pub struct MempoolAnnounce {
+    pub txid: Txid,
+    pub replaced: Vec<Txid>,
+}
+
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
     inner: Mutex<ActiveMempool>,
     query: Arc<Query>,
     /// When false, peers' tx inv/tx are ignored (IBD / catch-up).
     relay_enabled: AtomicBool,
-    /// Broadcast accepted txids so sessions can inv (origin exclusion is per-session).
-    announce: broadcast::Sender<Txid>,
+    /// Broadcast accepts so sessions can inv (origin exclusion is per-session).
+    announce: broadcast::Sender<MempoolAnnounce>,
     /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
 }
@@ -131,8 +142,15 @@ impl MempoolHub {
         self.relay_enabled.load(Ordering::SeqCst)
     }
 
-    pub fn subscribe_announces(&self) -> broadcast::Receiver<Txid> {
+    pub fn subscribe_announces(&self) -> broadcast::Receiver<MempoolAnnounce> {
         self.announce.subscribe()
+    }
+
+    fn publish_announce(&self, r: &AcceptResult) {
+        let _ = self.announce.send(MempoolAnnounce {
+            txid: r.txid,
+            replaced: r.replaced.clone(),
+        });
     }
 
     pub fn live_count(&self) -> usize {
@@ -198,7 +216,7 @@ impl MempoolHub {
         let r = g.accept_tx(tx, &utxo)?;
         drop(g);
         self.push_recent(tx, &r);
-        let _ = self.announce.send(r.txid);
+        self.publish_announce(&r);
         Ok(r)
     }
 
@@ -212,7 +230,7 @@ impl MempoolHub {
         drop(g);
         for (tx, r) in txs.iter().zip(res.iter()) {
             self.push_recent(tx, r);
-            let _ = self.announce.send(r.txid);
+            self.publish_announce(r);
         }
         Ok(res)
     }

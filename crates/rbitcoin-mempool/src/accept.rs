@@ -44,6 +44,8 @@ pub struct AcceptResult {
     pub fee_sat: u64,
     pub weight: u64,
     pub slot: u32,
+    /// Mempool txids removed by full-RBF / RBFR when admitting this tx (empty if no conflict).
+    pub replaced: Vec<Txid>,
 }
 
 /// Why accept failed (policy / graph / durable / consensus script).
@@ -428,6 +430,7 @@ impl ActiveMempool {
             fee_sat,
             weight,
             slot,
+            replaced: conflict_set.into_iter().collect(),
         })
     }
 
@@ -989,7 +992,13 @@ mod tests {
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.accept_tx(&low, &utxos).unwrap();
         assert!(mp.graph.contains(&low_id));
-        mp.accept_tx(&high, &utxos).expect("rbf");
+        let r = mp.accept_tx(&high, &utxos).expect("rbf");
+        assert_eq!(r.txid, high_id);
+        assert!(
+            r.replaced.contains(&low_id),
+            "replaced should list conflict {:?}",
+            r.replaced
+        );
         assert!(!mp.graph.contains(&low_id));
         assert!(mp.graph.contains(&high_id));
         assert_eq!(mp.live_count(), 1);

@@ -9,9 +9,13 @@ mod handlers;
 mod script_fields;
 mod server;
 mod tx_json;
+mod ws;
 
 pub use script_fields::{esplora_script_fields, EsploraScriptFields};
-pub use server::{run_esplora, EsploraConfig, EsploraHandle};
+pub use server::{
+    run_esplora, EsploraConfig, EsploraHandle, DEFAULT_MAX_TRACK_ADDRESSES, DEFAULT_MAX_TRACK_TXS,
+    DEFAULT_MAX_WS_CONNECTIONS, DEFAULT_MAX_WS_MESSAGE_BYTES,
+};
 pub use tx_json::{build_tx_json, tx_status_json};
 
 pub fn crate_name() -> &'static str {

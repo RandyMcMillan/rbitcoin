@@ -75,6 +75,63 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Unknown path | 404 | plain body |
 | **Non-goal / never** | — | Graphical explorer features: `address-prefix` search, Liquid/assets, mining `block-template`, explorer UI-only APIs |
 
+## Esplora WebSocket (wallet live subset)
+
+Same listen as REST (`--esplora-listen`). Paths: **`/v1/ws`** (preferred) and
+**`/ws`** alias. Plain WS in-process; terminate **WSS** at the reverse proxy
+(often public URL `wss://host/api/v1/ws` if the proxy strips `/api`).
+
+**Product boundary:** wallet live updates only (tip, address watchlist, pending
+txids, wallet-scoped RBF). **Not** a mempool.space explorer live backend.
+Message *names* follow mempool.space where listed; **payloads use Esplora REST
+shapes** (`build_tx_json` / `tx_status_json` / tip height+hash).
+
+### Client → server (supported)
+
+| Message | Behavior |
+|---------|----------|
+| `{ "action": "want", "data": ["blocks"] }` | Subscribe tip pushes; other `data` tokens **no-op** (no disconnect) |
+| empty want / no `blocks` | Clear tip subscription |
+| `{ "track-address": "<addr>" }` / `{ "track-addresses": [...] }` | Watchlist (network-checked); over-cap → `{ "error": "max_track_addresses exceeded" }` |
+| `{ "stop-track-address": "…" }` / `stop-track-addresses` / empty track-address | Unsubscribe |
+| `{ "track-tx": "<txid>" }` / `{ "track-txs": [...] }` | Pending set; over-cap → error |
+| `{ "stop-track-tx": "…" }` / `stop-track-txs` | Unsubscribe |
+
+No client API for global `track-mempool*`, `track-rbf`, or `want` stats/charts.
+
+### Server → client (supported)
+
+| Key | When |
+|-----|------|
+| `{ "block": { "height", "id", "timestamp" } }` | Tip advance after `want: blocks` |
+| `{ "address-transactions": [ … ] }` | Mempool accept touching a tracked script (in/out when resolvable) |
+| `{ "block-transactions": [ … ] }` | Tip height: confirmed history for tracked scripts at that height (SH index) |
+| `{ "tx": { "txid", "status" } }` | Tracked txid status transition (mempool / confirmed) |
+| `{ "replaced-transactions": [ { "txid", "replaced-by" } ] }` | Full-RBF replace **only if** old or new intersects this connection’s tracks |
+
+Unknown client keys: ignored (or JSON error for bad JSON / oversize). Lagged
+broadcast receivers drop (best-effort, like Electrum).
+
+### Caps (`EsploraConfig`, defaults)
+
+| Knob | Default |
+|------|---------|
+| max_ws_connections | 64 (separate from REST concurrency) |
+| max_ws_message_bytes | 64 KiB |
+| max_track_addresses | 64 / connection |
+| max_track_txs | 64 / connection |
+
+### Gap list (explorer-only — not supported)
+
+| mempool.space-style feature | Status |
+|-----------------------------|--------|
+| `want`: `stats`, `mempool-blocks`, `live-2h-chart` | **No** |
+| `track-mempool` / `track-mempool-txids` global firehose | **No** |
+| `track-mempool-block` projected templates | **No** |
+| Global `track-rbf` / `rbfLatest` trees | **No** (wallet-scoped replace only) |
+| CPFP / `txPosition` / explorer fee-ladder fields | **No** |
+| Durable resume / sequence cursors | **No** |
+
 ## BIP324 v2 short-ID surface (live paths)
 
 Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.rs`).

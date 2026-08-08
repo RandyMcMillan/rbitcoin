@@ -51,10 +51,12 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   graphical explorer product. The node is **internet-facing capable**:
   application DoS limits (`ServeLimits` — max connections, request size, idle
   timeout, plus Electrum scripthash-sub / broadcast-hex caps) are **always
-  enforced**, not only when bound to localhost. Excess connections are refused
-  without hanging; oversize lines/bodies fail closed. Esplora is opt-in
-  (`--esplora-listen`). Edge TLS, multi-tenant metering, and API keys are still
-  out of process (see [`OPERATOR.md`](./OPERATOR.md)).
+  enforced**, not only when bound to localhost. Esplora WebSocket adds a
+  **separate** socket cap, inbound frame size limit, and per-connection
+  address/tx track caps (defaults 64/64 KiB/64/64). Excess connections and
+  oversize lines/bodies/frames fail closed without hanging accept. Esplora is
+  opt-in (`--esplora-listen`). Edge TLS, multi-tenant metering, and API keys
+  are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
   mislead a **wallet** backend are in scope.
 - **No wallet keys in this repository:** do **not** send seed phrases or private

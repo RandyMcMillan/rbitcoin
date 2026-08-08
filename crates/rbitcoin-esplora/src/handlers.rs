@@ -521,7 +521,7 @@ fn utxo_response(st: &AppState, sh: &[u8; 32]) -> Response {
     }
 }
 
-fn resolve_address_sh(addr_s: &str, network: Network) -> Result<[u8; 32], ()> {
+pub(crate) fn resolve_address_sh(addr_s: &str, network: Network) -> Result<[u8; 32], ()> {
     let addr = Address::from_str(addr_s).map_err(|_| ())?;
     let addr = addr.require_network(network).map_err(|_| ())?;
     Ok(script_hash(addr.script_pubkey().as_bytes()))

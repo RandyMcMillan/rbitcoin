@@ -324,7 +324,8 @@ pub async fn peer_session_with(
                 } => {
                     if let Some(ann) = ann {
                         match ann {
-                            Ok(txid) => {
+                            Ok(ann) => {
+                                let txid = ann.txid;
                                 // Origin exclusion: do not re-announce to the peer that sent it.
                                 if from_this_peer.contains_key(&txid) {
                                     continue;

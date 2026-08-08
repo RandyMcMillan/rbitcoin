@@ -32,7 +32,8 @@ pub use seeds::{
 };
 pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 pub use tx_relay::{
-    decode_len_prefixed_package, ElectrumMempoolItem, MempoolHub, QueryUtxoProvider,
+    decode_len_prefixed_package, ElectrumMempoolItem, MempoolAnnounce, MempoolHub,
+    QueryUtxoProvider,
 };
 
 pub fn crate_name() -> &'static str {

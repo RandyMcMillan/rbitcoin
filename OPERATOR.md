@@ -357,17 +357,39 @@ Conf: `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
+| WebSocket | `/v1/ws` (+ `/ws`); **separate** WS connection cap (default 64) so upgrades do not starve REST |
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`), `/txs/mempool`; complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
-| Without mempool | mempool routes empty/safe; POST broadcast → **503** |
+| Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
 | Unknown / non-goal | **404** (explorer-only APIs e.g. address-prefix; Liquid; mining template) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.  
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
+WebSocket extras (defaults): max 64 concurrent `/v1/ws` sockets, 64 KiB client frames,
+64 tracked addresses and 64 tracked txids per connection. See [`COMPAT.md`](./COMPAT.md)
+“Esplora WebSocket”.
+
+### Reverse proxy (TLS + WebSocket upgrade)
+
+Terminate TLS and forward REST **and** WebSocket to the same upstream. Example nginx:
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;
+}
+```
+
+Clients then use `wss://host/api/v1/ws` (proxy strips `/api`). Caddy: `reverse_proxy`
+with default HTTP/1.1 upgrade support to the same listen.
 
 ## Signet lab
 

@@ -324,8 +324,8 @@ where
                     None
                 }
             } => {
-                // Mempool change: push scripthash status for subscribed hashes.
-                if let Some(Ok(_txid)) = ann {
+                // Mempool change (accept and/or RBF replace): re-status subscribed hashes.
+                if let Some(Ok(_ann)) = ann {
                     if let Some(mp) = &mempool {
                         for sh in sh_subs.iter() {
                             if let Ok(status) = scripthash_status_full(&query, mp, sh) {

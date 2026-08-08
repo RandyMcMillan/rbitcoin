@@ -491,8 +491,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Esplora REST (plain HTTP; TLS via reverse proxy). Shares Query; tip-only in v1 skeleton.
+    // Esplora REST + wallet WebSocket (plain HTTP; TLS via reverse proxy).
+    // Tip bridge is independent of Electrum so want:blocks works with Electrum off.
     let mut esplora_handles = Vec::new();
+    let mut esplora_tip_bridge = None;
     if let Some(addr) = config.esplora_listen {
         if !shutdown.requested() {
             let q = node.hub.query.clone();
@@ -502,15 +504,34 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
                 rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
             };
+            let (esplora_tip_tx, _) = broadcast::channel::<TipEvent>(64);
+            let mut hub_tips = node.hub.subscribe_tips();
+            let bridge_tx = esplora_tip_tx.clone();
+            let bridge_stop = Arc::clone(&shutdown.flag);
+            esplora_tip_bridge = Some(tokio::spawn(async move {
+                loop {
+                    if bridge_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match hub_tips.recv().await {
+                        Ok(ev) => {
+                            let _ = bridge_tx.send(ev);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }));
             let ecfg = EsploraConfig::with_network(addr, btc_net);
             let max_conn = ecfg.limits.max_connections;
             let max_body = ecfg.limits.max_request_bytes;
             let idle_secs = ecfg.limits.idle_timeout.as_secs();
-            match run_esplora(ecfg, q, Some(mempool.clone())).await {
+            let max_ws = ecfg.max_ws_connections;
+            match run_esplora(ecfg, q, Some(mempool.clone()), Some(esplora_tip_tx)).await {
                 Ok(h) => {
                     info!(
-                        "esplora HTTP on {} (full REST; max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
-                        h.local_addr, max_conn, max_body, idle_secs
+                        "esplora HTTP+WS on {} (REST + /v1/ws; max_conn={} max_body={} idle={}s max_ws={}; TLS via reverse proxy if public)",
+                        h.local_addr, max_conn, max_body, idle_secs, max_ws
                     );
                     esplora_handles.push(h);
                 }
@@ -518,7 +539,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
         }
     }
-
     // Tip-follow loop until max_run (`Some(0)` = exit after catch-up + tip mode)
     // or until a shutdown signal.
     //
@@ -708,6 +728,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     for e in esplora_handles {
         e.shutdown().await;
+    }
+    if let Some(h) = esplora_tip_bridge {
+        h.abort();
+        let _ = h.await;
     }
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.

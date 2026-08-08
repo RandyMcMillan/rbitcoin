@@ -221,6 +221,25 @@ fn load_main_fuse(dir: &Path) -> Option<SealedFuse8> {
     SealedFuse8::read_from(&path).ok()
 }
 
+/// Open main head from disk, fold **16 B OA head keys** into fuse u64s, write BF8R.
+///
+/// Not Class A / `tx.body` txids — SH head slots only store Electrum prefix keys.
+fn build_main_fuse_from_disk(dir: &Path) -> Result<(), StoreError> {
+    let head_path = dir.join("scripthash.head");
+    let head = ShardedScriptHashHead::open_for_role(&head_path, HeadRole::ScriptHash)?;
+    let mut set: HashSet<u64> = HashSet::new();
+    head.for_each_occupied(|full, _val| {
+        // `full` is head_key[16] zero-padded to 32 (see ScriptHashHead::for_each_occupied).
+        set.insert(sh_fuse_key(&full));
+        Ok(())
+    })?;
+    let mut keys: Vec<u64> = set.into_iter().collect();
+    keys.sort_unstable();
+    let fuse = SealedFuse8::build(&keys)?;
+    fuse.write_to(&dir.join(MAIN_FUSE_NAME))?;
+    Ok(())
+}
+
 /// Where a scripthash key lives for head upsert routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyHome {
@@ -351,26 +370,39 @@ impl ScriptHashTable {
         let _ = std::fs::write(&marker, b"1");
         self.main_sealed
             .store(true, std::sync::atomic::Ordering::Release);
-        // Build membership fuse from current main keys (no FN for sealed set).
-        // Until the fuse is ready, sealed routing falls back to try-upsert.
-        self.rebuild_main_fuse()?;
+        // Fuse8 is **background** only: seal must not block tip/write while walking
+        // multi‑GiB main OA + building a huge filter. Until the product lands,
+        // sealed routing uses try-upsert (update-only) — slower, never blocks.
+        self.spawn_main_fuse_build();
         Ok(())
     }
 
-    /// Collect main OA keys and write [`MAIN_FUSE_NAME`] + in-memory filter.
-    fn rebuild_main_fuse(&self) -> Result<(), StoreError> {
-        let mut set: HashSet<u64> = HashSet::new();
-        self.head.for_each_occupied(|full, _val| {
-            set.insert(sh_fuse_key(&full));
-            Ok(())
-        })?;
-        let mut keys: Vec<u64> = set.into_iter().collect();
-        keys.sort_unstable();
-        let fuse = SealedFuse8::build(&keys)?;
-        let path = self.store_dir.join(MAIN_FUSE_NAME);
-        fuse.write_to(&path)?;
-        *self.main_fuse.lock().unwrap() = Some(fuse);
-        Ok(())
+    /// Best-effort bg walk of main head (16 B keys) → BF8R file. Does not touch
+    /// `self.main_fuse` from this thread; [`Self::main_fuse_opt`] reloads when ready.
+    fn spawn_main_fuse_build(&self) {
+        let dir = self.store_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("sh-main-fuse".into())
+            .spawn(move || {
+                if let Err(e) = build_main_fuse_from_disk(&dir) {
+                    rbitcoin_log::warn!(
+                        "store: scripthash main fuse build failed (try-upsert until retry): {e}"
+                    );
+                }
+            });
+    }
+
+    /// In-memory fuse if ready; otherwise try load BF8R written by the bg builder.
+    fn main_fuse_opt(&self) -> Option<SealedFuse8> {
+        {
+            let g = self.main_fuse.lock().unwrap();
+            if g.is_some() {
+                return g.clone();
+            }
+        }
+        let loaded = load_main_fuse(&self.store_dir)?;
+        *self.main_fuse.lock().unwrap() = Some(loaded.clone());
+        Some(loaded)
     }
 
     /// Seal overflow head when its load ≥ [`ShardedScriptHashHead::SH_SEAL_LOAD`].
@@ -942,7 +974,7 @@ impl ScriptHashTable {
         let mut main_try: Vec<([u8; 32], ShHeadValue)> = Vec::new();
         let mut ovf_u: Vec<([u8; 32], ShHeadValue)> = Vec::new();
 
-        let fuse = self.main_fuse.lock().unwrap().clone();
+        let fuse = self.main_fuse_opt();
         let sealed = self.main_is_sealed();
 
         for (key, val, home) in upserts {
@@ -2103,15 +2135,19 @@ mod tests {
             main_keys.push(sh);
         }
         assert!(t.main_is_sealed());
+        // Fuse is built asynchronously — wait for BF8R product (tiny heads are quick).
+        for _ in 0..200 {
+            if dir.join(MAIN_FUSE_NAME).is_file() && load_main_fuse(&dir).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            dir.join(MAIN_FUSE_NAME).is_file(),
-            "real fuse product after seal"
+            load_main_fuse(&dir).is_some(),
+            "bg fuse must write valid BF8R (not placeholder)"
         );
-        // Valid fuse loads into process (BF8R), not placeholder.
-        assert!(
-            t.main_fuse.lock().unwrap().is_some(),
-            "in-memory fuse after seal"
-        );
+        // Pull into process via routing helper path.
+        assert!(t.main_fuse_opt().is_some(), "main_fuse_opt reloads when ready");
 
         let sh_new = script_hash(&[0xd1, 0xaa, 0xbb, 0xcc]);
         t.put_create(&rec(sh_new, 7_777, 0)).unwrap();
@@ -2131,7 +2167,10 @@ mod tests {
 
         drop(t);
         let t = ScriptHashTable::open(&dir).unwrap();
-        assert!(t.main_fuse.lock().unwrap().is_some(), "fuse reloads on open");
+        assert!(
+            t.main_fuse_opt().is_some() || load_main_fuse(&dir).is_some(),
+            "fuse reloads on open"
+        );
         assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2226,20 +2265,20 @@ mod tests {
         assert!(t.contains_create(&sh0, Fk(10_000)).unwrap());
 
         t.flush().unwrap();
-        // Seal marker + fuse product (bg may race; wait briefly).
         assert!(
             dir.join(MAIN_SEALED_NAME).is_file() || ratio >= ShardedScriptHashHead::SH_SEAL_LOAD,
             "seal marker or load gate"
         );
-        for _ in 0..50 {
-            if dir.join("scripthash.head.fuse8").is_file() {
+        // Bg fuse (may lag); sealed routing is correct via try-upsert until ready.
+        for _ in 0..200 {
+            if load_main_fuse(&dir).is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            dir.join("scripthash.head.fuse8").is_file(),
-            "main fuse artifact after seal"
+            load_main_fuse(&dir).is_some(),
+            "bg main fuse BF8R after seal (tiny head)"
         );
 
         drop(t);

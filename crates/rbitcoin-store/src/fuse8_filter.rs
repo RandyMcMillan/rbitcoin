@@ -178,12 +178,13 @@ fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
     o += 4;
     let fp_len = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap()) as usize;
     o += 8;
-    if payload.len() < o + fp_len {
-        return Err(StoreError::Corrupt("fuse8 fingerprints truncated"));
-    }
-    // Sanity: refuse absurd lengths that would OOM or never match a real seal.
+    // Sanity first: refuse absurd lengths before comparing to payload (avoids
+    // saturating arithmetic games and keeps OOM claims out of the heap path).
     if fp_len > 512 * 1024 * 1024 {
         return Err(StoreError::Corrupt("fuse8 fingerprints too large"));
+    }
+    if payload.len() < o + fp_len {
+        return Err(StoreError::Corrupt("fuse8 fingerprints truncated"));
     }
     if segment_length == 0 || segment_length_mask != segment_length.saturating_sub(1) {
         return Err(StoreError::Corrupt("fuse8 segment_length invalid"));

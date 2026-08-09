@@ -1420,24 +1420,24 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 
 // ─── Consensus + reconstruct: one mature mine, many assertions ──────────────
 
-/// Single mature-chain build covers:
-/// - accept genesis + long mine (reopen tip)
-/// - coinbase maturity + spend + double-spend reject
-/// - create_fk on spend + reconstruct (soft prev_txid from create body)
-/// - reconstruct after reopen (sampled + multi-tx spend block)
-/// - store-backed locator/headers helpers
-/// - service flags
+/// Single mature-chain pad covers consensus + scripthash + reconstruct + reorg:
+/// - accept genesis + maturity pad + spend + double-spend reject
+/// - create_fk on spend + reconstruct (create_fk packing)
+/// - reconstruct after reopen (sampled heights)
+/// - scripthash history / balance / listunspent for OP_TRUE
+/// - disconnect tip restores spent coinbase UTXO
+/// - locator/headers + service flags
 #[test]
-fn consensus_mature_chain_spend_and_reconstruct() {
+fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     use bitcoin::p2p::ServiceFlags;
     use rbitcoin_net::local_service_flags;
-    use rbitcoin_store::InputRecord;
+    use rbitcoin_store::{script_hash, InputRecord};
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
     let params = ChainParams::regtest();
 
-    // ONE maturity pad for both spend and reconstruct paths.
+    // ONE maturity pad for spend, reconstruct, and scripthash contracts.
     let chain = build_mature_regtest_with_spend(&q, &params);
     let tip_h = chain.tip_height();
     assert_eq!(q.tip_height(), Some(Height(tip_h)));
@@ -1497,7 +1497,86 @@ fn consensus_mature_chain_spend_and_reconstruct() {
         .unwrap();
     assert!(cbin.is_coinbase());
 
-    // Double-spend must fail.
+    // Scripthash index on OP_TRUE coinbases / spend (same pad — no second mine).
+    let sh = script_hash(&[0x51]);
+    let history = q.scripthash_history(&sh).unwrap();
+    assert!(
+        !history.is_empty() && history.len() >= 2,
+        "OP_TRUE history empty or short: {}",
+        history.len()
+    );
+    let bal = q.scripthash_balance(&sh).unwrap();
+    assert!(bal.confirmed > 0, "confirmed={}", bal.confirmed);
+    assert_eq!(bal.unconfirmed, 0);
+    let utxos = q.scripthash_listunspent(&sh).unwrap();
+    assert!(!utxos.is_empty());
+    assert!(!utxos
+        .iter()
+        .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0));
+
+    // Extra store/query surface on the same pad (coverage without a second open).
+    assert!(q.scripthash_entry_count() > 0);
+    let tip_fk = q.tip_header_fk().unwrap().expect("tip header fk");
+    let tip_hdr = q.get_header(tip_fk).unwrap();
+    assert_eq!(BlockHash::from_byte_array(tip_hdr.hash), chain.tip_hash());
+    let by_hash = q
+        .get_header_by_hash(&chain.tip_hash().to_byte_array())
+        .unwrap();
+    assert!(by_hash.is_some());
+    let at_h = q.header_at_height(Height(tip_h)).unwrap();
+    assert!(at_h.is_some());
+    let fks = q.block_tx_fks(Height(1)).unwrap();
+    assert_eq!(fks.len(), 1);
+    let cb1 = q.get_tx(fks[0]).unwrap();
+    assert_eq!(cb1.txid, chain.matured_coinbase_txid.to_byte_array());
+    let out0 = q.tx_output(&cb1, 0).unwrap();
+    // Coinbase output script is OP_TRUE anyone-can-spend in our miner.
+    assert_eq!(out0.script.as_slice(), &[0x51]);
+    let full = q.store().get_tx_full(fks[0]).unwrap();
+    assert_eq!(full.0.txid, cb1.txid);
+    assert!(q.store().is_confirmed_strong(fks[0]).unwrap());
+    // Body/head occupancy counters (store stats used by RPC/status).
+    assert!(q.tx_body_count() > 0);
+    assert!(q.tx_head_occupied() > 0);
+    // Spentness of the matured coinbase out (spent at tip).
+    assert!(q
+        .is_outpoint_spent(chain.matured_coinbase_txid.as_byte_array(), 0)
+        .unwrap());
+    assert_eq!(
+        q.height_of_hash(&chain.tip_hash().to_byte_array()).unwrap(),
+        Some(Height(tip_h))
+    );
+    // tip-1 fast path in height_of_hash
+    if tip_h > 0 {
+        assert_eq!(
+            q.height_of_hash(
+                &chain.blocks[(tip_h - 1) as usize]
+                    .block_hash()
+                    .to_byte_array()
+            )
+            .unwrap(),
+            Some(Height(tip_h - 1))
+        );
+    }
+    assert_eq!(
+        q.height_of_hash(&chain.blocks[1].block_hash().to_byte_array())
+            .unwrap(),
+        Some(Height(1))
+    );
+    // Mid-chain height (exercises reverse walk, not only tip/tip-1 fast path).
+    let mid = tip_h / 2;
+    assert_eq!(
+        q.height_of_hash(&chain.blocks[mid as usize].block_hash().to_byte_array())
+            .unwrap(),
+        Some(Height(mid))
+    );
+    assert!(q.height_of_hash(&[0xcd; 32]).unwrap().is_none());
+    let wh = q.wire_header_at_height(Height(tip_h)).unwrap();
+    assert_eq!(wh.block_hash(), chain.tip_hash());
+    let wh0 = q.wire_header_at_height(Height::GENESIS).unwrap();
+    assert_eq!(wh0.block_hash(), chain.blocks[0].block_hash());
+
+    // Double-spend must fail (tip still includes original spend).
     let tip_block = chain.blocks.last().unwrap();
     let spend2 = spend_anyone_can_spend(
         chain.matured_coinbase_txid,
@@ -1511,8 +1590,6 @@ fn consensus_mature_chain_spend_and_reconstruct() {
         vec![spend2],
     );
     let err = accept_and_connect_block(&q, &params, Height(tip_h + 1), &b_bad, Milestone::NONE);
-    // Rejection may surface as PrevoutSpent / BadTx, or write-path multi-spender
-    // invariant when denserels already mark the out spent.
     let msg = format!("{err:?}");
     assert!(
         err.is_err()
@@ -1525,74 +1602,9 @@ fn consensus_mature_chain_spend_and_reconstruct() {
     );
     assert_eq!(q.tip_height(), Some(Height(tip_h)));
 
-    q.flush().unwrap();
-    drop(q);
-
-    // Reopen — reconstruct without RAM cache.
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(tip_h)));
-
-    // Sample heights: genesis, early, mid, tip (multi-tx). Full 100+ scan is redundant.
-    let sample = [0u32, 1, tip_h / 2, tip_h - 1, tip_h];
-    for h in sample {
-        assert_reconstruct_eq(&q, h, &chain.blocks[h as usize]);
-    }
-
-    assert!(q.reconstruct_block_by_hash(&[0xab; 32]).unwrap().is_none());
-    assert!(q.reconstruct_block_at_height(Height(9999)).is_err());
-
-    let loc = q.locator_hashes().unwrap();
-    assert!(!loc.is_empty());
-    let headers = q
-        .headers_after_locator(
-            &loc[loc.len().saturating_sub(1)..],
-            BlockHash::from_byte_array([0; 32]),
-            2000,
-        )
-        .unwrap();
-    assert!(!headers.is_empty());
-
-    let flags = local_service_flags();
-    assert!(flags.has(ServiceFlags::NETWORK));
-    assert!(flags.has(ServiceFlags::WITNESS));
-}
-
-// ─── Phase 6: scripthash index + wire ring + archive epoch ──────────────────
-
-#[test]
-fn scripthash_index_history_balance_and_reorg() {
-    use rbitcoin_store::script_hash;
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-
-    // Build mature chain with a spend of OP_TRUE coinbase (script [0x51]).
-    let chain = build_mature_regtest_with_spend(&q, &params);
-    let sh = script_hash(&[0x51]);
-
-    let history = q.scripthash_history(&sh).unwrap();
-    assert!(
-        !history.is_empty(),
-        "OP_TRUE outputs should appear in history"
-    );
-    // Coinbase h1 and spend tx both touch this script.
-    assert!(history.len() >= 2);
-
-    let bal = q.scripthash_balance(&sh).unwrap();
-    // Many coinbases still unspent; balance should be positive.
-    assert!(bal.confirmed > 0, "confirmed={}", bal.confirmed);
-    assert_eq!(bal.unconfirmed, 0);
-
-    let utxos = q.scripthash_listunspent(&sh).unwrap();
-    assert!(!utxos.is_empty());
-    // Spent coinbase from h1 must not be listed.
-    assert!(!utxos
-        .iter()
-        .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0));
-
-    // Reorg: disconnect tip (spend block) → coinbase UTXO returns, history drops spend.
+    // Reorg: disconnect tip (spend) → matured coinbase UTXO returns.
     q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(tip_h - 1)));
     let utxos2 = q.scripthash_listunspent(&sh).unwrap();
     assert!(
         utxos2
@@ -1600,24 +1612,11 @@ fn scripthash_index_history_balance_and_reorg() {
             .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0),
         "after disconnect, matured coinbase should be unspent again"
     );
-}
 
-/// Kill mid-Class-C can leave creates on disk with tip not advanced. After reopen,
-/// sequential body warm + skip must prevent duplicate creates (no chain walk).
-#[test]
-fn scripthash_reopen_warm_prevents_dup_creates() {
-    use rbitcoin_store::{script_hash, ScriptHashRecord};
+    // Snapshot SH creates before reopen (kill mid-Class-C shape).
+    use rbitcoin_store::ScriptHashRecord;
     use std::collections::HashMap;
-
-    let td = TestDatadir::new().unwrap();
-    let path = td.store_path();
-    let q = Query::open_or_create(&path).unwrap();
-    let params = ChainParams::regtest();
-    let _chain = build_mature_regtest_with_spend(&q, &params);
     let n0 = q.scripthash_entry_count();
-    assert!(n0 > 0);
-
-    // Snapshot durable creates (simulates disk after kill).
     let mut durable: Vec<ScriptHashRecord> = Vec::new();
     q.store()
         .scripthash
@@ -1626,14 +1625,14 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
         })
         .unwrap();
     assert_eq!(durable.len() as u64, n0);
+
+    q.flush().unwrap();
     drop(q);
 
-    // Reopen: cold process caches. Warm loads create_tx set from body.
-    let q = Query::open_or_create(&path).unwrap();
+    // Reopen — reconstruct without RAM cache + warm SH create index (no dups).
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(tip_h - 1)));
     q.warm_scripthash_create_index().unwrap();
-
-    // Simulate re-confirm: only append create_tx_fks not already durable.
-    // Confirm path uses a height watermark; this checks durable body coverage.
     let mut indexed = std::collections::HashSet::new();
     q.store()
         .scripthash
@@ -1650,19 +1649,55 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
         "after warm, all durable create txs must be considered indexed"
     );
     assert_eq!(q.scripthash_entry_count(), n0);
-
-    // Naive append without skip would dup; with skip set empty put — count unchanged.
     let mut heads = HashMap::new();
     q.store()
         .scripthash
         .put_create_batch_append(&to_put, &mut heads)
         .unwrap();
-    assert_eq!(q.scripthash_entry_count(), n0); // empty to_put; count unchanged
+    assert_eq!(q.scripthash_entry_count(), n0);
 
-    let sh = script_hash(&[0x51]);
-    let bal = q.scripthash_balance(&sh).unwrap();
-    assert!(bal.confirmed > 0);
+    // Sample heights still on chain after disconnect.
+    let sample_tip = tip_h - 1;
+    for h in [0u32, 1, sample_tip / 2, sample_tip] {
+        assert_reconstruct_eq(&q, h, &chain.blocks[h as usize]);
+    }
+
+    assert!(q.reconstruct_block_by_hash(&[0xab; 32]).unwrap().is_none());
+    assert!(q.reconstruct_block_at_height(Height(9999)).is_err());
+
+    let loc = q.locator_hashes().unwrap();
+    assert!(!loc.is_empty());
+    let headers = q
+        .headers_after_locator(
+            &loc[loc.len().saturating_sub(1)..],
+            BlockHash::from_byte_array([0; 32]),
+            2000,
+        )
+        .unwrap();
+    assert!(!headers.is_empty());
+    // Stop-hash match path (headers_after_locator early exit).
+    let stop = chain.blocks[3.min(sample_tip as usize)].block_hash();
+    let stopped = q
+        .headers_after_locator(&[chain.blocks[0].block_hash()], stop, 50)
+        .unwrap();
+    assert!(!stopped.is_empty());
+    assert_eq!(stopped.last().unwrap().block_hash(), stop);
+    // Zero locator entry → start from genesis.
+    let from_zero = q
+        .headers_after_locator(
+            &[BlockHash::from_byte_array([0u8; 32])],
+            BlockHash::from_byte_array([0u8; 32]),
+            5,
+        )
+        .unwrap();
+    assert_eq!(from_zero.len(), 5);
+
+    let flags = local_service_flags();
+    assert!(flags.has(ServiceFlags::NETWORK));
+    assert!(flags.has(ServiceFlags::WITNESS));
 }
+
+// ─── Phase 6: wire ring + archive epoch ─────────────────────────────────────
 
 #[test]
 fn wire_ring_and_archive_epoch() {

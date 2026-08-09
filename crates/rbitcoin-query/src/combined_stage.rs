@@ -286,6 +286,9 @@ mod tests {
         // Under free: full densify_hi regardless of rate.
         assert_eq!(soft_densify_band_hi(100, 1000, free, Some(0.1)), 1000);
         assert!(!soft_assign_restricted(free));
+        // densify_hi < path_lo edge (empty band).
+        assert_eq!(soft_densify_band_hi(50, 40, free, Some(1.0)), 40);
+        assert_eq!(soft_densify_band_hi(50, 40, over, Some(1.0)), 40);
         // Over free: confirm window only.
         assert_eq!(
             soft_densify_band_hi(100, 1000, over, Some(0.1)),
@@ -297,10 +300,17 @@ mod tests {
             100,
             "rate cold → tip-adjacent only"
         );
+        // Window clamp to densify_hi when rate is high.
+        assert_eq!(
+            soft_densify_band_hi(100, 110, over, Some(5.0)),
+            110,
+            "window 300 clamped to densify_hi=110"
+        );
         assert!(soft_assign_restricted(over));
         assert!(!soft_confirm_window_covered(50, over, Some(5.0))); // 50 < 300
         assert!(soft_confirm_window_covered(300, over, Some(5.0)));
         assert!(soft_confirm_window_covered(1, over, None)); // cold + over free
+        assert!(!soft_confirm_window_covered(1, free, None)); // under free never covered
 
         let (dir, q) = temp_query();
         assert!(!q.block_queue_update_soft_pressure(Some(5.0)));

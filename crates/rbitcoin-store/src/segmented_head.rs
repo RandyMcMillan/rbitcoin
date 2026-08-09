@@ -1141,7 +1141,7 @@ mod tests {
         let h = SegmentedTxHead::create(&dir, layout).unwrap();
         assert_eq!(h.max_keys_per_segment(), 819);
 
-        let n = 900u64; // forces a roll
+        let n = 820u64; // forces a roll (max_keys=819)
         let mut entries = Vec::with_capacity(n as usize);
         for i in 0..n {
             entries.push((mixed(i + 1), Fk(i + 1)));
@@ -1151,7 +1151,7 @@ mod tests {
         assert!(h.sealed_segment_count() >= 1);
 
         // Known members resolve (as candidates).
-        for i in [1u64, 400, 819, 820, 900] {
+        for i in [1u64, 400, 819, 820] {
             let cands = h.probe_candidates(&mixed(i)).unwrap();
             assert!(
                 cands.iter().any(|f| f.0 == i),
@@ -1165,7 +1165,7 @@ mod tests {
         h.flush().unwrap();
         drop(h);
         let h2 = SegmentedTxHead::open(&dir).unwrap();
-        for i in [1u64, 500, 900] {
+        for i in [1u64, 500, 820] {
             let cands = h2.probe_candidates(&mixed(i)).unwrap();
             assert!(cands.iter().any(|f| f.0 == i), "reopen missing {i}");
         }
@@ -1176,77 +1176,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One seal pad: install_sealed_fuse rejects + open-keys + v1 soft-open queue.
+    /// Avoids two separate 900-insert seals in the default suite.
     #[test]
-    fn install_sealed_fuse_rejects_always_probe_and_unknown_id() {
+    fn install_sealed_fuse_and_v1_soft_open_journey() {
         let dir = tmp();
         let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-        let h = SegmentedTxHead::create(&dir, layout).unwrap();
-        let n = 900u64;
-        let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&entries, false).unwrap();
-        assert!(h.sealed_segment_count() >= 1);
-        let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
-        assert!(h
-            .install_sealed_fuse(0, SealedFuse8::always_probe())
-            .is_err());
-        assert!(h.install_sealed_fuse(999_999, fuse.clone()).is_err());
-        // Open tail file_id must not accept install (not sealed).
-        let open_id = h
-            .segments_snapshot()
-            .iter()
-            .find(|s| !s.sealed)
-            .map(|s| s.file_id)
-            .expect("open tail");
-        assert!(h.install_sealed_fuse(open_id, fuse.clone()).is_err());
-        h.install_sealed_fuse(0, fuse).unwrap();
-        assert!(h.sealed_fuse_rewrite_queue().is_empty());
-        // fuse_path_for_file_id + open_keys helpers.
-        let p = h.fuse_path_for_file_id(0);
-        assert!(p.to_string_lossy().contains("000000.fuse8"));
-        assert!(h.open_keys_len() > 0 || h.open_keys_len() == 0); // exercise both branches via call
-                                                                  // replace_open_keys wrong length.
-        assert!(h.replace_open_keys(vec![1, 2, 3]).is_err());
-        let open_n = h
-            .segments_snapshot()
-            .last()
-            .map(|s| s.count.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
-        if open_n > 0 {
-            let keys: Vec<u64> = (0..open_n).map(|i| i + 1).collect();
-            h.replace_open_keys(keys).unwrap();
-            assert_eq!(h.open_keys_len() as u64, open_n);
+        // 0.8 * 1024 = 819 → seal at 820.
+        let n = 820u64;
+        {
+            let h = SegmentedTxHead::create(&dir, layout).unwrap();
+            let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+            h.insert_many(&entries, false).unwrap();
+            assert!(h.sealed_segment_count() >= 1);
+            let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
+            assert!(h
+                .install_sealed_fuse(0, SealedFuse8::always_probe())
+                .is_err());
+            assert!(h.install_sealed_fuse(999_999, fuse.clone()).is_err());
+            let open_id = h
+                .segments_snapshot()
+                .iter()
+                .find(|s| !s.sealed)
+                .map(|s| s.file_id)
+                .expect("open tail");
+            assert!(h.install_sealed_fuse(open_id, fuse.clone()).is_err());
+            h.install_sealed_fuse(0, fuse).unwrap();
+            assert!(h.sealed_fuse_rewrite_queue().is_empty());
+            let p = h.fuse_path_for_file_id(0);
+            assert!(p.to_string_lossy().contains("000000.fuse8"));
+            assert!(h.replace_open_keys(vec![1, 2, 3]).is_err());
+            let open_n = h
+                .segments_snapshot()
+                .last()
+                .map(|s| s.count.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+            if open_n > 0 {
+                let keys: Vec<u64> = (0..open_n).map(|i| i + 1).collect();
+                h.replace_open_keys(keys).unwrap();
+                assert_eq!(h.open_keys_len() as u64, open_n);
+            }
+            h.flush().unwrap();
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    /// Legacy fuse8 v1 envelope must soft-open (always-probe), not fail the head.
-    #[test]
-    fn sealed_fuse_v1_soft_open_queues_rewrite() {
-        let dir = tmp();
-        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-        let h = SegmentedTxHead::create(&dir, layout).unwrap();
-        let n = 900u64;
-        let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&entries, false).unwrap();
-        assert!(h.sealed_segment_count() >= 1);
-        h.flush().unwrap();
-        drop(h);
-
-        // Overwrite sealed segment 0 fuse with a v1 envelope (historical xorf path).
+        // Same pad: overwrite fuse as v1 → soft-open queues rewrite (always-probe).
         let fuse_path = dir.join("tx.head").join("000000.fuse8");
-        assert!(fuse_path.is_file());
         let mut raw = Vec::from(*b"BF8R");
-        raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+        raw.extend_from_slice(&1u32.to_le_bytes());
         raw.extend_from_slice(&0u64.to_le_bytes());
         std::fs::write(&fuse_path, &raw).unwrap();
-
         let h2 = SegmentedTxHead::open(&dir).unwrap();
         let q = h2.sealed_fuse_rewrite_queue();
         assert!(
             q.iter().any(|(id, _, _)| *id == 0),
             "file_id 0 should need fuse rewrite: {q:?}"
         );
-        // Lookup still finds sealed members (always-probe, no FN).
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
         let _ = std::fs::remove_dir_all(&dir);

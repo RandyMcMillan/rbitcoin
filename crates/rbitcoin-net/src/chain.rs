@@ -634,22 +634,12 @@ impl ChainHub {
         };
 
         let fork_height = fork_h.map(|h| h.0);
-        let tip_h = self.tip_height().unwrap_or(0);
 
-        // Work on new path
+        // Work on new path (header work only — same ranking as most_work helpers).
         let new_work = sum_work(blocks.iter().map(|b| b.header.work()));
 
-        // Work on our path from fork+1..=tip
-        let start = fork_height.map(|h| h + 1).unwrap_or(0);
-        let mut our_works = Vec::new();
-        if self.tip_height().is_some() {
-            for h in start..=tip_h {
-                if let Some(b) = self.block_at_height(h)? {
-                    our_works.push(b.header.work());
-                }
-            }
-        }
-        let our_work = sum_work(our_works.into_iter());
+        // Work on our path from fork+1..=tip (wire headers; no full body load).
+        let our_work = self.work_from_fork_to_tip(fork_height)?;
 
         if self.tip_height().is_some() && !work_better(new_work, our_work) {
             return Ok(AcceptOutcome::IgnoredWeaker);
@@ -782,11 +772,23 @@ impl ChainHub {
 
     /// Total chain work from genesis through tip (best effort from headers).
     pub fn chain_work(&self) -> Result<Work, NetError> {
+        self.work_from_fork_to_tip(None)
+    }
+
+    /// Sum wire-header work on the best chain from `fork_height+1` through tip.
+    ///
+    /// `fork_height = None` means from genesis (height 0) through tip.
+    /// Empty tip → zero work.
+    fn work_from_fork_to_tip(&self, fork_height: Option<u32>) -> Result<Work, NetError> {
         let Some(tip) = self.tip_height() else {
             return Ok(Work::from_be_bytes([0u8; 32]));
         };
+        let start = fork_height.map(|h| h + 1).unwrap_or(0);
+        if start > tip {
+            return Ok(Work::from_be_bytes([0u8; 32]));
+        }
         let mut works = Vec::new();
-        for h in 0..=tip {
+        for h in start..=tip {
             let hdr = self
                 .query
                 .wire_header_at_height(Height(h))
@@ -977,21 +979,7 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
     }
 }
 
-fn sum_work(iter: impl Iterator<Item = Work>) -> Work {
-    let mut acc: Option<Work> = None;
-    for w in iter {
-        acc = Some(match acc {
-            None => w,
-            Some(a) => a + w,
-        });
-    }
-    acc.unwrap_or_else(|| Work::from_be_bytes([0u8; 32]))
-}
-
-/// Strictly more work (Bitcoin most-work rule).
-fn work_better(new: Work, old: Work) -> bool {
-    new > old
-}
+use crate::most_work::{sum_work, work_better};
 
 #[cfg(test)]
 mod tests {

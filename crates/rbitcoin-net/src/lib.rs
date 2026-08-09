@@ -6,6 +6,7 @@ mod codec;
 mod compact;
 mod error;
 mod ibd;
+mod most_work;
 mod msg_decode;
 mod peer;
 mod peer_dos;
@@ -20,6 +21,10 @@ pub use codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_
 pub use error::NetError;
 pub use ibd::{
     ibd, ibd_cancellable, IbdConfig, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
+};
+pub use most_work::{
+    first_best_ancestor, lca_on_best_chain, path_hashes_from_ancestor, sum_work,
+    sum_work_for_hashes, work_better,
 };
 pub use peer::local_service_flags;
 pub use peer_dos::{

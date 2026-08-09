@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn work_chain_progress_fetch_hole_requires_body_queue() {
         use super::super::body::BodyPresence;
-        use super::{claim_ready, work_chain_progress};
+        use super::{claim_ready, tip_fetch_hole, work_chain_progress};
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
         use rbitcoin_consensus::{ChainParams, Milestone};
@@ -490,6 +490,39 @@ mod tests {
         body.mark_pending(h1);
         let p2 = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
         assert_eq!(p2.tip_hole, 3);
+
+        // Rejected tip+1 stops the hole walk.
+        body.mark_rejected(h1);
+        assert!(!claim_ready(&hub, &mut body, 1, &h1));
+        let p3 = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
+        assert_eq!(p3.tip_hole, 0, "rejected tip+1 is not a download hole");
+
+        // tip_fetch_hole with empty height map (no headers past tip).
+        let hole0 = tip_fetch_hole(&hub, &HashMap::new(), &mut body);
+        assert_eq!(hole0, 0);
+
+        // Gap in height map stops walk (missing header on path).
+        let mut sparse = HashMap::new();
+        sparse.insert(1, h1);
+        // no height 2 → break after counting hole for h1 if not ready
+        let mut body_gap = BodyPresence::new();
+        body_gap.mark_missing(h1);
+        let hole_gap = tip_fetch_hole(&hub, &sparse, &mut body_gap);
+        assert_eq!(hole_gap, 1);
+
+        // BQ claim-ready at tip+1 stops hole after reset body.
+        let mut body2 = BodyPresence::new();
+        body2.mark_missing(h1);
+        hub.query
+            .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
+            .unwrap();
+        assert!(claim_ready(&hub, &mut body2, 1, &h1));
+        let hole_ready = tip_fetch_hole(&hub, &h2h, &mut body2);
+        assert_eq!(hole_ready, 0, "BQ-ready tip+1 → hole=0");
+
+        // Confirmed tip block is claim-ready (hub.has_block).
+        let ghash = hub.tip_hash().expect("genesis tip");
+        assert!(claim_ready(&hub, &mut body2, 0, &ghash));
 
         let _ = std::fs::remove_dir_all(dir);
     }

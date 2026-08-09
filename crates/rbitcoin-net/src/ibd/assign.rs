@@ -708,6 +708,10 @@ mod tests {
         cfg.per_peer = 16;
 
         const HI: u32 = 4096;
+        // Claim-ready prefix (tiny BQ) so tip-hole race stops; densify walks the rest.
+        // Pending without BQ is a fetch hole — keep prefix short (not 2.5k BQ enqueues).
+        const FILL: u32 = 64;
+        let tiny = [0u8; 8];
         for ht in 1u32..=HI {
             let hash = h(ht);
             st.record_height(hash, ht);
@@ -715,7 +719,10 @@ mod tests {
             st.ordered_set.insert(hash);
             st.ordered.push_back(hash);
             st.max_ordered_height = ht;
-            if ht <= 2500 {
+            if ht <= FILL {
+                hub.query
+                    .block_queue_enqueue(ht, hash.to_byte_array(), ht as u64, &tiny)
+                    .unwrap();
                 st.body.mark_pending(hash);
             } else {
                 st.body.mark_missing(hash);
@@ -731,26 +738,32 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
-            None, // under free (empty BQ) — full densify ahead
+            None, // under free floor — full densify ahead
         );
 
         let far: Vec<u32> = st
             .inflight
             .keys()
             .filter_map(|hash| st.hash_height.get(hash).copied())
-            .filter(|&ht| ht > 2500)
+            .filter(|&ht| ht > FILL)
             .collect();
         assert!(
             !far.is_empty(),
-            "expected densify past filled 2.5k prefix; inflight heights={:?}",
+            "expected densify past claim-ready prefix; inflight heights={:?}",
             st.inflight
                 .keys()
                 .filter_map(|hash| st.hash_height.get(hash).copied())
                 .collect::<Vec<_>>()
         );
+        // Horizon is CONTIG_DENSIFY_AHEAD (64k), not the old 2048 cap.
         assert!(
-            far.iter().any(|&ht| ht > 2048),
-            "legacy CONTIG_DENSIFY_AHEAD=2048 must not be the ceiling; far={far:?}"
+            CONTIG_DENSIFY_AHEAD as u32 > 2048,
+            "CONTIG_DENSIFY_AHEAD={CONTIG_DENSIFY_AHEAD}"
+        );
+        let max_far = far.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_far > FILL,
+            "densify must walk past claim-ready fill; max_far={max_far} far={far:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1010,10 +1023,15 @@ mod tests {
         );
         assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
 
-        // Claim-ready path (pending/BQ), not Class A alone — archived-without-wire
-        // must still re-get tip holes (see cover_tip_holes_regets_class_a_*).
+        // Claim-ready: pending **with** body-queue wire (not Class A alone).
+        // Zombie pending without BQ is a tip fetch hole (cover_tip_holes re-gets).
+        let tiny = [0u8; 8];
         for ht in 1u32..=12 {
-            st.body.mark_pending(h(ht));
+            let hash = h(ht);
+            hub.query
+                .block_queue_enqueue(ht, hash.to_byte_array(), ht as u64, &tiny)
+                .unwrap();
+            st.body.mark_pending(hash);
         }
         st.inflight.clear();
         st.slots.iter_mut().for_each(|s| s.in_flight.clear());
@@ -1030,7 +1048,11 @@ mod tests {
             true,
             None,
         );
-        assert!(st.inflight.is_empty());
+        assert!(
+            st.inflight.is_empty(),
+            "claim-ready tip band must not re-get; inflight={:?}",
+            st.inflight.keys().collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

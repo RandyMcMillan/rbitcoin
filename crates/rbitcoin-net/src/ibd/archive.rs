@@ -285,8 +285,21 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
         let Some(&hash) = st.height_to_hash.get(&ht) else {
             break;
         };
-        if hub.has_block(&hash) || st.body.is_rejected(&hash) {
-            // Confirmed or blacklisted — stop contiguous Class A rehydrate.
+        if hub.has_block(&hash) {
+            // Confirmed-set contains this hash. If that is tip+1 while tip is
+            // still lower, confirmed[] stole the tip+1 row (mainnet stall:
+            // conf[mid]=tip+1 → has_block true → never rehydrate/offer tip+1).
+            if ht == path_lo && hub.tip_height().is_some() {
+                warn!(
+                    "ibd: tip+1={ht} {hash} is in confirmed-set while tip={} — \
+                     confirmed[] likely maps an earlier height to tip+1; run \
+                     rbitcoin-rebuild-headers --write (scrubs stolen tip+1)",
+                    hub.tip_height().unwrap_or(0)
+                );
+            }
+            break;
+        }
+        if st.body.is_rejected(&hash) {
             break;
         }
         // Already have body-queue wire.

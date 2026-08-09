@@ -285,12 +285,16 @@ cargo run -p rbitcoin-store --release --bin rbitcoin-rebuild-headers -- \
   --datadir ./datadir-mainnet --write
 ```
 
-The tool re-links the confirmed chain when safe and **nulls** every non-null
-`prev_fk` whose hash does not verify against the parent row. Resume walk length
+The tool re-links the confirmed chain when safe, **nulls** every non-null
+`prev_fk` whose hash does not verify against the parent row, and **scrubs**
+confirmed heights that wrongly point at tip / tip+1 (that made `has_block(tip+1)`
+true while tip stayed mid-chain — confirm never claimed tip+1). Resume walk
 should drop from a poisoned multi-tens-of-thousands path to the real unconfirmed
-extension. New writes go through a unique-by-hash header gate (no second row for
-the same block hash; false parent edges rejected). Prefer a fresh datadir if
-corruption is widespread.
+extension. New writes go through a unique-by-hash header gate. Prefer a fresh
+datadir if corruption is widespread.
+
+After `--write`, restart the node; expect `Class A rehydrate filled N…` and tip
+advance from the next block.
 
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
 is damaged or an old 4k-slot table was left wedged, stop the node and delete that

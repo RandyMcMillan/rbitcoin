@@ -404,7 +404,13 @@ pub async fn ibd_cancellable(
         TIP_HOLE_MAX,
     ) {
         Ok(n) if n > 0 => {
-            rbitcoin_log::debug!("ibd: Class A rehydrate filled {n} body-queue height(s)");
+            info!("ibd: Class A rehydrate filled {n} body-queue height(s) for tip batch");
+        }
+        Ok(0) => {
+            // Silence is what made the tip+1 has_block stall look like "no errors".
+            rbitcoin_log::debug!(
+                "ibd: Class A rehydrate filled 0 (tip+1 missing height map, has_block, or no Class A)"
+            );
         }
         Ok(_) => {}
         Err(e) => {

@@ -62,6 +62,10 @@ fn main() -> ExitCode {
             println!("null_prev_rows={}", r.null_prev_rows);
             println!("confirmed_relinked={}", r.confirmed_relinked);
             println!("false_prev_nulled={}", r.false_prev_nulled);
+            println!(
+                "confirmed_tip_plus_one_scrubbed={}",
+                r.confirmed_tip_plus_one_scrubbed
+            );
             println!("resume_walk_before={}", r.resume_walk_before);
             println!("resume_walk_after={}", r.resume_walk_after);
             if !r.wrote {

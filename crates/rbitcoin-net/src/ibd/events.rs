@@ -496,16 +496,34 @@ pub(crate) fn apply_confirm_reject(
     //
     // - Wire-only: wrong/corrupt body (`unexpected previous header`)
     // - Header window: `missing retarget first header` race
+    // Soft re-get: bad **wire** or **corrupt Class A reconstruct** (merkle).
+    // The block *hash* is fine — never permanent-blacklist; clear bad association
+    // so densify/getdata can refill. Mainnet tip+1 stall: Class A body for
+    // tip+1 failed merkle, hash was blacklisted, tip froze with hole=0.
     let soft_wire = err.contains("unexpected previous header")
         || err.contains("unexpected previous")
-        || err.contains("missing retarget first header");
+        || err.contains("missing retarget first header")
+        || err.contains("merkle root mismatch");
     if soft_wire {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
             let _ = q.block_queue_dequeue_height(height);
+            if err.contains("merkle root mismatch") {
+                // Corrupt Class A association — drop so rehydrate will not
+                // reconstruct the same bad body on the next restart.
+                match q.clear_archived_body(hash.as_byte_array()) {
+                    Ok(true) => warn!(
+                        "ibd: cleared corrupt Class A body for {hash} @{height} (merkle mismatch)"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => warn!("ibd: clear Class A body {hash} @{height}: {e}"),
+                }
+            }
         }
         st.body.mark_missing(hash);
+        // Ensure densify can re-request: not archived-known after Class A clear.
+        st.body.demote_known(hash);
         warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
         return;
     }
@@ -616,6 +634,28 @@ mod confirm_reject_tests {
         assert!(
             st.body.is_rejected(&hash),
             "fk mismatch is permanent (not tip-ahead soft requeue)"
+        );
+
+        // Merkle mismatch (corrupt Class A reconstruct) → soft re-get, not blacklist.
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(938_453));
+        let hash = h(0xae);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            938_454,
+            hash,
+            "consensus: bad block: merkle root mismatch",
+            None,
+        );
+        assert!(
+            !st.body.is_rejected(&hash),
+            "merkle mismatch must soft re-get (Class A body may be corrupt)"
+        );
+        assert!(
+            !st.body.is_known_archived(&hash),
+            "merkle mismatch should demote Class A known so densify re-gets"
         );
 
         // Wire-only soft: unexpected previous header → re-getdata, not blacklist.

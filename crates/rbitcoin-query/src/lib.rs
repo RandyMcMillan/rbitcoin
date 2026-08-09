@@ -1701,6 +1701,21 @@ impl Query {
         Ok(self.store.header_txs.has_body(fk)?)
     }
 
+    /// Drop Class A body association for `hash` (header row kept; txs not freed).
+    ///
+    /// Use when reconstruct fails header checks (merkle mismatch): peer re-getdata
+    /// can supply a good body for the same block hash.
+    pub fn clear_archived_body(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
+        let Some((fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(false);
+        };
+        let cleared = self.store.header_txs.clear_body(fk)?;
+        if cleared {
+            self.store.header_txs.flush()?;
+        }
+        Ok(cleared)
+    }
+
     /// Total headers with a Class A body on disk (durable, any prior run).
     pub fn archived_block_count(&self) -> Result<u64, QueryError> {
         Ok(self.store.archived_block_count()?)
@@ -1844,17 +1859,28 @@ mod tests {
         (dir, q)
     }
 
-    fn coinbase_block(h: u32, prev: Fk) -> (HeaderRecord, TxApply) {
-        let mut hash = [0u8; 32];
-        hash[0..4].copy_from_slice(&h.to_le_bytes());
-        hash[4] = 0xab;
+    /// Write-gate-safe: non-null `prev` requires `parent_hash` committed in header hash.
+    fn coinbase_block(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, TxApply) {
+        let version = 1;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[4] = 0xab;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
         let header = HeaderRecord {
             prev_fk: prev,
-            version: 1,
-            timestamp: h + 1,
-            bits: 0x207fffff,
-            nonce: h,
-            merkle_root: hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash,
         };
         let mut txid = [0u8; 32];
@@ -2000,8 +2026,10 @@ mod tests {
         assert!(q.index_mode().is_tip());
 
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         for h in 0..4u32 {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
 
@@ -2066,9 +2094,11 @@ mod tests {
         assert!(q.index_mode().uses_durable_spends());
 
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         for h in 0..4u32 {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             hashes.push(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
@@ -2195,7 +2225,7 @@ mod tests {
             .is_empty());
 
         // Archive-only header without confirm.
-        let (orphan, _) = coinbase_block(99, Fk::NULL);
+        let (orphan, _) = coinbase_block(99, Fk::NULL, None);
         let ofk = q.ensure_header(&orphan).unwrap();
         assert_eq!(q.ensure_header(&orphan).unwrap(), ofk);
         assert!(q.is_header_archived(&orphan.hash).unwrap());
@@ -2337,17 +2367,19 @@ mod tests {
     fn reconstruct_and_connect_error_arms() {
         let (dir, q) = temp_query("reconstruct");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         // Multi-tx block at h=1 for odd merkle layer.
         for h in 0..3u32 {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             let mut txs = vec![ta];
             if h == 1 {
                 // Extra coinbase-like create with unique txid (not real coinbase).
-                let mut t2 = coinbase_block(h + 100, prev).1;
+                let mut t2 = coinbase_block(h + 100, Fk::NULL, None).1;
                 t2.tx.txid[30] = 0xee;
                 txs.push(t2);
-                let mut t3 = coinbase_block(h + 200, prev).1;
+                let mut t3 = coinbase_block(h + 200, Fk::NULL, None).1;
                 t3.tx.txid[30] = 0xef;
                 txs.push(t3);
             }
@@ -2502,11 +2534,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
 
         // put_header / put_tx / put_spend surfaces.
-        let mut orphan = coinbase_block(50, Fk::NULL).0;
+        let mut orphan = coinbase_block(50, Fk::NULL, None).0;
         orphan.hash[5] = 0x99;
         let ofk = q.put_header(&orphan).unwrap();
         assert_eq!(q.get_header(ofk).unwrap().hash, orphan.hash);
-        let mut trec = coinbase_block(50, Fk::NULL).1.tx;
+        let mut trec = coinbase_block(50, Fk::NULL, None).1.tx;
         trec.txid[0] = 0x77;
         let _tfk = q.put_tx(&trec).unwrap();
         // put_spend needs real create - skip if fails
@@ -2525,7 +2557,7 @@ mod tests {
 
         // confirm_load of height above tip with archived body (archive-only ahead).
         // Archive header+body at height 3 without confirm.
-        let (h3, ta3) = coinbase_block(3, prev);
+        let (h3, ta3) = coinbase_block(3, prev, Some(hashes[2]));
         let h3hash = h3.hash;
         q.archive_block(&h3, &[ta3]).unwrap();
         let (st, parents, thin, bodies) = q.load_confirm_parents(&[(3, h3hash)]).unwrap();
@@ -2581,12 +2613,12 @@ mod tests {
     fn spend_edge_and_confirm_idempotent_path() {
         let (dir, q) = temp_query("spend-edge");
         // Parent coinbase then child spend in next block.
-        let (h0, ta0) = coinbase_block(0, Fk::NULL);
+        let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
         let parent_txid = ta0.tx.txid;
         let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
         // Coinbase + spend of parent vout 0.
-        let (h1, cb1) = coinbase_block(1, prev);
-        let mut child = coinbase_block(1, prev).1;
+        let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+        let mut child = coinbase_block(1, prev, Some(h0.hash)).1;
         child.tx.txid[31] = 0x5e;
         child.tx.input_count = 1;
         child.inputs = vec![InputRecord {
@@ -2625,14 +2657,16 @@ mod tests {
     fn confirm_load_cancel_and_zero_io_paths() {
         let (dir, q) = temp_query("load-cancel");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         for h in 0..2u32 {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             hashes.push(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
         // Cancel before load of archived-ahead body.
-        let (h2, ta2) = coinbase_block(2, prev);
+        let (h2, ta2) = coinbase_block(2, prev, Some(hashes[1]));
         let h2hash = h2.hash;
         q.archive_block(&h2, &[ta2]).unwrap();
         q.request_confirm_cancel();
@@ -2679,9 +2713,11 @@ mod tests {
     fn confirm_run_non_tip_and_tx_runs() {
         let (dir, q) = temp_query("confirm-run");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut prepared = Vec::new();
         for h in 0..3u32 {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             let hash = header.hash;
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
             let (fk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
@@ -2722,11 +2758,11 @@ mod tests {
     fn confirm_noncontiguous_fks_and_mark_spends() {
         let (dir, q) = temp_query("confirm-nc-fks");
         // Parent coinbase then child spend.
-        let (h0, ta0) = coinbase_block(0, Fk::NULL);
+        let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
         let parent_txid = ta0.tx.txid;
         let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
-        let (h1, cb1) = coinbase_block(1, prev);
-        let mut child = coinbase_block(1, prev).1;
+        let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+        let mut child = coinbase_block(1, prev, Some(h0.hash)).1;
         child.tx.txid[31] = 0x5f;
         child.tx.input_count = 1;
         child.inputs = vec![InputRecord {

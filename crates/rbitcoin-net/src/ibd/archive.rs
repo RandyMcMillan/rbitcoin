@@ -343,6 +343,23 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
             }
         };
 
+        // Corrupt Class A (wrong txs linked to header) — do not feed confirm.
+        // Clear association so densify re-getdatas; never permanent-blacklist.
+        let merkle_ok = block
+            .compute_merkle_root()
+            .is_some_and(|mr| mr == block.header.merkle_root);
+        if !merkle_ok || block.block_hash() != hash {
+            warn!(
+                "ibd: Class A rehydrate h={ht} {hash}: reconstructed body fails header check \
+                 (merkle/hash) — clear Class A and re-getdata"
+            );
+            let _ = hub.query.clear_archived_body(hash.as_byte_array());
+            st.body.demote_known(hash);
+            st.body.mark_missing(hash);
+            failed = failed.saturating_add(1);
+            break;
+        }
+
         let mut payload = Vec::new();
         if block.consensus_encode(&mut payload).is_err() {
             warn!("ibd: Class A rehydrate encode h={ht} {hash} failed — re-getdata");

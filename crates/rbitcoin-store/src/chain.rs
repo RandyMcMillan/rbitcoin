@@ -1103,6 +1103,29 @@ impl HeaderTxsTable {
         Ok(self.get_range(header_fk)?.is_some())
     }
 
+    /// Drop Class A body association for `header_fk` (does not free tx rows).
+    ///
+    /// Used when reconstruct produces a block that fails header checks (e.g.
+    /// merkle root mismatch) — the header hash is fine; the association is bad.
+    pub fn clear_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
+        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+        if id == 0 {
+            return Err(StoreError::InvalidFk);
+        }
+        let had = self.has_body(header_fk)?;
+        if !had {
+            return Ok(false);
+        }
+        // Ensure array slots exist then zero (0 = no body).
+        let idx = id - 1;
+        if idx >= self.first.len() {
+            return Ok(false);
+        }
+        self.first.set(idx, 0)?;
+        self.count.set(idx, 0)?;
+        Ok(true)
+    }
+
     /// Number of headers that currently have a Class A body (`count > 0`).
     ///
     /// Full-array scan — use only for rare status/startup (`archived_block_count`).

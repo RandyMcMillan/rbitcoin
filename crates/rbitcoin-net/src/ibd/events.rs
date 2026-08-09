@@ -680,7 +680,9 @@ fn try_reorg_on_bad_prev(
 }
 
 /// Proactive most-work apply for exploration tips (seeded sibling fork) when
-/// bodies are held — does not require BadPrev livelock first.
+/// bodies are available via held map, Class A, or BQ-by-hash — not held-only.
+/// Tip+1 extensions never enter held on BlockFramed (only height≤tip siblings),
+/// so apply must load BQ/Class A the same way BadPrev gather does.
 fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
     use super::reorg::try_apply_best_candidate;
     use crate::chain::AcceptOutcome;
@@ -689,10 +691,6 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
 
     let tips: Vec<BlockHash> = st.reorg.explore_tips().to_vec();
     if tips.is_empty() {
-        return false;
-    }
-    // Wait until densify filled registered explore hashes.
-    if st.reorg.explore_need_pending() {
         return false;
     }
 
@@ -705,10 +703,23 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
             candidates.push(h);
         }
     }
+    // Registered explore needs (same-height winner + tip+1 extensions).
+    for &h in st.reorg.explore_need_hashes() {
+        if !candidates.contains(&h) {
+            candidates.push(h);
+        }
+    }
     for h in candidates {
         if let Some(b) = load_reorg_body(st, hub, h) {
+            // Promote into held so need_getdata clears (tip+1 never held by BlockFramed).
             st.reorg.hold_body(b.clone());
             bodies.insert(h, b);
+        }
+    }
+    // Every registered explore hash must be loadable before apply (BQ counts).
+    for &h in st.reorg.explore_need_hashes() {
+        if !bodies.contains_key(&h) {
+            return false;
         }
     }
     if bodies.is_empty() {
@@ -1127,6 +1138,140 @@ mod confirm_reject_tests {
         );
         assert_eq!(hub.tip_height(), Some(2));
         assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Mainnet-shaped multi-hop explore: win held (same-height), ext only in BQ.
+    /// `try_complete_awaiting_reorg` → `try_apply_exploration` must still reorg
+    /// (must not gate on held-only explore_need_pending).
+    #[test]
+    fn exploration_apply_win_held_ext_only_in_bq() {
+        use super::try_complete_awaiting_reorg;
+        use crate::chain::ChainHub;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-explore-bq-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let lose = mine(gen, 1_310_000_100, 1);
+        let mut win = mine(gen, 1_310_000_101, 1);
+        if win.block_hash() == lose.block_hash() {
+            let target = Target::from_compact(win.header.bits);
+            for nonce in 0..u32::MAX {
+                win.header.nonce = nonce;
+                if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        hub.accept_block(lose.clone()).unwrap();
+        hub.ensure_header(&win.header).unwrap();
+        let ext = mine(win.block_hash(), 1_310_000_200, 2);
+        hub.ensure_header(&ext.header).unwrap();
+
+        // Ext only in BQ (height tip+1) — not held. Win held as same-height sibling.
+        hub.query
+            .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
+            .unwrap();
+        assert!(hub
+            .query
+            .block_queue_payload_by_hash(&ext.block_hash().to_byte_array())
+            .unwrap()
+            .is_some());
+        assert!(hub
+            .query
+            .block_queue_payload_by_hash(&win.block_hash().to_byte_array())
+            .unwrap()
+            .is_none());
+
+        let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
+        st.record_height(win.block_hash(), 1);
+        st.record_height(ext.block_hash(), 2);
+        st.ordered.push_back(win.block_hash());
+        st.ordered.push_back(ext.block_hash());
+        st.ordered_set.insert(win.block_hash());
+        st.ordered_set.insert(ext.block_hash());
+        st.reorg.hold_body(win.clone());
+        st.reorg
+            .register_explore([win.block_hash(), ext.block_hash()], Some(ext.block_hash()));
+        // Held-only pending still true (ext not held) — apply must not care.
+        assert!(
+            st.reorg.explore_need_pending(),
+            "precondition: ext not held so held-only pending is true"
+        );
+
+        assert!(
+            try_complete_awaiting_reorg(&mut st, &hub),
+            "exploration apply must succeed with win held + ext in BQ"
+        );
+        assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+        assert_eq!(hub.tip_height(), Some(2));
         let _ = std::fs::remove_dir_all(dir);
     }
 

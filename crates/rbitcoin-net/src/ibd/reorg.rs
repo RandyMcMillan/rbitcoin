@@ -150,7 +150,16 @@ impl IbdReorgState {
         &self.explore_tips
     }
 
-    /// True while registered explore hashes still lack held bodies.
+    /// Registered exploration densify hashes (same-height winner + extensions).
+    pub fn explore_need_hashes(&self) -> &[BlockHash] {
+        &self.explore_need
+    }
+
+    /// True while registered explore hashes still lack **held** bodies.
+    ///
+    /// Tip+1+ extensions live in BQ, not held — production apply uses
+    /// load_reorg_body availability, not this flag. Kept for unit preconditions.
+    #[cfg(test)]
     pub fn explore_need_pending(&self) -> bool {
         self.explore_need
             .iter()

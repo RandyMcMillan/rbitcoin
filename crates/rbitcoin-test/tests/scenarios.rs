@@ -482,16 +482,27 @@ fn chain_connect_reorg_and_growth() {
     // Default hash head is 64 slots; 80 blocks (header+tx keys) forces rehash.
     const N: u32 = 80;
     let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
     for h in 0..N {
-        let mut hash = [0u8; 32];
-        hash[0..4].copy_from_slice(&h.to_le_bytes());
+        let version = 1;
+        let timestamp = h;
+        let bits = 1;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
         let header = HeaderRecord {
             prev_fk: prev,
-            version: 1,
-            timestamp: h,
-            bits: 1,
-            nonce: h,
-            merkle_root: hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash,
         };
         let mut txid = [0u8; 32];
@@ -517,6 +528,7 @@ fn chain_connect_reorg_and_growth() {
             }],
             outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
+        parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
     assert_eq!(q.tip_height(), Some(Height(N - 1)));
@@ -1695,6 +1707,26 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     let flags = local_service_flags();
     assert!(flags.has(ServiceFlags::NETWORK));
     assert!(flags.has(ServiceFlags::WITNESS));
+
+    // Consensus header helpers on the same pad (no second open).
+    let mtp = rbitcoin_consensus::median_time_past(&q, Height(sample_tip)).unwrap();
+    assert!(mtp > 0, "mtp={mtp}");
+    let bits = rbitcoin_consensus::expected_next_bits(&q, &params, Height(sample_tip + 1)).unwrap();
+    let tip_bits = q
+        .header_at_height(Height(sample_tip))
+        .unwrap()
+        .unwrap()
+        .1
+        .bits;
+    assert_eq!(
+        bits.to_consensus(),
+        tip_bits,
+        "regtest no-retarget: next bits == tip bits"
+    );
+    // Idempotent ensure_header at tip.
+    let tip_rec = q.get_header(tip_fk).unwrap();
+    let again = q.ensure_header(&tip_rec).unwrap();
+    assert_eq!(again, tip_fk);
 }
 
 // ─── Phase 6: wire ring + archive epoch ─────────────────────────────────────
@@ -2427,12 +2459,8 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
     accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
     tip = b1.block_hash();
     tip_time = b1.header.time;
-    for h in 2..=maturity {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
+    // pad_empty_from is the fast maturity path (not per-block accept loop).
+    (tip, tip_time) = pad_empty_from(&q, &params, tip, tip_time, 2, maturity);
 
     // Archive spend chain without confirming (Class A present, tip still maturity).
     let ha = maturity + 1;

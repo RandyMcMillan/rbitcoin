@@ -1233,38 +1233,40 @@ mod tests {
         );
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn force_roll_body_soft_span() {
-        let dir = tmp();
-        let layout = HeadLayout::with_entry_bytes(12, 4).unwrap(); // 4096 slots, max=3276
-        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        // Same suite budget: force roll + mono refuse without extra full pads.
+        let dir_roll = tmp();
+        let layout_roll = HeadLayout::with_entry_bytes(12, 4).unwrap(); // 4096 slots
+        let h_roll = SegmentedTxHead::create(&dir_roll, layout_roll).unwrap();
         let batch1: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&batch1, false).unwrap();
-        assert_eq!(h.segment_count(), 1);
+        h_roll.insert_many(&batch1, false).unwrap();
+        assert_eq!(h_roll.segment_count(), 1);
         let batch2: Vec<_> = (100..150u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&batch2, true).unwrap(); // force roll
-        assert!(h.segment_count() >= 2);
-        assert!(h.sealed_segment_count() >= 1);
-        let cands = h.probe_candidates(&mixed(50)).unwrap();
-        assert!(cands.iter().any(|f| f.0 == 50));
-        let cands = h.probe_candidates(&mixed(120)).unwrap();
-        assert!(cands.iter().any(|f| f.0 == 120));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        h_roll.insert_many(&batch2, true).unwrap(); // force roll
+        assert!(h_roll.segment_count() >= 2);
+        assert!(h_roll.sealed_segment_count() >= 1);
+        assert!(h_roll
+            .probe_candidates(&mixed(50))
+            .unwrap()
+            .iter()
+            .any(|f| f.0 == 50));
+        assert!(h_roll
+            .probe_candidates(&mixed(120))
+            .unwrap()
+            .iter()
+            .any(|f| f.0 == 120));
 
-    #[test]
-    fn refuse_mono_tx_head_file() {
-        let dir = tmp();
-        std::fs::write(dir.join("tx.head"), b"legacy").unwrap();
-        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-        let err = SegmentedTxHead::create(&dir, layout)
+        let dir_mono = tmp();
+        std::fs::write(dir_mono.join("tx.head"), b"legacy").unwrap();
+        let layout_mono = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let err = SegmentedTxHead::create(&dir_mono, layout_mono)
             .err()
             .expect("must refuse mono head");
         let s = format!("{err}");
         assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
+
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_roll);
+        let _ = std::fs::remove_dir_all(&dir_mono);
     }
 }

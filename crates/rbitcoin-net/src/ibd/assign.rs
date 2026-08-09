@@ -707,10 +707,12 @@ mod tests {
         cfg.window = 128;
         cfg.per_peer = 16;
 
-        const HI: u32 = 4096;
-        // Claim-ready prefix (tiny BQ) so tip-hole race stops; densify walks the rest.
-        // Pending without BQ is a fetch hole — keep prefix short (not 2.5k BQ enqueues).
-        const FILL: u32 = 64;
+        // Past legacy 2048 ceiling with headroom; keep map/BQ setup small for suite speed.
+        const HI: u32 = 2200;
+        // Claim-ready prefix via tiny BQ so tip-hole race stops (pending without BQ
+        // is a fetch hole). Fill through just under the legacy 2048 densify ceiling
+        // so the first missing heights densify issues are already past that line.
+        const FILL: u32 = 2040;
         let tiny = [0u8; 8];
         for ht in 1u32..=HI {
             let hash = h(ht);
@@ -755,15 +757,11 @@ mod tests {
                 .filter_map(|hash| st.hash_height.get(hash).copied())
                 .collect::<Vec<_>>()
         );
-        // Horizon is CONTIG_DENSIFY_AHEAD (64k), not the old 2048 cap.
+        // Runtime pin: densify must issue heights past the legacy 2048 ceiling
+        // (CONTIG_DENSIFY_AHEAD is 64k — not a constant-only check).
         assert!(
-            CONTIG_DENSIFY_AHEAD as u32 > 2048,
-            "CONTIG_DENSIFY_AHEAD={CONTIG_DENSIFY_AHEAD}"
-        );
-        let max_far = far.iter().copied().max().unwrap_or(0);
-        assert!(
-            max_far > FILL,
-            "densify must walk past claim-ready fill; max_far={max_far} far={far:?}"
+            far.iter().any(|&ht| ht > 2048),
+            "legacy CONTIG_DENSIFY_AHEAD=2048 must not be the ceiling; far={far:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

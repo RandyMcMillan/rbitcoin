@@ -328,7 +328,7 @@ pub(crate) fn issue_batch(
 
 /// Contiguous tip+1.. hashes that still need getdata (assign tip-hole race).
 ///
-/// Stops at the first **claim-ready** body (pending / body queue / Class A) so
+/// Stops at the first **claim-ready** body (body-queue wire / confirmed) so
 /// densify priority matches operator `hole=` (fetch gap, not confirm backlog).
 pub(crate) fn contiguous_tip_holes(
     st: &mut IbdWorkState,
@@ -402,20 +402,20 @@ pub(crate) fn cover_tip_holes(
     let now = Instant::now();
 
     for &h in holes {
-        // Skip only when **claim-ready** (confirmed / pending / body-queue wire).
-        // Class A alone (`is_known_archived`) is **not** enough — sole confirm
-        // intake is BQ wire. Resume seed marks Class A as known so densify does
-        // not re-walk the whole band; tip-hole race must still re-get so
-        // claim_ready can become true (restart BQ is empty by design).
-        if hub.has_block(&h) || st.body.is_pending(&h) {
+        // Skip only when **claim-ready** (confirmed or body-queue wire present).
+        // Class A alone and **zombie pending without BQ** are not enough — sole
+        // confirm intake is BQ wire. Resume seed marks Class A as known so densify
+        // does not re-walk the whole band; tip-hole race must still re-get.
+        let ht = st.hash_height.get(&h).copied();
+        if hub.has_block(&h) {
             continue;
         }
-        if st
-            .hash_height
-            .get(&h)
-            .is_some_and(|&ht| hub.query.block_queue_has_height(ht))
-        {
+        if ht.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
             continue;
+        }
+        // Pending RAM flag without BQ: demote so skip_download / densify agree.
+        if st.body.is_pending(&h) {
+            st.body.mark_missing(h);
         }
         let (already, second_at) = st
             .inflight
@@ -643,6 +643,54 @@ mod tests {
         assert!(
             st.inflight.contains_key(&hole),
             "tip hole must be inflight after cover"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Zombie pending (flag set, no BQ wire) must still be a tip hole and re-getdata.
+    /// Mainnet ~97%: hole=0 + inflight=0 while tip+1 pending without claimable wire.
+    #[test]
+    fn cover_tip_holes_regets_zombie_pending_without_body_queue() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(0xaa);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.height_to_hash.insert(ht, hole);
+        st.hash_height.insert(hole, ht);
+        st.record_height(hole, ht);
+        // Soft-stall shape: pending set without body-queue wire.
+        st.body.mark_pending(hole);
+        assert!(st.body.is_pending(&hole));
+        assert!(!hub.query.block_queue_has_height(ht));
+        assert!(
+            !super::super::progress::claim_ready(&hub, &mut st.body, ht, &hole),
+            "zombie pending must not be claim-ready"
+        );
+
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert_eq!(holes, vec![hole], "zombie pending is a fetch hole");
+
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        assert!(
+            issued >= 1,
+            "must re-getdata zombie pending tip hole (got issued={issued})"
+        );
+        assert!(
+            st.inflight.contains_key(&hole),
+            "tip hole must be inflight after cover"
+        );
+        assert!(
+            !st.body.is_pending(&hole),
+            "cover demotes zombie pending to missing"
         );
 
         let _ = std::fs::remove_dir_all(dir);

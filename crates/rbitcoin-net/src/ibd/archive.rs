@@ -289,14 +289,18 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
             // Confirmed or blacklisted — stop contiguous Class A rehydrate.
             break;
         }
-        // Already claim-ready wire.
-        if st.body.is_pending(&hash) || hub.query.block_queue_has_height(ht) {
+        // Already have body-queue wire.
+        if hub.query.block_queue_has_height(ht) {
             st.body.mark_pending(hash);
             confirm_feed.note(ht, hash);
             n = n.saturating_add(1);
             h_min = h_min.min(ht);
             h_max = h_max.max(ht);
             continue;
+        }
+        // Zombie pending without BQ — clear and try Class A rehydrate / re-get.
+        if st.body.is_pending(&hash) {
+            st.body.mark_missing(hash);
         }
         // Need Class A on disk (seed `mark_archived` and/or store probe).
         let has_class_a = st.body.is_known_archived(&hash)

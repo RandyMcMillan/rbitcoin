@@ -1932,7 +1932,7 @@ fn load_decode_bq_block(
 /// Pre-noting ahead of tip lets the engine batch multi-block waves when the
 /// **body queue** leads tip. Caps at [`OFFER_AHEAD`].
 ///
-/// Claim-ready = bq / pending wire only (not Class A alone).
+/// Claim-ready = body-queue wire only (not Class A alone, not zombie pending).
 ///
 /// Uses `height_to_hash` for **O(OFFER_AHEAD)** work — never scans the full
 /// ordered path (that pegged a core at ~130k headers with tip frozen).
@@ -1974,7 +1974,7 @@ pub(crate) fn offer_confirm_ready(
             }
             break;
         }
-        // bq / pending only — break on first hole so tip densify is not starved.
+        // Body-queue wire only — break on first hole so tip densify is not starved.
         if !super::progress::claim_ready(hub, body, ht, &hash) {
             break;
         }
@@ -2528,21 +2528,18 @@ mod tests {
         let feed = ConfirmFeed::new();
         let mut body = BodyPresence::new();
         let mut h2h = HashMap::new();
-        // Tip is 0; expect tip+1 = 1. Claim-ready = body-queue pending wire only.
+        // Tip is 0; expect tip+1 = 1. Zombie pending without BQ is not claim-ready.
         let h1 = bh(0x11);
         h2h.insert(1u32, h1);
         body.mark_pending(h1);
         let mut max_arch = 0u32;
         let shared = AtomicU32::new(0);
         let n = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
-        assert_eq!(n, 1);
-        assert_eq!(max_arch, 1);
-        assert_eq!(shared.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(feed.size_snap().0, 1);
+        assert_eq!(n, 0, "pending without body queue must not note");
+        assert_eq!(feed.size_snap().0, 0);
 
         // Rejected tip+1 stops and notes zero new.
         body.mark_rejected(h1);
-        feed.finish([1]);
         let n2 = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
         assert_eq!(n2, 0);
 
@@ -2582,12 +2579,10 @@ mod tests {
             "Class A without body queue must not note confirm feed"
         );
 
-        // Pending wire (bq) is claim-ready.
+        // Zombie pending without BQ is still not claim-ready.
         body.mark_pending(h1);
         let n6 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
-        assert_eq!(n6, 1);
-        assert_eq!(max_arch, 1);
-        assert_eq!(feed.size_snap().0, 1);
+        assert_eq!(n6, 0, "pending alone must not note without body queue");
 
         let _ = std::fs::remove_dir_all(dir);
     }

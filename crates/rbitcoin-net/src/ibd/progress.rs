@@ -78,9 +78,12 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
 
 /// True if confirm lookup/load can claim this height without another getdata.
 ///
-/// **Only** body-queue / pending wire. Class A alone is not claim-ready — the
-/// sole confirm intake is bq → lookup → load (wire). Tip-follow reorgs use
-/// peer wire via [`crate::chain::ChainHub::accept_block`], not this feed.
+/// **Only** body-queue wire (or already confirmed). Class A alone is not
+/// claim-ready — the sole confirm intake is bq → lookup → load (wire).
+///
+/// **Pending without BQ is not claim-ready** (zombie): `mark_pending` can outlive
+/// queue drop / failed pack. Treating it as ready made `hole=0` + `inflight=0`
+/// while tip+1 could not load (mainnet ~97% stall: feed ahead, claim wait forever).
 pub(crate) fn claim_ready(
     hub: &ChainHub,
     body: &mut BodyPresence,
@@ -93,10 +96,6 @@ pub(crate) fn claim_ready(
     if body.is_rejected(hash) {
         return false;
     }
-    // Peer/rehydrate already parked wire in the body queue.
-    if body.is_pending(hash) {
-        return true;
-    }
     hub.query.block_queue_has_height(height)
 }
 
@@ -104,7 +103,7 @@ pub(crate) fn claim_ready(
 ///
 /// - Missing header on the work path → stop (cannot request further).
 /// - Rejected tip+1 → stop (not a download gap; confirm is blacklisted).
-/// - Claim-ready (queue/pending wire) → stop.
+/// - Claim-ready (body-queue wire) → stop.
 /// - Otherwise increment hole (needs getdata before tip can claim it).
 pub(crate) fn tip_fetch_hole(
     hub: &ChainHub,
@@ -440,9 +439,9 @@ mod tests {
     }
 
     #[test]
-    fn work_chain_progress_fetch_hole_pending_is_ready() {
+    fn work_chain_progress_fetch_hole_requires_body_queue() {
         use super::super::body::BodyPresence;
-        use super::work_chain_progress;
+        use super::{claim_ready, work_chain_progress};
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
         use rbitcoin_consensus::{ChainParams, Milestone};
@@ -462,7 +461,7 @@ mod tests {
         let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
         hub.ensure_genesis().unwrap();
 
-        // tip=0 (genesis) → path_lo=1. Heights 1,2 missing; 3 pending (has wire).
+        // tip=0 (genesis) → path_lo=1. Heights 1..3 missing from BQ.
         let mut h2h = HashMap::new();
         let mut body = BodyPresence::new();
         let h1 = BlockHash::from_byte_array([1u8; 32]);
@@ -473,21 +472,24 @@ mod tests {
         h2h.insert(3, h3);
         body.mark_missing(h1);
         body.mark_missing(h2);
-        body.mark_pending(h3); // body queue owns wire → claim-ready
+        // Zombie pending without BQ must **not** look claim-ready (mainnet stall).
+        body.mark_pending(h3);
+        assert!(
+            !claim_ready(&hub, &mut body, 3, &h3),
+            "pending alone without body queue is not claim-ready"
+        );
 
         let p = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
         assert_eq!(p.tip, 0);
-        assert_eq!(p.ready_hwm, 10);
-        assert_eq!(p.headers, 50);
         assert_eq!(
-            p.tip_hole, 2,
-            "pending at h=3 is claim-ready; hole is only missing 1..2"
+            p.tip_hole, 3,
+            "zombie pending at h=3 still counts as fetch hole"
         );
 
-        // Pending at tip+1 → hole=0 (fetch already filled; confirm can claim).
+        // Zombie pending at tip+1 → still hole (must re-getdata).
         body.mark_pending(h1);
         let p2 = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
-        assert_eq!(p2.tip_hole, 0);
+        assert_eq!(p2.tip_hole, 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }

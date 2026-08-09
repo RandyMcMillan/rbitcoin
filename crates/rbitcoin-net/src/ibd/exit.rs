@@ -17,6 +17,21 @@ pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
     st.max_peer_height.saturating_sub(known_hi)
 }
 
+/// WARN cadence for empty `headers` while still lagging peer horizon.
+///
+/// Streak must **not** be reset after log: a reset every N empties re-fires
+/// `streak == 1` and floods the log when many peers reply empty in parallel.
+#[inline]
+pub(crate) fn should_log_empty_headers_lag(streak: u32) -> bool {
+    streak == 1 || (streak > 0 && streak % 64 == 0)
+}
+
+/// Re-`getheaders` cadence while lagging (one peer, round-robin) after empty replies.
+#[inline]
+pub(crate) fn should_rerequest_headers_on_empty_lag(streak: u32) -> bool {
+    streak == 1 || (streak > 0 && streak % 8 == 0)
+}
+
 /// Work path idle: no ordered hashes, no inflight getdata, archive queue empty.
 #[inline]
 pub fn path_drained(st: &IbdWorkState, archive_q_count: usize) -> bool {
@@ -155,5 +170,30 @@ mod tests {
         near.max_ready_height = 105;
         assert!(!peer_caught_up(&near, 100));
         assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
+    }
+
+    /// Empty-headers lag WARN/reget cadence (mainnet log flood regression).
+    #[test]
+    fn empty_headers_lag_rate_limits() {
+        assert!(should_log_empty_headers_lag(1));
+        assert!(!should_log_empty_headers_lag(2));
+        assert!(!should_log_empty_headers_lag(8));
+        assert!(!should_log_empty_headers_lag(16));
+        assert!(should_log_empty_headers_lag(64));
+        assert!(should_log_empty_headers_lag(128));
+        // 21 peers × 8 empties would have logged ~5× if streak reset every 8.
+        let logs: u32 = (1..=200)
+            .filter(|&s| should_log_empty_headers_lag(s))
+            .count() as u32;
+        assert!(logs <= 5, "expected sparse logs in 200 empties, got {logs}");
+
+        assert!(should_rerequest_headers_on_empty_lag(1));
+        assert!(!should_rerequest_headers_on_empty_lag(2));
+        assert!(should_rerequest_headers_on_empty_lag(8));
+        assert!(should_rerequest_headers_on_empty_lag(16));
+        let regets: u32 = (1..=64)
+            .filter(|&s| should_rerequest_headers_on_empty_lag(s))
+            .count() as u32;
+        assert_eq!(regets, 9); // 1,8,16,...,64
     }
 }

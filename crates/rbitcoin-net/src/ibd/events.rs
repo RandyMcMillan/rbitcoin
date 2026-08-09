@@ -3,7 +3,9 @@
 use super::assign::clear_hash_inflight;
 use super::assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 use super::dial::{release_peer_block_work, request_headers, request_headers_from};
-use super::exit::header_lag_behind_peers;
+use super::exit::{
+    header_lag_behind_peers, should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
+};
 use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
@@ -252,9 +254,13 @@ pub(crate) fn apply_peer_event(
                     st.headers_done = true;
                 } else if lag > 2 {
                     // Peers advertise a higher tip than our work path — empty is a
-                    // false EOF (locator stuck at confirmed tip while headers lead).
-                    // Keep requesting with work-path locator; never mark done.
-                    if st.empty_header_streak == 1 || st.empty_header_streak % 16 == 0 {
+                    // false EOF (locator stuck / peer-horizon skew). Keep syncing;
+                    // never mark headers_done.
+                    //
+                    // **Do not reset** `empty_header_streak` here: a prior reset every
+                    // 8 empties re-triggered `streak == 1` WARNs and re-getheaders
+                    // storms (mainnet: thousands of "empty headers but lag=…" lines).
+                    if should_log_empty_headers_lag(st.empty_header_streak) {
                         warn!(
                             "ibd: empty headers but lag={lag} behind max_peer_height={} (known≈{}, tip={tip_h}) — keep header sync",
                             st.max_peer_height,
@@ -263,11 +269,10 @@ pub(crate) fn apply_peer_event(
                         );
                     }
                     st.headers_done = false;
-                    if st.empty_header_streak >= 8 {
-                        st.empty_header_streak = 0;
+                    if should_rerequest_headers_on_empty_lag(st.empty_header_streak) {
+                        let tips = work_path_tips(st);
+                        let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
                     }
-                    let tips = work_path_tips(st);
-                    let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
                 } else if st.empty_header_streak < 8
                     && st.ordered_set.len() < ORDERED_HEADERS_SOFT_CAP
                 {

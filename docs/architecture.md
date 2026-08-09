@@ -199,6 +199,7 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
+| [`docs/design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md) | Most-work reorg (IBD any depth, tip-follow ≥99) |
 | [`docs/experimental-mainnet.md`](./experimental-mainnet.md) | Lab mainnet ops |
 | [`OPERATOR.md`](../OPERATOR.md) | Knobs, logging, memory budgets |
 | [`COMPAT.md`](../COMPAT.md) | Product surface vs Core / Electrum methods |

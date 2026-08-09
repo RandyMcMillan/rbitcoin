@@ -17,7 +17,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Lookup pack size:** soft **Σ `tx.input`** budget (default **8000**, `RBITCOIN_CONFIRM_BATCH_INPUTS`; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do not assume large multi-dozen block waves.
 
-**Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
+**Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** (when implemented) also calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. See [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 
 **Wire retained on the pipeline batch only:** lookup/load pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Class A packed form is planned once and committed in the write stage.
 

@@ -102,14 +102,33 @@ a LevelDB bag.
   kept forever as raw wire `blk` files.
 - After IBD, a **wire-format ring** covers the soft tip window for serve,
   reorg, and recovery ([crash recovery](./crash-recovery.md)).
-- **Most-work reorg:** header work ranks candidates; full block validation
-  decides the tip. `ChainHub::accept_branch` disconnects only after the apply
-  path is gathered and restores the prior tip if connect fails mid-branch.
-  IBD classifies BadPrev as corrupt wire vs competing path; tip-follow pending
-  holds ≥128 bodies for deep reorgs; resume prefers most-work header children
-  (body is a tie-break). Design: [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 - **Epoch finalize** fsyncs buried archive prefixes in steady state; IBD itself
   does not promise Core-class durability mid-catch-up.
+
+### Most-work chain selection (IBD + tip-follow)
+
+The node follows the **fully valid** chain with **strictly most cumulative
+work** (Bitcoin rule). Header work only **ranks candidates**; full block
+connect decides the tip.
+
+```text
+headers / BQ / pending
+    → MostWorkSelector (skip invalid-marked)
+    → gather bodies (BQ · held-by-hash side bodies · Class A)
+    → ChainHub::accept_branch (snapshot → disconnect → connect;
+         mid-branch fail restores prior tip; mark invalid; re-rank)
+```
+
+| Path | Behavior |
+|------|----------|
+| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). Side-branch bodies are held **by hash** (BQ is height first-wins). |
+| **Tip-follow** | Pending cap ≥128; assemble max-work fork into `accept_branch`. |
+| **Resume** | Prefer deeper/more-work header children; Class A body only tie-breaks. |
+| **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). |
+
+Normative detail: [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
+(Brief history: an earlier soft-only BadPrev path could livelock on a losing
+sibling tip; that is replaced by the design above.)
 
 ### Identity without fat keys
 

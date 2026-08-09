@@ -1,7 +1,8 @@
 # Design: Most-work reorg for IBD and tip-follow
 
-**Status:** implemented (selector, `accept_branch` restore, IBD classify/apply,
-tip-follow pending ≥128, resume most-work child scoring).
+**Status:** complete — selector, `accept_branch` tip restore, IBD BadPrev
+classify/apply with held-by-hash side bodies + densify need, tip-follow
+pending ≥128, multi-candidate re-rank after invalid, resume most-work scoring.
 
 ## Rule (Bitcoin)
 
@@ -41,7 +42,8 @@ IBD scrub / tip-follow pending clear / resume seed
 |-----------|------|
 | `most_work` | Pure LCA/path/`sum_work`/`select_most_work`/`InvalidHashSet` |
 | `ChainHub::accept_branch` | Sole apply; tip restore on mid-branch connect fail |
-| `ibd::reorg` | BadPrev classify (corrupt vs competing); apply/re-rank loop |
+| `ibd::reorg` | BadPrev classify; **held_bodies** by hash; awaiting densify; apply/re-rank loop |
+| Body gather | BQ (height) · held-by-hash side bodies · Class A · BQ-by-hash |
 | Tip-follow pending | Cap 128; assemble max-work fork from pending map |
 | `resume_work_path_after_tip` | Child score = subtree header work, then depth; body tie-break |
 

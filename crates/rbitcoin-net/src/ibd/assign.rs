@@ -923,6 +923,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Most-work reorg awaiting densify: assign issues getdata for need_getdata hashes.
+    #[test]
+    fn assign_issues_reorg_need_getdata() {
+        use bitcoin::block::{Header, Version};
+        use bitcoin::{CompactTarget, Target};
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 16;
+        cfg.per_peer = 4;
+        // Synthetic held tip+1 + need winner hash.
+        let gen = hub.tip_hash().unwrap();
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let need = h(0xab);
+        // Minimal held tip block for awaiting state (payload not used by assign).
+        let mut held = bitcoin::Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: gen,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_100,
+                bits,
+                nonce: 0,
+            },
+            txdata: vec![],
+        };
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            held.header.nonce = nonce;
+            if held.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        st.reorg.set_awaiting(held, vec![need]);
+        st.body.mark_missing(need);
+        assert_eq!(st.reorg.need_getdata(), vec![need]);
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true,
+            None,
+        );
+        assert!(
+            st.inflight.contains_key(&need),
+            "reorg need_getdata must be issued as getdata"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn assign_depth_densify_cache_and_early_exits() {
         let (dir, hub) = tmp_hub();

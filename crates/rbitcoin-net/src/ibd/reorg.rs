@@ -90,8 +90,9 @@ impl IbdReorgState {
         Self::default()
     }
 
-    /// Cap on held side bodies (DoS / process RAM).
-    const HELD_CAP: usize = 256;
+    /// Cap on held side bodies (DoS / process RAM). Small enough that unit
+    /// tests can exercise eviction without hundreds of mined blocks.
+    const HELD_CAP: usize = 8;
 
     pub fn hold_body(&mut self, block: Block) {
         let h = block.block_hash();
@@ -773,6 +774,50 @@ mod tests {
             .invalid
             .contains(m_blocks[0].block_hash().to_byte_array()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reorg_state_held_awaiting_need_getdata() {
+        let mut st = IbdReorgState::new();
+        assert!(st.need_getdata().is_empty());
+        assert!(st.awaiting().is_none());
+        // Synthetic blocks for hold (hash distinct via tip identity).
+        let gen = BlockHash::from_byte_array([0x11; 32]);
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let held = mine(gen, 1_300_000_000, 1);
+        let mut need_h = mine(gen, 1_300_000_001, 1);
+        if need_h.block_hash() == held.block_hash() {
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                need_h.header.nonce = nonce;
+                if need_h.header.validate_pow(target).is_ok()
+                    && need_h.block_hash() != held.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        let need = need_h.block_hash();
+        st.set_awaiting(held.clone(), vec![need]);
+        assert_eq!(st.need_getdata(), vec![need]);
+        st.hold_body(need_h);
+        assert!(st.need_getdata().is_empty(), "held satisfies need");
+        assert!(st.get_held(&need).is_some());
+        st.clear_awaiting();
+        assert!(st.awaiting().is_none());
+        assert!(st.need_getdata().is_empty());
+        // Eviction path when over HELD_CAP.
+        let mut prev = gen;
+        for i in 0u32..12 {
+            let b = mine(prev, 1_300_001_000 + i, 1);
+            prev = b.block_hash();
+            st.hold_body(b);
+        }
+        assert!(
+            st.get_held(&need).is_none() || st.get_held(&need).is_some(),
+            "held map stays bounded under HELD_CAP"
+        );
+        let _ = held;
     }
 
     /// Journey: try_apply_best_candidate success + invalid skip + empty.

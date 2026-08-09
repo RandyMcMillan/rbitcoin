@@ -439,10 +439,26 @@ mod tests {
         assert_eq!(anc2, h(3));
         // Max walk too short → None.
         assert!(first_best_ancestor(&parent, &on_best, h(5), 1).is_none());
-        // Disconnected tips → no LCA.
+        // Disconnected tips → no LCA (tip_a not on best, tip_b walk exhausts).
         let orphan = h(99);
         assert!(lca_on_best_chain(&parent, &on_best, orphan, h(3), 8).is_none());
+        assert!(lca_on_best_chain(&parent, &on_best, h(3), orphan, 8).is_none());
+        // path child == ancestor → empty.
+        assert_eq!(
+            path_hashes_from_ancestor(&parent, h(5), h(5), 32).unwrap(),
+            Vec::<[u8; 32]>::new()
+        );
+        // Empty apply_path candidate skipped by selector.
+        let empty_path = cand(5, &[], 9, 1, 1);
+        assert_eq!(
+            select_most_work(w(1), &[empty_path], &|_| false),
+            SelectOutcome::IgnoreWeaker
+        );
         // Empty work of missing hash.
         assert!(sum_work_for_hashes(&[h(9)], &|_| None).is_none());
+        // first_best: walk off graph → None.
+        assert!(first_best_ancestor(&parent, &on_best, h(99), 4).is_none());
+        // path walk budget exhausted without hitting ancestor.
+        assert!(path_hashes_from_ancestor(&parent, h(0), h(5), 1).is_none());
     }
 }

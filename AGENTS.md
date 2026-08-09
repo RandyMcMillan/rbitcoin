@@ -61,6 +61,23 @@ order + HWM**, not map mutexes (maps removed — phase 6).
 If a change introduces a new long-held store lock on the IBD/read path, it is the
 wrong design — fix the protocol. See `docs/concurrency.md`.
 
+## On-disk format changes: warn, schema, or migrate
+
+Changing any durable store bytes (table layout, side files like fuse8,
+envelope version, encode of sealed products) must not surprise an operator with
+a silent wipe / full head rebuild. Pick at least one:
+
+| Option | When |
+|--------|------|
+| **Soft migrate** | Payload-only change (e.g. fuse8 v1→v2): open legacy, log a clear `warn!`, always-probe or dual-read, rewrite on open or next seal — **do not** treat decode failure as “recreate whole table” |
+| **`SCHEMA_VERSION` bump** | Class A / OA / body layout change, or anything that cannot soft-open prior files |
+| **Explicit refuse** | Incompatible durable state: hard error with a one-line wipe/reindex message (which files), not a cryptic `Corrupt` that cascades into head recreate |
+
+Also document the change in `SCHEMA.md` / `SCHEMA_HISTORY.md` in the same
+commit as the format code. Side-format version fields (e.g. BF8R version) are
+not a substitute for operator-visible logs when migration runs. See fuse8 v1→v2
+notes in `SCHEMA_HISTORY.md` (side format under schema 14).
+
 ## io_uring: do not flatten custom machines
 
 **Under no circumstances** replace a purpose-built / multi-stage **io_uring

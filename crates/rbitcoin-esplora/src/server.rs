@@ -393,17 +393,27 @@ mod tests {
         (dir, q)
     }
 
-    fn coinbase(h: u32, prev: Fk) -> (HeaderRecord, TxApply) {
-        let mut hash = [0u8; 32];
-        hash[0..4].copy_from_slice(&h.to_le_bytes());
-        hash[5] = 0xab;
+    fn coinbase(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, TxApply) {
+        let version = 1;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[5] = 0xab;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
         let header = HeaderRecord {
             prev_fk: prev,
-            version: 1,
-            timestamp: h + 1,
-            bits: 0x207fffff,
-            nonce: h,
-            merkle_root: hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash,
         };
         let mut txid = [0u8; 32];
@@ -458,9 +468,11 @@ mod tests {
     async fn tip_endpoints_and_unknown_404() {
         let (dir, q) = temp_query("tip");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut tip_hash = [0u8; 32];
         for h in 0..3u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             tip_hash = header.hash;
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
@@ -517,10 +529,12 @@ mod tests {
     async fn block_and_tx_read_path() {
         let (dir, q) = temp_query("block-tx");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         let mut coinbase_txids = Vec::new();
         for h in 0..3u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             hashes.push(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
@@ -628,10 +642,12 @@ mod tests {
 
         let (dir, q) = temp_query("remain");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         let mut coinbase_txids = Vec::new();
         for h in 0..4u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             hashes.push(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
@@ -758,10 +774,12 @@ mod tests {
 
         let (dir, q) = temp_query("p0-block");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         let mut coinbase_txids = Vec::new();
         for h in 0..3u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             hashes.push(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
@@ -886,8 +904,10 @@ mod tests {
 
         let (dir, q) = temp_query("ws-tip");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         for h in 0..2u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
         let q = Arc::new(q);
@@ -1031,9 +1051,11 @@ mod tests {
         let (watch_addr, watch_spk) = regtest_p2wpkh();
         let (dir, q) = temp_query("ws-addr");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut coinbase_txids = Vec::new();
         for h in 0..101u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
@@ -1070,7 +1092,7 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(49_0000_0000, watch_spk.to_bytes())],
         };
-        let (cb_header, cb) = coinbase(101, prev);
+        let (cb_header, cb) = coinbase(101, prev, parent_hash);
         let _prev = q
             .connect_block(Height(101), &cb_header, &[cb, ta_pay])
             .expect("connect pay block");
@@ -1201,9 +1223,11 @@ mod tests {
 
         let (dir, q) = temp_query("ws-tx-conf");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut coinbase_txids = Vec::new();
         for h in 0..101u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
@@ -1273,8 +1297,8 @@ mod tests {
         assert!(saw_unconf, "unconfirmed track-tx push");
 
         // Confirm the same txid via connect_block, then tip.
-        let tip_fk = q.header_at_height(Height(100)).unwrap().unwrap().0;
-        let (h_hdr, cb) = coinbase(101, tip_fk);
+        let (tip_fk, tip_rec) = q.header_at_height(Height(100)).unwrap().unwrap();
+        let (h_hdr, cb) = coinbase(101, tip_fk, Some(tip_rec.hash));
         let ta = TxApply {
             tx: TxRecord {
                 txid: pending_bytes,
@@ -1426,9 +1450,11 @@ mod tests {
         let (watch_addr, watch_spk) = regtest_p2wpkh();
         let (dir, q) = temp_query("ws-rbf");
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut coinbase_txids = Vec::new();
         for h in 0..101u32 {
-            let (header, ta) = coinbase(h, prev);
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             coinbase_txids.push(ta.tx.txid);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }

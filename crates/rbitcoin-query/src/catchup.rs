@@ -739,17 +739,31 @@ mod tests {
         buf
     }
 
-    fn coinbase_block(h: u32, prev: Fk) -> (HeaderRecord, crate::TxApply) {
-        let mut hash = [0u8; 32];
-        hash[0..4].copy_from_slice(&h.to_le_bytes());
-        hash[4] = 0xcd;
+    fn coinbase_block(
+        h: u32,
+        prev: Fk,
+        parent_hash: Option<[u8; 32]>,
+    ) -> (HeaderRecord, crate::TxApply) {
+        let version = 1;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[4] = 0xcd;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
         let header = HeaderRecord {
             prev_fk: prev,
-            version: 1,
-            timestamp: h + 1,
-            bits: 0x207fffff,
-            nonce: h,
-            merkle_root: hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash,
         };
         let mut txid = [0u8; 32];
@@ -782,8 +796,10 @@ mod tests {
     fn seed_direct_chain(q: &Query, n: u32) {
         q.enter_direct_index_mode().unwrap();
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         for h in 0..n {
-            let (header, ta) = coinbase_block(h, prev);
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
         assert_eq!(q.tip_height(), Some(Height(n - 1)));
@@ -1355,7 +1371,8 @@ mod tests {
 
         let tip_h = q.tip_height().unwrap().0;
         let tip_fk = q.store.confirmed.get(Height(tip_h)).unwrap().unwrap();
-        let (header, ta) = coinbase_block(tip_h + 1, tip_fk);
+        let tip_hash = q.store.get_header(tip_fk).unwrap().hash;
+        let (header, ta) = coinbase_block(tip_h + 1, tip_fk, Some(tip_hash));
         q.connect_block(Height(tip_h + 1), &header, &[ta])
             .expect("tip connect");
 

@@ -407,16 +407,22 @@ mod tests {
         };
         let hfk0 = q.archive_block(&h0, &[ta0]).unwrap();
 
-        // h1: coinbase + spend of parent vout 0
-        let mut h1hash = [0u8; 32];
-        h1hash[0] = 0xa1;
+        // h1: coinbase + spend of parent vout 0 (hash commits to h0 via write gate).
+        let version = 1;
+        let timestamp = 2;
+        let bits = 0x207fffff;
+        let nonce = 1;
+        let mut merkle = [0u8; 32];
+        merkle[0] = 0xa1;
+        let h1hash =
+            rbitcoin_store::block_header_hash(version, &h0.hash, &merkle, timestamp, bits, nonce);
         let h1 = HeaderRecord {
             prev_fk: hfk0,
-            version: 1,
-            timestamp: 2,
-            bits: 0x207fffff,
-            nonce: 1,
-            merkle_root: h1hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash: h1hash,
         };
         let mut cb_txid = [0u8; 32];

@@ -1259,19 +1259,30 @@ mod tests {
         let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
         // Build 2-block synthetic chain.
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         let mut hashes = Vec::new();
         let mut first_txid = [0u8; 32];
         for h in 0..2u32 {
-            let mut hash = [0u8; 32];
-            hash[0..4].copy_from_slice(&h.to_le_bytes());
-            hash[5] = 0xec;
+            let version = 1;
+            let timestamp = h + 1;
+            let bits = 0x207fffff;
+            let nonce = h;
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xec;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+                }
+            };
             let header = HeaderRecord {
                 prev_fk: prev,
-                version: 1,
-                timestamp: h + 1,
-                bits: 0x207fffff,
-                nonce: h,
-                merkle_root: hash,
+                version,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: merkle,
                 hash,
             };
             let mut txid = [0u8; 32];
@@ -1301,6 +1312,7 @@ mod tests {
                 outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
             };
             hashes.push(hash);
+            parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
 
@@ -1495,17 +1507,28 @@ mod tests {
 
         let (dir, q) = tmp_store();
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         for h in 0..4u32 {
-            let mut hash = [0u8; 32];
-            hash[0..4].copy_from_slice(&h.to_le_bytes());
-            hash[5] = 0xee;
+            let version = 1;
+            let timestamp = h + 1;
+            let bits = 0x207fffff;
+            let nonce = h;
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xee;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+                }
+            };
             let header = HeaderRecord {
                 prev_fk: prev,
-                version: 1,
-                timestamp: h + 1,
-                bits: 0x207fffff,
-                nonce: h,
-                merkle_root: hash,
+                version,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: merkle,
                 hash,
             };
             let mut txid = [0u8; 32];
@@ -1531,6 +1554,7 @@ mod tests {
                 }],
                 outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
             };
+            parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
 

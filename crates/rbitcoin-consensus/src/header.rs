@@ -142,17 +142,28 @@ mod median_time_past_tests {
         (dir, q)
     }
 
-    fn coinbase(h: u32, prev: Fk) -> (HeaderRecord, TxApply) {
-        let mut hash = [0u8; 32];
-        hash[0..4].copy_from_slice(&h.to_le_bytes());
-        hash[4] = 0xcd;
+    /// Write-gate-safe synthetic coinbase: non-null `prev_fk` must commit `parent_hash`.
+    fn coinbase(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, TxApply) {
+        let version = 1;
+        let timestamp = 1_000 + h * 10;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[4] = 0xcd;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
         let header = HeaderRecord {
             prev_fk: prev,
-            version: 1,
-            timestamp: 1_000 + h * 10,
-            bits: 0x207fffff,
-            nonce: h,
-            merkle_root: hash,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
             hash,
         };
         let mut txid = [0u8; 32];
@@ -185,8 +196,10 @@ mod median_time_past_tests {
     fn mtp_from_confirmed_chain_and_missing_above_tip() {
         let (dir, q) = temp_q();
         let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
         for h in 0..3u32 {
-            let (hdr, ta) = coinbase(h, prev);
+            let (hdr, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(hdr.hash);
             prev = q.connect_block(Height(h), &hdr, &[ta]).unwrap();
         }
         let mtp = median_time_past(&q, Height(2)).unwrap();
@@ -225,10 +238,10 @@ mod median_time_past_tests {
         let err = validate_header(&q, &params, Height(0), &bad).unwrap_err();
         assert!(matches!(err, ConsensusError::BadHeader(_)), "{err:?}");
 
-        // Synthetic tip for prev linkage.
-        let (h0, ta0) = coinbase(0, Fk::NULL);
+        // Synthetic tip for prev linkage (child hash commits to parent).
+        let (h0, ta0) = coinbase(0, Fk::NULL, None);
         let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
-        let (h1, ta1) = coinbase(1, prev);
+        let (h1, ta1) = coinbase(1, prev, Some(h0.hash));
         q.connect_block(Height(1), &h1, &[ta1]).unwrap();
 
         // Header with wrong prev hash at height 1.

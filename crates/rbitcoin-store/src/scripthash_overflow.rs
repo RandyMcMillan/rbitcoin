@@ -140,8 +140,24 @@ impl ShOverflowStack {
             let fuse_path = ovf_fuse_path(store_dir, *id);
             let is_last = i + 1 == ids.len();
             let fuse = if fuse_path.is_file() {
-                match SealedFuse8::read_from(&fuse_path) {
-                    Ok(f) => Some(f),
+                match crate::fuse8_filter::open_file(&fuse_path) {
+                    Ok(crate::fuse8_filter::FuseFileOpen::Ready(f)) => Some(f),
+                    Ok(crate::fuse8_filter::FuseFileOpen::NeedsRewrite { reason, .. }) => {
+                        // Legacy v1 fuse: drop and treat as open only on last segment;
+                        // sealed non-last must still fail hard (cannot rewrite SH fuse here).
+                        if is_last {
+                            rbitcoin_log::warn!(
+                                "store: scripthash.ovf fuse migrate id={id} ({reason}) — \
+                                 treating last segment as open (fuse removed)"
+                            );
+                            let _ = std::fs::remove_file(&fuse_path);
+                            None
+                        } else {
+                            return Err(StoreError::Corrupt(
+                                "scripthash.ovf: sealed segment fuse needs rewrite (re-seal ovf)",
+                            ));
+                        }
+                    }
                     Err(_) if is_last => {
                         // Corrupt fuse on open (last) segment: treat as open.
                         let _ = std::fs::remove_file(&fuse_path);

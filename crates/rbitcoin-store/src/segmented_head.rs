@@ -25,7 +25,7 @@
 
 use crate::address_head::{AddressHead, HeadLayout, HEAD_LOAD_START, MAINNET_BITS};
 use crate::error::StoreError;
-use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
+use crate::fuse8_filter::{fuse_key_from_mixed, open_file, FuseFileOpen, SealedFuse8};
 use crate::tx_idx::DEFAULT_SOFT_SPAN;
 use rbitcoin_primitives::{Fk, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
@@ -94,6 +94,8 @@ struct Segment {
     fuse: Option<SealedFuse8>,
     /// Mixed fuse keys while open (for seal). Empty when sealed.
     open_keys: Mutex<Vec<u64>>,
+    /// Sealed fuse is always-probe (legacy v1 / unreadable body); rewrite as v2.
+    fuse_needs_rewrite: bool,
 }
 
 /// Multi-segment keyless address head with seal-time binary fuse8.
@@ -142,14 +144,25 @@ impl SegmentedTxHead {
                 return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
             }
             let sealed = d.flags & FLAG_SEALED != 0;
-            let fuse = if sealed {
+            let (fuse, fuse_needs_rewrite) = if sealed {
                 let fp = segment_fuse_path(&dir, d.file_id);
                 if !fp.exists() {
                     return Err(StoreError::Corrupt("tx.head sealed segment missing fuse8"));
                 }
-                Some(SealedFuse8::read_from(&fp)?)
+                match open_file(&fp)? {
+                    FuseFileOpen::Ready(f) => (Some(f), false),
+                    FuseFileOpen::NeedsRewrite { gate, reason } => {
+                        rbitcoin_log::warn!(
+                            "store: tx.head fuse migrate file_id={} path={} ({reason}) — \
+                             using always-probe until Class A rewrite to fuse8 v2",
+                            d.file_id,
+                            fp.display()
+                        );
+                        (Some(gate), true)
+                    }
+                }
             } else {
-                None
+                (None, false)
             };
             max_id = max_id.max(d.file_id);
             segs.push(Arc::new(Segment {
@@ -160,6 +173,7 @@ impl SegmentedTxHead {
                 head: Arc::new(head),
                 fuse,
                 open_keys: Mutex::new(Vec::new()),
+                fuse_needs_rewrite,
             }));
         }
         for (i, s) in segs.iter().enumerate() {
@@ -265,6 +279,64 @@ impl SegmentedTxHead {
     ///
     /// Required before seal when this process did not insert every open create
     /// (crash/restart mid-segment). `keys.len()` must equal open `count`.
+    /// On-disk path for a segment's sealed fuse file.
+    pub fn fuse_path_for_file_id(&self, file_id: u32) -> PathBuf {
+        segment_fuse_path(&self.dir, file_id)
+    }
+
+    /// Sealed segments whose fuse is legacy (v1) or unreadable: `(file_id, first_fk, count)`.
+    ///
+    /// Used after open to rebuild fuse8 **v2** from Class A without wiping `tx.head`.
+    pub fn sealed_fuse_rewrite_queue(&self) -> Vec<(u32, u64, u64)> {
+        self.segments_snapshot()
+            .iter()
+            .filter(|s| s.sealed && s.fuse_needs_rewrite)
+            .map(|s| (s.file_id, s.first_fk, s.count.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// Install a rebuilt v2 fuse for a sealed segment (after rewriting `.fuse8` on disk).
+    pub fn install_sealed_fuse(&self, file_id: u32, fuse: SealedFuse8) -> Result<(), StoreError> {
+        if fuse.is_always_probe() {
+            return Err(StoreError::Corrupt(
+                "tx.head install_sealed_fuse: always-probe not durable",
+            ));
+        }
+        let _g = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_list = (**guard).clone();
+        let mut found = false;
+        for s in &mut new_list {
+            if s.file_id != file_id {
+                continue;
+            }
+            if !s.sealed {
+                return Err(StoreError::Corrupt(
+                    "tx.head install_sealed_fuse: segment not sealed",
+                ));
+            }
+            *s = Arc::new(Segment {
+                first_fk: s.first_fk,
+                count: AtomicU64::new(s.count.load(Ordering::Relaxed)),
+                file_id: s.file_id,
+                sealed: true,
+                head: Arc::clone(&s.head),
+                fuse: Some(fuse),
+                open_keys: Mutex::new(Vec::new()),
+                fuse_needs_rewrite: false,
+            });
+            found = true;
+            break;
+        }
+        if !found {
+            return Err(StoreError::Corrupt(
+                "tx.head install_sealed_fuse: file_id not found",
+            ));
+        }
+        *guard = Arc::new(new_list);
+        Ok(())
+    }
+
     pub fn replace_open_keys(&self, keys: Vec<u64>) -> Result<(), StoreError> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let segs = self.segments_snapshot();
@@ -661,6 +733,7 @@ impl SegmentedTxHead {
             head: Arc::new(head),
             fuse: None,
             open_keys: Mutex::new(Vec::new()),
+            fuse_needs_rewrite: false,
         });
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
@@ -739,6 +812,7 @@ impl SegmentedTxHead {
                 head: Arc::clone(&old.head),
                 fuse: Some(fuse),
                 open_keys: Mutex::new(Vec::new()),
+                fuse_needs_rewrite: false,
             }));
             *guard = Arc::new(new_list);
         }
@@ -1099,6 +1173,39 @@ mod tests {
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy fuse8 v1 envelope must soft-open (always-probe), not fail the head.
+    #[test]
+    fn sealed_fuse_v1_soft_open_queues_rewrite() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let n = 900u64;
+        let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&entries, false).unwrap();
+        assert!(h.sealed_segment_count() >= 1);
+        h.flush().unwrap();
+        drop(h);
+
+        // Overwrite sealed segment 0 fuse with a v1 envelope (historical xorf path).
+        let fuse_path = dir.join("tx.head").join("000000.fuse8");
+        assert!(fuse_path.is_file());
+        let mut raw = Vec::from(*b"BF8R");
+        raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&fuse_path, &raw).unwrap();
+
+        let h2 = SegmentedTxHead::open(&dir).unwrap();
+        let q = h2.sealed_fuse_rewrite_queue();
+        assert!(
+            q.iter().any(|(id, _, _)| *id == 0),
+            "file_id 0 should need fuse rewrite: {q:?}"
+        );
+        // Lookup still finds sealed members (always-probe, no FN).
+        let cands = h2.probe_candidates(&mixed(1)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

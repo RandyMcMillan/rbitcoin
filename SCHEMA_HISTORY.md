@@ -32,6 +32,24 @@ Versions below are listed **newest → oldest** after the summary table.
 
 See [`SCHEMA.md`](./SCHEMA.md).
 
+### Side format: sealed fuse8 payload v1 → v2 (still schema 14)
+
+Not a full `SCHEMA_VERSION` bump — Class A / `tx.head` OA layout unchanged.
+
+| | |
+|--|--|
+| **v1** | `BF8R` envelope + bincode of **xorf** `BinaryFuse8` (pre in-tree port) |
+| **v2** | `BF8R` + explicit LE body of in-tree `BinaryFuse8` |
+
+**Open behavior:** a sealed `tx.head.NNNNNN.fuse8` at **v1** (or unreadable v2 body) logs
+`store: tx.head fuse migrate …` and uses an always-probe gate, then **rewrites** the
+fuse from Class A txids as v2. The head tables are **not** wiped. (A binary that
+only hard-failed on decode would recreate+rebuild the entire segmented head — avoid.)
+
+**Process for next format change:** bump the fuse **version** field, soft-open legacy,
+log a one-line warn, migrate or refuse with a clear message — do not silently
+`Corrupt` → full head wipe unless the OA layout itself changed.
+
 **Relative to v13:**
 
 - Class B SH head value: **Empty / Inline (≤2) / Paged** (first+last **4 KiB** page offs; bit-63 flags).

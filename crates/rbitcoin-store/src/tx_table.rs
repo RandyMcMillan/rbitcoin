@@ -1194,8 +1194,62 @@ impl TxTable {
             // Open segment may have creates from a prior process; rebuild fuse
             // keys from Class A so a later seal never FN pre-restart members.
             t.rebuild_open_segment_fuse_keys()?;
+            // Soft-migrate sealed fuse8 v1 (xorf/bincode) → v2 without wiping head.
+            t.rewrite_legacy_sealed_fuses()?;
         }
         Ok(t)
+    }
+
+    /// Rewrite sealed `.fuse8` files that opened as always-probe (legacy v1).
+    ///
+    /// Rebuilds fuse keys from Class A `txid.body` for each stale sealed segment and
+    /// installs a durable v2 payload. Head OA tables are left intact.
+    fn rewrite_legacy_sealed_fuses(&self) -> Result<(), StoreError> {
+        let queue = self.head.sealed_fuse_rewrite_queue();
+        if queue.is_empty() {
+            return Ok(());
+        }
+        rbitcoin_log::warn!(
+            "store: rewriting {} sealed tx.head fuse8 file(s) to v2 (format migration; \
+             head data kept)",
+            queue.len()
+        );
+        for (file_id, first_fk, count) in queue {
+            if count == 0 {
+                continue;
+            }
+            let last_fk = first_fk.saturating_add(count).saturating_sub(1);
+            let n_body = self.count();
+            if first_fk == 0 || first_fk > n_body || last_fk > n_body {
+                rbitcoin_log::warn!(
+                    "store: skip fuse rewrite file_id={file_id} first_fk={first_fk} \
+                     count={count} body={n_body} (range past Class A)"
+                );
+                continue;
+            }
+            let txids = self.body_txid_range(first_fk, last_fk)?;
+            if txids.len() as u64 != count {
+                return Err(StoreError::Corrupt(
+                    "tx.head fuse rewrite: body range count mismatch",
+                ));
+            }
+            let mut keys: Vec<u64> = txids
+                .iter()
+                .map(|txid| crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid)))
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let fuse = crate::fuse8_filter::SealedFuse8::build(&keys)?;
+            let path = self.head.fuse_path_for_file_id(file_id);
+            fuse.write_to(&path)?;
+            self.head.install_sealed_fuse(file_id, fuse)?;
+            rbitcoin_log::info!(
+                "store: tx.head fuse rewritten v2 file_id={file_id} first_fk={first_fk} \
+                 count={count} unique_keys={}",
+                keys.len()
+            );
+        }
+        Ok(())
     }
 
     /// Rebuild open-tail fuse keys from Class A body txids (crash/restart safe).

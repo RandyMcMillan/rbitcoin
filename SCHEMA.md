@@ -242,6 +242,7 @@ bits-widen / shadow-resize path.
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
 | Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → seal + new open |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
+| Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
 | Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B); max depth 1024 |
 | Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
 | Lookup | **Open always** → sealed **newest→oldest** (fuse gate) → body-verify candidates (deepest match wins, BIP30-shaped) |

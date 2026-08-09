@@ -959,11 +959,27 @@ mod chain_table_tests {
         ));
         assert_eq!(ht.count_bodies().unwrap(), 5);
         assert!(matches!(ht.get_range(Fk::NULL), Err(StoreError::InvalidFk)));
+
+        // clear_body: drop association without freeing tx rows (merkle soft-reget path).
+        assert!(matches!(
+            ht.clear_body(Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(!ht.clear_body(Fk(99)).unwrap(), "no body → false");
+        assert!(ht.clear_body(Fk(1)).unwrap(), "had body → true");
+        assert!(!ht.has_body(Fk(1)).unwrap());
+        assert!(!ht.clear_body(Fk(1)).unwrap(), "already clear → false");
+        assert_eq!(ht.count_bodies().unwrap(), 4);
+
         ht.flush().unwrap();
         ht.flush_async().unwrap();
         drop(ht);
         let ht = HeaderTxsTable::open(&dir).unwrap();
         assert_eq!(ht.get_range(Fk(5)).unwrap(), Some((Fk(500), 2)));
+        assert!(
+            !ht.has_body(Fk(1)).unwrap(),
+            "clear_body durable after reopen"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

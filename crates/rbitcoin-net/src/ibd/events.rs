@@ -637,6 +637,34 @@ mod confirm_reject_tests {
         );
 
         // Merkle mismatch (corrupt Class A reconstruct) → soft re-get, not blacklist.
+        // Drive clear_archived_body when a Query is present (production IBD path).
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-merkle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = rbitcoin_query::Query::open_or_create(dir.join("store")).unwrap();
+        let hdr = rbitcoin_store::HeaderRecord {
+            prev_fk: rbitcoin_primitives::Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0xae,
+            merkle_root: [0xae; 32],
+            hash: h(0xae).to_byte_array(),
+        };
+        let hfk = q.put_header(&hdr).unwrap();
+        // Associate a dummy Class A range so clear_body has something to drop.
+        q.store()
+            .header_txs
+            .put_range(hfk, rbitcoin_primitives::Fk(1), 1)
+            .unwrap();
+        assert!(q.store().header_txs.has_body(hfk).unwrap());
+
         let mut st = IbdWorkState::new(Vec::new(), None, Some(938_453));
         let hash = h(0xae);
         st.body.mark_archived(hash);
@@ -647,7 +675,7 @@ mod confirm_reject_tests {
             938_454,
             hash,
             "consensus: bad block: merkle root mismatch",
-            None,
+            Some(&q),
         );
         assert!(
             !st.body.is_rejected(&hash),
@@ -657,6 +685,11 @@ mod confirm_reject_tests {
             !st.body.is_known_archived(&hash),
             "merkle mismatch should demote Class A known so densify re-gets"
         );
+        assert!(
+            !q.store().header_txs.has_body(hfk).unwrap(),
+            "soft re-get must clear corrupt Class A association"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
 
         // Wire-only soft: unexpected previous header → re-getdata, not blacklist.
         let mut st = IbdWorkState::new(Vec::new(), None, Some(125_652));

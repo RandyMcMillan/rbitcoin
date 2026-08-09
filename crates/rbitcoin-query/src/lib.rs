@@ -2538,6 +2538,11 @@ mod tests {
         orphan.hash[5] = 0x99;
         let ofk = q.put_header(&orphan).unwrap();
         assert_eq!(q.get_header(ofk).unwrap().hash, orphan.hash);
+        // clear_archived_body: missing hash → false; after body association → true.
+        assert!(!q.clear_archived_body(&[0xde; 32]).unwrap());
+        q.store().header_txs.put_range(ofk, Fk(1), 1).unwrap();
+        assert!(q.clear_archived_body(&orphan.hash).unwrap());
+        assert!(!q.clear_archived_body(&orphan.hash).unwrap());
         let mut trec = coinbase_block(50, Fk::NULL, None).1.tx;
         trec.txid[0] = 0x77;
         let _tfk = q.put_tx(&trec).unwrap();

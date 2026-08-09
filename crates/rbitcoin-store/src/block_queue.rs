@@ -334,8 +334,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Serialize env mutators — parallel suite races `budget_from_env` readers.
+    static BQ_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn default_budget_unlimited_unless_env() {
+        let _g = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let b = BlockQueue::budget_from_env();
         if std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES").is_ok()
             || std::env::var("RBITCOIN_BLOCK_QUEUE_GB").is_ok()
@@ -348,8 +352,7 @@ mod tests {
 
     #[test]
     fn budget_from_env_bytes_and_gb_clamps() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_b = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
         let prev_g = std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB");
         std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");

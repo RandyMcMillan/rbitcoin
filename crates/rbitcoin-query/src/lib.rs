@@ -1368,6 +1368,23 @@ impl Query {
         Ok(g.get_by_height(height)?.map(|q| q.payload))
     }
 
+    /// Payload for a block **hash** if present on the RAM queue (any height).
+    ///
+    /// Used by most-work reorg gather for same-height competitors that cannot
+    /// share the tip's height slot under first-wins enqueue.
+    pub fn block_queue_payload_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, QueryError> {
+        let g = self.block_queue.lock().unwrap();
+        for meta in g.list_meta() {
+            if &meta.hash == hash {
+                return Ok(g.get(meta.id)?.map(|q| q.payload));
+            }
+        }
+        Ok(None)
+    }
+
     /// True if the in-RAM body queue holds `height`.
     pub fn block_queue_has_height(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();

@@ -132,6 +132,33 @@ pub(crate) fn assign_work_ordered(
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
+    // 1b) Most-work reorg: pull winning-sibling (or other) bodies held by hash
+    // that cannot use the tip height BQ slot.
+    let reorg_need = st.reorg.need_getdata();
+    if !reorg_need.is_empty() {
+        let mut room = cfg.window.saturating_sub(st.inflight.len());
+        let mut peer_i = st.assign_rot;
+        for h in reorg_need {
+            if room == 0 {
+                break;
+            }
+            if st.inflight.contains_key(&h) || st.body.skip_download(hub, &h) {
+                continue;
+            }
+            for _ in 0..alive.len() {
+                let pid = alive[peer_i % alive.len()];
+                peer_i += 1;
+                if !peer_has_slot(st, pid, cfg.per_peer) {
+                    continue;
+                }
+                if issue_one(st, pid, h, &mut room, &mut issued) {
+                    break;
+                }
+            }
+        }
+        st.assign_rot = peer_i;
+    }
+
     // 2) Densify only when archive soft has room and not Critical.
     if !archive_can_assign || matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);

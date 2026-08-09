@@ -62,15 +62,76 @@ pub fn is_bad_prev_err(err: &str) -> bool {
     err.contains("unexpected previous header") || err.contains("unexpected previous")
 }
 
-/// Process-local invalid apply marks for this IBD run.
+/// Awaiting a missing body (e.g. winning sibling) before apply can run.
+#[derive(Debug, Clone)]
+pub struct AwaitingBodies {
+    /// Block we already hold (typically tip+1 on the winning path).
+    pub held_tip: Block,
+    /// Hashes still needed (e.g. winning sibling at tip height).
+    pub need: Vec<BlockHash>,
+}
+
+/// Process-local reorg state for one IBD run.
+///
+/// Bodies for **side branches** are held by hash here: the body queue is
+/// height-keyed first-wins, so a same-height competitor of the tip cannot
+/// live in BQ while the tip path occupies that height.
 #[derive(Debug, Default)]
 pub struct IbdReorgState {
     pub invalid: InvalidHashSet,
+    /// Side-branch / reorg-candidate bodies keyed by block hash.
+    held_bodies: HashMap<BlockHash, Block>,
+    /// Incomplete gather: need `need` hashes before applying `held_tip` path.
+    awaiting: Option<AwaitingBodies>,
 }
 
 impl IbdReorgState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cap on held side bodies (DoS / process RAM).
+    const HELD_CAP: usize = 256;
+
+    pub fn hold_body(&mut self, block: Block) {
+        let h = block.block_hash();
+        if self.held_bodies.len() >= Self::HELD_CAP && !self.held_bodies.contains_key(&h) {
+            // Drop an arbitrary older entry (HashMap iter order is arbitrary).
+            if let Some(k) = self.held_bodies.keys().next().copied() {
+                self.held_bodies.remove(&k);
+            }
+        }
+        self.held_bodies.insert(h, block);
+    }
+
+    pub fn get_held(&self, hash: &BlockHash) -> Option<Block> {
+        self.held_bodies.get(hash).cloned()
+    }
+
+    pub fn set_awaiting(&mut self, held_tip: Block, need: Vec<BlockHash>) {
+        self.awaiting = Some(AwaitingBodies { held_tip, need });
+    }
+
+    pub fn clear_awaiting(&mut self) {
+        self.awaiting = None;
+    }
+
+    pub fn awaiting(&self) -> Option<&AwaitingBodies> {
+        self.awaiting.as_ref()
+    }
+
+    /// Hashes densify/getdata should still pull for an incomplete reorg.
+    pub fn need_getdata(&self) -> Vec<BlockHash> {
+        self.awaiting
+            .as_ref()
+            .map(|a| {
+                a.need
+                    .iter()
+                    .filter(|h| !self.held_bodies.contains_key(*h))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -205,7 +266,7 @@ pub fn apply_sibling_winning_path(
 }
 
 /// Try candidates in most-work order: first successful apply wins; failed paths
-/// are invalid-marked and skipped on subsequent ranks.
+/// are invalid-marked and **re-ranked** so a remaining valid heavier N can win.
 pub fn try_apply_best_candidate(
     hub: &ChainHub,
     bodies: &HashMap<BlockHash, Block>,
@@ -229,24 +290,40 @@ pub fn try_apply_best_candidate(
     if built.is_empty() {
         return Ok(None);
     }
-    let cands: Vec<WorkCandidate> = built.iter().map(|(c, _)| c.clone()).collect();
-    match rank_candidates(hub, &cands, &reorg.invalid)? {
-        SelectOutcome::IgnoreWeaker => Ok(None),
-        SelectOutcome::Switch { candidate_tip, .. } => {
-            let Some((_, blocks)) = built.iter().find(|(c, _)| c.tip == candidate_tip) else {
-                reorg.invalid.mark(candidate_tip);
-                return Ok(None);
-            };
-            match apply_reorg_branch(hub, blocks, reorg) {
-                Ok(o @ AcceptOutcome::Accepted { .. }) => Ok(Some(o)),
-                Ok(_) => {
+    // Bounded re-rank loop: each failed/ignored candidate is invalid-marked.
+    for _ in 0..built.len().saturating_add(1) {
+        let cands: Vec<WorkCandidate> = built
+            .iter()
+            .filter(|(c, _)| {
+                !reorg.invalid.contains(c.tip)
+                    && !c.apply_path.iter().any(|h| reorg.invalid.contains(*h))
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        if cands.is_empty() {
+            return Ok(None);
+        }
+        match rank_candidates(hub, &cands, &reorg.invalid)? {
+            SelectOutcome::IgnoreWeaker => return Ok(None),
+            SelectOutcome::Switch { candidate_tip, .. } => {
+                let Some((_, blocks)) = built.iter().find(|(c, _)| c.tip == candidate_tip) else {
                     reorg.invalid.mark(candidate_tip);
-                    Ok(None)
+                    continue;
+                };
+                match apply_reorg_branch(hub, blocks, reorg) {
+                    Ok(o @ AcceptOutcome::Accepted { .. }) => return Ok(Some(o)),
+                    Ok(_) => {
+                        reorg.invalid.mark(candidate_tip);
+                        // re-rank remaining
+                    }
+                    Err(_) => {
+                        // apply_reorg_branch already marked the path invalid
+                    }
                 }
-                Err(_) => Ok(None), // path marked invalid in apply_reorg_branch
             }
         }
     }
+    Ok(None)
 }
 
 /// Walk from `tip` via pending bodies until parent is on best chain.
@@ -618,6 +695,83 @@ mod tests {
             SelectOutcome::IgnoreWeaker
         );
         assert!(candidate_from_blocks(&hub, &[]).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Single try_apply call: heavy invalid M is marked then remaining valid N wins.
+    #[test]
+    fn try_apply_reranks_after_invalid_heavy_in_one_call() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        // L tip height 2.
+        let mut tip = gen;
+        for h in 1..=2u32 {
+            let b = mine(tip, 1_500_050_000 + h * 600, h);
+            tip = b.block_hash();
+            hub.accept_block(b).unwrap();
+        }
+        let l_tip = hub.tip_hash().unwrap();
+
+        // M: length 4 with bad mid block (heavier headers, invalid).
+        let mut m_blocks = Vec::new();
+        let mut p = gen;
+        for (i, h) in (1..=4u32).enumerate() {
+            let b = if i == 1 {
+                let bad_tx = Transaction {
+                    version: TxVersion::ONE,
+                    lock_time: LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: bitcoin::Txid::from_byte_array([0xee; 32]),
+                            vout: 0,
+                        },
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(1),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    }],
+                };
+                mine_extra(p, 1_500_051_000 + i as u32 * 600, h, vec![bad_tx])
+            } else {
+                mine(p, 1_500_051_000 + i as u32 * 600, h)
+            };
+            p = b.block_hash();
+            m_blocks.push(b);
+        }
+        // N: valid length 3 (heavier than L, lighter than M headers).
+        let mut n_blocks = Vec::new();
+        let mut p = gen;
+        for (i, h) in (1..=3u32).enumerate() {
+            let b = mine(p, 1_500_052_000 + i as u32 * 600, h);
+            p = b.block_hash();
+            n_blocks.push(b);
+        }
+        let mut bodies = HashMap::new();
+        for b in m_blocks.iter().chain(n_blocks.iter()) {
+            bodies.insert(b.block_hash(), b.clone());
+        }
+        let mut reorg = IbdReorgState::new();
+        let out = try_apply_best_candidate(
+            &hub,
+            &bodies,
+            &[
+                m_blocks.last().unwrap().block_hash(),
+                n_blocks.last().unwrap().block_hash(),
+            ],
+            &mut reorg,
+        )
+        .unwrap()
+        .expect("N must win after M invalid in one try_apply call");
+        assert!(matches!(out, AcceptOutcome::Accepted { height: 3 }));
+        assert_eq!(hub.tip_hash().unwrap(), n_blocks[2].block_hash());
+        assert_ne!(hub.tip_hash().unwrap(), l_tip);
+        assert!(reorg
+            .invalid
+            .contains(m_blocks[0].block_hash().to_byte_array()));
         let _ = std::fs::remove_dir_all(dir);
     }
 

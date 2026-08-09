@@ -359,12 +359,27 @@ pub(crate) fn apply_peer_event(
                 st.body.mark_missing(hash);
                 return;
             }
+            // Side-branch body at tip height (or any competing hash): hold by
+            // hash for most-work reorg. BQ is height first-wins and cannot store
+            // a same-height sibling of the confirmed tip.
+            let tip_hash = hub.tip_hash();
+            if height <= tip_h && tip_hash != Some(hash) {
+                if let Ok(block) = bitcoin::consensus::deserialize::<bitcoin::Block>(&payload) {
+                    st.reorg.hold_body(block);
+                    st.body.mark_pending(hash);
+                    if try_complete_awaiting_reorg(st, hub) {
+                        return;
+                    }
+                }
+            }
             // Already have wire for this height — keep first copy only.
             if hub.query.block_queue_has_height(height) {
                 st.body.mark_pending(hash);
                 if let Some(feed) = confirm_feed {
                     feed.note(height, hash);
                 }
+                // Still may complete reorg if this hash filled awaiting need via hold.
+                let _ = try_complete_awaiting_reorg(st, hub);
                 return;
             }
             let raw = hash.to_byte_array();
@@ -372,7 +387,10 @@ pub(crate) fn apply_peer_event(
                 .query
                 .block_queue_offer(height, raw, header_fk.0, &payload)
             {
-                Ok(_offer) => {}
+                Ok(_offer) => {
+                    // Tip+1 wire may unlock awaiting reorg once winner is held.
+                    let _ = try_complete_awaiting_reorg(st, hub);
+                }
                 Err(e) => {
                     rbitcoin_log::warn!("ibd: body queue offer failed ({e}) h={height}");
                     st.body.mark_missing(hash);
@@ -551,6 +569,28 @@ pub(crate) fn apply_confirm_reject(
     }
 }
 
+/// Load a full block for `hash` from reorg held map, Class A, or BQ-by-hash.
+fn load_reorg_body(
+    st: &IbdWorkState,
+    hub: &crate::chain::ChainHub,
+    hash: BlockHash,
+) -> Option<bitcoin::Block> {
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash as _;
+    if let Some(b) = st.reorg.get_held(&hash) {
+        return Some(b);
+    }
+    if let Ok(Some(b)) = hub.query.reconstruct_block_by_hash(&hash.to_byte_array()) {
+        return Some(b);
+    }
+    if let Ok(Some(wire)) = hub.query.block_queue_payload_by_hash(&hash.to_byte_array()) {
+        if let Ok(b) = deserialize::<bitcoin::Block>(&wire) {
+            return Some(b);
+        }
+    }
+    None
+}
+
 /// On BadPrev, if the rejected body's prev is a known competing header, try
 /// most-work reorg onto `[winning_prev, rejected_body, …]`. Returns true if
 /// tip moved (caller should not soft-reget).
@@ -563,29 +603,24 @@ fn try_reorg_on_bad_prev(
     use super::reorg::{apply_sibling_winning_path, classify_bad_prev, BadPrevClass};
     use crate::chain::AcceptOutcome;
     use bitcoin::consensus::deserialize;
-    use bitcoin::hashes::Hash as _;
     use rbitcoin_log::info;
 
     let Some(tip) = hub.tip_hash() else {
         return false;
     };
-    // Prefer live body from BQ (peek, no dequeue yet); else Class A reconstruct.
-    let body = hub
+    // Ext body: BQ at reject height, held map, Class A, or BQ-by-hash.
+    let ext = hub
         .query
         .block_queue_payload(height)
         .ok()
         .flatten()
         .and_then(|wire| deserialize::<bitcoin::Block>(&wire).ok())
-        .or_else(|| {
-            hub.query
-                .reconstruct_block_by_hash(&hash.to_byte_array())
-                .ok()
-                .flatten()
-        });
-    let Some(ext) = body else {
-        // Bodies not ready — soft re-get will re-offer.
+        .or_else(|| load_reorg_body(st, hub, hash));
+    let Some(ext) = ext else {
         return false;
     };
+    // Always hold tip+1 for gather retries (BQ height slot is fragile under soft-reget).
+    st.reorg.hold_body(ext.clone());
     let wire_prev = ext.header.prev_blockhash;
     match classify_bad_prev(hub, wire_prev, tip) {
         BadPrevClass::CorruptWire { .. } => false,
@@ -596,17 +631,27 @@ fn try_reorg_on_bad_prev(
             info!(
                 "ibd: BadPrev competing path @{height}: tip={losing_tip} wire_prev={winning_prev} — trying most-work reorg"
             );
-            let winning = hub
-                .query
-                .reconstruct_block_by_hash(&winning_prev.to_byte_array())
-                .ok()
-                .flatten();
-            let Some(win_block) = winning else {
+            let win_block = load_reorg_body(st, hub, winning_prev);
+            let Some(win_block) = win_block else {
+                // Same-height competitor is rarely Class A (confirm archives tip path
+                // only) and cannot share the tip height BQ slot. Hold ext, densify
+                // the winner by hash, complete reorg when its body arrives.
+                st.reorg.set_awaiting(ext.clone(), vec![winning_prev]);
+                st.body.mark_missing(winning_prev);
+                if st.ordered_set.insert(winning_prev) {
+                    st.ordered.push_front(winning_prev);
+                }
+                // Map winner at tip height for assign band walk without overwriting
+                // tip's height_to_hash entry used by confirm (tip stays mapped).
+                let tip_h = hub.tip_height().unwrap_or(0);
+                st.hash_height.insert(winning_prev, tip_h);
+                st.known_headers.insert(winning_prev);
                 warn!(
-                    "ibd: competing reorg needs body for winning prev {winning_prev}; soft-reget ext"
+                    "ibd: competing reorg awaiting body for winning prev {winning_prev} (held tip+1 {hash})"
                 );
                 return false;
             };
+            st.reorg.hold_body(win_block.clone());
             match apply_sibling_winning_path(hub, win_block, &[ext], &mut st.reorg) {
                 Ok(AcceptOutcome::Accepted { height: new_h }) => {
                     info!("ibd: most-work reorg after BadPrev → tip_h={new_h}");
@@ -615,6 +660,7 @@ fn try_reorg_on_bad_prev(
                     st.body.mark_archived(hash);
                     st.body.mark_archived(winning_prev);
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, losing_tip);
+                    st.reorg.clear_awaiting();
                     true
                 }
                 Ok(other) => {
@@ -626,6 +672,60 @@ fn try_reorg_on_bad_prev(
                     false
                 }
             }
+        }
+    }
+}
+
+/// After a side-branch body is held, try to finish an awaiting reorg.
+fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
+    use super::reorg::apply_sibling_winning_path;
+    use crate::chain::AcceptOutcome;
+    use rbitcoin_log::info;
+
+    let Some(awaiting) = st.reorg.awaiting().cloned() else {
+        return false;
+    };
+    let mut missing = Vec::new();
+    let mut wins = Vec::new();
+    for h in &awaiting.need {
+        if let Some(b) = load_reorg_body(st, hub, *h) {
+            st.reorg.hold_body(b.clone());
+            wins.push(b);
+        } else {
+            missing.push(*h);
+        }
+    }
+    if !missing.is_empty() {
+        st.reorg.set_awaiting(awaiting.held_tip, missing);
+        return false;
+    }
+    // Sibling path: first need is winning prev at tip height; held_tip is tip+1.
+    let Some(win_block) = wins.into_iter().next() else {
+        return false;
+    };
+    let ext = awaiting.held_tip;
+    let losing = hub.tip_hash();
+    match apply_sibling_winning_path(hub, win_block.clone(), &[ext.clone()], &mut st.reorg) {
+        Ok(AcceptOutcome::Accepted { height: new_h }) => {
+            info!("ibd: most-work reorg completed after body gather → tip_h={new_h}");
+            let tip_h = hub.tip_height().unwrap_or(0);
+            let _ = hub.query.block_queue_dequeue_height(tip_h);
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, ext.block_hash());
+            st.body.mark_archived(ext.block_hash());
+            st.body.mark_archived(win_block.block_hash());
+            if let Some(l) = losing {
+                remove_from_ordered(&mut st.ordered, &mut st.ordered_set, l);
+            }
+            st.reorg.clear_awaiting();
+            true
+        }
+        Ok(other) => {
+            warn!("ibd: awaiting reorg not applied: {other:?}");
+            false
+        }
+        Err(e) => {
+            warn!("ibd: awaiting reorg failed: {e}");
+            false
         }
     }
 }
@@ -942,6 +1042,8 @@ mod confirm_reject_tests {
         hub.ensure_header(&win.header).unwrap();
         let ext = mine(win.block_hash(), 1_300_000_300, 2);
         hub.ensure_header(&ext.header).unwrap();
+        // Winning sibling body held by hash (cannot share tip height BQ slot).
+        // Ext body on BQ at tip+1 — the real BadPrev wire shape.
         let wire = serialize(&ext);
         hub.query
             .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &wire)
@@ -950,6 +1052,11 @@ mod confirm_reject_tests {
         let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
         st.ordered.push_back(ext.block_hash());
         st.ordered_set.insert(ext.block_hash());
+        // Side body arrives as BlockFramed would: hold by hash before reject.
+        st.reorg.hold_body(win.clone());
+        let pre_tip = hub.tip_hash().unwrap();
+        assert_eq!(pre_tip, lose.block_hash());
+        // Sole entry: shipped apply_confirm_reject must reorg tip onto ext.
         apply_confirm_reject(
             &mut st,
             2,
@@ -958,18 +1065,18 @@ mod confirm_reject_tests {
             Some(hub.query.as_ref()),
             Some(&hub),
         );
-        // Competing path classified; without Class A for winner soft-regets.
+        assert_eq!(
+            hub.tip_height(),
+            Some(2),
+            "apply_confirm_reject alone must reorg when winner body is held"
+        );
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            ext.block_hash(),
+            "tip must be winning path tip+1 after BadPrev reorg"
+        );
+        assert_ne!(hub.tip_hash().unwrap(), pre_tip);
         assert!(!st.body.is_rejected(&ext.block_hash()));
-        // Full apply (shipped sibling path).
-        let mut reorg = super::super::reorg::IbdReorgState::new();
-        let out =
-            super::super::reorg::apply_sibling_winning_path(&hub, win, &[ext.clone()], &mut reorg)
-                .unwrap();
-        assert!(matches!(
-            out,
-            crate::chain::AcceptOutcome::Accepted { height: 2 }
-        ));
-        assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
         let _ = std::fs::remove_dir_all(dir);
     }
 

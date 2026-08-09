@@ -1765,22 +1765,32 @@ impl Query {
             if kids.is_empty() {
                 break;
             }
-            // Prefer a child that already has a Class A body; among ties, highest fk
-            // (later archive / main-chain append order).
-            let mut best: Option<(Fk, [u8; 32], bool)> = None;
+            // Prefer the child that heads the heaviest header subtree (most-work
+            // path). Body presence only breaks ties; then higher fk.
+            // (Old body-first order re-elected archived losing forks after reorg.)
+            let mut best: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
             for &(fk, hash) in kids {
                 let has_body = self.store.header_txs.has_body(fk)?;
+                let (sub_work, depth) = Self::resume_subtree_score(&self.store, &children, fk)?;
                 let take = match best {
                     None => true,
-                    Some((best_fk, _, best_body)) => {
-                        (has_body && !best_body) || (has_body == best_body && fk.0 > best_fk.0)
+                    Some((best_fk, _, best_body, best_w, best_d)) => {
+                        if sub_work != best_w {
+                            sub_work > best_w
+                        } else if depth != best_d {
+                            depth > best_d
+                        } else if has_body != best_body {
+                            has_body && !best_body
+                        } else {
+                            fk.0 > best_fk.0
+                        }
                     }
                 };
                 if take {
-                    best = Some((fk, hash, has_body));
+                    best = Some((fk, hash, has_body, sub_work, depth));
                 }
             }
-            let Some((fk, hash, has_body)) = best else {
+            let Some((fk, hash, has_body, _, _)) = best else {
                 break;
             };
             height = height.saturating_add(1);
@@ -1793,6 +1803,36 @@ impl Query {
             cur_fk = fk;
         }
         Ok(out)
+    }
+
+    /// Max path work and depth under `root` (including root header work).
+    ///
+    /// Used by [`Self::resume_work_path_after_tip`] to prefer most-work children
+    /// over body-only archived losers.
+    fn resume_subtree_score(
+        store: &rbitcoin_store::Store,
+        children: &U64Map<Vec<(Fk, [u8; 32])>>,
+        root: Fk,
+    ) -> Result<(bitcoin::Work, u32), QueryError> {
+        use bitcoin::{CompactTarget, Target};
+        let rec = store.get_header(root)?;
+        let own = Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work();
+        let Some(kids) = children.get(&root.0) else {
+            return Ok((own, 1));
+        };
+        if kids.is_empty() {
+            return Ok((own, 1));
+        }
+        let mut best_child_w = bitcoin::Work::from_be_bytes([0u8; 32]);
+        let mut best_depth = 0u32;
+        for &(fk, _) in kids {
+            let (w, d) = Self::resume_subtree_score(store, children, fk)?;
+            if w > best_child_w || (w == best_child_w && d > best_depth) {
+                best_child_w = w;
+                best_depth = d;
+            }
+        }
+        Ok((own + best_child_w, best_depth.saturating_add(1)))
     }
 
     /// Flush header rows + Class A body associations (IBD writer durability).
@@ -2890,5 +2930,52 @@ mod tests {
         assert!(recs2.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resume must prefer deeper/more-work header lineage over a short loser
+    /// that already has a Class A body (shipped `resume_work_path_after_tip`).
+    #[test]
+    fn resume_work_path_prefers_most_work_over_body() {
+        let (dir, q) = temp_query("resume-most-work");
+        let (g, tg) = coinbase_block(0, Fk::NULL, None);
+        let gfk = q.put_header(&g).unwrap();
+        let _ = q.archive_block(&g, &[tg]).unwrap();
+        // Loser: single child with body.
+        let (lose, tl) = coinbase_block(1, gfk, Some(g.hash));
+        let _ = q.put_header(&lose).unwrap();
+        let _ = q.archive_block(&lose, &[tl]).unwrap();
+        // Winner: two-header chain, no Class A bodies.
+        let mut w1 = coinbase_block(11, gfk, Some(g.hash)).0;
+        if w1.hash == lose.hash {
+            w1.nonce = w1.nonce.wrapping_add(7);
+            w1.hash = rbitcoin_store::block_header_hash(
+                w1.version,
+                &g.hash,
+                &w1.merkle_root,
+                w1.timestamp,
+                w1.bits,
+                w1.nonce,
+            );
+        }
+        let w1fk = q.put_header(&w1).unwrap();
+        let (w2, _) = coinbase_block(12, w1fk, Some(w1.hash));
+        let _ = q.put_header(&w2).unwrap();
+
+        let path = q.resume_work_path_after_tip(g.hash, 0, 8).unwrap();
+        assert!(!path.is_empty(), "resume must pick a child of genesis");
+        assert_eq!(
+            path[0].hash,
+            w1.hash,
+            "prefer deeper/more-work child over body-only loser; path={:?}",
+            path.iter()
+                .map(|e| (e.hash, e.has_body))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            path.len() >= 2 && path[1].hash == w2.hash,
+            "must follow winner chain: {path:?}"
+        );
+        assert!(!path[0].has_body, "winner first hop may lack body");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

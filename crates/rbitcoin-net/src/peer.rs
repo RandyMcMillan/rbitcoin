@@ -55,7 +55,14 @@ const MAX_PENDING_CMPCT: usize = 8;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
 /// Cap on full blocks waiting for in-order tip accept (DoS / process RAM).
-const MAX_PENDING_BLOCKS: usize = 64;
+///
+/// Must be ≥99 so tip-follow can assemble a 99-block competing branch for
+/// most-work reorg (see `docs/design-ibd-most-work-reorg.md`).
+const MAX_PENDING_BLOCKS: usize = 128;
+
+/// Test/assert surface for the tip-follow pending-body cap (equals production).
+#[cfg(test)]
+pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
@@ -908,27 +915,22 @@ fn try_reorg_from_pending(
             }
         }
     }
+    // Assemble each fork; try **max-work** branch first (header work = length on
+    // equal-bits regtest / mainnet segments with similar bits).
+    let mut branches: Vec<Vec<bitcoin::Block>> = Vec::new();
     for start in fork_starts {
-        let mut branch = Vec::new();
-        let mut cur = start;
-        loop {
-            let Some(b) = pending_blocks.get(&cur) else {
-                break;
-            };
-            branch.push(b.clone());
-            // find child in pending
-            let next = pending_blocks
-                .iter()
-                .find(|(_, blk)| blk.header.prev_blockhash == cur)
-                .map(|(h, _)| *h);
-            match next {
-                Some(n) => cur = n,
-                None => break,
+        if let Some(branch) = assemble_pending_branch(pending_blocks, start) {
+            if !branch.is_empty() {
+                branches.push(branch);
             }
         }
-        if branch.is_empty() {
-            continue;
-        }
+    }
+    branches.sort_by(|a, b| {
+        let wa = crate::most_work::sum_work(a.iter().map(|blk| blk.header.work()));
+        let wb = crate::most_work::sum_work(b.iter().map(|blk| blk.header.work()));
+        wb.cmp(&wa)
+    });
+    for branch in branches {
         match hub.accept_branch(&branch) {
             Ok(AcceptOutcome::Accepted { .. }) => {
                 for b in &branch {
@@ -941,6 +943,32 @@ fn try_reorg_from_pending(
         }
     }
     Ok(())
+}
+
+/// Walk pending map from a fork-start hash following one child at a time.
+fn assemble_pending_branch(
+    pending_blocks: &HashMap<BlockHash, bitcoin::Block>,
+    start: BlockHash,
+) -> Option<Vec<bitcoin::Block>> {
+    let mut branch = Vec::new();
+    let mut cur = start;
+    loop {
+        let b = pending_blocks.get(&cur)?;
+        branch.push(b.clone());
+        let next = pending_blocks
+            .iter()
+            .find(|(_, blk)| blk.header.prev_blockhash == cur)
+            .map(|(h, _)| *h);
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+        // DoS: do not assemble past the pending-body cap.
+        if branch.len() >= MAX_PENDING_BLOCKS {
+            break;
+        }
+    }
+    Some(branch)
 }
 
 fn headers_for_peer(
@@ -1990,6 +2018,101 @@ mod tests {
         let recon = apply_cmpct_blocktxn(&hub, &pc, &bt).expect("blocktxn fill");
         assert_eq!(recon.txdata.len(), 2);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tip-follow pending reorg: max-work fork assembled and applied via shipped path.
+    #[test]
+    fn try_reorg_from_pending_picks_max_work_branch() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let (dir, q) = tmp_store("pending-reorg");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: BlockVersion::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+
+        // Main tip height 2 (times near genesis MTP window).
+        let b1 = mine(gen, 1_300_000_100, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        let b2 = mine(b1.block_hash(), 1_300_000_200, 2);
+        hub.accept_block(b2.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(2));
+
+        // Pending: short side from gen (1 block) + long side from gen (4 blocks).
+        let short = mine(gen, 1_300_001_000, 1);
+        let mut long = Vec::new();
+        let mut p = gen;
+        for (i, h) in (1..=4u32).enumerate() {
+            let b = mine(p, 1_300_002_000 + i as u32 * 600, h);
+            p = b.block_hash();
+            long.push(b);
+        }
+        let mut pb = HashMap::new();
+        pb.insert(short.block_hash(), short);
+        for b in &long {
+            pb.insert(b.block_hash(), b.clone());
+        }
+        let mut ph = HashMap::new();
+        assert!(MAX_PENDING_BLOCKS_FOR_TEST >= 128);
+        try_reorg_from_pending(&hub, &mut pb, &mut ph).unwrap();
+        assert_eq!(
+            hub.tip_height(),
+            Some(4),
+            "must reorg onto longer pending branch"
+        );
+        assert_eq!(hub.tip_hash().unwrap(), long[3].block_hash());
+        // Winning branch removed from pending.
+        assert!(!pb.contains_key(&long[3].block_hash()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

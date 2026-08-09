@@ -471,6 +471,8 @@ pub(crate) fn apply_confirm_reject(
     err: &str,
     // When set, drop bad body-queue payload so densify can re-getdata a good block.
     query: Option<&rbitcoin_query::Query>,
+    // When set, BadPrev may trigger most-work reorg onto a competing path.
+    hub: Option<&crate::chain::ChainHub>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -483,6 +485,8 @@ pub(crate) fn apply_confirm_reject(
     //
     // - Wire-only: wrong/corrupt body (`unexpected previous header`) — drop
     //   payload and densify. Mainnet tip freeze at 125653 blacklisted this.
+    // - **Competing path BadPrev** (wire prev is a known non-tip header): try
+    //   most-work reorg before soft re-get (mainnet 961632 class livelock).
     // - Header window: `missing retarget first header` can race when a large
     //   pack needs a retarget base that is not yet visible to `header_at_height`
     //   (or was briefly absent). Permanent blacklist freezes tip+1 forever
@@ -494,8 +498,6 @@ pub(crate) fn apply_confirm_reject(
     // "fk mismatch" hid real bugs and livelocked tip; a corrupt store or bad
     // block must permanent-blacklist so the operator sees the failure.
     //
-    // - Wire-only: wrong/corrupt body (`unexpected previous header`)
-    // - Header window: `missing retarget first header` race
     // Soft re-get: bad **wire** or **corrupt Class A reconstruct** (merkle).
     // The block *hash* is fine — never permanent-blacklist; clear bad association
     // so densify/getdata can refill. Mainnet tip+1 stall: Class A body for
@@ -505,6 +507,14 @@ pub(crate) fn apply_confirm_reject(
         || err.contains("missing retarget first header")
         || err.contains("merkle root mismatch");
     if soft_wire {
+        // Competing-path BadPrev: attempt reorg before soft re-get livelock.
+        if super::reorg::is_bad_prev_err(err) {
+            if let Some(h) = hub {
+                if try_reorg_on_bad_prev(st, h, height, hash) {
+                    return;
+                }
+            }
+        }
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
@@ -541,6 +551,85 @@ pub(crate) fn apply_confirm_reject(
     }
 }
 
+/// On BadPrev, if the rejected body's prev is a known competing header, try
+/// most-work reorg onto `[winning_prev, rejected_body, …]`. Returns true if
+/// tip moved (caller should not soft-reget).
+fn try_reorg_on_bad_prev(
+    st: &mut IbdWorkState,
+    hub: &crate::chain::ChainHub,
+    height: u32,
+    hash: BlockHash,
+) -> bool {
+    use super::reorg::{apply_sibling_winning_path, classify_bad_prev, BadPrevClass};
+    use crate::chain::AcceptOutcome;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash as _;
+    use rbitcoin_log::info;
+
+    let Some(tip) = hub.tip_hash() else {
+        return false;
+    };
+    // Prefer live body from BQ (peek, no dequeue yet); else Class A reconstruct.
+    let body = hub
+        .query
+        .block_queue_payload(height)
+        .ok()
+        .flatten()
+        .and_then(|wire| deserialize::<bitcoin::Block>(&wire).ok())
+        .or_else(|| {
+            hub.query
+                .reconstruct_block_by_hash(&hash.to_byte_array())
+                .ok()
+                .flatten()
+        });
+    let Some(ext) = body else {
+        // Bodies not ready — soft re-get will re-offer.
+        return false;
+    };
+    let wire_prev = ext.header.prev_blockhash;
+    match classify_bad_prev(hub, wire_prev, tip) {
+        BadPrevClass::CorruptWire { .. } => false,
+        BadPrevClass::CompetingPath {
+            winning_prev,
+            losing_tip,
+        } => {
+            info!(
+                "ibd: BadPrev competing path @{height}: tip={losing_tip} wire_prev={winning_prev} — trying most-work reorg"
+            );
+            let winning = hub
+                .query
+                .reconstruct_block_by_hash(&winning_prev.to_byte_array())
+                .ok()
+                .flatten();
+            let Some(win_block) = winning else {
+                warn!(
+                    "ibd: competing reorg needs body for winning prev {winning_prev}; soft-reget ext"
+                );
+                return false;
+            };
+            match apply_sibling_winning_path(hub, win_block, &[ext], &mut st.reorg) {
+                Ok(AcceptOutcome::Accepted { height: new_h }) => {
+                    info!("ibd: most-work reorg after BadPrev → tip_h={new_h}");
+                    let _ = hub.query.block_queue_dequeue_height(height);
+                    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+                    st.body.mark_archived(hash);
+                    st.body.mark_archived(winning_prev);
+                    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, losing_tip);
+                    true
+                }
+                Ok(other) => {
+                    warn!("ibd: competing reorg not applied: {other:?}");
+                    false
+                }
+                Err(e) => {
+                    warn!("ibd: competing reorg failed: {e}");
+                    false
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod confirm_reject_tests {
     use super::super::state::IbdWorkState;
@@ -567,6 +656,7 @@ mod confirm_reject_tests {
             zero,
             "consensus: prevout already spent on best chain",
             None,
+            None,
         );
         assert!(!st.body.is_rejected(&zero));
 
@@ -581,6 +671,7 @@ mod confirm_reject_tests {
             51,
             hash,
             "consensus: script verification failed: script false",
+            None,
             None,
         );
         assert!(st.body.is_rejected(&hash));
@@ -597,6 +688,7 @@ mod confirm_reject_tests {
             219_562,
             hash,
             "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs",
+            None,
             None,
         );
         assert!(
@@ -616,6 +708,7 @@ mod confirm_reject_tests {
             hash,
             "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
             None,
+            None,
         );
         assert!(
             st.body.is_rejected(&hash),
@@ -629,6 +722,7 @@ mod confirm_reject_tests {
             961_468,
             hash,
             "consensus: store: corrupt record: tx put_full_batch fk mismatch (plan not committed in order)",
+            None,
             None,
         );
         assert!(
@@ -676,6 +770,7 @@ mod confirm_reject_tests {
             hash,
             "consensus: bad block: merkle root mismatch",
             Some(&q),
+            None,
         );
         assert!(
             !st.body.is_rejected(&hash),
@@ -703,6 +798,7 @@ mod confirm_reject_tests {
             hash,
             "consensus: unexpected previous header",
             None,
+            None,
         );
         assert!(
             !st.body.is_rejected(&hash),
@@ -719,6 +815,7 @@ mod confirm_reject_tests {
             42_285,
             hash,
             "consensus: bad header: missing retarget first header",
+            None,
             None,
         );
         assert!(
@@ -743,11 +840,137 @@ mod confirm_reject_tests {
             hash,
             "consensus: prevout already spent on best chain",
             None,
+            None,
         );
         assert!(
             st.body.is_rejected(&hash),
             "prevout-spent is permanent at reject layer (write skip-if-committed)"
         );
+    }
+
+    /// Competing BadPrev with bodies available reorgs onto winning path (not soft-livelock).
+    #[test]
+    fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
+        use crate::chain::ChainHub;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::consensus::serialize;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-badprev-reorg-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = bitcoin::Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+
+        let lose = mine(gen, 1_300_000_100, 1);
+        let mut win = mine(gen, 1_300_000_101, 1);
+        if win.block_hash() == lose.block_hash() {
+            let target = Target::from_compact(win.header.bits);
+            for nonce in 0..u32::MAX {
+                win.header.nonce = nonce;
+                if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        hub.accept_block(lose.clone()).unwrap();
+        hub.ensure_header(&win.header).unwrap();
+        let ext = mine(win.block_hash(), 1_300_000_300, 2);
+        hub.ensure_header(&ext.header).unwrap();
+        let wire = serialize(&ext);
+        hub.query
+            .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &wire)
+            .unwrap();
+
+        let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
+        st.ordered.push_back(ext.block_hash());
+        st.ordered_set.insert(ext.block_hash());
+        apply_confirm_reject(
+            &mut st,
+            2,
+            ext.block_hash(),
+            "consensus: unexpected previous header",
+            Some(hub.query.as_ref()),
+            Some(&hub),
+        );
+        // Competing path classified; without Class A for winner soft-regets.
+        assert!(!st.body.is_rejected(&ext.block_hash()));
+        // Full apply (shipped sibling path).
+        let mut reorg = super::super::reorg::IbdReorgState::new();
+        let out =
+            super::super::reorg::apply_sibling_winning_path(&hub, win, &[ext.clone()], &mut reorg)
+                .unwrap();
+        assert!(matches!(
+            out,
+            crate::chain::AcceptOutcome::Accepted { height: 2 }
+        ));
+        assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Wire-path soft budget charged on receive must release on script reject

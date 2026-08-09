@@ -23,8 +23,8 @@ pub use ibd::{
     ibd, ibd_cancellable, IbdConfig, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
 pub use most_work::{
-    first_best_ancestor, lca_on_best_chain, path_hashes_from_ancestor, sum_work,
-    sum_work_for_hashes, work_better,
+    first_best_ancestor, lca_on_best_chain, path_hashes_from_ancestor, select_most_work, sum_work,
+    sum_work_for_hashes, work_better, InvalidHashSet, SelectOutcome, WorkCandidate,
 };
 pub use peer::local_service_flags;
 pub use peer_dos::{

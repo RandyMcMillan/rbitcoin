@@ -645,6 +645,20 @@ impl ChainHub {
             return Ok(AcceptOutcome::IgnoredWeaker);
         }
 
+        // Snapshot old tip path for restore if connect fails mid-branch.
+        let tip_h = self.tip_height().unwrap_or(0);
+        let mut old_path: Vec<Block> = Vec::new();
+        if let Some(fh) = fork_height {
+            if tip_h > fh {
+                old_path.reserve((tip_h - fh) as usize);
+                for h in (fh + 1)..=tip_h {
+                    if let Some(b) = self.block_at_height(h)? {
+                        old_path.push(b);
+                    }
+                }
+            }
+        }
+
         // Reorg: disconnect down to fork, then connect branch.
         if let Some(fh) = fork_height {
             self.disconnect_to(fh)?;
@@ -663,7 +677,24 @@ impl ChainHub {
 
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
         for (i, b) in blocks.iter().enumerate() {
-            self.connect_at(base + i as u32, b.clone())?;
+            if let Err(e) = self.connect_at(base + i as u32, b.clone()) {
+                // Mid-branch connect fail: restore pre-attempt tip (not leave LCA).
+                if let Some(fh) = fork_height {
+                    if let Err(disc) = self.disconnect_to(fh) {
+                        return Err(NetError::Consensus(format!(
+                            "reorg connect failed ({e}); disconnect for restore failed: {disc}"
+                        )));
+                    }
+                    for (j, ob) in old_path.iter().enumerate() {
+                        if let Err(re) = self.connect_at(base + j as u32, ob.clone()) {
+                            return Err(NetError::Consensus(format!(
+                                "reorg connect failed ({e}); tip restore failed: {re}"
+                            )));
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
         let height = base + (blocks.len() as u32) - 1;
         Ok(AcceptOutcome::Accepted { height })
@@ -1510,6 +1541,226 @@ mod tests {
         // confirm_script_phase empty need after already confirmed.
         assert!(hub.confirm_script_phase(&[(1, h1)]).unwrap().is_none());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Mine a coinbase-only block with optional extra txs (for invalid mid-branch).
+    fn mine_with_extra(prev: BlockHash, time: u32, height: u32, extra: Vec<Transaction>) -> Block {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time,
+            bits,
+            nonce: 0,
+        };
+        let mut txdata = vec![coinbase(height)];
+        txdata.extend(extra);
+        let mut block = Block { header, txdata };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    /// Journey: deep most-work reorg (≥16), weaker ignored, mid-branch invalid
+    /// restores pre-attempt tip (shipped `accept_branch`).
+    #[test]
+    fn most_work_reorg_depth16_and_invalid_mid_branch_restores_tip() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let mut tip = gen;
+        let time = 1_400_000_000u32;
+        // Best chain height 0..=8. Fork at height 2: main continues to 8.
+        for h in 1..=8u32 {
+            let b = mine(tip, time + h * 600, h);
+            tip = b.block_hash();
+            hub.accept_block(b).unwrap();
+        }
+        assert_eq!(hub.tip_height(), Some(8));
+        let main_tip = hub.tip_hash().unwrap();
+
+        // Fork parent at height 2.
+        let fork_parent = hub
+            .query
+            .header_at_height(Height(2))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash;
+        let fork_prev = BlockHash::from_byte_array(fork_parent);
+        let fork_time = hub
+            .query
+            .header_at_height(Height(2))
+            .unwrap()
+            .unwrap()
+            .1
+            .timestamp;
+
+        // Competing branch depth 16 from height 3..=18 (16 blocks) → more work.
+        let mut branch = Vec::new();
+        let mut p = fork_prev;
+        let mut t = fork_time;
+        for (i, h) in (3..=18u32).enumerate() {
+            let b = mine(p, t + 601 + i as u32, h);
+            p = b.block_hash();
+            t = b.header.time;
+            branch.push(b);
+        }
+        assert_eq!(branch.len(), 16);
+        let out = hub.accept_branch(&branch).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 18 }),
+            "depth-16 reorg must accept, got {out:?}"
+        );
+        assert_eq!(hub.tip_height(), Some(18));
+        assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
+        assert_ne!(hub.tip_hash().unwrap(), main_tip);
+
+        // Weaker shorter branch from height 17 → IgnoredWeaker.
+        let weak = mine(hub.tip_hash().unwrap(), t + 10, 19); // extends tip — Accepted
+        let _ = weak;
+        let weak_side = mine(fork_prev, t + 9000, 3);
+        let weak_out = hub.accept_branch(&[weak_side]).unwrap();
+        assert!(
+            matches!(weak_out, AcceptOutcome::IgnoredWeaker),
+            "short side from old LCA must be weaker: {weak_out:?}"
+        );
+        assert_eq!(hub.tip_height(), Some(18));
+
+        // Mid-branch invalid: longer path from height 10 with a bad spend in the middle.
+        let pre_tip = hub.tip_hash().unwrap();
+        let pre_h = hub.tip_height().unwrap();
+        let fork2 = hub
+            .query
+            .header_at_height(Height(10))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash;
+        let fork2_prev = BlockHash::from_byte_array(fork2);
+        let fork2_time = hub
+            .query
+            .header_at_height(Height(10))
+            .unwrap()
+            .unwrap()
+            .1
+            .timestamp;
+
+        // Path length 10 (> remaining 8 on main from 11..=18) so work_better.
+        let mut bad_branch = Vec::new();
+        let mut p = fork2_prev;
+        let mut t = fork2_time;
+        for (i, h) in (11..=20u32).enumerate() {
+            let b = if i == 2 {
+                // Height 13: spend a non-existent prevout → connect fails.
+                let bad_tx = Transaction {
+                    version: TxVersion::ONE,
+                    lock_time: LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: bitcoin::Txid::from_byte_array([0xee; 32]),
+                            vout: 0,
+                        },
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(1),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    }],
+                };
+                mine_with_extra(p, t + 701 + i as u32, h, vec![bad_tx])
+            } else {
+                mine(p, t + 701 + i as u32, h)
+            };
+            p = b.block_hash();
+            t = b.header.time;
+            bad_branch.push(b);
+        }
+        assert_eq!(bad_branch.len(), 10);
+        let err = hub
+            .accept_branch(&bad_branch)
+            .expect_err("invalid mid-branch must fail connect");
+        assert!(
+            matches!(err, NetError::Consensus(_)),
+            "expected consensus fail, got {err}"
+        );
+        // Tip restored to pre-attempt.
+        assert_eq!(
+            hub.tip_height(),
+            Some(pre_h),
+            "tip height must restore after failed reorg"
+        );
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            pre_tip,
+            "tip hash must equal pre-attempt tip after mid-branch invalid"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tip-follow capacity: 99-block competing branch via shipped `accept_branch`.
+    #[test]
+    fn most_work_reorg_depth99_tip_follow_capacity() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let mut tip = gen;
+        let time = 1_600_000_000u32;
+        // Main chain tip at height 10.
+        for h in 1..=10u32 {
+            let b = mine(tip, time + h * 600, h);
+            tip = b.block_hash();
+            hub.accept_block(b).unwrap();
+        }
+        assert_eq!(hub.tip_height(), Some(10));
+        let fork_parent = hub
+            .query
+            .header_at_height(Height(1))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash;
+        let fork_prev = BlockHash::from_byte_array(fork_parent);
+        let fork_time = hub
+            .query
+            .header_at_height(Height(1))
+            .unwrap()
+            .unwrap()
+            .1
+            .timestamp;
+        // 99 blocks after height 1 → tip height 100.
+        let mut branch = Vec::with_capacity(99);
+        let mut p = fork_prev;
+        let mut t = fork_time;
+        for (i, h) in (2..=100u32).enumerate() {
+            let b = mine(p, t + 601 + i as u32, h);
+            p = b.block_hash();
+            t = b.header.time;
+            branch.push(b);
+        }
+        assert_eq!(branch.len(), 99);
+        assert!(
+            crate::peer::MAX_PENDING_BLOCKS_FOR_TEST >= 99,
+            "pending cap must allow 99-block reorg assembly"
+        );
+        let out = hub.accept_branch(&branch).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 100 }),
+            "99-block reorg must accept, got {out:?}"
+        );
+        assert_eq!(hub.tip_height(), Some(100));
+        assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

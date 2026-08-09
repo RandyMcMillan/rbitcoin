@@ -23,8 +23,11 @@ mod path;
 mod peer_io;
 mod perf_log;
 mod progress;
+mod reorg;
 mod state;
 mod status;
+
+// reorg module used by events/state; public surface via crate::most_work + tests.
 
 use archive::{
     rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue, ArchiveQueueBudget,
@@ -476,7 +479,14 @@ pub async fn ibd_cancellable(
                     st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(&mut st, height, hash, &err, Some(hub.query.as_ref()));
+                    apply_confirm_reject(
+                        &mut st,
+                        height,
+                        hash,
+                        &err,
+                        Some(hub.query.as_ref()),
+                        Some(hub.as_ref()),
+                    );
                 }
             }
         }
@@ -575,7 +585,14 @@ pub async fn ibd_cancellable(
                     st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(&mut st, height, hash, &err, Some(hub.query.as_ref()));
+                    apply_confirm_reject(
+                        &mut st,
+                        height,
+                        hash,
+                        &err,
+                        Some(hub.query.as_ref()),
+                        Some(hub.as_ref()),
+                    );
                 }
             }
         }
@@ -1132,6 +1149,7 @@ pub async fn ibd_cancellable(
                         hash,
                         &err,
                         Some(hub.query.as_ref()),
+                        Some(hub.as_ref()),
                     );
                         }
                     }

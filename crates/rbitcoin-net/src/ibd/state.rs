@@ -10,6 +10,7 @@
 
 use super::assign_plan::compact_ordered;
 use super::body::{BodyPresence, BodyPresenceSizes};
+use super::reorg::IbdReorgState;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -113,6 +114,8 @@ pub(crate) struct IbdWorkState {
     pub assign_rot: usize,
     /// Stall-disconnect cooldowns (addr → until).
     pub addr_cooldown: HashMap<SocketAddr, Instant>,
+    /// Process-local invalid apply marks for most-work reorg (IBD run only).
+    pub reorg: IbdReorgState,
     /// Loop turns since last [`Self::hygiene`].
     hygiene_counter: u32,
 }
@@ -160,6 +163,7 @@ impl IbdWorkState {
             header_req_seq: 0,
             assign_rot: 0,
             addr_cooldown: HashMap::new(),
+            reorg: IbdReorgState::new(),
             hygiene_counter: 0,
         }
     }

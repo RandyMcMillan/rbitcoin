@@ -102,6 +102,12 @@ a LevelDB bag.
   kept forever as raw wire `blk` files.
 - After IBD, a **wire-format ring** covers the soft tip window for serve,
   reorg, and recovery ([crash recovery](./crash-recovery.md)).
+- **Most-work reorg:** header work ranks candidates; full block validation
+  decides the tip. `ChainHub::accept_branch` disconnects only after the apply
+  path is gathered and restores the prior tip if connect fails mid-branch.
+  IBD classifies BadPrev as corrupt wire vs competing path; tip-follow pending
+  holds ≥128 bodies for deep reorgs; resume prefers most-work header children
+  (body is a tie-break). Design: [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 - **Epoch finalize** fsyncs buried archive prefixes in steady state; IBD itself
   does not promise Core-class durability mid-catch-up.
 
@@ -199,7 +205,7 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
-| [`docs/design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md) | Most-work reorg (IBD any depth, tip-follow ≥99) |
+| [`docs/design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md) | Most-work reorg design (selector, apply, invalid-heavy, resume) |
 | [`docs/experimental-mainnet.md`](./experimental-mainnet.md) | Lab mainnet ops |
 | [`OPERATOR.md`](../OPERATOR.md) | Knobs, logging, memory budgets |
 | [`COMPAT.md`](../COMPAT.md) | Product surface vs Core / Electrum methods |

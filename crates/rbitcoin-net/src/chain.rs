@@ -168,15 +168,26 @@ impl ChainHub {
 
     /// Like [`ensure_header`], but returns the header fk for the archive writer
     /// (avoids a second hash-head probe on the hot write path).
+    ///
+    /// **Fail closed:** non-genesis headers require the parent row to already
+    /// exist. Never write `prev_fk = NULL` for a missing parent (that created
+    /// millions of orphan rows and false resume edges on mainnet).
     pub fn ensure_header_fk(&self, header: &Header) -> Result<Fk, NetError> {
         let prev_fk = if header.prev_blockhash.to_byte_array() == [0u8; 32] {
             Fk::NULL
         } else {
-            self.query
+            match self
+                .query
                 .get_header_by_hash(header.prev_blockhash.as_byte_array())
                 .map_err(|e| NetError::Consensus(e.to_string()))?
-                .map(|(fk, _)| fk)
-                .unwrap_or(Fk::NULL)
+            {
+                Some((fk, _)) => fk,
+                None => {
+                    return Err(NetError::Consensus(
+                        "header parent unknown — ensure parent before child".into(),
+                    ));
+                }
+            }
         };
         let rec = header_to_record(prev_fk, header);
         self.query

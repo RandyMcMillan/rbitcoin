@@ -1,7 +1,9 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::sharded_hashhead::ShardedHashHead;
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{Fk, TableKind};
+use std::sync::Mutex;
 
 /// Fixed-size header body record (88 bytes). See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
@@ -46,10 +48,37 @@ impl HeaderRecord {
     }
 }
 
+/// Double-SHA256 of a bitcoin block header (80 bytes), internal byte order.
+pub fn block_header_hash(
+    version: i32,
+    prev_hash: &[u8; 32],
+    merkle_root: &[u8; 32],
+    timestamp: u32,
+    bits: u32,
+    nonce: u32,
+) -> [u8; 32] {
+    let mut ser = [0u8; 80];
+    ser[0..4].copy_from_slice(&version.to_le_bytes());
+    ser[4..36].copy_from_slice(prev_hash);
+    ser[36..68].copy_from_slice(merkle_root);
+    ser[68..72].copy_from_slice(&timestamp.to_le_bytes());
+    ser[72..76].copy_from_slice(&bits.to_le_bytes());
+    ser[76..80].copy_from_slice(&nonce.to_le_bytes());
+    let mut eng = sha256::HashEngine::default();
+    eng.input(&ser);
+    let mid = sha256::Hash::from_engine(eng);
+    let mut eng2 = sha256::HashEngine::default();
+    eng2.input(mid.as_byte_array());
+    sha256::Hash::from_engine(eng2).to_byte_array()
+}
+
 pub struct HeaderTable {
     body: TableFile,
     head: ShardedHashHead,
     count: std::sync::atomic::AtomicU64,
+    /// Serializes check-then-put so two threads cannot both miss and both append
+    /// the same full hash (I1 + I4).
+    put_lock: Mutex<()>,
 }
 
 impl HeaderTable {
@@ -63,6 +92,7 @@ impl HeaderTable {
             body,
             head,
             count: std::sync::atomic::AtomicU64::new(0),
+            put_lock: Mutex::new(()),
         })
     }
 
@@ -81,13 +111,61 @@ impl HeaderTable {
             body,
             head,
             count: std::sync::atomic::AtomicU64::new(count),
+            put_lock: Mutex::new(()),
         })
     }
 
+    /// Append-only insert **without** uniqueness. Prefer [`Self::ensure`].
+    ///
+    /// Used by offline rebuild tools that rewrite a clean table from scratch.
+    pub fn put_raw(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.put_unlocked(rec)
+    }
+
     /// Append header and publish into the hash head. Returns new FK.
+    ///
+    /// **Deprecated for hot paths:** use [`Self::ensure`] so the same full hash
+    /// cannot get a second body row with a divergent `prev_fk`.
     pub fn put(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
+        self.ensure(rec)
+    }
+
+    /// Write gate: at most one body row per full block hash (I1).
+    ///
+    /// - If `hash` already exists → return that fk (ignore caller's `prev_fk`).
+    /// - Else if `prev_fk` is non-null → parent must exist and
+    ///   `hash` must equal SHA256D(header fields with parent.hash as prev) (I2/I3).
+    /// - Else (`prev_fk` null) → append as-is (genesis / synthetic test rows).
+    ///
+    /// Lookup + insert hold [`Self::put_lock`] (I4).
+    pub fn ensure(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fk, _)) = self.get_by_hash_unlocked(&rec.hash)? {
+            return Ok(fk);
+        }
+        if !rec.prev_fk.is_null() {
+            let parent = self.get(rec.prev_fk)?;
+            let expect = block_header_hash(
+                rec.version,
+                &parent.hash,
+                &rec.merkle_root,
+                rec.timestamp,
+                rec.bits,
+                rec.nonce,
+            );
+            if expect != rec.hash {
+                return Err(StoreError::Corrupt(
+                    "header prev_fk does not match block hash (false parent edge)",
+                ));
+            }
+        }
+        self.put_unlocked(rec)
+    }
+
+    fn put_unlocked(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
         use std::sync::atomic::Ordering;
-        // Single appender: body → count → head (allocate-then-publish).
+        // body → count → head (allocate-then-publish).
         let base = self.count.load(Ordering::Acquire);
         let fk = Fk(base + 1);
         let offset = FILE_HEADER_LEN as u64 + base * HEADER_RECORD_LEN as u64;
@@ -112,6 +190,15 @@ impl HeaderTable {
     }
 
     pub fn get_by_hash(&self, hash: &[u8; 32]) -> Result<Option<(Fk, HeaderRecord)>, StoreError> {
+        // Head reads are safe without put_lock (body append-only; head multi-list
+        // is append-oriented). Callers that check-then-put must use ensure.
+        self.get_by_hash_unlocked(hash)
+    }
+
+    fn get_by_hash_unlocked(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<(Fk, HeaderRecord)>, StoreError> {
         // 16-byte head prefix may collide — verify full hash on the body.
         for fk in self.head.get_all(hash)? {
             let rec = self.get(fk)?;
@@ -125,6 +212,19 @@ impl HeaderTable {
     /// Number of header rows currently stored (highest fk = this value).
     pub fn count(&self) -> u64 {
         self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Overwrite one header row in place (offline repair / rebuild tools).
+    pub fn rewrite(&self, fk: Fk, rec: &HeaderRecord) -> Result<(), StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let count = self.count.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 || id > count {
+            return Err(StoreError::NotFound);
+        }
+        let offset = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64;
+        self.body.write_at(offset, &rec.encode())?;
+        Ok(())
     }
 
     /// Occupied open-address slots in the header hash head.
@@ -216,6 +316,101 @@ mod tests {
             HeaderTable::open(&dir),
             Err(StoreError::Corrupt(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real block-header fields with PoW-style hash committed to a real parent.
+    fn linked_child(parent: &HeaderRecord, parent_fk: Fk, salt: u32) -> HeaderRecord {
+        let version = 1;
+        let timestamp = 1_700_000_000 + salt;
+        let bits = 0x207fffff;
+        let nonce = salt;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&salt.to_le_bytes());
+        let hash = block_header_hash(version, &parent.hash, &merkle, timestamp, bits, nonce);
+        HeaderRecord {
+            prev_fk: parent_fk,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
+            hash,
+        }
+    }
+
+    /// Production failure shape: same full hash as an older block, but `prev_fk`
+    /// points at a tip-extension header. Without the write gate this plants a
+    /// false child edge that resume walks as "headers past tip".
+    #[test]
+    fn ensure_rejects_duplicate_hash_with_divergent_prev_and_false_parent_edge() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+
+        // G (null prev, synthetic hash) → A → B → C (real linked hashes).
+        let g = sample([0x11; 32]);
+        let g_fk = t.ensure(&g).unwrap();
+        let a = linked_child(&g, g_fk, 1);
+        let a_fk = t.ensure(&a).unwrap();
+        let b = linked_child(&a, a_fk, 2);
+        let b_fk = t.ensure(&b).unwrap();
+        let c = linked_child(&b, b_fk, 3);
+        let c_fk = t.ensure(&c).unwrap();
+        assert_eq!(t.count(), 4);
+
+        // Poison: re-insert G's identity with prev_fk = C (false parent).
+        let mut poison = g.clone();
+        poison.prev_fk = c_fk;
+        // Same hash as G; gate must return G's fk and not append.
+        let again = t.ensure(&poison).unwrap();
+        assert_eq!(again, g_fk, "same hash must not create a second row");
+        assert_eq!(t.count(), 4, "duplicate hash must not grow the table");
+        assert_eq!(t.get(g_fk).unwrap().prev_fk, Fk::NULL);
+
+        // First-time insert of a header whose hash commits to A as parent, but
+        // caller lies with prev_fk = C → corrupt (false parent edge).
+        let honest = linked_child(&a, a_fk, 99);
+        let mut lying = honest.clone();
+        lying.prev_fk = c_fk;
+        let err = t.ensure(&lying).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(_)),
+            "false parent edge must be rejected at write gate, got {err}"
+        );
+        assert_eq!(t.count(), 4);
+
+        // Honest insert still works.
+        let ok = t.ensure(&honest).unwrap();
+        assert_eq!(t.count(), 5);
+        assert_eq!(t.get(ok).unwrap().prev_fk, a_fk);
+
+        // Children of C: only what truly points at C (none of the poisons).
+        let mut kids_of_c = 0u32;
+        for id in 1..=t.count() {
+            let rec = t.get(Fk(id)).unwrap();
+            if rec.prev_fk == c_fk {
+                kids_of_c += 1;
+            }
+        }
+        assert_eq!(
+            kids_of_c, 0,
+            "C must not gain false children from poison puts"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_same_hash_twice_is_idempotent() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+        let h = sample([7u8; 32]);
+        let fk1 = t.ensure(&h).unwrap();
+        let mut h2 = h.clone();
+        h2.prev_fk = Fk(999); // divergent prev ignored on hit
+        let fk2 = t.ensure(&h2).unwrap();
+        assert_eq!(fk1, fk2);
+        assert_eq!(t.count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

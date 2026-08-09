@@ -125,8 +125,20 @@ impl Store {
         self.confirmed.tip_height()
     }
 
+    /// Header write gate: unique by full hash; reject false `prev_fk` edges.
+    /// See [`HeaderTable::ensure`].
     pub fn put_header(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        self.headers.put(rec)
+        self.headers.ensure(rec)
+    }
+
+    /// Append without uniqueness (offline rebuild only).
+    pub fn put_header_raw(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
+        self.headers.put_raw(rec)
+    }
+
+    /// In-place rewrite of one header row (offline repair).
+    pub fn rewrite_header(&self, fk: Fk, rec: &HeaderRecord) -> Result<(), StoreError> {
+        self.headers.rewrite(fk, rec)
     }
 
     pub fn get_header(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {

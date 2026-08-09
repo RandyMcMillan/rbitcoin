@@ -26,6 +26,7 @@ mod int_map;
 mod io_backend;
 mod open_address;
 mod point_table;
+pub mod rebuild_headers;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
@@ -64,7 +65,7 @@ pub use file::{
 };
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
-pub use header_table::HeaderRecord;
+pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};

@@ -271,6 +271,27 @@ page cache.
 
 Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block connect.
 
+**Header graph repair (false `prev_fk` / empty-headers lag past tip):** If IBD
+resume seeds an absurd `ready_to` far above peer horizon (e.g. `known≈982k` while
+peers advertise ~961k) and logs `empty headers but lag=…`, the Class A header
+table may contain **false parent edges** (duplicate rows / `prev_fk` that does
+not match the prev committed in the block hash). Stop the node and run:
+
+```bash
+# from a nix develop / built store bin
+cargo run -p rbitcoin-store --release --bin rbitcoin-rebuild-headers -- \
+  --datadir ./datadir-mainnet --dry-run
+cargo run -p rbitcoin-store --release --bin rbitcoin-rebuild-headers -- \
+  --datadir ./datadir-mainnet --write
+```
+
+The tool re-links the confirmed chain when safe and **nulls** every non-null
+`prev_fk` whose hash does not verify against the parent row. Resume walk length
+should drop from a poisoned multi-tens-of-thousands path to the real unconfirmed
+extension. New writes go through a unique-by-hash header gate (no second row for
+the same block hash; false parent edges rejected). Prefer a fresh datadir if
+corruption is widespread.
+
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
 is damaged or an old 4k-slot table was left wedged, stop the node and delete that
 directory — the next start recreates it empty and redownloads unconfirmed txs.

@@ -1785,14 +1785,14 @@ impl Query {
         Ok(self.store.flush_header_archive()?)
     }
 
-    /// Ensure a header row exists (no txs). Idempotent by hash.
+    /// Ensure a header row exists (no txs). Idempotent by full block hash.
     ///
-    /// Used to pipeline header sync into the store so out-of-order bodies can
-    /// resolve `prev_fk` without waiting for tip confirm.
+    /// Write gate: at most one body row per hash; non-null `prev_fk` must match
+    /// the parent committed in the block hash (see store `HeaderTable::ensure`).
+    /// Used to pipeline header sync so out-of-order bodies resolve parent fk.
     pub fn ensure_header(&self, header: &HeaderRecord) -> Result<Fk, QueryError> {
-        if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
-            return Ok(fk);
-        }
+        // Store gate is authoritative (lock + uniqueness + prev integrity).
+        // Skip confirm-parent-cache short-circuit so we never bypass ensure.
         Ok(self.store.put_header(header)?)
     }
 

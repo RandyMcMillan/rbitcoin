@@ -30,7 +30,7 @@ pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
     resolve_fixed_seeds, AddrMan, PeerEntry, PeerFlags,
 };
-pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
+pub use service::{magic_for, magic_for_params, NetConfig, P2PHandle, P2PNode};
 pub use tx_relay::{
     decode_len_prefixed_package, ElectrumMempoolItem, MempoolAnnounce, MempoolHub,
     QueryUtxoProvider,

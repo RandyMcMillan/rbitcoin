@@ -21,6 +21,8 @@ where
     let mut datadir_set = false;
     let mut network = Network::Mainnet;
     let mut network_set = false;
+    let mut signet_challenge = None;
+    let mut signet_block_time = None;
     let mut smoke = false;
     let mut listen: Option<SocketAddr> = None;
     let mut electrum_listen: Option<SocketAddr> = None;
@@ -56,6 +58,7 @@ where
     [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
+Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
 Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
@@ -118,6 +121,40 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--signetchallenge" | "--signet-challenge" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --signetchallenge requires hexadecimal script bytes");
+                    return ExitCode::from(2);
+                }
+                match crate::config::parse_signet_challenge(&args[i].to_string_lossy()) {
+                    Ok(challenge) => signet_challenge = Some(challenge),
+                    Err(e) => {
+                        eprintln!("error: bad --signetchallenge: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--signetblocktime" | "--signet-block-time" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --signetblocktime requires seconds");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<u64>() {
+                    Ok(n) if n > 0 => signet_block_time = Some(n),
+                    Ok(_) => {
+                        eprintln!("error: --signetblocktime must be greater than zero");
+                        return ExitCode::from(2);
+                    }
+                    Err(e) => {
+                        eprintln!("error: bad --signetblocktime: {e}");
                         return ExitCode::from(2);
                     }
                 }
@@ -374,6 +411,12 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     if network_set {
         config.network = network;
     }
+    if let Some(challenge) = signet_challenge {
+        config.signet_challenge = Some(challenge);
+    }
+    if signet_block_time.is_some() {
+        config.signet_block_time = signet_block_time;
+    }
     if let Some(a) = listen {
         config.p2p_listen = Some(a);
     }
@@ -625,6 +668,30 @@ mod tests {
         // CLI published operator envs for library readers.
         assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "10");
         assert_eq!(std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").unwrap(), "64");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_signet_cli_smoke() {
+        let dir = tmp_datadir();
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "signet",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--signetchallenge",
+            "51",
+            "--signetblocktime",
+            "60",
+            "--no-seeds",
+            "--log-level",
+            "error",
+            "--milestone",
+            "0",
+        ]);
+        assert_exit(code, ExitCode::SUCCESS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

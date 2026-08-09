@@ -9,7 +9,7 @@ use crate::peer_dos::{inbound_semaphore, max_inbound_from_env};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_consensus::{signet_magic, ChainParams, Milestone};
 use rbitcoin_primitives::Network as RNetwork;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
@@ -65,7 +65,7 @@ impl P2PNode {
         params: ChainParams,
         milestone: Milestone,
     ) -> Result<Self, NetError> {
-        let magic = Magic::from(params.network);
+        let magic = magic_for_params(&params);
         let hub = Arc::new(ChainHub::new(query, params, milestone));
         hub.ensure_genesis()?;
         let cache = hub.cache.clone();
@@ -279,6 +279,14 @@ pub fn magic_for(network: RNetwork) -> Magic {
     })
 }
 
+/// Resolve P2P message magic, including BIP325 custom-Signet derivation.
+pub fn magic_for_params(params: &ChainParams) -> Magic {
+    match params.signet_challenge.as_ref() {
+        Some(challenge) => Magic::from_bytes(signet_magic(challenge.as_script())),
+        None => Magic::from(params.network),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +310,17 @@ mod tests {
         assert_eq!(cfg.magic, Magic::REGTEST);
         assert!(cfg.listen.is_none());
         assert_eq!(cfg.user_agent, "/rbitcoin:0.1.0/");
+    }
+
+    #[test]
+    fn custom_signet_uses_challenge_derived_magic() {
+        use bitcoin::ScriptBuf;
+
+        let challenge = ScriptBuf::from_bytes(vec![0x51]);
+        let params = ChainParams::custom_signet(challenge, 60).unwrap();
+        assert_eq!(
+            magic_for_params(&params),
+            Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd])
+        );
     }
 }

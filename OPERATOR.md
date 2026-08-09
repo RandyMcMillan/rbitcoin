@@ -41,6 +41,8 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 |------|----------------|---------|
 | `--datadir PATH` | same | `./datadir` |
 | `--network NET` | `--chain` | `mainnet` |
+| `--signetchallenge HEX` | `--signet-challenge` | default global Signet challenge |
+| `--signetblocktime SECONDS` | `--signet-block-time` | 600; requires a custom challenge |
 | `--listen ADDR` | | bind later default port |
 | `--connect ADDR` | (repeatable) | seeds |
 | `--milestone HEIGHT` | `--assumevalid-height` | network default (mainnet 840000) |
@@ -402,6 +404,29 @@ mkdir -p ./datadir-signet
   --max-outbound 16 \
   --log-level info
 ```
+
+### Custom Signet
+
+A custom Signet derives its P2P message magic from the challenge. Default
+Signet seeds are not used, so provide at least one peer with `--connect`.
+Use a dedicated datadir for each challenge.
+
+```bash
+mkdir -p ./datadir-custom-signet
+./target/release/rbitcoin-node \
+  --datadir ./datadir-custom-signet \
+  --network signet \
+  --signetchallenge 51 \
+  --signetblocktime 60 \
+  --connect 192.0.2.1:38333 \
+  --listen 0.0.0.0:38333 \
+  --milestone 0 \
+  --log-level info
+```
+
+The equivalent conf-file keys are `signetchallenge` and `signetblocktime`.
+Replace the illustrative `OP_TRUE` challenge and documentation-only peer with
+the parameters supplied by the custom Signet operator.
 
 ### Resume / clean stop
 

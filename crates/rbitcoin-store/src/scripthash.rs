@@ -2172,14 +2172,12 @@ mod tests {
     #[test]
     fn sealed_fuse_absent_goes_overflow_try_upsert_updates_main() {
         let dir = tmp();
-        let t = ScriptHashTable::create(&dir).unwrap();
-        let mut main_keys = Vec::new();
-        for i in 0..52u32 {
-            let sh = script_hash(&[0xd0, (i & 0xff) as u8, 0x44, 0x55]);
-            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
-            main_keys.push(sh);
-        }
+        // Fixed mono 64-slot head — not `create()` alone (env race on HEAD_SCALE).
+        let t = create_tiny_mono_sh(&dir);
+        let _n_main = fill_until_main_sealed(&t, 0xd0);
         assert!(t.main_is_sealed());
+        // fill_until_main_sealed: tag + i LE bytes; first key is i=0.
+        let sh0 = script_hash(&[0xd0, 0, 0, 0x7e]);
         // Fuse is built asynchronously — wait for BF8R product (tiny heads are quick).
         for _ in 0..200 {
             if dir.join(MAIN_FUSE_NAME).is_file() && load_main_fuse(&dir).is_some() {
@@ -2191,7 +2189,6 @@ mod tests {
             load_main_fuse(&dir).is_some(),
             "bg fuse must write valid BF8R (not placeholder)"
         );
-        // Pull into process via routing helper path.
         assert!(
             t.main_fuse_opt().is_some(),
             "main_fuse_opt reloads when ready"
@@ -2207,7 +2204,6 @@ mod tests {
         assert!(t.contains_create(&sh_new, Fk(7_777)).unwrap());
 
         // Existing main key: try-upsert path (fuse says present) updates main.
-        let sh0 = main_keys[0];
         t.put_create(&rec(sh0, 8_888, 1)).unwrap();
         assert!(t.head.get(&sh0).unwrap().is_some());
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
@@ -2229,11 +2225,8 @@ mod tests {
     #[test]
     fn sealed_try_upsert_absent_key_overflows_not_main_slot() {
         let dir = tmp();
-        let t = ScriptHashTable::create(&dir).unwrap();
-        for i in 0..52u32 {
-            let sh = script_hash(&[0xe0, (i & 0xff) as u8, 0x66, 0x77]);
-            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
-        }
+        let t = create_tiny_mono_sh(&dir);
+        let n_main = fill_until_main_sealed(&t, 0xe0);
         assert!(t.main_is_sealed());
         // Free slots remain (~0.8 of 64); drop fuse so Absent is forced through
         // try-upsert (not fuse-absent short-circuit).
@@ -2269,7 +2262,7 @@ mod tests {
         // for_each must not double-count (no dual-home).
         let mut n = 0u64;
         t.for_each_live_create(|_| n += 1).unwrap();
-        assert_eq!(n, 53, "52 main + 1 overflow only");
+        assert_eq!(n, u64::from(n_main) + 1, "{n_main} main + 1 overflow only");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

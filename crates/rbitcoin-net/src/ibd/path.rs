@@ -31,6 +31,8 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
     let mut with_body = 0u32;
     let mut ready_prefix_to = tip_h;
     let mut ready_prefix = true;
+    let mut explore_need = Vec::new();
+    let mut explore_is_sibling_fork = false;
     for e in &path {
         let hash = BlockHash::from_byte_array(e.hash);
         st.known_headers.insert(hash);
@@ -39,6 +41,19 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
         st.max_ordered_height = st.max_ordered_height.max(e.height);
         if st.ordered_set.insert(hash) {
             st.ordered.push_back(hash);
+        }
+        // Same-height sibling (or any path entry not yet confirmed) needs densify.
+        if e.height <= tip_h && hash != tip_hash {
+            explore_is_sibling_fork = true;
+            if !e.has_body {
+                explore_need.push(hash);
+            }
+        } else if !e.has_body {
+            // Extension beyond tip: densify via ordered/height band; also register
+            // first few for reorg gather when on a sibling fork.
+            if explore_is_sibling_fork && explore_need.len() < 4 {
+                explore_need.push(hash);
+            }
         }
         if e.has_body {
             // Class A on disk: densify may skip re-walking the whole band via
@@ -54,6 +69,15 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             ready_prefix = false;
         }
     }
+    if explore_is_sibling_fork {
+        let explore_tip = path.last().map(|e| BlockHash::from_byte_array(e.hash));
+        st.reorg.register_explore(explore_need, explore_tip);
+        info!(
+            "ibd: resume seed greater-work sibling fork explore_need={} explore_tip={:?}",
+            st.reorg.need_getdata().len(),
+            explore_tip
+        );
+    }
     st.max_ready_height = st.max_ready_height.max(ready_prefix_to);
     // Peers may still advertise a higher tip; keep header sync open.
     st.headers_done = false;
@@ -67,12 +91,23 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
 }
 
 /// Highest hashes on the download path (newest first) for getheaders locators.
+///
+/// Includes proactive exploration tips (greater-work sibling path) so empty
+/// getheaders lag can re-root onto the heavier store chain.
 pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     let mut tips = Vec::with_capacity(8);
     // ordered is tip→far; the back is the highest known header on the path.
     for h in st.ordered.iter().rev().take(4) {
         if st.ordered_set.contains(h) {
             tips.push(*h);
+        }
+    }
+    for h in st.reorg.explore_tips() {
+        if !tips.contains(h) {
+            tips.push(*h);
+        }
+        if tips.len() >= 8 {
+            break;
         }
     }
     // Also sample by max height in hash_height if ordered is empty/ghosty.
@@ -284,6 +319,128 @@ mod tests {
         let n = st.ordered.len();
         seed_work_path_from_store(&mut st, &hub);
         assert_eq!(st.ordered.len(), n);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tip on short loser; heavier sibling headers in store → seed ordered + explore need.
+    #[test]
+    fn seed_work_path_registers_greater_work_sibling_explore() {
+        use super::seed_work_path_from_store;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-path-seed-sib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            let coinbase = Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let lose = mine(gen, 1_700_000_100, 1);
+        let mut win = mine(gen, 1_700_000_101, 1);
+        if win.block_hash() == lose.block_hash() {
+            let target = Target::from_compact(win.header.bits);
+            for nonce in 0..u32::MAX {
+                win.header.nonce = nonce;
+                if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        hub.accept_block(lose.clone()).unwrap();
+        hub.ensure_header(&win.header).unwrap();
+        let ext = mine(win.block_hash(), 1_700_000_200, 2);
+        hub.ensure_header(&ext.header).unwrap();
+
+        let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        seed_work_path_from_store(&mut st, &hub);
+        assert!(
+            st.ordered_set.contains(&win.block_hash()),
+            "seed must place winning sibling on ordered"
+        );
+        assert!(
+            st.ordered_set.contains(&ext.block_hash()),
+            "seed must place winner extension on ordered"
+        );
+        assert!(
+            !st.reorg.need_getdata().is_empty() || !st.reorg.explore_tips().is_empty(),
+            "must register explore densify needs or tips"
+        );
+        assert!(
+            st.reorg.explore_tips().contains(&ext.block_hash())
+                || st.reorg.need_getdata().contains(&win.block_hash())
+        );
+        let tips = work_path_tips(&st);
+        assert!(
+            tips.contains(&ext.block_hash()) || tips.contains(&win.block_hash()),
+            "locator tips must include exploration path"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

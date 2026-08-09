@@ -83,6 +83,11 @@ pub struct IbdReorgState {
     held_bodies: HashMap<BlockHash, Block>,
     /// Incomplete gather: need `need` hashes before applying `held_tip` path.
     awaiting: Option<AwaitingBodies>,
+    /// Proactive exploration: hashes densify should pull (same-height winner +
+    /// extensions) without waiting for BadPrev awaiting.
+    explore_need: Vec<BlockHash>,
+    /// Candidate tips on an exploration path (for proactive most-work apply).
+    explore_tips: Vec<BlockHash>,
 }
 
 impl IbdReorgState {
@@ -103,6 +108,8 @@ impl IbdReorgState {
             }
         }
         self.held_bodies.insert(h, block);
+        // Filled need → drop from explore densify list.
+        self.explore_need.retain(|x| *x != h);
     }
 
     pub fn get_held(&self, hash: &BlockHash) -> Option<Block> {
@@ -121,9 +128,45 @@ impl IbdReorgState {
         self.awaiting.as_ref()
     }
 
-    /// Hashes densify/getdata should still pull for an incomplete reorg.
+    /// Register hashes (and optional path tip) for exploration densify / apply.
+    pub fn register_explore(
+        &mut self,
+        need: impl IntoIterator<Item = BlockHash>,
+        tip: Option<BlockHash>,
+    ) {
+        for h in need {
+            if !self.explore_need.contains(&h) {
+                self.explore_need.push(h);
+            }
+        }
+        if let Some(t) = tip {
+            if !self.explore_tips.contains(&t) {
+                self.explore_tips.push(t);
+            }
+        }
+    }
+
+    pub fn explore_tips(&self) -> &[BlockHash] {
+        &self.explore_tips
+    }
+
+    /// True while registered explore hashes still lack held bodies.
+    pub fn explore_need_pending(&self) -> bool {
+        self.explore_need
+            .iter()
+            .any(|h| !self.held_bodies.contains_key(h))
+    }
+
+    pub fn clear_explore(&mut self) {
+        self.explore_need.clear();
+        self.explore_tips.clear();
+    }
+
+    /// Hashes densify/getdata should still pull for an incomplete reorg
+    /// (awaiting gather **or** proactive exploration).
     pub fn need_getdata(&self) -> Vec<BlockHash> {
-        self.awaiting
+        let mut out: Vec<BlockHash> = self
+            .awaiting
             .as_ref()
             .map(|a| {
                 a.need
@@ -132,7 +175,13 @@ impl IbdReorgState {
                     .copied()
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for h in &self.explore_need {
+            if !self.held_bodies.contains_key(h) && !out.contains(h) {
+                out.push(*h);
+            }
+        }
+        out
     }
 }
 
@@ -572,6 +621,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Exploration gather: tip on loser, held bodies for win+ext, apply via
+    /// try_apply_best_candidate without a BadPrev reject event.
+    #[test]
+    fn exploration_bodies_reorg_without_badprev() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let lose = mine(gen, 1_500_003_000, 1);
+        let mut win = mine(gen, 1_500_003_001, 1);
+        if win.block_hash() == lose.block_hash() {
+            let target = Target::from_compact(win.header.bits);
+            for nonce in 0..u32::MAX {
+                win.header.nonce = nonce;
+                if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        hub.accept_block(lose.clone()).unwrap();
+        hub.ensure_header(&win.header).unwrap();
+        let ext = mine(win.block_hash(), 1_500_003_100, 2);
+        hub.ensure_header(&ext.header).unwrap();
+
+        let mut bodies = HashMap::new();
+        bodies.insert(win.block_hash(), win.clone());
+        bodies.insert(ext.block_hash(), ext.clone());
+        let mut reorg = IbdReorgState::new();
+        reorg.register_explore([win.block_hash(), ext.block_hash()], Some(ext.block_hash()));
+        // Simulate densify filled held bodies.
+        reorg.hold_body(win.clone());
+        reorg.hold_body(ext.clone());
+        assert!(!reorg.explore_need_pending());
+
+        let out = try_apply_best_candidate(&hub, &bodies, &[ext.block_hash()], &mut reorg)
+            .unwrap()
+            .expect("exploration path must reorg tip");
+        assert!(matches!(out, AcceptOutcome::Accepted { height: 2 }));
+        assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Heavier invalid M then valid heavier N (or stay L).
     #[test]
     fn invalid_heavy_then_alternate_or_stay() {
@@ -802,6 +893,15 @@ mod tests {
         assert_eq!(st.need_getdata(), vec![need]);
         st.hold_body(need_h);
         assert!(st.need_getdata().is_empty(), "held satisfies need");
+        // Proactive exploration need merges into need_getdata.
+        let explore = mine(gen, 1_300_000_050, 1);
+        let eh = explore.block_hash();
+        st.register_explore([eh], Some(eh));
+        assert!(st.explore_need_pending());
+        assert_eq!(st.need_getdata(), vec![eh]);
+        st.hold_body(explore);
+        assert!(!st.explore_need_pending());
+        assert!(st.need_getdata().is_empty());
         assert!(st.get_held(&need).is_some());
         st.clear_awaiting();
         assert!(st.awaiting().is_none());

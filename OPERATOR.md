@@ -271,7 +271,14 @@ page cache.
 
 Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block connect.
 
-**Header graph repair (false `prev_fk` / empty-headers lag past tip):** If IBD
+**Empty-headers lag — two different causes:**
+
+| Symptom | Cause | Fix |
+|---------|--------|-----|
+| `known≈982k` while peers ~961k, absurd resume walk | False `prev_fk` / duplicate header edges | `rbitcoin-rebuild-headers` below |
+| `tip=H` but tip **hash** is a short orphan sibling; peers ahead; store already has a longer mainnet header path | Stale confirmed tip; need most-work **explore + reorg** | Restart a node with sibling-fork resume (no rebuild-headers). If tip hash ≠ best header at that height, expect reorg once bodies densify |
+
+**Header graph repair (false `prev_fk` only):** If IBD
 resume seeds an absurd `ready_to` far above peer horizon (e.g. `known≈982k` while
 peers advertise ~961k) and logs `empty headers but lag=…`, the Class A header
 table may contain **false parent edges** (duplicate rows / `prev_fk` that does

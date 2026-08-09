@@ -270,6 +270,9 @@ pub(crate) fn apply_peer_event(
                     }
                     st.headers_done = false;
                     if should_rerequest_headers_on_empty_lag(st.empty_header_streak) {
+                        // Re-seed greater-work sibling paths already in the header
+                        // table (mainnet 961632 class: peers empty on dead branch).
+                        super::path::seed_work_path_from_store(st, hub);
                         let tips = work_path_tips(st);
                         let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
                     }
@@ -676,11 +679,72 @@ fn try_reorg_on_bad_prev(
     }
 }
 
+/// Proactive most-work apply for exploration tips (seeded sibling fork) when
+/// bodies are held — does not require BadPrev livelock first.
+fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
+    use super::reorg::try_apply_best_candidate;
+    use crate::chain::AcceptOutcome;
+    use rbitcoin_log::info;
+    use std::collections::HashMap;
+
+    let tips: Vec<BlockHash> = st.reorg.explore_tips().to_vec();
+    if tips.is_empty() {
+        return false;
+    }
+    // Wait until densify filled registered explore hashes.
+    if st.reorg.explore_need_pending() {
+        return false;
+    }
+
+    let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+    // Prefer held + Class A + BQ for every hash we know on the work path.
+    let mut candidates: Vec<BlockHash> = st.ordered.iter().copied().collect();
+    candidates.extend(tips.iter().copied());
+    for h in st.hash_height.keys().copied() {
+        if !candidates.contains(&h) {
+            candidates.push(h);
+        }
+    }
+    for h in candidates {
+        if let Some(b) = load_reorg_body(st, hub, h) {
+            st.reorg.hold_body(b.clone());
+            bodies.insert(h, b);
+        }
+    }
+    if bodies.is_empty() {
+        return false;
+    }
+    let losing = hub.tip_hash();
+    match try_apply_best_candidate(hub, &bodies, &tips, &mut st.reorg) {
+        Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
+            info!("ibd: most-work reorg after exploration gather → tip_h={new_h}");
+            for b in bodies.values() {
+                st.body.mark_archived(b.block_hash());
+            }
+            if let Some(l) = losing {
+                remove_from_ordered(&mut st.ordered, &mut st.ordered_set, l);
+            }
+            st.reorg.clear_awaiting();
+            st.reorg.clear_explore();
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            warn!("ibd: exploration reorg failed: {e}");
+            false
+        }
+    }
+}
+
 /// After a side-branch body is held, try to finish an awaiting reorg.
 fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
     use super::reorg::apply_sibling_winning_path;
     use crate::chain::AcceptOutcome;
     use rbitcoin_log::info;
+
+    if try_apply_exploration(st, hub) {
+        return true;
+    }
 
     let Some(awaiting) = st.reorg.awaiting().cloned() else {
         return false;
@@ -2113,5 +2177,118 @@ pub(crate) fn parent_height(
     if hub.tip_hash() == Some(prev) {
         return Some(hub.tip_height().unwrap_or(0).saturating_add(1));
     }
+    // Confirmed ancestor (tip−1 / deeper): competing headers often attach to a
+    // non-tip parent that is not yet in the RAM height map. height_of_hash is
+    // best-chain only — orphan prevs stay None (peer batch_prev can fill).
+    if let Ok(Some(h)) = hub.query.height_of_hash(&prev.to_byte_array()) {
+        return Some(h.0.saturating_add(1));
+    }
     None
+}
+
+#[cfg(test)]
+mod parent_height_tests {
+    use super::parent_height;
+    use crate::chain::ChainHub;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
+        TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut ss = if height == 0 {
+            vec![0x00]
+        } else {
+            rbitcoin_consensus::bip34_height_script(height)
+        };
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time,
+            bits,
+            nonce: 0,
+        };
+        let mut block = Block {
+            header,
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    /// Competing header attaches to confirmed tip−1 (not tip, not in RAM map).
+    #[test]
+    fn parent_height_resolves_confirmed_tip_minus_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-parent-h-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let p = mine(gen, 1_600_000_100, 1);
+        hub.accept_block(p.clone()).unwrap();
+        let lose = mine(p.block_hash(), 1_600_000_200, 2);
+        hub.accept_block(lose.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(2));
+        let tip = hub.tip_hash().unwrap();
+        assert_eq!(tip, lose.block_hash());
+
+        // RAM map empty — only store knows P at height 1.
+        let empty = HashMap::new();
+        assert_eq!(
+            parent_height(&empty, &hub, p.block_hash()),
+            Some(2),
+            "child of confirmed tip−1 must get height tip"
+        );
+        assert_eq!(
+            parent_height(&empty, &hub, tip),
+            Some(3),
+            "child of tip still tip+1"
+        );
+        let unknown = BlockHash::from_byte_array([0xab; 32]);
+        assert_eq!(parent_height(&empty, &hub, unknown), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

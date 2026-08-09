@@ -1742,10 +1742,13 @@ impl Query {
     ///
     /// IBD only remembered the ordered path in RAM. On restart it re-ran
     /// getheaders/getdata even though Class A was already on disk. This walks
-    /// `header.body` once, builds a prev→children map, and follows the best
-    /// (prefer-archived) child chain from the confirmed tip.
+    /// Build a prev→children map over all header rows and walk a most-work path
+    /// for IBD ordered seeding.
     ///
-    /// `max` caps how many headers are returned (IBD ordered cap).
+    /// Prefer a **sibling of the confirmed tip** under tip’s parent when that
+    /// sibling’s header subtree has **strictly more work** than tip’s own
+    /// subtree (depth breaks remaining ties; Class A body only after that).
+    /// Otherwise walk tip→children as before. Caps at `max` entries.
     pub fn resume_work_path_after_tip(
         &self,
         tip_hash: [u8; 32],
@@ -1755,7 +1758,7 @@ impl Query {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let Some((tip_fk, _)) = self.get_header_by_hash(&tip_hash)? else {
+        let Some((tip_fk, tip_rec)) = self.get_header_by_hash(&tip_hash)? else {
             return Ok(Vec::new());
         };
         let n = self.store.header_count();
@@ -1772,9 +1775,57 @@ impl Query {
             children.entry(prev).or_default().push((fk, rec.hash));
         }
 
+        let (tip_sub_w, _tip_sub_d) = Self::resume_subtree_score(&self.store, &children, tip_fk)?;
+
+        // Best sibling under tip's parent with strictly more work than tip's
+        // full subtree (includes tip + its descendants).
+        let mut best_sib: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
+        if let Some(parent_fk) = tip_rec.prev_fk.get() {
+            if let Some(sibs) = children.get(&parent_fk) {
+                for &(fk, hash) in sibs {
+                    if fk == tip_fk {
+                        continue;
+                    }
+                    let has_body = self.store.header_txs.has_body(fk)?;
+                    let (sub_w, sub_d) = Self::resume_subtree_score(&self.store, &children, fk)?;
+                    if sub_w <= tip_sub_w {
+                        continue; // strictly greater work only
+                    }
+                    let take = match best_sib {
+                        None => true,
+                        Some((best_fk, _, best_body, best_w, best_d)) => {
+                            if sub_w != best_w {
+                                sub_w > best_w
+                            } else if sub_d != best_d {
+                                sub_d > best_d
+                            } else if has_body != best_body {
+                                has_body && !best_body
+                            } else {
+                                fk.0 > best_fk.0
+                            }
+                        }
+                    };
+                    if take {
+                        best_sib = Some((fk, hash, has_body, sub_w, sub_d));
+                    }
+                }
+            }
+        }
+
         let mut out = Vec::with_capacity(max.min(4096));
-        let mut cur_fk = tip_fk;
-        let mut height = tip_height;
+        let (mut cur_fk, mut height) = if let Some((fk, hash, has_body, _, _)) = best_sib {
+            // Sibling at same height as tip — include it as first explore entry.
+            out.push(ResumeWorkEntry {
+                height: tip_height,
+                hash,
+                header_fk: fk,
+                has_body,
+            });
+            (fk, tip_height)
+        } else {
+            (tip_fk, tip_height)
+        };
+
         while out.len() < max {
             let Some(kids) = children.get(&cur_fk.0) else {
                 break;
@@ -2993,6 +3044,60 @@ mod tests {
             "must follow winner chain: {path:?}"
         );
         assert!(!path[0].has_body, "winner first hop may lack body");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Confirmed tip on short loser; heavier sibling path under tip's parent must
+    /// still be returned (mainnet 961632 class exploration).
+    #[test]
+    fn resume_work_path_from_loser_tip_explores_heavier_sibling() {
+        let (dir, q) = temp_query("resume-from-loser");
+        let (g, tg) = coinbase_block(0, Fk::NULL, None);
+        let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+        let (p, tp) = coinbase_block(1, gfk, Some(g.hash));
+        let pfk = q.connect_block(Height(1), &p, &[tp]).unwrap();
+
+        // Loser tip: single hop at height 2 with body (confirmed).
+        let (lose, tl) = coinbase_block(2, pfk, Some(p.hash));
+        let _lfk = q.connect_block(Height(2), &lose, &[tl]).unwrap();
+        assert_eq!(q.tip_height().map(|h| h.0), Some(2));
+
+        // Winner: same parent, two-header extension (strictly more work).
+        let mut w1 = coinbase_block(21, pfk, Some(p.hash)).0;
+        if w1.hash == lose.hash {
+            w1.nonce = w1.nonce.wrapping_add(11);
+            w1.hash = rbitcoin_store::block_header_hash(
+                w1.version,
+                &p.hash,
+                &w1.merkle_root,
+                w1.timestamp,
+                w1.bits,
+                w1.nonce,
+            );
+        }
+        let w1fk = q.put_header(&w1).unwrap();
+        let (w2, _) = coinbase_block(22, w1fk, Some(w1.hash));
+        let _ = q.put_header(&w2).unwrap();
+
+        // Resume from **loser tip** (not parent) — must still explore winner.
+        let path = q
+            .resume_work_path_after_tip(lose.hash, 2, 8)
+            .expect("resume");
+        assert!(
+            !path.is_empty(),
+            "must explore a path from loser tip; path empty"
+        );
+        assert_eq!(
+            path[0].hash,
+            w1.hash,
+            "first hop is winning sibling at tip height; got {:?}",
+            path.iter().map(|e| e.hash).collect::<Vec<_>>()
+        );
+        assert_eq!(path[0].height, 2, "sibling shares tip height");
+        assert!(
+            path.len() >= 2 && path[1].hash == w2.hash,
+            "must continue winner chain: {path:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

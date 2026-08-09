@@ -103,14 +103,15 @@ pre-attempt tip hash (snapshot before disconnect).
 
 ## Resume / restart
 
-`resume_work_path_after_tip` scores **tip’s descendant subtree** against
-**siblings of tip under tip’s parent** (strictly greater header work, then
-depth; Class A body only breaks ties). If a sibling path is heavier, the
-returned walk starts at that sibling (same height as tip) and continues along
-its most-work children — not only tip descendants. Prevents empty-headers
-livelock when confirmed tip is a short orphan while archive already holds a
-heavier fork (mainnet 961632 class). Body preference alone must never re-elect
-an archived losing fork after a reorg.
+`resume_work_path_after_tip` walks **tip → ancestors** (bounded). At each
+parent it scores the on-path child’s subtree against **siblings** (strictly
+greater header work, then depth; Class A body only breaks ties). The nearest
+heavier sibling path is explored (not only tip descendants). Covers tip on a
+loser **child** (mainnet 0139ed under 0169eb: better fork is d1e0 under
+grandparent). Body preference alone must never re-elect an archived losing fork.
+
+BadPrev densify walks **header prev links to the best-chain LCA** and
+`need_getdata`s every missing mid body (not wire_prev alone).
 
 Empty-headers with peer lag is **not** EOF when a heavier store path exists:
 re-seed exploration and include greater-work tips in getheaders locators.

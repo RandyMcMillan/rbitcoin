@@ -595,18 +595,22 @@ fn load_reorg_body(
 }
 
 /// On BadPrev, if the rejected body's prev is a known competing header, try
-/// most-work reorg onto `[winning_prev, rejected_body, …]`. Returns true if
-/// tip moved (caller should not soft-reget).
+/// most-work reorg onto the **full** header path from best-chain LCA to the
+/// rejected hash (every mid body, not wire_prev alone). Returns true if tip
+/// moved (caller should not soft-reget).
 fn try_reorg_on_bad_prev(
     st: &mut IbdWorkState,
     hub: &crate::chain::ChainHub,
     height: u32,
     hash: BlockHash,
 ) -> bool {
-    use super::reorg::{apply_sibling_winning_path, classify_bad_prev, BadPrevClass};
+    use super::reorg::{
+        classify_bad_prev, header_hashes_to_best_ancestor, try_apply_best_candidate, BadPrevClass,
+    };
     use crate::chain::AcceptOutcome;
     use bitcoin::consensus::deserialize;
     use rbitcoin_log::info;
+    use std::collections::HashMap;
 
     let Some(tip) = hub.tip_hash() else {
         return false;
@@ -634,36 +638,57 @@ fn try_reorg_on_bad_prev(
             info!(
                 "ibd: BadPrev competing path @{height}: tip={losing_tip} wire_prev={winning_prev} — trying most-work reorg"
             );
-            let win_block = load_reorg_body(st, hub, winning_prev);
-            let Some(win_block) = win_block else {
-                // Same-height competitor is rarely Class A (confirm archives tip path
-                // only) and cannot share the tip height BQ slot. Hold ext, densify
-                // the winner by hash, complete reorg when its body arrives.
-                st.reorg.set_awaiting(ext.clone(), vec![winning_prev]);
-                st.body.mark_missing(winning_prev);
-                if st.ordered_set.insert(winning_prev) {
-                    st.ordered.push_front(winning_prev);
+            // Full path tip→LCA (oldest-first), e.g. [d1e0, 02022e, 1574b].
+            let path = match header_hashes_to_best_ancestor(hub, hash) {
+                Ok(p) if !p.is_empty() => p,
+                Ok(_) => vec![winning_prev, hash],
+                Err(e) => {
+                    warn!("ibd: BadPrev path-to-LCA failed: {e}");
+                    vec![winning_prev, hash]
                 }
-                // Map winner at tip height for assign band walk without overwriting
-                // tip's height_to_hash entry used by confirm (tip stays mapped).
-                let tip_h = hub.tip_height().unwrap_or(0);
-                st.hash_height.insert(winning_prev, tip_h);
-                st.known_headers.insert(winning_prev);
+            };
+            let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+            bodies.insert(hash, ext.clone());
+            let mut need = Vec::new();
+            for (i, h) in path.iter().enumerate() {
+                let hgt = height.saturating_sub((path.len() - 1 - i) as u32);
+                st.hash_height.insert(*h, hgt);
+                st.known_headers.insert(*h);
+                if *h == hash {
+                    continue;
+                }
+                if let Some(b) = load_reorg_body(st, hub, *h) {
+                    st.reorg.hold_body(b.clone());
+                    bodies.insert(*h, b);
+                } else {
+                    need.push(*h);
+                    st.body.mark_missing(*h);
+                    if st.ordered_set.insert(*h) {
+                        st.ordered.push_front(*h);
+                    }
+                }
+            }
+            if !need.is_empty() {
+                // Awaiting alone feeds need_getdata (assign 1b). Avoid
+                // register_explore here so try_complete uses full awaiting gather.
+                st.reorg.set_awaiting(ext.clone(), need.clone());
                 warn!(
-                    "ibd: competing reorg awaiting body for winning prev {winning_prev} (held tip+1 {hash})"
+                    "ibd: competing reorg awaiting {} body/bodies on path to LCA (held tip+1 {hash}) need={need:?}",
+                    need.len()
                 );
                 return false;
-            };
-            st.reorg.hold_body(win_block.clone());
-            match apply_sibling_winning_path(hub, win_block, &[ext], &mut st.reorg) {
-                Ok(AcceptOutcome::Accepted { height: new_h }) => {
+            }
+            match try_apply_best_candidate(hub, &bodies, &[hash], &mut st.reorg) {
+                Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
                     info!("ibd: most-work reorg after BadPrev → tip_h={new_h}");
                     let _ = hub.query.block_queue_dequeue_height(height);
                     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-                    st.body.mark_archived(hash);
-                    st.body.mark_archived(winning_prev);
+                    for h in &path {
+                        st.body.mark_archived(*h);
+                    }
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, losing_tip);
                     st.reorg.clear_awaiting();
+                    st.reorg.clear_explore();
                     true
                 }
                 Ok(other) => {
@@ -749,9 +774,10 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
 
 /// After a side-branch body is held, try to finish an awaiting reorg.
 fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
-    use super::reorg::apply_sibling_winning_path;
+    use super::reorg::{header_hashes_to_best_ancestor, try_apply_best_candidate};
     use crate::chain::AcceptOutcome;
     use rbitcoin_log::info;
+    use std::collections::HashMap;
 
     if try_apply_exploration(st, hub) {
         return true;
@@ -761,11 +787,9 @@ fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainH
         return false;
     };
     let mut missing = Vec::new();
-    let mut wins = Vec::new();
     for h in &awaiting.need {
         if let Some(b) = load_reorg_body(st, hub, *h) {
-            st.reorg.hold_body(b.clone());
-            wins.push(b);
+            st.reorg.hold_body(b);
         } else {
             missing.push(*h);
         }
@@ -774,24 +798,39 @@ fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainH
         st.reorg.set_awaiting(awaiting.held_tip, missing);
         return false;
     }
-    // Sibling path: first need is winning prev at tip height; held_tip is tip+1.
-    let Some(win_block) = wins.into_iter().next() else {
-        return false;
-    };
-    let ext = awaiting.held_tip;
+    // Full path from held tip (rejected tip+1) to LCA — not win+ext only.
+    let tip_hash = awaiting.held_tip.block_hash();
+    let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+    st.reorg.hold_body(awaiting.held_tip.clone());
+    bodies.insert(tip_hash, awaiting.held_tip);
+    if let Ok(path) = header_hashes_to_best_ancestor(hub, tip_hash) {
+        for h in path {
+            if let Some(b) = load_reorg_body(st, hub, h) {
+                st.reorg.hold_body(b.clone());
+                bodies.insert(h, b);
+            }
+        }
+    }
+    for h in &awaiting.need {
+        if let Some(b) = load_reorg_body(st, hub, *h) {
+            bodies.insert(*h, b);
+        }
+    }
     let losing = hub.tip_hash();
-    match apply_sibling_winning_path(hub, win_block.clone(), &[ext.clone()], &mut st.reorg) {
-        Ok(AcceptOutcome::Accepted { height: new_h }) => {
+    match try_apply_best_candidate(hub, &bodies, &[tip_hash], &mut st.reorg) {
+        Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
             info!("ibd: most-work reorg completed after body gather → tip_h={new_h}");
             let tip_h = hub.tip_height().unwrap_or(0);
             let _ = hub.query.block_queue_dequeue_height(tip_h);
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, ext.block_hash());
-            st.body.mark_archived(ext.block_hash());
-            st.body.mark_archived(win_block.block_hash());
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, tip_hash);
+            for h in bodies.keys() {
+                st.body.mark_archived(*h);
+            }
             if let Some(l) = losing {
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, l);
             }
             st.reorg.clear_awaiting();
+            st.reorg.clear_explore();
             true
         }
         Ok(other) => {
@@ -1272,6 +1311,271 @@ mod confirm_reject_tests {
         );
         assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
         assert_eq!(hub.tip_height(), Some(2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Multi-hop with all path bodies already loadable → reorg without await.
+    #[test]
+    fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
+        use crate::chain::ChainHub;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-multi-hop-ready-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let l1 = mine(gen, 1_410_000_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_410_000_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        let mut w1 = mine(gen, 1_410_000_101, 1);
+        if w1.block_hash() == l1.block_hash() {
+            let target = Target::from_compact(w1.header.bits);
+            for nonce in 0..u32::MAX {
+                w1.header.nonce = nonce;
+                if w1.header.validate_pow(target).is_ok() && w1.block_hash() != l1.block_hash() {
+                    break;
+                }
+            }
+        }
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_410_000_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_410_000_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        // Full path bodies available via BQ-by-hash.
+        for (ht, b) in [(1u32, &w1), (2, &w2), (3, &w3)] {
+            hub.query
+                .block_queue_offer(ht, b.block_hash().to_byte_array(), 0, &serialize(b))
+                .unwrap();
+        }
+        let mut st = IbdWorkState::new(Vec::new(), Some(l2.block_hash()), Some(2));
+        apply_confirm_reject(
+            &mut st,
+            3,
+            w3.block_hash(),
+            "consensus: unexpected previous header",
+            Some(hub.query.as_ref()),
+            Some(&hub),
+        );
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            w3.block_hash(),
+            "full path ready → reorg without await"
+        );
+        assert!(st.reorg.awaiting().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Multi-hop fork (log shape): tip already on loser **child**; heavier path
+    /// needs mid body at fork height, not only wire_prev. BadPrev must densify
+    /// full LCA path then reorg.
+    #[test]
+    fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
+        use super::try_complete_awaiting_reorg;
+        use crate::chain::ChainHub;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-multi-hop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let distinct = |mut b: bitcoin::Block, avoid: BlockHash| {
+            if b.block_hash() == avoid {
+                let target = Target::from_compact(b.header.bits);
+                for nonce in 0..u32::MAX {
+                    b.header.nonce = nonce;
+                    if b.header.validate_pow(target).is_ok() && b.block_hash() != avoid {
+                        break;
+                    }
+                }
+            }
+            b
+        };
+
+        // Loser path: gen → L1 → L2 (tip).
+        let l1 = mine(gen, 1_400_000_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_400_000_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(2));
+        assert_eq!(hub.tip_hash().unwrap(), l2.block_hash());
+
+        // Heavier path: gen → W1 → W2 → W3 (headers; bodies staged).
+        let w1 = distinct(mine(gen, 1_400_000_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_400_000_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_400_000_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+
+        // Only tip+1 body available (W3); mids W1/W2 missing — log shape.
+        hub.query
+            .block_queue_offer(3, w3.block_hash().to_byte_array(), 0, &serialize(&w3))
+            .unwrap();
+
+        let mut st = IbdWorkState::new(Vec::new(), Some(l2.block_hash()), Some(2));
+        apply_confirm_reject(
+            &mut st,
+            3,
+            w3.block_hash(),
+            "consensus: unexpected previous header",
+            Some(hub.query.as_ref()),
+            Some(&hub),
+        );
+        // Must await **both** mid bodies, not only wire_prev (W2).
+        let need = st.reorg.need_getdata();
+        assert!(
+            need.contains(&w1.block_hash()),
+            "must densify fork-height mid W1; need={need:?}"
+        );
+        assert!(
+            need.contains(&w2.block_hash()),
+            "must densify wire_prev W2; need={need:?}"
+        );
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            l2.block_hash(),
+            "tip unchanged while awaiting"
+        );
+
+        // Bodies arrive → complete reorg.
+        st.reorg.hold_body(w1.clone());
+        st.reorg.hold_body(w2.clone());
+        assert!(
+            try_complete_awaiting_reorg(&mut st, &hub),
+            "full path bodies must apply reorg"
+        );
+        assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
+        assert_eq!(hub.tip_height(), Some(3));
         let _ = std::fs::remove_dir_all(dir);
     }
 

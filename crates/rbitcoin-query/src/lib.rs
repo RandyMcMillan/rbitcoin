@@ -1775,25 +1775,37 @@ impl Query {
             children.entry(prev).or_default().push((fk, rec.hash));
         }
 
-        let (tip_sub_w, _tip_sub_d) = Self::resume_subtree_score(&self.store, &children, tip_fk)?;
-
-        // Best sibling under tip's parent with strictly more work than tip's
-        // full subtree (includes tip + its descendants).
-        let mut best_sib: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
-        if let Some(parent_fk) = tip_rec.prev_fk.get() {
+        // Walk tip → ancestors (bounded). At each parent, if a sibling of the
+        // on-path child heads a **strictly heavier** subtree than the on-path
+        // child, explore that sibling. Covers tip-on-loser-child (mainnet 0139ed
+        // under 0169eb: better fork is d1e0 under grandparent 807f).
+        const ANCESTOR_HOPS: u32 = 32;
+        // (fk, hash, has_body, height of sibling)
+        let mut best_sib: Option<(Fk, [u8; 32], bool, u32)> = None;
+        let mut path_fk = tip_fk;
+        let mut path_h = tip_height;
+        let mut path_rec = tip_rec;
+        for _ in 0..ANCESTOR_HOPS {
+            let Some(parent_fk) = path_rec.prev_fk.get() else {
+                break;
+            };
+            let (path_sub_w, _path_sub_d) =
+                Self::resume_subtree_score(&self.store, &children, path_fk)?;
             if let Some(sibs) = children.get(&parent_fk) {
                 for &(fk, hash) in sibs {
-                    if fk == tip_fk {
+                    if fk == path_fk {
                         continue;
                     }
                     let has_body = self.store.header_txs.has_body(fk)?;
                     let (sub_w, sub_d) = Self::resume_subtree_score(&self.store, &children, fk)?;
-                    if sub_w <= tip_sub_w {
-                        continue; // strictly greater work only
+                    if sub_w <= path_sub_w {
+                        continue;
                     }
                     let take = match best_sib {
                         None => true,
-                        Some((best_fk, _, best_body, best_w, best_d)) => {
+                        Some((best_fk, _, best_body, _)) => {
+                            let (best_w, best_d) =
+                                Self::resume_subtree_score(&self.store, &children, best_fk)?;
                             if sub_w != best_w {
                                 sub_w > best_w
                             } else if sub_d != best_d {
@@ -1806,22 +1818,31 @@ impl Query {
                         }
                     };
                     if take {
-                        best_sib = Some((fk, hash, has_body, sub_w, sub_d));
+                        // Sibling shares height with the on-path child at this level.
+                        best_sib = Some((fk, hash, has_body, path_h));
                     }
                 }
             }
+            if best_sib.is_some() {
+                break; // nearest better fork (shallowest reorg)
+            }
+            if path_h == 0 {
+                break;
+            }
+            path_h = path_h.saturating_sub(1);
+            path_fk = Fk(parent_fk);
+            path_rec = self.store.get_header(path_fk)?;
         }
 
         let mut out = Vec::with_capacity(max.min(4096));
-        let (mut cur_fk, mut height) = if let Some((fk, hash, has_body, _, _)) = best_sib {
-            // Sibling at same height as tip — include it as first explore entry.
+        let (mut cur_fk, mut height) = if let Some((fk, hash, has_body, sib_h)) = best_sib {
             out.push(ResumeWorkEntry {
-                height: tip_height,
+                height: sib_h,
                 hash,
                 header_fk: fk,
                 has_body,
             });
-            (fk, tip_height)
+            (fk, sib_h)
         } else {
             (tip_fk, tip_height)
         };
@@ -3044,6 +3065,111 @@ mod tests {
             "must follow winner chain: {path:?}"
         );
         assert!(!path[0].has_body, "winner first hop may lack body");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two heavier sibling forks under grandparent: pick the strictly heavier.
+    #[test]
+    fn resume_from_loser_child_picks_heavier_of_two_forks() {
+        let (dir, q) = temp_query("resume-two-forks");
+        let (g, tg) = coinbase_block(0, Fk::NULL, None);
+        let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+        let (l1, tl1) = coinbase_block(1, gfk, Some(g.hash));
+        let l1fk = q.connect_block(Height(1), &l1, &[tl1]).unwrap();
+        let (l2, tl2) = coinbase_block(2, l1fk, Some(l1.hash));
+        let _ = q.connect_block(Height(2), &l2, &[tl2]).unwrap();
+        // Wa: 2-block side (work > L1 alone path with L2 = 2? L1+L2=2, Wa alone=1 fail;
+        // Wa+Wa2 = 2 equal — need Wa 3 deep).
+        let mut wa1 = coinbase_block(21, gfk, Some(g.hash)).0;
+        if wa1.hash == l1.hash {
+            wa1.nonce = wa1.nonce.wrapping_add(3);
+            wa1.hash = rbitcoin_store::block_header_hash(
+                wa1.version,
+                &g.hash,
+                &wa1.merkle_root,
+                wa1.timestamp,
+                wa1.bits,
+                wa1.nonce,
+            );
+        }
+        let wa1fk = q.put_header(&wa1).unwrap();
+        let (wa2, _) = coinbase_block(22, wa1fk, Some(wa1.hash));
+        let wa2fk = q.put_header(&wa2).unwrap();
+        let (wa3, _) = coinbase_block(23, wa2fk, Some(wa2.hash));
+        let _ = q.put_header(&wa3).unwrap();
+        // Wb: 4-deep → strictly heavier than Wa.
+        let mut wb1 = coinbase_block(31, gfk, Some(g.hash)).0;
+        if wb1.hash == l1.hash || wb1.hash == wa1.hash {
+            wb1.nonce = wb1.nonce.wrapping_add(17);
+            wb1.hash = rbitcoin_store::block_header_hash(
+                wb1.version,
+                &g.hash,
+                &wb1.merkle_root,
+                wb1.timestamp,
+                wb1.bits,
+                wb1.nonce,
+            );
+        }
+        let wb1fk = q.put_header(&wb1).unwrap();
+        let (wb2, _) = coinbase_block(32, wb1fk, Some(wb1.hash));
+        let wb2fk = q.put_header(&wb2).unwrap();
+        let (wb3, _) = coinbase_block(33, wb2fk, Some(wb2.hash));
+        let wb3fk = q.put_header(&wb3).unwrap();
+        let (wb4, _) = coinbase_block(34, wb3fk, Some(wb3.hash));
+        let _ = q.put_header(&wb4).unwrap();
+
+        let path = q.resume_work_path_after_tip(l2.hash, 2, 8).expect("resume");
+        assert_eq!(
+            path[0].hash,
+            wb1.hash,
+            "must pick heavier Wb over Wa; path={:?}",
+            path.iter().map(|e| e.hash).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tip already on loser **child** (L2); heavier fork is sibling of L1 under
+    /// grandparent — ancestor walk must find W1 (mainnet 0139ed class).
+    #[test]
+    fn resume_from_loser_child_explores_grandparent_sibling_fork() {
+        let (dir, q) = temp_query("resume-loser-child");
+        let (g, tg) = coinbase_block(0, Fk::NULL, None);
+        let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+        // L1 then L2 tip.
+        let (l1, tl1) = coinbase_block(1, gfk, Some(g.hash));
+        let l1fk = q.connect_block(Height(1), &l1, &[tl1]).unwrap();
+        let (l2, tl2) = coinbase_block(2, l1fk, Some(l1.hash));
+        let _ = q.connect_block(Height(2), &l2, &[tl2]).unwrap();
+        // W1 sibling of L1, then W2.
+        let mut w1 = coinbase_block(11, gfk, Some(g.hash)).0;
+        if w1.hash == l1.hash {
+            w1.nonce = w1.nonce.wrapping_add(13);
+            w1.hash = rbitcoin_store::block_header_hash(
+                w1.version,
+                &g.hash,
+                &w1.merkle_root,
+                w1.timestamp,
+                w1.bits,
+                w1.nonce,
+            );
+        }
+        let w1fk = q.put_header(&w1).unwrap();
+        let (w2, _) = coinbase_block(12, w1fk, Some(w1.hash));
+        let w2fk = q.put_header(&w2).unwrap();
+        let (w3, _) = coinbase_block(13, w2fk, Some(w2.hash));
+        let _ = q.put_header(&w3).unwrap();
+
+        let path = q.resume_work_path_after_tip(l2.hash, 2, 8).expect("resume");
+        assert!(
+            !path.is_empty() && path[0].hash == w1.hash,
+            "from L2 must explore W1 under grandparent; path={:?}",
+            path.iter().map(|e| (e.height, e.hash)).collect::<Vec<_>>()
+        );
+        assert_eq!(path[0].height, 1, "W1 at fork height of L1");
+        assert!(
+            path.len() >= 2 && path[1].hash == w2.hash,
+            "continue W path: {path:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

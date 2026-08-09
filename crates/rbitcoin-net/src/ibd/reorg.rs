@@ -291,39 +291,6 @@ pub fn apply_reorg_branch(
     }
 }
 
-/// Mainnet-class sibling reorg: tip on losing sibling; apply path starts at
-/// winning sibling (same height) then extensions.
-///
-/// `winning_at_fork` is the block at the losing tip's height on the winning
-/// chain; `extension` is optional tip+1… already gathered.
-pub fn apply_sibling_winning_path(
-    hub: &ChainHub,
-    winning_at_fork: Block,
-    extension: &[Block],
-    reorg: &mut IbdReorgState,
-) -> Result<AcceptOutcome, NetError> {
-    let mut branch = Vec::with_capacity(1 + extension.len());
-    branch.push(winning_at_fork);
-    branch.extend(extension.iter().cloned());
-    // Skip if any hash invalid-marked.
-    if branch
-        .iter()
-        .any(|b| reorg.invalid.contains(b.block_hash().to_byte_array()))
-    {
-        return Ok(AcceptOutcome::IgnoredWeaker);
-    }
-    // Prefer selector+gather when bodies are complete (same as multi-candidate path).
-    let mut bodies = HashMap::new();
-    for b in &branch {
-        bodies.insert(b.block_hash(), b.clone());
-    }
-    let tip = branch.last().unwrap().block_hash();
-    match try_apply_best_candidate(hub, &bodies, &[tip], reorg)? {
-        Some(o) => Ok(o),
-        None => apply_reorg_branch(hub, &branch, reorg),
-    }
-}
-
 /// Try candidates in most-work order: first successful apply wins; failed paths
 /// are invalid-marked and **re-ranked** so a remaining valid heavier N can win.
 pub fn try_apply_best_candidate(
@@ -383,6 +350,47 @@ pub fn try_apply_best_candidate(
         }
     }
     Ok(None)
+}
+
+/// Header hashes from `tip` back to (not including) a best-chain / confirmed
+/// ancestor, **oldest-first**. Used so BadPrev densify requests every mid-path
+/// body to the LCA (mainnet: d1e0 + 02022e + tip+1, not wire_prev alone).
+pub fn header_hashes_to_best_ancestor(
+    hub: &ChainHub,
+    tip: BlockHash,
+) -> Result<Vec<BlockHash>, NetError> {
+    use bitcoin::hashes::Hash as _;
+    let mut rev = Vec::new();
+    let mut cur = tip;
+    for _ in 0..10_000 {
+        if hub.has_block(&cur)
+            || hub
+                .query
+                .height_of_hash(&cur.to_byte_array())
+                .map_err(|e| NetError::Consensus(e.to_string()))?
+                .is_some()
+        {
+            break;
+        }
+        rev.push(cur);
+        let Some((_fk, rec)) = hub
+            .query
+            .get_header_by_hash(&cur.to_byte_array())
+            .map_err(|e| NetError::Consensus(e.to_string()))?
+        else {
+            break;
+        };
+        let Some(pfk) = rec.prev_fk.get() else {
+            break;
+        };
+        let parent = hub
+            .query
+            .get_header(rbitcoin_primitives::Fk(pfk))
+            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        cur = BlockHash::from_byte_array(parent.hash);
+    }
+    rev.reverse();
+    Ok(rev)
 }
 
 /// Walk from `tip` via pending bodies until parent is on best chain.
@@ -543,6 +551,28 @@ mod tests {
         block
     }
 
+    /// Test helper: win-at-fork + optional extension via shipped apply path.
+    fn apply_sibling_winning_path(
+        hub: &ChainHub,
+        winning_at_fork: Block,
+        extension: &[Block],
+        reorg: &mut IbdReorgState,
+    ) -> Result<AcceptOutcome, NetError> {
+        let mut bodies = HashMap::new();
+        let tip = extension
+            .last()
+            .map(|b| b.block_hash())
+            .unwrap_or_else(|| winning_at_fork.block_hash());
+        bodies.insert(winning_at_fork.block_hash(), winning_at_fork);
+        for b in extension {
+            bodies.insert(b.block_hash(), b.clone());
+        }
+        match try_apply_best_candidate(hub, &bodies, &[tip], reorg)? {
+            Some(o) => Ok(o),
+            None => Ok(AcceptOutcome::IgnoredWeaker),
+        }
+    }
+
     #[test]
     fn classify_corrupt_vs_competing() {
         let (dir, hub) = tmp_hub();
@@ -595,6 +625,40 @@ mod tests {
         let a = mine(gen, 1_500_000_300, 1);
         let b = mine(gen, 1_500_000_400, 1); // not child of a
         assert!(candidate_from_blocks(&hub, &[a, b]).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn header_hashes_to_best_ancestor_walks_mid_path() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_060_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        // Side path not confirmed: w1 → w2
+        let mut w1 = mine(gen, 1_500_060_101, 1);
+        if w1.block_hash() == l1.block_hash() {
+            let target = Target::from_compact(w1.header.bits);
+            for nonce in 0..u32::MAX {
+                w1.header.nonce = nonce;
+                if w1.header.validate_pow(target).is_ok() && w1.block_hash() != l1.block_hash() {
+                    break;
+                }
+            }
+        }
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_060_200, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let path = header_hashes_to_best_ancestor(&hub, w2.block_hash()).unwrap();
+        assert_eq!(
+            path,
+            vec![w1.block_hash(), w2.block_hash()],
+            "oldest-first mid path to LCA"
+        );
+        // Already on best chain → empty.
+        assert!(header_hashes_to_best_ancestor(&hub, l1.block_hash())
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

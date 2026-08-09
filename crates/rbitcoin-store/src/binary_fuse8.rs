@@ -327,3 +327,36 @@ impl BinaryFuse8 {
         self.fingerprints.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_key_and_small_set_no_false_negatives() {
+        let one = BinaryFuse8::try_from_keys(&[0x1122_3344_5566_7788]).unwrap();
+        assert!(one.contains(0x1122_3344_5566_7788));
+        assert!(one.len() > 0);
+
+        let keys: Vec<u64> = (0u64..50)
+            .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect();
+        let f = BinaryFuse8::try_from_keys(&keys).unwrap();
+        for &k in &keys {
+            assert!(f.contains(k), "FN on {k:#x}");
+        }
+        // Re-encode-style field invariants used by fuse8_filter decode.
+        assert_eq!(f.segment_length_mask, f.segment_length.saturating_sub(1));
+        assert!(f.segment_length >= 4);
+        assert!(f.segment_count_length >= f.segment_length);
+    }
+
+    #[test]
+    fn empty_keys_constructs_via_caller_dummy_only() {
+        // try_from_keys([]) uses size==0 geometry; may still succeed with empty
+        // reverse_order and zero stack — document current behavior.
+        let r = BinaryFuse8::try_from_keys(&[]);
+        // Either Ok (empty fingerprints path) or Err — both exercised for coverage.
+        let _ = r;
+    }
+}

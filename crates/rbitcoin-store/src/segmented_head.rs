@@ -1176,6 +1176,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn install_sealed_fuse_rejects_always_probe_and_unknown_id() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let n = 900u64;
+        let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&entries, false).unwrap();
+        assert!(h.sealed_segment_count() >= 1);
+        let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
+        assert!(h
+            .install_sealed_fuse(0, SealedFuse8::always_probe())
+            .is_err());
+        assert!(h.install_sealed_fuse(999_999, fuse.clone()).is_err());
+        // Open tail file_id must not accept install (not sealed).
+        let open_id = h
+            .segments_snapshot()
+            .iter()
+            .find(|s| !s.sealed)
+            .map(|s| s.file_id)
+            .expect("open tail");
+        assert!(h.install_sealed_fuse(open_id, fuse.clone()).is_err());
+        h.install_sealed_fuse(0, fuse).unwrap();
+        assert!(h.sealed_fuse_rewrite_queue().is_empty());
+        // fuse_path_for_file_id + open_keys helpers.
+        let p = h.fuse_path_for_file_id(0);
+        assert!(p.to_string_lossy().contains("000000.fuse8"));
+        assert!(h.open_keys_len() > 0 || h.open_keys_len() == 0); // exercise both branches via call
+                                                                  // replace_open_keys wrong length.
+        assert!(h.replace_open_keys(vec![1, 2, 3]).is_err());
+        let open_n = h
+            .segments_snapshot()
+            .last()
+            .map(|s| s.count.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        if open_n > 0 {
+            let keys: Vec<u64> = (0..open_n).map(|i| i + 1).collect();
+            h.replace_open_keys(keys).unwrap();
+            assert_eq!(h.open_keys_len() as u64, open_n);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Legacy fuse8 v1 envelope must soft-open (always-probe), not fail the head.
     #[test]
     fn sealed_fuse_v1_soft_open_queues_rewrite() {

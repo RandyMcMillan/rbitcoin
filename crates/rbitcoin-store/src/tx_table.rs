@@ -4497,6 +4497,67 @@ mod tests {
         });
     }
 
+    /// Legacy fuse8 v1 on a sealed segment: open rewrites to v2 without wiping head.
+    #[test]
+    fn reopen_rewrites_legacy_v1_sealed_fuse_to_v2() {
+        with_env_lock(|| {
+            SegmentedTxHead::test_set_soft_span_bytes(0);
+            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+            let dir = tempfile_dir("fuse-v1-rewrite");
+            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+            {
+                let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+                let recs: Vec<TxRecord> = (0..900u64)
+                    .map(|i| {
+                        let mut txid = [0u8; 32];
+                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 0,
+                            output_start_fk: Fk::NULL,
+                            output_count: 0,
+                        }
+                    })
+                    .collect();
+                t.put_batch(&recs).unwrap();
+                assert!(t.head.sealed_segment_count() >= 1);
+                t.flush().unwrap();
+            }
+            // Overwrite sealed file_id=0 fuse with historical v1 envelope.
+            let fuse_path = dir.join("tx.head").join("000000.fuse8");
+            assert!(fuse_path.is_file());
+            let mut raw = Vec::from(*b"BF8R");
+            raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+            raw.extend_from_slice(&0u64.to_le_bytes());
+            std::fs::write(&fuse_path, &raw).unwrap();
+
+            let t = TxTable::open(&dir).unwrap();
+            assert!(
+                t.head.sealed_fuse_rewrite_queue().is_empty(),
+                "open must rewrite legacy fuses before returning"
+            );
+            // Durable file is v2.
+            let bytes = std::fs::read(&fuse_path).unwrap();
+            assert_eq!(&bytes[0..4], b"BF8R");
+            let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            assert_eq!(ver, 2, "fuse must be rewritten as v2");
+            // Sealed members still resolve (no FN).
+            for i in [1u64, 100, 400, 819] {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(
+                    t.get_fk_by_txid(&txid).unwrap(),
+                    Some(Fk(i)),
+                    "fk={i} after fuse migrate"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// Soft-span force_roll uses **open** segment first_fk (after a prior roll).
     #[test]
     fn soft_span_roll_on_open_segment_not_only_first() {

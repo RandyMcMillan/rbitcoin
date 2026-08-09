@@ -61,6 +61,13 @@ mod tests {
         let mut h = U64IdentityHasher::default();
         h.write_u64(0xdead_beef_cafe_u64);
         assert_eq!(h.finish(), 0xdead_beef_cafe_u64);
+        // Byte-path mix (Hash trait fallback for non-u64 keys).
+        let mut h2 = U64IdentityHasher::default();
+        h2.write(&[0x01, 0x02, 0x03, 0x04]);
+        assert_ne!(h2.finish(), 0);
+        let mut h3 = U64IdentityHasher::default();
+        h3.write_u32(0xabcd_u32);
+        assert_eq!(h3.finish(), 0xabcd_u64);
 
         let n = 8_000u64;
         let mut m: U64Map<u32> = U64Map::with_capacity_and_hasher(n as usize, Default::default());

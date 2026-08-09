@@ -160,4 +160,43 @@ mod tests {
         assert_eq!(f.script_type, "p2pk");
         assert!(f.asm.contains("OP_CHECKSIG"));
     }
+
+    #[test]
+    fn p2wsh_op_return_and_bare_multisig_types() {
+        // v0 P2WSH: OP_0 + 32-byte push
+        let spk_wsh = {
+            let mut v = vec![0x00, 0x20];
+            v.extend_from_slice(&[0xab; 32]);
+            v
+        };
+        assert_eq!(
+            esplora_script_fields(&spk_wsh, Network::Bitcoin).script_type,
+            "v0_p2wsh"
+        );
+        // OP_RETURN
+        let opreturn = Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(b"hi")
+            .into_script();
+        assert_eq!(
+            esplora_script_fields(opreturn.as_bytes(), Network::Bitcoin).script_type,
+            "op_return"
+        );
+        // Bare multisig ends with CHECKMULTISIG
+        let multi = Builder::new()
+            .push_int(1)
+            .push_key(&PublicKey::from_slice(&G_COMPRESSED).unwrap())
+            .push_int(1)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(
+            esplora_script_fields(multi.as_bytes(), Network::Bitcoin).script_type,
+            "multisig"
+        );
+        // Short script is not bare multisig
+        assert_eq!(
+            esplora_script_fields(&[0x51, 0x51], Network::Regtest).script_type,
+            "unknown"
+        );
+    }
 }

@@ -298,4 +298,122 @@ mod tests {
         assert!(SealedFuse8::always_probe().write_to(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn v2_unreadable_body_needs_rewrite() {
+        let dir = tmp();
+        let path = dir.join("badv2.fuse8");
+        let mut raw = Vec::from(*MAGIC);
+        raw.extend_from_slice(&VERSION_V2.to_le_bytes());
+        // body_len claims 4 bytes but payload is empty / short after header.
+        raw.extend_from_slice(&4u64.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 4]); // too short for full v2 fields
+        std::fs::write(&path, &raw).unwrap();
+        match open_file(&path).unwrap() {
+            FuseFileOpen::NeedsRewrite { gate, reason } => {
+                assert!(gate.is_always_probe());
+                assert!(reason.contains("v2") || reason.contains("unreadable"));
+            }
+            FuseFileOpen::Ready(_) => panic!("short v2 body must not be Ready"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_body_rejects_absurd_fingerprint_len() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u64.to_le_bytes()); // seed
+        body.extend_from_slice(&64u32.to_le_bytes()); // seg_len
+        body.extend_from_slice(&63u32.to_le_bytes()); // mask
+        body.extend_from_slice(&64u32.to_le_bytes()); // count_len
+        body.extend_from_slice(&(600 * 1024 * 1024u64).to_le_bytes()); // absurd
+                                                                       // no fingerprints
+        assert!(decode_body(&body).is_err());
+    }
+
+    #[test]
+    fn decode_body_rejects_invalid_geometry_and_truncation() {
+        // Short header.
+        assert!(decode_body(&[0u8; 10]).is_err());
+        // Valid geometry header but fingerprints truncated.
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u64.to_le_bytes());
+        body.extend_from_slice(&64u32.to_le_bytes());
+        body.extend_from_slice(&63u32.to_le_bytes());
+        body.extend_from_slice(&64u32.to_le_bytes());
+        body.extend_from_slice(&8u64.to_le_bytes()); // claims 8 fps
+        body.extend_from_slice(&[1, 2, 3]); // only 3
+        assert!(decode_body(&body).is_err());
+        // segment_length == 0
+        let mut bad_seg = Vec::new();
+        bad_seg.extend_from_slice(&1u64.to_le_bytes());
+        bad_seg.extend_from_slice(&0u32.to_le_bytes());
+        bad_seg.extend_from_slice(&0u32.to_le_bytes());
+        bad_seg.extend_from_slice(&0u32.to_le_bytes());
+        bad_seg.extend_from_slice(&0u64.to_le_bytes());
+        assert!(decode_body(&bad_seg).is_err());
+        // mask != segment_length - 1
+        let mut bad_mask = Vec::new();
+        bad_mask.extend_from_slice(&1u64.to_le_bytes());
+        bad_mask.extend_from_slice(&64u32.to_le_bytes());
+        bad_mask.extend_from_slice(&0u32.to_le_bytes()); // wrong mask
+        bad_mask.extend_from_slice(&64u32.to_le_bytes());
+        bad_mask.extend_from_slice(&0u64.to_le_bytes());
+        assert!(decode_body(&bad_mask).is_err());
+    }
+
+    #[test]
+    fn fuse_key_from_mixed_xors_quarters() {
+        let mut m = [0u8; 32];
+        m[0] = 1;
+        m[8] = 2;
+        m[16] = 4;
+        m[24] = 8;
+        let k = fuse_key_from_mixed(&m);
+        assert_eq!(k, 1u64 ^ 2u64 << 0 ^ 4u64 << 0 ^ 8u64); // LE quarters xor
+                                                            // All-zero → zero.
+        assert_eq!(fuse_key_from_mixed(&[0u8; 32]), 0);
+    }
+
+    #[test]
+    fn roundtrip_v2_write_read_and_fingerprint_bytes() {
+        let dir = tmp();
+        let path = dir.join("rt.fuse8");
+        let gate = SealedFuse8::build(&[10u64, 20, 30, 40, 50]).unwrap();
+        assert!(gate.fingerprint_bytes() > 0);
+        assert!(gate.contains(10));
+        assert!(gate.contains(50));
+        gate.write_to(&path).unwrap();
+        match open_file(&path).unwrap() {
+            FuseFileOpen::Ready(g) => {
+                assert!(g.contains(10));
+                assert!(g.contains(50));
+                assert!(!g.is_always_probe());
+            }
+            FuseFileOpen::NeedsRewrite { .. } => panic!("fresh v2 must be Ready"),
+        }
+        // Empty keys path builds dummy.
+        let empty = SealedFuse8::build(&[]).unwrap();
+        assert!(empty.contains(0)); // dummy always built
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_unknown_version_is_corrupt() {
+        let dir = tmp();
+        let path = dir.join("v99.fuse8");
+        let mut raw = Vec::from(*MAGIC);
+        raw.extend_from_slice(&99u32.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &raw).unwrap();
+        assert!(open_file(&path).is_err());
+        // Bad magic.
+        std::fs::write(
+            &path,
+            b"XXXX\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+        assert!(open_file(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -241,3 +241,79 @@ fn last_push_data(script: &[u8]) -> Option<&[u8]> {
     }
     last
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_push_data_direct_and_pushdata() {
+        // OP_1 (non-push) clears last.
+        assert!(last_push_data(&[0x51]).is_none());
+        // Direct push of 2 bytes.
+        assert_eq!(last_push_data(&[0x02, 0xaa, 0xbb]), Some(&[0xaa, 0xbb][..]));
+        // Truncated direct push → break with no complete last from this op.
+        assert!(last_push_data(&[0x03, 0xaa]).is_none());
+        // OP_PUSHDATA1
+        assert_eq!(
+            last_push_data(&[0x4c, 0x02, 0x11, 0x22]),
+            Some(&[0x11, 0x22][..])
+        );
+        assert!(last_push_data(&[0x4c]).is_none()); // missing length
+        assert!(last_push_data(&[0x4c, 0x05, 0x01]).is_none()); // truncated body
+                                                                // OP_PUSHDATA2
+        assert_eq!(
+            last_push_data(&[0x4d, 0x02, 0x00, 0x33, 0x44]),
+            Some(&[0x33, 0x44][..])
+        );
+        assert!(last_push_data(&[0x4d, 0x01]).is_none()); // short len field
+        assert!(last_push_data(&[0x4d, 0x03, 0x00, 0x01]).is_none()); // short body
+                                                                      // Non-push after push clears last.
+        assert!(last_push_data(&[0x01, 0xaa, 0x51]).is_none());
+        // Empty push then real push.
+        assert_eq!(last_push_data(&[0x00, 0x01, 0xee]), Some(&[0xee][..]));
+    }
+
+    #[test]
+    fn redeem_and_witness_script_asm_helpers() {
+        assert!(inner_redeemscript_asm(&[]).is_none());
+        assert!(inner_redeemscript_asm(&[0x00]).is_none()); // empty push
+        let redeem = inner_redeemscript_asm(&[0x01, 0x51]).unwrap();
+        assert!(redeem.contains("OP_1") || redeem.contains("1"));
+
+        assert!(inner_witnessscript_asm(&[]).is_none());
+        assert!(inner_witnessscript_asm(&[String::from("51")]).is_none()); // len < 2
+                                                                           // Two items, last is OP_TRUE script — not a DER sig.
+        let asm = inner_witnessscript_asm(&[String::from("00"), String::from("51")]).unwrap();
+        assert!(!asm.is_empty());
+        // DER-looking last item skipped.
+        assert!(inner_witnessscript_asm(&[String::from("00"), String::from("3000")]).is_none());
+        // Empty last stack item.
+        assert!(inner_witnessscript_asm(&[String::from("00"), String::new()]).is_none());
+        // Invalid hex.
+        assert!(inner_witnessscript_asm(&[String::from("00"), String::from("zz")]).is_none());
+    }
+
+    #[test]
+    fn block_hash_hex_reverses_bytes() {
+        let mut h = [0u8; 32];
+        h[0] = 0xab;
+        h[31] = 0xcd;
+        let s = block_hash_hex(&h);
+        assert_eq!(s.len(), 64);
+        assert!(s.starts_with("cd"));
+        assert!(s.ends_with("ab"));
+    }
+
+    #[test]
+    fn vout_fields_includes_type_and_value() {
+        // P2WPKH: 0x00 0x14 + 20 bytes
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0x11; 20]);
+        let v = vout_fields(&spk, 50_000, Network::Bitcoin);
+        assert_eq!(v["value"], 50_000);
+        assert_eq!(v["scriptpubkey_type"], "v0_p2wpkh");
+        assert!(v["scriptpubkey"].as_str().unwrap().len() > 0);
+        assert!(v.get("scriptpubkey_address").is_some());
+    }
+}

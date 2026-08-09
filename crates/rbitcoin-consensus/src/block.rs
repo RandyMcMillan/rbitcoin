@@ -2290,8 +2290,10 @@ mod finality_tests {
 #[cfg(test)]
 mod structure_rule_tests {
     use super::{
-        bip16_active_from_prev_mtp, bip34_height_script, block_subsidy, merkle_root_bytes,
-        validate_block_structure, ScriptCheckJob, ValidationContext, BIP16_EXCEPTION_MAINNET,
+        bip16_active_from_prev_mtp, bip34_height_script, block_subsidy, is_p2sh_script,
+        is_p2wpkh_program, is_p2wsh_program, last_script_push, merkle_root_bytes,
+        script_sigop_count, validate_block_structure, ScriptCheckJob, ValidationContext,
+        BIP16_EXCEPTION_MAINNET,
     };
     use crate::error::ConsensusError;
     use crate::milestone::Milestone;
@@ -2657,6 +2659,61 @@ mod structure_rule_tests {
         assert_eq!(block_subsidy(419_999, &p), 25_0000_0000);
         assert_eq!(block_subsidy(420_000, &p), 12_5000_0000);
         assert_eq!(block_subsidy(210_000 * 64, &p), 0);
+    }
+
+    #[test]
+    fn script_sigop_count_and_last_push_helpers() {
+        // CHECKSIG / CHECKSIGVERIFY
+        assert_eq!(script_sigop_count(&[0xac], false), 1);
+        assert_eq!(script_sigop_count(&[0xad], false), 1);
+        // CHECKMULTISIG without accurate → 20
+        assert_eq!(script_sigop_count(&[0xae], false), 20);
+        assert_eq!(script_sigop_count(&[0xaf], false), 20);
+        // Accurate: OP_2 CHECKMULTISIG → 2
+        assert_eq!(script_sigop_count(&[0x52, 0xae], true), 2);
+        // Direct push skip
+        assert_eq!(script_sigop_count(&[0x01, 0xff, 0xac], false), 1);
+        // PUSHDATA1 / 2 / 4 skip
+        assert_eq!(script_sigop_count(&[0x4c, 0x01, 0xab, 0xac], false), 1);
+        assert_eq!(
+            script_sigop_count(&[0x4d, 0x01, 0x00, 0xcd, 0xac], false),
+            1
+        );
+        assert_eq!(
+            script_sigop_count(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xee, 0xac], false),
+            1
+        );
+        // last_script_push variants
+        assert_eq!(
+            last_script_push(&[0x02, 0x11, 0x22]),
+            Some(&[0x11, 0x22][..])
+        );
+        assert_eq!(
+            last_script_push(&[0x4c, 0x02, 0xaa, 0xbb]),
+            Some(&[0xaa, 0xbb][..])
+        );
+        assert_eq!(
+            last_script_push(&[0x4d, 0x01, 0x00, 0x99]),
+            Some(&[0x99][..])
+        );
+        assert_eq!(
+            last_script_push(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0x77]),
+            Some(&[0x77][..])
+        );
+        assert!(last_script_push(&[]).is_none());
+        // Program shape helpers
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend_from_slice(&[0u8; 20]);
+        p2sh.push(0x87);
+        assert!(is_p2sh_script(&p2sh));
+        assert!(!is_p2sh_script(&[0x00]));
+        let mut wpkh = vec![0x00, 0x14];
+        wpkh.extend_from_slice(&[1u8; 20]);
+        assert!(is_p2wpkh_program(&wpkh));
+        let mut wsh = vec![0x00, 0x20];
+        wsh.extend_from_slice(&[2u8; 32]);
+        assert!(is_p2wsh_program(&wsh));
+        assert!(!is_p2wsh_program(&wpkh));
     }
 
     #[test]

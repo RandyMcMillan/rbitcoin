@@ -263,4 +263,92 @@ mod tests {
         assert!(inner.lock().unwrap().control().stop);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn memtable_cap_and_run_control_helpers() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-runctrl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        // No env → default, floored at 1000.
+        assert_eq!(memtable_cap("RBITCOIN_TEST_NO_SUCH_CAP", 500), 1_000);
+        assert_eq!(memtable_cap("RBITCOIN_TEST_NO_SUCH_CAP", 5_000), 5_000);
+
+        // Empty runs dir → next_seq starts at 1.
+        let mut ctrl = RunControl::open(&dir, "sh.runs");
+        assert_eq!(ctrl.next_seq, 1);
+        assert!(!ctrl.stop);
+        ctrl.stop = true;
+        ctrl.finalize = true;
+        ctrl.reset_for_enable();
+        assert!(!ctrl.stop && !ctrl.finalize);
+
+        let runs = ctrl.runs_dir.clone();
+        std::fs::write(runs.join("SEAL"), b"keep").unwrap();
+        std::fs::write(runs.join("1.run"), b"x").unwrap();
+        std::fs::write(runs.join("junk.tmp"), b"y").unwrap();
+        let sub = runs.join("nested");
+        let _ = std::fs::create_dir_all(&sub);
+        std::fs::write(sub.join("z"), b"z").unwrap();
+        clear_runs_dir(&runs);
+        assert!(runs.join("SEAL").is_file());
+        assert!(!runs.join("1.run").exists());
+        assert!(!runs.join("junk.tmp").exists());
+        assert!(!sub.exists());
+
+        let (rd, io) = runs_dir_io(&ctrl);
+        assert_eq!(rd, runs);
+        assert_eq!(on_disk_run_count(&rd, &io), 0);
+        std::fs::write(runs.join("2.run"), b"a").unwrap();
+        // list_runs may or may not count depending on name format; just exercise path.
+        let _ = on_disk_run_count(&rd, &io);
+
+        // Finalize with pending but no worker flushes pending.
+        let enabled = AtomicBool::new(true);
+        let inner = Mutex::new(EmptyMem {
+            ctrl: RunControl::open(&dir, "pending.runs"),
+            pending: 3,
+        });
+        let cv = Condvar::new();
+        let join: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        finalize_wait_join(&enabled, &inner, &cv, &join).unwrap();
+        assert_eq!(inner.lock().unwrap().pending_len(), 0);
+        assert!(!enabled.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_worker_idempotent() {
+        let enabled = AtomicBool::new(false);
+        let join: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        let hit = Arc::new(AtomicBool::new(false));
+        let hit2 = Arc::clone(&hit);
+        spawn_worker(
+            "rbitcoin-test-run-worker",
+            || {},
+            &enabled,
+            &join,
+            move || {
+                hit2.store(true, Ordering::SeqCst);
+            },
+        );
+        // Second spawn is a no-op once enabled.
+        spawn_worker(
+            "rbitcoin-test-run-worker-2",
+            || panic!("must not start twice"),
+            &enabled,
+            &join,
+            || {},
+        );
+        if let Some(h) = join.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        assert!(hit.load(Ordering::SeqCst));
+        assert!(enabled.load(Ordering::SeqCst));
+    }
 }

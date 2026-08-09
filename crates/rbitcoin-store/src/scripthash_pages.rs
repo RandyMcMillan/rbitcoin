@@ -333,10 +333,31 @@ mod tests {
         assert_eq!(sh_head_value_mode(w0, w1).unwrap(), ShHeadValueMode::Paged);
         assert!(sh_word_flagged(w0));
         assert!(!sh_word_flagged(w1));
-        // w1 flagged illegal
+        // w1 flagged illegal (inline)
         assert!(sh_head_value_mode(3, SH_FLAG_BIT | 1).is_err());
         // null first inline
         assert!(sh_head_value_mode(0, 5).is_err());
+        // Paged: both words flagged → error (line 135-138)
+        assert!(sh_head_value_mode(SH_FLAG_BIT | 4096, SH_FLAG_BIT | 8192).is_err());
+        // Paged: null first or last payload
+        assert!(sh_head_value_mode(SH_FLAG_BIT | 0, 8192).is_err());
+        assert!(sh_head_value_mode(SH_FLAG_BIT | 4096, 0).is_err());
+        // encode rejects null page offs (after pack)
+        assert!(sh_encode_paged_head(0, 8192).is_err());
+        assert!(sh_encode_paged_head(4096, 0).is_err());
+        // decode non-paged → error
+        let inline = {
+            let mut b = [0u8; 16];
+            b[0..8].copy_from_slice(&3u64.to_le_bytes());
+            b
+        };
+        assert!(sh_decode_paged_head(&inline).is_err());
+        // page next with flag bit
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8]
+            .copy_from_slice(&(SH_FLAG_BIT | 100).to_le_bytes());
+        assert!(sh_page_next(&page).is_err());
     }
 
     #[test]
@@ -401,6 +422,20 @@ mod tests {
         page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
             .copy_from_slice(&((SH_PAGE_FK_CAP + 1) as u16).to_le_bytes());
         assert!(sh_page_n_fks(&page).is_err());
+        assert!(sh_page_entries(&page).is_err());
+    }
+
+    #[test]
+    fn page_entries_reject_null_and_flagged_fk_bytes() {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        // n_fks=1 with null fk body
+        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].copy_from_slice(&1u16.to_le_bytes());
+        page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(sh_page_entries(&page).is_err());
+        // flagged fk body
+        page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + 8]
+            .copy_from_slice(&(SH_FLAG_BIT | 9).to_le_bytes());
         assert!(sh_page_entries(&page).is_err());
     }
 }

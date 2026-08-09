@@ -113,4 +113,17 @@ mod tests {
         try_for_each_parallel(&empty, |_| Ok(())).unwrap();
         try_for_each_parallel(&[1u32], |_| Ok(())).unwrap();
     }
+
+    #[test]
+    fn spawn_detached_runs_work() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::sync_channel(1);
+        spawn_detached(move || {
+            let _ = tx.send(42u32);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            42
+        );
+    }
 }

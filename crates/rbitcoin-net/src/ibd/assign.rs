@@ -545,13 +545,14 @@ mod tests {
 
         st.height_to_hash.clear();
         let hole = h(21);
-        let ready = h(22);
+        let zombie = h(22);
         st.height_to_hash.insert(0, hole);
-        st.height_to_hash.insert(1, ready);
+        st.height_to_hash.insert(1, zombie);
         st.body.mark_missing(hole);
-        st.body.mark_pending(ready);
+        // Pending without body queue is a fetch hole (not claim-ready).
+        st.body.mark_pending(zombie);
         let holes = contiguous_tip_holes(&mut st, &hub, 8);
-        assert_eq!(holes, vec![hole]);
+        assert_eq!(holes, vec![hole, zombie]);
 
         let mut room = 10usize;
         let mut issued = 0u64;

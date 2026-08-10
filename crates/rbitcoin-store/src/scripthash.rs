@@ -20,8 +20,8 @@ use crate::scripthash_layout::{
 use crate::scripthash_overflow::{ovf_dir, ovf_seg_path};
 use crate::scripthash_overflow::{ovf_segment_slots, ShOverflowStack};
 use crate::scripthash_pages::{
-    sh_page_count_for_entries, sh_page_decode_slice, sh_page_init_empty, sh_page_pack,
-    sh_page_set_next, sh_page_try_append, SH_PAGE_FK_CAP, SH_PAGE_SIZE,
+    sh_page_count_for_entries, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk,
+    sh_page_pack, sh_page_set_next, sh_page_try_append, SH_PAGE_FK_CAP, SH_PAGE_SIZE,
 };
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
@@ -700,14 +700,44 @@ impl ScriptHashTable {
     fn collect_page_chain(&self, first_page: u64) -> Result<Vec<ShEntry>, StoreError> {
         let mut out = Vec::new();
         let mut off = first_page;
+        let mut prev_last: Option<u64> = None;
         while off != 0 {
             let mut page = [0u8; SH_PAGE_SIZE];
             self.body.read_at(off, &mut page)?;
             let (next, ents) = sh_page_decode_slice(&page)?;
+            if let (Some(pl), Some(first)) = (prev_last, ents.first()) {
+                if first.create_tx_fk.0 <= pl {
+                    return Err(StoreError::Corrupt(
+                        "invariant: scripthash page chain create_fks not strictly increasing",
+                    ));
+                }
+            }
+            if let Some(last) = ents.last() {
+                prev_last = Some(last.create_tx_fk.0);
+            }
             out.extend(ents);
             off = next;
         }
         Ok(out)
+    }
+
+    /// Max durable create_tx_fk for a head value (**last page only** when paged).
+    ///
+    /// Sorted-chain invariant: max is the last entry of the last page (or max
+    /// inline FK). Never walks earlier pages.
+    pub fn last_create_fk_for_value(&self, val: &ShHeadValue) -> Result<Option<Fk>, StoreError> {
+        match val {
+            ShHeadValue::Empty => Ok(None),
+            ShHeadValue::Inline { .. } => {
+                let ents = val.inline_entries();
+                Ok(ents.iter().map(|e| e.create_tx_fk).max_by_key(|f| f.0))
+            }
+            ShHeadValue::Paged { last_page, .. } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                self.body.read_at(*last_page, &mut page)?;
+                sh_page_last_fk(&page)
+            }
+        }
     }
 
     pub fn contains_create(
@@ -715,21 +745,34 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
         create_tx_fk: Fk,
     ) -> Result<bool, StoreError> {
-        for (_fk, rec) in self.entries(scripthash)? {
-            if rec.create_tx_fk == create_tx_fk {
-                return Ok(true);
+        if create_tx_fk.is_null() {
+            return Ok(false);
+        }
+        let Some(val) = self.head_value(scripthash)? else {
+            return Ok(false);
+        };
+        // Sorted chains: present iff create_tx_fk ≤ max and (equal max or in chain).
+        // Equality to max is enough for common re-queue of last create; lower may
+        // still need a walk for exact contains — keep full walk for API accuracy.
+        match self.last_create_fk_for_value(&val)? {
+            None => Ok(false),
+            Some(max) if create_tx_fk.0 > max.0 => Ok(false),
+            Some(max) if create_tx_fk.0 == max.0 => Ok(true),
+            Some(_) => {
+                for (_fk, rec) in self.entries(scripthash)? {
+                    if rec.create_tx_fk == create_tx_fk {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
-        Ok(false)
     }
 
-    /// Append a create (idempotent on create_tx_fk).
+    /// Append a create (idempotent: `fk ≤ max` existing is a no-op).
     pub fn put_create(&self, rec: &ScriptHashRecord) -> Result<(), StoreError> {
         if rec.create_tx_fk.is_null() {
             return Err(StoreError::InvalidFk);
-        }
-        if self.contains_create(&rec.scripthash, rec.create_tx_fk)? {
-            return Ok(());
         }
         let mut heads = HashMap::new();
         if let Some(v) = self.head_value(&rec.scripthash)? {
@@ -739,51 +782,26 @@ impl ScriptHashTable {
         Ok(())
     }
 
-    /// Bulk append with durable dup walk. Returns how many were written.
+    /// Bulk append. Re-queued FKs `≤` durable max are skipped; only higher FKs
+    /// are written. Returns how many were written.
     pub fn put_create_batch(&self, recs: &[ScriptHashRecord]) -> Result<usize, StoreError> {
         if recs.is_empty() {
             return Ok(0);
         }
-        let mut known: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
-        let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
-        for rec in recs {
-            if !known.contains_key(&rec.scripthash) {
-                let mut fks = Vec::new();
-                for (_fk, e) in self.entries(&rec.scripthash)? {
-                    fks.push(e.create_tx_fk);
-                }
-                known.insert(rec.scripthash, fks);
-                if let Some(v) = self.head_value(&rec.scripthash)? {
-                    heads.insert(rec.scripthash, v);
-                }
-            }
-        }
-        let filtered: Vec<ScriptHashRecord> = recs
-            .iter()
-            .filter(|rec| {
-                if rec.create_tx_fk.is_null() {
-                    return false;
-                }
-                let durable = known
-                    .get(&rec.scripthash)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                !durable.contains(&rec.create_tx_fk)
-            })
-            .cloned()
-            .collect();
-        let (n, _) = self.put_create_batch_append(&filtered, &mut heads)?;
+        let mut heads = HashMap::new();
+        let (n, _) = self.put_create_batch_append(recs, &mut heads)?;
         Ok(n)
     }
 
-    /// Forward-append creates (no durable chain walk). Process-local `heads` map.
+    /// Forward-append creates. Process-local `heads` map.
     ///
-    /// Tip-mode / steady-state path (not cold bulk materialize). Returns
-    /// `(written_count, timing)`.
+    /// Per scripthash key: sort create_tx_fks ascending, skip every `fk ≤` durable
+    /// max (last page only), append the rest. **No full page-chain walk** on
+    /// insert. Callers must apply SH batches in non-decreasing block/batch time
+    /// order so skipped re-queues do not leave permanent holes.
     ///
-    /// Creates for the **same scripthash** are applied in one body write (after
-    /// sorting). Head upserts use **no rehash**: existing main keys stay on main;
-    /// new keys go to main until seal load (~0.8), then to overflow.
+    /// Head upserts use **no rehash**: existing main keys stay on main; new keys
+    /// go to main until seal load (~0.8), then to overflow.
     pub fn put_create_batch_append(
         &self,
         recs: &[ScriptHashRecord],
@@ -814,8 +832,6 @@ impl ScriptHashTable {
                         continue;
                     }
                     if heads.contains_key(&rec.scripthash) {
-                        // Caller pre-seeded value; home resolved after seed loop
-                        // via key_home (must not mark Absent — sealed main appends).
                         continue;
                     }
                     if seen_miss.insert(rec.scripthash) {
@@ -834,7 +850,6 @@ impl ScriptHashTable {
                     still.push(key);
                 }
             }
-            // Overflow stack probe for keys missing on main.
             if !still.is_empty() {
                 let g = self.overflow.lock().unwrap();
                 for key in still {
@@ -847,14 +862,12 @@ impl ScriptHashTable {
                 }
             }
         }
-        // Resolve home for pre-seeded keys (caller map) and first-touch cold body.
         for &i in &order {
             let key = recs[i].scripthash;
             if home.contains_key(&key) {
                 continue;
             }
             if heads.contains_key(&key) {
-                // Prefer main if present there; else overflow; else treat as new.
                 home.insert(key, self.key_home(&key)?);
             } else {
                 home.insert(key, KeyHome::Absent);
@@ -862,8 +875,7 @@ impl ScriptHashTable {
         }
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        // Walk sorted order; one body write per distinct scripthash with all
-        // new create_tx_fks for that key.
+        // Walk scripthash-sorted order; per key: sort FKs, skip ≤ max, append.
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
         let mut written = 0usize;
@@ -877,45 +889,36 @@ impl ScriptHashTable {
                 continue;
             }
             let key = rec0.scripthash;
-            let mut new_ents: Vec<ShEntry> = Vec::new();
-            // HashSet: hot scripts can appear many times in one batch.
-            let mut seen_fk: crate::U64Set = crate::U64Set::default();
+            let mut fk_vals: Vec<u64> = Vec::new();
             while i < order.len() {
                 let rec = &recs[order[i]];
                 if rec.scripthash != key {
                     break;
                 }
-                if !rec.create_tx_fk.is_null() && seen_fk.insert(rec.create_tx_fk.0) {
-                    new_ents.push(ShEntry::new(rec.create_tx_fk));
+                if !rec.create_tx_fk.is_null() {
+                    fk_vals.push(rec.create_tx_fk.0);
                 }
                 i += 1;
             }
-            if new_ents.is_empty() {
+            if fk_vals.is_empty() {
                 continue;
             }
+            fk_vals.sort_unstable();
+            fk_vals.dedup();
 
             let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let mut old_live = self.collect_entries_locked(&cur)?;
-            // Linear any() over large lists (busy scripthashes) pegs one core on
-            // warm residual apply; HashSet is O(1) per new create.
-            let add: Vec<ShEntry> = if old_live.len() <= 8 {
-                new_ents
-                    .into_iter()
-                    .filter(|e| !old_live.iter().any(|o| o.create_tx_fk == e.create_tx_fk))
-                    .collect()
-            } else {
-                let have: crate::U64Set = old_live.iter().map(|o| o.create_tx_fk.0).collect();
-                new_ents
-                    .into_iter()
-                    .filter(|e| !have.contains(&e.create_tx_fk.0))
-                    .collect()
-            };
+            let max = self.last_create_fk_for_value(&cur)?;
+            let max_u = max.map(|f| f.0).unwrap_or(0);
+            let add: Vec<ShEntry> = fk_vals
+                .into_iter()
+                .filter(|&fk| max.is_none() || fk > max_u)
+                .map(|fk| ShEntry::new(Fk(fk)))
+                .collect();
             if add.is_empty() {
                 continue;
             }
             written += add.len();
-            old_live.extend(add);
-            let new_val = self.write_entries_for_key(&mut alloc, &cur, &old_live)?;
+            let new_val = self.append_sorted_creates(&mut alloc, &cur, &add)?;
             heads.insert(key, new_val.clone());
             let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
             head_final.push((key, new_val, kh));
@@ -1012,12 +1015,9 @@ impl ScriptHashTable {
         self.collect_entries(&[0u8; 32], val)
     }
 
-    /// Pack `live` (full set, oldest→newest) into inline or page chain.
-    ///
-    /// **Append-only growth:** when `old` is already paged and `live` is a pure
-    /// extension of the on-disk chain, only new tail FKs are written (RMW last
-    /// page / link new pages). Shrinks / reorder (unlink) rewrite a fresh chain.
-    fn write_entries_for_key(
+    /// Rewrite full sorted chain for a key (unlink / rare full rebuild).
+    /// Prefer [`Self::append_sorted_creates`] for tip append.
+    fn rewrite_entries_for_key(
         &self,
         alloc: &mut AllocState,
         old: &ShHeadValue,
@@ -1036,6 +1036,14 @@ impl ScriptHashTable {
             self.free_if_paged(alloc, old)?;
             return Ok(ShHeadValue::Empty);
         }
+        // Ensure sorted before pack.
+        for w in live.windows(2) {
+            if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
+                return Err(StoreError::Corrupt(
+                    "invariant: scripthash rewrite create_fks not strictly increasing",
+                ));
+            }
+        }
         if n <= SH_INLINE_CAP as u32 {
             self.free_if_paged(alloc, old)?;
             return Ok(if n == 1 {
@@ -1044,31 +1052,65 @@ impl ScriptHashTable {
                 ShHeadValue::inline_two(live[0], live[1])
             });
         }
-
-        // Pure append onto existing page chain when prefix matches.
-        if let ShHeadValue::Paged {
-            first_page,
-            last_page,
-        } = old
-        {
-            if old_n as usize <= live.len()
-                && old_list
-                    .iter()
-                    .zip(live.iter())
-                    .all(|(a, b)| a.create_tx_fk == b.create_tx_fk)
-            {
-                let tail = &live[old_n as usize..];
-                if tail.is_empty() {
-                    return Ok(old.clone());
-                }
-                let last = self.append_fks_to_pages(alloc, *first_page, *last_page, tail)?;
-                return Ok(ShHeadValue::paged(*first_page, last));
-            }
-        }
-
         self.free_if_paged(alloc, old)?;
         let (first, last) = self.write_new_page_chain(alloc, live)?;
         Ok(ShHeadValue::paged(first, last))
+    }
+
+    /// Append strictly increasing `new_ents` (all already `> durable max`) without
+    /// walking the full page chain. Body I/O: fill last page + optional new pages.
+    fn append_sorted_creates(
+        &self,
+        alloc: &mut AllocState,
+        old: &ShHeadValue,
+        new_ents: &[ShEntry],
+    ) -> Result<ShHeadValue, StoreError> {
+        if new_ents.is_empty() {
+            return Ok(old.clone());
+        }
+        // Defensive: batch must be strictly increasing.
+        for w in new_ents.windows(2) {
+            if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
+                return Err(StoreError::Corrupt(
+                    "invariant: scripthash append batch create_fks not strictly increasing",
+                ));
+            }
+        }
+        alloc.live_count = alloc.live_count.saturating_add(new_ents.len() as u64);
+
+        match old {
+            ShHeadValue::Empty => {
+                if new_ents.len() <= SH_INLINE_CAP {
+                    return Ok(if new_ents.len() == 1 {
+                        ShHeadValue::inline_one(new_ents[0])
+                    } else {
+                        ShHeadValue::inline_two(new_ents[0], new_ents[1])
+                    });
+                }
+                let (first, last) = self.write_new_page_chain(alloc, new_ents)?;
+                Ok(ShHeadValue::paged(first, last))
+            }
+            ShHeadValue::Inline { .. } => {
+                let mut live = old.inline_entries().to_vec();
+                live.extend_from_slice(new_ents);
+                if live.len() <= SH_INLINE_CAP {
+                    return Ok(if live.len() == 1 {
+                        ShHeadValue::inline_one(live[0])
+                    } else {
+                        ShHeadValue::inline_two(live[0], live[1])
+                    });
+                }
+                let (first, last) = self.write_new_page_chain(alloc, &live)?;
+                Ok(ShHeadValue::paged(first, last))
+            }
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
+                let last = self.append_fks_to_pages(alloc, *first_page, *last_page, new_ents)?;
+                Ok(ShHeadValue::paged(*first_page, last))
+            }
+        }
     }
 
     fn write_new_page_chain(
@@ -1201,9 +1243,10 @@ impl ScriptHashTable {
         let Some(pos) = live.iter().position(|e| e.create_tx_fk == create_tx_fk) else {
             return Ok(false);
         };
-        live.swap_remove(pos);
+        live.remove(pos); // keep remaining order; sort if swap would break
+        live.sort_by_key(|e| e.create_tx_fk.0);
         let mut alloc = self.alloc.lock().unwrap();
-        let new_val = self.write_entries_for_key(&mut alloc, &val, &live)?;
+        let new_val = self.rewrite_entries_for_key(&mut alloc, &val, &live)?;
         write_alloc_header(&self.body, &alloc)?;
         drop(alloc);
         match home {
@@ -1434,12 +1477,25 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.shards_flushed
     }
 
-    /// Pack one key's live creates (oldest→newest). Empty chains are skipped.
+    /// Pack one key's live creates (**strictly increasing** create_tx_fk). Empty skipped.
     ///
     /// Keys must be presented in **non-decreasing scripthash order** (sorted-run
     /// merge). Crossing a prefix-shard boundary installs the previous live image.
+    /// FKs are sorted+deduped here so merge-stream order glitches never break pages.
     pub fn put_chain(&mut self, key: [u8; 32], entries: &[ShEntry]) -> Result<(), StoreError> {
-        let n = entries.len() as u32;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Sort+dedup create_tx_fk ascending (cold stream may interleave within key).
+        let mut fks: Vec<u64> = entries
+            .iter()
+            .filter(|e| !e.create_tx_fk.is_null())
+            .map(|e| e.create_tx_fk.0)
+            .collect();
+        fks.sort_unstable();
+        fks.dedup();
+        let sorted: Vec<ShEntry> = fks.into_iter().map(|fk| ShEntry::new(Fk(fk))).collect();
+        let n = sorted.len() as u32;
         if n == 0 {
             return Ok(());
         }
@@ -1465,15 +1521,15 @@ impl<'a> ScriptHashBulkSession<'a> {
 
         let val = if n <= SH_INLINE_CAP as u32 {
             if n == 1 {
-                ShHeadValue::inline_one(entries[0])
+                ShHeadValue::inline_one(sorted[0])
             } else {
-                ShHeadValue::inline_two(entries[0], entries[1])
+                ShHeadValue::inline_two(sorted[0], sorted[1])
             }
         } else {
             // Flush streaming body, then write page chain at bump (aligned).
             self.flush_body()?;
             let (first, last, new_bump) =
-                Self::bulk_write_page_chain(&self.table.body, self.bump, entries)?;
+                Self::bulk_write_page_chain(&self.table.body, self.bump, &sorted)?;
             self.bump = new_bump;
             self.body_write_off = new_bump;
             ShHeadValue::paged(first, last)
@@ -1979,6 +2035,49 @@ mod tests {
         let n2 = t.put_create_batch(&recs).unwrap();
         assert_eq!(n2, 0);
         assert_eq!(t.entries(&sh).unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-queued lower/equal FKs are skipped; only higher append. Multi-page max
+    /// from last page only (sorted chain).
+    #[test]
+    fn put_create_batch_skips_leq_max_appends_higher() {
+        use crate::scripthash_pages::SH_PAGE_FK_CAP;
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0xab]);
+        // Fill past two pages so last page holds the max.
+        let n = SH_PAGE_FK_CAP * 2 + 5;
+        let first: Vec<_> = (1..=n as u64).map(|i| rec(sh, i, 0)).collect();
+        assert_eq!(t.put_create_batch(&first).unwrap(), n);
+        assert_eq!(t.entries(&sh).unwrap().len(), n);
+        let max = t
+            .last_create_fk_for_value(&t.head_value(&sh).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(max, Fk(n as u64));
+
+        // Mix re-queued older FKs with new higher ones.
+        let batch = vec![
+            rec(sh, 1, 0),
+            rec(sh, n as u64 / 2, 0),
+            rec(sh, n as u64, 0),
+            rec(sh, n as u64 + 1, 0),
+            rec(sh, n as u64 + 3, 0),
+            rec(sh, n as u64 + 2, 0), // unsorted in batch
+        ];
+        let written = t.put_create_batch(&batch).unwrap();
+        assert_eq!(written, 3, "only fks > max must be written");
+        let got = t.entries(&sh).unwrap();
+        assert_eq!(got.len(), n + 3);
+        for (i, (_, e)) in got.iter().enumerate() {
+            assert_eq!(e.create_tx_fk.0, (i as u64) + 1);
+        }
+        // Only-lower batch is no-op.
+        assert_eq!(
+            t.put_create_batch(&[rec(sh, 1, 0), rec(sh, 2, 0)]).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

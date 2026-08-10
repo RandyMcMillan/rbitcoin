@@ -275,7 +275,28 @@ Used where the key is a 32 B hash and the value is a single fk (or multi-list)
 
 ## Class B — scripthash (Electrum)
 
-Thin create index: **create_tx_fk only** (no vout in the index).
+Thin create index: **create_tx_fk only** (no vout in the index). Creates only
+(outputs); spends join via Class A + spend annotations.
+
+### Sorted create_fk invariant
+
+For each key, durable create_tx_fks are **strictly increasing** by `create_tx_fk.0`
+(within each page and across pages: last of page *i* < first of page *i+1*).
+
+**Insert / batch model (tip + warm residual):**
+
+1. Read **max existing** FK (**last page only** when paged; inline from head).
+2. From the batch (sort+dedup by fk), **skip every `fk ≤ max`** (re-queue / HWM
+   replay is safe — not a hard error).
+3. Append remaining higher FKs: fill last page (one write) + new full pages with
+   `next` known (one write each). **No full chain walk** on insert.
+
+**Caller contract:** apply SH create batches for a key in **non-decreasing
+block/batch time order**. Skipping lower fks assumes an earlier batch already
+wrote them; inserting a later block before an earlier one can leave permanent holes.
+
+Cold bulk: page-once pack (`next` predicted; no previous-page RMW). Megakeys
+stream page N in RAM → write → page N+1.
 
 ### Head
 
@@ -298,7 +319,7 @@ Thin create index: **create_tx_fk only** (no vout in the index).
 | Mode | When | Value (`w0`, `w1`) |
 |------|------|---------------------|
 | Empty | no creates | `0`, `0` |
-| Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` |
+| Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` (fk0 < fk1) |
 | **Paged** | ≥3 | bit63=1, **first** page off; bit63=0, **last** page off |
 
 Schema-13 **slab** packing (flag + class/used + slab off) is **rejected** on decode —
@@ -307,9 +328,10 @@ rebuild / rematerialize SH (no dual-read).
 ### Body pages (schema 14)
 
 - After RBT1 header: 4 KiB alloc page (`SHAL`) + **fixed 4096 B pages**.
-- Page layout: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to **510** create_tx_fks.
+- Page layout: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to **510** create_tx_fks (**strictly increasing**).
 - Chain is singly linked first→last; head stores first+last for O(1) walk start and append target.
-- Append-only growth RMW last page / link a new page (page freelist reuses class-7 4 KiB slots).
+- Append-only growth: RMW **last page only** / link new pages (page freelist reuses class-7 4 KiB slots).
+- Encode/decode refuse unsorted pages; collect refuses cross-page order breaks.
 
 ### Query join
 

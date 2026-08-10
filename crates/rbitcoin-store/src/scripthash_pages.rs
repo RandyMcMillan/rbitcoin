@@ -238,12 +238,14 @@ fn sh_page_set_n_fks(page: &mut [u8; SH_PAGE_SIZE], n: u16) {
     page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].copy_from_slice(&n.to_le_bytes());
 }
 
-/// Entries currently stored in the page (oldest → newest within page).
+/// Entries currently stored in the page (**strictly increasing** create_tx_fk).
 ///
 /// Uses [`ShEntry`] encode/decode (same 8 B layout as slab body entries).
+/// Refuses equal/decreasing consecutive FKs (durable corruption or bad pack).
 pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreError> {
     let n = sh_page_n_fks(page)? as usize;
     let mut out = Vec::with_capacity(n);
+    let mut prev: Option<u64> = None;
     for i in 0..n {
         let off = SH_PAGE_OFF_FKS + i * SH_ENTRY_LEN;
         let e = ShEntry::decode(&page[off..off + SH_ENTRY_LEN])?;
@@ -253,9 +255,37 @@ pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreE
         if e.create_tx_fk.0 & SH_FLAG_BIT != 0 {
             return Err(StoreError::Corrupt("scripthash page fk has flag bit set"));
         }
+        if let Some(p) = prev {
+            if e.create_tx_fk.0 <= p {
+                return Err(StoreError::Corrupt(
+                    "invariant: scripthash page create_fks not strictly increasing",
+                ));
+            }
+        }
+        prev = Some(e.create_tx_fk.0);
         out.push(e);
     }
     Ok(out)
+}
+
+/// Last create_tx_fk on this page (`None` if empty).
+#[inline]
+pub fn sh_page_last_fk(page: &[u8; SH_PAGE_SIZE]) -> Result<Option<Fk>, StoreError> {
+    let n = sh_page_n_fks(page)? as usize;
+    if n == 0 {
+        return Ok(None);
+    }
+    let off = SH_PAGE_OFF_FKS + (n - 1) * SH_ENTRY_LEN;
+    let e = ShEntry::decode(&page[off..off + SH_ENTRY_LEN])?;
+    if e.is_null() {
+        return Err(StoreError::Corrupt("scripthash page null last fk"));
+    }
+    if e.create_tx_fk.0 & SH_FLAG_BIT != 0 {
+        return Err(StoreError::Corrupt(
+            "scripthash page last fk has flag bit set",
+        ));
+    }
+    Ok(Some(e.create_tx_fk))
 }
 
 /// Number of 4 KiB pages needed for `n` create entries (`0` → `0`).
@@ -268,7 +298,8 @@ pub fn sh_page_count_for_entries(n: usize) -> usize {
     }
 }
 
-/// Pack up to [`SH_PAGE_FK_CAP`] entries into a fresh page with `next_page_off` already set.
+/// Pack up to [`SH_PAGE_FK_CAP`] **strictly increasing** entries into a fresh page
+/// with `next_page_off` already set.
 ///
 /// Cold bulk and new-chain writers use this so each page is written **once** with its
 /// next link known up front — no read-modify-write of the previous page.
@@ -281,6 +312,14 @@ pub fn sh_page_pack(
         return Err(StoreError::Corrupt(
             "scripthash page pack: entries exceed page capacity",
         ));
+    }
+    // Pre-check strictly increasing so pack fails cleanly (not mid-page).
+    for w in entries.windows(2) {
+        if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash page pack create_fks not strictly increasing",
+            ));
+        }
     }
     sh_page_init_empty(page);
     sh_page_set_next(page, next_off)?;
@@ -300,6 +339,10 @@ pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool,
 }
 
 /// Append one [`ShEntry`] to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
+///
+/// Requires `entry.create_tx_fk` **strictly greater** than the page's last FK when
+/// non-empty (sorted page chain invariant). Equal/lower is a pack/encode bug —
+/// durable re-queue of lower FKs is filtered **before** append by table writers.
 pub fn sh_page_try_append_entry(
     page: &mut [u8; SH_PAGE_SIZE],
     entry: ShEntry,
@@ -315,6 +358,13 @@ pub fn sh_page_try_append_entry(
     let n = sh_page_n_fks(page)? as usize;
     if n >= SH_PAGE_FK_CAP {
         return Ok(false);
+    }
+    if let Some(last) = sh_page_last_fk(page)? {
+        if entry.create_tx_fk.0 <= last.0 {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash page append create_fk not strictly increasing",
+            ));
+        }
     }
     let off = SH_PAGE_OFF_FKS + n * SH_ENTRY_LEN;
     let enc = entry.encode();
@@ -479,6 +529,35 @@ mod tests {
             .collect();
         let mut page = [0u8; SH_PAGE_SIZE];
         assert!(sh_page_pack(&mut page, &too_many, 0).is_err());
+    }
+
+    #[test]
+    fn page_fks_must_be_strictly_increasing() {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        assert!(sh_page_try_append(&mut page, Fk(10)).unwrap());
+        assert!(sh_page_try_append(&mut page, Fk(20)).unwrap());
+        // Equal / lower rejected at append (encode bug), not silent.
+        assert!(sh_page_try_append(&mut page, Fk(20)).is_err());
+        assert!(sh_page_try_append(&mut page, Fk(5)).is_err());
+        assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(20)));
+
+        // Pack rejects unsorted input.
+        let unsorted = vec![
+            ShEntry::new(Fk(3)),
+            ShEntry::new(Fk(1)),
+            ShEntry::new(Fk(2)),
+        ];
+        assert!(sh_page_pack(&mut page, &unsorted, 0).is_err());
+
+        // Decode refuses durable unsorted bytes (plant equal consecutive).
+        sh_page_init_empty(&mut page);
+        sh_page_try_append(&mut page, Fk(1)).unwrap();
+        sh_page_try_append(&mut page, Fk(2)).unwrap();
+        // Overwrite second fk to 1 without going through append.
+        let off = SH_PAGE_OFF_FKS + SH_ENTRY_LEN;
+        page[off..off + SH_ENTRY_LEN].copy_from_slice(&ShEntry::new(Fk(1)).encode());
+        assert!(sh_page_entries(&page).is_err());
     }
 
     #[test]

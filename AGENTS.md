@@ -44,6 +44,18 @@ additional fields (which will also have the inner object).
 In short, prefer composition over mutation as well as composition over
 inheritance.
 
+## Scripthash (Class B) insert rules
+
+| Rule | Detail |
+|------|--------|
+| Creates only | Index is thin `create_tx_fk` per Electrum scripthash (outputs); spends join Class A + annotations |
+| Sorted FKs | Durable create_tx_fks per key are **strictly increasing** (within pages and across pages) |
+| Insert | Max FK from **last page only** (or inline); **skip `fk ≤ max`** (re-queue OK); append higher only — **no full chain walk** on insert |
+| Batch order | Callers must apply SH create batches in **non-decreasing block/batch time order** so skip-lower never leaves holes |
+| Cold megakey | Pack each 4 KiB page in RAM with `next` predicted; **one write per page** (no previous-page RMW) |
+
+See `SCHEMA.md` Class B and `scripthash_pages.rs`.
+
 ## Store concurrency: lock-free by default
 
 **Default: no locks on the store hot path.** Concurrency is **roles + publish

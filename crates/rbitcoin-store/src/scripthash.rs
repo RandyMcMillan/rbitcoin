@@ -20,7 +20,8 @@ use crate::scripthash_layout::{
 use crate::scripthash_overflow::{ovf_dir, ovf_seg_path};
 use crate::scripthash_overflow::{ovf_segment_slots, ShOverflowStack};
 use crate::scripthash_pages::{
-    sh_page_decode_slice, sh_page_init_empty, sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE,
+    sh_page_count_for_entries, sh_page_decode_slice, sh_page_init_empty, sh_page_pack,
+    sh_page_set_next, sh_page_try_append, SH_PAGE_FK_CAP, SH_PAGE_SIZE,
 };
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
@@ -1078,43 +1079,23 @@ impl ScriptHashTable {
         if live.is_empty() {
             return Err(StoreError::Corrupt("scripthash empty page chain"));
         }
-        let mut first = 0u64;
-        let mut last = 0u64;
+        // Pre-allocate all pages, then pack each with next known — one write per page
+        // (no RMW of the previous page to fix up next). Offsets may be non-contiguous
+        // when freelist reuses slabs.
+        let n_pages = sh_page_count_for_entries(live.len());
+        let mut offs = Vec::with_capacity(n_pages);
+        for _ in 0..n_pages {
+            offs.push(self.alloc_page(alloc)?);
+        }
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_init_empty(&mut page);
-        let mut have_page = false;
-        for e in live {
-            loop {
-                if sh_page_try_append(&mut page, e.create_tx_fk)? {
-                    if !have_page {
-                        let off = self.alloc_page(alloc)?;
-                        if first == 0 {
-                            first = off;
-                        } else {
-                            let mut prev = [0u8; SH_PAGE_SIZE];
-                            self.body.read_at(last, &mut prev)?;
-                            sh_page_set_next(&mut prev, off)?;
-                            self.body.write_at(last, &prev)?;
-                        }
-                        last = off;
-                        have_page = true;
-                    }
-                    break;
-                }
-                // Current page full — must already be allocated.
-                if !have_page {
-                    return Err(StoreError::Corrupt("scripthash page full before alloc"));
-                }
-                self.body.write_at(last, &page)?;
-                sh_page_init_empty(&mut page);
-                have_page = false;
-            }
+        for (pi, &off) in offs.iter().enumerate() {
+            let start = pi * SH_PAGE_FK_CAP;
+            let end = (start + SH_PAGE_FK_CAP).min(live.len());
+            let next = offs.get(pi + 1).copied().unwrap_or(0);
+            sh_page_pack(&mut page, &live[start..end], next)?;
+            self.body.write_at(off, &page)?;
         }
-        if first == 0 || !have_page {
-            return Err(StoreError::Corrupt("scripthash page chain write failed"));
-        }
-        self.body.write_at(last, &page)?;
-        Ok((first, last))
+        Ok((offs[0], *offs.last().expect("n_pages >= 1")))
     }
 
     /// Append `tail` FKs onto an existing chain ending at `last_page`.
@@ -1126,11 +1107,15 @@ impl ScriptHashTable {
         tail: &[ShEntry],
     ) -> Result<u64, StoreError> {
         let _ = first_page;
+        if tail.is_empty() {
+            return Ok(last_page);
+        }
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         self.body.read_at(last, &mut page)?;
         for e in tail {
             if !sh_page_try_append(&mut page, e.create_tx_fk)? {
+                // Roll: write full page once with next set, start empty successor.
                 let new_off = self.alloc_page(alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 self.body.write_at(last, &page)?;
@@ -1138,8 +1123,9 @@ impl ScriptHashTable {
                 assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
                 last = new_off;
             }
-            self.body.write_at(last, &page)?;
         }
+        // Single write of the open last page (was per-FK write_at before).
+        self.body.write_at(last, &page)?;
         Ok(last)
     }
 
@@ -1551,55 +1537,40 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Write a full page chain at `bump` (4 KiB aligned). Returns (first, last, new_bump).
+    ///
+    /// Contiguous layout: pack each page with `next` known, **one** `write_at` per page.
+    /// (Previously: write full page with next=0, then RMW previous when allocating next.)
     fn bulk_write_page_chain(
         body: &TableFile,
         bump: u64,
         entries: &[ShEntry],
     ) -> Result<(u64, u64, u64), StoreError> {
-        let mut bump = (bump + 4095) & !4095;
-        let mut first = 0u64;
-        let mut last = 0u64;
-        let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_init_empty(&mut page);
-        let mut have = false;
-        for e in entries {
-            loop {
-                if sh_page_try_append(&mut page, e.create_tx_fk)? {
-                    if !have {
-                        let off = bump;
-                        bump = bump.saturating_add(SH_PAGE_SIZE as u64);
-                        body.ensure_capacity(bump)?;
-                        if bump > body.logical_len() {
-                            body.set_logical_len(bump)?;
-                        }
-                        if first == 0 {
-                            first = off;
-                        } else {
-                            let mut prev = [0u8; SH_PAGE_SIZE];
-                            body.read_at(last, &mut prev)?;
-                            sh_page_set_next(&mut prev, off)?;
-                            body.write_at(last, &prev)?;
-                        }
-                        last = off;
-                        have = true;
-                    }
-                    break;
-                }
-                if !have {
-                    return Err(StoreError::Corrupt(
-                        "scripthash bulk page full before alloc",
-                    ));
-                }
-                body.write_at(last, &page)?;
-                sh_page_init_empty(&mut page);
-                have = false;
-            }
-        }
-        if first == 0 || !have {
+        if entries.is_empty() {
             return Err(StoreError::Corrupt("scripthash bulk page chain empty"));
         }
-        body.write_at(last, &page)?;
-        Ok((first, last, bump))
+        let base = (bump + 4095) & !4095;
+        let n_pages = sh_page_count_for_entries(entries.len());
+        let end = base.saturating_add((n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64));
+        body.ensure_capacity(end)?;
+        if end > body.logical_len() {
+            body.set_logical_len(end)?;
+        }
+        let mut page = [0u8; SH_PAGE_SIZE];
+        for pi in 0..n_pages {
+            let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
+            let start = pi * SH_PAGE_FK_CAP;
+            let end_i = (start + SH_PAGE_FK_CAP).min(entries.len());
+            let next = if pi + 1 < n_pages {
+                off + SH_PAGE_SIZE as u64
+            } else {
+                0
+            };
+            sh_page_pack(&mut page, &entries[start..end_i], next)?;
+            body.write_at(off, &page)?;
+        }
+        let first = base;
+        let last = base + ((n_pages - 1) as u64) * (SH_PAGE_SIZE as u64);
+        Ok((first, last, end))
     }
 
     fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
@@ -2694,6 +2665,60 @@ mod tests {
         let t2 = ScriptHashTable::open(&dir).unwrap();
         assert_eq!(t2.entry_count(), creates);
         assert_eq!(t2.entries(&sh0).unwrap().len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cold bulk megakey: multi-page chain is contiguous at bump (single-pass pack
+    /// writes next links on first write — no previous-page RMW).
+    #[test]
+    fn bulk_session_megakey_page_chain_contiguous_once() {
+        use crate::scripthash_pages::{SH_PAGE_FK_CAP, SH_PAGE_SIZE};
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        // Two full pages + 3 FKs → 3 pages.
+        let n = SH_PAGE_FK_CAP * 2 + 3;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x10;
+        sh[1] = 0xee;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut session = t.bulk_session(1).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        let (creates, keys, _, _) = session.finish().unwrap();
+        assert_eq!(keys, 1);
+        assert_eq!(creates, n as u64);
+        let got = t.entries(&sh).unwrap();
+        assert_eq!(got.len(), n);
+        for (i, (_, e)) in got.iter().enumerate() {
+            assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
+        }
+        let (first, last) = match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => (first_page, last_page),
+            other => panic!("expected paged, got {other:?}"),
+        };
+        // Contiguous bump layout: last = first + (n_pages-1)*4096.
+        assert_eq!(
+            last,
+            first + 2 * SH_PAGE_SIZE as u64,
+            "bulk chain pages must be contiguous at bump"
+        );
+        assert!(first > 0 && first % (SH_PAGE_SIZE as u64) == 0);
+        // Tip-path multi-page (write_new_page_chain) also round-trips same size.
+        let sh2 = script_hash(&[0xef]);
+        let recs: Vec<_> = (1..=n as u32).map(|v| rec(sh2, u64::from(v), v)).collect();
+        assert_eq!(t.put_create_batch(&recs).unwrap(), n);
+        assert_eq!(t.entries(&sh2).unwrap().len(), n);
+        match t.head_value(&sh2).unwrap().unwrap() {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
+                assert_ne!(first_page, last_page);
+            }
+            other => panic!("expected paged, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

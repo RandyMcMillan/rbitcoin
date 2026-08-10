@@ -257,6 +257,42 @@ pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreE
     Ok(out)
 }
 
+/// Number of 4 KiB pages needed for `n` create entries (`0` → `0`).
+#[inline]
+pub fn sh_page_count_for_entries(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n.div_ceil(SH_PAGE_FK_CAP)
+    }
+}
+
+/// Pack up to [`SH_PAGE_FK_CAP`] entries into a fresh page with `next_page_off` already set.
+///
+/// Cold bulk and new-chain writers use this so each page is written **once** with its
+/// next link known up front — no read-modify-write of the previous page.
+pub fn sh_page_pack(
+    page: &mut [u8; SH_PAGE_SIZE],
+    entries: &[ShEntry],
+    next_off: u64,
+) -> Result<(), StoreError> {
+    if entries.len() > SH_PAGE_FK_CAP {
+        return Err(StoreError::Corrupt(
+            "scripthash page pack: entries exceed page capacity",
+        ));
+    }
+    sh_page_init_empty(page);
+    sh_page_set_next(page, next_off)?;
+    for e in entries {
+        if !sh_page_try_append_entry(page, *e)? {
+            return Err(StoreError::Corrupt(
+                "scripthash page pack: page full unexpectedly",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Append one create FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
 pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool, StoreError> {
     sh_page_try_append_entry(page, ShEntry::new(fk))
@@ -395,6 +431,53 @@ mod tests {
         sh_page_init_empty(&mut page);
         assert!(sh_page_try_append(&mut page, Fk::NULL).is_err());
         assert!(sh_page_try_append(&mut page, Fk(SH_FLAG_BIT | 1)).is_err());
+    }
+
+    #[test]
+    fn page_count_for_entries_and_pack_sets_next_before_write() {
+        assert_eq!(sh_page_count_for_entries(0), 0);
+        assert_eq!(sh_page_count_for_entries(1), 1);
+        assert_eq!(sh_page_count_for_entries(SH_PAGE_FK_CAP), 1);
+        assert_eq!(sh_page_count_for_entries(SH_PAGE_FK_CAP + 1), 2);
+        // Two full pages + 3 → three pages (contiguous layout at base).
+        let n = SH_PAGE_FK_CAP * 2 + 3;
+        assert_eq!(sh_page_count_for_entries(n), 3);
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let base = 4096u64;
+        let mut pages = Vec::new();
+        for pi in 0..3 {
+            let start = pi * SH_PAGE_FK_CAP;
+            let end = (start + SH_PAGE_FK_CAP).min(ents.len());
+            let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
+            let next = if pi + 1 < 3 {
+                off + SH_PAGE_SIZE as u64
+            } else {
+                0
+            };
+            let mut page = [0u8; SH_PAGE_SIZE];
+            sh_page_pack(&mut page, &ents[start..end], next).unwrap();
+            assert_eq!(sh_page_next(&page).unwrap(), next);
+            assert_eq!(sh_page_n_fks(&page).unwrap() as usize, end - start);
+            pages.push(page);
+        }
+        assert_eq!(sh_page_next(&pages[0]).unwrap(), base + SH_PAGE_SIZE as u64);
+        assert_eq!(
+            sh_page_next(&pages[1]).unwrap(),
+            base + 2 * SH_PAGE_SIZE as u64
+        );
+        assert_eq!(sh_page_next(&pages[2]).unwrap(), 0);
+        // Reconstruct FK order from packed pages.
+        let mut got = Vec::new();
+        for p in &pages {
+            got.extend(sh_page_entries(p).unwrap());
+        }
+        assert_eq!(got, ents);
+        // Over-capacity pack must fail (no silent truncate).
+        let too_many: Vec<_> = (1..=SH_PAGE_FK_CAP as u64 + 1)
+            .map(|i| ShEntry::new(Fk(i)))
+            .collect();
+        let mut page = [0u8; SH_PAGE_SIZE];
+        assert!(sh_page_pack(&mut page, &too_many, 0).is_err());
     }
 
     #[test]

@@ -20,6 +20,19 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 | Rust crate graph | `Cargo.lock` (crates.io checksums) |
 | Source tree | Flake `self` filtered via cargo-aware `cleanSourceWith` in `nix/rbitcoin.nix` |
 
+### Pin policy (nixpkgs channel)
+
+| Policy | Detail |
+|--------|--------|
+| Channel | NixOS **stable/large** branch (`nixos-YY.MM`) — currently **`nixos-26.05`** |
+| Why not unstable | Hydra-tested channel + official binary cache; less churn for release digests |
+| Lock | Exact commit via `flake.lock`; `shell.nix` / `default.nix` read the same lock |
+| Update cadence | Deliberate (`nix flake update`), ~each stable release or near EOL — not daily |
+| Co-bumps | **crane**, GHA `dtolnay/rust-toolchain@…`, shell `llvmPackages`, AGENTS toolchain strings |
+| Verify after bump | `nix develop` → fmt/clippy/test; `nix build .#rbitcoin-musl` static install |
+
+Channel branches advance only after Hydra succeeds ([channel branches](https://wiki.nixos.org/wiki/Channel_branches); status at [status.nixos.org](https://status.nixos.org/)). That is the “tested snapshot” — not a floating `master` commit.
+
 Release builds set remapped path prefixes and strip symbols so digests do not
 depend on the builder’s checkout path or username.
 

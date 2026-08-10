@@ -1,12 +1,14 @@
 {
   description = "rbitcoin — pinned Nix builds for byte-identical release binaries";
 
-  # Pin advanced via flake.lock (nix flake lock). Do not use import <nixpkgs> {}.
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+  # Track the current NixOS **stable/large** channel (Hydra-tested; cache.nixos.org).
+  # Advance deliberately with `nix flake update` every ~6 months or near channel EOL —
+  # not daily. Exact rev is frozen in flake.lock (never floating import <nixpkgs> {}).
+  # See docs/reproducible-builds.md § pin policy.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   # Layered cargo builds: deps derivation + app derivation (faster rebuilds).
-  # Pin a crane that works with nixos-24.11 rustc (1.82). Latest crane wants
-  # nixpkgs ≥26.05 and pulls edition2024 crates into crane-utils.
-  inputs.crane.url = "github:ipetkov/crane/v0.20.1";
+  # Crane ≥0.23 targets modern nixpkgs; keep in lockstep with the channel bump.
+  inputs.crane.url = "github:ipetkov/crane/v0.23.4";
 
   outputs =
     { self, nixpkgs, crane }:
@@ -37,6 +39,8 @@
           # Optional dynamic glibc package (Nix-store linked; not portable off-store).
           rbitcoin-glibc = mkRbitcoin pkgs;
           # Primary / default: fully static musl — portable operator binary.
+          # callPackage under pkgsStatic so rustc's sysroot includes musl std;
+          # rbitcoin.nix scopes static link flags to the host target only.
           rbitcoin-musl = mkRbitcoin pkgs.pkgsStatic;
         in
         {
@@ -82,8 +86,9 @@
               cargo
               rustfmt
               clippy
-              llvmPackages_19.bintools
-              llvmPackages_19.llvm
+              # Match rustc's LLVM major (nixos-26.05 → rustc 1.95 → LLVM 21).
+              llvmPackages.bintools
+              llvmPackages.llvm
               cargo-llvm-cov
               pkg-config
             ];
@@ -91,8 +96,8 @@
             # Dev shell still denies warnings; release package uses its own RUSTFLAGS.
             RUSTFLAGS = "-Dwarnings";
             shellHook = ''
-              export LLVM_COV="${pkgs.llvmPackages_19.llvm}/bin/llvm-cov"
-              export LLVM_PROFDATA="${pkgs.llvmPackages_19.llvm}/bin/llvm-profdata"
+              export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
+              export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
               echo "rbitcoin devShell: rustc=$(rustc --version) (pinned nixpkgs via flake)"
             '';
           };

@@ -20,8 +20,9 @@ pkgs.mkShell {
     cargo
     rustfmt
     clippy
-    llvmPackages_19.bintools
-    llvmPackages_19.llvm
+    # Match rustc's LLVM major (nixos-26.05 → rustc 1.95 → LLVM 21).
+    llvmPackages.bintools
+    llvmPackages.llvm
     cargo-llvm-cov
     pkg-config
   ];
@@ -30,8 +31,8 @@ pkgs.mkShell {
   # Deny rustc warnings for first-party crates (also via workspace.lints).
   RUSTFLAGS = "-Dwarnings";
   shellHook = ''
-    export LLVM_COV="${pkgs.llvmPackages_19.llvm}/bin/llvm-cov"
-    export LLVM_PROFDATA="${pkgs.llvmPackages_19.llvm}/bin/llvm-profdata"
+    export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
+    export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
     echo "rbitcoin shell.nix: rustc=$(rustc --version) (pinned via flake.lock)"
   '';
 }

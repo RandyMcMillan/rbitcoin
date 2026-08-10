@@ -96,7 +96,7 @@ impl SealedFuse8 {
         let filter = self
             .filter
             .as_ref()
-            .ok_or_else(|| StoreError::Corrupt("fuse8 write always-probe placeholder"))?;
+            .ok_or(StoreError::Corrupt("fuse8 write always-probe placeholder"))?;
         let body = encode_body(filter);
         let mut f = File::create(path).map_err(|e| StoreError::io(path, e))?;
         f.write_all(MAGIC).map_err(|e| StoreError::io(path, e))?;

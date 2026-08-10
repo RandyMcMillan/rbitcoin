@@ -62,7 +62,7 @@ impl UringSession {
             let ring = io_uring::IoUring::new(entries).map_err(|e| {
                 StoreError::io(
                     Path::new("io_uring"),
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring: {e}")),
+                    std::io::Error::other(format!("io_uring: {e}")),
                 )
             })?;
             Ok(Self {

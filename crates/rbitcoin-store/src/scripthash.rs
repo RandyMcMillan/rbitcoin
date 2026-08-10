@@ -768,7 +768,7 @@ impl ScriptHashTable {
                     .get(&rec.scripthash)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                !durable.iter().any(|&c| c == rec.create_tx_fk)
+                !durable.contains(&rec.create_tx_fk)
             })
             .cloned()
             .collect();
@@ -1521,7 +1521,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 if r.scripthash != key {
                     break;
                 }
-                if !r.create_tx_fk.is_null() && !seen.iter().any(|&c| c == r.create_tx_fk) {
+                if !r.create_tx_fk.is_null() && !seen.contains(&r.create_tx_fk) {
                     seen.push(r.create_tx_fk);
                     live.push(ShEntry::new(r.create_tx_fk));
                 }

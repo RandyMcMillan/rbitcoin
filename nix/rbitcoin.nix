@@ -5,14 +5,23 @@
 # app layer when `Cargo.lock` is unchanged — same RUSTFLAGS / pins as before.
 #
 # Call as:
-#   callPackage ./nix/rbitcoin.nix { craneLib = crane.mkLib pkgs; }
-# with `pkgs` = pkgsStatic for musl, or plain pkgs for glibc.
+#   # dynamic glibc:
+#   pkgs.callPackage ./nix/rbitcoin.nix { craneLib = crane.mkLib pkgs; }
+#   # fully static musl:
+#   pkgs.pkgsStatic.callPackage ./nix/rbitcoin.nix {
+#     craneLib = crane.mkLib pkgs.pkgsStatic;
+#   }
+#
+# Under pkgsStatic, build.rs / proc-macros must link with the *build* platform
+# (dynamic gnu) compiler. Host product objects use the musl linker + `+crt-static`
+# only via `CARGO_TARGET_<host>_RUSTFLAGS` — never global `RUSTFLAGS` alone
+# (rustc 1.95 / nixos-26.05: global static flags break build scripts).
 {
   lib,
   craneLib,
   pkg-config,
   stdenv,
-  # pkgsStatic is a cross-like stdenv: build scripts need the *build* platform cc.
+  # pkgsStatic is cross-like: build scripts need the *build* platform cc.
   buildPackages,
 }:
 
@@ -38,14 +47,17 @@ let
   # Deterministic flags. Do **not** embed `${src}` in RUSTFLAGS — that would
   # change the deps layer hash on every .rs edit and defeat crane caching.
   # Remap the Nix build top (always `/build` in the sandbox) instead.
-  commonRUSTFLAGS = lib.concatStringsSep " " (
+  commonRUSTFLAGS = lib.concatStringsSep " " [
+    "--remap-path-prefix"
+    "/build/=/source/"
+    "-C"
+    "debuginfo=0"
+    "-C"
+    "strip=symbols"
+  ];
+  hostRUSTFLAGS = lib.concatStringsSep " " (
     [
-      "--remap-path-prefix"
-      "/build/=/source/"
-      "-C"
-      "debuginfo=0"
-      "-C"
-      "strip=symbols"
+      commonRUSTFLAGS
     ]
     ++ lib.optionals stdenv.hostPlatform.isMusl [
       "-C"
@@ -63,13 +75,22 @@ let
     "rbitcoin-store"
   ];
 
-  # pkgsStatic: buildPlatform is gnu, hostPlatform is musl — must target musl
-  # explicitly and point cargo at the *host* linker (not depsBuildBuild's gnu cc).
+  # Host (product) triple — musl when callPackage under pkgsStatic.
   rustTarget =
     stdenv.hostPlatform.rust.rustcTarget or stdenv.hostPlatform.rust.cargoShortTarget
       or stdenv.hostPlatform.config;
   rustTargetEnv = lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget);
+
+  # Build platform triple (gnu on Linux) — build.rs / proc-macros.
+  buildRustTarget =
+    stdenv.buildPlatform.rust.rustcTarget or stdenv.buildPlatform.rust.cargoShortTarget
+      or stdenv.buildPlatform.config;
+  buildRustTargetEnv = lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] buildRustTarget);
+
   isCross = stdenv.buildPlatform != stdenv.hostPlatform;
+
+  buildCc = buildPackages.stdenv.cc;
+  hostCc = stdenv.cc;
 
   commonArgs = {
     inherit src;
@@ -78,17 +99,43 @@ let
     strictDeps = true;
     nativeBuildInputs = [
       pkg-config
-      stdenv.cc
-    ];
-    # Build-platform cc only for build.rs / proc-macros when cross (pkgsStatic).
-    depsBuildBuild = lib.optionals isCross [ buildPackages.stdenv.cc ];
+      # Prefer build-platform cc on PATH so cargo's default `cc` for build
+      # scripts is dynamic gnu when cross/static.
+      buildCc
+    ]
+    ++ lib.optionals isCross [ hostCc ];
+    # Build-platform cc for build.rs / proc-macros when cross (pkgsStatic).
+    depsBuildBuild = lib.optionals isCross [ buildCc ];
     inherit cargoExtraArgs;
+    # Build-script flags: never `+crt-static`.
     RUSTFLAGS = commonRUSTFLAGS;
     # Force cargo to emit host (musl) objects into target/<triple>/…; without
     # this, build can land in target/release linked with the build-platform
     # gnu linker (dynamic glibc).
     CARGO_BUILD_TARGET = rustTarget;
-    "CARGO_TARGET_${rustTargetEnv}_LINKER" = "${stdenv.cc.targetPrefix}cc";
+    "CARGO_TARGET_${rustTargetEnv}_LINKER" = "${hostCc}/bin/${hostCc.targetPrefix}cc";
+    "CARGO_TARGET_${rustTargetEnv}_RUSTFLAGS" = hostRUSTFLAGS;
+    # Explicit build-platform linker so proc-macro/build-script links stay dynamic.
+    "CARGO_TARGET_${buildRustTargetEnv}_LINKER" = "${buildCc}/bin/${buildCc.targetPrefix}cc";
+    "CARGO_TARGET_${buildRustTargetEnv}_RUSTFLAGS" = commonRUSTFLAGS;
+    # Also set CC_*/HOST_CC for crates that shell out to the C compiler.
+    "CC_${buildRustTargetEnv}" = "${buildCc}/bin/${buildCc.targetPrefix}cc";
+    "CC_${rustTargetEnv}" = "${hostCc}/bin/${hostCc.targetPrefix}cc";
+    HOST_CC = "${buildCc}/bin/${buildCc.targetPrefix}cc";
+    # pkgsStatic's stdenv injects `-static` into NIX_* link flags for *every*
+    # cc invocation — including build-platform gcc used for build.rs. That
+    # yields "attempted static link of dynamic object … glibc" under rustc
+    # 1.95. Strip forced static from the env; host product staticity comes
+    # from `+crt-static` on CARGO_TARGET_<musl>_RUSTFLAGS instead.
+    preConfigure = lib.optionalString stdenv.hostPlatform.isStatic ''
+      strip_static() {
+        printf '%s' "$1" | tr ' ' '\n' | grep -v '^-static$' | tr '\n' ' '
+      }
+      export NIX_CFLAGS_LINK="$(strip_static "''${NIX_CFLAGS_LINK-}")"
+      export NIX_LDFLAGS="$(strip_static "''${NIX_LDFLAGS-}")"
+      export NIX_LDFLAGS_FOR_TARGET="$(strip_static "''${NIX_LDFLAGS_FOR_TARGET-}")"
+      export NIX_CFLAGS_LINK_FOR_TARGET="$(strip_static "''${NIX_CFLAGS_LINK_FOR_TARGET-}")"
+    '';
     # Release product only — full workspace tests stay on the CI/dev path.
     doCheck = false;
   };

@@ -413,8 +413,8 @@ impl StrongTxTable {
         if need_bits <= n {
             return Ok(());
         }
-        let need_bytes = (need_bits + 7) / 8;
-        let cur_bytes = (n + 7) / 8;
+        let need_bytes = need_bits.div_ceil(8);
+        let cur_bytes = n.div_ceil(8);
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut v) = *guard {
             if need_bytes as usize > v.len() {

@@ -115,7 +115,7 @@ CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
 
 ### Required before each code commit (`test` job)
 
-From `nix-shell` (or the same **rustc 1.82** class CI pins):
+From `nix-shell` (or the same **rustc 1.95** class CI pins):
 
 ```bash
 cargo fmt --all -- --check          # if dirty: cargo fmt --all
@@ -129,9 +129,10 @@ cargo test --workspace
 | `clippy … -D warnings` | Clean under `[workspace.lints.clippy]` allows in root `Cargo.toml` |
 | `cargo test --workspace` | All non-ignored tests pass |
 
-**Toolchain:** CI pins **rustc 1.82.0** (same class as `nix-shell` / crane). Do not
-rely on host “latest stable” alone. Expand clippy allows only for real noise
-after a toolchain bump — prefer fixing the code.
+**Toolchain:** CI pins **rustc 1.95.0** (same class as `nix-shell` / crane via
+`nixos-26.05` in `flake.lock`). Do not rely on host “latest stable” alone.
+Expand clippy allows only for real noise after a toolchain bump — prefer
+fixing the code.
 
 ### Coverage job
 

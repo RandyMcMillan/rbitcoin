@@ -2061,11 +2061,11 @@ fn pin_for_wire_batch(
                 }
                 // Schema-13 decode leaves zero identity — stamp from parent_pin only.
                 if tx.txid == [0u8; 32] {
-                    tx.txid = parent_pin.create_txid(id).ok_or_else(|| {
-                        ConsensusError::Store(StoreError::Corrupt(
-                            "invariant: lookup stage miss (load parent create identity not stamped)",
-                        ))
-                    })?;
+                    tx.txid = parent_pin
+                        .create_txid(id)
+                        .ok_or(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: lookup stage miss (load parent create identity not stamped)",
+                    )))?;
                 }
                 let cb = if tx.input_count != 1 {
                     Some(false)

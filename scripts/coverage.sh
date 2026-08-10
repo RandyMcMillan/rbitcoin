@@ -118,7 +118,7 @@ PY
   echo "Coverage OK: ${LCOV_PCT}% ≥ ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT}; LH*100 >= LF*${LINE_MIN_PCT})"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
-  echo "Tooling: use llvmPackages matching rustc (rustc 1.82 → LLVM 19; see shell.nix)."
+  echo "Tooling: use llvmPackages matching rustc (rustc 1.95 → LLVM 21; see shell.nix)."
   exit 0
 fi
 

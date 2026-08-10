@@ -253,7 +253,7 @@ impl MultiList {
     }
 
     fn contains(&self, head: Fk, target: Fk) -> Result<bool, StoreError> {
-        Ok(self.collect(head)?.iter().any(|f| *f == target))
+        Ok(self.collect(head)?.contains(&target))
     }
 
     fn flush(&self) -> Result<(), StoreError> {

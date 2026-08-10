@@ -164,6 +164,9 @@ fn resolve_fk_and_range_pread(
         .collect())
 }
 
+/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` high bits).
+const UD_KIND_IDX: u64 = 2;
+
 /// Fill idx page buffers via held session; returns true if all pages complete.
 #[cfg(target_os = "linux")]
 fn fill_idx_pages(
@@ -171,25 +174,50 @@ fn fill_idx_pages(
     pages: &[crate::tx_idx::IdxPagePlan],
     bufs: &mut [Vec<u8>],
 ) -> bool {
-    use crate::bulk_io::ReadOp;
-    let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(bufs.len());
+    // Staged SQEs on the held plan ring (no nested TLS bulk_io session).
+    let flags = crate::dontcache_policy::idx_sqe_rw_flags(0, 1);
     for (i, page) in pages.iter().enumerate() {
-        let ptr = bufs[i].as_mut_ptr();
-        let len = bufs[i].len();
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        ops.push(ReadOp {
-            fd: page.fd,
-            offset: page.page_off,
-            buf: slice,
-            result: i32::MIN,
-            dontcache: false,
-        });
+        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, i as u32);
+        if sess
+            .push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, flags)
+            .is_err()
+        {
+            sess.drain_all();
+            return false;
+        }
     }
-    if !crate::bulk_io::pread_batch_on_session(sess, &mut ops) {
-        return false;
+    sess.sync_submission();
+    let mut results = vec![i32::MIN; pages.len()];
+    let need = pages.len();
+    let mut done = 0usize;
+    while done < need {
+        let mut cqes = sess.harvest_ready();
+        if cqes.is_empty() {
+            if sess.submit_and_wait_one().is_err() {
+                sess.drain_all();
+                return false;
+            }
+            cqes = sess.harvest_ready();
+            if cqes.is_empty() {
+                sess.drain_all();
+                return false;
+            }
+        } else if sess.submit().is_err() {
+            sess.drain_all();
+            return false;
+        }
+        for (ud, res) in cqes {
+            let (kind, slot) = crate::uring_session::unpack_ud(ud);
+            if kind != UD_KIND_IDX || (slot as usize) >= results.len() {
+                sess.drain_all();
+                return false;
+            }
+            results[slot as usize] = res;
+            done += 1;
+        }
     }
-    for (i, op) in ops.iter().enumerate() {
-        if op.result < 0 || (op.result as usize) < pages[i].want {
+    for (i, &res) in results.iter().enumerate() {
+        if res < 0 || (res as usize) < pages[i].want {
             let page = &pages[i];
             let rc = unsafe {
                 libc::pread(

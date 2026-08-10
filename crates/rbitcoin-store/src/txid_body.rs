@@ -289,6 +289,10 @@ impl TxidBody {
         // Build page jobs: (first_fk, blob).
         let mut jobs: Vec<(u64, Vec<u8>, Vec<u64>)> = Vec::with_capacity(groups.len());
         for (_page, group) in groups {
+            debug_assert!(
+                (group.last().unwrap() - group.first().unwrap() + 1) <= TXID_ENTRIES_PER_PAGE,
+                "page group wider than entries-per-page geometry"
+            );
             let first = *group.first().unwrap();
             let last = *group.last().unwrap();
             let bytes = ((last - first + 1) as usize) * (TXID_ENTRY_LEN as usize);
@@ -316,7 +320,8 @@ impl TxidBody {
                         offset: off,
                         buf: slice,
                         result: i32::MIN,
-                        dontcache: false, // sidefile never DONTCACHE
+                        // Policy: sidefile peeks never DONTCACHE (flags always 0).
+                        dontcache: crate::dontcache_policy::sidefile_sqe_rw_flags(0, 0) != 0,
                     });
                 }
                 used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);

@@ -11,7 +11,7 @@
 use crate::error::StoreError;
 use crate::scripthash_pages::{
     sh_decode_paged_head, sh_encode_paged_head, sh_head_value_mode, sh_word_payload,
-    ShHeadValueMode, SH_FLAG_BIT,
+    ShHeadValueMode,
 };
 use rbitcoin_primitives::Fk;
 
@@ -25,8 +25,8 @@ pub const SH_HEAD_KEY_LEN: usize = 16;
 pub const SH_HEAD_VALUE_LEN: usize = 16;
 /// On-disk head slot size.
 pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
-/// High bit marks non-inline head value (paged). Same bit as legacy slab marker.
-pub const SH_SLAB_MARKER: u64 = SH_FLAG_BIT;
+/// High bit marks non-inline head value (paged). Same value as [`SH_FLAG_BIT`].
+pub const SH_SLAB_MARKER: u64 = 1u64 << 63;
 /// Alloc header magic after the RBT1 file header.
 pub const SH_ALLOC_MAGIC: [u8; 4] = *b"SHAL";
 pub const SH_ALLOC_VERSION: u16 = 2;
@@ -137,8 +137,8 @@ impl ShHeadValue {
                 } else {
                     0
                 };
-                debug_assert_eq!(w0 & SH_FLAG_BIT, 0, "fk must not set flag bit");
-                debug_assert_eq!(w1 & SH_FLAG_BIT, 0, "fk must not set flag bit");
+                debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
+                debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
                 out[8..16].copy_from_slice(&w1.to_le_bytes());
             }

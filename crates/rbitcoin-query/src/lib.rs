@@ -1385,6 +1385,15 @@ impl Query {
         Ok(None)
     }
 
+    /// True if any RAM queue entry has `hash` (meta only — no payload clone).
+    ///
+    /// Prefer this over [`Self::block_queue_payload_by_hash`] on hot readiness
+    /// checks (reorg densify / exploration gate).
+    pub fn block_queue_has_hash(&self, hash: &[u8; 32]) -> bool {
+        let g = self.block_queue.lock().unwrap();
+        g.list_meta().iter().any(|m| &m.hash == hash)
+    }
+
     /// True if the in-RAM body queue holds `height`.
     pub fn block_queue_has_height(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();

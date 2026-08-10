@@ -355,6 +355,9 @@ pub fn try_apply_best_candidate(
 /// Header hashes from `tip` back to (not including) a best-chain / confirmed
 /// ancestor, **oldest-first**. Used so BadPrev densify requests every mid-path
 /// body to the LCA (mainnet: d1e0 + 02022e + tip+1, not wire_prev alone).
+///
+/// Stops on [`ChainHub::has_block`] only — do not call `height_of_hash` for side
+/// headers (orphan full confirmed-table scan; mainnet CPU spin on BadPrev).
 pub fn header_hashes_to_best_ancestor(
     hub: &ChainHub,
     tip: BlockHash,
@@ -363,13 +366,7 @@ pub fn header_hashes_to_best_ancestor(
     let mut rev = Vec::new();
     let mut cur = tip;
     for _ in 0..10_000 {
-        if hub.has_block(&cur)
-            || hub
-                .query
-                .height_of_hash(&cur.to_byte_array())
-                .map_err(|e| NetError::Consensus(e.to_string()))?
-                .is_some()
-        {
+        if hub.has_block(&cur) {
             break;
         }
         rev.push(cur);
@@ -394,6 +391,10 @@ pub fn header_hashes_to_best_ancestor(
 }
 
 /// Walk from `tip` via pending bodies until parent is on best chain.
+///
+/// Parent-on-chain uses **`has_block` only** — never `height_of_hash` on side
+/// headers (that full-scans confirmed[] for orphans and pegged one core on
+/// mainnet BadPrev/explore gather).
 fn gather_path_to_best_parent(
     hub: &ChainHub,
     bodies: &HashMap<BlockHash, Block>,
@@ -408,15 +409,7 @@ fn gather_path_to_best_parent(
         let b = bodies.get(&cur)?;
         let prev = b.header.prev_blockhash;
         rev.push(b.clone());
-        if hub.has_block(&prev)
-            || prev.to_byte_array() == [0u8; 32]
-            || hub
-                .query
-                .height_of_hash(&prev.to_byte_array())
-                .ok()
-                .flatten()
-                .is_some()
-        {
+        if hub.has_block(&prev) || prev.to_byte_array() == [0u8; 32] {
             rev.reverse();
             return Some(rev);
         }

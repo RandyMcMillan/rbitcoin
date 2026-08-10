@@ -32,6 +32,15 @@ pub(crate) fn should_rerequest_headers_on_empty_lag(streak: u32) -> bool {
     streak == 1 || (streak > 0 && streak % 8 == 0)
 }
 
+/// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
+///
+/// Must stay rare: mainnet ~1M headers ≈ 200–300ms per call. Same cadence as
+/// [`should_log_empty_headers_lag`] so getheaders can still fan out every 8.
+#[inline]
+pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32) -> bool {
+    should_log_empty_headers_lag(streak)
+}
+
 /// Work path idle: no ordered hashes, no inflight getdata, archive queue empty.
 #[inline]
 pub fn path_drained(st: &IbdWorkState, archive_q_count: usize) -> bool {
@@ -195,5 +204,17 @@ mod tests {
             .filter(|&s| should_rerequest_headers_on_empty_lag(s))
             .count() as u32;
         assert_eq!(regets, 9); // 1,8,16,...,64
+
+        // Full store reseed is sparser than getheaders (O(headers) walk).
+        assert!(should_reseed_work_path_on_empty_lag(1));
+        assert!(!should_reseed_work_path_on_empty_lag(8));
+        assert!(should_reseed_work_path_on_empty_lag(64));
+        let reseeds: u32 = (1..=64)
+            .filter(|&s| should_reseed_work_path_on_empty_lag(s))
+            .count() as u32;
+        assert!(
+            reseeds < regets,
+            "reseed={reseeds} must be rarer than reget={regets}"
+        );
     }
 }

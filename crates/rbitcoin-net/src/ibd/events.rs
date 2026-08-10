@@ -5,6 +5,7 @@ use super::assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 use super::dial::{release_peer_block_work, request_headers, request_headers_from};
 use super::exit::{
     header_lag_behind_peers, should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
+    should_reseed_work_path_on_empty_lag,
 };
 use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
@@ -270,9 +271,11 @@ pub(crate) fn apply_peer_event(
                     }
                     st.headers_done = false;
                     if should_rerequest_headers_on_empty_lag(st.empty_header_streak) {
-                        // Re-seed greater-work sibling paths already in the header
-                        // table (mainnet 961632 class: peers empty on dead branch).
-                        super::path::seed_work_path_from_store(st, hub);
+                        // Full store resume walks **all** headers (~300ms on mainnet).
+                        // Re-seed sparsely; getheaders still every 8 empties.
+                        if should_reseed_work_path_on_empty_lag(st.empty_header_streak) {
+                            super::path::seed_work_path_from_store(st, hub);
+                        }
                         let tips = work_path_tips(st);
                         let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
                     }
@@ -572,7 +575,33 @@ pub(crate) fn apply_confirm_reject(
     }
 }
 
-/// Load a full block for `hash` from reorg held map, Class A, or BQ-by-hash.
+/// True if reorg gather can obtain `hash` without a Class A reconstruct probe.
+///
+/// Hot path gate for exploration: do **not** call `reconstruct_block_by_hash`
+/// here (store IO on hundreds of ordered hashes pegged one core on mainnet).
+fn reorg_body_ready_cheap(
+    st: &IbdWorkState,
+    hub: &crate::chain::ChainHub,
+    hash: BlockHash,
+) -> bool {
+    use bitcoin::hashes::Hash as _;
+    if st.reorg.get_held(&hash).is_some() {
+        return true;
+    }
+    if hub.has_block(&hash) {
+        return true;
+    }
+    if let Some(&ht) = st.hash_height.get(&hash) {
+        if hub.query.block_queue_has_height(ht) {
+            return true;
+        }
+    }
+    hub.query.block_queue_has_hash(&hash.to_byte_array()) || st.body.is_known_archived(&hash)
+}
+
+/// Load a full block for `hash` from reorg held map, BQ-by-hash, or Class A.
+///
+/// Order: held → BQ (cheap RAM) → Class A reconstruct (store IO last).
 fn load_reorg_body(
     st: &IbdWorkState,
     hub: &crate::chain::ChainHub,
@@ -583,13 +612,13 @@ fn load_reorg_body(
     if let Some(b) = st.reorg.get_held(&hash) {
         return Some(b);
     }
-    if let Ok(Some(b)) = hub.query.reconstruct_block_by_hash(&hash.to_byte_array()) {
-        return Some(b);
-    }
     if let Ok(Some(wire)) = hub.query.block_queue_payload_by_hash(&hash.to_byte_array()) {
         if let Ok(b) = deserialize::<bitcoin::Block>(&wire) {
             return Some(b);
         }
+    }
+    if let Ok(Some(b)) = hub.query.reconstruct_block_by_hash(&hash.to_byte_array()) {
+        return Some(b);
     }
     None
 }
@@ -708,6 +737,11 @@ fn try_reorg_on_bad_prev(
 /// bodies are available via held map, Class A, or BQ-by-hash — not held-only.
 /// Tip+1 extensions never enter held on BlockFramed (only height≤tip siblings),
 /// so apply must load BQ/Class A the same way BadPrev gather does.
+///
+/// **Hot path:** called from every mid `BlockFramed`. Must **not** probe Class A
+/// / `load_reorg_body` for the full ordered path (mainnet ~180 hashes → multi-
+/// second drain, 1-core peg, status delayed ~minute). Gate on explore_need
+/// cheap readiness, then load only need + tip→LCA walks.
 fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
     use super::reorg::try_apply_best_candidate;
     use crate::chain::AcceptOutcome;
@@ -719,34 +753,52 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
         return false;
     }
 
-    let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
-    // Prefer held + Class A + BQ for every hash we know on the work path.
-    let mut candidates: Vec<BlockHash> = st.ordered.iter().copied().collect();
-    candidates.extend(tips.iter().copied());
-    for h in st.hash_height.keys().copied() {
-        if !candidates.contains(&h) {
-            candidates.push(h);
-        }
-    }
-    // Registered explore needs (same-height winner + tip+1 extensions).
-    for &h in st.reorg.explore_need_hashes() {
-        if !candidates.contains(&h) {
-            candidates.push(h);
-        }
-    }
-    for h in candidates {
-        if let Some(b) = load_reorg_body(st, hub, h) {
-            // Promote into held so need_getdata clears (tip+1 never held by BlockFramed).
-            st.reorg.hold_body(b.clone());
-            bodies.insert(h, b);
-        }
-    }
-    // Every registered explore hash must be loadable before apply (BQ counts).
-    for &h in st.reorg.explore_need_hashes() {
-        if !bodies.contains_key(&h) {
+    // Cheap gate: any registered need still missing → skip (no store probes).
+    let need: Vec<BlockHash> = st.reorg.explore_need_hashes().to_vec();
+    for &h in &need {
+        if !reorg_body_ready_cheap(st, hub, h) {
             return false;
         }
     }
+
+    let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+    for &h in &need {
+        let Some(b) = load_reorg_body(st, hub, h) else {
+            return false;
+        };
+        st.reorg.hold_body(b.clone());
+        bodies.insert(h, b);
+    }
+
+    // Load only the contiguous path from each explore tip back to best chain
+    // (header prev walk) — not every ordered/hash_height entry.
+    for &tip in &tips {
+        let mut cur = tip;
+        for _ in 0..10_000 {
+            if hub.has_block(&cur) {
+                break;
+            }
+            if !bodies.contains_key(&cur) {
+                let Some(b) = load_reorg_body(st, hub, cur) else {
+                    break; // incomplete path for this tip; try_apply may still use another
+                };
+                st.reorg.hold_body(b.clone());
+                let prev = b.header.prev_blockhash;
+                bodies.insert(cur, b);
+                if hub.has_block(&prev) || prev.to_byte_array() == [0u8; 32] {
+                    break;
+                }
+                cur = prev;
+                continue;
+            }
+            let prev = bodies[&cur].header.prev_blockhash;
+            if hub.has_block(&prev) || prev.to_byte_array() == [0u8; 32] {
+                break;
+            }
+            cur = prev;
+        }
+    }
+
     if bodies.is_empty() {
         return false;
     }

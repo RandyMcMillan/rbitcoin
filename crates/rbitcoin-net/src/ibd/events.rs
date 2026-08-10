@@ -1918,16 +1918,11 @@ mod confirm_reject_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Red pin: zombie `pending` on a mid at an **already-confirmed height** is
-    /// never demoted by tip-hole cover / tip-batch stale expire (those only walk
-    /// tip+1..). Assign reorg need (1b) then `skip_download` forever → mid never
-    /// re-getdatas, reorg cannot gather, tip hole on the winner path stays open
-    /// while densify may still fill far heights (mainnet: hole + bq soft growth).
-    ///
-    /// Run with `cargo test -p rbitcoin-net zombie_pending_mid -- --ignored`.
-    /// Remove `ignore` when shipping the assign/body demote fix (TDD green).
+    /// Zombie `pending` on a mid at an **already-confirmed height** must be
+    /// demoted by reorg densify assign (1b) the same way tip-hole cover demotes
+    /// tip+1 zombies. Tip-batch stale expire only walks tip+1.. — without 1b
+    /// demote, `skip_download` forever and mids never re-getdata.
     #[test]
-    #[ignore = "red: zombie mid pending at confirmed height blocks reorg densify 1b"]
     fn zombie_pending_mid_at_confirmed_height_never_reget() {
         use super::super::assign::{assign_work_ordered, AssignDepth};
         use super::super::path::seed_work_path_from_store;

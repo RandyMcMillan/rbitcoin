@@ -132,8 +132,9 @@ pub(crate) fn assign_work_ordered(
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // 1b) Most-work reorg: pull winning-sibling (or other) bodies held by hash
-    // that cannot use the tip height BQ slot.
+    // 1b) Most-work reorg: pull winning-sibling / mid-path bodies held by hash
+    // (cannot use tip-height BQ). Same zombie-pending demote as tip holes —
+    // mids sit at height ≤ tip so tip-batch expire never clears them.
     let reorg_need = st.reorg.need_getdata();
     if !reorg_need.is_empty() {
         let mut room = cfg.window.saturating_sub(st.inflight.len());
@@ -142,7 +143,19 @@ pub(crate) fn assign_work_ordered(
             if room == 0 {
                 break;
             }
-            if st.inflight.contains_key(&h) || st.body.skip_download(hub, &h) {
+            if st.inflight.contains_key(&h) {
+                continue;
+            }
+            if hub.has_block(&h) {
+                continue;
+            }
+            let ht = st.hash_height.get(&h).copied();
+            // Already have height-keyed wire — no peer re-get (load_reorg / claim).
+            if ht.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
+                continue;
+            }
+            demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
+            if st.body.skip_download(hub, &h) {
                 continue;
             }
             for _ in 0..alive.len() {
@@ -413,6 +426,34 @@ pub(crate) fn tip_hole_peer_target(
     }
 }
 
+/// Demote zombie `pending` (flag set, no body-queue wire) so getdata can re-issue.
+///
+/// Confirm intake and reorg gather need real wire (BQ / held). `mark_pending`
+/// alone is not enough — without BQ it is a zombie that would `skip_download`
+/// forever. Tip-hole cover and reorg densify (1b) share this; only walks the
+/// small hole/need lists (not the full pending map).
+#[inline]
+fn demote_zombie_pending_for_fetch(
+    body: &mut super::body::BodyPresence,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: Option<u32>,
+) {
+    if !body.is_pending(&hash) {
+        return;
+    }
+    if hub.has_block(&hash) {
+        return;
+    }
+    // Height-keyed BQ is the sole confirm claim path; also covers tip+1 explore
+    // needs that landed via BlockFramed offer. Side mids at height ≤ tip almost
+    // never have a free height slot (first-wins / rehydrate drops ≤ tip).
+    if height.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
+        return;
+    }
+    body.mark_missing(hash);
+}
+
 /// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
@@ -440,10 +481,7 @@ pub(crate) fn cover_tip_holes(
         if ht.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
             continue;
         }
-        // Pending RAM flag without BQ: demote so skip_download / densify agree.
-        if st.body.is_pending(&h) {
-            st.body.mark_missing(h);
-        }
+        demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
         let (already, second_at) = st
             .inflight
             .get(&h)

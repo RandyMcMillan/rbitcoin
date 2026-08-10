@@ -132,12 +132,16 @@ pub(crate) fn assign_work_ordered(
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // 1b) Most-work reorg: pull winning-sibling / mid-path bodies held by hash
-    // (cannot use tip-height BQ). Same zombie-pending demote as tip holes —
-    // mids sit at height ≤ tip so tip-batch expire never clears them.
+    // 1b) Most-work reorg: pull mid-path / sibling bodies by **hash** (BQ is
+    // height first-wins and may hold a different block at the same height).
+    // Mids sit at height ≤ tip so tip-batch expire never clears them.
+    // Always reserve a few slots for reorg need even when densify filled the
+    // window — without mids tip stays frozen on the loser fork.
     let reorg_need = st.reorg.need_getdata();
     if !reorg_need.is_empty() {
-        let mut room = cfg.window.saturating_sub(st.inflight.len());
+        use bitcoin::hashes::Hash as _;
+        let reserve = reorg_need.len().min(8);
+        let mut room = cfg.window.saturating_sub(st.inflight.len()).max(reserve);
         let mut peer_i = st.assign_rot;
         for h in reorg_need {
             if room == 0 {
@@ -149,12 +153,15 @@ pub(crate) fn assign_work_ordered(
             if hub.has_block(&h) {
                 continue;
             }
-            let ht = st.hash_height.get(&h).copied();
-            // Already have height-keyed wire — no peer re-get (load_reorg / claim).
-            if ht.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
+            // Ready only when **this hash** is on BQ (not merely the height slot).
+            if hub.query.block_queue_has_hash(&h.to_byte_array()) {
                 continue;
             }
-            demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
+            // Zombie pending without **this** hash's wire → demote (height BQ
+            // may be a loser residual at the same height).
+            if st.body.is_pending(&h) && !hub.query.block_queue_has_hash(&h.to_byte_array()) {
+                st.body.mark_missing(h);
+            }
             if st.body.skip_download(hub, &h) {
                 continue;
             }

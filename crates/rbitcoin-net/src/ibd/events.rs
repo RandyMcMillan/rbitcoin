@@ -842,8 +842,11 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
     }
 }
 
-/// After a side-branch body is held, try to finish an awaiting reorg.
-fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) -> bool {
+/// After a side-branch body is held (or BQ has mids), try to finish an awaiting reorg.
+pub(crate) fn try_complete_awaiting_reorg(
+    st: &mut IbdWorkState,
+    hub: &crate::chain::ChainHub,
+) -> bool {
     use super::reorg::{header_hashes_to_best_ancestor, try_apply_best_candidate};
     use crate::chain::AcceptOutcome;
     use rbitcoin_log::info;
@@ -870,28 +873,51 @@ fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainH
     }
     // Full path from held tip (rejected tip+1) to LCA — not win+ext only.
     let tip_hash = awaiting.held_tip.block_hash();
+    let held_tip = awaiting.held_tip.clone();
     let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
-    st.reorg.hold_body(awaiting.held_tip.clone());
-    bodies.insert(tip_hash, awaiting.held_tip);
+    st.reorg.hold_body(held_tip.clone());
+    bodies.insert(tip_hash, held_tip.clone());
+    let mut path_missing = Vec::new();
     if let Ok(path) = header_hashes_to_best_ancestor(hub, tip_hash) {
         for h in path {
+            if h == tip_hash {
+                continue;
+            }
             if let Some(b) = load_reorg_body(st, hub, h) {
                 st.reorg.hold_body(b.clone());
                 bodies.insert(h, b);
+            } else {
+                path_missing.push(h);
+                st.body.mark_missing(h);
             }
         }
     }
     for h in &awaiting.need {
-        if let Some(b) = load_reorg_body(st, hub, *h) {
-            bodies.insert(*h, b);
+        if bodies.contains_key(h) {
+            continue;
         }
+        if let Some(b) = load_reorg_body(st, hub, *h) {
+            st.reorg.hold_body(b.clone());
+            bodies.insert(*h, b);
+        } else if !path_missing.contains(h) {
+            path_missing.push(*h);
+        }
+    }
+    if !path_missing.is_empty() {
+        st.reorg.set_awaiting(held_tip, path_missing);
+        return false;
     }
     let losing = hub.tip_hash();
     match try_apply_best_candidate(hub, &bodies, &[tip_hash], &mut st.reorg) {
         Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
             info!("ibd: most-work reorg completed after body gather → tip_h={new_h}");
-            let tip_h = hub.tip_height().unwrap_or(0);
-            let _ = hub.query.block_queue_dequeue_height(tip_h);
+            // Old reject height is tip+1 of pre-reorg tip; dequeue that slot.
+            if let Some(old_tip) = losing {
+                if let Some(ht) = st.hash_height.get(&tip_hash).copied() {
+                    let _ = hub.query.block_queue_dequeue_height(ht);
+                }
+                let _ = old_tip;
+            }
             clear_hash_inflight(&mut st.slots, &mut st.inflight, tip_hash);
             for h in bodies.keys() {
                 st.body.mark_archived(*h);
@@ -902,6 +928,13 @@ fn try_complete_awaiting_reorg(st: &mut IbdWorkState, hub: &crate::chain::ChainH
             st.reorg.clear_awaiting();
             st.reorg.clear_explore();
             true
+        }
+        Ok(None) => {
+            warn!(
+                "ibd: awaiting reorg not applied (no candidate; bodies={})",
+                bodies.len()
+            );
+            false
         }
         Ok(other) => {
             warn!("ibd: awaiting reorg not applied: {other:?}");

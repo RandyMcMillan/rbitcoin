@@ -43,7 +43,7 @@ use dial::{
 };
 use events::{
     apply_confirm_reject, apply_peer_event, disconnect_all_peers,
-    drain_ready_peer_and_archive_events, update_confirm_lag,
+    drain_ready_peer_and_archive_events, try_complete_awaiting_reorg, update_confirm_lag,
 };
 use exit::{
     all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
@@ -556,6 +556,12 @@ pub async fn ibd_cancellable(
             archive_can_assign,
             tip_rate_opt,
         );
+
+        // Complete multi-hop reorg when mid bodies landed (BQ/held) without
+        // waiting for another BadPrev reject cycle.
+        if st.reorg.awaiting().is_some() && try_complete_awaiting_reorg(&mut st, hub.as_ref()) {
+            last_progress = Instant::now();
+        }
 
         // Note claim-ready heights into the confirm feed (body queue / pending wire only).
         offer_confirm_ready(

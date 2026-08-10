@@ -315,7 +315,7 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
             session.drain_all();
             return false;
         }
-        pread_batch_on_session(session, ops, total_nonempty)
+        pread_batch_on_session_inner(session, ops, total_nonempty)
     }) {
         Some(true) => true,
         Some(false) => false,
@@ -336,8 +336,32 @@ fn test_force_session_false() -> bool {
     TEST_FORCE_SESSION_FALSE.with(|c| c.get())
 }
 
+/// Bulk pread on an **already-held** plan TLS session (no nested `with_thread_local`).
+///
+/// Used by head-resolve ID stage after probe holds the ring. Returns false if
+/// any SQE failed — caller falls back to libc pread for that batch.
 #[cfg(target_os = "linux")]
-fn pread_batch_on_session(
+pub(crate) fn pread_batch_on_session(
+    session: &mut crate::uring_session::UringSession,
+    ops: &mut [ReadOp<'_>],
+) -> bool {
+    let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
+    if total_nonempty == 0 {
+        for op in ops.iter_mut() {
+            if op.buf.is_empty() {
+                op.result = 0;
+            }
+        }
+        return true;
+    }
+    for op in ops.iter_mut() {
+        op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
+    }
+    pread_batch_on_session_inner(session, ops, total_nonempty)
+}
+
+#[cfg(target_os = "linux")]
+fn pread_batch_on_session_inner(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [ReadOp<'_>],
     total_nonempty: usize,

@@ -1,56 +1,32 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
-//! Schema **13+** fused FdOnly machine on **one** TLS [`UringSession`], **two waves**:
+//! Schema **13+** two waves on probe (uring when available):
 //! 1. **Hot probe** — page-coalesced loads for non-DONTCACHE segs (ages ≤3) → cands
-//! 2. **STAGE_ID / STAGE_IDX** — sidefile identity + idx range (depth-first)
+//! 2. **ID / IDX** — page-grouped `txid.body` identity fill, then depth-first BIP30
+//!    match in RAM + `record_range` idx
 //! 3. If any key still unmatched: **cold probe** (DONTCACHE segs ages ≥4) for
-//!    survivors only → full cand list (no per-seg short-circuit) → ID/IDX again
+//!    survivors only → full cand list → ID/IDX again
 //! 4. **denserels** (optional) — packed body when outs are needed
 //!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
-//! STAGE_IDX, returns `(fk, body_range)` so prep denserels-loads by offset.
+//! idx, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
-//! **IO shape:** one `with_thread_local` owns the ring for both waves. Nested TLS
-//! uring is a hard error. Up to [`MAX_IN_FLIGHT`] keys in flight for ID/IDX.
+//! **IO shape:** probe may use one TLS [`UringSession`]; sidefile ID is
+//! page-grouped bulk pread (one read per OS page of `txid.body`). Nested TLS
+//! uring remains a hard error.
 //!
 //! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
 
 use crate::error::StoreError;
 use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
 use crate::io_backend::{self, ReadIoBackend};
-use crate::tx_idx::BodyRangeIdxPlan;
 use crate::tx_table::{
     decode_packed_tx_outs_with_spender_rels_secret, OutputRecord, TxRecord, TxTable,
 };
-use crate::txid_body::{TxidBody, TXID_ENTRY_LEN};
+use crate::txid_body::TxidBody;
 use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
-use std::os::fd::RawFd;
 use std::time::Instant;
-
-/// Concurrent keys in the plan head-resolve uring machine (matches default ring).
-const MAX_IN_FLIGHT: usize = 128;
-
-/// Sidefile identity pread (32 B).
-const STAGE_ID: u64 = 1;
-/// `tx.idx` OS-page pread for body_range after identity match.
-const STAGE_IDX: u64 = 2;
-
-/// One plan key: candidates deepest-first; buffers stable for in-flight SQEs.
-struct KeyWork {
-    key_i: u32,
-    cands: Vec<u64>,
-    cand_i: usize,
-    /// Sidefile identity buffer (32 B).
-    id_buf: [u8; 32],
-    pending_fk: u64,
-    pending_rank: u32,
-    /// STAGE_IDX plan + page buffers (set after identity hit).
-    idx_plan: Option<BodyRangeIdxPlan>,
-    idx_bufs: Vec<Vec<u8>>,
-    /// Which idx page CQE we are waiting on (0 or 1).
-    idx_page_i: u8,
-}
 
 /// Stamp short-circuit: **txids → (fk, body_range)** via one TLS uring machine.
 ///
@@ -126,7 +102,7 @@ fn resolve_fk_and_range_pread(
     let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(hot_cands.iter().map(|c| c.len() as u64).sum());
-    id_idx_wave_pread(
+    id_idx_wave(
         table,
         txids,
         &hot_cands,
@@ -139,6 +115,7 @@ fn resolve_fk_and_range_pread(
         &mut idx_ns,
         &first_fks,
         &mut local_age,
+        None,
     )?;
 
     // Wave 2: full cold depth for keys that missed hot (no further short-circuit).
@@ -155,7 +132,7 @@ fn resolve_fk_and_range_pread(
         let cold_cands = table.head.probe_candidates_batch_cold(&mixed, &active)?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(cold_cands.iter().map(|c| c.len() as u64).sum());
-        id_idx_wave_pread(
+        id_idx_wave(
             table,
             txids,
             &cold_cands,
@@ -168,6 +145,7 @@ fn resolve_fk_and_range_pread(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
+            None,
         )?;
     }
 
@@ -186,8 +164,120 @@ fn resolve_fk_and_range_pread(
         .collect())
 }
 
-/// Depth-first sidefile + idx for each key's cand list (pread).
-fn id_idx_wave_pread(
+/// Fill idx page buffers via held session; returns true if all pages complete.
+#[cfg(target_os = "linux")]
+fn fill_idx_pages(
+    sess: &mut UringSession,
+    pages: &[crate::tx_idx::IdxPagePlan],
+    bufs: &mut [Vec<u8>],
+) -> bool {
+    use crate::bulk_io::ReadOp;
+    let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(bufs.len());
+    for (i, page) in pages.iter().enumerate() {
+        let ptr = bufs[i].as_mut_ptr();
+        let len = bufs[i].len();
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        ops.push(ReadOp {
+            fd: page.fd,
+            offset: page.page_off,
+            buf: slice,
+            result: i32::MIN,
+            dontcache: false,
+        });
+    }
+    if !crate::bulk_io::pread_batch_on_session(sess, &mut ops) {
+        return false;
+    }
+    for (i, op) in ops.iter().enumerate() {
+        if op.result < 0 || (op.result as usize) < pages[i].want {
+            let page = &pages[i];
+            let rc = unsafe {
+                libc::pread(
+                    page.fd,
+                    bufs[i].as_mut_ptr() as *mut libc::c_void,
+                    page.want,
+                    page.page_off as libc::off_t,
+                )
+            };
+            if rc < 0 || (rc as usize) < page.want {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fill_idx_pages(
+    _sess: &mut UringSession,
+    _pages: &[crate::tx_idx::IdxPagePlan],
+    _bufs: &mut [Vec<u8>],
+) -> bool {
+    false
+}
+
+/// Body range for `fk` without nested TLS bulk when a plan session is held.
+///
+/// - `session == None`: [`VarTable::record_range`] (may use process bulk_io TLS).
+/// - `session == Some`: plan idx pages + preads on the **held** session (or libc
+///   fallback), then [`BodyRangeIdxPlan::decode_range`].
+fn body_range_no_nested_tls(
+    table: &TxTable,
+    fk: Fk,
+    session: Option<&mut UringSession>,
+) -> Result<Option<(u64, u64)>, StoreError> {
+    let Some(sess) = session else {
+        return match table.body.record_range(fk) {
+            Ok((off, len)) if len > 0 => Ok(Some((off, len))),
+            Ok(_) | Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => Ok(None),
+            Err(e) => Err(e),
+        };
+    };
+    let plan = match table.body.plan_body_range_idx(fk) {
+        Ok(p) => p,
+        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) | Err(StoreError::InvalidFk) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if plan.pages.is_empty() {
+        return Ok(None);
+    }
+    let mut bufs: Vec<Vec<u8>> = plan.pages.iter().map(|p| vec![0u8; p.want]).collect();
+    let filled = fill_idx_pages(sess, &plan.pages, &mut bufs);
+    if !filled {
+        for (i, page) in plan.pages.iter().enumerate() {
+            let rc = unsafe {
+                libc::pread(
+                    page.fd,
+                    bufs[i].as_mut_ptr() as *mut libc::c_void,
+                    page.want,
+                    page.page_off as libc::off_t,
+                )
+            };
+            if rc < 0 || (rc as usize) < page.want {
+                return Ok(None);
+            }
+        }
+    }
+    let page_refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
+    match plan.decode_range(&page_refs) {
+        Ok((off, len)) if len > 0 => Ok(Some((off, len))),
+        Ok(_) | Err(StoreError::Corrupt(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Sidefile ID (page-grouped bulk) then depth-first BIP30 match + idx.
+///
+/// Collects every still-active key's cand create_fks, fills identities with
+/// **one bulk pread per OS page** of `txid.body`, then walks each key's cand
+/// list in original order in RAM. Idx uses held session when provided (no
+/// nested TLS bulk from `record_range`).
+///
+/// When `session` is `Some`, ID + IDX page preads ride that **already-held**
+/// plan ring. When `None`, libc pread for ID and normal `record_range` for IDX.
+fn id_idx_wave(
     table: &TxTable,
     txids: &[[u8; 32]],
     cands_by_key: &[Vec<Fk>],
@@ -200,39 +290,48 @@ fn id_idx_wave_pread(
     idx_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
+    mut session: Option<&mut UringSession>,
 ) -> Result<(), StoreError> {
+    // ── ID stage: page-grouped bulk fill for all active cands ─────────────
+    let mut all_fks: Vec<Fk> = Vec::new();
+    for (ki, cands) in cands_by_key.iter().enumerate() {
+        if skip_if_won && winner[ki].is_some() {
+            continue;
+        }
+        all_fks.extend_from_slice(cands);
+    }
+    let t_id = Instant::now();
+    let (id_map, _pages) = match session.as_deref_mut() {
+        Some(sess) => side.get_many_page_grouped_on_session(&all_fks, sess)?,
+        None => side.get_many_page_grouped(&all_fks)?,
+    };
+    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+    *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
+
+    // ── RAM depth-first match + IDX ───────────────────────────────────────
     for (ki, cands) in cands_by_key.iter().enumerate() {
         if skip_if_won && winner[ki].is_some() {
             continue;
         }
         for (rank0, &fk) in cands.iter().enumerate() {
             let rank = (rank0 + 1) as u64;
-            let t_id = Instant::now();
-            let got = match side.get(fk) {
-                Ok(t) => t,
-                Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {
-                    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-                    *miss_peeks = miss_peeks.saturating_add(1);
-                    *body_lookups = body_lookups.saturating_add(1);
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let Some(id) = fk.get() else {
+                *miss_peeks = miss_peeks.saturating_add(1);
+                continue;
             };
-            *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-            *body_lookups = body_lookups.saturating_add(1);
-            if got != txids[ki] {
+            let Some(got) = id_map.get(&id) else {
+                *miss_peeks = miss_peeks.saturating_add(1);
+                continue;
+            };
+            if *got != txids[ki] {
                 *miss_peeks = miss_peeks.saturating_add(1);
                 continue;
             }
             crate::head_resolve_stats::add_hit_rank(rank);
             let t_idx = Instant::now();
-            match table.body.record_range(fk) {
-                Ok((off, len)) if len > 0 => {
-                    winner[ki] = Some((fk, (off, len)));
-                    crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
-                }
-                Ok(_) | Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
-                Err(e) => return Err(e),
+            if let Some(range) = body_range_no_nested_tls(table, fk, session.as_deref_mut())? {
+                winner[ki] = Some((fk, range));
+                crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
             }
             *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
             break; // depth-first short-circuit within this wave's cands
@@ -301,7 +400,7 @@ fn resolve_denserels_pread(
     Ok((out, dens_ns))
 }
 
-// ── uring: single TLS machine (probe → ID → IDX) ────────────────────────────
+// ── uring probe path (ID stage is page-grouped bulk, shared with pread) ─────
 
 fn resolve_fk_and_range_uring(
     table: &TxTable,
@@ -309,7 +408,7 @@ fn resolve_fk_and_range_uring(
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-    // One TLS ring for the entire machine: head pages, sidefile, idx.
+    // TLS ring for head probe waves; sidefile ID is page-grouped pread.
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
         resolve_fk_and_range_uring_on(session, table, txids)
     })?
@@ -321,9 +420,6 @@ fn resolve_fk_and_range_uring_on(
     txids: &[[u8; 32]],
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();
-    let side_fd: RawFd = side.body_read_fd();
-    let side_path = side.file_path().to_path_buf();
-    let count = table.body.count();
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
@@ -336,39 +432,32 @@ fn resolve_fk_and_range_uring_on(
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
 
-    // ── Wave 1: hot head pages + ID/IDX ───────────────────────────────────
+    // ── Wave 1: hot head pages (uring) + page-grouped ID/IDX ──────────────
     let t_probe = Instant::now();
     let hot_cands = table
         .head
         .probe_candidates_batch_hot_on_session(&mixed, session)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-    let hot_u64: Vec<Vec<u64>> = hot_cands
-        .into_iter()
-        .map(|v| v.into_iter().map(|f| f.0).collect())
-        .collect();
-    cands_total = cands_total.saturating_add(hot_u64.iter().map(|v| v.len() as u64).sum());
+    cands_total = cands_total.saturating_add(hot_cands.iter().map(|v| v.len() as u64).sum());
     debug_assert_eq!(session.in_flight(), 0);
 
-    id_idx_wave_uring(
-        session,
+    id_idx_wave(
         table,
         txids,
-        &hot_u64,
+        &hot_cands,
         side,
-        side_fd,
-        &side_path,
-        count,
         &mut winner,
-        /*only_unset=*/ false,
+        /*skip_if_won=*/ false,
         &mut body_lookups,
         &mut miss_peeks,
         &mut id_ns,
         &mut idx_ns,
         &first_fks,
         &mut local_age,
+        Some(session),
     )?;
 
-    // ── Wave 2: full cold head for survivors + ID/IDX (no further SC) ─────
+    // ── Wave 2: full cold head for survivors + ID/IDX ─────────────────────
     let mut need_cold = false;
     let mut active = vec![false; txids.len()];
     for (i, w) in winner.iter().enumerate() {
@@ -383,30 +472,23 @@ fn resolve_fk_and_range_uring_on(
             .head
             .probe_candidates_batch_cold_on_session(&mixed, &active, session)?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        let cold_u64: Vec<Vec<u64>> = cold_cands
-            .into_iter()
-            .map(|v| v.into_iter().map(|f| f.0).collect())
-            .collect();
-        cands_total = cands_total.saturating_add(cold_u64.iter().map(|v| v.len() as u64).sum());
+        cands_total = cands_total.saturating_add(cold_cands.iter().map(|v| v.len() as u64).sum());
         debug_assert_eq!(session.in_flight(), 0);
 
-        id_idx_wave_uring(
-            session,
+        id_idx_wave(
             table,
             txids,
-            &cold_u64,
+            &cold_cands,
             side,
-            side_fd,
-            &side_path,
-            count,
             &mut winner,
-            /*only_unset=*/ true,
+            /*skip_if_won=*/ true,
             &mut body_lookups,
             &mut miss_peeks,
             &mut id_ns,
             &mut idx_ns,
             &first_fks,
             &mut local_age,
+            Some(session),
         )?;
     }
 
@@ -423,414 +505,6 @@ fn resolve_fk_and_range_uring_on(
         .enumerate()
         .map(|(i, t)| (*t, winner[i]))
         .collect())
-}
-
-/// One ID/IDX wave on a held session for the given cand lists.
-///
-/// When `only_unset` is true, keys that already have a winner are skipped
-/// (wave-2 cold pass after hot hits).
-fn id_idx_wave_uring(
-    session: &mut UringSession,
-    table: &TxTable,
-    txids: &[[u8; 32]],
-    cands_u64: &[Vec<u64>],
-    side: &TxidBody,
-    side_fd: RawFd,
-    side_path: &std::path::Path,
-    count: u64,
-    winner: &mut [Option<(Fk, (u64, u64))>],
-    only_unset: bool,
-    body_lookups: &mut u64,
-    miss_peeks: &mut u64,
-    id_ns: &mut u64,
-    idx_ns: &mut u64,
-    first_fks: &[u64],
-    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-) -> Result<(), StoreError> {
-    let mut done = vec![false; txids.len()];
-    if only_unset {
-        for (i, w) in winner.iter().enumerate() {
-            if w.is_some() {
-                done[i] = true;
-            }
-        }
-    }
-    let mut next_key = 0usize;
-    let mut free_slots: Vec<usize> = (0..MAX_IN_FLIGHT).collect();
-    // SQE destinations declared *before* the drain guard: on Err/unwind the
-    // guard drops first (drains ring) while these buffers are still live.
-    let mut slots: Vec<Option<KeyWork>> = (0..MAX_IN_FLIGHT).map(|_| None).collect();
-    let mut in_flight = 0usize;
-    let mut ring = DrainSessionOnDrop(session);
-
-    arm_keys(
-        table,
-        txids,
-        cands_u64,
-        side,
-        &mut ring,
-        side_fd,
-        count,
-        &mut free_slots,
-        &mut slots,
-        &mut in_flight,
-        &mut next_key,
-        &mut done,
-        id_ns,
-    )?;
-    ring.sync_submission();
-    let _ = ring.submit();
-
-    while in_flight > 0 {
-        let t_wait = Instant::now();
-        let mut cqes = ring.harvest_ready();
-        if cqes.is_empty() {
-            ring.submit_and_wait_one()?;
-            cqes = ring.harvest_ready();
-        }
-        let wait_ns = t_wait.elapsed().as_nanos() as u64;
-
-        for (ud, res) in cqes {
-            let (kind, slot_u) = uring_session::unpack_ud(ud);
-            let slot = slot_u as usize;
-            if slot >= slots.len() || slots[slot].is_none() {
-                return Err(StoreError::Corrupt("head resolve bad slot"));
-            }
-            in_flight = in_flight.saturating_sub(1);
-
-            match kind {
-                STAGE_ID => {
-                    *id_ns = id_ns.saturating_add(wait_ns);
-                    *body_lookups = body_lookups.saturating_add(1);
-                    let outcome = on_stage_id(
-                        table, txids, &mut slots, slot, &mut ring, side, side_fd, side_path, count,
-                        res, id_ns, idx_ns, winner, &mut done, miss_peeks,
-                    )?;
-                    match outcome {
-                        SqeOutcome::SqePushed => in_flight += 1,
-                        SqeOutcome::Finished => {
-                            slots[slot] = None;
-                            free_slots.push(slot);
-                        }
-                    }
-                }
-                STAGE_IDX => {
-                    *idx_ns = idx_ns.saturating_add(wait_ns);
-                    let outcome = on_stage_idx(
-                        table, &mut slots, slot, &mut ring, side, side_fd, count, res, id_ns,
-                        idx_ns, winner, &mut done, miss_peeks, first_fks, local_age,
-                    )?;
-                    match outcome {
-                        SqeOutcome::SqePushed => in_flight += 1,
-                        SqeOutcome::Finished => {
-                            slots[slot] = None;
-                            free_slots.push(slot);
-                        }
-                    }
-                }
-                _ => return Err(StoreError::Corrupt("head resolve bad stage")),
-            }
-        }
-
-        arm_keys(
-            table,
-            txids,
-            cands_u64,
-            side,
-            &mut ring,
-            side_fd,
-            count,
-            &mut free_slots,
-            &mut slots,
-            &mut in_flight,
-            &mut next_key,
-            &mut done,
-            id_ns,
-        )?;
-        ring.sync_submission();
-        let _ = ring.submit();
-    }
-
-    drop(ring);
-    Ok(())
-}
-
-/// Drain the session on drop while caller-held SQE buffers are still live.
-struct DrainSessionOnDrop<'a>(&'a mut UringSession);
-
-impl std::ops::Deref for DrainSessionOnDrop<'_> {
-    type Target = UringSession;
-    fn deref(&self) -> &UringSession {
-        self.0
-    }
-}
-impl std::ops::DerefMut for DrainSessionOnDrop<'_> {
-    fn deref_mut(&mut self) -> &mut UringSession {
-        self.0
-    }
-}
-impl Drop for DrainSessionOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.drain_all();
-    }
-}
-
-enum SqeOutcome {
-    /// Another SQE was pushed for this slot (ID next cand, ID retry, or IDX page).
-    SqePushed,
-    /// Key finished (hit with range, or candidates exhausted).
-    Finished,
-}
-
-/// STAGE_ID CQE: match → plan+push STAGE_IDX; miss → next cand; errors/retry.
-fn on_stage_id(
-    table: &TxTable,
-    txids: &[[u8; 32]],
-    slots: &mut [Option<KeyWork>],
-    slot: usize,
-    session: &mut UringSession,
-    side: &TxidBody,
-    side_fd: RawFd,
-    side_path: &std::path::Path,
-    count: u64,
-    res: i32,
-    id_ns: &mut u64,
-    idx_ns: &mut u64,
-    winner: &mut [Option<(Fk, (u64, u64))>],
-    done: &mut [bool],
-    miss_peeks: &mut u64,
-) -> Result<SqeOutcome, StoreError> {
-    if res < 0 {
-        // ENOTSUP (-95): RWF_DONTCACHE unsupported — demote and retry once.
-        if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-            crate::bulk_io::note_rwf_dontcache_unsupported();
-            if let Some(w) = slots[slot].as_mut() {
-                let off = match TxidBody::entry_offset(w.pending_fk) {
-                    Ok(o) => o,
-                    Err(_) => {
-                        return Err(StoreError::io(
-                            side_path,
-                            std::io::Error::from_raw_os_error(-res),
-                        ));
-                    }
-                };
-                w.id_buf = [0u8; 32];
-                let ud = uring_session::pack_ud(STAGE_ID, slot as u32);
-                session.push_pread_flags(side_fd, off, &mut w.id_buf, ud, 0)?;
-                return Ok(SqeOutcome::SqePushed);
-            }
-        }
-        return Err(StoreError::io(
-            side_path,
-            std::io::Error::from_raw_os_error(-res),
-        ));
-    }
-
-    if res as usize != TXID_ENTRY_LEN as usize {
-        // Short identity — try next cand.
-        let still = submit_next_id_or_done(
-            side,
-            slots[slot].as_mut().unwrap(),
-            session,
-            side_fd,
-            count,
-            slot as u32,
-            id_ns,
-        )?;
-        return Ok(if still {
-            SqeOutcome::SqePushed
-        } else {
-            let w = slots[slot].as_ref().unwrap();
-            done[w.key_i as usize] = true;
-            SqeOutcome::Finished
-        });
-    }
-
-    let w = slots[slot].as_mut().unwrap();
-    let key_i = w.key_i as usize;
-    let got = w.id_buf;
-    if got != txids[key_i] {
-        *miss_peeks = miss_peeks.saturating_add(1);
-        let still = submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?;
-        return Ok(if still {
-            SqeOutcome::SqePushed
-        } else {
-            done[key_i] = true;
-            SqeOutcome::Finished
-        });
-    }
-
-    // Identity hit → STAGE_IDX for body_range on the same session.
-    crate::head_resolve_stats::add_hit_rank(w.pending_rank.max(1) as u64);
-    let fk = Fk(w.pending_fk);
-    let t_idx = Instant::now();
-    let plan = match table.body.plan_body_range_idx(fk) {
-        Ok(p) => p,
-        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) | Err(StoreError::InvalidFk) => {
-            *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-            let still =
-                submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?;
-            return Ok(if still {
-                SqeOutcome::SqePushed
-            } else {
-                done[key_i] = true;
-                SqeOutcome::Finished
-            });
-        }
-        Err(e) => return Err(e),
-    };
-    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-
-    if plan.pages.is_empty() {
-        done[key_i] = true;
-        return Ok(SqeOutcome::Finished);
-    }
-
-    let bufs: Vec<Vec<u8>> = plan.pages.iter().map(|p| vec![0u8; p.want]).collect();
-    w.idx_plan = Some(plan);
-    w.idx_bufs = bufs;
-    w.idx_page_i = 0;
-    submit_idx_page(slots[slot].as_mut().unwrap(), session, slot as u32)?;
-    let _ = winner; // set on STAGE_IDX complete
-    Ok(SqeOutcome::SqePushed)
-}
-
-/// STAGE_IDX CQE: more pages → push next; else decode body_range and finish.
-fn on_stage_idx(
-    _table: &TxTable,
-    slots: &mut [Option<KeyWork>],
-    slot: usize,
-    session: &mut UringSession,
-    side: &TxidBody,
-    side_fd: RawFd,
-    count: u64,
-    res: i32,
-    id_ns: &mut u64,
-    idx_ns: &mut u64,
-    winner: &mut [Option<(Fk, (u64, u64))>],
-    done: &mut [bool],
-    _miss_peeks: &mut u64,
-    first_fks: &[u64],
-    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-) -> Result<SqeOutcome, StoreError> {
-    let w = slots[slot].as_mut().unwrap();
-    let page_i = w.idx_page_i as usize;
-    let plan = w.idx_plan.as_ref().expect("STAGE_IDX without plan");
-    let page = &plan.pages[page_i];
-    let want = page.want;
-
-    if res < 0 {
-        if res == -95 && crate::bulk_io::rwf_dontcache_ok() && page.rw_flags != 0 {
-            crate::bulk_io::note_rwf_dontcache_unsupported();
-            // Retry this page without DONTCACHE.
-            let fd = page.fd;
-            let off = page.page_off;
-            let ud = uring_session::pack_ud(STAGE_IDX, slot as u32);
-            let buf = &mut w.idx_bufs[page_i];
-            buf.fill(0);
-            session.push_pread_flags(fd, off, buf, ud, 0)?;
-            return Ok(SqeOutcome::SqePushed);
-        }
-        // Treat as miss — try next cand identity.
-        w.idx_plan = None;
-        w.idx_bufs.clear();
-        w.idx_page_i = 0;
-        let still = submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?;
-        return Ok(if still {
-            SqeOutcome::SqePushed
-        } else {
-            let key_i = w.key_i as usize;
-            done[key_i] = true;
-            SqeOutcome::Finished
-        });
-    }
-
-    if (res as usize) < want {
-        // Short read — fill remainder via libc pread on the same fd (no TLS nest).
-        let fd = page.fd;
-        let off = page.page_off;
-        let buf = &mut w.idx_bufs[page_i];
-        let rc = unsafe {
-            libc::pread(
-                fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                want,
-                off as libc::off_t,
-            )
-        };
-        if rc < 0 || (rc as usize) < want {
-            w.idx_plan = None;
-            w.idx_bufs.clear();
-            w.idx_page_i = 0;
-            let still =
-                submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?;
-            return Ok(if still {
-                SqeOutcome::SqePushed
-            } else {
-                let key_i = w.key_i as usize;
-                done[key_i] = true;
-                SqeOutcome::Finished
-            });
-        }
-    }
-
-    // More idx pages?
-    if page_i + 1 < plan.pages.len() {
-        w.idx_page_i = (page_i + 1) as u8;
-        submit_idx_page(w, session, slot as u32)?;
-        return Ok(SqeOutcome::SqePushed);
-    }
-
-    // Decode body_range from filled pages (already on the outer ring — no nested
-    // bulk_io / record_range). Corrupt idx is a miss → next cand, or hard Err
-    // only for unexpected IO errors.
-    let t0 = Instant::now();
-    let page_refs: Vec<&[u8]> = w.idx_bufs.iter().map(|b| b.as_slice()).collect();
-    let range = match plan.decode_range(&page_refs) {
-        Ok((off, len)) if len > 0 => Some((off, len)),
-        Ok(_) | Err(StoreError::Corrupt(_)) => None,
-        Err(e) => return Err(e),
-    };
-    *idx_ns = idx_ns.saturating_add(t0.elapsed().as_nanos() as u64);
-
-    let key_i = w.key_i as usize;
-    let fk = Fk(w.pending_fk);
-    if let Some(r) = range {
-        winner[key_i] = Some((fk, r));
-        crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
-        done[key_i] = true;
-        return Ok(SqeOutcome::Finished);
-    }
-
-    // Empty/corrupt range — try next cand.
-    w.idx_plan = None;
-    w.idx_bufs.clear();
-    w.idx_page_i = 0;
-    let still = submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?;
-    Ok(if still {
-        SqeOutcome::SqePushed
-    } else {
-        done[key_i] = true;
-        SqeOutcome::Finished
-    })
-}
-
-fn submit_idx_page(
-    work: &mut KeyWork,
-    session: &mut UringSession,
-    slot: u32,
-) -> Result<(), StoreError> {
-    let page_i = work.idx_page_i as usize;
-    let plan = work.idx_plan.as_ref().expect("idx plan");
-    let page = &plan.pages[page_i];
-    let fd = page.fd;
-    let off = page.page_off;
-    let flags = page.rw_flags;
-    let ud = uring_session::pack_ud(STAGE_IDX, slot);
-    let buf = &mut work.idx_bufs[page_i];
-    buf.fill(0);
-    session.push_pread_flags(fd, off, buf, ud, flags)?;
-    Ok(())
 }
 
 fn resolve_denserels_uring(
@@ -892,106 +566,6 @@ fn resolve_denserels_uring(
         out.push((txid, mapped));
     }
     Ok((out, dens_ns))
-}
-
-/// Submit next cand sidefile identity, or false if candidates exhausted.
-fn submit_next_id_or_done(
-    side: &TxidBody,
-    work: &mut KeyWork,
-    session: &mut UringSession,
-    side_fd: RawFd,
-    count: u64,
-    slot: u32,
-    id_ns: &mut u64,
-) -> Result<bool, StoreError> {
-    let side_n = side.count();
-    while work.cand_i < work.cands.len() {
-        let rank = (work.cand_i + 1) as u32;
-        let fk = work.cands[work.cand_i];
-        work.cand_i += 1;
-        if fk == 0 || fk > count {
-            continue;
-        }
-        let t0 = Instant::now();
-        let off = match TxidBody::entry_offset(fk) {
-            Ok(o) => o,
-            Err(_) => {
-                *id_ns = id_ns.saturating_add(t0.elapsed().as_nanos() as u64);
-                continue;
-            }
-        };
-        *id_ns = id_ns.saturating_add(t0.elapsed().as_nanos() as u64);
-        work.pending_fk = fk;
-        work.pending_rank = rank;
-        work.id_buf = [0u8; 32];
-        work.idx_plan = None;
-        work.idx_bufs.clear();
-        work.idx_page_i = 0;
-        let ud = uring_session::pack_ud(STAGE_ID, slot);
-        let rw_flags = crate::dontcache_policy::sidefile_sqe_rw_flags(fk, side_n);
-        session.push_pread_flags(side_fd, off, &mut work.id_buf, ud, rw_flags)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn arm_keys(
-    _table: &TxTable,
-    txids: &[[u8; 32]],
-    cands_by_key: &[Vec<u64>],
-    side: &TxidBody,
-    session: &mut UringSession,
-    side_fd: RawFd,
-    count: u64,
-    free_slots: &mut Vec<usize>,
-    slots: &mut [Option<KeyWork>],
-    in_flight: &mut usize,
-    next_key: &mut usize,
-    done: &mut [bool],
-    id_ns: &mut u64,
-) -> Result<(), StoreError> {
-    while *next_key < txids.len()
-        && *in_flight < MAX_IN_FLIGHT
-        && session.free_sq() > 0
-        && !free_slots.is_empty()
-    {
-        let key_i = *next_key;
-        *next_key += 1;
-        // Wave-2: winners already marked done; skip without taking a slot.
-        if done[key_i] {
-            continue;
-        }
-        let slot = free_slots.pop().unwrap();
-        let cands = cands_by_key[key_i].clone();
-        if cands.is_empty() {
-            free_slots.push(slot);
-            done[key_i] = true;
-            continue;
-        }
-        slots[slot] = Some(KeyWork {
-            key_i: key_i as u32,
-            cands,
-            cand_i: 0,
-            id_buf: [0u8; 32],
-            pending_fk: 0,
-            pending_rank: 0,
-            idx_plan: None,
-            idx_bufs: Vec::new(),
-            idx_page_i: 0,
-        });
-        let submitted = {
-            let w = slots[slot].as_mut().unwrap();
-            submit_next_id_or_done(side, w, session, side_fd, count, slot as u32, id_ns)?
-        };
-        if submitted {
-            *in_flight += 1;
-        } else {
-            slots[slot] = None;
-            free_slots.push(slot);
-            done[key_i] = true;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

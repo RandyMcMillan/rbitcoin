@@ -755,10 +755,9 @@ impl TxIdx {
             return Err(StoreError::NotFound);
         }
         let segs = self.segments_snapshot();
-        let n_segs = segs.len();
 
         let (si0, slot0) = locate_slot(&segs, id)?;
-        let page0 = plan_page(&segs[si0], si0, n_segs, slot0)?;
+        let page0 = plan_page(&segs[si0], slot0)?;
 
         if id == count {
             // Last published record: start(id) + body_end.
@@ -796,7 +795,7 @@ impl TxIdx {
             });
         }
 
-        let page1 = plan_page(&segs[si1], si1, n_segs, slot1)?;
+        let page1 = plan_page(&segs[si1], slot1)?;
         let end_rel = (slot_file_off(slot1) - page1.page_off) as u16;
         Ok(BodyRangeIdxPlan {
             pages: vec![page0, page1],
@@ -812,13 +811,12 @@ impl TxIdx {
     }
 }
 
-/// One OS-page pread for plan STAGE_IDX (no IO yet).
+/// One OS-page pread for planned idx range decode (no IO yet).
 #[derive(Clone, Debug)]
 pub(crate) struct IdxPagePlan {
     pub fd: std::os::fd::RawFd,
     pub page_off: u64,
     pub want: usize,
-    pub rw_flags: i32,
 }
 
 /// How to decode `(body_off, body_len)` once page buffers are filled.
@@ -893,23 +891,19 @@ fn locate_slot(segs: &[Segment], id: u64) -> Result<(usize, u64), StoreError> {
     Ok((si, slot))
 }
 
-fn plan_page(
-    seg: &Segment,
-    si: usize,
-    n_segs: usize,
-    slot: u64,
-) -> Result<IdxPagePlan, StoreError> {
+fn plan_page(seg: &Segment, slot: u64) -> Result<IdxPagePlan, StoreError> {
     let page_off = align_down(slot_file_off(slot), IDX_OS_PAGE);
     let file_end = seg.file.logical_len();
     let want = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
     if want < 4 {
-        return Err(StoreError::Corrupt("tx.idx page too short for STAGE_IDX"));
+        return Err(StoreError::Corrupt(
+            "tx.idx page too short for body_range plan",
+        ));
     }
     Ok(IdxPagePlan {
         fd: seg.file.read_fd(),
         page_off,
         want,
-        rw_flags: crate::dontcache_policy::idx_sqe_rw_flags(si, n_segs),
     })
 }
 

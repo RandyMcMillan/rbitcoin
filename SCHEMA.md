@@ -150,9 +150,9 @@ S (8-byte aligned only):
 
 There is **no** leading magic byte and **no** leading txid (schema 11–12 stored txid at `[S, S+32)`). There are **no** standalone `input.body` / `output.body` tables.
 
-**Alignment** (schema 13+): `S % 8 == 0` only. The schema-11/12 page non-straddle rule for a leading 32-byte txid is retired.
+**Alignment** (schema 13+): `S % 8 == 0` only. The pad exists so record starts match **`tx.idx` u32 stride-8** (`IDX_STRIDE = 8`): idx stores body offsets as stride units from `body_base`. The schema-11/12 page non-straddle rule for a leading 32-byte txid is **retired** — identity is **`txid.body`**, not body bytes.
 
-Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt. Identity for a known `create_fk` is **`txid.body`**, not body bytes.
+Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt.
 
 **Body meta (32 B):** version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
 On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload). Soft `TxRecord.txid` is filled from the sidefile on get paths.

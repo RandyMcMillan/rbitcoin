@@ -373,9 +373,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     //
     // Only when catch_up_complete: mid-chain peer death must not enter tip mode
     // (would bulk-load SH while still behind horizon).
+    // Tip SH materialize must succeed before follow peers / Electrum. A failed
+    // materialize (e.g. ENOSPC mid-cold) leaves reinit'd or residual SH — do not
+    // accept tip blocks or serve history until finalize is tip-ready.
+    let mut tip_indexes_ready = false;
     if catch_up_complete && !shutdown.requested() {
         let sh_ok = enter_tip_mode(&node.hub.query, Some(Arc::clone(&shutdown.flag)));
         if sh_ok && !shutdown.requested() {
+            tip_indexes_ready = true;
             // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
             mempool.set_relay_enabled(true);
             info!(
@@ -386,6 +391,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         } else if shutdown.requested() {
             warn!(
                 "node: tip SH materialize interrupted — restart to resume (CHECKPOINT/READY kept under scripthash.runs/merge/)"
+            );
+        } else {
+            warn!(
+                "node: tip SH not ready after materialize — skip follow peers and Electrum; \
+                 free disk / fix store and restart to retry finalize"
             );
         }
     } else if !catch_up_complete && !shutdown.requested() {
@@ -399,7 +409,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Bound each connect so a single dead seed cannot stall post-IBD for minutes
     // (OS TCP timeouts are often 2+ min; IBD dial already uses 8s).
     // Each session actively getheaders from tip (fills gaps after SH materialize).
-    if !shutdown.requested() {
+    if tip_indexes_ready && !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
         const FOLLOW_CONNECT_SECS: u64 = 8;
         for (i, peer) in targets.iter().take(follow_n).enumerate() {
@@ -437,115 +447,123 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     // Electrum: share Query + mempool; bridge ChainHub tip events → header push.
+    // Only when SH tip indexes are ready (same gate as follow peers).
     let mut electrum_handles = Vec::new();
     let mut electrum_bridge = None;
-    if let Some(addr) = config.electrum_listen {
-        if !shutdown.requested() {
-            let q = node.hub.query.clone();
-            let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
-            let mut hub_tips = node.hub.subscribe_tips();
-            let bridge_tx = electrum_tip_tx.clone();
-            let bridge_stop = Arc::clone(&shutdown.flag);
-            electrum_bridge = Some(tokio::spawn(async move {
-                loop {
-                    if bridge_stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match hub_tips.recv().await {
-                        Ok(ev) => {
-                            let mut buf = Vec::with_capacity(80);
-                            if ev.header.consensus_encode(&mut buf).is_err() {
-                                continue;
-                            }
-                            let _ = bridge_tx.send(TipNotify {
-                                height: ev.height,
-                                header_hex: rbitcoin_primitives::hex_encode(buf),
-                            });
+    if tip_indexes_ready {
+        if let Some(addr) = config.electrum_listen {
+            if !shutdown.requested() {
+                let q = node.hub.query.clone();
+                let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
+                let mut hub_tips = node.hub.subscribe_tips();
+                let bridge_tx = electrum_tip_tx.clone();
+                let bridge_stop = Arc::clone(&shutdown.flag);
+                electrum_bridge = Some(tokio::spawn(async move {
+                    loop {
+                        if bridge_stop.load(Ordering::SeqCst) {
+                            break;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        match hub_tips.recv().await {
+                            Ok(ev) => {
+                                let mut buf = Vec::with_capacity(80);
+                                if ev.header.consensus_encode(&mut buf).is_err() {
+                                    continue;
+                                }
+                                let _ = bridge_tx.send(TipNotify {
+                                    height: ev.height,
+                                    header_hex: rbitcoin_primitives::hex_encode(buf),
+                                });
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
                     }
+                }));
+                let ecfg = ElectrumConfig::for_params(addr, &params);
+                let max_conn = ecfg.limits.max_connections;
+                let max_line = ecfg.limits.max_request_bytes;
+                let idle_secs = ecfg.limits.idle_timeout.as_secs();
+                match run_electrum(
+                    ecfg,
+                    q,
+                    params.clone(),
+                    electrum_tip_tx,
+                    Some(mempool.clone()),
+                )
+                .await
+                {
+                    Ok(h) => {
+                        info!(
+                            "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
+                            h.local_addr, max_conn, max_line, idle_secs
+                        );
+                        electrum_handles.push(h);
+                    }
+                    Err(e) => warn!("electrum TCP start warning: {e}"),
                 }
-            }));
-            let ecfg = ElectrumConfig::for_params(addr, &params);
-            let max_conn = ecfg.limits.max_connections;
-            let max_line = ecfg.limits.max_request_bytes;
-            let idle_secs = ecfg.limits.idle_timeout.as_secs();
-            match run_electrum(
-                ecfg,
-                q,
-                params.clone(),
-                electrum_tip_tx,
-                Some(mempool.clone()),
-            )
-            .await
-            {
-                Ok(h) => {
-                    info!(
-                        "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
-                        h.local_addr, max_conn, max_line, idle_secs
-                    );
-                    electrum_handles.push(h);
-                }
-                Err(e) => warn!("electrum TCP start warning: {e}"),
             }
         }
     }
 
     // Esplora REST + wallet WebSocket (plain HTTP; TLS via reverse proxy).
     // Tip bridge is independent of Electrum so want:blocks works with Electrum off.
+    // Still requires tip SH ready — history endpoints need durable scripthash.
     let mut esplora_handles = Vec::new();
     let mut esplora_tip_bridge = None;
-    if let Some(addr) = config.esplora_listen {
-        if !shutdown.requested() {
-            let q = node.hub.query.clone();
-            let btc_net = match config.network {
-                rbitcoin_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-                rbitcoin_primitives::Network::Testnet => bitcoin::Network::Testnet,
-                rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
-                rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
-            };
-            let (esplora_tip_tx, _) = broadcast::channel::<TipEvent>(64);
-            let mut hub_tips = node.hub.subscribe_tips();
-            let bridge_tx = esplora_tip_tx.clone();
-            let bridge_stop = Arc::clone(&shutdown.flag);
-            esplora_tip_bridge = Some(tokio::spawn(async move {
-                loop {
-                    if bridge_stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match hub_tips.recv().await {
-                        Ok(ev) => {
-                            let _ = bridge_tx.send(ev);
+    if tip_indexes_ready {
+        if let Some(addr) = config.esplora_listen {
+            if !shutdown.requested() {
+                let q = node.hub.query.clone();
+                let btc_net = match config.network {
+                    rbitcoin_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
+                    rbitcoin_primitives::Network::Testnet => bitcoin::Network::Testnet,
+                    rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
+                    rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
+                };
+                let (esplora_tip_tx, _) = broadcast::channel::<TipEvent>(64);
+                let mut hub_tips = node.hub.subscribe_tips();
+                let bridge_tx = esplora_tip_tx.clone();
+                let bridge_stop = Arc::clone(&shutdown.flag);
+                esplora_tip_bridge = Some(tokio::spawn(async move {
+                    loop {
+                        if bridge_stop.load(Ordering::SeqCst) {
+                            break;
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        match hub_tips.recv().await {
+                            Ok(ev) => {
+                                let _ = bridge_tx.send(ev);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
                     }
-                }
-            }));
-            let ecfg = EsploraConfig::with_network(addr, btc_net);
-            let max_conn = ecfg.limits.max_connections;
-            let max_body = ecfg.limits.max_request_bytes;
-            let idle_secs = ecfg.limits.idle_timeout.as_secs();
-            let max_ws = ecfg.max_ws_connections;
-            match run_esplora(ecfg, q, Some(mempool.clone()), Some(esplora_tip_tx)).await {
-                Ok(h) => {
-                    info!(
+                }));
+                let ecfg = EsploraConfig::with_network(addr, btc_net);
+                let max_conn = ecfg.limits.max_connections;
+                let max_body = ecfg.limits.max_request_bytes;
+                let idle_secs = ecfg.limits.idle_timeout.as_secs();
+                let max_ws = ecfg.max_ws_connections;
+                match run_esplora(ecfg, q, Some(mempool.clone()), Some(esplora_tip_tx)).await {
+                    Ok(h) => {
+                        info!(
                         "esplora HTTP+WS on {} (REST + /v1/ws; max_conn={} max_body={} idle={}s max_ws={}; TLS via reverse proxy if public)",
                         h.local_addr, max_conn, max_body, idle_secs, max_ws
                     );
-                    esplora_handles.push(h);
+                        esplora_handles.push(h);
+                    }
+                    Err(e) => warn!("esplora HTTP start warning: {e}"),
                 }
-                Err(e) => warn!("esplora HTTP start warning: {e}"),
             }
         }
-    }
+    } // tip_indexes_ready (esplora)
+
     // Tip-follow loop until max_run (`Some(0)` = exit after catch-up + tip mode)
     // or until a shutdown signal.
     //
     // Quiet like Core: log **tip updates** only; when tip looks stale open an
     // extra outbound (log that). No periodic "at tip" heartbeat.
-    if config.max_run_secs != Some(0) && !shutdown.requested() {
+    // Requires tip SH ready — otherwise stay idle (or exit) until restart.
+    if tip_indexes_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
         let deadline = config
             .max_run_secs
             .map(|s| Instant::now() + Duration::from_secs(s));
@@ -817,15 +835,24 @@ pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> 
             false
         }
     };
+    if !sh_ok {
+        return false;
+    }
+
+    // Fail closed when Class A exists: residual runs mean creates not yet in
+    // durable SH. Empty / genesis-only store has tip_max=0 and is never
+    // "tip-ready" by that metric — still allow Tip index flags.
+    let tip_max = query.store().txs.count();
     let leftover = query.scripthash_run_count();
     if leftover > 0 {
         warn!(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
-             Electrum history may be incomplete; fix and restart to retry finalize"
+             refusing tip-follow / Electrum until drain succeeds (restart finalize)"
         );
+        return false;
     }
-
-    if !sh_ok {
+    if tip_max > 0 && !query.sh_is_tip_ready() {
+        warn!("node: scripthash materialize returned ok but not tip-ready — refusing tip mode");
         return false;
     }
 

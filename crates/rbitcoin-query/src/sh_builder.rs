@@ -1259,7 +1259,14 @@ impl ShRunBuilder {
         ColdProgress::clear(store_dir);
 
         // Post-interrupt catch-up runs: warm-insert into live SH head (no reinit).
+        // Inclusion HWM must cover both cold stream **and** deferred create_fks.
         let mut n_deferred = 0u64;
+        let mut hwm = max_fk_seen;
+        for r in &pending_after {
+            if let Ok(body) = rbitcoin_store::read_run_body(r) {
+                hwm = hwm.max(max_fk_in_body(&body));
+            }
+        }
         if !pending_after.is_empty() {
             info!(
                 "node: scripthash applying {} deferred run(s) after cold materialize",
@@ -1271,10 +1278,10 @@ impl ShRunBuilder {
             }
         }
         clear_runs_dir(&runs_dir);
-        if max_fk_seen > 0 {
-            let _ = store_seal(&runs_dir, max_fk_seen);
-            self.sealed_fk.store(max_fk_seen, Ordering::Release);
-            let _ = store.scripthash.note_include_hwm(max_fk_seen);
+        if hwm > 0 {
+            let _ = store_seal(&runs_dir, hwm);
+            self.sealed_fk.store(hwm, Ordering::Release);
+            let _ = store.scripthash.note_include_hwm(hwm);
         }
 
         info!(

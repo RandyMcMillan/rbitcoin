@@ -293,7 +293,7 @@ impl Query {
             ));
         }
 
-        let n = match cancel {
+        let mut n = match cancel {
             None => self.sh_run.finalize_and_bulk_materialize(&self.store)?,
             Some(c) => self
                 .sh_run
@@ -309,6 +309,55 @@ impl Query {
             return Err(StoreError::Corrupt(
                 "scripthash materialize finished empty while Class A creates remain above SEAL",
             ));
+        }
+
+        // Post-materialize drain: failed/partial cold loads, or creates that
+        // landed as small runs after recollect but before claim, must be folded
+        // into the durable head **before** tip-ready / Electrum. Mainnet saw
+        // leftover catalog after ENOSPC rematerialize + short Direct catch-up.
+        // Bounded loop: each pass recollects create_fk > SEAL then warm/cold
+        // materializes residual runs.
+        //
+        // Empty store (tip_max==0): nothing to cover — skip tip-ready fail-closed.
+        let tip_final = self.store.txs.count();
+        if tip_final > 0 {
+            const MAX_POST_DRAIN_ROUNDS: u32 = 8;
+            for round in 1..=MAX_POST_DRAIN_ROUNDS {
+                if self.sh_is_tip_ready() {
+                    break;
+                }
+                self.sh_run.refresh_seal();
+                let residual = self.sh_run.on_disk_run_count();
+                let tip_now = self.store.txs.count();
+                let seal_now = self.sh_run.sealed_max_create_fk();
+                let hwm_now = self.store.scripthash.include_hwm();
+                rbitcoin_log::info!(
+                    "node: scripthash post-materialize drain round={round}/{MAX_POST_DRAIN_ROUNDS} \
+                     residual_runs={residual} seal={seal_now} include_hwm={hwm_now} tip_max={tip_now}"
+                );
+                self.rebuild_sh_unsealed_from_class_a_cancellable(cancel)?;
+                let n2 = match cancel {
+                    None => self.sh_run.finalize_and_bulk_materialize(&self.store)?,
+                    Some(c) => self
+                        .sh_run
+                        .finalize_and_bulk_materialize_cancellable(&self.store, Some(c))?,
+                };
+                n = n.saturating_add(n2);
+            }
+            if !self.sh_is_tip_ready() {
+                let residual = self.sh_run.on_disk_run_count();
+                let tip_now = self.store.txs.count();
+                let seal_now = self.sh_run.sealed_max_create_fk();
+                let hwm_now = self.store.scripthash.include_hwm();
+                rbitcoin_log::error!(
+                    "node: scripthash not tip-ready after post-materialize drain \
+                     residual_runs={residual} seal={seal_now} include_hwm={hwm_now} tip_max={tip_now}"
+                );
+                return Err(StoreError::Corrupt(
+                    "scripthash residual runs or create gap remain after materialize drain \
+                     (refuse tip-follow / Electrum)",
+                ));
+            }
         }
         Ok(n)
     }
@@ -1435,6 +1484,108 @@ mod tests {
             q.sh_run.sealed_max_create_fk() >= tip_max,
             "Direct enter must raise SEAL to include_hwm covering tip"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failed mid-materialize (empty head + claimed mats) + more Direct creates
+    /// as small runs → finalize must fold **all** creates into durable SH and be
+    /// tip-ready before tip-follow / Electrum (mainnet ENOSPC rematerialize class).
+    #[test]
+    fn scenario_failed_materialize_then_small_runs_then_finalize_tip_ready() {
+        use rbitcoin_store::{claim_run_for_materialize, list_runs};
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-fail-then-runs-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+
+        // Phase 1: Direct chain + recollect spills into catalog runs.
+        seed_direct_chain(&q, 6);
+        let tip_max_phase1 = q.store.txs.count();
+        assert!(tip_max_phase1 >= 6);
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        assert!(
+            q.sh_run.on_disk_run_count() > 0,
+            "recollect must leave catalog runs"
+        );
+
+        // Phase 2: simulate materialize *start* then failure — claim runs as .mat
+        // and reinit empty head (FullCold reinit) without streaming them in.
+        let runs_dir = dir.join("scripthash.runs");
+        {
+            let runs = list_runs(&runs_dir).unwrap();
+            assert!(!runs.is_empty());
+            for r in runs {
+                claim_run_for_materialize(&r).unwrap();
+            }
+        }
+        q.store
+            .scripthash
+            .reinit_empty_for_cold_materialize()
+            .unwrap();
+        assert!(
+            !q.store.scripthash.has_durable_index(),
+            "failed materialize leaves empty head"
+        );
+        assert!(
+            q.sh_run.on_disk_run_count() > 0,
+            "claimed .mat leftovers must remain visible"
+        );
+        assert!(
+            !q.sh_is_tip_ready(),
+            "must not be tip-ready after failed materialize"
+        );
+
+        // Phase 3: more Direct blocks → small new SH runs (post-fail catch-up).
+        let tip_h = q.tip_height().unwrap().0;
+        let tip_fk = q.store.confirmed.get(Height(tip_h)).unwrap().unwrap();
+        let tip_hash = q.store.get_header(tip_fk).unwrap().hash;
+        let mut prev = tip_fk;
+        let mut parent_hash = Some(tip_hash);
+        for h in (tip_h + 1)..=(tip_h + 3) {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let tip_max_final = q.store.txs.count();
+        assert!(tip_max_final > tip_max_phase1);
+
+        // Phase 4: finalize must recollect gap + materialize claimed + new runs.
+        let n_mat = q
+            .finalize_sh_runs()
+            .expect("finalize after failed materialize + more runs");
+        assert!(
+            n_mat > 0 || q.store.scripthash.has_durable_index(),
+            "materialize must produce durable SH"
+        );
+        assert_eq!(
+            q.scripthash_run_count(),
+            0,
+            "no residual runs before tip-ready"
+        );
+        assert!(
+            q.sh_is_tip_ready(),
+            "must be tip-ready seal={} hwm={} tip_max={} runs={}",
+            q.sh_run.sealed_max_create_fk(),
+            q.store.scripthash.include_hwm(),
+            tip_max_final,
+            q.sh_run.on_disk_run_count()
+        );
+        // Inclusion floor covers every Class A create through tip.
+        let floor = crate::sh_builder::durable_sh_inclusion_floor(
+            q.store.scripthash.include_hwm(),
+            q.sh_run.sealed_max_create_fk(),
+        );
+        assert!(
+            floor >= tip_max_final,
+            "include floor must cover tip creates floor={floor} tip_max={tip_max_final}"
+        );
+        q.enter_tip_index_mode();
+        assert!(q.sh_is_tip_ready());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

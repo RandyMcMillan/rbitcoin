@@ -128,6 +128,14 @@ impl IbdReorgState {
         self.awaiting.as_ref()
     }
 
+    /// True if `hash` is the held tip+1 of an incomplete reorg gather (do not
+    /// soft re-getdata / tip-hole race it — densify **mids** instead).
+    pub fn is_awaiting_held_tip(&self, hash: &BlockHash) -> bool {
+        self.awaiting
+            .as_ref()
+            .is_some_and(|a| a.held_tip.block_hash() == *hash)
+    }
+
     /// Register hashes (and optional path tip) for exploration densify / apply.
     pub fn register_explore(
         &mut self,

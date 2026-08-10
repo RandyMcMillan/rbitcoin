@@ -625,8 +625,12 @@ fn load_reorg_body(
 
 /// On BadPrev, if the rejected body's prev is a known competing header, try
 /// most-work reorg onto the **full** header path from best-chain LCA to the
-/// rejected hash (every mid body, not wire_prev alone). Returns true if tip
-/// moved (caller should not soft-reget).
+/// rejected hash (every mid body, not wire_prev alone).
+///
+/// Returns **true** when the reject is **handled** (reorg applied **or** mid
+/// bodies are awaited). Caller must **not** soft re-getdata tip+1 in those
+/// cases — that livelocked mainnet (re-download tip+1 forever while mids never
+/// densify). Returns false only for corrupt wire / apply failure → soft re-get.
 fn try_reorg_on_bad_prev(
     st: &mut IbdWorkState,
     hub: &crate::chain::ChainHub,
@@ -640,6 +644,15 @@ fn try_reorg_on_bad_prev(
     use bitcoin::consensus::deserialize;
     use rbitcoin_log::info;
     use std::collections::HashMap;
+
+    // Already gathering mids for this tip+1 — do not soft re-get / re-log spam.
+    // Still try complete (mids may have been held since the last BadPrev).
+    if st.reorg.is_awaiting_held_tip(&hash) {
+        let _ = hub.query.block_queue_dequeue_height(height);
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+        let _ = try_complete_awaiting_reorg(st, hub);
+        return true;
+    }
 
     let Some(tip) = hub.tip_hash() else {
         return false;
@@ -681,7 +694,8 @@ fn try_reorg_on_bad_prev(
             let mut need = Vec::new();
             for (i, h) in path.iter().enumerate() {
                 let hgt = height.saturating_sub((path.len() - 1 - i) as u32);
-                st.hash_height.insert(*h, hgt);
+                // Keep height_to_hash in sync so assign/BlockFramed resolve mids.
+                st.record_height(*h, hgt);
                 st.known_headers.insert(*h);
                 if *h == hash {
                     continue;
@@ -698,14 +712,18 @@ fn try_reorg_on_bad_prev(
                 }
             }
             if !need.is_empty() {
-                // Awaiting alone feeds need_getdata (assign 1b). Avoid
-                // register_explore here so try_complete uses full awaiting gather.
+                // Awaiting feeds need_getdata (assign 1b). Return true so soft
+                // path does **not** mark_missing/re-get tip+1 (mainnet livelock).
                 st.reorg.set_awaiting(ext.clone(), need.clone());
+                let _ = hub.query.block_queue_dequeue_height(height);
+                clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+                // Keep tip+1 out of tip-hole re-get while mids densify.
+                st.body.mark_pending(hash);
                 warn!(
                     "ibd: competing reorg awaiting {} body/bodies on path to LCA (held tip+1 {hash}) need={need:?}",
                     need.len()
                 );
-                return false;
+                return true;
             }
             match try_apply_best_candidate(hub, &bodies, &[hash], &mut st.reorg) {
                 Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
@@ -1617,6 +1635,40 @@ mod confirm_reject_tests {
             hub.tip_hash().unwrap(),
             l2.block_hash(),
             "tip unchanged while awaiting"
+        );
+        // Handled without soft re-get of tip+1 (mainnet livelock class).
+        assert!(
+            st.reorg.is_awaiting_held_tip(&w3.block_hash()),
+            "must await held tip+1 W3"
+        );
+        assert!(
+            !st.body.skip_download(&hub, &w1.block_hash())
+                || st.reorg.need_getdata().contains(&w1.block_hash()),
+            "mids must remain densify targets"
+        );
+        // Second BadPrev while awaiting must not soft mark_missing tip+1
+        // (that re-getdatas tip+1 forever while mids starve).
+        apply_confirm_reject(
+            &mut st,
+            3,
+            w3.block_hash(),
+            "consensus: unexpected previous header",
+            Some(hub.query.as_ref()),
+            Some(&hub),
+        );
+        assert!(
+            st.reorg.is_awaiting_held_tip(&w3.block_hash()),
+            "still awaiting after re-reject"
+        );
+        // tip+1 stays pending (held), not demoted to missing for densify re-get.
+        assert!(
+            st.body.is_pending(&w3.block_hash()) || st.reorg.get_held(&w3.block_hash()).is_some(),
+            "tip+1 must stay held/pending while awaiting mids, not soft-missing"
+        );
+        assert!(
+            st.reorg.need_getdata().contains(&w1.block_hash())
+                && st.reorg.need_getdata().contains(&w2.block_hash()),
+            "mids still densify targets after re-reject"
         );
 
         // Bodies arrive → complete reorg.

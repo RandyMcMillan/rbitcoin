@@ -394,6 +394,10 @@ pub(crate) fn contiguous_tip_holes(
         if st.body.is_rejected(&hash) {
             break;
         }
+        // Reorg gather holds tip+1 — not a fetch hole for that hash (mids densify).
+        if st.reorg.is_awaiting_held_tip(&hash) {
+            break;
+        }
         if claim_ready(hub, &mut st.body, ht, &hash) {
             break;
         }
@@ -474,6 +478,12 @@ pub(crate) fn cover_tip_holes(
         // Class A alone and **zombie pending without BQ** are not enough — sole
         // confirm intake is BQ wire. Resume seed marks Class A as known so densify
         // does not re-walk the whole band; tip-hole race must still re-get.
+        //
+        // Exception: tip+1 held for incomplete reorg mid gather — re-get would
+        // re-BadPrev forever while mids starve (mainnet 961633 livelock).
+        if st.reorg.is_awaiting_held_tip(&h) {
+            continue;
+        }
         let ht = st.hash_height.get(&h).copied();
         if hub.has_block(&h) {
             continue;

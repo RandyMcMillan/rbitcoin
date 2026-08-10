@@ -123,8 +123,9 @@ pub enum ShHeadValueMode {
 
 /// Classify a 16-byte head value without allocating (schema-14 rules).
 ///
-/// **Note:** schema-13 slab bytes also have w0 flagged; [`ShHeadValue::decode`](crate::scripthash_layout::ShHeadValue::decode)
-/// refuses historical slab packing before treating flagged words as paged.
+/// Flagged `w0` is **paged** (first/last page offs). Schema-13 slab packing used the
+/// same flag bit; store open refuses schema-13 with a durable SH index, so decode
+/// does not try to sniff slab-vs-paged from offset shape.
 #[inline]
 pub fn sh_head_value_mode(w0: u64, w1: u64) -> Result<ShHeadValueMode, StoreError> {
     if w0 == 0 && w1 == 0 {

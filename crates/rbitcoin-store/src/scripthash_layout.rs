@@ -162,28 +162,11 @@ impl ShHeadValue {
         if w0 == 0 && w1 == 0 {
             return Ok(ShHeadValue::Empty);
         }
-        // Schema-13 slab: w0 = SH_SLAB_MARKER | class<<32 | used (bits 40..62 clear), w1 = off.
-        // Paged first_page is a file offset (typically ≥ payload_start ≈ 4KiB+); refuse
-        // the historical packing shape so old heads never decode as paged.
-        if (w0 & SH_SLAB_MARKER) != 0 {
-            let bits40_62_clear = (w0 & 0x7fff_ff00_0000_0000) == 0;
-            let class = ((w0 >> 32) & 0xff) as u8;
-            let used = (w0 & 0xffff_ffff) as u32;
-            // Historical slab: used ≤ class capacity (small). Real page offs are ≥4KiB.
-            if bits40_62_clear && class <= SH_MAX_CLASS && used > 0 && used <= slab_cap(class) {
-                return Err(StoreError::Corrupt(
-                    "scripthash: legacy slab head value (rebuild scripthash index)",
-                ));
-            }
-            let arr: &[u8; 16] = buf
-                .try_into()
-                .map_err(|_| StoreError::Corrupt("short scripthash head value"))?;
-            let (first, last) = sh_decode_paged_head(arr)?;
-            return Ok(ShHeadValue::Paged {
-                first_page: first,
-                last_page: last,
-            });
-        }
+        // Schema-14 paged: w0 flagged, w1 clear, both payloads non-zero page offs.
+        // Do **not** sniff "legacy slab" from offset shape: large `scripthash.body`
+        // page offsets (e.g. class<<32 | 4096) collide with schema-13 packing and
+        // false-positive mid warm-apply. Schema-13 stores with a durable SH index
+        // are refused at store open (`meta`); empty-SH 13→14 upgrades wipe/rebuild.
         match sh_head_value_mode(w0, w1)? {
             ShHeadValueMode::Empty => Ok(ShHeadValue::Empty),
             ShHeadValueMode::Inline => {
@@ -278,18 +261,30 @@ mod tests {
     }
 
     #[test]
-    fn legacy_slab_bytes_rejected() {
-        // Schema-13 slab: FLAG | class<<32 | used, w1 = slab_off
-        let mut bad = [0u8; 16];
+    fn paged_offsets_that_look_like_legacy_slab_still_decode() {
+        // Regression: body offs such as (10<<32)|4096 used to trip a slab sniffer
+        // and abort warm apply on multi‑GiB scripthash.body.
+        let first = (10u64 << 32) | 4096;
+        let last = first + 4096;
+        let paged = ShHeadValue::paged(first, last);
+        let got = ShHeadValue::decode(&paged.encode()).unwrap();
+        assert_eq!(got, paged);
+        // Historical slab packing shape also decodes as paged (open refuses schema-13
+        // durable SH; no per-slot dual-read).
+        let mut slab_shaped = [0u8; 16];
         let w0 = SH_SLAB_MARKER | (1u64 << 32) | 5;
-        bad[0..8].copy_from_slice(&w0.to_le_bytes());
-        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
-        let err = ShHeadValue::decode(&bad).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("legacy slab") || msg.contains("rebuild"),
-            "{msg}"
-        );
+        slab_shaped[0..8].copy_from_slice(&w0.to_le_bytes());
+        slab_shaped[8..16].copy_from_slice(&4112u64.to_le_bytes());
+        match ShHeadValue::decode(&slab_shaped).unwrap() {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
+                assert_eq!(first_page, (1u64 << 32) | 5);
+                assert_eq!(last_page, 4112);
+            }
+            other => panic!("expected paged, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2591,21 +2591,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_slab_head_value_rejected_on_public_decode() {
-        // Public decode path must refuse schema-13 slab packing (rebuild SH).
-        use crate::scripthash_layout::SH_SLAB_MARKER;
-        let mut bad = [0u8; 16];
-        let w0 = SH_SLAB_MARKER | (2u64 << 32) | 10;
-        bad[0..8].copy_from_slice(&w0.to_le_bytes());
-        bad[8..16].copy_from_slice(&8192u64.to_le_bytes());
-        let err = ShHeadValue::decode(&bad).unwrap_err();
-        assert!(
-            format!("{err}").contains("legacy slab") || format!("{err}").contains("rebuild"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn freelist_reuses_page() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();

@@ -1579,6 +1579,535 @@ mod confirm_reject_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Mainnet-shaped stall repro (no production fix yet): tip already on a
+    /// **loser child** while the heavier path's mid blocks sit at heights that
+    /// are already confirmed (with loser bodies). Densify only fills far
+    /// extensions on the winner path (tip+2+) into the body queue, leaving a
+    /// tip+1 hole — and something must still be able to densify/load the mids
+    /// at those already-confirmed heights (reorg need / BlockFramed hold), or
+    /// IBD spins with hole>0 + conf=0 while BQ grows ahead.
+    ///
+    /// Log shape: resume explore_need=…, tip frozen, hole≥1, bq soft growing,
+    /// claim spinning, no reorg until mids load.
+    #[test]
+    fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
+        use super::super::assign::{assign_work_ordered, AssignDepth};
+        use super::super::path::seed_work_path_from_store;
+        use super::super::peer_io::{PeerEvent, PeerSlot};
+        use super::super::progress::{claim_ready, tip_fetch_hole};
+        use super::super::status::LoopStats;
+        use super::super::IbdConfig;
+        use super::{apply_peer_event, try_complete_awaiting_reorg};
+        use crate::chain::ChainHub;
+        use crate::seeds::AddrMan;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::mpsc;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-mid-confirmed-hole-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let distinct = |mut b: bitcoin::Block, avoid: BlockHash| {
+            if b.block_hash() == avoid {
+                let target = Target::from_compact(b.header.bits);
+                for nonce in 0..u32::MAX {
+                    b.header.nonce = nonce;
+                    if b.header.validate_pow(target).is_ok() && b.block_hash() != avoid {
+                        break;
+                    }
+                }
+            }
+            b
+        };
+
+        // Loser path confirmed: gen → L1 → L2 (tip @2). Heights 1 and 2 occupied.
+        let l1 = mine(gen, 1_500_000_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_000_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(2));
+        assert!(hub.has_block(&l1.block_hash()));
+        assert!(hub.has_block(&l2.block_hash()));
+
+        // Heavier winner headers only: gen → W1@1 → W2@2 → W3@3 → W4@4 → W5@5.
+        // Mid heights 1 and 2 are already confirmed (with L1/L2) — bodies missing.
+        let w1 = distinct(mine(gen, 1_500_000_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_000_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_000_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_000_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+        let w5 = mine(w4.block_hash(), 1_500_000_501, 5);
+        hub.ensure_header(&w5.header).unwrap();
+
+        assert!(!hub.has_block(&w1.block_hash()));
+        assert!(!hub.has_block(&w2.block_hash()));
+
+        // Resume seed as IBD does after open (mainnet explore_need log).
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        let slot = PeerSlot {
+            id: 0,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
+            cmd_tx,
+            in_flight: HashSet::new(),
+            block_progress_ms: Arc::new(AtomicU64::new(0)),
+            peer_height: 100,
+            connected_ms: 1,
+            first_data_ms: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            alive: true,
+            task,
+        };
+        let mut st = IbdWorkState::new(vec![slot], hub.tip_hash(), hub.tip_height());
+        seed_work_path_from_store(&mut st, &hub);
+
+        assert!(
+            st.ordered_set.contains(&w1.block_hash()) && st.ordered_set.contains(&w2.block_hash()),
+            "seed must order winner mids at confirmed heights"
+        );
+        assert_eq!(
+            st.height_to_hash.get(&1),
+            Some(&w1.block_hash()),
+            "height map must track winner W1 at already-confirmed height 1 (not L1)"
+        );
+        assert_eq!(
+            st.height_to_hash.get(&2),
+            Some(&w2.block_hash()),
+            "height map must track winner W2 at already-confirmed height 2 (not L2)"
+        );
+        assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
+
+        let need = st.reorg.need_getdata();
+        assert!(
+            need.contains(&w1.block_hash()) && need.contains(&w2.block_hash()),
+            "explore/reorg densify must still need mids at confirmed heights; need={need:?}"
+        );
+        // skip_download must not treat "height already confirmed" as done for the
+        // *winner* hash — only hub.has_block(that hash).
+        assert!(
+            !st.body.skip_download(&hub, &w1.block_hash()),
+            "W1 must remain downloadable despite height 1 being confirmed as L1"
+        );
+        assert!(
+            !st.body.skip_download(&hub, &w2.block_hash()),
+            "W2 must remain downloadable despite height 2 being confirmed as L2"
+        );
+
+        // Densify-ahead shape (mainnet): only a *far* winner body lands in BQ
+        // (tip+3), leaving a contiguous hole at tip+1..tip+2. Far payload alone
+        // must not reorg; explore_tip is W5 without a full contiguous body path.
+        hub.query
+            .block_queue_offer(5, w5.block_hash().to_byte_array(), 0, &serialize(&w5))
+            .unwrap();
+        st.body.mark_pending(w5.block_hash());
+
+        assert!(
+            !claim_ready(&hub, &mut st.body, 3, &w3.block_hash()),
+            "tip+1 W3 must not be claim-ready when only far densify is in BQ"
+        );
+        let hole = tip_fetch_hole(&hub, &st.height_to_hash, &mut st.body);
+        assert!(
+            hole >= 2,
+            "must leave tip+1.. hole while densify is only far ahead; hole={hole}"
+        );
+        assert!(
+            !try_complete_awaiting_reorg(&mut st, &hub),
+            "far non-contiguous BQ alone must not reorg off loser tip"
+        );
+        assert_eq!(hub.tip_hash().unwrap(), l2.block_hash());
+
+        // Assign must still getdata mids at confirmed heights + tip hole — not
+        // only densify further past the hole.
+        let stats = LoopStats::default();
+        let cfg = IbdConfig::for_test();
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            3,
+            AssignDepth::Full,
+            true,
+            None,
+        );
+        assert!(
+            st.inflight.contains_key(&w1.block_hash())
+                && st.inflight.contains_key(&w2.block_hash()),
+            "assign reorg need (1b) must getdata both mids at confirmed heights; inflight={:?}",
+            st.inflight.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            st.inflight.contains_key(&w3.block_hash()),
+            "assign tip-hole race must also getdata tip+1 W3; inflight={:?}",
+            st.inflight.keys().collect::<Vec<_>>()
+        );
+
+        // Production BlockFramed path for height≤tip mids: hold by hash (BQ
+        // first-wins cannot store same-height competitors of confirmed tip).
+        let write_next = AtomicU32::new(3);
+        let mut book = AddrMan::new();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        for b in [&w1, &w2] {
+            apply_peer_event(
+                &mut st,
+                &hub,
+                PeerEvent::BlockFramed {
+                    peer: 0,
+                    hash: b.block_hash(),
+                    payload: serialize(b),
+                },
+                &write_next,
+                &mut book,
+                local,
+                None,
+            );
+            assert!(
+                st.reorg.get_held(&b.block_hash()).is_some(),
+                "BlockFramed mid at confirmed height must hold by hash for reorg; hash={}",
+                b.block_hash()
+            );
+            // Still on loser: exploration tip is far (W5) and W3/W4 not loadable yet.
+            assert_eq!(
+                hub.tip_hash().unwrap(),
+                l2.block_hash(),
+                "holding mids alone must not reorg without contiguous path to a tip"
+            );
+        }
+
+        // Tip+1 body arrives into BQ (height > tip). Exploration may still fail
+        // (explore_need includes W4; explore_tip=W5 needs full path). Confirm
+        // BadPrev is the production path that densifies LCA→tip+1 and applies.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlockFramed {
+                peer: 0,
+                hash: w3.block_hash(),
+                payload: serialize(&w3),
+            },
+            &write_next,
+            &mut book,
+            local,
+            None,
+        );
+        assert!(
+            hub.query.block_queue_has_height(3) || st.reorg.get_held(&w3.block_hash()).is_some(),
+            "W3 tip+1 must land in BQ or held"
+        );
+
+        // Exploration may apply if a full path is loadable; else BadPrev densify
+        // to LCA must reorg using held mids at confirmed heights.
+        let _ = try_complete_awaiting_reorg(&mut st, &hub);
+        if hub.tip_hash() == Some(l2.block_hash()) {
+            apply_confirm_reject(
+                &mut st,
+                3,
+                w3.block_hash(),
+                "consensus: unexpected previous header",
+                Some(hub.query.as_ref()),
+                Some(&hub),
+            );
+            if hub.tip_hash() == Some(l2.block_hash()) {
+                let _ = try_complete_awaiting_reorg(&mut st, &hub);
+            }
+        }
+
+        // Contract: with mids held at already-confirmed heights + tip+1 wire,
+        // tip must leave the loser fork. Failure here is the mainnet stall class.
+        let tip = hub.tip_hash().unwrap();
+        assert_ne!(
+            tip,
+            l2.block_hash(),
+            "must reorg off loser once mid bodies at confirmed heights are held + tip+1 wire; \
+             tip={tip} need={:?} held_w1={} held_w2={} bq3={}",
+            st.reorg.need_getdata(),
+            st.reorg.get_held(&w1.block_hash()).is_some(),
+            st.reorg.get_held(&w2.block_hash()).is_some(),
+            hub.query.block_queue_has_height(3)
+        );
+        assert!(
+            tip == w3.block_hash() || tip == w4.block_hash() || tip == w5.block_hash(),
+            "tip must be on winner path; tip={tip}"
+        );
+        assert!(
+            hub.tip_height().unwrap() >= 3,
+            "winner tip height must be ≥3; got {:?}",
+            hub.tip_height()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Red pin: zombie `pending` on a mid at an **already-confirmed height** is
+    /// never demoted by tip-hole cover / tip-batch stale expire (those only walk
+    /// tip+1..). Assign reorg need (1b) then `skip_download` forever → mid never
+    /// re-getdatas, reorg cannot gather, tip hole on the winner path stays open
+    /// while densify may still fill far heights (mainnet: hole + bq soft growth).
+    ///
+    /// Run with `cargo test -p rbitcoin-net zombie_pending_mid -- --ignored`.
+    /// Remove `ignore` when shipping the assign/body demote fix (TDD green).
+    #[test]
+    #[ignore = "red: zombie mid pending at confirmed height blocks reorg densify 1b"]
+    fn zombie_pending_mid_at_confirmed_height_never_reget() {
+        use super::super::assign::{assign_work_ordered, AssignDepth};
+        use super::super::path::seed_work_path_from_store;
+        use super::super::peer_io::PeerSlot;
+        use super::super::status::LoopStats;
+        use super::super::IbdConfig;
+        use crate::chain::ChainHub;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::mpsc;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-zombie-mid-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let distinct = |mut b: bitcoin::Block, avoid: BlockHash| {
+            if b.block_hash() == avoid {
+                let target = Target::from_compact(b.header.bits);
+                for nonce in 0..u32::MAX {
+                    b.header.nonce = nonce;
+                    if b.header.validate_pow(target).is_ok() && b.block_hash() != avoid {
+                        break;
+                    }
+                }
+            }
+            b
+        };
+
+        let l1 = mine(gen, 1_510_000_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_510_000_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        let w1 = distinct(mine(gen, 1_510_000_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_510_000_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_510_000_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        let slot = PeerSlot {
+            id: 0,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+            cmd_tx,
+            in_flight: HashSet::new(),
+            block_progress_ms: Arc::new(AtomicU64::new(0)),
+            peer_height: 100,
+            connected_ms: 1,
+            first_data_ms: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            alive: true,
+            task,
+        };
+        let mut st = IbdWorkState::new(vec![slot], hub.tip_hash(), hub.tip_height());
+        seed_work_path_from_store(&mut st, &hub);
+        assert!(st.reorg.need_getdata().contains(&w1.block_hash()));
+
+        // Zombie: pending flag without held body and without BQ wire — same class
+        // as tip+1 zombie, but at height ≤ tip so cover_tip_holes never demotes it.
+        st.body.mark_pending(w1.block_hash());
+        assert!(st.body.is_pending(&w1.block_hash()));
+        assert!(st.reorg.get_held(&w1.block_hash()).is_none());
+        assert!(!hub.query.block_queue_has_height(1));
+        assert!(
+            st.body.skip_download(&hub, &w1.block_hash()),
+            "precondition: pending mid is skip_download"
+        );
+        assert!(
+            st.reorg.need_getdata().contains(&w1.block_hash()),
+            "need_getdata still lists mid (not held)"
+        );
+
+        let stats = LoopStats::default();
+        let cfg = IbdConfig::for_test();
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            3,
+            AssignDepth::Full,
+            true,
+            None,
+        );
+
+        // Desired contract: demote zombie mid and re-getdata (same as tip-hole
+        // cover does for tip+1 zombies). Today assign 1b skip_download's the mid
+        // forever — this assertion is the red pin for that stall class.
+        assert!(
+            st.inflight.contains_key(&w1.block_hash()),
+            "must re-getdata zombie-pending mid at already-confirmed height; \
+             skip_download={} need={:?} inflight={:?}",
+            st.body.skip_download(&hub, &w1.block_hash()),
+            st.reorg.need_getdata(),
+            st.inflight.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !st.body.is_pending(&w1.block_hash()),
+            "zombie mid pending must be demoted to missing before re-get (like tip-hole cover)"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Competing BadPrev with bodies available reorgs onto winning path (not soft-livelock).
     #[test]
     fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {

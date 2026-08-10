@@ -39,11 +39,23 @@ pub(crate) struct WorkStructureSizes {
 ///
 /// Near/far densify use a single peer. Tip-hole hashes race a second peer
 /// immediately and a third only after [`super::TIP_HOLE_THIRD_PEER_AFTER`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct InflightReq {
     pub peers: HashSet<usize>,
     /// When the second peer was first attached (tip-hole third-peer timer).
     pub second_peer_at: Option<Instant>,
+    /// When this hash first entered global inflight (stale tip-hole re-get).
+    pub started_at: Instant,
+}
+
+impl Default for InflightReq {
+    fn default() -> Self {
+        Self {
+            peers: HashSet::new(),
+            second_peer_at: None,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 impl InflightReq {
@@ -53,6 +65,7 @@ impl InflightReq {
         Self {
             peers,
             second_peer_at: None,
+            started_at: Instant::now(),
         }
     }
 

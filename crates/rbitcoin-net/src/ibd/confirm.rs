@@ -1861,19 +1861,28 @@ pub(crate) fn spawn_confirm_engine(
                         // Permanent reject path: wipe tip-ahead HWM so the next
                         // ordered claim does not inherit a poisoned next_tx_start.
                         lookup_ahead.clear_all(&hub);
-                        // Requeue height for claim only until reject event blacklists.
-                        feed.requeue_wire(&[(expect, hash, None)]);
+                        // **Do not** requeue the rejected tip height here.
+                        // Soft BadPrev never blacklists — requeue caused a 10ms
+                        // claim→reject spin (mainnet 1574b @961634) while mids
+                        // densified and tip froze. Main-thread apply_confirm_reject
+                        // decides soft re-get / await / permanent blacklist; offer
+                        // re-notes only when claim_ready again.
                         feed.finish(std::iter::once(expect));
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm lookup reject {hash} @ {expect}: {e}");
+                        static N: AtomicU32 = AtomicU32::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n % 50 == 0 {
+                            warn!("ibd: confirm lookup reject {hash} @ {expect}: {e} (n={n})");
+                        }
                         let _ = event_tx.send(ConfirmEvent::Reject {
                             height: expect,
                             hash,
                             err: msg,
                         });
-                        std::thread::sleep(Duration::from_millis(10));
+                        // Brief pause so main can apply reject / densify before we claim again.
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
             }

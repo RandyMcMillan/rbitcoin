@@ -25,7 +25,7 @@ use crate::chain::ChainHub;
 use bitcoin::BlockHash;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How much assign work to do this call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +283,7 @@ fn collect_height_band(
 
 /// Hash at `ht` that still needs a new single-peer getdata (not inflight/pending/done).
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
+    use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
     if st.inflight.contains_key(&h) {
         return None;
@@ -290,9 +291,14 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
     if st.body.is_known_archived(&h) || st.body.is_pending(&h) || st.body.is_rejected(&h) {
         return None;
     }
-    // Body queue already holds wire for this height.
-    if hub.query.block_queue_has_height(ht) {
-        return None;
+    // Only skip when BQ holds **this** hash. A different first-wins body at `ht`
+    // is a gap (claim_ready false) — drop it and re-request the work-path hash.
+    match hub.query.block_queue_hash_at_height(ht) {
+        Some(bq_h) if bq_h == h.to_byte_array() => return None,
+        Some(_) => {
+            let _ = hub.query.block_queue_dequeue_height(ht);
+        }
+        None => {}
     }
     if st.body.skip_download(hub, &h) {
         return None;
@@ -437,7 +443,8 @@ pub(crate) fn tip_hole_peer_target(
     }
 }
 
-/// Demote zombie `pending` (flag set, no body-queue wire) so getdata can re-issue.
+/// Demote zombie `pending` (flag set, no **matching** body-queue wire) so getdata
+/// can re-issue.
 ///
 /// Confirm intake and reorg gather need real wire (BQ / held). `mark_pending`
 /// alone is not enough — without BQ it is a zombie that would `skip_download`
@@ -450,20 +457,30 @@ fn demote_zombie_pending_for_fetch(
     hash: BlockHash,
     height: Option<u32>,
 ) {
+    use bitcoin::hashes::Hash as _;
     if !body.is_pending(&hash) {
         return;
     }
     if hub.has_block(&hash) {
         return;
     }
-    // Height-keyed BQ is the sole confirm claim path; also covers tip+1 explore
-    // needs that landed via BlockFramed offer. Side mids at height ≤ tip almost
-    // never have a free height slot (first-wins / rehydrate drops ≤ tip).
-    if height.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
-        return;
+    // Only keep pending when BQ holds **this** hash at its height (not a
+    // different first-wins occupant).
+    if let Some(ht) = height {
+        if hub
+            .query
+            .block_queue_hash_at_height(ht)
+            .is_some_and(|h| h == hash.to_byte_array())
+        {
+            return;
+        }
     }
     body.mark_missing(hash);
 }
+
+/// Tip-hole getdata older than this with no claimable wire is cleared and re-issued
+/// (mainnet freeze: inflight stuck, soft frozen, hole=1 forever).
+const TIP_HOLE_INFLIGHT_STALE: Duration = Duration::from_secs(20);
 
 /// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
 pub(crate) fn cover_tip_holes(
@@ -473,6 +490,7 @@ pub(crate) fn cover_tip_holes(
     alive: &[usize],
     holes: &[BlockHash],
 ) -> u64 {
+    use bitcoin::hashes::Hash as _;
     if holes.is_empty() || alive.is_empty() {
         return 0;
     }
@@ -495,10 +513,23 @@ pub(crate) fn cover_tip_holes(
         if hub.has_block(&h) {
             continue;
         }
-        if ht.is_some_and(|ht| hub.query.block_queue_has_height(ht)) {
-            continue;
+        // Wrong first-wins body at this height: drop it so we can get the right hash.
+        if let Some(ht) = ht {
+            if let Some(bq_h) = hub.query.block_queue_hash_at_height(ht) {
+                if bq_h == h.to_byte_array() {
+                    continue; // correct wire present
+                }
+                let _ = hub.query.block_queue_dequeue_height(ht);
+            }
         }
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
+        // Stale tip-hole inflight with no wire → clear and re-race (frozen inflight).
+        if let Some(req) = st.inflight.get(&h) {
+            if now.duration_since(req.started_at) >= TIP_HOLE_INFLIGHT_STALE {
+                clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+                st.body.mark_missing(h);
+            }
+        }
         let (already, second_at) = st
             .inflight
             .get(&h)
@@ -679,6 +710,54 @@ mod tests {
         assert_eq!(far_slots_per_peer(16, true), 2);
         assert!(far_slots_per_peer(16, true) < 16);
         assert_eq!(far_slots_per_peer(16, false), 8);
+    }
+
+    /// Wrong first-wins body at tip+1 is not claim-ready; cover must dequeue and
+    /// re-get the work-path hash (general hole=1 with bq soft growing ahead).
+    #[test]
+    fn cover_tip_holes_drops_wrong_bq_hash_and_regets() {
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let want = h(0xabc);
+        let wrong = h(0xdef);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.record_height(want, ht);
+        st.height_to_hash.insert(ht, want);
+        // First-wins wrong wire at tip+1.
+        hub.query
+            .block_queue_offer(ht, wrong.to_byte_array(), 0, b"wrong")
+            .unwrap();
+        assert!(hub.query.block_queue_has_height(ht));
+        assert!(
+            !super::super::progress::claim_ready(&hub, &mut st.body, ht, &want),
+            "wrong BQ hash must not be claim-ready"
+        );
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert_eq!(holes, vec![want]);
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        assert!(
+            issued >= 1,
+            "must re-get correct tip+1 hash; issued={issued}"
+        );
+        assert!(
+            !hub.query.block_queue_has_height(ht)
+                || hub
+                    .query
+                    .block_queue_hash_at_height(ht)
+                    .is_some_and(|x| x == want.to_byte_array()),
+            "wrong BQ body must be dequeued"
+        );
+        assert!(st.inflight.contains_key(&want));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Resume seed marks Class A tip+1 as known without BQ wire. Confirm intake is

@@ -283,6 +283,14 @@ impl BlockQueue {
             .find(|(_, e)| e.height == height)
             .map(|(&id, _)| id)
     }
+
+    /// Hash of the first queue entry at `height`, if any (no payload clone).
+    pub fn hash_at_height(&self, height: u32) -> Option<[u8; 32]> {
+        self.index
+            .values()
+            .find(|e| e.height == height)
+            .map(|e| e.hash)
+    }
 }
 
 #[cfg(test)]

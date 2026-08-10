@@ -1400,6 +1400,15 @@ impl Query {
         g.contains_height(height)
     }
 
+    /// Hash of the first body-queue entry at `height`, if any.
+    ///
+    /// Used by claim-ready so a **wrong** first-wins body at tip+1 is not treated
+    /// as ready (hole forever / BadPrev thrash).
+    pub fn block_queue_hash_at_height(&self, height: u32) -> Option<[u8; 32]> {
+        let g = self.block_queue.lock().unwrap();
+        g.hash_at_height(height)
+    }
+
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
     /// Brief mutex locks only (header plans / SH / heads). Call from the ~5s

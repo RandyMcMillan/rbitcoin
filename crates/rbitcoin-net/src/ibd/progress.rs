@@ -90,13 +90,18 @@ pub(crate) fn claim_ready(
     height: u32,
     hash: &BlockHash,
 ) -> bool {
+    use bitcoin::hashes::Hash as _;
     if hub.has_block(hash) {
         return true;
     }
     if body.is_rejected(hash) {
         return false;
     }
-    hub.query.block_queue_has_height(height)
+    // Must be **this** hash at the height — first-wins BQ of a different block
+    // is not claim-ready (mainnet tip+1 wrong-wire thrash / permanent hole).
+    hub.query
+        .block_queue_hash_at_height(height)
+        .is_some_and(|h| h == hash.to_byte_array())
 }
 
 /// Count heights from tip+1 until the next claim-ready body (fetch gap).

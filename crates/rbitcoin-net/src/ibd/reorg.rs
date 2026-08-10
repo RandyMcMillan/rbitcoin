@@ -95,9 +95,10 @@ impl IbdReorgState {
         Self::default()
     }
 
-    /// Cap on held side bodies (DoS / process RAM). Small enough that unit
-    /// tests can exercise eviction without hundreds of mined blocks.
-    const HELD_CAP: usize = 8;
+    /// Cap on held side bodies (DoS / process RAM). Sized for multi-hop BadPrev
+    /// paths (mainnet-class LCA walks) without thrashing; still small enough
+    /// that unit tests can exercise eviction without huge chains.
+    pub(crate) const HELD_CAP: usize = 32;
 
     pub fn hold_body(&mut self, block: Block) {
         let h = block.block_hash();
@@ -980,16 +981,24 @@ mod tests {
         st.clear_awaiting();
         assert!(st.awaiting().is_none());
         assert!(st.need_getdata().is_empty());
-        // Eviction path when over HELD_CAP.
+        // Eviction path when over HELD_CAP (fresh map so only these keys count).
+        let mut st_cap = IbdReorgState::new();
+        let mut held_keys = Vec::new();
         let mut prev = gen;
-        for i in 0u32..12 {
+        for i in 0u32..(IbdReorgState::HELD_CAP as u32 + 4) {
             let b = mine(prev, 1_300_001_000 + i, 1);
             prev = b.block_hash();
-            st.hold_body(b);
+            held_keys.push(b.block_hash());
+            st_cap.hold_body(b);
         }
-        assert!(
-            st.get_held(&need).is_none() || st.get_held(&need).is_some(),
-            "held map stays bounded under HELD_CAP"
+        let still = held_keys
+            .iter()
+            .filter(|k| st_cap.get_held(k).is_some())
+            .count();
+        assert_eq!(
+            still,
+            IbdReorgState::HELD_CAP,
+            "held map must stay exactly HELD_CAP after overflow inserts"
         );
         let _ = held;
     }

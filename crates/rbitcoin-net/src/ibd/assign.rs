@@ -299,18 +299,26 @@ fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 }
 
 /// Hash at `ht` that still needs a new single-peer getdata (not inflight/pending/done).
+///
+/// Order matters: BQ hash-match before pending. Pending with matching wire is done;
+/// **zombie** pending (flag set, wrong/no wire) must demote and re-get — skipping
+/// all pending first left densify-ahead heights frozen (tip advances past tip-batch
+/// cover, soft filled, conf stuck on a later hole).
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
     let &h = st.height_to_hash.get(&ht)?;
-    if st.inflight.contains_key(&h) {
+    if st.inflight.contains_key(&h) || st.body.is_rejected(&h) {
         return None;
     }
-    if st.body.is_known_archived(&h) || st.body.is_pending(&h) || st.body.is_rejected(&h) {
+    // Class A seed: densify skips re-walk; tip-hole cover re-gets tip batch.
+    if st.body.is_known_archived(&h) {
         return None;
     }
-    // Only skip when BQ holds **this** hash. Wrong first-wins → drop + re-get.
+    // Matching BQ wire → densified. Wrong first-wins dequeued as Gap.
     if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
         return None;
     }
+    // Zombie pending without matching wire → demote so skip_download allows getdata.
+    demote_zombie_pending_for_fetch(&mut st.body, hub, h, Some(ht));
     if st.body.skip_download(hub, &h) {
         return None;
     }
@@ -970,6 +978,65 @@ mod tests {
         assert!(
             !st.inflight.contains_key(&held_hash),
             "must not race getdata for held tip+1"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Densify-ahead zombie pending (flag set, no matching BQ) must re-get.
+    /// Regression: need_hash_at used to skip all pending before BQ check, so
+    /// heights past tip-batch cover never demoted and conf froze mid-IBD.
+    #[test]
+    fn densify_zombie_pending_regets_work_path() {
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 32;
+        cfg.per_peer = 8;
+        let want1 = h(0x31);
+        let want2 = h(0x32);
+        st.record_height(want1, 1);
+        st.record_height(want2, 2);
+        st.height_to_hash.insert(1, want1);
+        st.height_to_hash.insert(2, want2);
+        st.ordered_set.insert(want1);
+        st.ordered_set.insert(want2);
+        st.ordered.push_back(want1);
+        st.ordered.push_back(want2);
+        st.max_ordered_height = 2;
+        // tip+1 claim-ready so densify walks to ht=2.
+        hub.query
+            .block_queue_offer(1, want1.to_byte_array(), 0, b"ok1")
+            .unwrap();
+        st.body.mark_pending(want1);
+        // tip+2 zombie: pending without BQ wire.
+        st.body.mark_pending(want2);
+        assert!(!hub.query.block_queue_has_height(2));
+        assert!(
+            !super::super::progress::claim_ready(&hub, &mut st.body, 2, &want2),
+            "zombie pending must not be claim-ready"
+        );
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true,
+            None,
+        );
+        assert!(
+            st.inflight.contains_key(&want2),
+            "densify must re-get zombie pending at ht=2; inflight={:?}",
+            st.inflight.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !st.body.is_pending(&want2),
+            "need_hash_at must demote zombie pending before issue"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

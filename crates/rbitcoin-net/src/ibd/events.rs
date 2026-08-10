@@ -817,12 +817,17 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
     match try_apply_best_candidate(hub, &bodies, &tips, &mut st.reorg) {
         Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
             info!("ibd: most-work reorg after exploration gather → tip_h={new_h}");
-            // Accepted always advances tip; fall back to explore tip if query lags.
-            let tip = hub
-                .tip_hash()
-                .or(apply_tip)
-                .expect("most-work accept leaves a tip hash");
-            on_reorg_accepted(st, hub, tip, bodies.keys().copied(), losing);
+            // Accepted advances tip; fall back to explore tip if query lags.
+            let tip = hub.tip_hash().or(apply_tip);
+            if let Some(tip) = tip {
+                on_reorg_accepted(st, hub, tip, bodies.keys().copied(), losing);
+            } else {
+                for h in bodies.keys() {
+                    st.body.mark_archived(*h);
+                }
+                st.reorg.clear_awaiting();
+                st.reorg.clear_explore();
+            }
             true
         }
         Ok(_) => false,

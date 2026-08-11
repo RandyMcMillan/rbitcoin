@@ -122,6 +122,14 @@ pub enum AcceptError {
     /// Conflicting mempool txs exist and replacement does not pay enough.
     RbfInsufficient,
     Coinbase,
+    /// Duplicate previous_output within the same transaction (011).
+    InputsDuplicate,
+    /// Coinbase maturity not met at tip+1 (011).
+    ImmatureCoinbase,
+    /// Absolute nLockTime / sequence finality not met for next block (011).
+    NotFinal,
+    /// BIP68 relative lock not satisfied at tip (011).
+    NonBip68Final,
     NotFound(Txid),
     Durable(String),
     /// Consensus script verification failed for one or more inputs.
@@ -145,6 +153,10 @@ impl std::fmt::Display for AcceptError {
             AcceptError::PackageNotTopo => f.write_str("package not topologically ordered"),
             AcceptError::RbfInsufficient => f.write_str("rbf insufficient fee"),
             AcceptError::Coinbase => f.write_str("coinbase"),
+            AcceptError::InputsDuplicate => f.write_str("inputs-duplicate"),
+            AcceptError::ImmatureCoinbase => f.write_str("coinbase immature"),
+            AcceptError::NotFinal => f.write_str("not final"),
+            AcceptError::NonBip68Final => f.write_str("non-BIP68-final"),
             AcceptError::NotFound(t) => write!(f, "not found {t}"),
             AcceptError::Durable(s) => write!(f, "durable: {s}"),
             AcceptError::Script(s) => write!(f, "script: {s}"),
@@ -161,6 +173,56 @@ impl From<MempoolError> for AcceptError {
             other => AcceptError::Durable(other.to_string()),
         }
     }
+}
+
+/// Maturity, absolute finality (`is_final_tx`), and BIP68 at the next block.
+fn check_mempool_structural(
+    tx: &Transaction,
+    chain_coins: &[Option<Coin>],
+    tip: ChainTipCtx,
+) -> Result<(), AcceptError> {
+    let next_height = tip.height.saturating_add(1);
+    for c in chain_coins.iter().flatten() {
+        if c.is_coinbase && next_height < c.create_height.saturating_add(100) {
+            return Err(AcceptError::ImmatureCoinbase);
+        }
+    }
+    if !rbitcoin_consensus::is_final_tx(tx, next_height, tip.mtp) {
+        return Err(AcceptError::NotFinal);
+    }
+    if rbitcoin_consensus::bip68_active_for_tx(tx) {
+        let mut prev_heights = Vec::with_capacity(tx.input.len());
+        let mut prev_mtps = Vec::with_capacity(tx.input.len());
+        for (i, inp) in tx.input.iter().enumerate() {
+            let seq = inp.sequence.to_consensus_u32();
+            let lock_enabled = seq & (1u32 << 31) == 0;
+            match chain_coins.get(i).and_then(|c| c.as_ref()) {
+                Some(c) => {
+                    // Unknown create height with an active relative lock → fail closed.
+                    if lock_enabled && c.create_height == 0 && !c.is_coinbase {
+                        return Err(AcceptError::NonBip68Final);
+                    }
+                    prev_heights.push(c.create_height);
+                    prev_mtps.push(0);
+                }
+                None => {
+                    // Mempool parent: treat as created at next_height (unconfirmed).
+                    prev_heights.push(next_height);
+                    prev_mtps.push(tip.mtp);
+                }
+            }
+        }
+        if !rbitcoin_consensus::sequence_locks_satisfied(
+            tx,
+            &prev_heights,
+            &prev_mtps,
+            next_height,
+            tip.mtp,
+        ) {
+            return Err(AcceptError::NonBip68Final);
+        }
+    }
+    Ok(())
 }
 
 /// Run consensus script verification for every input (mempool / tip height assumed
@@ -289,14 +351,18 @@ impl ActiveMempool {
     /// When prevouts are missing from both mempool and chain UTXO, the tx is
     /// parked in the [`Orphanage`] (Core-class weight budget) and
     /// [`AcceptError::Orphaned`] is returned — not a hard peer reject.
+    ///
+    /// `tip` is the confirmed tip for maturity / `is_final_tx` / BIP68 (next block
+    /// height = `tip.height + 1`, BIP113 cutoff = `tip.mtp`).
     pub fn accept_tx(
         &mut self,
         tx: &Transaction,
         utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let r = self.accept_tx_inner(tx, utxos)?;
+        let r = self.accept_tx_inner(tx, utxos, tip)?;
         // Promote orphans waiting on this parent (best-effort; nested orphans re-park).
-        self.promote_orphans_of(r.txid, utxos);
+        self.promote_orphans_of(r.txid, utxos, tip);
         Ok(r)
     }
 
@@ -304,6 +370,7 @@ impl ActiveMempool {
         &mut self,
         tx: &Transaction,
         utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
@@ -317,8 +384,19 @@ impl ActiveMempool {
             return Err(AcceptError::Orphaned(txid));
         }
 
+        // Finding 011: duplicate inputs before any value sum (phantom fee).
+        {
+            let mut seen = BTreeSet::new();
+            for inp in &tx.input {
+                if !seen.insert(inp.previous_output) {
+                    return Err(AcceptError::InputsDuplicate);
+                }
+            }
+        }
+
         // Resolve prevouts: in-mempool first, then provider (chain).
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
+        let mut chain_coins: Vec<Option<Coin>> = Vec::with_capacity(tx.input.len());
         let mut parent_txids = BTreeSet::new();
         let mut direct_conflicts: BTreeSet<Txid> = BTreeSet::new();
         let mut missing_parents: BTreeSet<Txid> = BTreeSet::new();
@@ -330,7 +408,7 @@ impl ActiveMempool {
                     direct_conflicts.insert(c);
                 }
             }
-            let txout = if let Some(creator) = self.graph.creator(&op) {
+            let (txout, chain_coin) = if let Some(creator) = self.graph.creator(&op) {
                 if !self.graph.mempool_utxo(&op) {
                     // Spent in-mempool — must RBF the conflict set.
                     if let Some(c) = self.graph.conflict_txid(&op) {
@@ -346,7 +424,7 @@ impl ActiveMempool {
                     .get(&creator)
                     .ok_or(AcceptError::Durable("parent body missing".into()))?;
                 match parent_tx.output.get(op.vout as usize).cloned() {
-                    Some(o) => o,
+                    Some(o) => (o, None),
                     None => {
                         missing_parents.insert(op.txid);
                         continue;
@@ -354,13 +432,14 @@ impl ActiveMempool {
                 }
             } else if let Some(coin) = utxos.get_coin(&op) {
                 // Confirmed unspent only — spent/missing create → None (finding 010).
-                coin.txout
+                (coin.txout.clone(), Some(coin))
             } else {
                 missing_parents.insert(op.txid);
                 continue;
             };
             input_value = input_value.saturating_add(txout.value.to_sat());
             prevouts.push(txout);
+            chain_coins.push(chain_coin);
         }
 
         if !missing_parents.is_empty() {
@@ -371,6 +450,9 @@ impl ActiveMempool {
             // Cap full / overweight: surface as missing for diagnostics.
             return Err(AcceptError::MissingPrevout(tx.input[0].previous_output));
         }
+
+        // Structural chain-context (011): maturity, absolute finality, BIP68.
+        check_mempool_structural(tx, &chain_coins, tip)?;
 
         let output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         if output_value > input_value {
@@ -509,11 +591,11 @@ impl ActiveMempool {
     }
 
     /// Re-try orphans that listed `parent` as missing (recursive via accept_tx).
-    fn promote_orphans_of(&mut self, parent: Txid, utxos: &impl UtxoProvider) {
+    fn promote_orphans_of(&mut self, parent: Txid, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
         let children = self.orphanage.take_children_of(&parent);
         for child in children {
             // accept_tx re-parks if still missing other parents; ignores soft errors.
-            let _ = self.accept_tx(&child, utxos);
+            let _ = self.accept_tx(&child, utxos, tip);
         }
     }
 
@@ -603,6 +685,7 @@ impl ActiveMempool {
         &mut self,
         txs: &[Transaction],
         utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
     ) -> Result<Vec<AcceptResult>, AcceptError> {
         if txs.is_empty() {
             return Err(AcceptError::PackageEmpty);
@@ -643,7 +726,7 @@ impl ActiveMempool {
 
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         for tx in txs {
-            match self.accept_tx(tx, utxos) {
+            match self.accept_tx(tx, utxos, tip) {
                 Ok(r) => accepted.push(r),
                 Err(e) => {
                     // Roll back this package's accepts (children first).
@@ -689,6 +772,7 @@ impl ActiveMempool {
             &MapUtxoProvider {
                 map: std::collections::HashMap::new(),
             },
+            ChainTipCtx::default(),
         )
     }
 
@@ -697,6 +781,7 @@ impl ActiveMempool {
         &mut self,
         block_txids: &[Txid],
         utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
     ) -> Result<usize, AcceptError> {
         let mut n = 0usize;
         for txid in block_txids {
@@ -708,7 +793,7 @@ impl ActiveMempool {
         // Re-accept orphans waiting on confirmed parents first, then drop any
         // orphan that was itself included in the block.
         for txid in block_txids {
-            self.promote_orphans_of(*txid, utxos);
+            self.promote_orphans_of(*txid, utxos, tip);
         }
         self.orphanage.erase_for_block(block_txids);
         if n > 0 {
@@ -728,10 +813,11 @@ impl ActiveMempool {
         &mut self,
         txs: &[Transaction],
         utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
     ) -> Vec<Result<AcceptResult, AcceptError>> {
         txs.iter()
             .filter(|t| !t.is_coinbase())
-            .map(|t| self.accept_tx(t, utxos))
+            .map(|t| self.accept_tx(t, utxos, tip))
             .collect()
     }
 
@@ -824,6 +910,12 @@ mod tests {
         p
     }
 
+    /// Tip high enough that maturity/finality/BIP68 do not block normal test txs.
+    const TIP_OK: ChainTipCtx = ChainTipCtx {
+        height: 1_000_000,
+        mtp: u32::MAX,
+    };
+
     fn coin(txout: TxOut) -> Coin {
         Coin {
             txout,
@@ -846,6 +938,110 @@ mod tests {
         (op, txout, MapUtxoProvider { map })
     }
 
+    /// Finding 011: duplicate inputs rejected before fee accounting.
+    #[test]
+    fn reject_duplicate_inputs() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: op, // same outpoint twice
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::InputsDuplicate),
+            "got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 011: absolute nLockTime height form not final at tip+1.
+    #[test]
+    fn reject_non_final_locktime_height() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut tx = spend_tx(op, 99_000);
+        // Height lock: need block_height > 500; tip.height+1 = 101 → not final.
+        tx.lock_time = LockTime::from_height(500).unwrap();
+        // Non-final sequence so locktime is enforced.
+        tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+        let tip = ChainTipCtx {
+            height: 100,
+            mtp: u32::MAX,
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+        assert!(matches!(err, AcceptError::NotFinal), "got {err}");
+        // At tip 500, next height 501 > 500 → final.
+        let tip2 = ChainTipCtx {
+            height: 500,
+            mtp: u32::MAX,
+        };
+        mp.accept_tx(&tx, &utxos, tip2).expect("final at tip 500");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 011: immature coinbase spend rejected.
+    #[test]
+    fn reject_immature_coinbase() {
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        map.insert(
+            op,
+            Coin {
+                txout: TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                create_height: 50,
+                is_coinbase: true,
+            },
+        );
+        let utxos = MapUtxoProvider { map };
+        let tx = spend_tx(op, 49_0000_0000);
+        // tip 100 → next 101; need create+100 = 150.
+        let tip = ChainTipCtx {
+            height: 100,
+            mtp: u32::MAX,
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ImmatureCoinbase),
+            "got {err}"
+        );
+        let tip2 = ChainTipCtx {
+            height: 149,
+            mtp: u32::MAX,
+        };
+        mp.accept_tx(&tx, &utxos, tip2)
+            .expect("mature at tip 149 (next=150)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Finding 010: provider returns no coin for a spent/missing outpoint → reject.
     #[test]
     fn reject_when_provider_has_no_unspent_coin() {
@@ -859,7 +1055,7 @@ mod tests {
             map: HashMap::new(), // spent or unknown → no coin
         };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp.accept_tx(&tx, &utxos).expect_err("must not admit");
+        let err = mp.accept_tx(&tx, &utxos, TIP_OK).expect_err("must not admit");
         // Orphanage parks missing parents; empty map → orphaned or missing.
         assert!(
             matches!(err, AcceptError::Orphaned(_) | AcceptError::MissingPrevout(_)),
@@ -894,7 +1090,7 @@ mod tests {
         let txid = tx.compute_txid();
         {
             let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-            let r = mp.accept_tx(&tx, &utxos).expect("accept");
+            let r = mp.accept_tx(&tx, &utxos, TIP_OK).expect("accept");
             assert_eq!(r.txid, txid);
             assert_eq!(r.fee_sat, 1000);
             assert_eq!(mp.live_count(), 1);
@@ -934,7 +1130,7 @@ mod tests {
         let utxos = MapUtxoProvider { map };
         let tx = spend_tx(op, 99_000); // empty scriptSig + empty witness
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
         assert!(
             matches!(err, AcceptError::Script(_)),
             "expected Script reject, got {err}"
@@ -943,7 +1139,7 @@ mod tests {
         // Sanity: ACS still accepted (Libre + consensus anyone-can-spend).
         let (op2, _, utxos2) = chain_utxo(50_000);
         let ok = spend_tx(op2, 49_000);
-        mp.accept_tx(&ok, &utxos2).expect("ACS still ok");
+        mp.accept_tx(&ok, &utxos2, TIP_OK).expect("ACS still ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -954,7 +1150,7 @@ mod tests {
         // fee 1 sat — below 0.1 sat/vB for any real tx weight
         let tx = spend_tx(op, 99_999);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::Policy("min relay fee")));
         assert_eq!(mp.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -967,7 +1163,7 @@ mod tests {
         // 1-sat output is dust under Core; Libre allows it.
         let tx = spend_tx(op, 1);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos).expect("dust ok");
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("dust ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -978,10 +1174,10 @@ mod tests {
         let parent = spend_tx(op, 90_000);
         let pid = parent.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&parent, &utxos).unwrap();
+        mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
 
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 80_000);
-        mp.accept_tx(&child, &utxos).unwrap();
+        mp.accept_tx(&child, &utxos, TIP_OK).unwrap();
         assert_eq!(mp.live_count(), 2);
         let c = mp.graph.cluster_of(&pid).unwrap();
         assert_eq!(c.members.len(), 2);
@@ -1000,7 +1196,7 @@ mod tests {
             let remain = 10_000_000u64 - (i as u64 + 1) * 1_000;
             let tx = spend_tx(prev_op, remain);
             let last_txid = tx.compute_txid();
-            mp.accept_tx(&tx, &utxos)
+            mp.accept_tx(&tx, &utxos, TIP_OK)
                 .unwrap_or_else(|e| panic!("i={i}: {e}"));
             prev_op = OutPoint {
                 txid: last_txid,
@@ -1010,7 +1206,7 @@ mod tests {
         assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
         let remain = 10_000_000u64 - (MAX_CLUSTER_COUNT as u64 + 1) * 1_000;
         let extra = spend_tx(prev_op, remain);
-        let err = mp.accept_tx(&extra, &utxos).unwrap_err();
+        let err = mp.accept_tx(&extra, &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
         assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1023,7 +1219,7 @@ mod tests {
         let mut tx = spend_tx(op, 90_000);
         tx.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::Policy("libre annex")));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1038,7 +1234,7 @@ mod tests {
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 90_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let res = mp
-            .accept_package(&[parent.clone(), child.clone()], &utxos)
+            .accept_package(&[parent.clone(), child.clone()], &utxos, TIP_OK)
             .expect("package");
         assert_eq!(res.len(), 2);
         assert_eq!(mp.live_count(), 2);
@@ -1046,7 +1242,7 @@ mod tests {
         assert_eq!(c.members.len(), 2);
         // Wrong order rejected.
         let mut mp2 = ActiveMempool::open_or_create(tmp_dir()).unwrap();
-        let err = mp2.accept_package(&[child, parent], &utxos).unwrap_err();
+        let err = mp2.accept_package(&[child, parent], &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::PackageNotTopo));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1058,7 +1254,7 @@ mod tests {
         let tx = spend_tx(op, 90_000);
         let txid = tx.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         assert_eq!(mp.live_count(), 1);
         let n = mp.remove_for_block(&[txid]).unwrap();
         assert_eq!(n, 1);
@@ -1076,10 +1272,10 @@ mod tests {
         let tx = spend_tx(op, 90_000);
         let txid = tx.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         mp.remove_for_block(&[txid]).unwrap();
         assert_eq!(mp.live_count(), 0);
-        let results = mp.reorg_disconnect_reaccept(&[tx], &utxos);
+        let results = mp.reorg_disconnect_reaccept(&[tx], &utxos, TIP_OK);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
         assert_eq!(mp.live_count(), 1);
@@ -1095,9 +1291,9 @@ mod tests {
         let low_id = low.compute_txid();
         let high_id = high.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&low, &utxos).unwrap();
+        mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
         assert!(mp.graph.contains(&low_id));
-        let r = mp.accept_tx(&high, &utxos).expect("rbf");
+        let r = mp.accept_tx(&high, &utxos, TIP_OK).expect("rbf");
         assert_eq!(r.txid, high_id);
         assert!(
             r.replaced.contains(&low_id),
@@ -1121,8 +1317,8 @@ mod tests {
         let high = spend_tx(op, 50_000); // fee 50000
         let low = spend_tx(op, 99_000); // fee 1000 — cannot replace
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&high, &utxos).unwrap();
-        let err = mp.accept_tx(&low, &utxos).unwrap_err();
+        mp.accept_tx(&high, &utxos, TIP_OK).unwrap();
+        let err = mp.accept_tx(&low, &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1148,7 +1344,7 @@ mod tests {
             // Vary fees so worst-chunk ordering is defined: low fee first.
             let out = 99_000u64 - u64::from(i) * 100; // higher i → higher fee
             let tx = spend_tx(op, out);
-            mp.accept_tx(&tx, &utxos)
+            mp.accept_tx(&tx, &utxos, TIP_OK)
                 .unwrap_or_else(|e| panic!("i={i}: {e}"));
         }
         assert!(mp.graph.total_weight() <= mp.max_weight + 500); // allow one protected overflow
@@ -1223,7 +1419,7 @@ mod tests {
         map.insert(op, coin(txout));
         let utxos = MapUtxoProvider { map };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos)
+        mp.accept_tx(&tx, &utxos, TIP_OK)
             .unwrap_or_else(|e| panic!("large single-tx should accept: {e} (weight={w})"));
         assert_eq!(mp.live_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1239,8 +1435,8 @@ mod tests {
         let pid = parent.compute_txid();
         let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 998_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&parent, &utxos).unwrap();
-        mp.accept_tx(&child, &utxos).unwrap();
+        mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+        mp.accept_tx(&child, &utxos, TIP_OK).unwrap();
         assert_eq!(mp.live_count(), 2);
         // Replacement of parent only: fee 5000 on same weight class — absolute fee 5000 > 2000
         // would pass BIP125; use fee that loses absolute vs set but wins rate vs direct.
@@ -1249,7 +1445,7 @@ mod tests {
         let repl = spend_tx(op, 998_500); // fee 1500
         let rid = repl.compute_txid();
         // If pure RBFR works: accept. (Weights of spend_tx are equal-ish.)
-        let r = mp.accept_tx(&repl, &utxos);
+        let r = mp.accept_tx(&repl, &utxos, TIP_OK);
         match r {
             Ok(_) => {
                 assert!(mp.graph.contains(&rid));
@@ -1270,12 +1466,12 @@ mod tests {
         let tx = spend_tx(op, 90_000);
         let txid = tx.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         let body_before = mp.store.body_logical_len().unwrap();
         // Confirm-remove leaves a DEAD slot (body still holds the old payload).
         mp.remove_for_block(&[txid]).unwrap();
         // Re-accept so we have live + dead history in the body file.
-        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         let (_f, live, dead) = mp.store.slot_stats();
         assert_eq!(live, 1);
         // remove_for_block may already have auto-compacted; either way compact is safe.
@@ -1347,13 +1543,13 @@ mod tests {
             }],
         };
         assert!(matches!(
-            mp.accept_tx(&cb, &utxos),
+            mp.accept_tx(&cb, &utxos, TIP_OK),
             Err(AcceptError::Coinbase)
         ));
 
         // Package empty / too large.
         assert!(matches!(
-            mp.accept_package(&[], &utxos),
+            mp.accept_package(&[], &utxos, TIP_OK),
             Err(AcceptError::PackageEmpty)
         ));
         // Count over MAX_PACKAGE_COUNT (25).
@@ -1373,15 +1569,15 @@ mod tests {
             })
             .collect();
         assert!(matches!(
-            mp.accept_package(&many, &utxos),
+            mp.accept_package(&many, &utxos, TIP_OK),
             Err(AcceptError::PackageTooLarge { .. })
         ));
 
         let tx = spend_tx(op, 99_000);
-        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         // Duplicate.
         assert!(matches!(
-            mp.accept_tx(&tx, &utxos),
+            mp.accept_tx(&tx, &utxos, TIP_OK),
             Err(AcceptError::Duplicate(_))
         ));
 
@@ -1396,7 +1592,7 @@ mod tests {
         );
         let missing_id = missing.compute_txid();
         assert!(matches!(
-            mp.accept_tx(&missing, &empty),
+            mp.accept_tx(&missing, &empty, TIP_OK),
             Err(AcceptError::Orphaned(_))
         ));
         assert!(mp.orphanage.contains(&missing_id));
@@ -1407,7 +1603,7 @@ mod tests {
 
         // Package coinbase / not topo / oversized count.
         assert!(matches!(
-            mp.accept_package(&[cb], &utxos),
+            mp.accept_package(&[cb], &utxos, TIP_OK),
             Err(AcceptError::Coinbase)
         ));
         let a = spend_tx(op, 98_000);
@@ -1420,12 +1616,12 @@ mod tests {
         );
         // Child before parent → not topo.
         assert!(matches!(
-            mp.accept_package(&[b.clone(), a.clone()], &utxos),
+            mp.accept_package(&[b.clone(), a.clone()], &utxos, TIP_OK),
             Err(AcceptError::PackageNotTopo)
         ));
         // Duplicate in package.
         assert!(matches!(
-            mp.accept_package(&[a.clone(), a.clone()], &utxos),
+            mp.accept_package(&[a.clone(), a.clone()], &utxos, TIP_OK),
             Err(AcceptError::Duplicate(_))
         ));
 
@@ -1438,7 +1634,7 @@ mod tests {
         // Negative fee.
         let fat = spend_tx(op, 200_000);
         assert!(matches!(
-            mp.accept_tx(&fat, &utxos),
+            mp.accept_tx(&fat, &utxos, TIP_OK),
             Err(AcceptError::Policy(_))
         ));
 
@@ -1457,10 +1653,10 @@ mod tests {
         let (op, _, utxos) = chain_utxo(1_000_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let low = spend_tx(op, 999_000); // fee 1000
-        mp.accept_tx(&low, &utxos).unwrap();
+        mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
         // Conflict: same prevout, higher fee.
         let high = spend_tx(op, 900_000); // fee 100_000
-        let r = mp.accept_tx(&high, &utxos).expect("rbf");
+        let r = mp.accept_tx(&high, &utxos, TIP_OK).expect("rbf");
         assert_eq!(r.txid, high.compute_txid());
         assert!(!mp.graph.contains(&low.compute_txid()));
         assert!(mp.graph.contains(&high.compute_txid()));
@@ -1485,13 +1681,13 @@ mod tests {
         let child_id = child.compute_txid();
 
         assert!(matches!(
-            mp.accept_tx(&child, &utxos),
+            mp.accept_tx(&child, &utxos, TIP_OK),
             Err(AcceptError::Orphaned(_))
         ));
         assert_eq!(mp.orphan_count(), 1);
         assert!(!mp.graph.contains(&child_id));
 
-        mp.accept_tx(&parent, &utxos).expect("parent");
+        mp.accept_tx(&parent, &utxos, TIP_OK).expect("parent");
         assert!(mp.graph.contains(&parent_id));
         assert!(
             mp.graph.contains(&child_id),
@@ -1549,7 +1745,7 @@ mod tests {
             );
             let utxos = MapUtxoProvider { map };
             let tx = spend_tx(op, 99_000);
-            mp.accept_tx(&tx, &utxos)
+            mp.accept_tx(&tx, &utxos, TIP_OK)
                 .unwrap_or_else(|e| panic!("accept {i}: {e}"));
         }
         assert_eq!(mp.live_count(), 4);
@@ -1568,7 +1764,7 @@ mod tests {
         );
         let utxos = MapUtxoProvider { map };
         let tx = spend_tx(op, 99_000);
-        let r = mp.accept_tx(&tx, &utxos);
+        let r = mp.accept_tx(&tx, &utxos, TIP_OK);
         assert!(
             r.is_ok(),
             "expected free-slot (evict or grow), got {:?}",

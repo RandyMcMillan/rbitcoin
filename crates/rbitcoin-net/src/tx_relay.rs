@@ -8,7 +8,9 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, Coin, UtxoProvider};
+use rbitcoin_mempool::{
+    AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin, UtxoProvider,
+};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
@@ -240,13 +242,27 @@ impl MempoolHub {
         found
     }
 
+    /// Confirmed tip snapshot for mempool structural checks (height + BIP113 MTP).
+    fn chain_tip_ctx(&self) -> ChainTipCtx {
+        use rbitcoin_consensus::median_time_past;
+        use rbitcoin_primitives::Height;
+        let height = self.query.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if height == 0 {
+            0
+        } else {
+            median_time_past(self.query.as_ref(), Height(height)).unwrap_or(0)
+        };
+        ChainTipCtx { height, mtp }
+    }
+
     /// Accept a peer (or local) transaction when relay is enabled.
     pub fn accept_tx(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
+        let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        let r = g.accept_tx(tx, &utxo)?;
+        let r = g.accept_tx(tx, &utxo, tip)?;
         drop(g);
         self.push_recent(tx, &r);
         self.publish_announce(&r);
@@ -258,8 +274,9 @@ impl MempoolHub {
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
+        let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        let res = g.accept_package(txs, &utxo)?;
+        let res = g.accept_package(txs, &utxo, tip)?;
         drop(g);
         for (tx, r) in txs.iter().zip(res.iter()) {
             self.push_recent(tx, r);
@@ -274,8 +291,9 @@ impl MempoolHub {
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
+        let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        g.remove_for_block_with_utxo(txids, &utxo).unwrap_or(0)
+        g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0)
     }
 
     /// Unique txs parked waiting on missing parents (Core-class orphanage).
@@ -288,8 +306,9 @@ impl MempoolHub {
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
+        let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        g.reorg_disconnect_reaccept(txs, &utxo)
+        g.reorg_disconnect_reaccept(txs, &utxo, tip)
             .into_iter()
             .filter(|r| r.is_ok())
             .count()
@@ -764,11 +783,13 @@ mod tests {
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
         let mut tip = genesis.block_hash();
         let mut tip_time = genesis.header.time;
-        // Two blocks → two coinbases we can spend (mempool does not enforce maturity).
+        // Early coinbases + maturity pad so mempool coinbase maturity (100) is met.
         let mut coinbase_txids = Vec::new();
-        for h in 1u32..=3 {
+        for h in 1u32..=103 {
             let b = mine(tip, tip_time + 600, h);
-            coinbase_txids.push(b.txdata[0].compute_txid());
+            if h <= 3 {
+                coinbase_txids.push(b.txdata[0].compute_txid());
+            }
             accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
             tip = b.block_hash();
             tip_time = b.header.time;

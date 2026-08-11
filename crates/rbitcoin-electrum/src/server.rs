@@ -2014,9 +2014,12 @@ mod tests {
         let mut tip = genesis.block_hash();
         let mut tip_time = genesis.header.time;
         let mut coinbase_txids = Vec::new();
-        for h in 1u32..=2 {
+        // Maturity pad (100) so early coinbases are spendable in mempool.
+        for h in 1u32..=103 {
             let b = mine(tip, tip_time + 600, h);
-            coinbase_txids.push(b.txdata[0].compute_txid());
+            if h <= 2 {
+                coinbase_txids.push(b.txdata[0].compute_txid());
+            }
             accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
             tip = b.block_hash();
             tip_time = b.header.time;

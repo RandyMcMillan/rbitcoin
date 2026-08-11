@@ -1426,7 +1426,8 @@ fn store_start_states_lookup_load_confirm() {
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s1));
 
     // Structural: lookup stage source must not denserels-decode body on stamp path.
-    let src = include_str!("mod.rs");
+    // Stamp/load live in lookup.rs after Q-10/Q-11 stage split.
+    let src = include_str!("lookup.rs");
     let stamp_fn = src
         .split("pub fn confirm_wire_lookup_stamp")
         .nth(1)

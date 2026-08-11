@@ -373,12 +373,11 @@ pub struct InsertPageOutcome {
     pub wrote_new: bool,
     /// Probe depth of the empty slot written (or 0 if idempotent).
     pub depth: u32,
-    /// Local slot index within the page (valid if `wrote_new`).
     /// Local slot of the new empty (unit tests; insert_many uses full-page write-back).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub empty_local: u64,
     /// Encoded create_fk written when `wrote_new` (unit tests).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub stored_fk: u64,
 }
 
@@ -419,7 +418,9 @@ pub fn insert_fk_into_page_buf(
             return Ok(InsertPageOutcome {
                 wrote_new: false,
                 depth: 0,
+                #[cfg(test)]
                 empty_local: 0,
+                #[cfg(test)]
                 stored_fk: new_u,
             });
         }
@@ -434,7 +435,9 @@ pub fn insert_fk_into_page_buf(
     Ok(InsertPageOutcome {
         wrote_new: true,
         depth: scan.depth_end,
+        #[cfg(test)]
         empty_local: scan.empty_local,
+        #[cfg(test)]
         stored_fk: new_u,
     })
 }
@@ -699,10 +702,9 @@ impl AddressHead {
 
     /// Read one open-address entry (0 = empty).
     ///
-    /// Hot path uses [`Self::load_page_slots`] (one page `read_at`). This remains
-    /// for tests and rare single-slot diagnostics. Uses `read_at` so FdOnly
-    /// works past the tiny header map window.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Hot path uses [`Self::load_page_slots`] (one page `read_at`). Test/diagnostic
+    /// single-slot path. Uses `read_at` so FdOnly works past the tiny header map window.
+    #[cfg(test)]
     pub(crate) fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
         let off = self.entry_off(slot);
         match self.layout.entry_bytes {

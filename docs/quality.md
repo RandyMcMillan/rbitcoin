@@ -76,7 +76,6 @@ MSRV drift, etc.).
 |----|------|-----|-----------------|
 | **Q-10** | **Split god-files** | Still the main velocity tax (see baseline) | Stage/IO modules &lt;~1.5k lines; tests next to stage or in `tests/` without dual oracles |
 | **Q-11** | **Extract longest functions** | IBD main loop, pin batch, `eval_script`, peer frame handlers, perf formatters | Named pure helpers; unit tests on policy tables without full IBD |
-| **Q-12** | **Kill or quarantine `allow(dead_code)`** | `bulk_io` (many), `address_head`, `file`, `uring_session` still allow | Delete unused; or `#[cfg(test)]` only; AGENTS policy holds |
 | **Q-14** | **Head-module glossary** | address_head / hashhead / sharded / segmented / scripthash_head | One architecture diagram + “when to use which” table in docs |
 | **Q-15** | **RPC crate destiny** | Stub package text honest; still a workspace member with no surface | Either minimal useful node RPC slice *or* remove from default workspace “product” narrative |
 | **Q-16** | **Residual process env** | ~36 `RBITCOIN_*` names still appear in crates (SH/BQ/slots, path-IO **string** leftovers, test-only). Path overrides and confirm queue envs are **dead**; many other reads remain | Either hardcode / CLI-struct remaining production reads, or keep only documented unstable set; no silent “advanced env bible” |
@@ -149,7 +148,7 @@ MSRV drift, etc.).
 | Docs consistency | Strong | ↑ (findings, invariants, env policy) |
 | Contributor onboarding | Medium–Strong | → |
 | CI fidelity | **Strong** | ↑↑ (split gates + multinode + CodeQL + Dependabot ignores) |
-| Dead / stub surface | Medium | → (RPC stub; dead_code allows remain) |
+| Dead / stub surface | Medium–Strong | ↑ (Q-12: store dead_code allows cleared; RPC stub remains) |
 | Test reliability/speed | Medium–Strong | ↑ (tier A multinode default; overflow fix; heavies still ignored) |
 | Adversarial / findings hygiene | **Strong** | ↑↑ (no allowlist; regressions named; dual-path kill) |
 
@@ -248,7 +247,8 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 | Was | Resolution |
 |-----|------------|
-| (open) god-files / long fns / dead_code allows | **In progress** — Q-10/Q-11/Q-12 remain |
+| Store `allow(dead_code)` hotspots | **Fixed (Q-12)** — live APIs unsilenced; test-only surfaces under `#[cfg(test)]` (`bulk_io` RMW, `address_head` insert fields/`read_entry`, `file` load_u*, `UringSession::new`) |
+| (open) god-files / long fns | **In progress** — Q-10/Q-11 remain |
 
 ### Product surface growth (post-audit)
 
@@ -259,9 +259,8 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 ### Still intentionally open (see Remaining)
 
-God-files (Q-10/Q-11), `allow(dead_code)` (Q-12), residual env reads (Q-16), cargo
-deny/SBOM/musl CI (P2), continuous fuzz / tutorial / soak (P3), tier-C multinode
-optional (Q-38).
+God-files (Q-10/Q-11), residual env reads (Q-16), cargo deny/SBOM/musl CI (P2),
+continuous fuzz / tutorial / soak (P3), tier-C multinode optional (Q-38).
 
 ---
 
@@ -284,7 +283,7 @@ optional (Q-38).
 
 | Audience | Read |
 |----------|------|
-| Maintainers picking the next refactor | Remaining **P1** (start **Q-10** / **Q-12**) |
+| Maintainers picking the next refactor | Remaining **P1** (start **Q-10** / **Q-11**) |
 | Release engineering | **P2 Q-20–Q-23** |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** fuzz |
 | Docs / README | **Q-14**, **Q-34** |

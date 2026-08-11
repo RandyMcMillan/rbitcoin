@@ -42,8 +42,8 @@ impl UringSession {
     /// Open a private ring. Returns `Err` if io_uring is disabled or setup fails.
     ///
     /// Prefer [`with_thread_local`] on production paths (avoids setup/teardown).
-    /// Kept for unit tests / one-shot probes only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Unit tests / one-shot probes only.
+    #[cfg(test)]
     pub fn new(entries: u32) -> Result<Self, StoreError> {
         if !crate::bulk_io::io_uring_enabled() {
             return Err(StoreError::Corrupt("io_uring unavailable"));

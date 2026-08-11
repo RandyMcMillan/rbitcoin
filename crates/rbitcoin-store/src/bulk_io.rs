@@ -58,7 +58,9 @@ pub struct WriteOp<'a> {
 }
 
 /// One page RMW slot for [`page_rmw_pipelined`]: pread into `buf`, apply, pwrite.
-#[allow(dead_code)]
+///
+/// Test / reusable primitive only — production `tx.head` insert uses other paths.
+#[cfg(test)]
 pub struct PageRmw<'a> {
     pub fd: RawFd,
     pub offset: u64,
@@ -198,9 +200,8 @@ pub fn pread_batch_backend(ops: &mut [ReadOp<'_>], backend: crate::io_backend::R
 
 /// Submit all ops; fill [`WriteOp::result`]. Prefers io_uring; else serial pwrite.
 ///
-/// Public counterpart of [`pread_batch`]. Page RMW uses the mixed pipeline
-/// ([`page_rmw_pipelined`]); this remains for bulk write-only call sites/tests.
-#[allow(dead_code)]
+/// Public counterpart of [`pread_batch`]. Used by production bulk writers
+/// (e.g. `var_table`) and tests.
 pub fn pwrite_batch(ops: &mut [WriteOp<'_>]) {
     if ops.is_empty() {
         return;
@@ -262,8 +263,8 @@ pub fn test_take_last_write_dontcache() -> Vec<bool> {
 ///
 /// On non-Linux or `RBITCOIN_IO_URING=0`, returns `false` immediately.
 ///
-/// Kept as a reusable primitive (tests); `tx.head` insert is per-txid mmap path.
-#[allow(dead_code)]
+/// Reusable primitive for tests; `tx.head` insert is a separate production path.
+#[cfg(test)]
 pub fn page_rmw_pipelined(
     pages: &mut [PageRmw<'_>],
     apply: impl FnMut(usize, &mut [u8]) -> bool,
@@ -450,7 +451,6 @@ fn pread_batch_on_session_inner(
 
 /// Pipelined bulk pwrite — same fill/harvest shape as [`pread_batch_uring`].
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
@@ -549,10 +549,10 @@ fn pwrite_batch_on_session(
 }
 
 /// user_data: low 63 bits = page index; bit 63 set ⇒ write completion.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const RMW_WRITE_BIT: u64 = 1u64 << 63;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn page_rmw_pipelined_uring(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,
@@ -560,7 +560,7 @@ fn page_rmw_pipelined_uring(
     with_bulk_session(|session| page_rmw_on_session(session, pages, &mut apply)).unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn page_rmw_on_session(
     session: &mut crate::uring_session::UringSession,
     pages: &mut [PageRmw<'_>],
@@ -700,7 +700,7 @@ fn pwrite_batch_uring(_ops: &mut [WriteOp<'_>]) -> bool {
     false
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn page_rmw_pipelined_uring(
     _pages: &mut [PageRmw<'_>],
     _apply: impl FnMut(usize, &mut [u8]) -> bool,
@@ -761,7 +761,6 @@ fn pread_one(op: &mut ReadOp<'_>) {
     op.result = got as i32;
 }
 
-#[allow(dead_code)]
 fn pwrite_batch_fallback(ops: &mut [WriteOp<'_>]) {
     for op in ops.iter_mut() {
         pwrite_one(op);
@@ -796,8 +795,8 @@ fn pwrite_one(op: &mut WriteOp<'_>) {
     op.result = got as i32;
 }
 
-/// Sequential page RMW (pread → apply → pwrite). Used when io_uring is off.
-#[allow(dead_code)]
+/// Sequential page RMW (pread → apply → pwrite). Test helper when io_uring is off.
+#[cfg(test)]
 pub fn page_rmw_serial(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,

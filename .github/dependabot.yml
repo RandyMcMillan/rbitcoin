@@ -1,0 +1,74 @@
+# Dependabot version updates — see docs.github.com/code-security/dependabot
+#
+# Ecosystems in this tree:
+#   cargo           Cargo.toml / Cargo.lock (workspace)
+#   github-actions  .github/workflows/*
+#   nix             flake.lock inputs (nixpkgs, crane, …)
+#
+# No Docker / npm / Go / Python app manifests today. Security updates for
+# supported ecosystems still flow from GitHub Advisories when enabled on the
+# repo (Settings → Code security → Dependabot security updates).
+#
+# Nix pin policy (docs/reproducible-builds.md): advance nixpkgs deliberately
+# (~channel cadence), co-bump crane / CI rustc. Dependabot nix PRs are a
+# *proposal* — review CI + musl build before merge; monthly schedule avoids
+# daily flake noise.
+
+version: 2
+
+updates:
+  # --- Rust workspace -------------------------------------------------------
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "cargo"
+    commit-message:
+      prefix: "deps(cargo)"
+    # Bundle routine bumps; leave majors as individual PRs for review.
+    groups:
+      cargo-patch:
+        update-types:
+          - "patch"
+      cargo-minor:
+        update-types:
+          - "minor"
+    # Optional cooldown (Dependabot default is short); keep patches responsive.
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+
+  # --- GitHub Actions -------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # --- Nix flakes (flake.lock inputs) ---------------------------------------
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      # Deliberate pin policy: not weekly channel churn.
+      interval: "monthly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "nix"
+    commit-message:
+      prefix: "deps(nix)"

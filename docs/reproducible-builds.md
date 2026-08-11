@@ -30,6 +30,7 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 | Update cadence | Deliberate (`nix flake update`), ~each stable release or near EOL — not daily |
 | Co-bumps | **crane**, GHA `dtolnay/rust-toolchain@…`, shell `llvmPackages`, AGENTS toolchain strings |
 | Verify after bump | `nix develop` → fmt/clippy/test; `nix build .#rbitcoin-musl` static install |
+| Dependabot | [`.github/dependabot.yml`](../.github/dependabot.yml) opens **monthly** Nix PRs (plus weekly Cargo / Actions). Treat flake PRs as proposals — still co-bump and verify as above before merge |
 
 Channel branches advance only after Hydra succeeds ([channel branches](https://wiki.nixos.org/wiki/Channel_branches); status at [status.nixos.org](https://status.nixos.org/)). That is the “tested snapshot” — not a floating `master` commit.
 

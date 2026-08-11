@@ -635,9 +635,27 @@ impl ConfirmQueueDepths {
         let _ = hwm.fetch_max(depth_after, Ordering::Relaxed);
     }
 
+    /// Batch depth: saturating so a double-recv under teardown cannot wrap to
+    /// usize::MAX and panic debug overflow on the next send (`fetch_add + 1`).
+    #[inline]
+    fn note_batch_depth_send(depth: &AtomicUsize, hwm: &AtomicUsize) {
+        let prev = depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or(0);
+        Self::note_depth_hwm(hwm, prev.saturating_add(1));
+    }
+
+    #[inline]
+    fn note_batch_depth_recv(depth: &AtomicUsize) {
+        let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+
     fn note_lookup_send(&self, blocks: usize) {
-        let d = self.lookup_to_load.fetch_add(1, Ordering::Relaxed) + 1;
-        Self::note_depth_hwm(&self.load_hwm, d);
+        Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
         self.load_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(blocks))
@@ -645,7 +663,7 @@ impl ConfirmQueueDepths {
             .ok();
     }
     fn note_lookup_recv(&self, blocks: usize) {
-        self.lookup_to_load.fetch_sub(1, Ordering::Relaxed);
+        Self::note_batch_depth_recv(&self.lookup_to_load);
         self.load_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(blocks))
@@ -654,8 +672,7 @@ impl ConfirmQueueDepths {
     }
 
     fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        let d = self.load_to_scripts.fetch_add(1, Ordering::Relaxed) + 1;
-        Self::note_depth_hwm(&self.script_hwm, d);
+        Self::note_batch_depth_send(&self.load_to_scripts, &self.script_hwm);
         // Saturating: concurrent note_script_send under parallel load can race past
         // usize::MAX on wire_bytes/parents counters in debug overflow checks.
         self.script_blocks
@@ -675,7 +692,7 @@ impl ConfirmQueueDepths {
             .ok();
     }
     fn note_script_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        self.load_to_scripts.fetch_sub(1, Ordering::Relaxed);
+        Self::note_batch_depth_recv(&self.load_to_scripts);
         self.script_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(blocks))
@@ -694,8 +711,7 @@ impl ConfirmQueueDepths {
     }
 
     fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        let d = self.scripts_to_write.fetch_add(1, Ordering::Relaxed) + 1;
-        Self::note_depth_hwm(&self.write_hwm, d);
+        Self::note_batch_depth_send(&self.scripts_to_write, &self.write_hwm);
         self.write_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(blocks))
@@ -713,7 +729,7 @@ impl ConfirmQueueDepths {
             .ok();
     }
     fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        self.scripts_to_write.fetch_sub(1, Ordering::Relaxed);
+        Self::note_batch_depth_recv(&self.scripts_to_write);
         self.write_blocks
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(blocks))

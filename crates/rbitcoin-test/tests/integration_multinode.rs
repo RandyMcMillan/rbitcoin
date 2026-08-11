@@ -1,9 +1,10 @@
 //! Multi-node P2P integration tests.
 //!
-//! **Default suite** (fast): single-hop IBD + pure reorg hub. Keep this tiny so
-//! `cargo test --workspace` stays reliable under parallel load.
-//! **Heavier topology** (`#[ignore]`): multi-hop, tip-follow, 48-block dual seeder,
-//! full node entry — run via `scripts/integration.sh` (or `-- --ignored`).
+//! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
+//! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
+//! **Tier B (default suite pure):** non-IBD reorg / hub tests.
+//! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
+//! `scripts/integration.sh` or `-- --ignored` only.
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -48,96 +49,98 @@ async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
         .expect("ibd sync")
 }
 
-/// Two nodes, seed has 8 blocks, peer syncs tip.
-///
-/// Default suite keeps only non-IBD multinode (`reorg_to_longer_branch`). Full
-/// IBD can stall on confirm lookup claim under parallel workspace load.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "single-hop IBD; run via scripts/integration.sh"]
+/// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default + CI multinode).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
-    let seed_dir = TempDir::new().unwrap();
-    let peer_dir = TempDir::new().unwrap();
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 8).await;
-    assert_eq!(seed.cache.tip_height(), Some(8));
-    assert_eq!(seed.query.tip_height(), Some(Height(8)));
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 8).await;
+        assert_eq!(seed.cache.tip_height(), Some(8));
+        assert_eq!(seed.query.tip_height(), Some(Height(8)));
 
-    let peer = start_node(&peer_dir).await;
-    let n = sync_ibd(&peer, seed.local_addr).await;
-    assert!(n >= 8, "downloaded {n}");
-    peer.wait_height(8, Duration::from_secs(5))
+        let peer = start_node(&peer_dir).await;
+        let n = sync_ibd(&peer, seed.local_addr).await;
+        assert!(n >= 8, "downloaded {n}");
+        peer.wait_height(8, Duration::from_secs(5))
+            .await
+            .expect("tip");
+
+        // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
+        assert_eq!(peer.query.tip_height(), Some(Height(8)));
+        assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(60), fut)
         .await
-        .expect("tip");
-
-    // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
-    assert_eq!(peer.query.tip_height(), Some(Height(8)));
-    assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
-
-    seed.shutdown().await;
-    peer.shutdown().await;
+        .expect("two_node_header_and_block_sync wall timeout (60s)");
 }
 
-/// Phase 4: seeder shuts down and restarts with empty RAM cache; peer still IBD-syncs
-/// via store-backed getheaders + reconstruct getdata.
-///
-/// Ignored in default suite: under parallel workspace load this path can stall
-/// minutes on tip confirm (plan claim) — keep for `scripts/integration.sh`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "cold reconstruct serve; run via scripts/integration.sh"]
+/// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
+/// (tier A — default + CI multinode).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_after_restart_via_reconstruct() {
-    let seed_dir = TempDir::new().unwrap();
-    let peer_dir = TempDir::new().unwrap();
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 10).await;
-    let tip_hash = seed.cache.tip_hash().unwrap();
-    seed.shutdown().await;
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 10).await;
+        let tip_hash = seed.cache.tip_hash().unwrap();
+        seed.shutdown().await;
 
-    // Restart seeder on same store — cache is empty; serve must use reconstruct.
-    let seed = start_node(&seed_dir).await;
-    assert!(
-        seed.cache.is_empty(),
-        "restarted seeder must not rely on warm RAM cache"
-    );
-    assert_eq!(seed.query.tip_height(), Some(Height(10)));
-
-    let peer = start_node(&peer_dir).await;
-    let n = sync_ibd(&peer, seed.local_addr).await;
-    assert!(n >= 10, "downloaded {n}");
-    peer.wait_height(10, Duration::from_secs(10))
-        .await
-        .expect("tip");
-
-    assert_eq!(peer.query.tip_height(), Some(Height(10)));
-    let peer_tip = peer
-        .query
-        .header_at_height(Height(10))
-        .unwrap()
-        .unwrap()
-        .1
-        .hash;
-    assert_eq!(peer_tip, tip_hash.to_byte_array());
-
-    // Peer can reconstruct every height from its own store.
-    for h in 0..=10u32 {
-        let b = peer
-            .query
-            .reconstruct_block_at_height(Height(h))
-            .expect("peer reconstruct");
-        assert_eq!(
-            b.header.block_hash().to_byte_array(),
-            peer.query
-                .header_at_height(Height(h))
-                .unwrap()
-                .unwrap()
-                .1
-                .hash
+        // Restart seeder on same store — cache is empty; serve must use reconstruct.
+        let seed = start_node(&seed_dir).await;
+        assert!(
+            seed.cache.is_empty(),
+            "restarted seeder must not rely on warm RAM cache"
         );
-    }
+        assert_eq!(seed.query.tip_height(), Some(Height(10)));
 
-    seed.shutdown().await;
-    peer.shutdown().await;
+        let peer = start_node(&peer_dir).await;
+        let n = sync_ibd(&peer, seed.local_addr).await;
+        assert!(n >= 10, "downloaded {n}");
+        peer.wait_height(10, Duration::from_secs(10))
+            .await
+            .expect("tip");
+
+        assert_eq!(peer.query.tip_height(), Some(Height(10)));
+        let peer_tip = peer
+            .query
+            .header_at_height(Height(10))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash;
+        assert_eq!(peer_tip, tip_hash.to_byte_array());
+
+        // Peer can reconstruct every height from its own store.
+        for h in 0..=10u32 {
+            let b = peer
+                .query
+                .reconstruct_block_at_height(Height(h))
+                .expect("peer reconstruct");
+            assert_eq!(
+                b.header.block_hash().to_byte_array(),
+                peer.query
+                    .header_at_height(Height(h))
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .hash
+            );
+        }
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(90), fut)
+        .await
+        .expect("serve_after_restart_via_reconstruct wall timeout (90s)");
 }
 
 /// Multi-hop serve after sync (mid → leaf). Ignored: longer wall + parallel IBD flakiness.

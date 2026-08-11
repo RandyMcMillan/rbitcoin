@@ -64,7 +64,6 @@ level peers cannot ignore**.
 
 | ID | Item | Why it still matters | Done looks like |
 |----|------|----------------------|-----------------|
-| **Q-03** | **Default CI does not run multi-node IBD** | Hardest product surface is `#[ignore]` | Small hermetic multi-node path green in default CI *or* weekly required job with hang fixed |
 | **Q-04** | **Env knobs inventory** | ~40 `RBITCOIN_*` in code vs fewer in OPERATOR | Every public knob in OPERATOR advanced section; private knobs `cfg`/`doc(hidden)` or `RBITCOIN_UNSTABLE_*` |
 
 ### P1 — Maintainability (code that scales with AI + human review)
@@ -228,6 +227,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Core script/TX allowlist debt | **Fixed (Q-01)** — allowlist concept removed; every Core script/TX row must pass; findings 001–011 have named regressions |
 | External findings process incomplete | **Fixed (Q-01)** — status + Regression links in `docs/external_findings/` |
 | Confirm dual-path soft recovery | **Fixed (Q-02)** — killed load identity soft-fill + `ColdPinMode` dual API; denserels by range only; invariants.md updated |
+| Multi-node IBD only `#[ignore]` | **Fixed (Q-03)** — tier A two-node + cold reconstruct in default suite + required CI `multinode` job (coverage cadence); queue depth counters saturating |
 | Most-work reorg / tip hole livelocks | **Largely fixed** — multi-hop reorg, tip-hole race, zombie pending, resume seed stack/O(N²) fixes |
 | SH/fuse wipe risk on format | **Fixed** — soft-migrate fuse8; AGENTS on-disk format rules |
 
@@ -240,7 +240,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 ### Still intentionally open (see Remaining)
 
-God-files, ignored multi-node IBD in default CI, `allow(dead_code)` bulk_io, `IbdConfig::for_test` in node, cargo deny/SBOM, continuous fuzz in CI, first-hour tutorial.
+God-files, `allow(dead_code)` bulk_io, `IbdConfig::for_test` in node, cargo deny/SBOM, continuous fuzz in CI, first-hour tutorial.
 
 ---
 

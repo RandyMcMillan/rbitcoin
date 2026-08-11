@@ -72,8 +72,9 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / every edit) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + non-IBD multinode reorg + short IBD error-path smokes. **No full multi-node IBD** (see hang note). |
-| **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | All P2P IBD (2-node, multi-hop, tip-follow, 12-block smoke, mesh, `run_p2p`) |
+| **Default** (CI / every edit) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **tier A multi-node IBD** (8-block single-hop + cold reconstruct) + reorg + short IBD error-path smokes. |
+| **CI multinode job** | same as tier A filters | Required job after fmt/clippy/test (coverage cadence) |
+| **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
 | **Ignored benches** | `cargo test -p rbitcoin-net --test freeze_benches -- --ignored` etc. | Optional perf / contention probes |
 
 ### Suite speed budgets (default tier)
@@ -101,7 +102,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` once per store |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Hang note:** full IBD paths (`P2PNode::sync` → confirm lookup claim) can stall for many minutes under parallel `cargo test --workspace` load on this host (loadq full, claim ~5 s loops). They stay `#[ignore]` until that is fixed; still covered by `scripts/integration.sh` / `--ignored`.
+**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall; `serve_after_restart_via_reconstruct` 90s wall. Confirm pipeline queue depths use saturating counters so teardown races cannot panic on overflow. Heavier paths remain `#[ignore]` (`scripts/integration.sh`).
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -146,8 +147,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `wire_ring_and_archive_epoch` | Wire/epoch | Multi-tip ring + finalize soft zone |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
 | `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
-| `two_node_header_and_block_sync` | P2P (**ignored**) | Seeder → peer single-hop IBD |
-| `serve_after_restart_via_reconstruct` | P2P (**ignored**) | Cold serve via reconstruct |
+| `two_node_header_and_block_sync` | P2P (**default / multinode CI**) | Seeder → peer 8-block IBD |
+| `serve_after_restart_via_reconstruct` | P2P (**default / multinode CI**) | Cold serve via reconstruct |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
 | `three_node_relay_path` | P2P (**ignored**) | Hop serve — `scripts/integration.sh` |
 | `ibd_skips_dead_peer` | P2P (**ignored**) | Dial book skips dead address |
@@ -162,7 +163,7 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 ### Integration / multi-node
 
-Default CI runs only the **fast** `integration_multinode` cases (no `--ignored`).
+Default CI + required **multinode** job run tier A `integration_multinode` cases (not `--ignored` heavies).
 Heavy topology is `#[ignore]` and run periodically:
 
 ```bash

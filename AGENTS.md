@@ -123,7 +123,7 @@ land the simplification as a drive-by cleanup.
 
 CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
 `master`/`main`). Required checks are separate jobs so the push/PR UI shows
-which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`coverage`**.
+which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`**.
 **Do not push or leave a commit that would fail any of them.** A red CI on
 `master` is incomplete work.
 
@@ -161,7 +161,7 @@ When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs
 |-------|-------------|
 | **Each intermediate step** | Targeted tests for crates/modules touched; logical commits with public hygiene. Do **not** require full workspace suite, full coverage, or musl install after every slice. |
 | **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%), **one** musl build + install. |
-| **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
+| **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `multinode` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
 
 Single-shot turns (one bugfix, no multi-step plan) still follow the full commit
 recipe below including musl when code changes.

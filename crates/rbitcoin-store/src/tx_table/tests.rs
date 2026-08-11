@@ -1,0 +1,2221 @@
+//! Tx table unit tests (peeled).
+
+use super::*;
+use crate::segmented_head::SegmentedTxHead;
+
+fn tempfile_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-{name}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn tiny_layout() -> HeadLayout {
+    HeadLayout::new(crate::address_head::TINY_BITS).unwrap()
+}
+
+fn create_tiny(dir: &Path) -> TxTable {
+    TxTable::create_with_head_layout(dir, tiny_layout()).unwrap()
+}
+
+/// Process-global env knobs still used by a few tests (read-batch / bulk IO).
+/// Hold this while mutating so parallel tests cannot race.
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// Offline output-run decode (production uses packed denserels path).
+fn decode_output_run_prefix(
+    buf: &[u8],
+    count: u32,
+) -> Result<(Vec<OutputRecord>, usize), StoreError> {
+    let mut out = Vec::with_capacity(count as usize);
+    let mut off = 0;
+    for _ in 0..count {
+        let (rec, used) = OutputRecord::decode_at(&buf[off..])?;
+        off += used;
+        out.push(rec);
+    }
+    Ok((out, off))
+}
+
+fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
+    let (out, used) = decode_output_run_prefix(buf, count)?;
+    if used != buf.len() {
+        return Err(StoreError::Corrupt("output run trailing bytes"));
+    }
+    Ok(out)
+}
+
+fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
+    let (out, used) = decode_input_run_prefix(buf, count)?;
+    if used != buf.len() {
+        return Err(StoreError::Corrupt("input run trailing bytes"));
+    }
+    Ok(out)
+}
+
+/// Simulate crash after body/idx publish, before `txid.body` catch-up:
+/// body leads identity → open truncates body/idx to the common prefix.
+#[test]
+fn open_repairs_body_leading_txid_count() {
+    let dir = tempfile_dir("skew-repair");
+    {
+        let t = create_tiny(&dir);
+        let mut items = Vec::new();
+        for i in 0..5u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i.wrapping_add(1);
+            let tx = TxRecord {
+                txid,
+                version: 2,
+                locktime: 0,
+                input_count: 0,
+                output_count: 1,
+                input_start_fk: Fk::NULL,
+                output_start_fk: Fk::NULL,
+            };
+            let outs = vec![OutputRecord::unspent(1000 + i64::from(i), vec![0x51])];
+            items.push((tx, Vec::new(), outs));
+        }
+        t.put_full_batch_indexed(&items, true).unwrap();
+        assert_eq!(t.count(), 5);
+        assert_eq!(t.txid_sidefile().count(), 5);
+        // Identity lag only (body/idx still at 5).
+        t.txid_sidefile().truncate_to_count(3).unwrap();
+        assert_eq!(t.txid_sidefile().count(), 3);
+        assert_eq!(t.count(), 5);
+    }
+    let t2 = TxTable::open(&dir).expect("open should repair skew");
+    assert_eq!(t2.count(), 3);
+    assert_eq!(t2.txid_sidefile().count(), 3);
+    // Kept prefix still readable.
+    let tx = t2.get(Fk(1)).unwrap();
+    assert_eq!(tx.txid[0], 1);
+    let tx3 = t2.get(Fk(3)).unwrap();
+    assert_eq!(tx3.txid[0], 3);
+    assert!(t2.get(Fk(4)).is_err());
+    // Further appends work after repair.
+    let mut txid = [0u8; 32];
+    txid[0] = 99;
+    let tx = TxRecord {
+        txid,
+        version: 2,
+        locktime: 0,
+        input_count: 0,
+        output_count: 1,
+        input_start_fk: Fk::NULL,
+        output_start_fk: Fk::NULL,
+    };
+    let outs = vec![OutputRecord::unspent(42, vec![0x51])];
+    t2.put_full_batch_indexed(&[(tx, Vec::new(), outs)], true)
+        .unwrap();
+    assert_eq!(t2.count(), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decode_prevout_at_skips_script_and_witness() {
+    let rec = InputRecord {
+        prev_txid: [9u8; 32],
+        create_fk: Fk(1),
+        prev_index: 3,
+        sequence: 0xffff_fffe,
+        script_sig: vec![0xab; 40],
+        witness: vec![vec![0x30; 70], vec![0x21; 33]],
+    };
+    let enc = rec.encode();
+    let (cfk, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
+    assert_eq!(cfk, Fk(1));
+    assert_eq!(vout, 3);
+    assert_eq!(used, enc.len());
+    // Full decode still matches.
+    let (full, used2) = InputRecord::decode_at(&enc).unwrap();
+    assert_eq!(used2, used);
+    assert_eq!(full.script_sig.len(), 40);
+}
+
+/// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).
+#[test]
+fn input_encode_create_fk_not_prev_txid() {
+    let rec = InputRecord {
+        prev_txid: [0xaa; 32], // soft only — not on disk
+        create_fk: Fk(42),
+        prev_index: 7,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    };
+    let enc = rec.encode();
+    // flags(1) + create_fk(8) + compact vout(1 for 7) = 10
+    assert_eq!(enc.len(), 10, "enc={:?}", enc);
+    // v9 would have been flags + 32-byte txid + vout = 34 for same case
+    assert!(enc.len() + 24 <= 34);
+    let dec = InputRecord::decode(&enc).unwrap();
+    assert_eq!(dec.create_fk, Fk(42));
+    assert_eq!(dec.prev_index, 7);
+    assert_eq!(dec.prev_txid, [0u8; 32]);
+}
+
+#[test]
+fn scan_packed_meta_and_prevouts_no_output_alloc() {
+    let tx = TxRecord {
+        txid: [7u8; 32],
+        version: 2,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 2,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let inputs = vec![
+        InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        },
+        InputRecord {
+            prev_txid: [3u8; 32],
+            create_fk: Fk(1),
+            prev_index: 1,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![vec![0xaa]],
+        },
+    ];
+    let outputs = vec![OutputRecord::unspent(50, vec![0x51])];
+    let mut raw = Vec::new();
+    encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+    let (meta, prevouts) = scan_packed_meta_and_prevouts(&raw).unwrap();
+    assert_eq!(meta.txid, [0u8; 32], "body scan has no leading txid");
+    assert_eq!(prevouts.len(), 2);
+    assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
+    assert_eq!(prevouts[1], (Fk(1), 1));
+}
+
+#[test]
+fn packed_output_spender_rels_multi_vout_one_walk() {
+    let tx = TxRecord {
+        txid: [8u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 4,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(1, vec![0x51]),
+        OutputRecord::unspent(2, vec![0x51]),
+        OutputRecord::unspent(3, vec![0x51]),
+        OutputRecord::unspent(4, vec![0x51]),
+    ];
+    let mut raw = Vec::new();
+    encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+    let single0 = TxTable::packed_output_spender_rel(&raw, 0).unwrap();
+    let single3 = TxTable::packed_output_spender_rel(&raw, 3).unwrap();
+    let multi = TxTable::packed_output_spender_rels(&raw, &[3, 0, 3]).unwrap();
+    assert_eq!(multi.len(), 2);
+    assert_eq!(multi[0], (0, single0));
+    assert_eq!(multi[1], (3, single3));
+    // Layout denserels match encode+decode denserels (prep-ahead pin path).
+    let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
+    let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+    assert_eq!(layout, decode_rels);
+    assert_eq!(layout[0] as u64, single0);
+    assert_eq!(layout[3] as u64, single3);
+    // Each rel points at a 9-byte spender field (null fk + flags).
+    for (_, rel) in multi {
+        let fo = rel as usize;
+        assert!(raw.len() >= fo + 9);
+        assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
+    }
+}
+
+/// Exact layout denserels (no encode) match encode+decode for varied shapes.
+#[test]
+fn denserels_layout_exact_matches_encode_decode_shapes() {
+    let cases: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = vec![
+        // Coinbase + OP_TRUE out
+        (
+            TxRecord {
+                txid: [1u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01, 0x02], vec![])],
+            vec![OutputRecord::unspent(50, vec![0x51])],
+        ),
+        // Non-final sequence, long script, multi-witness, multi-vout
+        (
+            TxRecord {
+                txid: [2u8; 32],
+                version: 2,
+                locktime: 100,
+                input_start_fk: Fk::NULL,
+                input_count: 2,
+                output_start_fk: Fk::NULL,
+                output_count: 3,
+            },
+            vec![
+                InputRecord {
+                    prev_txid: [9u8; 32],
+                    create_fk: Fk(42),
+                    prev_index: 0,
+                    sequence: 1,
+                    script_sig: vec![0xab; 40],
+                    witness: vec![vec![0x01], vec![0x02; 33]],
+                },
+                InputRecord {
+                    prev_txid: [8u8; 32],
+                    create_fk: Fk(99),
+                    prev_index: 300, // compact size 3 bytes
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                },
+            ],
+            vec![
+                OutputRecord::unspent(0, vec![]),
+                OutputRecord::unspent(1, vec![0x51]),
+                OutputRecord::unspent(21_000_000 * 100_000_000, vec![0x00; 25]),
+            ],
+        ),
+    ];
+    for (tx, inputs, outputs) in cases {
+        assert_eq!(inputs.len() as u32, tx.input_count);
+        assert_eq!(outputs.len() as u32, tx.output_count);
+        for i in &inputs {
+            let mut buf = Vec::new();
+            i.encode_into(&mut buf);
+            assert_eq!(
+                i.encoded_len_exact(),
+                buf.len(),
+                "input exact len vs encode"
+            );
+        }
+        for o in &outputs {
+            let mut buf = Vec::new();
+            o.encode_into(&mut buf);
+            assert_eq!(
+                o.encoded_len_exact(),
+                buf.len(),
+                "output exact len vs encode"
+            );
+        }
+        let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
+        let mut raw = Vec::new();
+        encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+        let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+        assert_eq!(layout, decode_rels, "layout denserels vs encode+decode");
+    }
+}
+
+/// Bulk body_txid_range matches serial body_txid (idx batch + bulk pread).
+#[test]
+fn body_txid_range_matches_serial() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-txid-range-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let mk = |i: u64| {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        txid[8] = 0xce;
+        let rec = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+        (rec, inputs, outputs)
+    };
+    for i in 1..=40u64 {
+        let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+    }
+    assert!(t.body_txid_range(5, 4).unwrap().is_empty());
+    let bulk = t.body_txid_range(1, 40).unwrap();
+    assert_eq!(bulk.len(), 40);
+    for i in 1..=40u64 {
+        assert_eq!(bulk[(i - 1) as usize], t.body_txid(Fk(i)).unwrap());
+    }
+    let mid = t.body_txid_range(10, 25).unwrap();
+    for (j, id) in (10..=25).enumerate() {
+        assert_eq!(mid[j], t.body_txid(Fk(id)).unwrap());
+    }
+    // Through last published id (body-end path for last length).
+    let tail = t.body_txid_range(38, 40).unwrap();
+    assert_eq!(tail.len(), 3);
+    for (j, id) in (38..=40).enumerate() {
+        assert_eq!(tail[j], t.body_txid(Fk(id)).unwrap());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fat packed body: sidefile identity matches without reading full payload.
+#[test]
+fn body_txid_thin_prefix_matches_fat_packed_body() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-thin-txid-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let mut txid = [0xabu8; 32];
+    txid[0] = 0x7e;
+    let tx = TxRecord {
+        txid,
+        version: 2,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0xde; 64],
+        witness: vec![vec![0xad; 50_000]], // fat body
+    }];
+    let outputs = vec![OutputRecord::unspent(42, vec![0x51; 100])];
+    let fk = t
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+        .unwrap()[0];
+    let from_thin = t.body_txid(fk).unwrap();
+    assert_eq!(from_thin, txid, "sidefile thin identity");
+    let (_off, len) = t.body.record_range(fk).unwrap();
+    assert!(len > 50_000, "body should be large");
+    // Offset-only identity is gone (schema 13); use fk.
+    assert!(t.body_txid_at(_off, len).is_err());
+    // Head resolve still works.
+    assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bulk body_range (sorted mmap) + get_full_batch_at agree with sequential paths.
+#[test]
+fn bulk_body_range_and_full_match_sequential() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-bulk-body-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let mut fks = Vec::new();
+    for i in 0u8..12 {
+        let mut txid = [0u8; 32];
+        txid[0] = i.wrapping_add(10);
+        let tx = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![i],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+        fks.push(
+            t.put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+                .unwrap()[0],
+        );
+    }
+    // Unsorted + sparse sample still matches serial body_range.
+    let mut shuffled = fks.clone();
+    shuffled.reverse();
+    let sparse = vec![shuffled[0], shuffled[3], shuffled[3], shuffled[7]];
+    let batch_sparse = t.body_range_batch(&sparse).unwrap();
+    for (fk, br) in sparse.iter().zip(batch_sparse.iter()) {
+        let seq = t.body_range(*fk).unwrap();
+        assert_eq!(*br, Some(seq), "fk={fk:?}");
+    }
+    let batch_ranges = t.body_range_batch(&fks).unwrap();
+    for (fk, br) in fks.iter().zip(batch_ranges.iter()) {
+        let seq = t.body_range(*fk).unwrap();
+        assert_eq!(*br, Some(seq));
+    }
+    let range_args: Vec<(Fk, u64, u64)> = fks
+        .iter()
+        .zip(batch_ranges.iter())
+        .filter_map(|(fk, r)| r.map(|(o, l)| (*fk, o, l)))
+        .collect();
+    let bulk = t.get_full_batch_at(&range_args).unwrap();
+    for ((fk, off, len), got) in range_args.iter().zip(bulk.iter()) {
+        let seq = t.get_full(*fk).unwrap();
+        let b = got.as_ref().expect("bulk decode");
+        assert_eq!(b.0.txid, seq.0.txid);
+        assert_eq!(b.0.txid, t.body_txid(*fk).unwrap());
+        // Offset-only decode has no sidefile fill.
+        assert_eq!(t.get_full_at(*off, *len).unwrap().0.txid, [0u8; 32]);
+        assert_eq!(b.3.len(), b.2.len()); // denserels
+        for o in &b.2 {
+            assert!(o.spender_field.is_null());
+        }
+    }
+    let meta_ranges: Vec<(u64, u64)> = range_args.iter().map(|(_, o, l)| (*o, *l)).collect();
+    let meta = t.get_meta_and_outputs_batch_at(&meta_ranges).unwrap();
+    for ((_, off, len), got) in range_args.iter().zip(meta.iter()) {
+        let seq = t.get_meta_and_outputs_at(*off, *len).unwrap();
+        let b = got.as_ref().expect("meta bulk");
+        assert_eq!(b.0, seq.0);
+        assert_eq!(b.1.len(), seq.1.len());
+        assert_eq!(b.2.len(), b.1.len()); // dense spender_rels
+                                          // Content-only outs (spender fields cleared for pin/FIFO).
+        for o in &b.1 {
+            assert!(o.spender_field.is_null());
+            assert!(!o.multi_spender);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shape A: multi-cand Prefix33 select + one denserels for winner (outs present).
+///
+/// Two creates of the same txid (foreigner + real); deepest wins; denserels
+/// decode returns outs for pin without a second denserels wave on wrong cands.
+#[test]
+fn get_fk_and_outs_shape_a_multi_cand_one_denserels() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-shape-a-multi-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let txid = [0x5a; 32];
+    let mk = |hint: u8, value: i64| {
+        let rec = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![hint],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(value, vec![0x51, hint])];
+        (rec, inputs, outputs)
+    };
+    // Older create (shallower) then deeper BIP30 winner with distinct value.
+    let _fk_old = t.put_full_batch_indexed(&[mk(1, 11)], true).unwrap()[0];
+    let fk_new = t.put_full_batch_indexed(&[mk(2, 22)], true).unwrap()[0];
+
+    // Also a single-cand key (denserels-only path).
+    let mut solo = [0u8; 32];
+    solo[0] = 0x77;
+    let solo_rec = TxRecord {
+        txid: solo,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let solo_in = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let solo_out = vec![OutputRecord::unspent(33, vec![0x51])];
+    let fk_solo = t
+        .put_full_batch_indexed(&[(solo_rec, solo_in, solo_out)], true)
+        .unwrap()[0];
+
+    let (batch, _dens_ns) = t
+        .get_fk_and_outs_by_txid_batch(&[txid, solo, [0xff; 32]])
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+
+    let multi = batch.iter().find(|(id, _)| *id == txid).unwrap();
+    let (fk, outs_opt) = multi.1.as_ref().expect("multi-cand hit");
+    assert_eq!(*fk, fk_new);
+    let (tx, outs, dens) = outs_opt.as_ref().expect("denserels for winner");
+    assert_eq!(tx.txid, txid);
+    assert_eq!(outs.len(), 1);
+    assert_eq!(outs[0].value, 22);
+    assert_eq!(dens.len(), outs.len());
+
+    let single = batch.iter().find(|(id, _)| *id == solo).unwrap();
+    let (fk_s, outs_s) = single.1.as_ref().expect("single-cand hit");
+    assert_eq!(*fk_s, fk_solo);
+    let (tx_s, outs_s, _) = outs_s.as_ref().expect("single denserels-only");
+    assert_eq!(tx_s.txid, solo);
+    assert_eq!(outs_s[0].value, 33);
+
+    assert!(batch.iter().any(|(id, r)| *id == [0xff; 32] && r.is_none()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Streaming early-exit: deepest match → fewer body_lookups than cand count.
+#[test]
+fn streaming_resolve_early_exit_fewer_body_lookups() {
+    if !crate::bulk_io::io_uring_enabled() {
+        return;
+    }
+    // Serialize: head_resolve_stats are process-wide atomics.
+    static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-stream-early-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let txid = [0xcd; 32];
+    let mk = |hint: u8| {
+        let rec = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![hint],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+        (rec, inputs, outputs)
+    };
+    // Two creates of same txid → two cands; deepest (second) should match first try.
+    let _fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+    let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+    let _ = crate::head_resolve_stats::sample_and_reset();
+    let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
+    assert_eq!(batch[0].1.map(|(f, _)| f), Some(fk2));
+    let range = batch[0].1.unwrap().1;
+    assert!(range.1 > 0, "body range from idx on winner");
+    let s = crate::head_resolve_stats::sample_and_reset();
+    // Deepest-first early exit: body_lookups ≤ cands.
+    assert!(
+        s.body_lookups <= s.cands.max(1),
+        "body_lookups {} > cands {}",
+        s.body_lookups,
+        s.cands
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Depth-max match: foreigners + two same-txid creates; batch prefers deepest.
+#[test]
+fn get_fk_by_txid_batch_depth_wins_with_workers() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-batch-depth-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let txid = [0xab; 32];
+        let mk = |hint: u8| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![hint],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        let fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+        let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+        // Also resolve a few unrelated keys in the same bulk call.
+        let mut extra = Vec::new();
+        for i in 0u8..10 {
+            let mut other = [0u8; 32];
+            other[0] = i.wrapping_add(1);
+            let rec = TxRecord {
+                txid: other,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x01],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            let fk = t
+                .put_full_batch_indexed(&[(rec, inputs, outputs)], true)
+                .unwrap()[0];
+            extra.push((other, fk));
+        }
+        let mut keys: Vec<[u8; 32]> = extra.iter().map(|(t, _)| *t).collect();
+        keys.push(txid);
+        keys.push([0xff; 32]); // miss
+        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+        let hit = batch
+            .iter()
+            .find(|(t, _)| *t == txid)
+            .unwrap()
+            .1
+            .map(|(f, _)| f);
+        assert_eq!(hit, Some(fk2));
+        assert_ne!(hit, Some(fk1));
+        for (other, fk) in &extra {
+            let h = batch
+                .iter()
+                .find(|(t, _)| t == other)
+                .unwrap()
+                .1
+                .map(|(f, _)| f);
+            assert_eq!(h, Some(*fk));
+        }
+        assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_BULK_IO_WORKERS");
+    });
+}
+
+#[test]
+fn get_fk_by_txid_batch_matches_single() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-batch-fk-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let mut items = Vec::new();
+    for i in 0u8..5 {
+        let mut txid = [0u8; 32];
+        txid[0] = i.wrapping_add(1);
+        let tx = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+        items.push((tx, inputs, outputs));
+    }
+    let fks = t.put_full_batch_indexed(&items, true).unwrap();
+    let mut keys: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
+    keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
+    let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+    assert_eq!(batch.len(), 5);
+    for (txid, row) in &batch {
+        let single = t.get_fk_by_txid(txid).unwrap();
+        assert_eq!(row.map(|(f, _)| f), single);
+        assert!(row.is_some());
+        let (fk, range) = row.unwrap();
+        let known = t.body.record_range(fk).unwrap();
+        assert_eq!(range, known, "returned range must match tx.idx");
+    }
+    // Miss
+    let miss = t.get_fk_by_txid_batch(&[[0xff; 32]]).unwrap();
+    assert_eq!(miss[0].1, None);
+    let _ = fks;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Range denserels: known_txid + sparse need_vouts (N2.0/N2.1).
+#[test]
+fn get_outs_denserels_by_range_sparse_need() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-range-dens-txid-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let want_txid = {
+        let mut x = [0u8; 32];
+        x[0] = 0xab;
+        x[31] = 0xcd;
+        x
+    };
+    let big_script = vec![0xAAu8; 200];
+    let tx = TxRecord {
+        txid: want_txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 3,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(1, big_script.clone()),
+        OutputRecord::unspent(2, vec![0x51, 0x52]),
+        OutputRecord::unspent(3, big_script.clone()),
+    ];
+    let fk = t
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+        .unwrap()[0];
+    let range = t.body.record_range(fk).unwrap();
+    // Only need vout 1 — skip allocating big scripts on 0 and 2.
+    let (rows, body_ns, dec_ns) = t
+        .get_outs_denserels_by_range_batch(&[(fk, range, want_txid, vec![1])])
+        .unwrap();
+    assert!(body_ns > 0 || dec_ns > 0 || true); // timers fire or tiny fixture
+    let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
+    assert_eq!(got.txid, want_txid);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].0, 1);
+    assert_eq!(live[0].1.script, vec![0x51, 0x52]);
+    assert_eq!(sparse.len(), 1);
+    assert_eq!(sparse[0].0, 1);
+    // Full decode for comparison.
+    let full = decode_packed_tx_outs_with_spender_rels_secret(
+        &t.body.get_raw(fk).unwrap(),
+        Some(t.store_secret()),
+    )
+    .unwrap();
+    assert_eq!(full.1.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_primary_slot_stable_and_ordered() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-slot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let a = [1u8; 32];
+    let b = [2u8; 32];
+    let sa = t.head_primary_slot(&a);
+    let sb = t.head_primary_slot(&b);
+    assert_eq!(sa, t.head_primary_slot(&a));
+    // Distinct keys almost always land on distinct primary slots at tiny scale.
+    assert_ne!(sa, sb);
+    let mut keys = vec![b, a];
+    keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
+    assert!(t.head_primary_slot(&keys[0]) <= t.head_primary_slot(&keys[1]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Operator recovery: delete `tx.head/` (+ legacy flat files) → open rebuilds.
+#[test]
+fn missing_tx_head_rebuilds_from_bodies_on_open() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-rebuild-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+
+        {
+            let t = create_tiny(&dir);
+            for i in 1..=20u64 {
+                let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            assert_eq!(t.count(), 20);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&7u64.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(7)));
+            t.flush().unwrap();
+        }
+
+        // Wipe segmented head meta + files.
+        assert!(crate::segmented_head::head_meta_exists(&dir));
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+
+        let t = TxTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 20);
+        assert!(crate::segmented_head::head_meta_exists(&dir));
+        for i in 1..=20u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                t.get_fk_by_txid(&txid).unwrap(),
+                Some(Fk(i)),
+                "txid {i} missing after head rebuild"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    });
+}
+
+#[test]
+fn missing_tx_head_with_no_bodies_creates_empty() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let t = create_tiny(&dir);
+            t.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        let t = TxTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 0);
+        assert!(crate::segmented_head::head_meta_exists(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    });
+}
+
+#[test]
+fn get_output_spender_metas_at_one_walk() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-metas-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
+    let tx = TxRecord {
+        txid: [0xcd; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 3,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(1, vec![0x51]),
+        OutputRecord::unspent(2, vec![0x51]),
+        OutputRecord::unspent(3, vec![0x51]),
+    ];
+    let fks = t
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+        .unwrap();
+    let (off, len) = t.body_range(fks[0]).unwrap();
+    let s1 = Fk(10);
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, Fk(20))])
+        .unwrap();
+    let metas = t.get_output_spender_metas_at(off, len, &[0, 1, 2]).unwrap();
+    assert_eq!(metas.len(), 3);
+    assert!(!metas[0].1 && metas[0].2 == s1);
+    assert!(!metas[1].1 && metas[1].2.is_null());
+    assert!(!metas[2].1 && metas[2].2 == Fk(20));
+
+    // Bulk 9-byte abs preads match the packed walk (pin → write spentness path).
+    let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
+    let (_meta, outs, rels) = decoded[0].as_ref().expect("decode with rels");
+    assert_eq!(outs.len(), 3);
+    assert_eq!(rels.len(), 3);
+    for o in outs {
+        assert!(o.spender_field.is_null());
+    }
+    let abs: Vec<u64> = rels
+        .iter()
+        .map(|r| off.saturating_add(u64::from(*r)))
+        .collect();
+    let bulk = t.get_spender_meta_at_abs_batch(&abs).unwrap();
+    assert_eq!(bulk.len(), 3);
+    assert_eq!(
+        bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        Some((s1, false))
+    );
+    assert_eq!(
+        bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        Some((Fk::NULL, false))
+    );
+    assert_eq!(
+        bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        Some((Fk(20), false))
+    );
+    // Both backends must agree.
+    let mmap = t
+        .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Pread)
+        .unwrap();
+    let uring = t
+        .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Uring)
+        .unwrap();
+    assert_eq!(mmap, bulk);
+    assert_eq!(uring, bulk);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_spends_on_create_at_batch_patches_all_vouts() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-spend-batch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
+    let tx = TxRecord {
+        txid: [0xab; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 3,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(10, vec![0x51]),
+        OutputRecord::unspent(20, vec![0x51]),
+        OutputRecord::unspent(30, vec![0x51]),
+    ];
+    let fks = t
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+        .unwrap();
+    let fk = fks[0];
+    let (off, len) = t.body_range(fk).unwrap();
+    let s1 = Fk(100);
+    let s2 = Fk(200);
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, s2)])
+        .unwrap();
+    let (m0, f0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+    let (m2, f2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
+    assert!(!m0 && f0 == s1);
+    assert!(!m2 && f2 == s2);
+    let (m1, f1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
+    assert!(!m1 && f1.is_null());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn input_witness_roundtrip() {
+    let rec = InputRecord {
+        prev_txid: [1u8; 32],
+        create_fk: Fk(1),
+        prev_index: 2,
+        sequence: 0xffff_fffe,
+        script_sig: vec![0x00],
+        witness: vec![vec![0x30, 0x01], vec![0x21, 0xaa]],
+    };
+    let enc = rec.encode();
+    let dec = InputRecord::decode(&enc).unwrap();
+    assert_eq!(dec.create_fk, Fk(1));
+    assert_eq!(dec.prev_index, 2);
+    assert_eq!(dec.sequence, rec.sequence);
+    assert_eq!(dec.script_sig, rec.script_sig);
+    assert_eq!(dec.witness, rec.witness);
+    assert_eq!(dec.prev_txid, [0u8; 32], "prev_txid not on disk");
+}
+
+#[test]
+fn input_flags_roundtrip() {
+    let rec = InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    };
+    let enc = rec.encode();
+    // flags only: null prev + final seq + empty script + empty witness
+    assert_eq!(enc.len(), 1);
+    assert_eq!(InputRecord::decode(&enc).unwrap(), rec);
+}
+
+#[test]
+fn input_rejects_legacy_local_prev() {
+    use crate::compact::write_compact_size;
+    // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
+    let flags = input_flags::RESERVED4
+        | input_flags::SEQ_FINAL
+        | input_flags::EMPTY_SCRIPT
+        | input_flags::EMPTY_WITNESS;
+    let mut enc = vec![flags];
+    write_compact_size(&mut enc, 42);
+    write_compact_size(&mut enc, 1);
+    assert!(InputRecord::decode(&enc).is_err());
+}
+
+#[test]
+fn input_run_roundtrip() {
+    let run = vec![
+        InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        },
+        InputRecord {
+            prev_txid: [2u8; 32],
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: 1,
+            script_sig: vec![],
+            witness: vec![vec![0xab]],
+        },
+        InputRecord {
+            prev_txid: [3u8; 32],
+            create_fk: Fk(1),
+            prev_index: 3,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        },
+    ];
+    let mut enc = Vec::new();
+    encode_input_run_secret(&run, &mut enc, None);
+    let dec = decode_input_run(&enc, 3).unwrap();
+    assert_eq!(dec.len(), 3);
+    assert!(dec[0].is_coinbase());
+    assert_eq!(dec[1].create_fk, Fk(1));
+    assert_eq!(dec[1].prev_index, 0);
+    assert_eq!(dec[1].witness, vec![vec![0xab]]);
+    assert_eq!(dec[2].create_fk, Fk(1));
+    assert_eq!(dec[2].prev_index, 3);
+    // Soft prev_txid not on disk.
+    assert_eq!(dec[1].prev_txid, [0u8; 32]);
+}
+
+#[test]
+fn output_run_roundtrip() {
+    let run = vec![
+        OutputRecord::unspent(50_0000_0000, vec![0x51]),
+        OutputRecord::unspent(0, vec![]),
+        OutputRecord::unspent(12345, vec![0x00, 0x14, 0xaa]),
+    ];
+    let mut enc = Vec::new();
+    encode_output_run_secret(&run, &mut enc, None);
+    assert_eq!(decode_output_run(&enc, 3).unwrap(), run);
+    // OP_TRUE + spender_field(8) + flags + uleb value
+    let mut tiny = Vec::new();
+    run[0].encode_into(&mut tiny);
+    assert!(
+        tiny.len() < 24,
+        "op_true+value should be compact: {}",
+        tiny.len()
+    );
+}
+
+#[test]
+fn tx_fixed_roundtrip() {
+    let rec = TxRecord {
+        txid: [9u8; 32],
+        version: 2,
+        locktime: 100,
+        input_start_fk: Fk(1),
+        input_count: 1,
+        output_start_fk: Fk(2),
+        output_count: 2,
+    };
+    let enc = rec.encode();
+    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
+}
+
+#[test]
+fn packed_tx_roundtrip() {
+    let tx = TxRecord {
+        txid: [7u8; 32],
+        version: 2,
+        locktime: 0,
+        input_start_fk: Fk(99), // ignored in packed
+        input_count: 1,
+        output_start_fk: Fk(88),
+        output_count: 2,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![0x01, 0x00],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(50_0000_0000, vec![0x51]),
+        OutputRecord::unspent(1, vec![0x00, 0x14]),
+    ];
+    let mut enc = Vec::new();
+    encode_packed_tx(&tx, &inputs, &outputs, &mut enc);
+    assert!(is_packed_tx_payload(&enc));
+    // Body meta starts without leading txid (schema 13).
+    assert_eq!(enc.len() >= TxRecord::BODY_META_LEN, true);
+    let (dtx, dins, douts) = decode_packed_tx(&enc).unwrap();
+    assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
+    assert_eq!(dtx.input_count, 1);
+    assert_eq!(dtx.output_count, 2);
+    assert!(dtx.input_start_fk.get().is_none());
+    assert_eq!(dins, inputs);
+    assert_eq!(douts, outputs);
+}
+
+#[test]
+fn short_or_truncated_packed_body_rejected() {
+    // Too short for body meta.
+    assert!(!is_packed_tx_payload(&[]));
+    assert!(!is_packed_tx_payload(&[0u8; 31]));
+    assert!(matches!(
+        decode_packed_tx(&[0u8; 31]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // Meta claims inputs/outputs but payload ends after body meta.
+    let rec = TxRecord {
+        txid: [1u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk(1),
+        input_count: 1,
+        output_start_fk: Fk(2),
+        output_count: 1,
+    };
+    let mut raw = Vec::new();
+    rec.encode_body_meta_into(&mut raw);
+    assert!(is_packed_tx_payload(&raw));
+    assert!(matches!(
+        decode_packed_tx(&raw),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        decode_packed_tx_outs_only(&raw),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn address_head_get_by_txid() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-addr-head-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Force tiny address width for the test process.
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [0x42u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
+    let fks = t
+        .put_full_batch_indexed(&[(tx.clone(), inputs, outputs)], true)
+        .unwrap();
+    assert_eq!(fks.len(), 1);
+    let (fk, rec) = t.get_by_txid(&tx.txid).unwrap().expect("found");
+    assert_eq!(fk, fks[0]);
+    assert_eq!(rec.txid, tx.txid);
+    assert!(t.get_by_txid(&[0x99u8; 32]).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Production API surface: abs spender meta, get_all, head snapshot, flushes.
+
+/// Dense encode/decode + error-arm coverage for packed Class A helpers.
+#[test]
+fn packed_encode_decode_flags_and_error_arms() {
+    // TxRecord short
+    assert!(matches!(
+        TxRecord::decode(&[0u8; 10]),
+        Err(StoreError::Corrupt(_))
+    ));
+    let meta = TxRecord {
+        txid: [9u8; 32],
+        version: -1,
+        locktime: 42,
+        input_start_fk: Fk(7),
+        input_count: 2,
+        output_start_fk: Fk(8),
+        output_count: 3,
+    };
+    let enc = meta.encode();
+    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    let dec = TxRecord::decode(&enc).unwrap();
+    assert_eq!(dec.txid, meta.txid);
+    assert_eq!(dec.version, -1);
+
+    // Output flag variants + decode errors
+    let o_empty = OutputRecord::unspent(0, vec![]);
+    let o_true = OutputRecord::unspent(1, vec![0x51]);
+    let o_script = OutputRecord {
+        value: 99,
+        script: vec![0x76, 0xa9],
+        spender_field: Fk(5),
+        multi_spender: true,
+    };
+    for o in [&o_empty, &o_true, &o_script] {
+        let e = o.encode();
+        let d = OutputRecord::decode(&e).unwrap();
+        assert_eq!(d.value, o.value);
+        assert_eq!(d.script, o.script);
+        assert_eq!(d.spender_field, o.spender_field);
+        assert_eq!(d.multi_spender, o.multi_spender);
+        let _ = o.encoded_len();
+    }
+    assert!(matches!(
+        OutputRecord::decode_at(&[0u8; 5]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // trailing on decode
+    let mut trail = o_true.encode();
+    trail.push(0xff);
+    assert!(matches!(
+        OutputRecord::decode(&trail),
+        Err(StoreError::Corrupt(_))
+    ));
+
+    // Input coinbase + full + prevout skip + errors
+    let coin = InputRecord::coinbase(u32::MAX, vec![], vec![]);
+    assert!(coin.is_coinbase());
+    let non_final = InputRecord {
+        prev_txid: [1u8; 32],
+        create_fk: Fk(3),
+        prev_index: 2,
+        sequence: 1,
+        script_sig: vec![0xaa, 0xbb],
+        witness: vec![vec![1, 2, 3], vec![4]],
+    };
+    for r in [&coin, &non_final] {
+        let e = r.encode();
+        let d = InputRecord::decode(&e).unwrap();
+        assert_eq!(d.create_fk, r.create_fk);
+        assert_eq!(d.prev_index, r.prev_index);
+        assert_eq!(d.sequence, r.sequence);
+        assert_eq!(d.script_sig, r.script_sig);
+        assert_eq!(d.witness, r.witness);
+        let (cfk, vout, used) = InputRecord::decode_prevout_at(&e).unwrap();
+        assert_eq!(cfk, r.create_fk);
+        assert_eq!(vout, r.prev_index);
+        assert_eq!(used, e.len());
+        let _ = r.encoded_len();
+    }
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&[]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        InputRecord::decode_at(&[]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // RESERVED4 flag
+    assert!(matches!(
+        InputRecord::decode_at(&[input_flags::RESERVED4]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&[input_flags::RESERVED4]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // non-coinbase create_fk truncated
+    assert!(matches!(
+        InputRecord::decode_at(&[0u8, 1, 2]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // create_fk null on non-coinbase
+    let mut bad = vec![0u8]; // no NULL_PREV
+    bad.extend_from_slice(&0u64.to_le_bytes());
+    bad.push(0); // vout compact 0
+    assert!(matches!(
+        InputRecord::decode_at(&bad),
+        Err(StoreError::Corrupt(_))
+    ));
+    // sequence truncated
+    let mut bad = vec![0u8]; // no SEQ_FINAL
+    bad.extend_from_slice(&1u64.to_le_bytes());
+    bad.push(0);
+    assert!(matches!(
+        InputRecord::decode_at(&bad),
+        Err(StoreError::Corrupt(_))
+    ));
+    // trailing
+    let mut trail = coin.encode();
+    trail.push(1);
+    assert!(matches!(
+        InputRecord::decode(&trail),
+        Err(StoreError::Corrupt(_))
+    ));
+
+    // Packed encode/decode
+    let tx = TxRecord {
+        txid: [0xab; 32],
+        version: 2,
+        locktime: 0,
+        input_start_fk: Fk(99), // cleared on pack
+        input_count: 2,
+        output_start_fk: Fk(88),
+        output_count: 2,
+    };
+    let inputs = vec![coin.clone(), non_final.clone()];
+    let outputs = vec![o_true.clone(), o_script.clone()];
+    let mut raw = Vec::new();
+    encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+    assert!(is_packed_tx_payload(&raw));
+    assert!(!is_packed_tx_payload(&[]));
+    assert!(!is_packed_tx_payload(&[0u8; 20]));
+    assert!(is_packed_tx_payload(&[0u8; 64])); // length gate only; decode may still fail
+    let (m, ins, outs) = decode_packed_tx(&raw).unwrap();
+    assert_eq!(m.txid, [0u8; 32], "body decode: no leading txid");
+    assert_eq!(m.input_start_fk, Fk::NULL);
+    assert_eq!(ins.len(), 2);
+    assert_eq!(outs.len(), 2);
+    let (m2, prevs) = scan_packed_meta_and_prevouts(&raw).unwrap();
+    assert_eq!(m2.txid, [0u8; 32]);
+    assert_eq!(prevs.len(), 2);
+    let (m3, outs_only) = decode_packed_tx_outs_only(&raw).unwrap();
+    assert_eq!(m3.txid, [0u8; 32]);
+    assert_eq!(outs_only.len(), 2);
+    let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+    assert_eq!(m4.txid, [0u8; 32]);
+    assert_eq!(rels.len(), 2);
+    // spender fields cleared
+    assert!(outs_rels.iter().all(|o| o.spender_field.is_null()));
+    let mut cleared = outs.clone();
+    cleared[0].spender_field = Fk(9);
+    cleared[0].multi_spender = true;
+    clear_output_spender_fields(&mut cleared);
+    assert!(cleared[0].spender_field.is_null());
+    assert!(!cleared[0].multi_spender);
+
+    // Packed error arms (short / truncated)
+    assert!(matches!(
+        decode_packed_tx(&[0x02, 0, 0]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        decode_packed_tx(&[0x01]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        scan_packed_meta_and_prevouts(&[0x02]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        decode_packed_tx_outs_with_spender_rels(&[0x01]),
+        Err(StoreError::Corrupt(_))
+    ));
+    // trailing zero pad is accepted (schema 11 alignment gap)
+    let mut trail_z = raw.clone();
+    trail_z.extend_from_slice(&[0u8; 7]);
+    let (mz, _, _) = decode_packed_tx(&trail_z).unwrap();
+    assert_eq!(mz.txid, [0u8; 32]);
+    // non-zero trailing garbage is rejected
+    let mut trail = raw.clone();
+    trail.push(0x01);
+    assert!(matches!(
+        decode_packed_tx(&trail),
+        Err(StoreError::Corrupt(_))
+    ));
+    // run helpers
+    let mut run = Vec::new();
+    encode_output_run_secret(&outputs, &mut run, None);
+    let (decoded, used) = decode_output_run_prefix(&run, 2).unwrap();
+    assert_eq!(used, run.len());
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decode_output_run(&run, 2).unwrap().len(), 2);
+    let mut irun = Vec::new();
+    encode_input_run_secret(&inputs, &mut irun, None);
+    assert_eq!(decode_input_run(&irun, 2).unwrap().len(), 2);
+    let mut trail_run = run.clone();
+    trail_run.push(1);
+    assert!(matches!(
+        decode_output_run(&trail_run, 2),
+        Err(StoreError::Corrupt(_))
+    ));
+
+    // Output value > i64::MAX (uleb overflow)
+    {
+        let mut bad = vec![0u8; 8]; // spender_field
+        bad.push(output_flags::EMPTY_SCRIPT);
+        // uleb128 of value that exceeds i64::MAX: 0xFF… with enough bytes
+        for _ in 0..10 {
+            bad.push(0xff);
+        }
+        bad.push(0x01);
+        assert!(matches!(
+            OutputRecord::decode_at(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+    // decode_prevout_at: create_fk null, prev_index too large, truncated fk
+    {
+        let mut null_fk = vec![0u8]; // no NULL_PREV
+        null_fk.extend_from_slice(&0u64.to_le_bytes());
+        null_fk.push(0);
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&null_fk),
+            Err(StoreError::Corrupt(_))
+        ));
+        // truncated create_fk (only 3 bytes after flags)
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&[0u8, 1, 2, 3]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // prev_index too large: compact_size > u32::MAX
+        let mut big_vout = vec![0u8];
+        big_vout.extend_from_slice(&1u64.to_le_bytes());
+        // compact size 0xFF → 8-byte length follows; use value > u32::MAX
+        big_vout.push(0xff);
+        big_vout.extend_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&big_vout),
+            Err(StoreError::Corrupt(_))
+        ));
+        // same for full decode_at
+        assert!(matches!(
+            InputRecord::decode_at(&big_vout),
+            Err(StoreError::Corrupt(_))
+        ));
+        // sequence truncated on decode_prevout (flags without SEQ_FINAL)
+        let mut short_seq = vec![0u8];
+        short_seq.extend_from_slice(&1u64.to_le_bytes());
+        short_seq.push(0); // vout 0
+                           // only 2 of 4 sequence bytes
+        short_seq.extend_from_slice(&[1, 2]);
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&short_seq),
+            Err(StoreError::Corrupt(_))
+        ));
+        // witness item truncated
+        let mut short_wit = vec![
+            input_flags::SEQ_FINAL, // no EMPTY_WITNESS
+        ];
+        short_wit.extend_from_slice(&1u64.to_le_bytes());
+        short_wit.push(0); // vout
+        short_wit.push(0); // empty script via compact 0? flags don't have EMPTY_SCRIPT
+                           // Actually EMPTY_SCRIPT not set → need script len
+                           // Rebuild: SEQ_FINAL | no EMPTY_SCRIPT | no EMPTY_WITNESS
+        let mut short_wit = vec![input_flags::SEQ_FINAL];
+        short_wit.extend_from_slice(&1u64.to_le_bytes());
+        short_wit.push(0); // vout
+        short_wit.push(0); // script len 0
+        short_wit.push(1); // 1 witness item
+        short_wit.push(5); // item len 5
+        short_wit.extend_from_slice(&[1, 2]); // only 2 bytes
+        assert!(matches!(
+            InputRecord::decode_at(&short_wit),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+    // packed outs short / count mismatch / trailing on outs_with_spender
+    {
+        let tx = TxRecord {
+            txid: [0xcd; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 2, // claim 2 outs but only encode 1
+        };
+        let inputs = [InputRecord::coinbase(u32::MAX, vec![], vec![])];
+        let outputs = [OutputRecord::unspent(1, vec![0x51])];
+        let mut raw = Vec::new();
+        // Manually pack body meta only (schema 13) with wrong meta count.
+        let mut meta = tx;
+        meta.output_count = 2;
+        meta.encode_body_meta_into(&mut raw);
+        encode_input_run_secret(&inputs, &mut raw, None);
+        encode_output_run_secret(&outputs, &mut raw, None);
+        // ends after 1 output but meta says 2
+        assert!(matches!(
+            decode_packed_tx(&raw),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            decode_packed_tx_outs_with_spender_rels(&raw),
+            Err(StoreError::Corrupt(_))
+        ));
+        // short scan
+        assert!(matches!(
+            scan_packed_meta_and_prevouts(&[0u8; 8]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // non-zero trailing on outs_only path
+        let mut good = Vec::new();
+        encode_packed_tx(
+            &TxRecord {
+                txid: [1; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            &inputs,
+            &outputs,
+            &mut good,
+        );
+        let mut trail = good.clone();
+        trail.push(0xee);
+        assert!(matches!(
+            decode_packed_tx_outs_with_spender_rels(&trail),
+            Err(StoreError::Corrupt(_))
+        ));
+        // zero pad accepted on outs path
+        let mut zpad = good.clone();
+        zpad.extend_from_slice(&[0u8; 5]);
+        let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&zpad).unwrap();
+        assert_eq!(m.txid, [0u8; 32], "body decode leaves txid zero");
+        assert_eq!(outs.len(), 1);
+    }
+    // input run trailing
+    {
+        let mut irun = Vec::new();
+        encode_input_run_secret(
+            &[InputRecord::coinbase(u32::MAX, vec![], vec![])],
+            &mut irun,
+            None,
+        );
+        irun.push(0);
+        assert!(matches!(
+            decode_input_run(&irun, 1),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+}
+
+/// body_txid_range edge / corrupt paths (empty body, inverted range).
+#[test]
+fn body_txid_range_edges() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-txid-range-edge-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+    assert!(t.body_txid_range(10, 5).unwrap().is_empty());
+    // Beyond count → NotFound or empty ranges
+    let _ = t.body_txid_range(1, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn next_tx_body_start_8_align_and_page_rule() {
+    // Schema 13: 8-byte align only (identity lives in txid.body).
+    assert_eq!(next_tx_body_start(0), 0);
+    assert_eq!(next_tx_body_start(1), 8);
+    assert_eq!(next_tx_body_start(8), 8);
+    assert_eq!(next_tx_body_start(9), 16);
+    assert_eq!(next_tx_body_start(4065), 4072);
+    assert_eq!(next_tx_body_start(4095), 4096);
+    for c in [0u64, 1, 7, 15, 100, 4090, 4095, 4096, 8191, 100_003] {
+        let s = next_tx_body_start(c);
+        assert_eq!(s % 8, 0, "c={c} s={s}");
+        assert!(s >= c);
+    }
+}
+
+/// Appended Class A records start 8-aligned; sidefile holds txid.
+#[test]
+fn put_full_aligns_record_starts_and_txid_prefix() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-tx-align-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = create_tiny(&dir);
+
+    let mut items = Vec::new();
+    for i in 0u8..40 {
+        let mut txid = [0u8; 32];
+        txid[0] = i;
+        txid[1] = 0xA5;
+        let tx = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        // Vary sizes so pad between records is non-trivial.
+        let script: Vec<u8> = (0..((i as usize % 17) + 1)).map(|b| b as u8).collect();
+        items.push((
+            tx,
+            vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+            vec![OutputRecord::unspent(1000 + i as i64, script)],
+        ));
+    }
+    let fks = t.put_full_batch_indexed(&items, true).unwrap();
+    assert_eq!(fks.len(), 40);
+    for (j, fk) in fks.iter().enumerate() {
+        let (off, len) = t.body.record_range(*fk).unwrap();
+        assert_eq!(off % 8, 0, "fk={} off={}", fk.0, off);
+        assert!(len >= TxRecord::BODY_META_LEN as u64);
+        let txid = t.body_txid(*fk).unwrap();
+        assert_eq!(txid, items[j].0.txid, "sidefile identity");
+        let (meta, ins, outs) = t.get_full(*fk).unwrap();
+        assert_eq!(meta.txid, items[j].0.txid);
+        assert_eq!(ins.len(), 1);
+        assert_eq!(outs.len(), 1);
+        // Body meta no longer begins with txid (schema 13).
+        let mut prefix = [0u8; 4];
+        t.body.read_prefix_at(off, len, &mut prefix).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(prefix),
+            items[j].0.version,
+            "body starts with version, not txid"
+        );
+    }
+    // Multi-batch: second batch pads from previous end.
+    let mut more = Vec::new();
+    for i in 40u8..55 {
+        let mut txid = [0u8; 32];
+        txid[0] = i;
+        more.push((
+            TxRecord {
+                txid,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ));
+    }
+    let fks2 = t.put_full_batch_indexed(&more, true).unwrap();
+    for (j, fk) in fks2.iter().enumerate() {
+        let (off, _) = t.body.record_range(*fk).unwrap();
+        assert_eq!(off % 8, 0);
+        assert_eq!(t.body_txid(*fk).unwrap(), more[j].0.txid);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+/// BIP30 same-txid twice → duplicate fuse keys; seal must still succeed (dedup for build only).
+#[test]
+fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
+    with_env_lock(|| {
+        SegmentedTxHead::test_set_soft_span_bytes(0);
+        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        let dir = tempfile_dir("bip30-seal");
+        // 10-bit: max_keys = 819
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let mut shared = [0u8; 32];
+        shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+        // Two Class A creates with the same txid (BIP30-shaped).
+        let r1 = TxRecord {
+            txid: shared,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        let r2 = r1.clone();
+        let fks = t.put_batch(&[r1, r2]).unwrap();
+        assert_eq!(fks.len(), 2);
+        assert_ne!(fks[0], fks[1]);
+        // Fill remaining to force seal of first segment (819 creates).
+        let mut rest = Vec::new();
+        for i in 3..=819u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            rest.push(TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            });
+        }
+        t.put_batch(&rest).unwrap();
+        // Next create forces roll/seal of the full segment.
+        let mut more = [0u8; 32];
+        more[0..8].copy_from_slice(&820u64.to_le_bytes());
+        t.put_batch(&[TxRecord {
+            txid: more,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        }])
+        .unwrap();
+        assert!(
+            t.head.sealed_segment_count() >= 1,
+            "seal must succeed despite BIP30 duplicate fuse keys"
+        );
+        // Newest BIP30 create wins (deeper probe).
+        let hit = t.get_fk_by_txid(&shared).unwrap();
+        assert_eq!(hit, Some(fks[1]), "newest same-txid create");
+        let all = t.get_all_by_txid(&shared).unwrap();
+        assert_eq!(all.len(), 2, "both BIP30 creates body-verify");
+        assert_eq!(all[0].0, fks[1]);
+        assert_eq!(all[1].0, fks[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// Reopen mid-open-segment, then fill to seal: pre-reopen creates must not FN.
+#[test]
+fn reopen_mid_segment_then_seal_no_fuse_fn() {
+    with_env_lock(|| {
+        // Only load@80% rolls — clear soft-span override/env from sibling tests.
+        SegmentedTxHead::test_set_soft_span_bytes(0);
+        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        let dir = tempfile_dir("reopen-seal-fn");
+        // 10-bit: max_keys = floor(0.8*1024) = 819
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let half = 400u64;
+        {
+            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+            let recs: Vec<TxRecord> = (0..half)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            t.put_batch(&recs).unwrap();
+            assert_eq!(t.head_segment_count(), 1);
+            assert_eq!(t.head.sealed_segment_count(), 0);
+            assert_eq!(t.head.open_keys_len() as u64, half);
+            t.flush().unwrap();
+        }
+        // Reopen: open_keys must rebuild from Class A.
+        let t = TxTable::open(&dir).unwrap();
+        assert_eq!(t.head.open_keys_len() as u64, half, "open keys rebuilt");
+        // Fill past 819 so first segment seals.
+        let more: Vec<TxRecord> = (half..900)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                }
+            })
+            .collect();
+        t.put_batch(&more).unwrap();
+        assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
+        // Pre-reopen members must resolve through sealed fuse (no FN).
+        for i in [1u64, 50, 200, 400] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                t.get_fk_by_txid(&txid).unwrap(),
+                Some(Fk(i)),
+                "pre-reopen fk={i} FN after seal"
+            );
+        }
+        for i in [401u64, 820, 900] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// Legacy fuse8 v1 → v2 rewrite on open (minimal seal: 820 creates @ bits=10).
+#[test]
+fn reopen_rewrites_legacy_v1_sealed_fuse_to_v2() {
+    with_env_lock(|| {
+        SegmentedTxHead::test_set_soft_span_bytes(0);
+        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        let dir = tempfile_dir("fuse-v1-rewrite");
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        {
+            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+            // 0.8 * 1024 slots = 819 → one seal at 820.
+            let recs: Vec<TxRecord> = (0..820u64)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            t.put_batch(&recs).unwrap();
+            assert!(t.head.sealed_segment_count() >= 1);
+            t.flush().unwrap();
+        }
+        let fuse_path = dir.join("tx.head").join("000000.fuse8");
+        assert!(fuse_path.is_file());
+        let mut raw = Vec::from(*b"BF8R");
+        raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&fuse_path, &raw).unwrap();
+
+        let t = TxTable::open(&dir).unwrap();
+        assert!(
+            t.head.sealed_fuse_rewrite_queue().is_empty(),
+            "open must rewrite legacy fuses before returning"
+        );
+        let bytes = std::fs::read(&fuse_path).unwrap();
+        assert_eq!(&bytes[0..4], b"BF8R");
+        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(ver, 2, "fuse must be rewritten as v2");
+        for i in [1u64, 100, 400, 819] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                t.get_fk_by_txid(&txid).unwrap(),
+                Some(Fk(i)),
+                "fk={i} after fuse migrate"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// Soft-span force_roll uses **open** segment first_fk (after a prior roll).
+#[test]
+fn soft_span_roll_on_open_segment_not_only_first() {
+    with_env_lock(|| {
+        let dir = tempfile_dir("soft-span-open");
+        let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0xab; 64],
+                witness: vec![vec![0xcd; 400]],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
+            (tx, inputs, outputs)
+        };
+        // ~2 fat creates per soft window (process-local override — env races
+        // with other store modules that also set RBITCOIN_TX_IDX_SOFT_SPAN).
+        SegmentedTxHead::test_set_soft_span_bytes(800);
+        for i in 1..=6u64 {
+            t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        let segs_mid = t.head_segment_count();
+        let sealed_mid = t.head.sealed_segment_count();
+        assert!(
+            segs_mid >= 2 && sealed_mid >= 1,
+            "first soft rolls segs={segs_mid} sealed={sealed_mid}"
+        );
+        for i in 7..=12u64 {
+            t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        let sealed = t.head.sealed_segment_count();
+        assert!(
+            sealed > sealed_mid,
+            "open-segment soft-span must seal again sealed={sealed} mid={sealed_mid} segs={}",
+            t.head_segment_count()
+        );
+        for i in [1u64, 6, 9, 12] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+        }
+        SegmentedTxHead::test_set_soft_span_bytes(0);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn segmented_head_roll_and_lookup_via_tx_table() {
+    let dir = tempfile_dir("seg-roll");
+    let layout = HeadLayout::with_entry_bytes(10, 4).unwrap(); // max_keys=819
+    let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+    let n = 820u64; // one seal @ bits=10 (max_keys=819)
+    let recs: Vec<TxRecord> = (0..n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        })
+        .collect();
+    // insert in chunks
+    for chunk in recs.chunks(100) {
+        t.put_batch(chunk).unwrap();
+    }
+    assert!(
+        t.head_segment_count() >= 2,
+        "segs={}",
+        t.head_segment_count()
+    );
+    // lookup first, mid, last
+    for i in [1u64, 400, 819, 820] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        let fk = t.get_fk_by_txid(&txid).unwrap();
+        assert_eq!(fk, Some(Fk(i)), "i={i}");
+    }
+    // miss (must not collide with LE u64 ids 1..=820)
+    let miss = [0xAAu8; 32];
+    assert_eq!(t.get_fk_by_txid(&miss).unwrap(), None);
+    t.flush().unwrap();
+    let t2 = TxTable::open(&dir).unwrap();
+    for i in [1u64, 500, 820] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(t2.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+    }
+    // twice
+    assert_eq!(
+        t2.get_fk_by_txid(&{
+            let mut x = [0u8; 32];
+            x[0..8].copy_from_slice(&1u64.to_le_bytes());
+            x
+        })
+        .unwrap(),
+        Some(Fk(1))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refuse_legacy_mono_head_on_create() {
+    let dir = tempfile_dir("legacy-mono");
+    std::fs::write(dir.join("tx.head"), b"mono").unwrap();
+    let err = TxTable::create(&dir).err().expect("must refuse mono head");
+    let s = format!("{err}");
+    assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

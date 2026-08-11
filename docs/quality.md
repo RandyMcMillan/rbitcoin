@@ -124,7 +124,7 @@ MSRV drift, etc.).
 |--------|-------|
 | First-party Rust LOC (`crates/**/*.rs`) | **~121k** |
 | Workspace crates | **14** |
-| Largest source files (lines) | `confirm_run` **5336**, `tx_table` **4689**, `block` **4186**, `ibd/events` **3421**, `query/lib` **3314**, `scripthash` **3110**, `scenarios` **2701**, `ibd/confirm` **2668**, `script/interpreter` **2592** |
+| Largest source files (lines) | `block` **4186**, `confirm_run/mod` **~3530** (tests peeled), `query/lib` **3314**, `scripthash` **3110**, `scenarios` **2701**, `ibd/confirm` **2668**, `script/interpreter` **2592**, `tx_table/mod` **~2470** (tests peeled), `ibd/events/mod` **~970** (tests peeled) |
 | `#[test]` / `#[tokio::test]` count | **~1.1k** |
 | Coverage gate | **≥90%** first-party LCOV (`LH`/`LF`) — required CI (last local run ~90.1% class) |
 | CI jobs (required-style) | **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`** (+ CodeQL workflow) |
@@ -248,7 +248,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Was | Resolution |
 |-----|------------|
 | Store `allow(dead_code)` hotspots | **Fixed (Q-12)** — live APIs unsilenced; test-only surfaces under `#[cfg(test)]` (`bulk_io` RMW, `address_head` insert fields/`read_entry`, `file` load_u*, `UringSession::new`) |
-| (open) god-files / long fns | **In progress** — Q-10/Q-11 remain |
+| (open) god-files / long fns | **In progress (Q-10a peels)** — tests peeled from `ibd/events`, `confirm_run`, `tx_table`; production stage splits (Q-10/Q-11) remain |
 
 ### Product surface growth (post-audit)
 

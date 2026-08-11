@@ -2678,7 +2678,7 @@ fn unified_wire_pipeline_rejects_double_spend() {
 fn unified_wire_prep_source_has_no_wire_rebuild() {
     let src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../rbitcoin-consensus/src/confirm_run.rs"
+        "/../rbitcoin-consensus/src/confirm_run/mod.rs"
     ));
     // confirm_wire_load_phase body must not invoke wire_rebuild.
     let start = src

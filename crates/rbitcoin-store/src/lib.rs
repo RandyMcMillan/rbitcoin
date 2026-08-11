@@ -21,6 +21,7 @@ mod head_resolve_denserels;
 pub mod head_resolve_stats;
 mod header_table;
 mod ibd_io_policy;
+mod integrity;
 mod idx_body_pipeline;
 mod int_map;
 mod io_backend;
@@ -67,6 +68,7 @@ pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
+pub use integrity::{merkle_root_from_txids, TipRevalidateReport, VERIFY_TIP_BLOCKS};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use io_backend::{

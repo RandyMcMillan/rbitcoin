@@ -1008,6 +1008,21 @@ impl Query {
                 "rbitcoin: repaired {repaired} Class C tx rows above confirmed tip (partial confirm / kill -9)"
             );
         }
+        // Core checkblocks-style tip window (structure + Class A merkle) before
+        // any P2P tip extension. Shrinks tip / clears bad bodies on failure.
+        let reval = store.revalidate_tip_window()?;
+        if !reval.is_clean() {
+            eprintln!(
+                "rbitcoin: tip revalidate tip_before={:?} tip_after={:?} first_bad={:?} reason={:?} \
+                 bodies_cleared={} shrunk={}",
+                reval.tip_before,
+                reval.tip_after,
+                reval.first_bad_height,
+                reval.first_bad_reason,
+                reval.bodies_cleared,
+                reval.tip_shrunk
+            );
+        }
         let store_path = store.path().to_path_buf();
         // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
         let sh_through = store.tip_height().map(|h| h.0 as u64).unwrap_or(u64::MAX);

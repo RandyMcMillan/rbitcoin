@@ -8,9 +8,7 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{
-    AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin, UtxoProvider,
-};
+use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin, UtxoProvider};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
@@ -485,9 +483,7 @@ impl MempoolHub {
         let Some(mut rate) = g.graph.frontier_feerate_sat_per_kvb(target_wu) else {
             // Empty: optional confirm-memory floor.
             drop(g);
-            return self
-                .confirm_memory_floor_btc_per_kb()
-                .unwrap_or(-1.0);
+            return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
         };
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         rate = rate.max(min_r);
@@ -503,14 +499,7 @@ impl MempoolHub {
         g.graph
             .mining_chunks_best_first()
             .into_iter()
-            .map(|c| {
-                (
-                    c.fee_rate_sat_per_kvb(),
-                    c.weight,
-                    c.fee_sat,
-                    c.txids.len(),
-                )
-            })
+            .map(|c| (c.fee_rate_sat_per_kvb(), c.weight, c.fee_sat, c.txids.len()))
             .collect()
     }
 
@@ -540,9 +529,7 @@ impl MempoolHub {
         // Median of samples (practical floor).
         let mut v: Vec<u64> = mem.iter().copied().collect();
         v.sort_unstable();
-        Some(v[v.len() / 2].max(
-            rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
-        ))
+        Some(v[v.len() / 2].max(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB))
     }
 
     fn confirm_memory_floor_btc_per_kb(&self) -> Option<f64> {

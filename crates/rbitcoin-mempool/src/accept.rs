@@ -967,10 +967,7 @@ mod tests {
         };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
-        assert!(
-            matches!(err, AcceptError::InputsDuplicate),
-            "got {err}"
-        );
+        assert!(matches!(err, AcceptError::InputsDuplicate), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1029,10 +1026,7 @@ mod tests {
         };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
-        assert!(
-            matches!(err, AcceptError::ImmatureCoinbase),
-            "got {err}"
-        );
+        assert!(matches!(err, AcceptError::ImmatureCoinbase), "got {err}");
         let tip2 = ChainTipCtx {
             height: 149,
             mtp: u32::MAX,
@@ -1055,10 +1049,15 @@ mod tests {
             map: HashMap::new(), // spent or unknown → no coin
         };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp.accept_tx(&tx, &utxos, TIP_OK).expect_err("must not admit");
+        let err = mp
+            .accept_tx(&tx, &utxos, TIP_OK)
+            .expect_err("must not admit");
         // Orphanage parks missing parents; empty map → orphaned or missing.
         assert!(
-            matches!(err, AcceptError::Orphaned(_) | AcceptError::MissingPrevout(_)),
+            matches!(
+                err,
+                AcceptError::Orphaned(_) | AcceptError::MissingPrevout(_)
+            ),
             "got {err}"
         );
         assert_eq!(mp.live_count(), 0);
@@ -1242,7 +1241,9 @@ mod tests {
         assert_eq!(c.members.len(), 2);
         // Wrong order rejected.
         let mut mp2 = ActiveMempool::open_or_create(tmp_dir()).unwrap();
-        let err = mp2.accept_package(&[child, parent], &utxos, TIP_OK).unwrap_err();
+        let err = mp2
+            .accept_package(&[child, parent], &utxos, TIP_OK)
+            .unwrap_err();
         assert!(matches!(err, AcceptError::PackageNotTopo));
         let _ = std::fs::remove_dir_all(&dir);
     }

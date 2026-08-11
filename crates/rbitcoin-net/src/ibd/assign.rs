@@ -23,7 +23,7 @@ use super::{
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -499,9 +499,42 @@ fn demote_zombie_pending_for_fetch(
 
 /// Tip-hole getdata older than this with no claimable wire is cleared and re-issued
 /// (mainnet freeze: inflight stuck, soft frozen, hole=1 forever).
-const TIP_HOLE_INFLIGHT_STALE: Duration = Duration::from_secs(20);
+///
+/// Short on purpose: confirm claim waits ~5s per tick while tip is blocked; 20s
+/// left the same slow race set holding hole=1 while densify progressed.
+const TIP_HOLE_INFLIGHT_STALE: Duration = Duration::from_secs(6);
 
-/// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
+/// Rank alive peer ids for tip-hole getdata: prefer peers not in `avoid`, then
+/// higher live `speed_sample` bps, then lower id. Unsampled peers sort last
+/// among non-avoided (bps=0).
+pub(crate) fn rank_tip_hole_peers(
+    slots: &[PeerSlot],
+    alive: &[usize],
+    avoid: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    let mut ranked: Vec<usize> = alive.to_vec();
+    ranked.sort_by(|&a, &b| {
+        let avoided_a = avoid.contains(&a) as u8;
+        let avoided_b = avoid.contains(&b) as u8;
+        avoided_a.cmp(&avoided_b).then_with(|| {
+            let bps = |pid: usize| -> u64 {
+                slots
+                    .iter()
+                    .find(|s| s.id == pid && s.alive)
+                    .and_then(|s| s.speed_sample())
+                    .map(|(_, bps)| bps)
+                    .unwrap_or(0)
+            };
+            bps(b).cmp(&bps(a)).then_with(|| a.cmp(&b))
+        })
+    });
+    ranked
+}
+
+/// Cover each tip-hole hash with multi-peer getdata, preferring faster peers.
+///
+/// Stale tip-batch inflight is cleared after [`TIP_HOLE_INFLIGHT_STALE`] and
+/// re-raced, preferring peers that were **not** in the cleared set.
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -513,7 +546,6 @@ pub(crate) fn cover_tip_holes(
         return 0;
     }
     let mut issued = 0u64;
-    let mut peer_i = st.assign_rot;
     let now = Instant::now();
 
     for &h in holes {
@@ -539,8 +571,11 @@ pub(crate) fn cover_tip_holes(
         }
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
         // Stale tip-hole inflight with no wire → clear and re-race (frozen inflight).
+        // Prefer not immediately reusing the same peer set when alternatives exist.
+        let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
             if now.duration_since(req.started_at) >= TIP_HOLE_INFLIGHT_STALE {
+                avoid = req.peers.clone();
                 clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
                 st.body.mark_missing(h);
             }
@@ -556,12 +591,12 @@ pub(crate) fn cover_tip_holes(
         }
         let mut need = want - already;
         let mut placed_any = false;
-        for _ in 0..alive.len() {
+        // Prefer non-avoided (re-race) then higher bps; avoid peers still last-resort.
+        let ranked = rank_tip_hole_peers(&st.slots, alive, &avoid);
+        for &pid in &ranked {
             if need == 0 {
                 break;
             }
-            let pid = alive[peer_i % alive.len()];
-            peer_i += 1;
             let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
                 continue;
             };
@@ -873,7 +908,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Stale tip-hole inflight (≥20s) with no claimable wire must clear and re-race.
+    /// Stale tip-hole inflight (≥6s) with no claimable wire must clear and re-race.
     /// Mainnet freeze: hole=1, inflight stuck forever, soft frozen, conf=0.
     #[test]
     fn cover_tip_holes_re_races_stale_inflight() {
@@ -891,19 +926,36 @@ mod tests {
         st.record_height(hole, ht);
         st.height_to_hash.insert(ht, hole);
         st.body.mark_missing(hole);
-        // Frozen inflight from a prior race that never delivered wire.
+        // Fresh inflight (<6s) must not re-race yet.
+        let mut fresh = InflightReq::new(0);
+        fresh.started_at = Instant::now() - Duration::from_secs(3);
+        st.inflight.insert(hole, fresh);
+        st.slots[0].in_flight.insert(hole);
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert_eq!(holes, vec![hole]);
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let issued_fresh = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        // Still at want peers (race fills), but started_at not cleared as stale.
+        let age_fresh = Instant::now().duration_since(st.inflight[&hole].started_at);
+        assert!(
+            age_fresh >= Duration::from_secs(2),
+            "fresh inflight must keep original started_at; age={age_fresh:?} issued={issued_fresh}"
+        );
+
+        // Frozen inflight from a prior race that never delivered wire (≥6s).
+        st.inflight.clear();
+        for s in st.slots.iter_mut() {
+            s.in_flight.clear();
+        }
         let mut frozen = InflightReq::new(0);
-        frozen.started_at = Instant::now() - Duration::from_secs(30);
+        frozen.started_at = Instant::now() - Duration::from_secs(7);
         st.inflight.insert(hole, frozen);
         st.slots[0].in_flight.insert(hole);
         assert!(
             !super::super::progress::claim_ready(&hub, &mut st.body, ht, &hole),
             "no wire → not claim-ready"
         );
-        let holes = contiguous_tip_holes(&mut st, &hub, 8);
-        assert_eq!(holes, vec![hole]);
-        let cfg = IbdConfig::for_test();
-        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
         let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
         assert!(
             issued >= 1,
@@ -913,11 +965,103 @@ mod tests {
             st.inflight.contains_key(&hole),
             "hash remains inflight after re-race"
         );
-        // Fresh started_at (not still the 30s-old stamp).
+        // Fresh started_at (not still the 7s-old stamp).
         let age = Instant::now().duration_since(st.inflight[&hole].started_at);
         assert!(
-            age < Duration::from_secs(5),
+            age < Duration::from_secs(2),
             "re-race must reset started_at; age={age:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tip-hole cover prefers higher speed_sample bps peers first.
+    #[test]
+    fn cover_tip_holes_prefers_fast_peers() {
+        use super::super::peer_io::ibd_mono_ms;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(0x61);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.record_height(hole, ht);
+        st.height_to_hash.insert(ht, hole);
+        st.body.mark_missing(hole);
+
+        // Peer 0 slow, peer 1 fast, peer 2 medium — inject lifetime samples.
+        let now = ibd_mono_ms().max(2_000);
+        for (i, bps_equiv_bytes) in [(0usize, 100_000u64), (1, 10_000_000u64), (2, 1_000_000u64)] {
+            st.slots[i].connected_ms = now.saturating_sub(2_000);
+            st.slots[i]
+                .first_data_ms
+                .store(now.saturating_sub(1_000), Ordering::Relaxed);
+            // bytes such that bps ≈ bytes*1000/1000ms = bytes for ~1s elapsed
+            st.slots[i]
+                .bytes_rx
+                .store(bps_equiv_bytes, Ordering::Relaxed);
+        }
+        // Cap want to 2 so only the top two speeds get work if ranking works.
+        // TIP_HOLE_MAX_PEERS is 4 but we only have 3 peers — all may get work.
+        // Assert peer 1 (fastest) is among inflight and peer order: 1 before 0.
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let avoid = HashSet::new();
+        let ranked = rank_tip_hole_peers(&st.slots, &alive, &avoid);
+        assert_eq!(ranked[0], 1, "fastest peer first: ranked={ranked:?}");
+        assert_eq!(ranked[1], 2, "medium second: ranked={ranked:?}");
+        assert_eq!(ranked[2], 0, "slow last: ranked={ranked:?}");
+
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        assert!(issued >= 1, "issued={issued}");
+        let peers = &st.inflight[&hole].peers;
+        assert!(
+            peers.contains(&1),
+            "fast peer must be in tip-hole race; peers={peers:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// After stale clear, re-race prefers peers not in the cleared set.
+    #[test]
+    fn cover_tip_holes_rerace_avoids_prior_peers() {
+        use super::super::state::InflightReq;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            (0..5).map(dummy_slot).collect(),
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(0x71);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.record_height(hole, ht);
+        st.height_to_hash.insert(ht, hole);
+        st.body.mark_missing(hole);
+
+        let mut frozen = InflightReq::new(0);
+        frozen.add_peer(1);
+        frozen.started_at = Instant::now() - Duration::from_secs(7);
+        st.inflight.insert(hole, frozen);
+        st.slots[0].in_flight.insert(hole);
+        st.slots[1].in_flight.insert(hole);
+
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let holes = vec![hole];
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &holes);
+        assert!(issued >= 1, "issued={issued}");
+        let peers = &st.inflight[&hole].peers;
+        // Prefer 2,3,4 over reusing 0,1 first — at least one new peer in race.
+        let new = peers.iter().any(|&p| p >= 2);
+        assert!(
+            new,
+            "re-race should include peers outside cleared set; peers={peers:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

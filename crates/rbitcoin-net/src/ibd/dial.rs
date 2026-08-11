@@ -17,6 +17,180 @@ use std::time::{Duration, Instant};
 /// How long to avoid redialing an address after a stall disconnect.
 pub(crate) const STALL_ADDR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
+// --- Relative-slow disconnect (outliers only; see plan) ---
+
+/// max/min bps within this factor → tight pack, never relative-disconnect.
+pub(crate) const RELATIVE_SLOW_CLUSTER_SPREAD: u64 = 2;
+/// Disconnect only if peer bps ≤ median / this (default 2 → half median).
+pub(crate) const RELATIVE_SLOW_OUTLIER_RATIO: u64 = 2;
+/// Per-peer mature sample age (ms since first block byte).
+pub(crate) const RELATIVE_SLOW_MIN_AGE_MS: u64 = 60_000;
+/// Per-peer mature payload floor for disconnect decisions (tip-rank may use less).
+pub(crate) const RELATIVE_SLOW_MIN_BYTES: u64 = 2 * 1024 * 1024;
+/// Target mature peers before relative rule runs (full IBD peer set).
+pub(crate) const RELATIVE_SLOW_MIN_SAMPLES: usize = 8;
+/// Floor when fewer than 16 alive peers.
+pub(crate) const RELATIVE_SLOW_MIN_SAMPLES_FLOOR: usize = 6;
+/// Global IBD download age before any relative disconnect (ms).
+pub(crate) const RELATIVE_SLOW_GLOBAL_WARMUP_MS: u64 = 60_000;
+
+/// One mature speed sample for relative-slow classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelativeSlowSample {
+    pub peer_id: usize,
+    pub bps: u64,
+    pub has_inflight: bool,
+}
+
+/// Minimum mature samples required given how many peers are alive.
+pub(crate) fn relative_slow_min_samples(alive: usize) -> usize {
+    if alive == 0 {
+        return RELATIVE_SLOW_MIN_SAMPLES;
+    }
+    if alive >= 16 {
+        RELATIVE_SLOW_MIN_SAMPLES
+    } else {
+        let half = alive.div_ceil(2);
+        half.max(RELATIVE_SLOW_MIN_SAMPLES_FLOOR).min(alive)
+    }
+}
+
+/// Median of a non-empty sorted slice (average of two middle when even).
+pub(crate) fn median_u64(sorted: &[u64]) -> u64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        let a = sorted[n / 2 - 1];
+        let b = sorted[n / 2];
+        a.saturating_add(b) / 2
+    }
+}
+
+/// Pure relative-slow pick: at most one peer id that is a clear half-median
+/// outlier with inflight work. Empty when pack is tight, thin, or no outlier.
+///
+/// Gate A: `max_bps <= min_bps * CLUSTER_SPREAD` → none.
+/// Gate B: `bps * OUTLIER_RATIO <= median` and `has_inflight` → worst bps.
+pub(crate) fn relative_slow_pick(
+    samples: &[RelativeSlowSample],
+    min_samples: usize,
+) -> Option<usize> {
+    if samples.len() < min_samples {
+        return None;
+    }
+    let mut bps: Vec<u64> = samples.iter().map(|s| s.bps).collect();
+    bps.sort_unstable();
+    let lo = bps[0];
+    let hi = bps[bps.len() - 1];
+    // Gate A — tight cluster (also when all equal / all zero).
+    if lo == 0 {
+        if hi == 0 {
+            return None;
+        }
+        // Zero bps with positive hi is extreme spread; allow Gate B.
+    } else if hi <= lo.saturating_mul(RELATIVE_SLOW_CLUSTER_SPREAD) {
+        return None;
+    }
+    let med = median_u64(&bps);
+    if med == 0 {
+        return None;
+    }
+    let mut worst: Option<(usize, u64)> = None;
+    for s in samples {
+        if !s.has_inflight {
+            continue;
+        }
+        if s.bps.saturating_mul(RELATIVE_SLOW_OUTLIER_RATIO) > med {
+            continue;
+        }
+        match worst {
+            None => worst = Some((s.peer_id, s.bps)),
+            Some((_, wb)) if s.bps < wb => worst = Some((s.peer_id, s.bps)),
+            Some((wid, wb)) if s.bps == wb && s.peer_id < wid => {
+                worst = Some((s.peer_id, s.bps));
+            }
+            _ => {}
+        }
+    }
+    worst.map(|(id, _)| id)
+}
+
+/// Two-tick hysteresis: first fail marks suspect; second consecutive same id
+/// returns disconnect. Different pick resets mark to the new id.
+pub(crate) fn relative_slow_with_hysteresis(
+    samples: &[RelativeSlowSample],
+    min_samples: usize,
+    prev_suspect: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match relative_slow_pick(samples, min_samples) {
+        Some(id) if prev_suspect == Some(id) => (Some(id), None),
+        Some(id) => (None, Some(id)),
+        None => (None, None),
+    }
+}
+
+/// Build mature relative-slow samples from live slots (age + bytes floors).
+pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSlowSample> {
+    let now = ibd_mono_ms();
+    let mut out = Vec::new();
+    for s in slots {
+        if !s.alive {
+            continue;
+        }
+        let first = s.first_data_ms.load(Ordering::Relaxed);
+        if first == 0 {
+            continue;
+        }
+        if now.saturating_sub(first) < RELATIVE_SLOW_MIN_AGE_MS {
+            continue;
+        }
+        let bytes = s.bytes_rx.load(Ordering::Relaxed);
+        if bytes < RELATIVE_SLOW_MIN_BYTES {
+            continue;
+        }
+        let Some((_, bps)) = s.speed_sample() else {
+            continue;
+        };
+        out.push(RelativeSlowSample {
+            peer_id: s.id,
+            bps,
+            has_inflight: !s.in_flight.is_empty(),
+        });
+    }
+    out
+}
+
+/// Earliest first-data mono ms among alive peers (0 = no download yet).
+pub(crate) fn global_first_block_ms(slots: &[PeerSlot]) -> u64 {
+    let mut min_first = 0u64;
+    for s in slots {
+        if !s.alive {
+            continue;
+        }
+        let first = s.first_data_ms.load(Ordering::Relaxed);
+        if first == 0 {
+            continue;
+        }
+        if min_first == 0 || first < min_first {
+            min_first = first;
+        }
+    }
+    min_first
+}
+
+/// True when IBD has been receiving block bytes long enough for relative rule.
+pub(crate) fn relative_slow_global_warmup_ok(slots: &[PeerSlot]) -> bool {
+    let first = global_first_block_ms(slots);
+    if first == 0 {
+        return false;
+    }
+    ibd_mono_ms().saturating_sub(first) >= RELATIVE_SLOW_GLOBAL_WARMUP_MS
+}
+
 /// Classified dial failure for [`AddrMan`] flag updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialFailKind {
@@ -282,6 +456,63 @@ pub(crate) fn disconnect_stalled_block_peers(
     }
 }
 
+/// Disconnect at most one **clear half-median outlier** (warm-up + cluster gate
+/// + two-tick hysteresis). Updates `suspect` for hysteresis across ticks.
+///
+/// Absolute stall ([`disconnect_stalled_block_peers`]) remains the zero-progress
+/// floor; this only cuts peers that keep making slow progress while the pack is
+/// dramatically faster.
+pub(crate) fn disconnect_relative_slow_block_peers(
+    slots: &mut [PeerSlot],
+    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    now: Instant,
+    suspect: &mut Option<usize>,
+) {
+    if !relative_slow_global_warmup_ok(slots) {
+        *suspect = None;
+        return;
+    }
+    let alive = slots.iter().filter(|s| s.alive).count();
+    let min_samples = relative_slow_min_samples(alive);
+    let samples = mature_relative_slow_samples(slots);
+    if samples.len() < min_samples {
+        *suspect = None;
+        return;
+    }
+    let (kick, next_suspect) = relative_slow_with_hysteresis(&samples, min_samples, *suspect);
+    *suspect = next_suspect;
+    let Some(id) = kick else {
+        return;
+    };
+    let Some(slot) = slots.iter().find(|s| s.id == id && s.alive) else {
+        *suspect = None;
+        return;
+    };
+    let addr = slot.addr;
+    let n_work = slot.in_flight.len();
+    let bps = samples
+        .iter()
+        .find(|s| s.peer_id == id)
+        .map(|s| s.bps)
+        .unwrap_or(0);
+    let mut bps_list: Vec<u64> = samples.iter().map(|s| s.bps).collect();
+    bps_list.sort_unstable();
+    let med = median_u64(&bps_list);
+    let lo = bps_list.first().copied().unwrap_or(0);
+    let hi = bps_list.last().copied().unwrap_or(0);
+    warn!(
+        "ibd: peer[{id}] {addr} relative-slow (bps={bps} med={med} spread={lo}..{hi}, {n_work} in-flight) — disconnect + reassign (cooldown {STALL_ADDR_COOLDOWN:?})"
+    );
+    addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
+    if let Some(s) = slots.iter_mut().find(|s| s.id == id) {
+        let _ = s.cmd_tx.send(PeerCmd::Shutdown);
+        s.task.abort();
+    }
+    release_peer_block_work(slots, inflight, id);
+    *suspect = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +596,126 @@ mod tests {
         expire_addr_cooldown(&mut cooldown, now);
         assert!(cooldown.contains_key(&addr(2)));
         assert!(!cooldown.contains_key(&addr(3)));
+    }
+
+    fn samp(id: usize, bps: u64, inflight: bool) -> RelativeSlowSample {
+        RelativeSlowSample {
+            peer_id: id,
+            bps,
+            has_inflight: inflight,
+        }
+    }
+
+    #[test]
+    fn relative_slow_pick_respects_cluster_and_outlier() {
+        // Thin samples
+        assert_eq!(relative_slow_pick(&[samp(0, 1_000_000, true)], 8), None);
+        // Tight pack — slowest is still in-cluster
+        let tight = [
+            samp(0, 1_000_000, true),
+            samp(1, 1_100_000, true),
+            samp(2, 1_200_000, true),
+            samp(3, 900_000, true),
+            samp(4, 1_050_000, true),
+            samp(5, 1_000_000, true),
+            samp(6, 1_080_000, true),
+            samp(7, 950_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&tight, 8), None);
+
+        // Mild spread, slowest > median/2
+        let mild = [
+            samp(0, 2_000_000, true),
+            samp(1, 1_500_000, true),
+            samp(2, 1_400_000, true),
+            samp(3, 1_100_000, true),
+            samp(4, 1_600_000, true),
+            samp(5, 1_550_000, true),
+            samp(6, 1_450_000, true),
+            samp(7, 1_300_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&mild, 8), None);
+
+        // Clear half-median outlier
+        let outlier = [
+            samp(0, 2_000_000, true),
+            samp(1, 1_900_000, true),
+            samp(2, 1_800_000, true),
+            samp(3, 800_000, true), // ≤ med/2
+            samp(4, 1_850_000, true),
+            samp(5, 1_950_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&outlier, 8), Some(3));
+
+        // Outlier without inflight is not kicked
+        let no_work = [
+            samp(0, 2_000_000, true),
+            samp(1, 1_900_000, true),
+            samp(2, 1_800_000, true),
+            samp(3, 800_000, false),
+            samp(4, 1_850_000, true),
+            samp(5, 1_950_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&no_work, 8), None);
+
+        // Two outliers → worst (lowest bps)
+        let two = [
+            samp(0, 2_000_000, true),
+            samp(1, 1_900_000, true),
+            samp(2, 1_800_000, true),
+            samp(3, 800_000, true),
+            samp(4, 400_000, true),
+            samp(5, 1_950_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&two, 8), Some(4));
+    }
+
+    #[test]
+    fn relative_slow_hysteresis_two_ticks() {
+        let outlier = [
+            samp(0, 2_000_000, true),
+            samp(1, 1_900_000, true),
+            samp(2, 1_800_000, true),
+            samp(3, 800_000, true),
+            samp(4, 1_850_000, true),
+            samp(5, 1_950_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        let (kick0, sus0) = relative_slow_with_hysteresis(&outlier, 8, None);
+        assert_eq!(kick0, None);
+        assert_eq!(sus0, Some(3));
+        let (kick1, sus1) = relative_slow_with_hysteresis(&outlier, 8, sus0);
+        assert_eq!(kick1, Some(3));
+        assert_eq!(sus1, None);
+        // Clear when pack tightens
+        let tight = [
+            samp(0, 1_000_000, true),
+            samp(1, 1_100_000, true),
+            samp(2, 1_200_000, true),
+            samp(3, 900_000, true),
+            samp(4, 1_050_000, true),
+            samp(5, 1_000_000, true),
+            samp(6, 1_080_000, true),
+            samp(7, 950_000, true),
+        ];
+        let (kick2, sus2) = relative_slow_with_hysteresis(&tight, 8, Some(3));
+        assert_eq!(kick2, None);
+        assert_eq!(sus2, None);
+    }
+
+    #[test]
+    fn relative_slow_min_samples_scales() {
+        assert_eq!(relative_slow_min_samples(16), 8);
+        assert_eq!(relative_slow_min_samples(10), 6); // max(6, 5)=6
+        assert_eq!(relative_slow_min_samples(4), 4); // min(alive)
+        assert_eq!(relative_slow_min_samples(8), 6);
     }
 
     #[test]

@@ -38,8 +38,8 @@ use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFe
 
 use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
 use dial::{
-    apply_dial_result, dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers,
-    expire_addr_cooldown, request_headers,
+    apply_dial_result, dial_batch, dial_blocked_addrs, disconnect_relative_slow_block_peers,
+    disconnect_stalled_block_peers, expire_addr_cooldown, request_headers,
 };
 use events::{
     apply_confirm_reject, apply_peer_event, disconnect_all_peers,
@@ -753,6 +753,15 @@ pub async fn ibd_cancellable(
             &mut st.addr_cooldown,
             now,
             cfg.stall,
+        );
+        // Relative-slow outliers (warm-up + cluster gate + hysteresis); absolute
+        // stall above remains the zero-progress floor.
+        disconnect_relative_slow_block_peers(
+            &mut st.slots,
+            &mut st.inflight,
+            &mut st.addr_cooldown,
+            now,
+            &mut st.relative_slow_suspect,
         );
         // Drop dead st.slots so we do not keep ghost rows (Drop aborts IO if needed).
         st.slots.retain(|s| s.alive);

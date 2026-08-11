@@ -106,6 +106,14 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 
 At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
+**Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
+tip+1 to the next claim-ready body. Tip-batch getdata races up to 4 peers
+(preferring faster live rates) and re-races after ~6s without wire. WARN
+`ibd: peer[…] stalled` is absolute zero block progress (~30s). WARN
+`ibd: peer[…] relative-slow (bps= med= spread=…)` disconnects a clear
+half-median outlier only after ~60s warm-up and only when the peer pack is not
+tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
+
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents` / plan-local external parents). No process pin FIFO. Header plans via ConfirmParentCache.
 
 **Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent

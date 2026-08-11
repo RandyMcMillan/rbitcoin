@@ -127,6 +127,8 @@ pub(crate) struct IbdWorkState {
     pub assign_rot: usize,
     /// Stall-disconnect cooldowns (addr → until).
     pub addr_cooldown: HashMap<SocketAddr, Instant>,
+    /// Relative-slow hysteresis: peer id that failed Gate B last hygiene tick.
+    pub relative_slow_suspect: Option<usize>,
     /// Process-local invalid apply marks for most-work reorg (IBD run only).
     pub reorg: IbdReorgState,
     /// Loop turns since last [`Self::hygiene`].
@@ -176,6 +178,7 @@ impl IbdWorkState {
             header_req_seq: 0,
             assign_rot: 0,
             addr_cooldown: HashMap::new(),
+            relative_slow_suspect: None,
             reorg: IbdReorgState::new(),
             hygiene_counter: 0,
         }

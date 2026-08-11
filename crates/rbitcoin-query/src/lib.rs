@@ -1803,27 +1803,36 @@ impl Query {
         let mut path_fk = tip_fk;
         let mut path_h = tip_height;
         let mut path_rec = tip_rec;
+        // Shared across all score queries — without this, the path walk is
+        // O(depth²): each step re-walked the remaining child chain from scratch
+        // (mainnet mid-IBD resume with ~64k headers ahead hung for a long time).
+        let mut score_memo: U64Map<(bitcoin::Work, u32)> = U64Map::default();
         for _ in 0..ANCESTOR_HOPS {
             let Some(parent_fk) = path_rec.prev_fk.get() else {
                 break;
             };
             let (path_sub_w, _path_sub_d) =
-                Self::resume_subtree_score(&self.store, &children, path_fk)?;
+                Self::resume_subtree_score(&self.store, &children, path_fk, &mut score_memo)?;
             if let Some(sibs) = children.get(&parent_fk) {
                 for &(fk, hash) in sibs {
                     if fk == path_fk {
                         continue;
                     }
                     let has_body = self.store.header_txs.has_body(fk)?;
-                    let (sub_w, sub_d) = Self::resume_subtree_score(&self.store, &children, fk)?;
+                    let (sub_w, sub_d) =
+                        Self::resume_subtree_score(&self.store, &children, fk, &mut score_memo)?;
                     if sub_w <= path_sub_w {
                         continue;
                     }
                     let take = match best_sib {
                         None => true,
                         Some((best_fk, _, best_body, _)) => {
-                            let (best_w, best_d) =
-                                Self::resume_subtree_score(&self.store, &children, best_fk)?;
+                            let (best_w, best_d) = Self::resume_subtree_score(
+                                &self.store,
+                                &children,
+                                best_fk,
+                                &mut score_memo,
+                            )?;
                             if sub_w != best_w {
                                 sub_w > best_w
                             } else if sub_d != best_d {
@@ -1878,7 +1887,8 @@ impl Query {
             let mut best: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
             for &(fk, hash) in kids {
                 let has_body = self.store.header_txs.has_body(fk)?;
-                let (sub_work, depth) = Self::resume_subtree_score(&self.store, &children, fk)?;
+                let (sub_work, depth) =
+                    Self::resume_subtree_score(&self.store, &children, fk, &mut score_memo)?;
                 let take = match best {
                     None => true,
                     Some((best_fk, _, best_body, best_w, best_d)) => {
@@ -1917,19 +1927,20 @@ impl Query {
     /// Used by [`Self::resume_work_path_after_tip`] to prefer most-work children
     /// over body-only archived losers.
     ///
-    /// **Iterative** post-order walk (memoized). A recursive DFS stack-overflowed
-    /// (SIGSEGV) on mainnet IBD restart when tip lagged the stored header band by
-    /// tens of thousands of heights (e.g. tip≈671k with ~64k headers already on
-    /// disk after an interrupted catch-up). Peer/assign logic is not on this path —
-    /// crash was always in resume seed before the first getdata assign.
+    /// **Iterative** post-order walk into a **shared** `memo` (one map per resume).
+    /// Recursive DFS stack-overflowed (SIGSEGV) on mid-IBD restart; a fresh memo
+    /// per call was O(depth²) on long header bands (each path step re-walked the
+    /// remaining chain).
     fn resume_subtree_score(
         store: &rbitcoin_store::Store,
         children: &U64Map<Vec<(Fk, [u8; 32])>>,
         root: Fk,
+        memo: &mut U64Map<(bitcoin::Work, u32)>,
     ) -> Result<(bitcoin::Work, u32), QueryError> {
         use bitcoin::{CompactTarget, Target};
-        // memo[fk] = (work, depth) for completed subtrees.
-        let mut memo: U64Map<(bitcoin::Work, u32)> = U64Map::default();
+        if let Some(&v) = memo.get(&root.0) {
+            return Ok(v);
+        }
         // false = first visit (push children), true = children done (fold).
         let mut stack: Vec<(Fk, bool)> = Vec::with_capacity(256);
         stack.push((root, false));

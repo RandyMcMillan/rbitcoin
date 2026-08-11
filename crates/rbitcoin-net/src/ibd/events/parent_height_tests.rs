@@ -8,8 +8,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
-    TxOut, Witness,
+    Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+    Witness,
 };
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_query::Query;

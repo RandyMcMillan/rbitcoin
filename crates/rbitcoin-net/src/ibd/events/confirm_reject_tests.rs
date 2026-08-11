@@ -297,8 +297,7 @@ fn bad_prev_gathers_winner_via_bq_by_hash() {
         let target = Target::from_compact(win.header.bits);
         for nonce in 0..u32::MAX {
             win.header.nonce = nonce;
-            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
-            {
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
                 break;
             }
         }
@@ -417,8 +416,7 @@ fn exploration_apply_win_held_ext_only_in_bq() {
         let target = Target::from_compact(win.header.bits);
         for nonce in 0..u32::MAX {
             win.header.nonce = nonce;
-            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
-            {
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
                 break;
             }
         }
@@ -999,8 +997,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
         None,
     );
     assert!(
-        st.inflight.contains_key(&w1.block_hash())
-            && st.inflight.contains_key(&w2.block_hash()),
+        st.inflight.contains_key(&w1.block_hash()) && st.inflight.contains_key(&w2.block_hash()),
         "assign reorg need (1b) must getdata both mids at confirmed heights; inflight={:?}",
         st.inflight.keys().collect::<Vec<_>>()
     );
@@ -1375,8 +1372,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
         let target = Target::from_compact(win.header.bits);
         for nonce in 0..u32::MAX {
             win.header.nonce = nonce;
-            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
-            {
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
                 break;
             }
         }
@@ -1505,8 +1501,7 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
         let target = Target::from_compact(win.header.bits);
         for nonce in 0..u32::MAX {
             win.header.nonce = nonce;
-            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash()
-            {
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
                 break;
             }
         }

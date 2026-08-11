@@ -938,7 +938,6 @@ pub(crate) fn try_complete_awaiting_reorg(
     }
 }
 
-
 pub(crate) fn parent_height(
     hash_height: &HashMap<BlockHash, u32>,
     hub: &ChainHub,
@@ -962,10 +961,9 @@ pub(crate) fn parent_height(
     None
 }
 
-
-#[cfg(test)]
-mod decode_header_prefix_tests;
 #[cfg(test)]
 mod confirm_reject_tests;
+#[cfg(test)]
+mod decode_header_prefix_tests;
 #[cfg(test)]
 mod parent_height_tests;

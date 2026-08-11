@@ -7,8 +7,12 @@
 //!    - Class A recollect: parallel fk chunks → **direct** catalog spill (~128 MiB)
 //! 2. **Watermark:** `SEAL` = contiguous create_fk floor for resume (`create_fk > SEAL`).
 //!    Parallel recollect only advances SEAL over a completed chunk prefix.
-//! 3. **Tip:** [`plan_sh_pre_materialize`] → recollect gap if needed → claim runs →
+//! 3. **Tip:** [`plan_sh_pre_materialize`] → **stop worker + drain memtable/L0**
+//!    (advance SEAL) → Class A recollect only for remaining gap → claim runs →
 //!    `WarmOnly` | `ColdResume` | `FullCold` (never wipe a durable head for residuals).
+//!    Drain-before-recollect avoids re-spilling the Direct tip tail still in
+//!    memtable/L0 while SEAL lags (mainnet: multi-million create_fk recollect at
+//!    IBD exit while L0 held the same range).
 //!
 //! # Write amp
 //!
@@ -810,6 +814,18 @@ impl ShRunBuilder {
     pub fn set_sealed_max_for_recollect(&self, max_fk: u64) -> Result<(), StoreError> {
         store_seal(&self.runs_dir, max_fk)?;
         self.sealed_fk.store(max_fk, Ordering::Release);
+        Ok(())
+    }
+
+    /// Stop the IBD SH worker and promote memtable/L0 into the catalog (tip entry).
+    ///
+    /// Call **before** Class A recollect so SEAL reflects creates already enqueued
+    /// during Direct IBD. Otherwise recollect re-reads Class A for the same
+    /// `create_fk > SEAL` tail still in memtable/L0 and double-spills it.
+    pub fn stop_and_drain_spills(&self) -> Result<(), StoreError> {
+        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
+        self.drain_spills()?;
+        self.refresh_seal();
         Ok(())
     }
 

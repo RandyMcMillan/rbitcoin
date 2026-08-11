@@ -269,7 +269,24 @@ impl Query {
             ShPreMaterializeAction::Noop => {}
         }
 
-        self.sh_run.refresh_seal();
+        // Drain Direct IBD memtable/L0 into the catalog and advance SEAL **before**
+        // Class A recollect. Creates for the unsealed tip tail already sit in the
+        // enqueue pipeline; recollecting first re-spills the same create_fks
+        // (mainnet IBD exit: seal lag multi-million, then drain promoted overlapping L0).
+        self.sh_run.stop_and_drain_spills()?;
+        let seal_before_recollect = self.sh_run.sealed_max_create_fk();
+        let tip_max = self.store.txs.count();
+        if tip_max > 0 && seal_before_recollect.saturating_add(SH_SEAL_LAG_OK) < tip_max {
+            rbitcoin_log::info!(
+                "node: scripthash post-drain gap seal={seal_before_recollect} \
+                 tip_max_create_fk={tip_max} — Class A recollect for residual"
+            );
+        } else if tip_max > 0 {
+            rbitcoin_log::info!(
+                "node: scripthash post-drain seal={seal_before_recollect} covers \
+                 tip_max_create_fk={tip_max} (lag≤{SH_SEAL_LAG_OK}) — Class A recollect no-op if seal≥tip"
+            );
+        }
         self.rebuild_sh_unsealed_from_class_a_cancellable(cancel)?;
 
         // Fail closed: never FullCold / "no runs" success on a zeroed head when
@@ -315,8 +332,8 @@ impl Query {
         // landed as small runs after recollect but before claim, must be folded
         // into the durable head **before** tip-ready / Electrum. Mainnet saw
         // leftover catalog after ENOSPC rematerialize + short Direct catch-up.
-        // Bounded loop: each pass recollects create_fk > SEAL then warm/cold
-        // materializes residual runs.
+        // Bounded loop: each pass drains memtable/L0, recollects create_fk > SEAL,
+        // then warm/cold materializes residual runs.
         //
         // Empty store (tip_max==0): nothing to cover — skip tip-ready fail-closed.
         let tip_final = self.store.txs.count();
@@ -335,6 +352,7 @@ impl Query {
                     "node: scripthash post-materialize drain round={round}/{MAX_POST_DRAIN_ROUNDS} \
                      residual_runs={residual} seal={seal_now} include_hwm={hwm_now} tip_max={tip_now}"
                 );
+                self.sh_run.stop_and_drain_spills()?;
                 self.rebuild_sh_unsealed_from_class_a_cancellable(cancel)?;
                 let n2 = match cancel {
                     None => self.sh_run.finalize_and_bulk_materialize(&self.store)?,
@@ -853,6 +871,77 @@ mod tests {
         }
         assert_eq!(q.tip_height(), Some(Height(n - 1)));
         assert!(q.store.txs.count() >= u64::from(n));
+    }
+
+    /// Tip entry must promote memtable/L0 (and advance SEAL) before Class A recollect.
+    ///
+    /// Mainnet regression: recollect ran with seal lag while the same create_fks
+    /// still sat in the Direct enqueue pipeline, then drain double-spilled them.
+    #[test]
+    fn tip_drain_before_recollect_covers_memtable_tail() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-drain-first-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 10);
+        let tip_max = q.store.txs.count();
+        assert!(tip_max >= 10);
+
+        // Simulate seal lag: clamp SEAL low, re-enqueue creates for the tail into
+        // the memtable (same shape as Direct confirm while worker is behind).
+        let lag_seal = tip_max.saturating_sub(6).max(1);
+        q.sh_run.set_sealed_max_for_recollect(lag_seal).unwrap();
+        q.sh_run.ensure_enabled();
+        let mut tail: Vec<ScriptHashRecord> = Vec::new();
+        for id in (lag_seal + 1)..=tip_max {
+            let (_tx, outs) = q.store.get_tx_meta_and_outputs(Fk(id)).unwrap();
+            for o in &outs {
+                tail.push(ScriptHashRecord::from_fk(
+                    rbitcoin_store::script_hash(&o.script),
+                    Fk(id),
+                ));
+            }
+        }
+        assert!(
+            !tail.is_empty(),
+            "need creates above lag_seal={lag_seal} tip_max={tip_max}"
+        );
+        q.sh_run.enqueue(&tail);
+        assert!(
+            q.sh_run.memtable_len() > 0,
+            "tail must sit in memtable before drain"
+        );
+
+        // Order under test: stop + drain first → SEAL covers enqueued tail.
+        q.sh_run.stop_and_drain_spills().unwrap();
+        assert_eq!(q.sh_run.memtable_len(), 0, "drain must empty memtable");
+        let seal_after_drain = q.sh_run.sealed_max_create_fk();
+        assert!(
+            seal_after_drain >= tip_max,
+            "drain must advance SEAL over memtable tail: seal={seal_after_drain} tip_max={tip_max} lag_was={lag_seal}"
+        );
+
+        // Recollect must early-out (sealed0 >= tip_max) — no Class A gap work.
+        let runs_before = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        q.rebuild_sh_unsealed_from_class_a().unwrap();
+        let runs_after = sh_catalog_total_records(&dir.join("scripthash.runs"));
+        assert_eq!(
+            runs_after, runs_before,
+            "recollect must not add runs when drain already covered tip"
+        );
+        assert_eq!(q.sh_run.sealed_max_create_fk(), seal_after_drain);
+
+        // Full tip finalize still settles a durable head.
+        let n_mat = q.finalize_sh_runs().unwrap();
+        assert!(
+            n_mat > 0 || q.store.scripthash.has_durable_index(),
+            "finalize after drain-first path must materialize SH"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Drive [`Query::finalize_sh_runs`] with durable head + high SEAL + no HWM.

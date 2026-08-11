@@ -325,26 +325,10 @@ pub(crate) const CONFIRM_BATCH_INPUTS_DEFAULT: u32 = 8000;
 /// ≥ [`CONFIRM_RUN_MAX_BLOCKS`] so the engine can fill a full hard-cap wave.
 const OFFER_AHEAD: u32 = 192;
 
-/// Soft max inputs per confirm batch (`RBITCOIN_CONFIRM_BATCH_INPUTS`).
+/// Soft max inputs per confirm batch (hardcoded production default).
+#[inline]
 pub(crate) fn confirm_batch_max_inputs() -> u32 {
-    use std::sync::OnceLock;
-    static N: OnceLock<u32> = OnceLock::new();
-    *N.get_or_init(|| {
-        let raw = std::env::var("RBITCOIN_CONFIRM_BATCH_INPUTS").ok();
-        let n = raw
-            .as_deref()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(CONFIRM_BATCH_INPUTS_DEFAULT)
-            .clamp(1, 1_000_000);
-        if raw.is_some() && n != CONFIRM_BATCH_INPUTS_DEFAULT {
-            rbitcoin_log::info!(
-                "ibd: confirm batch soft_max_inputs={n} max_blocks={} \
-                 (RBITCOIN_CONFIRM_BATCH_INPUTS)",
-                CONFIRM_RUN_MAX_BLOCKS
-            );
-        }
-        n
-    })
+    CONFIRM_BATCH_INPUTS_DEFAULT
 }
 
 /// Σ `tx.input.len()` over a decoded block (confirm pack work meter).
@@ -375,10 +359,8 @@ pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
-/// Hard clamp per stage (env abuse / OOM guard).
-pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
 
-/// Resolved load / script / write queue capacities (OnceLock; process-lifetime).
+/// Resolved load / script / write queue capacities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
     /// lookup→load (`loadq`)
@@ -389,72 +371,22 @@ pub(crate) struct ConfirmQueueCaps {
     pub write: usize,
 }
 
-fn parse_queue_cap(raw: Option<&str>, default: usize) -> usize {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-        .clamp(1, CONFIRM_QUEUE_CAP_MAX)
-}
-
-/// Per-stage confirm pipeline queue capacities.
+/// Per-stage confirm pipeline queue capacities (hardcoded production defaults).
 ///
-/// | Queue | Env | Default |
-/// |-------|-----|---------|
-/// | lookup→load (`loadq`) | `RBITCOIN_CONFIRM_LOAD_QUEUE` (legacy `…_PLAN_QUEUE`) | **8** |
-/// | load→scripts (`scriptq`) | `RBITCOIN_CONFIRM_SCRIPT_QUEUE` (legacy `…_PREP_QUEUE`) | **4** |
-/// | scripts→write (`writeq`) | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **20** |
+/// | Queue | Default |
+/// |-------|---------|
+/// | lookup→load (`loadq`) | **8** |
+/// | load→scripts (`scriptq`) | **4** |
+/// | scripts→write (`writeq`) | **20** |
 ///
-/// Legacy: if a per-stage env is unset, `RBITCOIN_CONFIRM_QUEUE` (when set) supplies
-/// that stage's default instead of the table above. Clamp **1..=64** each.
+/// Env overrides removed (Q-04): change defaults in code if needed.
+#[inline]
 pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
-    use std::sync::OnceLock;
-    static CAPS: OnceLock<ConfirmQueueCaps> = OnceLock::new();
-    *CAPS.get_or_init(|| {
-        let legacy = std::env::var("RBITCOIN_CONFIRM_QUEUE").ok();
-        let legacy_n = legacy
-            .as_deref()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(1, CONFIRM_QUEUE_CAP_MAX));
-
-        let load_raw = std::env::var("RBITCOIN_CONFIRM_LOAD_QUEUE")
-            .or_else(|_| std::env::var("RBITCOIN_CONFIRM_PLAN_QUEUE"))
-            .ok();
-        let script_raw = std::env::var("RBITCOIN_CONFIRM_SCRIPT_QUEUE")
-            .or_else(|_| std::env::var("RBITCOIN_CONFIRM_PREP_QUEUE"))
-            .ok();
-        let write_raw = std::env::var("RBITCOIN_CONFIRM_WRITE_QUEUE").ok();
-
-        let load = parse_queue_cap(
-            load_raw.as_deref(),
-            legacy_n.unwrap_or(LOAD_QUEUE_CAP_DEFAULT),
-        );
-        let script = parse_queue_cap(
-            script_raw.as_deref(),
-            legacy_n.unwrap_or(SCRIPT_QUEUE_CAP_DEFAULT),
-        );
-        let write = parse_queue_cap(
-            write_raw.as_deref(),
-            legacy_n.unwrap_or(WRITE_QUEUE_CAP_DEFAULT),
-        );
-        let caps = ConfirmQueueCaps {
-            load,
-            script,
-            write,
-        };
-        let non_default = load != LOAD_QUEUE_CAP_DEFAULT
-            || script != SCRIPT_QUEUE_CAP_DEFAULT
-            || write != WRITE_QUEUE_CAP_DEFAULT
-            || legacy.is_some();
-        if non_default {
-            rbitcoin_log::info!(
-                "ibd: confirm pipeline queues loadq cap={load} scriptq cap={script} \
-                 writeq cap={write} \
-                 (RBITCOIN_CONFIRM_LOAD_QUEUE / _SCRIPT_QUEUE / _WRITE_QUEUE; \
-                 legacy RBITCOIN_CONFIRM_QUEUE={})",
-                legacy.as_deref().unwrap_or("unset"),
-            );
-        }
-        caps
-    })
+    ConfirmQueueCaps {
+        load: LOAD_QUEUE_CAP_DEFAULT,
+        script: SCRIPT_QUEUE_CAP_DEFAULT,
+        write: WRITE_QUEUE_CAP_DEFAULT,
+    }
 }
 
 /// Lookup→load (`loadq`) `SyncSender` capacity.
@@ -2426,8 +2358,7 @@ mod tests {
             "loadq<0/2 scriptq<0/2 writeq<0/2"
         );
 
-        // Defaults when per-stage + legacy env unset (OnceLock — do not set
-        // RBITCOIN_CONFIRM_*_QUEUE in this test process).
+        // Hardcoded production queue caps (env overrides removed).
         let caps = super::confirm_queue_caps();
         assert_eq!(caps.load, super::LOAD_QUEUE_CAP_DEFAULT);
         assert_eq!(caps.script, super::SCRIPT_QUEUE_CAP_DEFAULT);
@@ -2436,10 +2367,7 @@ mod tests {
         assert_eq!(super::script_queue_cap(), caps.script);
         assert_eq!(super::write_queue_cap(), caps.write);
         for c in [caps.load, caps.script, caps.write] {
-            assert!(
-                (1..=super::CONFIRM_QUEUE_CAP_MAX).contains(&c),
-                "queue cap out of range: {c}"
-            );
+            assert!(c >= 1, "queue cap must be positive: {c}");
         }
         assert_eq!(
             format_conf_q(0, 0, 0, caps.load, caps.script, caps.write),

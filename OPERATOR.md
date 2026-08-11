@@ -128,31 +128,24 @@ modality matrix and demap plan: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
 
-**Bulk batch** only (`RBITCOIN_IO`). Table transport is always **fd pread/pwrite**
-(phase 6 — no maps). Compact Class C is L2 write-behind; see `docs/io-modality.md`.
+**Bulk batch** uses a **single** switch: `RBITCOIN_IO=uring|pread` (default uring
+when available). Table transport is always **fd pread/pwrite**. Compact Class C
+is L2 write-behind; see [`docs/io-modality.md`](docs/io-modality.md). Per-path
+env overrides are **removed**. If `uring` is selected but setup fails, demote to
+**pread** / **pwrite**.
 
-Hierarchy: **path env** (if set) → **global `RBITCOIN_IO`** → default (**uring** if
-the ring is available, else **pread** / **pwrite** for annotate). If `uring` is
-selected but setup fails, demote to **pread** / **pwrite**.
-
-| Env | Values | Site |
+| Env | Values | Note |
 |-----|--------|------|
-| **`RBITCOIN_IO`** | `uring` \| `pread` | Global default (`mmap` token demotes to pread with a warning — not a live bulk mode) |
-| `RBITCOIN_PIN_IO` | uring \| pread | Class A denserels / pin body pipeline |
-| `RBITCOIN_HEAD_RESOLVE_IO` | uring \| pread | Head-resolve body prefix (≤32 B) |
-| `RBITCOIN_SPEND_META` | uring \| pread | Structural 9 B spender-meta peeks |
-| `RBITCOIN_SPEND_ANN` | uring \| **pwrite** | Pure-write annotate store |
-| `RBITCOIN_CLASS_C_IO` | uring \| pread | Bulk create-height 4 B slots |
-| `RBITCOIN_CLASS_C_INRAM_MAX_MB` | integer MiB (default **256**) | Cap for L2 Class C load; over → pure fd L0 |
-| `RBITCOIN_TX_HEAD_ACCESS` | ignored if `map` | Always FdOnly after phase 6 (warn once if `map`) |
+| **`RBITCOIN_IO`** | `uring` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
+| `RBITCOIN_IO_URING=0` | deprecated | Same as `RBITCOIN_IO=pread` |
 
-**RWF_DONTCACHE (fixed):** only spend-annotate `tx.body` **pwrites** set the flag when the kernel supports it (ENOTSUP demotes for the process). Class A append, confirm/load body reads, head/idx/sidefile peeks do not. No env multi-mode.
+Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
+
+**RWF_DONTCACHE (fixed):** only spend-annotate `tx.body` **pwrites** set the flag when the kernel supports it. Class A append and load body reads do not.
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
-- **pread** / **pwrite** — libc positional IO; `RBITCOIN_BULK_IO_WORKERS` parallelizes pread only.
+- **pread** / **pwrite** — libc positional IO.
 - Class A **`tx.body` / `tx.idx` linear appends always pwrite**.
-- Perf log tokens: `ann={}ms/n={}` and `meta={}ms/n={}` (no `_mmap` / `_uring` suffix).
-- Compat: `RBITCOIN_IO_URING=0` (deprecated) ≈ global `RBITCOIN_IO=pread`.
 
 ## Defaults and memory budgets
 
@@ -164,12 +157,12 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Inbound P2P sessions | **125** | `--maxinbound` / `--maxconnections` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` / `--assumevalid-height` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `--archive-queue-mb` **or** advanced `RBITCOIN_ARCHIVE_QUEUE_MB` (CLI only overwrites when flag/conf set) |
-| ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP. No create pin FIFO / `RBITCOIN_RESIDENCY_BYTES` |
-| Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
+| ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
+| Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
-| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
-| Confirm stages | **lookup · load · scripts · write** | Pipeline queues default **loadq=8 · scriptq=4 · writeq=20** (`loadq=n/8 scriptq=n/4 writeq=n/20`). Env: `RBITCOIN_CONFIRM_LOAD_QUEUE`, `RBITCOIN_CONFIRM_SCRIPT_QUEUE`, `RBITCOIN_CONFIRM_WRITE_QUEUE` (each **1..=64**). Legacy aliases: `…_PLAN_QUEUE` → loadq, `…_PREP_QUEUE` → scriptq; `RBITCOIN_CONFIRM_QUEUE` fills any stage whose specific env is unset. Lookup packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks — at dense heights **usually a few blocks per batch** (live `n=`), not large multi-dozen block waves |
-| Confirm batch inputs | **8000** soft | `RBITCOIN_CONFIRM_BATCH_INPUTS` (1..=1e6). Live line: `h= n= in=` (**n** = blocks in this pack, **in** = Σ inputs). Dense mainnet: **n** often 1–3 |
+| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. Legacy mono-head datadirs require reindex |
+| Confirm stages | **lookup · load · scripts · write** | Pipeline queues **hardcoded** loadq=8 · scriptq=4 · writeq=20. Lookup packs tip-contiguous waves by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch |
+| Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 
@@ -194,24 +187,22 @@ materialized into heads: confirm only enqueues sorted runs (background flush +
 merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
 tables before Electrum (the only deferred index work). Tip SH materialize
 **streams catalog runs with direct k-way merge** (up to ~4096 open files;
-`RBITCOIN_SH_MAX_DIRECT_MERGE`) into a **live in-RAM open-address image per
-prefix shard** (final-sized, ~0.5–1 GiB peak on mainnet 64-way; never size from
-create counts — `RBITCOIN_SH_UNIQUE_HINT` optional). Fan-in reduce is **fallback
-only** when the catalog exceeds max direct. IBD promotes L0 spills only at
-≥75% of target run size (default target **512 MiB**) and compacts tiny catalog
-runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs ~**every
-10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
+default max direct merge) into a **live in-RAM open-address image per prefix
+shard** (final-sized, ~0.5–1 GiB peak on mainnet 64-way). Fan-in reduce is
+**fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
+only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
+catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs
+~**every 10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
 `catalog_complete` / `seal` / `tip_max_fk`. **Full cold reinit only if the SH
 head is empty** (or force rebuild); a nearly complete index with residual runs
-uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large catalog spills; tip Class A
-recollect is parallel (~64k-fk chunks, ~128 MiB per-thread spills, contiguous
-SEAL prefix for resume). Direct enter only recollects a small SEAL gap (crash
-window); full recollect is tip finalize. Tip materialize: WarmOnly / ColdResume
-/ FullCold. Catalog compact is **IBD worker only** (crumbs &lt;~96 MiB).
-**`RBITCOIN_SH_FORCE_REBUILD=1`:** sticky env must never redo multi-hour Class A
-work. Empty head + **usable** catalog (real run mass, not a stale high-SEAL tail)
-→ **reinit head only** + FullCold (keep runs/SEAL; gap recollect fills tip lag).
-Empty head + **unusable** catalog → nuclear wipe + full recollect. **Durable
+uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large
+catalog spills; tip Class A recollect is parallel. Direct enter only recollects
+a small SEAL gap (crash window); full recollect is tip finalize. Tip
+materialize: WarmOnly / ColdResume / FullCold. Catalog compact is **IBD worker
+only** (crumbs &lt;~96 MiB). Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`)
+must never redo multi-hour Class A work casually — see [`docs/env-knobs.md`](docs/env-knobs.md).
+Empty head + **usable** catalog → **reinit head only** + FullCold. Empty head +
+**unusable** catalog → nuclear wipe + full recollect. **Durable
 head** + FORCE → never wipe (bootstrap/clamp/Noop + warm residual only; materialize
 mode is WarmOnly). Unset the env after a successful rebuild. Incomplete catalog
 (high SEAL + tiny run mass, or consumed runs with no head) on an **empty** head

@@ -1,16 +1,13 @@
-//! Hierarchical bulk-IO backend selection for Class A body (no mmap payload).
+//! Bulk-IO backend selection for Class A body (no mmap payload).
 //!
-//! ## Global
-//! - `RBITCOIN_IO=uring|pread` — default when path env unset.
+//! ## Operator env (single switch)
+//! - `RBITCOIN_IO=uring|pread` — all bulk read/write paths (default: uring if available).
 //! - `RBITCOIN_IO=mmap` (legacy) → demoted to **pread** (one-time warn).
-//! - `RBITCOIN_IO_URING=0` → **pread** when `RBITCOIN_IO` unset.
+//! - `RBITCOIN_IO_URING=0` → **pread** when `RBITCOIN_IO` unset (deprecated alias).
 //!
-//! ## Path overrides
-//! - `RBITCOIN_PIN_IO` — denserels / Class A body pipeline
-//! - `RBITCOIN_HEAD_RESOLVE_IO` — head-resolve body prefix
-//! - `RBITCOIN_SPEND_META` — structural 9B peeks
-//! - `RBITCOIN_SPEND_ANN` — pure-write annotate (`uring|pwrite`)
-//! - `RBITCOIN_CLASS_C_IO` — bulk create-height slots
+//! Per-path env overrides (`RBITCOIN_PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`,
+//! `SPEND_ANN`, `CLASS_C_IO`) are **removed** — they ignored any value and used
+//! the global switch only (no dual-path matrix).
 //!
 //! Class A **tx.body** payload is always pread/pwrite/uring — never mmap.
 
@@ -137,72 +134,51 @@ fn default_write() -> WriteIoBackend {
     }
 }
 
-/// Resolve read backend for a path-specific env (then global, then default).
-pub(crate) fn resolve_read(path_env: &str) -> ReadIoBackend {
-    let selected = std::env::var(path_env)
-        .ok()
-        .and_then(|s| parse_read_token(&s))
-        .or_else(global_read_from_env)
-        .unwrap_or_else(default_read);
+/// Global bulk read backend (`RBITCOIN_IO` only — no path overrides).
+pub(crate) fn resolve_read(_path_env: &str) -> ReadIoBackend {
+    let selected = global_read_from_env().unwrap_or_else(default_read);
     effective_read(selected)
 }
 
-/// Resolve write backend for a path-specific env (then global, then default).
-pub(crate) fn resolve_write(path_env: &str) -> WriteIoBackend {
-    let selected = std::env::var(path_env)
-        .ok()
-        .and_then(|s| parse_write_token(&s))
-        .or_else(global_write_from_env)
-        .unwrap_or_else(default_write);
+/// Global bulk write backend (`RBITCOIN_IO` only — no path overrides).
+pub(crate) fn resolve_write(_path_env: &str) -> WriteIoBackend {
+    let selected = global_write_from_env().unwrap_or_else(default_write);
     effective_write(selected)
 }
 
-fn cached_read(path_env: &'static str) -> ReadIoBackend {
-    match path_env {
-        "RBITCOIN_PIN_IO" => {
-            static B: OnceLock<ReadIoBackend> = OnceLock::new();
-            *B.get_or_init(|| resolve_read("RBITCOIN_PIN_IO"))
-        }
-        "RBITCOIN_HEAD_RESOLVE_IO" => {
-            static B: OnceLock<ReadIoBackend> = OnceLock::new();
-            *B.get_or_init(|| resolve_read("RBITCOIN_HEAD_RESOLVE_IO"))
-        }
-        "RBITCOIN_SPEND_META" => {
-            static B: OnceLock<ReadIoBackend> = OnceLock::new();
-            *B.get_or_init(|| resolve_read("RBITCOIN_SPEND_META"))
-        }
-        "RBITCOIN_CLASS_C_IO" => {
-            static B: OnceLock<ReadIoBackend> = OnceLock::new();
-            *B.get_or_init(|| resolve_read("RBITCOIN_CLASS_C_IO"))
-        }
-        other => resolve_read(other),
-    }
+fn global_read_cached() -> ReadIoBackend {
+    static B: OnceLock<ReadIoBackend> = OnceLock::new();
+    *B.get_or_init(|| resolve_read(""))
+}
+
+fn global_write_cached() -> WriteIoBackend {
+    static B: OnceLock<WriteIoBackend> = OnceLock::new();
+    *B.get_or_init(|| resolve_write(""))
 }
 
 #[inline]
 pub fn pin_io_backend() -> ReadIoBackend {
-    cached_read("RBITCOIN_PIN_IO")
+    global_read_cached()
 }
 
 #[inline]
 pub fn head_resolve_io_backend() -> ReadIoBackend {
-    cached_read("RBITCOIN_HEAD_RESOLVE_IO")
+    global_read_cached()
 }
 
 #[inline]
 pub fn spend_meta_io_backend() -> ReadIoBackend {
-    cached_read("RBITCOIN_SPEND_META")
+    global_read_cached()
 }
 
 #[inline]
 pub fn class_c_io_backend() -> ReadIoBackend {
-    cached_read("RBITCOIN_CLASS_C_IO")
+    global_read_cached()
 }
 
 #[inline]
 pub fn spend_ann_io_backend() -> WriteIoBackend {
-    static B: OnceLock<WriteIoBackend> = OnceLock::new();
-    *B.get_or_init(|| resolve_write("RBITCOIN_SPEND_ANN"))
+    global_write_cached()
 }
 
 /// Class A body/idx linear appends always use **pwrite** (no mmap body append).
@@ -254,11 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn path_overrides_global() {
+    fn path_env_ignored_global_only() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_io_envs();
+        // Path overrides removed: PIN_IO=pread must not beat global uring.
         std::env::set_var("RBITCOIN_IO", "uring");
         std::env::set_var("RBITCOIN_PIN_IO", "pread");
+        let got = resolve_read("RBITCOIN_PIN_IO");
+        assert_eq!(got, effective_read(ReadIoBackend::Uring));
+        clear_io_envs();
+        std::env::set_var("RBITCOIN_IO", "pread");
         assert_eq!(resolve_read("RBITCOIN_PIN_IO"), ReadIoBackend::Pread);
         clear_io_envs();
     }

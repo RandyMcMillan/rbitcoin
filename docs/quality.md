@@ -62,9 +62,7 @@ level peers cannot ignore**.
 
 ### P0 — Trust, correctness, honesty
 
-| ID | Item | Why it still matters | Done looks like |
-|----|------|----------------------|-----------------|
-| **Q-04** | **Env knobs inventory** | ~40 `RBITCOIN_*` in code vs fewer in OPERATOR | Every public knob in OPERATOR advanced section; private knobs `cfg`/`doc(hidden)` or `RBITCOIN_UNSTABLE_*` |
+**Empty.** Q-01–Q-05 closed (see **Resolved** below).
 
 ### P1 — Maintainability (code that scales with AI + human review)
 
@@ -228,6 +226,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | External findings process incomplete | **Fixed (Q-01)** — status + Regression links in `docs/external_findings/` |
 | Confirm dual-path soft recovery | **Fixed (Q-02)** — killed load identity soft-fill + `ColdPinMode` dual API; denserels by range only; invariants.md updated |
 | Multi-node IBD only `#[ignore]` | **Fixed (Q-03)** — tier A two-node + cold reconstruct in default suite + required CI `multinode` job (coverage cadence); queue depth counters saturating |
+| Env knob museum | **Fixed (Q-04)** — `docs/env-knobs.md`; path IO matrix + confirm queue envs removed (hardcoded); survivors `RBITCOIN_IO` + logging; CLI primary |
 | Most-work reorg / tip hole livelocks | **Largely fixed** — multi-hop reorg, tip-hole race, zombie pending, resume seed stack/O(N²) fixes |
 | SH/fuse wipe risk on format | **Fixed** — soft-migrate fuse8; AGENTS on-disk format rules |
 
@@ -265,7 +264,7 @@ God-files, `allow(dead_code)` bulk_io, `IbdConfig::for_test` in node, cargo deny
 | Maintainers picking the next refactor | Remaining **P0–P1** |
 | Release engineering | P2 **Q-20–Q-23** (MSRV/Q-05 closed) |
 | Security / adversarial | P0 **Q-03**, P3 **Q-30** (Q-01/Q-02 closed) |
-| Docs / README | North star + Remaining **Q-04**, **Q-34** |
+| Docs / README | North star + **Q-34** (Q-04 env inventory closed) |
 | “Are we industry-leading yet?” | North star pillars + grade board |
 
 ---

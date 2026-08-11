@@ -4,6 +4,8 @@
 **Commit:** `1ec7e42` (2026-08-07)
 **Severity:** medium — remotely triggerable peer eviction; no crash, no consensus split
 **Status:** fixed — `drain_pending` keeps the session on accept failure (no disconnect/score)
+
+**Regression:** `rbitcoin-net` `peer::tests::cmpct_helpers_without_mempool_and_queue_out_closed` — invalid tip-extending body through `drain_pending` must not end the session (expects `Ok`).
 **Found by:** fuzzamoto differential campaign (Bitcoin Core primary vs rbitcoin reference,
 `oracle_consensus`)
 

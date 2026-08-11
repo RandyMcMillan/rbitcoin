@@ -8,6 +8,8 @@ invalid, and the two nodes fork at the same height.
 `oracle_consensus`)
 **Status:** fixed — reject same-block spends of later parents in assemble walk (see remediation commits)
 
+**Regression:** `rbitcoin-test` `consensus_rules::c8_same_block_child_before_parent_rejected` — child-before-parent same-block spend must not advance tip.
+
 ## Summary
 
 Bitcoin consensus requires the transactions in a block to appear in topological order: a

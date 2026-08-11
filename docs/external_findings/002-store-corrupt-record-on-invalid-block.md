@@ -11,6 +11,8 @@ relay. This document covers only the *misclassification*; the peer disconnect it
 differential campaign)
 **Status:** fixed — unresolved archive parent maps to `ConsensusError::MissingPrevout` (not corrupt)
 
+**Regression:** `rbitcoin-consensus` `error::tests::archive_unresolved_parent_is_missing_prevout_not_corrupt` — unresolved archive parent maps to `ConsensusError::MissingPrevout`, not store corrupt.
+
 ## Summary
 
 A block supplied by a peer can drive rbitcoin's archive batch planner into

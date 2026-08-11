@@ -4,6 +4,8 @@
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — 0-conf fraud enablement / mempool pollution (not consensus)
 **Status:** fixed — shipped accept path (2026-08) — mempool Coin view + confirmed spentness (plan 2026-08)
+
+**Regression:** `rbitcoin-mempool` `accept::tests::reject_when_provider_has_no_unspent_coin` (confirmed spentness / missing coin) and related accept reject paths.
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

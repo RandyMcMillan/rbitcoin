@@ -4,8 +4,8 @@
 //!
 //! Every data row is deserialized and verified through the **shipped**
 //! [`rbitcoin_consensus::script::verify_job_all_inputs`] path with prevouts
-//! from the fixture. Expected accept (valid) / reject (invalid) is asserted
-//! unless the row index appears in the allowlist with a reason.
+//! from the fixture. Expected accept (valid) / reject (invalid) is required
+//! for **all** data rows — no allowlist or skip inventory.
 
 use crate::block::{JobTx, ScriptCheckJob};
 use crate::script;
@@ -13,7 +13,6 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -649,20 +648,11 @@ fn verify_tx_row(
     script::verify_job_all_inputs(&job).map_err(|e| format!("{e}"))
 }
 
-/// Explicit allowlist: (fixture file, json array index, reason).
-const TX_ALLOWLIST: &[(&str, usize, &str)] = &[];
-
-fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String>) {
+fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, Vec<String>) {
     let rows = load_array(name);
-    let allow: HashSet<usize> = TX_ALLOWLIST
-        .iter()
-        .filter(|(f, _, _)| *f == name)
-        .map(|(_, i, _)| *i)
-        .collect();
     let mut total = 0u32;
     let mut pass = 0u32;
     let mut fail = 0u32;
-    let mut allow_skip = 0u32;
     let mut failures = Vec::new();
 
     for (idx, row) in rows.iter().enumerate() {
@@ -684,8 +674,6 @@ fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String
         let ok = if expect_ok { got.is_ok() } else { got.is_err() };
         if ok {
             pass += 1;
-        } else if allow.contains(&idx) {
-            allow_skip += 1;
         } else {
             fail += 1;
             if failures.len() < 30 {
@@ -696,79 +684,31 @@ fn run_tx_corpus(name: &str, expect_ok: bool) -> (u32, u32, u32, u32, Vec<String
             }
         }
     }
-    (total, pass, fail, allow_skip, failures)
-}
-
-/// Fail if TX_ALLOWLIST lists rows that already match Core without skip.
-#[test]
-fn tx_allowlist_has_no_stale_entries() {
-    let mut stale = Vec::new();
-    for &(file, idx, reason) in TX_ALLOWLIST {
-        let expect_ok = file == "tx_valid.json";
-        let rows = load_array(file);
-        let Some(row) = rows.get(idx) else {
-            continue;
-        };
-        let Value::Array(cells) = row else {
-            continue;
-        };
-        if cells.len() < 3 || !cells[0].is_array() {
-            continue;
-        }
-        let Some(tx_hex) = cells[1].as_str() else {
-            continue;
-        };
-        let flags_s = cells[2].as_str().unwrap_or("NONE");
-        let got = verify_tx_row(&cells[0], tx_hex, flags_s, expect_ok);
-        let ok = if expect_ok { got.is_ok() } else { got.is_err() };
-        if ok {
-            stale.push((file, idx, reason));
-            eprintln!("stale TX_ALLOWLIST {file}#{idx}: {reason}");
-        }
-    }
-    assert!(
-        stale.is_empty(),
-        "remove {} stale TX_ALLOWLIST entries (already match Core)",
-        stale.len()
-    );
+    (total, pass, fail, failures)
 }
 
 #[test]
 fn core_tx_valid_all_rows() {
-    let (total, pass, fail, allow_skip, failures) = run_tx_corpus("tx_valid.json", true);
-    eprintln!("core tx_valid: total={total} pass={pass} fail={fail} allow_skip={allow_skip}");
+    let (total, pass, fail, failures) = run_tx_corpus("tx_valid.json", true);
+    eprintln!("core tx_valid: total={total} pass={pass} fail={fail}");
     for f in &failures {
         eprintln!("  FAIL {f}");
     }
     assert!(total > 50, "expected many valid rows, total={total}");
-    assert_eq!(fail, 0, "tx_valid non-allowlisted failures: {fail}");
-    let inv: usize = TX_ALLOWLIST
-        .iter()
-        .filter(|(f, _, _)| *f == "tx_valid.json")
-        .count();
-    assert!(
-        allow_skip as usize <= inv,
-        "tx_valid allow_skip={allow_skip} exceeds inventory={inv}"
-    );
+    assert_eq!(fail, 0, "tx_valid failures: {fail}");
+    assert_eq!(pass, total, "every valid row must pass");
 }
 
 #[test]
 fn core_tx_invalid_all_rows() {
-    let (total, pass, fail, allow_skip, failures) = run_tx_corpus("tx_invalid.json", false);
-    eprintln!("core tx_invalid: total={total} pass={pass} fail={fail} allow_skip={allow_skip}");
+    let (total, pass, fail, failures) = run_tx_corpus("tx_invalid.json", false);
+    eprintln!("core tx_invalid: total={total} pass={pass} fail={fail}");
     for f in &failures {
         eprintln!("  FAIL {f}");
     }
     assert!(total > 50, "expected many invalid rows, total={total}");
-    assert_eq!(fail, 0, "tx_invalid non-allowlisted failures: {fail}");
-    let inv: usize = TX_ALLOWLIST
-        .iter()
-        .filter(|(f, _, _)| *f == "tx_invalid.json")
-        .count();
-    assert!(
-        allow_skip as usize <= inv,
-        "tx_invalid allow_skip={allow_skip} exceeds inventory={inv}"
-    );
+    assert_eq!(fail, 0, "tx_invalid failures: {fail}");
+    assert_eq!(pass, total, "every invalid row must reject as expected");
 }
 
 /// Spot-check: fixtures load and at least one valid row accepts via shipped path.

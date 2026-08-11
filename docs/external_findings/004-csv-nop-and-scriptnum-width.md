@@ -6,7 +6,9 @@
 the other rejects what Core accepts)
 **Found by:** source audit while fixing [003](./003-bip68-version-signedness-consensus-split.md),
 prompted by "check where the tx version is used"
-**Status:** fixed — CSV fails below v2 after disable-flag; CLTV/CSV scriptnum width 5; allowlist 128/129 removed
+**Status:** fixed — CSV fails below v2 after disable-flag; CLTV/CSV scriptnum width 5; Core corpus all-rows-pass (no allowlist)
+
+**Regression:** `rbitcoin-consensus` `script::interpreter::tests::csv_fails_when_tx_version_below_2` plus Core `script_tests` corpus (`core_script_tests_all_rows`).
 not independently reproduced by a fuzz testcase
 
 ## A. OP_CSV is a no-op below version 2; in Core it fails
@@ -86,9 +88,12 @@ With the patch applied, all 203 `rbitcoin-consensus` tests pass, including the v
 `csv_nop_when_tx_version_below_2`, which asserted the incorrect no-op behaviour, is renamed
 and inverted to `csv_fails_when_tx_version_below_2`.
 
-## Note on the existing allowlist
+## Note (historical)
 
-`crates/rbitcoin-consensus/src/script/core_tx_vectors.rs:460-461` allowlists two failures
+Earlier work temporarily allowlisted two Core TX rows; that inventory is **gone**.
+The following is archival context only — do not reintroduce skips.
+
+`crates/rbitcoin-consensus/src/script/core_tx_vectors.rs` previously allowlisted two failures
 with the comment *"CSV relative locktime edge not fully enforced"*:
 
 ```rust
@@ -96,6 +101,6 @@ with the comment *"CSV relative locktime edge not fully enforced"*:
 ("tx_invalid.json", 129, "CSV relative locktime edge not fully enforced"),
 ```
 
-These remained allowlisted after the patch and were not investigated. An allowlist entry
+These were historically allowlisted after the patch and were not investigated. An allowlist entry
 against Core's `tx_invalid.json` means rbitcoin accepts a transaction Core considers
 invalid, so both are worth treating as candidate consensus splits in their own right.

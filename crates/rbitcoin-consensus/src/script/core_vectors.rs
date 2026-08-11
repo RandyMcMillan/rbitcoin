@@ -2,9 +2,8 @@
 //!
 //! Every data row is driven through the **shipped** script verification path
 //! ([`crate::script::verify_job_all_inputs`]) using Core's credit/spend
-//! transaction template. Rows that cannot yet match Core's expected outcome
-//! must appear in [`ALLOWLIST`] with a one-line reason — silent skips and soft
-//! majority-rate gates are not success criteria.
+//! transaction template. **All** data rows must match Core — no allowlist,
+//! silent skip, or soft majority-rate gate.
 
 #![cfg(test)]
 
@@ -16,7 +15,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::script::Script;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn load_json() -> Value {
@@ -429,7 +427,7 @@ struct CoreFlags {
     minimal_if: bool,
     /// Core `SCRIPT_VERIFY_SIGPUSHONLY`.
     sig_push_only: bool,
-    /// Other named flags we do not yet implement (for allowlist diagnostics).
+    /// Other named flags we do not yet implement (diagnostics only).
     extra: Vec<String>,
 }
 
@@ -847,14 +845,6 @@ fn is_p2sh_script(spk: &[u8]) -> bool {
 // Format: (json_row_index, reason). Unknown failures must not be soft-passed.
 
 /// Rows we intentionally do not require to match Core yet.
-///
-/// Keep reasons concrete. Grow by fixing the engine, not by adding skips.
-/// Indices are into Core `script_tests.json` (refreshed from bitcoin/bitcoin master).
-const ALLOWLIST: &[(usize, &str)] = &[
-    // Revealed when assembler used OP_1..OP_16: prior soft EVAL_FALSE masked Ok vs named code.
-    // 1189/1193 CSV residual: cleared after 003/004 (stale audit 2026-08-08).
-];
-
 /// Map our error / Ok to whether it matches Core's expected result code.
 fn outcome_matches(expect: &str, got: &Result<(), String>) -> bool {
     match expect {
@@ -880,23 +870,18 @@ struct RowStats {
     ran: u32,
     pass: u32,
     fail: u32,
-    allow_skip: u32,
     failures: Vec<String>,
-    used_allow: HashSet<usize>,
 }
 
 fn run_all_script_rows() -> RowStats {
     let root = load_json();
     let arr = root.as_array().expect("script_tests root array");
-    let allow_idx: HashSet<usize> = ALLOWLIST.iter().map(|(i, _)| *i).collect();
     let mut st = RowStats {
         total: 0,
         ran: 0,
         pass: 0,
         fail: 0,
-        allow_skip: 0,
         failures: Vec::new(),
-        used_allow: HashSet::new(),
     };
 
     for (idx, row) in arr.iter().enumerate() {
@@ -924,11 +909,6 @@ fn run_all_script_rows() -> RowStats {
                 Ok(v) => v,
                 Err(e) => {
                     st.total += 1;
-                    if allow_idx.contains(&idx) {
-                        st.allow_skip += 1;
-                        st.used_allow.insert(idx);
-                        continue;
-                    }
                     st.fail += 1;
                     if st.failures.len() < 40 {
                         st.failures.push(format!("#{idx} witness parse: {e}"));
@@ -963,12 +943,6 @@ fn run_all_script_rows() -> RowStats {
         let sig_bytes = match assemble(sig_s) {
             Ok(b) => b,
             Err(e) => {
-                // Assemble failure: treat as skip only if allowlisted.
-                if allow_idx.contains(&idx) {
-                    st.allow_skip += 1;
-                    st.used_allow.insert(idx);
-                    continue;
-                }
                 st.ran += 1;
                 st.fail += 1;
                 if st.failures.len() < 40 {
@@ -981,11 +955,6 @@ fn run_all_script_rows() -> RowStats {
         // Core: `0x51 0x20 #TAPROOTOUTPUT#` → OP_1 + 32-byte tweaked output key.
         let pk_bytes = if pk_s.trim() == "0x51 0x20 #TAPROOTOUTPUT#" {
             let Some(out) = tap_out else {
-                if allow_idx.contains(&idx) {
-                    st.allow_skip += 1;
-                    st.used_allow.insert(idx);
-                    continue;
-                }
                 st.ran += 1;
                 st.fail += 1;
                 if st.failures.len() < 40 {
@@ -1001,11 +970,6 @@ fn run_all_script_rows() -> RowStats {
             match assemble(pk_s) {
                 Ok(b) => b,
                 Err(e) => {
-                    if allow_idx.contains(&idx) {
-                        st.allow_skip += 1;
-                        st.used_allow.insert(idx);
-                        continue;
-                    }
                     st.ran += 1;
                     st.fail += 1;
                     if st.failures.len() < 40 {
@@ -1026,13 +990,6 @@ fn run_all_script_rows() -> RowStats {
             continue;
         }
 
-        // Explicit allowlist only — every skip id must be inventoried (AC2).
-        if allow_idx.contains(&idx) {
-            st.allow_skip += 1;
-            st.used_allow.insert(idx);
-            continue;
-        }
-
         st.fail += 1;
         if st.failures.len() < 40 {
             st.failures.push(format!(
@@ -1043,102 +1000,23 @@ fn run_all_script_rows() -> RowStats {
     st
 }
 
-/// True if this JSON index is a data row that **matches Core without** allowlist skip.
-fn script_row_matches_core_without_skip(idx: usize) -> Option<bool> {
-    let root = load_json();
-    let arr = root.as_array().expect("script_tests root array");
-    let row = arr.get(idx)?;
-    let Value::Array(cells) = row else {
-        return None;
-    };
-    if cells.is_empty() {
-        return None;
-    }
-    let is_witness_form = cells[0].is_array();
-    let is_plain = cells[0].as_str().is_some();
-    if !is_witness_form && !is_plain {
-        return None;
-    }
-    if is_plain && cells.len() < 4 {
-        return None;
-    }
-    if is_witness_form && cells.len() < 5 {
-        return None;
-    }
-    let (witness, amount, sig_s, pk_s, flags_s, expect_s, tap_out) = if is_witness_form {
-        let (w, amt, tout) = parse_witness_and_amount(&cells[0]).ok()?;
-        (
-            w,
-            amt,
-            cells[1].as_str().unwrap_or(""),
-            cells[2].as_str().unwrap_or(""),
-            cells[3].as_str().unwrap_or(""),
-            cells[4].as_str().unwrap_or(""),
-            tout,
-        )
-    } else {
-        (
-            Witness::new(),
-            Amount::ZERO,
-            cells[0].as_str().unwrap_or(""),
-            cells[1].as_str().unwrap_or(""),
-            cells[2].as_str().unwrap_or(""),
-            cells[3].as_str().unwrap_or(""),
-            None,
-        )
-    };
-    let flags = parse_flags(flags_s);
-    let sig_bytes = assemble(sig_s).ok()?;
-    let pk_bytes = if pk_s.trim() == "0x51 0x20 #TAPROOTOUTPUT#" {
-        let out = tap_out?;
-        let mut b = vec![0x51, 0x20];
-        b.extend_from_slice(&out);
-        b
-    } else {
-        assemble(pk_s).ok()?
-    };
-    let got = run_script_row(&sig_bytes, &pk_bytes, witness, amount, &flags);
-    Some(outcome_matches(expect_s, &got))
-}
-
-/// Fail if ALLOWLIST still lists rows that already match Core (stale debt).
-#[test]
-fn script_allowlist_has_no_stale_entries() {
-    let mut stale = Vec::new();
-    for &(idx, reason) in ALLOWLIST {
-        if let Some(true) = script_row_matches_core_without_skip(idx) {
-            stale.push((idx, reason));
-        }
-    }
-    for (idx, reason) in &stale {
-        eprintln!("stale allowlist #{idx}: {reason}");
-    }
-    assert!(
-        stale.is_empty(),
-        "remove {} stale script ALLOWLIST entries (already match Core)",
-        stale.len()
-    );
-}
-
 /// Full Core `script_tests.json` corpus: every data row via shipped verify path.
 #[test]
 fn core_script_tests_all_rows() {
     let st = run_all_script_rows();
     eprintln!(
-        "core script_tests: total={total} ran={ran} pass={pass} fail={fail} allow_skip={allow}",
+        "core script_tests: total={total} ran={ran} pass={pass} fail={fail}",
         total = st.total,
         ran = st.ran,
         pass = st.pass,
         fail = st.fail,
-        allow = st.allow_skip,
     );
     for f in &st.failures {
         eprintln!("  FAIL {f}");
     }
-    // Every allow_skip must be inventoried; no silent category soft-skips.
     assert!(
         st.fail == 0,
-        "core script_tests non-allowlisted failures: {} (see FAIL lines)",
+        "core script_tests failures: {} (see FAIL lines)",
         st.fail
     );
     assert!(
@@ -1147,31 +1025,10 @@ fn core_script_tests_all_rows() {
         st.total
     );
     assert_eq!(
-        st.allow_skip as usize,
-        st.used_allow.len(),
-        "allow_skip count must equal distinct inventoried skip ids used"
+        st.pass, st.ran,
+        "every ran row must pass (pass={} ran={})",
+        st.pass, st.ran
     );
-    assert!(
-        st.allow_skip as usize <= ALLOWLIST.len(),
-        "allow_skip={} exceeds ALLOWLIST size={}",
-        st.allow_skip,
-        ALLOWLIST.len()
-    );
-    // Fail if any used skip is not in ALLOWLIST (defensive; allow_idx already gates).
-    let inventory: std::collections::HashSet<usize> = ALLOWLIST.iter().map(|(i, _)| *i).collect();
-    for id in &st.used_allow {
-        assert!(
-            inventory.contains(id),
-            "skip id #{id} used but not in ALLOWLIST inventory"
-        );
-    }
-    // Report unused inventory entries (fixture refresh may leave stale ids) — not a hard fail
-    // only if count is small; stale entries are still explicit inventory.
-    for (idx, reason) in ALLOWLIST {
-        if !st.used_allow.contains(idx) {
-            eprintln!("  allowlist unused #{idx}: {reason}");
-        }
-    }
 }
 
 /// Spot-check: known-valid empty scriptSig + DEPTH 0 EQUAL must accept.

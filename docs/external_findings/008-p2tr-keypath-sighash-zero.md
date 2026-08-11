@@ -4,6 +4,8 @@
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — consensus accept-invalid
 **Status:** fixed — consensus reject on shipped path (2026-08-10)
+
+**Regression:** `rbitcoin-consensus` `script::p2tr::tests::key_path_rejects_65_byte_sighash_byte_zero`.
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

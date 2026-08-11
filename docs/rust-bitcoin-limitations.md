@@ -7,11 +7,11 @@ requires something else.
 **Pinned crate:** `bitcoin` **0.32.x** (workspace `Cargo.toml` / lock; currently
 `0.32.101` range). Update the pin note when the workspace bumps.
 
-**Not this doc:** Core corpus allowlist rows in `core_vectors.rs` /
-`core_tx_vectors.rs` — those track **our** incomplete interpreter/harness vs
-Core fixtures. See [`consensus-tests.md`](./consensus-tests.md). When a gap is
-“do not use this rust-bitcoin helper,” put it **here**; when it is “we have not
-implemented DERSIG hard-fail yet,” keep it on the allowlist until fixed.
+**Not this doc:** Core corpus harness rows in `core_vectors.rs` /
+`core_tx_vectors.rs` — every fixture row must pass (no allowlist). See
+[`consensus-tests.md`](./consensus-tests.md). When a gap is “do not use this
+rust-bitcoin helper,” put it **here**; when the engine still disagrees with Core,
+**fix the engine** before commit.
 
 ## Process
 
@@ -34,10 +34,10 @@ implemented DERSIG hard-fail yet,” keep it on the allowlist until fixed.
 | RB-005 | Soft-fork heights | rust-bitcoin `Params` heights ≠ Inquisition/Core buried heights we need (e.g. REGTEST bip34 huge; CSV regtest) | Own `ChainParams` overlay (`csv_height`, `segwit_height`, `taproot_height`, …) | `params.rs` | mitigated | Local mining / script flags |
 | RB-006 | PoW / retarget | Compact target / retarget math lives in rust-bitcoin | `expected_next_bits` / `validate_pow` via rust-bitcoin; H7 documented as delegated | `header.rs`; [consensus-tests H7](./consensus-tests.md) | mitigated | We do not reimplement PoW math |
 | RB-007 | BIP331 / wire types | Some P2P message types not exposed yet | Track outside script; COMPAT / experimental docs | `COMPAT.md`, `experimental-mainnet.md` | open | Not an allowlist issue |
-| RB-008 | Full script engine | rust-bitcoin is **not** a Core script consensus engine; we intentionally avoid `bitcoinconsensus` | In-tree pure-Rust `rbitcoin-consensus::script` | `architecture.md`; allowlist = **our** gaps | mitigated (by design) | Pay down allowlist separately |
+| RB-008 | Full script engine | rust-bitcoin is **not** a Core script consensus engine; we intentionally avoid `bitcoinconsensus` | In-tree pure-Rust `rbitcoin-consensus::script` | `architecture.md` | mitigated (by design) | Core corpora all-rows-pass |
 
 ## Related
 
-- Core corpus policy and allowlist history: [`consensus-tests.md`](./consensus-tests.md)
-- External differential findings (fixed 001–005): [`external_findings/`](./external_findings/)
+- Core corpus policy (no allowlist): [`consensus-tests.md`](./consensus-tests.md)
+- External differential findings (fixed 001–011): [`external_findings/`](./external_findings/)
 - Architecture script split: [`architecture.md`](./architecture.md)

@@ -4,6 +4,8 @@
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — 0-conf fraud / relay pollution (not consensus)
 **Status:** fixed — shipped accept path (2026-08) — structural tip checks + `is_final_tx` / BIP68 (plan 2026-08)
+
+**Regression:** `rbitcoin-mempool` `accept::tests::reject_non_final_locktime_height`, `reject_immature_coinbase` (structural chain context).
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

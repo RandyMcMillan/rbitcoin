@@ -24,9 +24,9 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 
 | Fixture | Path | Harness | Success criterion |
 |---------|------|---------|-------------------|
-| `script_tests.json` | `crates/rbitcoin-consensus/tests/fixtures/` | `script::core_vectors::core_script_tests_all_rows` | **every** data row run; `fail == 0` after allowlist |
-| `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept (or allowlisted) |
-| `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject (or allowlisted) |
+| `script_tests.json` | `crates/rbitcoin-consensus/tests/fixtures/` | `script::core_vectors::core_script_tests_all_rows` | **every** data row; `fail == 0` (no allowlist) |
+| `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept |
+| `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 
 ### How the harness works
 
@@ -36,25 +36,20 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 4. Call shipped **`verify_job_all_inputs(ScriptCheckJob)`** (or bare EvalScript+P2SH path when `WITNESS` flag is off — Core treats v0 programs as bare without that flag).
 5. Compare accept/reject to Core’s expected code. Named error codes only require **reject**, not exact code string.
 
-### Allowlist policy
+### No allowlist
 
 - Soft majority pass rates are **not** success criteria.
-- Skips must be **explicit per row**: `ALLOWLIST` in `core_vectors.rs` (`(json_row_index, reason)`) and `TX_ALLOWLIST` in `core_tx_vectors.rs` (`(file, index, reason)`).
-- **No open-ended flag-category soft-skips.** Every mismatch that is not a hard fail is inventoried by id; the harness asserts `allow_skip ≤ ALLOWLIST.len()` and every used skip id is in the inventory.
-- Unknown failures fail the test. Grow coverage by **removing** allowlist entries and fixing the engine.
-- **History:** Allowlists were introduced deliberately (`1f6d703`, refined `28d0c82`) so Core corpora could land with an honest inventory instead of soft majority gates. Goal is empty inventory, not a permanent skip list.
-- **Status (2026-08-08):** All three Core JSON corpora have **empty allowlists** and
-  `fail=0` / `allow_skip=0` on the shipped path:
-  - `script_tests.json`: 1233/1233
-  - `tx_valid.json`: 121/121 (fixture flags are **inverted** — listed flags stay off)
-  - `tx_invalid.json`: 93/93
+- There is **no** row skip inventory. A mismatch fails the test; fix the engine or
+  the fixture interpretation before commit.
+- **Status:** all three Core JSON corpora green on the shipped path
+  (`script_tests` ~1233/1233, `tx_valid` 121/121, `tx_invalid` 93/93).
 
-### rust-bitcoin vs our allowlist
+### rust-bitcoin vs Core fixtures
 
-| List | Meaning |
-|------|---------|
-| Allowlist rows | **Our** interpreter/harness still disagrees with Core fixtures |
-| [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | **rust-bitcoin** (or secp via it) is wrong/incomplete for Core consensus; we wrap or bypass |
+| Topic | Doc |
+|-------|-----|
+| rust-bitcoin gaps we wrap | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) |
+| External consensus findings | [`external_findings/`](./external_findings/) |
 
 ### Origin / update
 
@@ -106,7 +101,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 
 1. Add a row to the inventory above (or mark **rust-bitcoin** / **lib** if delegated).
 2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario.
-3. For Core corpora: prefer **removing** an allowlist entry after engine fixes over adding skips.
+3. For Core corpora: every row must pass; never reintroduce allowlist/skip debt.
 4. Assert on the **error signal** string/variant so removing the check fails the test.
 
 Dependency gate: `cargo tree -i bitcoinconsensus` must not resolve.

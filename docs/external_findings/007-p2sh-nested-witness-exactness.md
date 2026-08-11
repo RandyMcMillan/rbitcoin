@@ -4,6 +4,8 @@
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — consensus accept-invalid
 **Status:** fixed — consensus reject on shipped path (2026-08-10)
+
+**Regression:** `rbitcoin-consensus` `script::nested::tests::p2sh_nested_non_minimal_redeem_push_malleated` and related nested-witness exactness tests in `nested.rs`.
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

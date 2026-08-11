@@ -157,6 +157,8 @@ mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer roles / lock-free publish |
 | [`COMPAT.md`](./COMPAT.md) | Intentional differences vs Core / Electrum methods |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev workflow and coverage bar |
+| [`docs/quality.md`](./docs/quality.md) | Living quality roadmap (priorities + resolved) |
+| [`docs/how-we-plan.md`](./docs/how-we-plan.md) | Red→Green→Refactor planning |
 | [`SECURITY.md`](./SECURITY.md) | Vulnerability reporting |
 | [`CHANGELOG.md`](./CHANGELOG.md) | Release notes |
 | [`docs/reproducible-builds.md`](./docs/reproducible-builds.md) | Pinned Nix byte-identical builds |

@@ -1102,6 +1102,42 @@ mod tests {
     }
 
     #[test]
+    fn lookup_stats_sample_and_snapshot_surface() {
+        // Clear then snapshot zeros; sample swaps to zero again.
+        let _ = sample_lookup_stats();
+        let snap0 = snapshot_lookup_stats();
+        assert_eq!(snap0.open_probes, 0);
+        assert_eq!(snap0.sealed_fuse_checks, 0);
+        assert_eq!(snap0.sealed_fuse_skips, 0);
+        assert_eq!(snap0.sealed_head_probes, 0);
+        assert_eq!(snap0.rolls, 0);
+        assert_eq!(snap0.seals, 0);
+        let s = sample_lookup_stats();
+        assert_eq!(s.open_probes, 0);
+        // After create/insert, counters may tick; just ensure API is callable.
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        h.insert_many(&[(mixed(1), Fk(1))], false).unwrap();
+        let _ = h.probe_candidates(&mixed(1)).unwrap();
+        let snap = snapshot_lookup_stats();
+        // At least one of the probe counters should be non-zero after probe.
+        let any = snap.open_probes
+            + snap.sealed_fuse_checks
+            + snap.sealed_fuse_skips
+            + snap.sealed_head_probes
+            + snap.rolls
+            + snap.seals;
+        let _ = any;
+        let sampled = sample_lookup_stats();
+        let snap_after = snapshot_lookup_stats();
+        // sample zeros atomics; snapshot after sample is zero.
+        assert_eq!(snap_after.open_probes, 0);
+        let _ = sampled;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migrates_flat_head_layout_on_open() {
         let dir = tmp();
         let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();

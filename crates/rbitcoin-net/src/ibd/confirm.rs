@@ -2613,4 +2613,112 @@ mod tests {
         // Max 0 → empty.
         assert!(claim_feed_run(1, 0, 100, |_| true, |_| false).is_empty());
     }
+
+    /// All thr_stats counters + zero-duration no-op + note_wire prefer path.
+    #[test]
+    fn thr_stats_all_stages_and_note_wire_prefer() {
+        use super::confirm_thr_stats;
+        use std::time::Duration;
+        let _ = confirm_thr_stats::sample_and_reset();
+        // Zero duration must not bump counters.
+        confirm_thr_stats::add_lookup_claim(Duration::ZERO);
+        confirm_thr_stats::add_write_work(Duration::ZERO);
+        let z = confirm_thr_stats::sample_and_reset();
+        assert_eq!(z.lookup_claim_ns, 0);
+        assert_eq!(z.write_work_ns, 0);
+
+        let d = Duration::from_nanos(1_000);
+        confirm_thr_stats::add_lookup_claim(d);
+        confirm_thr_stats::add_lookup_resolve(d);
+        confirm_thr_stats::add_lookup_clone(d);
+        confirm_thr_stats::add_lookup_stamp(d);
+        confirm_thr_stats::add_lookup_other(d);
+        confirm_thr_stats::add_lookup_send_wait(d);
+        confirm_thr_stats::add_load_recv_wait(d);
+        confirm_thr_stats::add_load_work(d);
+        confirm_thr_stats::add_load_send_wait(d);
+        confirm_thr_stats::add_script_recv_wait(d);
+        confirm_thr_stats::add_script_work(d);
+        confirm_thr_stats::add_script_send_wait(d);
+        confirm_thr_stats::add_write_recv_wait(d);
+        confirm_thr_stats::add_write_work(d);
+        let s = confirm_thr_stats::sample_and_reset();
+        assert!(s.lookup_claim_ns >= 1_000);
+        assert!(s.lookup_resolve_ns >= 1_000);
+        assert!(s.lookup_clone_ns >= 1_000);
+        assert!(s.lookup_stamp_ns >= 1_000);
+        assert!(s.lookup_other_ns >= 1_000);
+        assert!(s.lookup_send_wait_ns >= 1_000);
+        assert!(s.load_recv_wait_ns >= 1_000);
+        assert!(s.load_work_ns >= 1_000);
+        assert!(s.load_send_wait_ns >= 1_000);
+        assert!(s.script_recv_wait_ns >= 1_000);
+        assert!(s.script_work_ns >= 1_000);
+        assert!(s.script_send_wait_ns >= 1_000);
+        assert!(s.write_recv_wait_ns >= 1_000);
+        assert!(s.write_work_ns >= 1_000);
+
+        // note_wire: prefer keeping wire when already noted without; ignore inflight.
+        let feed = ConfirmFeed::new();
+        feed.note(10, bh(1));
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(g.ready.get(&10).unwrap().1.is_none());
+        }
+        // Re-note with wire upgrades the optional slot.
+        let genesis =
+            rbitcoin_consensus::genesis_block(&rbitcoin_consensus::ChainParams::regtest());
+        feed.note_wire(10, bh(1), Some(genesis.clone()));
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(g.ready.get(&10).unwrap().1.is_some());
+        }
+        // Second note_wire with wire does not replace existing wire.
+        let kept_nonce = genesis.header.nonce;
+        let mut other = genesis.clone();
+        other.header.nonce = kept_nonce.wrapping_add(99);
+        feed.note_wire(10, bh(1), Some(other));
+        {
+            let g = feed.inner.lock().unwrap();
+            assert_eq!(
+                g.ready.get(&10).unwrap().1.as_ref().unwrap().header.nonce,
+                kept_nonce,
+                "must keep first wire, not replace"
+            );
+        }
+        // Inflight height ignores note_wire entirely.
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.inflight.insert(11);
+        }
+        feed.note_wire(11, bh(2), Some(genesis.clone()));
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(!g.ready.contains_key(&11));
+        }
+        // requeue into existing ready without wire upgrades it.
+        feed.requeue_wire(&[(10, bh(1), None)]);
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(g.ready.get(&10).unwrap().1.is_some());
+            assert!(!g.inflight.contains(&10));
+        }
+        // requeue into existing ready that already has no wire, supply wire.
+        feed.note(12, bh(3));
+        feed.requeue_wire(&[(12, bh(3), Some(genesis))]);
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(g.ready.get(&12).unwrap().1.is_some());
+        }
+
+        // pack_stop_after edges.
+        assert!(!super::pack_stop_after(0, 0, 8000, 144));
+        assert!(super::pack_stop_after(0, 144, 8000, 144));
+        assert!(super::pack_stop_after(8001, 1, 8000, 144));
+        assert!(!super::pack_stop_after(8000, 1, 8000, 144));
+        assert_eq!(
+            super::confirm_batch_max_inputs(),
+            super::CONFIRM_BATCH_INPUTS_DEFAULT
+        );
+    }
 }

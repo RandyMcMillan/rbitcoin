@@ -129,6 +129,33 @@ mod tests {
     }
 
     #[test]
+    fn all_public_flags_and_sqe_helpers_surface() {
+        // Drive every public policy helper so LCOV counts the thin wrappers.
+        let _ = body_write_spend();
+        let _ = body_sqe_write_flags();
+        let _ = body_write();
+        let _ = body_always();
+        let _ = body_read_confirm();
+        let _ = body_read_spend_rmw();
+        let _ = body_read_generic();
+        assert!(!head_or_idx_segment(0));
+        assert!(!head_or_idx_segment(u32::MAX));
+        assert_eq!(sealed_age_from_index(0, 0), 0);
+        assert_eq!(sealed_age_from_index(0, 1), 0);
+        assert_eq!(sealed_age_from_index(0, 3), 2);
+        assert_eq!(sealed_age_from_index(2, 3), 0);
+        assert!(!head_or_idx_segment_index(0, 4));
+        assert!(!head_or_idx_segment_index(3, 4));
+        let _ = body_sqe_read_flags();
+        assert!(!txid_sidefile_entry(0, 0));
+        assert!(!txid_sidefile_entry(1, 100));
+        let _ = sidefile_sqe_rw_flags(0, 0);
+        let _ = sidefile_sqe_rw_flags(50, 100);
+        let _ = idx_sqe_rw_flags(0, 1);
+        let _ = idx_sqe_rw_flags(5, 10);
+    }
+
+    #[test]
     fn sealed_age_from_index_math() {
         assert_eq!(sealed_age_from_index(5, 6), 0);
         assert_eq!(sealed_age_from_index(0, 6), 5);

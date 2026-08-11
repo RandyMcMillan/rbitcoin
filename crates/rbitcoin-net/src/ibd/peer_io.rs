@@ -647,5 +647,19 @@ mod tests {
             out2[0],
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 18444)
         );
+
+        // IPv6 multicast rejected; IPv6 limited-network accepted.
+        let v6_multi =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8333);
+        assert!(!usable_dial_addr(&v6_multi));
+        let v6_net = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333);
+        let v2_v6 = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK_LIMITED,
+            addr: AddrV2::Ipv6(Ipv6Addr::LOCALHOST),
+            port: 8333,
+        };
+        let out3 = socket_addrs_from_addrv2(&[v2_v6]);
+        assert_eq!(out3, vec![v6_net]);
     }
 }

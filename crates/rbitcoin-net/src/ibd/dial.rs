@@ -861,4 +861,136 @@ mod tests {
         assert!(!loc.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// median / pick edge matrix + mature-sample early exits + relative-slow early exits.
+    #[test]
+    fn relative_slow_pure_edges_and_mature_sample_filters() {
+        assert_eq!(median_u64(&[]), 0);
+        assert_eq!(median_u64(&[7]), 7);
+        assert_eq!(median_u64(&[2, 8]), 5);
+        assert_eq!(median_u64(&[1, 2, 3]), 2);
+        assert_eq!(relative_slow_min_samples(0), RELATIVE_SLOW_MIN_SAMPLES);
+
+        // All-zero bps → Gate A none.
+        let zeros: Vec<_> = (0..8).map(|i| samp(i, 0, true)).collect();
+        assert_eq!(relative_slow_pick(&zeros, 8), None);
+        // Zero lo with positive hi: allow Gate B; pick lowest inflight outlier.
+        let zero_and_fast = [
+            samp(0, 0, true),
+            samp(1, 2_000_000, true),
+            samp(2, 1_900_000, true),
+            samp(3, 1_800_000, true),
+            samp(4, 1_850_000, true),
+            samp(5, 1_950_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&zero_and_fast, 8), Some(0));
+
+        // Equal worst bps → lower peer_id wins.
+        let tie = [
+            samp(5, 400_000, true),
+            samp(2, 400_000, true),
+            samp(0, 2_000_000, true),
+            samp(1, 1_900_000, true),
+            samp(3, 1_800_000, true),
+            samp(4, 1_850_000, true),
+            samp(6, 1_880_000, true),
+            samp(7, 1_920_000, true),
+        ];
+        assert_eq!(relative_slow_pick(&tie, 8), Some(2));
+
+        // Mature filters: dead / no first_data / young / under bytes / no sample.
+        let dead = {
+            let s = dummy_slot(0, addr(20), false);
+            s.first_data_ms
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            s.bytes_rx.store(
+                RELATIVE_SLOW_MIN_BYTES,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            s
+        };
+        let no_first = {
+            let s = dummy_slot(1, addr(21), true);
+            s.bytes_rx.store(
+                RELATIVE_SLOW_MIN_BYTES * 2,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            s
+        };
+        let young = {
+            let s = dummy_slot(2, addr(22), true);
+            // first_data near "now" → age too small for RELATIVE_SLOW_MIN_AGE_MS.
+            s.first_data_ms
+                .store(ibd_mono_ms().max(1), std::sync::atomic::Ordering::Relaxed);
+            s.bytes_rx.store(
+                RELATIVE_SLOW_MIN_BYTES * 2,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            s
+        };
+        let thin = {
+            let s = dummy_slot(3, addr(23), true);
+            s.first_data_ms
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            s.bytes_rx.store(1024, std::sync::atomic::Ordering::Relaxed);
+            s
+        };
+        let samples = mature_relative_slow_samples(&[dead, no_first, young, thin]);
+        // Fresh process: none mature (age/bytes). Long-lived llvm-cov may mature
+        // a slot with first=1 + enough mono — still never includes dead/no_first.
+        assert!(samples.iter().all(|s| s.peer_id != 0 && s.peer_id != 1));
+
+        assert_eq!(global_first_block_ms(&[]), 0);
+        let a_empty = dummy_slot(10, addr(30), true);
+        assert_eq!(global_first_block_ms(std::slice::from_ref(&a_empty)), 0);
+        let b_dead = {
+            let mut s = dummy_slot(11, addr(31), true);
+            s.alive = false;
+            s.first_data_ms
+                .store(5, std::sync::atomic::Ordering::Relaxed);
+            s
+        };
+        assert_eq!(global_first_block_ms(std::slice::from_ref(&b_dead)), 0);
+        let a = {
+            let s = dummy_slot(10, addr(30), true);
+            s.first_data_ms
+                .store(42, std::sync::atomic::Ordering::Relaxed);
+            s
+        };
+        let c = {
+            let s = dummy_slot(12, addr(32), true);
+            s.first_data_ms
+                .store(10, std::sync::atomic::Ordering::Relaxed);
+            s
+        };
+        assert_eq!(global_first_block_ms(&[a, c]), 10);
+        // Warmup fails when age since global first < 60s (typical unit-test process).
+        let a2 = {
+            let s = dummy_slot(10, addr(30), true);
+            s.first_data_ms
+                .store(10, std::sync::atomic::Ordering::Relaxed);
+            s
+        };
+        let warm = relative_slow_global_warmup_ok(std::slice::from_ref(&a2));
+        if ibd_mono_ms().saturating_sub(10) < RELATIVE_SLOW_GLOBAL_WARMUP_MS {
+            assert!(!warm);
+        }
+
+        // disconnect_relative_slow: fail warmup → clear suspect; thin samples → clear.
+        let mut slots = [dummy_slot(1, addr(40), true)];
+        let mut inflight = HashMap::new();
+        let mut cooldown = HashMap::new();
+        let mut suspect = Some(1usize);
+        disconnect_relative_slow_block_peers(
+            &mut slots,
+            &mut inflight,
+            &mut cooldown,
+            Instant::now(),
+            &mut suspect,
+        );
+        assert!(suspect.is_none());
+        assert!(cooldown.is_empty());
+    }
 }

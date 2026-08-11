@@ -535,6 +535,9 @@ mod tests {
     ///
     /// Fixture: `testdata/head_resolve_cand_fks.sample.json` or
     /// `RBITCOIN_CAND_FK_FIXTURE=/path/to.json`.
+    /// `not(coverage)`: exclude diagnostic microbench body from LCOV LF (llvm-cov
+    /// sets `cfg(coverage)`). Still runnable with `--ignored` in normal test builds.
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "dev microbench; not a CI gate"]
     fn id_stage_page_group_microbench() {

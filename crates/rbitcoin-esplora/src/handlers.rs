@@ -926,3 +926,91 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
+
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::{block_summary_json, resolve_address_sh};
+    use bitcoin::Network;
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{Query, TxApply};
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_query() -> (std::path::PathBuf, Query) {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-pure-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        (dir, q)
+    }
+
+    fn seed_genesis(q: &Query) -> [u8; 32] {
+        let merkle = [0xab; 32];
+        let hash = rbitcoin_store::block_header_hash(1, &[0u8; 32], &merkle, 1, 0x207f_ffff, 0);
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207f_ffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash,
+        };
+        let ta = TxApply {
+            tx: TxRecord {
+                txid: [0xcb; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x00],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let _ = q.connect_block(Height(0), &header, &[ta]).unwrap();
+        hash
+    }
+
+    #[test]
+    fn resolve_address_sh_and_block_summary_surface() {
+        // Invalid / wrong-network addresses.
+        assert!(resolve_address_sh("not-an-address", Network::Bitcoin).is_err());
+        assert!(resolve_address_sh(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            Network::Regtest
+        )
+        .is_err());
+        // Well-known mainnet P2WPKH.
+        let sh = resolve_address_sh(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            Network::Bitcoin,
+        )
+        .expect("mainnet p2wpkh");
+        assert_ne!(sh, [0u8; 32]);
+
+        let (dir, q) = temp_query();
+        let hash = seed_genesis(&q);
+        let summary = block_summary_json(&q, &hash).expect("genesis summary");
+        assert_eq!(summary["height"], 0);
+        assert_eq!(summary["tx_count"], 1);
+        assert!(summary["previousblockhash"].is_null());
+        assert!(summary["id"].as_str().unwrap().len() == 64);
+        assert!(summary["difficulty"].as_f64().unwrap() > 0.0);
+        // Unknown hash → NotFound class error.
+        assert!(block_summary_json(&q, &[0x11; 32]).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

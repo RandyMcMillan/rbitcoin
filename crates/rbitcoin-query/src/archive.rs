@@ -1383,4 +1383,77 @@ mod tests {
         assert_eq!(plan.spends.len(), 1);
         assert_eq!(plan.spends[0].2, Fk(3));
     }
+
+    /// retain_headers edges: empty ranges, all have body, no-op full keep, null fks.
+    #[test]
+    fn retain_headers_needing_body_edge_matrix() {
+        let dummy_pin = |i: u8| {
+            std::sync::Arc::new((
+                TxRecord {
+                    txid: [i; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                },
+                Vec::new(),
+                Vec::new(),
+            ))
+        };
+
+        // No per_header_ranges: keep iff packed non-empty.
+        let mut empty_ranges = super::ArchiveWritePlan::empty();
+        empty_ranges.packed = vec![(dummy_pin(1), Vec::new())];
+        assert!(empty_ranges
+            .retain_headers_needing_body(|_| Ok(false))
+            .unwrap());
+        let mut empty_all = super::ArchiveWritePlan::empty();
+        assert!(!empty_all
+            .retain_headers_needing_body(|_| Ok(false))
+            .unwrap());
+
+        // All headers already have body → clear plan, false.
+        let mut all_have = super::ArchiveWritePlan::empty();
+        all_have.planned_fks = vec![Fk(1), Fk(2)];
+        all_have.per_header_ranges = vec![(Fk(10), Fk(1), 1), (Fk(20), Fk(2), 1)];
+        all_have.packed = vec![(dummy_pin(1), Vec::new()), (dummy_pin(2), Vec::new())];
+        all_have.batch_pin = vec![dummy_pin(1), dummy_pin(2)];
+        all_have.batch_creates = vec![([1u8; 32], Fk(1)), ([2u8; 32], Fk(2))];
+        assert!(!all_have.retain_headers_needing_body(|_| Ok(true)).unwrap());
+        assert!(all_have.is_empty());
+        assert!(all_have.per_header_ranges.is_empty());
+
+        // Full keep (no strip): true without compact.
+        let mut full = super::ArchiveWritePlan::empty();
+        full.planned_fks = vec![Fk(1)];
+        full.per_header_ranges = vec![(Fk(10), Fk(1), 1)];
+        full.packed = vec![(dummy_pin(1), Vec::new())];
+        full.batch_pin = vec![dummy_pin(1)];
+        assert!(full.retain_headers_needing_body(|_| Ok(false)).unwrap());
+        assert_eq!(full.planned_fks, vec![Fk(1)]);
+
+        // Null planned fk skipped during compact.
+        let mut with_null = super::ArchiveWritePlan::empty();
+        with_null.planned_fks = vec![Fk::NULL, Fk(5)];
+        with_null.per_header_ranges = vec![(Fk(1), Fk::NULL, 1), (Fk(2), Fk(5), 1)];
+        with_null.packed = vec![(dummy_pin(0), Vec::new()), (dummy_pin(5), Vec::new())];
+        with_null.batch_pin = vec![dummy_pin(0), dummy_pin(5)];
+        // Header 1 already has body; header 2 needs body (first=Fk(5)).
+        assert!(with_null
+            .retain_headers_needing_body(|hfk| Ok(hfk == Fk(1)))
+            .unwrap());
+        assert_eq!(with_null.planned_fks, vec![Fk(5)]);
+
+        // external_parent_txid / clear_external / append empty other.
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.external_parent_txids.insert(7, [0xab; 32]);
+        assert_eq!(plan.external_parent_txid(7), Some([0xab; 32]));
+        assert!(plan.external_parent_txid(8).is_none());
+        plan.clear_external_parent_outs();
+        assert!(plan.external_parent_txids.is_empty());
+        plan.append(super::ArchiveWritePlan::empty());
+        assert!(plan.is_empty());
+    }
 }

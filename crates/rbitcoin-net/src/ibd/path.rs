@@ -183,6 +183,29 @@ mod tests {
         assert_eq!(tips, vec![h(3), h(1)]);
     }
 
+    /// Exploration tips merge into locator tips (cap 8, dedupe ordered members).
+    #[test]
+    fn work_path_tips_includes_explore_tips_capped() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(10));
+        for n in 1u8..=3 {
+            let hash = h(n);
+            st.ordered.push_back(hash);
+            st.ordered_set.insert(hash);
+        }
+        // Explore tips: one already on ordered (dedupe), plus many unique.
+        let mut need = Vec::new();
+        for n in 10u8..=20 {
+            need.push(h(n));
+        }
+        st.reorg.register_explore(need, Some(h(20)));
+        let tips = work_path_tips(&st);
+        assert!(tips.contains(&h(3))); // ordered newest
+        assert!(tips.contains(&h(20))); // explore tip
+        assert!(tips.len() <= 8);
+        // h(1) is on ordered (taken in first 4) so not re-added as explore.
+        assert_eq!(tips.iter().filter(|x| **x == h(1)).count(), 1);
+    }
+
     #[test]
     fn seed_work_path_from_empty_and_genesis_store() {
         use super::seed_work_path_from_store;

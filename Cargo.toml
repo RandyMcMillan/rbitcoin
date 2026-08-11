@@ -64,6 +64,9 @@ mimalloc = "0.1"
 # Fail the build on rustc warnings (unused imports, dead code, …).
 [workspace.lints.rust]
 warnings = "deny"
+# cargo-llvm-cov sets `cfg(coverage)` so diagnostic microbenches can use
+# `#[cfg(not(coverage))]` and stay out of the first-party LCOV denominator.
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(coverage)'] }
 
 # Clippy: CI runs `clippy … -- -D warnings`. Correctness/suspicious stay on (default
 # deny via clippy). Allow style/complexity noise that would otherwise require

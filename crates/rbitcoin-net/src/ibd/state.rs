@@ -340,4 +340,42 @@ mod tests {
         assert!(st.hash_height.contains_key(&keep));
         assert!(st.header_fks.contains_key(&keep));
     }
+
+    /// InflightReq::default + known_headers prune when known ≫ live ordered set.
+    #[test]
+    fn inflight_default_and_known_headers_hygiene_prune() {
+        let d = InflightReq::default();
+        assert!(d.peers.is_empty());
+        assert!(d.second_peer_at.is_none());
+        // started_at is Instant::now() — just ensure it is in the past/near now.
+        assert!(d.started_at.elapsed().as_secs() < 5);
+
+        let tip = h(0);
+        let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(1));
+        // Keep tip on the live ordered path so prune retain keeps it.
+        st.ordered.push_back(tip);
+        st.ordered_set.insert(tip);
+        // Flood known_headers past live+4096 threshold.
+        for i in 1u32..=4200 {
+            let mut b = [0u8; 32];
+            b[0..4].copy_from_slice(&i.to_le_bytes());
+            let hash = BlockHash::from_byte_array(b);
+            st.known_headers.insert(hash);
+            st.hash_height.insert(hash, i);
+            st.header_fks.insert(hash, Fk(u64::from(i)));
+        }
+        assert!(st.known_headers.len() > 4096);
+        // Force periodic hygiene path.
+        st.hygiene_counter = 31;
+        st.hygiene();
+        // Only live ordered (+ inflight) remains in known; bulk pruned.
+        assert!(
+            st.known_headers.len() <= 64,
+            "known_headers should prune when ≫ ordered: {}",
+            st.known_headers.len()
+        );
+        assert!(st.known_headers.contains(&tip));
+        // Auxiliary maps follow known after prune.
+        assert!(st.hash_height.len() <= st.known_headers.len().saturating_add(8));
+    }
 }

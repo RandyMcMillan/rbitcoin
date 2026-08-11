@@ -1811,4 +1811,87 @@ mod tests {
         assert_eq!(lay.body_range, Some((500, 80)));
         assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(520));
     }
+
+    /// PipelineParentStore size_snapshot / gc + set_layout_sparse / body_range_only edges.
+    #[test]
+    fn pipeline_store_snapshot_gc_and_layout_sparse_surface() {
+        let store = Arc::new(PipelineParentStore::new());
+        assert_eq!(store.size_snapshot(), (0, 0, 0));
+        assert_eq!(store.live_count(), 0);
+        store.gc_dead_weaks(); // empty map no-op
+
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 8);
+        // Null / missing pin early-outs (set_layout_sparse + set_body_range_only).
+        bp.set_layout_sparse(Fk::NULL, (0, 10), vec![(0, 1)], &[]);
+        bp.set_layout_sparse(Fk(99), (0, 10), vec![(0, 1)], &[0]);
+        bp.set_body_range_only(Fk::NULL, (1, 2));
+        bp.set_body_range_only(Fk(99), (1, 2));
+        bp.set_layout(Fk::NULL, (0, 1), &[1]);
+        bp.set_layout_for_need(Fk(99), (0, 1), &[1], &[]);
+
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10)), (1, out(20))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        bp.insert_owned(
+            Fk(2),
+            tx(2),
+            vec![(0, out(30))],
+            vec![0],
+            Some(false),
+            Some((100, 40)),
+            vec![(0, 5)],
+        );
+        bp.publish_to_store();
+        let (weak, live, bytes) = store.size_snapshot();
+        assert_eq!(weak, 2);
+        assert_eq!(live, 2);
+        assert!(bytes > 0);
+
+        // Grow checked via extra_need, then fill sparse layout.
+        bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[1]);
+        assert!(bp.has_parent_out(Fk(1), 0));
+        assert_eq!(bp.get_body_range(Fk(1)), Some((200, 50)));
+        assert!(bp.has_abs_layout(Fk(1)));
+        assert!(bp.has_spender_rels(Fk(1)));
+        // No-op when layout already covers same range+rels.
+        bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[]);
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(208));
+
+        // set_body_range_only updates range; same range is no-op.
+        bp.set_body_range_only(Fk(2), (300, 60));
+        assert_eq!(bp.get_body_range(Fk(2)), Some((300, 60)));
+        bp.set_body_range_only(Fk(2), (300, 60));
+        assert_eq!(bp.get_body_range(Fk(2)), Some((300, 60)));
+
+        // Drop all strong refs → Weaks die; gc shrinks map.
+        drop(bp);
+        assert_eq!(store.live_count(), 0);
+        let (weak_dead, live_dead, _) = store.size_snapshot();
+        assert_eq!(live_dead, 0);
+        assert!(weak_dead >= 2, "dead Weaks still occupy slots until gc");
+        store.gc_dead_weaks();
+        let (weak_after, live_after, bytes_after) = store.size_snapshot();
+        assert_eq!(weak_after, 0);
+        assert_eq!(live_after, 0);
+        assert_eq!(bytes_after, 0);
+    }
+
+    /// has_abs_layout / has_spender_rels null and missing pins.
+    #[test]
+    fn has_layout_helpers_null_and_missing() {
+        let bp = BatchParents::new();
+        assert!(!bp.has_abs_layout(Fk::NULL));
+        assert!(!bp.has_abs_layout(Fk(1)));
+        assert!(!bp.has_spender_rels(Fk::NULL));
+        assert!(!bp.has_spender_rels(Fk(1)));
+        assert!(bp.get_parent_tx(Fk::NULL).is_none());
+        assert!(bp.get_parent_coinbase(Fk::NULL).is_none());
+        assert!(bp.get_body_range(Fk::NULL).is_none());
+    }
 }

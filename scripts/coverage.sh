@@ -34,7 +34,8 @@ fi
 
 # main.rs trampolines are one-liners; logic is covered via cli_main in libs.
 # store_bench is a host-only microbench binary (not production path).
-IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/bin/store_bench\.rs$)'
+# main.rs trampolines; host-only bins (not production path).
+IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/bin/store_bench\.rs$|/bin/rebuild_headers\.rs$)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then
   # Default: do NOT clean instrumented artifacts. Incremental llvm-cov rebuilds

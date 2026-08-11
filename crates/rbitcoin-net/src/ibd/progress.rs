@@ -557,5 +557,24 @@ mod tests {
         let eta = steady.eta_string(now, 400, 7_600);
         assert!(eta.starts_with("eta="), "{eta}");
         assert!(eta.contains('h') || eta.contains('m'), "{eta}");
+
+        // Sub-0.5s dt does not update EMA; cold tracker still eta=?
+        let mut tiny = TipRateTracker::new();
+        tiny.push(t0, 10);
+        tiny.push(t0 + Duration::from_millis(100), 11);
+        assert!(tiny.eta_rate(t0 + Duration::from_millis(100)).is_none());
+        // tip >= horizon → "done"
+        let mut warm = TipRateTracker::new();
+        for i in 0u32..=40 {
+            warm.push(t0 + Duration::from_secs(u64::from(i) * 2), i * 2);
+        }
+        assert_eq!(
+            warm.eta_string(t0 + Duration::from_secs(100), 10_000, 100),
+            "done"
+        );
+        assert_eq!(
+            warm.eta_string(t0 + Duration::from_secs(100), 100, 100),
+            "done"
+        );
     }
 }

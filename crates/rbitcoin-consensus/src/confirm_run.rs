@@ -3042,6 +3042,88 @@ mod write_idempotent_tests {
         let c = batch_one(12);
         assert!(a.append_contiguous(c).is_ok());
         assert_eq!(a.len(), 3);
+
+        // Empty other is no-op.
+        assert!(a
+            .append_contiguous(ScriptOkBatch {
+                prepared: vec![],
+                wire_blocks: vec![],
+                batch_parents: rbitcoin_query::BatchParents::new(),
+                archive_plan: None,
+            })
+            .is_ok());
+        assert_eq!(a.len(), 3);
+
+        // Empty self absorbs other.
+        let mut empty = ScriptOkBatch {
+            prepared: vec![],
+            wire_blocks: vec![],
+            batch_parents: rbitcoin_query::BatchParents::new(),
+            archive_plan: None,
+        };
+        assert!(empty.append_contiguous(batch_one(50)).is_ok());
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty.heights_hashes()[0].0, 50);
+        assert!(!empty.is_empty());
+        assert!(empty.approx_wire_bytes() > 0);
+        assert_eq!(empty.parent_count(), 0);
+
+        // Wire/prepared length mismatch on contiguous height → Err(other).
+        let mut good = batch_one(60);
+        let mut bad = batch_one(61);
+        bad.wire_blocks.clear();
+        let err = good.append_contiguous(bad).err().expect("len mismatch");
+        assert_eq!(err.len(), 1);
+
+        // archive_plan merge: None + Some, Some + Some, Some + None.
+        let mut with_plan = batch_one(70);
+        with_plan.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
+        let mut next = batch_one(71);
+        next.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
+        assert!(with_plan.append_contiguous(next).is_ok());
+        assert!(with_plan.archive_plan.is_some());
+        let mut only_other = batch_one(72);
+        // Self plan remains Some; other None keeps it.
+        only_other.archive_plan = None;
+        assert!(with_plan.append_contiguous(only_other).is_ok());
+        assert!(with_plan.archive_plan.is_some());
+        // Self None absorbs other's plan.
+        let mut no_plan = batch_one(80);
+        let mut has = batch_one(81);
+        has.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
+        assert!(no_plan.append_contiguous(has).is_ok());
+        assert!(no_plan.archive_plan.is_some());
+    }
+
+    /// denserels ensure with no plan is a pure no-op warm path.
+    #[test]
+    fn ensure_external_parent_denserels_none_plan_is_noop() {
+        use super::ensure_external_parent_denserels_from_plan;
+        use rbitcoin_query::Query;
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-denserels-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        let st = ensure_external_parent_denserels_from_plan(&q, None, None).unwrap();
+        assert_eq!(st.parents, 0);
+        // Empty plan mut ref also no-ops past collect.
+        let mut empty = rbitcoin_query::ArchiveWritePlan::empty();
+        let st2 = ensure_external_parent_denserels_from_plan(&q, Some(&mut empty), None).unwrap();
+        assert_eq!(st2.parents, 0);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// Heights at or below tip must be stripped before structural write

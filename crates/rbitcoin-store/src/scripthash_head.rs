@@ -1639,6 +1639,10 @@ mod tests {
     }
 
     /// Diagnostic wall-time arm of batch seed (not default suite).
+    ///
+    /// `not(coverage)`: cargo-llvm-cov sets `cfg(coverage)` — keep this body out of
+    /// the first-party LCOV LF denominator (still runnable with `--ignored` off-cov).
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "diagnostic microbench; run with --ignored --nocapture"]
     fn microbench_get_many_wall_vs_serial_seed() {

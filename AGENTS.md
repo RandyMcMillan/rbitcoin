@@ -150,12 +150,27 @@ cargo test --workspace
 Expand clippy allows only for real noise after a toolchain bump — prefer
 fixing the code.
 
+### Multi-step plan execution (targeted mid-plan; full gates at end)
+
+When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs/how-we-plan.md)):
+
+| Phase | Expectation |
+|-------|-------------|
+| **Each intermediate step** | Targeted tests for crates/modules touched; logical commits with public hygiene. Do **not** require full workspace suite, full coverage, or musl install after every slice. |
+| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%), **one** musl build + install. |
+| **Push to master** | Still must keep CI green — do not push intermediate commits that fail the required `test` job if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
+
+Single-shot turns (one bugfix, no multi-step plan) still follow the full commit
+recipe below including musl when code changes.
+
 ### Coverage job
 
 `./scripts/coverage.sh` enforces **≥90% first-party line coverage** (LCOV
 `LH`/`LF`; see `COVERAGE.md`). It runs as a **required** CI job (slow). Prefer
 running it when touching store/query/consensus hot paths. Prefer not to grow
 uncovered production regions; the 90% bar applies to new and existing code.
+During multi-step plans, run coverage at **plan end** (not every step) unless
+the step’s contract is the coverage gate itself.
 
 If a change cannot pass required gates, **do not commit it as done** — fix, split,
 or get explicit user approval for a temporary exception (prefer none).
@@ -177,11 +192,15 @@ Green-then-refactor is fine as **two** commits when each stands alone (tests sti
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
-1. **Pass CI gates** (fmt / clippy / tests — see above). A commit that fails GitHub Actions is incomplete work.
+1. **Pass tests for what you touched** (targeted during multi-step plans; full
+   workspace suite when finishing a plan or for single-shot turns). A commit that
+   would fail GitHub Actions `test` is incomplete work if pushed.
 2. **Commit** following the public hygiene table above. Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-3. **Rebuild and install the portable static musl release** so
-   `./target/release/rbitcoin-node` matches the tree. This is **mandatory every
-   code-changing turn** — not optional after tests.
+3. **Musl install:** for **single-shot** code-changing turns, rebuild and install
+   the portable static musl release so `./target/release/rbitcoin-node` matches
+   the tree. For **multi-step plan execution**, defer musl to the **final plan
+   step** (with full suite + coverage) — do not `nix build .#rbitcoin-musl` after
+   every intermediate slice.
 
 ### Required recipe (only this — single `nix build`)
 

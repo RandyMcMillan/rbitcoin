@@ -171,6 +171,23 @@ Aligned with AGENTS.md TDD + suite speed:
 | Prefer synthetic `/tmp` fixtures; no agent-VM mainnet open | |
 | After Refactor, same tests still pass; only drop **duplicate** tests | |
 
+### Mid-plan gates vs plan-end gates
+
+Multi-step plan execution uses **targeted** verification between slices.
+**Full** workspace suite, coverage, and musl install run **once at plan end**
+(or release) — not after every intermediate commit — unless the story *is*
+those gates.
+
+| When | Run |
+|------|-----|
+| **Each plan step** | Targeted tests for crates/modules touched (`cargo test -p …`); optional crate-local clippy; Red→green on the step contract |
+| **Not mid-plan** | `cargo test --workspace`, `./scripts/coverage.sh`, full workspace `clippy … -D warnings`, `nix build .#rbitcoin-musl` / musl install |
+| **Final plan step only** | `cargo fmt --all -- --check`, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%), **then** one musl build + install to `target/release/` |
+
+Logical commits per step still follow public hygiene; each checkpoint must leave
+**targeted** tests green. Master CI remains the bar for pushes; plan-end is when
+the agent proves the full local gate set.
+
 **Suite speed is a first-class planning constraint.** More steps ⇒ more tests ⇒
 we must keep each Red thin. A plan that multiplies multi-second full-store opens
 is a bad plan even if slices are “vertical.”

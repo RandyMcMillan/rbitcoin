@@ -14,6 +14,9 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
     };
     let tip_h = hub.tip_height().unwrap_or(0);
     let t0 = Instant::now();
+    // Operator breadcrumb: crash between "peers ready" and this line is in
+    // resume_work_path (header graph walk), not getdata assign.
+    info!("ibd: resume seed walk start tip={tip_h} max_ordered={MAX_ORDERED_HEADERS}");
     let path = match hub.query.resume_work_path_after_tip(
         tip_hash.to_byte_array(),
         tip_h,

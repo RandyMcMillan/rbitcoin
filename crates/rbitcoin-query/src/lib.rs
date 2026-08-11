@@ -1916,30 +1916,59 @@ impl Query {
     ///
     /// Used by [`Self::resume_work_path_after_tip`] to prefer most-work children
     /// over body-only archived losers.
+    ///
+    /// **Iterative** post-order walk (memoized). A recursive DFS stack-overflowed
+    /// (SIGSEGV) on mainnet IBD restart when tip lagged the stored header band by
+    /// tens of thousands of heights (e.g. tip≈671k with ~64k headers already on
+    /// disk after an interrupted catch-up). Peer/assign logic is not on this path —
+    /// crash was always in resume seed before the first getdata assign.
     fn resume_subtree_score(
         store: &rbitcoin_store::Store,
         children: &U64Map<Vec<(Fk, [u8; 32])>>,
         root: Fk,
     ) -> Result<(bitcoin::Work, u32), QueryError> {
         use bitcoin::{CompactTarget, Target};
-        let rec = store.get_header(root)?;
-        let own = Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work();
-        let Some(kids) = children.get(&root.0) else {
-            return Ok((own, 1));
-        };
-        if kids.is_empty() {
-            return Ok((own, 1));
-        }
-        let mut best_child_w = bitcoin::Work::from_be_bytes([0u8; 32]);
-        let mut best_depth = 0u32;
-        for &(fk, _) in kids {
-            let (w, d) = Self::resume_subtree_score(store, children, fk)?;
-            if w > best_child_w || (w == best_child_w && d > best_depth) {
-                best_child_w = w;
-                best_depth = d;
+        // memo[fk] = (work, depth) for completed subtrees.
+        let mut memo: U64Map<(bitcoin::Work, u32)> = U64Map::default();
+        // false = first visit (push children), true = children done (fold).
+        let mut stack: Vec<(Fk, bool)> = Vec::with_capacity(256);
+        stack.push((root, false));
+        while let Some((fk, children_done)) = stack.pop() {
+            if memo.contains_key(&fk.0) {
+                continue;
             }
+            if !children_done {
+                stack.push((fk, true));
+                if let Some(kids) = children.get(&fk.0) {
+                    for &(ck, _) in kids {
+                        if !memo.contains_key(&ck.0) {
+                            stack.push((ck, false));
+                        }
+                    }
+                }
+                continue;
+            }
+            let rec = store.get_header(fk)?;
+            let own = Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work();
+            let mut best_child_w = bitcoin::Work::from_be_bytes([0u8; 32]);
+            let mut best_depth = 0u32;
+            if let Some(kids) = children.get(&fk.0) {
+                for &(ck, _) in kids {
+                    let Some(&(w, d)) = memo.get(&ck.0) else {
+                        // Cycle / incomplete child — treat as zero (corrupt graph).
+                        continue;
+                    };
+                    if w > best_child_w || (w == best_child_w && d > best_depth) {
+                        best_child_w = w;
+                        best_depth = d;
+                    }
+                }
+            }
+            memo.insert(fk.0, (own + best_child_w, best_depth.saturating_add(1)));
         }
-        Ok((own + best_child_w, best_depth.saturating_add(1)))
+        memo.get(&root.0).copied().ok_or_else(|| {
+            StoreError::Corrupt("resume_subtree_score: root missing after walk".into())
+        })
     }
 
     /// Flush header rows + Class A body associations (IBD writer durability).
@@ -3188,6 +3217,33 @@ mod tests {
             path.len() >= 2 && path[1].hash == w2.hash,
             "continue W path: {path:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deep header band after tip (mid-IBD restart). Recursive subtree scoring
+    /// stack-overflowed here on mainnet (~64k headers ahead of tip 671583).
+    #[test]
+    fn resume_work_path_deep_chain_after_tip_no_stack_overflow() {
+        let (dir, q) = temp_query("resume-deep");
+        let (g, tg) = coinbase_block(0, Fk::NULL, None);
+        let mut prev_fk = q.put_header(&g).unwrap();
+        let _ = q.archive_block(&g, &[tg]).unwrap();
+        let mut prev_hash = g.hash;
+        // Tall enough that recursive DFS would blow a default ~2–8 MiB stack
+        // when scoring the child under tip.
+        const DEPTH: u32 = 12_000;
+        for i in 1..=DEPTH {
+            let (h, _) = coinbase_block(i, prev_fk, Some(prev_hash));
+            prev_fk = q.put_header(&h).unwrap();
+            prev_hash = h.hash;
+        }
+        // Tip = genesis; path should walk the long child chain (capped by max).
+        let path = q
+            .resume_work_path_after_tip(g.hash, 0, 32)
+            .expect("deep resume must not stack-overflow");
+        assert_eq!(path.len(), 32, "capped walk length");
+        assert_eq!(path[0].height, 1);
+        assert_eq!(path[31].height, 32);
         let _ = std::fs::remove_dir_all(dir);
     }
 

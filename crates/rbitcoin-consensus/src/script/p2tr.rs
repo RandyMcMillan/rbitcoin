@@ -72,6 +72,11 @@ fn verify_key_path(
     let (sig_bytes, sighash_ty) = if sig_raw.len() == 64 {
         (sig_raw, TapSighashType::Default)
     } else if sig_raw.len() == 65 {
+        // BIP341: 65-byte form with sighash byte 0x00 is invalid (Core /
+        // EvalChecksigTapscript). Mirror tapscript `checksig_schnorr`.
+        if sig_raw[64] == 0x00 {
+            return Err(ConsensusError::Script("p2tr sighash type".into()));
+        }
         let ty = TapSighashType::from_consensus_u8(sig_raw[64])
             .map_err(|_| ConsensusError::Script("p2tr sighash type".into()))?;
         (&sig_raw[..64], ty)
@@ -369,6 +374,84 @@ mod bip341_tests {
             const_scriptcode: false,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
+    }
+
+    /// Finding 008: 65-byte key-path sig with sighash byte 0x00 is invalid (BIP341).
+    #[test]
+    fn key_path_rejects_65_byte_sighash_byte_zero() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[4u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
+        let output_key = tweaked.to_keypair().x_only_public_key().0;
+
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(output_key),
+        };
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let mut cache = SighashCache::new(&tx);
+        let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
+        let sighash = cache
+            .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
+            .unwrap();
+        let msg = Message::from_digest(sighash.to_byte_array());
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
+        // Valid 64-byte form, then append illegal 0x00 sighash byte.
+        let mut sig65 = sig.as_ref().to_vec();
+        sig65.push(0x00);
+        tx.input[0].witness = Witness::from_slice(&[sig65.as_slice()]);
+
+        let job = ScriptCheckJob {
+            txid: [0u8; 32],
+            prevouts: vec![prevout],
+            tx: crate::block::JobTx::owned(tx.clone()),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
+            const_scriptcode: false,
+        };
+        let err = script::verify_job_all_inputs(&job).expect_err("0x00 sighash must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sighash") || msg.contains("p2tr"),
+            "expected key-path sighash reject, got {err}"
+        );
+
+        // Control: plain 64-byte still accepted (same key material as above).
+        let mut tx64 = (*job.tx).clone();
+        tx64.input[0].witness = Witness::from_slice(&[sig.as_ref()]);
+        let job64 = ScriptCheckJob {
+            tx: crate::block::JobTx::owned(tx64),
+            prevouts: job.prevouts.clone(),
+            ..job
+        };
+        script::verify_job_all_inputs(&job64).expect("64-byte Default key-path control");
     }
 
     /// BIP341: annex (last item starting with 0x50) is part of the key-path sighash.

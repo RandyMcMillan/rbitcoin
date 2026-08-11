@@ -376,27 +376,24 @@ fn check_witness_commitment_with_wtxids(
     leaves.push([0u8; 32]); // coinbase wtxid
     leaves.extend_from_slice(precomputed_non_cb);
     let witness_root = merkle_root_bytes(&leaves);
+    // BIP141 / Core: when commitment is present, coinbase witness must be
+    // exactly one 32-byte reserved value (bad-witness-nonce-size otherwise).
+    let wit = &coinbase.input[0].witness;
+    if wit.len() != 1 {
+        return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
+    }
+    let reserved = wit
+        .nth(0)
+        .ok_or(ConsensusError::BadBlock("bad-witness-nonce-size"))?;
+    if reserved.len() != 32 {
+        return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
+    }
     // commitment hash = SHA256D(witness_root || witness_reserved_value)
-    // Standard reserved value is 32 zero bytes when not using commitment nonce.
-    let reserved = [0u8; 32];
     let mut buf = [0u8; 64];
     buf[0..32].copy_from_slice(&witness_root);
-    buf[32..64].copy_from_slice(&reserved);
+    buf[32..64].copy_from_slice(reserved);
     let hash = sha256d::Hash::hash(&buf);
     if hash.to_byte_array() != committed {
-        // Also accept if witness reserved is in coinbase witness stack (BIP141)
-        if coinbase.input[0].witness.len() >= 1 {
-            let wr = coinbase.input[0].witness.last().unwrap();
-            if wr.len() == 32 {
-                let mut buf2 = [0u8; 64];
-                buf2[0..32].copy_from_slice(&witness_root);
-                buf2[32..64].copy_from_slice(wr);
-                let hash2 = sha256d::Hash::hash(&buf2);
-                if hash2.to_byte_array() == committed {
-                    return Ok(());
-                }
-            }
-        }
         return Err(ConsensusError::BadBlock("witness commitment mismatch"));
     }
     Ok(())
@@ -2810,6 +2807,70 @@ mod structure_rule_tests {
         let b = block_with(vec![cb, spend]);
         validate_block_structure(&b, &ctx_h(1)).expect("reserved witness commitment");
         let _ = leaves;
+    }
+
+    /// Finding 009: commitment present requires exactly one 32-byte coinbase witness item.
+    #[test]
+    fn s8_rejects_empty_or_multi_item_coinbase_witness_reserved() {
+        use bitcoin::hashes::{sha256d, Hash};
+
+        let mut spend = non_coinbase_spend(13);
+        spend.input[0].witness = Witness::from_slice(&[vec![0xab]]);
+        let wtxid = spend.compute_wtxid().to_byte_array();
+        let leaves = vec![[0u8; 32], wtxid];
+        let witness_root = merkle_root_bytes(&leaves);
+        // Commitment over reserved = zeros (valid crypto if nonce were present).
+        let reserved_zero = [0u8; 32];
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&witness_root);
+        buf[32..].copy_from_slice(&reserved_zero);
+        let committed = sha256d::Hash::hash(&buf).to_byte_array();
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend_from_slice(&committed);
+
+        // Empty coinbase witness → bad-witness-nonce-size (not accept via zero probe).
+        {
+            let mut cb = coinbase(1);
+            cb.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+            });
+            // witness empty
+            let b = block_with(vec![cb, spend.clone()]);
+            let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
+            assert!(
+                matches!(err, ConsensusError::BadBlock(s) if s.contains("witness") || s.contains("nonce")),
+                "empty reserved: got {err:?}"
+            );
+        }
+
+        // Multi-item stack with last = zeros matching commitment → still reject.
+        {
+            let mut cb = coinbase(1);
+            cb.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+            });
+            cb.input[0].witness = Witness::from_slice(&[vec![0xff], reserved_zero.to_vec()]);
+            let b = block_with(vec![cb, spend.clone()]);
+            let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
+            assert!(
+                matches!(err, ConsensusError::BadBlock(s) if s.contains("witness") || s.contains("nonce")),
+                "multi-item reserved: got {err:?}"
+            );
+        }
+
+        // Control: exactly one 32-zero item + matching commitment → Ok.
+        {
+            let mut cb = coinbase(1);
+            cb.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            });
+            cb.input[0].witness = Witness::from_slice(&[reserved_zero.as_slice()]);
+            let b = block_with(vec![cb, spend]);
+            validate_block_structure(&b, &ctx_h(1)).expect("single zero reserved OK");
+        }
     }
 
     #[test]

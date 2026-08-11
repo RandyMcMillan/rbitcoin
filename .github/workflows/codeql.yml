@@ -1,0 +1,83 @@
+# CodeQL code scanning — advanced setup (in-repo, reviewable).
+#
+# Free for public repositories (GitHub Actions + code scanning). Private repos
+# need a plan that includes code scanning; enable Code scanning in
+# Settings → Code security if alerts do not appear after the first run.
+#
+# Languages: Rust (workspace) + GitHub Actions workflows.
+# Query suite: security-extended (default security + extra high-signal queries).
+# Build: manual cargo build with the same rustc pin as ci.yml for precise results.
+#
+# https://docs.github.com/code-security/code-scanning
+
+name: codeql
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    # Weekly full scan (catches issues that miss PR diffs); offset from top of hour.
+    - cron: "23 5 * * 1"
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      # Required to upload SARIF and write code-scanning alerts
+      security-events: write
+      contents: read
+      actions: read
+      # Packs from GitHub Container Registry if used later
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            # manual = most precise for compiled languages; matches a real build.
+            build-mode: manual
+          - language: actions
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # security-extended: default security suite + additional queries with
+          # lower false-positive rate than the full quality pack.
+          queries: security-extended
+
+      # Rust only: produce a real build so CodeQL sees the compiled graph.
+      # Pin matches .github/workflows/ci.yml and the Nix/shell 1.95 class.
+      - name: Install Rust toolchain
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Build workspace (CodeQL extract)
+        if: matrix.language == 'rust'
+        env:
+          CARGO_TERM_COLOR: always
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: target/codeql
+          # Match CI warning policy without failing extract on style-only noise.
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --workspace --all-targets
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

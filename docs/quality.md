@@ -217,6 +217,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 |-----|------------|
 | CI floating `@stable` vs Nix 1.82 | **Fixed** — CI pins **rustc 1.95.0**; Nix on **nixos-26.05** / same class |
 | Coverage + test thrash one `target/` | **Fixed** — `target/dev` vs `target/cov` (shell, coverage.sh, CI caches) |
+| No CodeQL / code scanning workflow | **Fixed** — `.github/workflows/codeql.yml` (Rust manual build + Actions, `security-extended`, weekly schedule) |
 | Deps: rayon / xorf / bincode on hot graph | **Fixed** — in-tree fuse8 + script_pool; store Cargo notes |
 
 ### Correctness & adversarial

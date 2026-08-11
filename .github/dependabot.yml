@@ -42,7 +42,7 @@ updates:
       default-days: 3
       semver-major-days: 7
 
-  # --- GitHub Actions -------------------------------------------------------
+  # --- GitHub Actions (ci.yml, codeql.yml, …) -------------------------------
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

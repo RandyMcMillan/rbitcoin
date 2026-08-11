@@ -18,7 +18,13 @@ Best-chain views ignore uncommitted Class C state:
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ `tx_height ≤ tip`. Queries that mean “on best chain” use this (or equivalent).
 
-On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-relative, not a full rebuild).
+On open (in order):
+
+1. `repair_class_c_above_tip` clears strong/height **above** tip (tip-relative, not a full rebuild).
+2. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
+3. **Tip-window revalidate** (Core `checkblocks=6`): last six confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`. On failure: clear bad Class A association and/or shrink tip to last good height, flush confirmed, repair Class C again.
+
+Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ### L2 write-behind + body queue (phase 6)
 
@@ -68,6 +74,9 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 Clean shutdown: `flush_for_shutdown` fsyncs tip/Class C (incl. L2 dirty images) then async Class A.
 Steady path: payload pwrite + HWM publish; `sync_data` unless `defer_durable_flush`.
 Kill mid-payload before HWM publish: readers never see past previous published length.
+
+Connect barrier (`flush_class_c_tip`): headers (if dirty) → strong → height → header_txs → **confirmed last** → soft `tip_seal`.
+Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_seal`) before unstrong/height clear.
 
 ## Operator
 

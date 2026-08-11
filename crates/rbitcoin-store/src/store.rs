@@ -821,6 +821,8 @@ impl Store {
     /// advancing tip. Prefer [`Self::flush_class_c_tip`] for the full barrier.
     pub fn flush_class_c_pre_tip(&self) -> Result<(), StoreError> {
         // Tip-as-commit: never flush confirmed here.
+        // Headers first so conf tip cannot reference a non-durable header_fk.
+        self.headers.flush()?;
         self.strong_tx.flush()?;
         // tx_height is L0 write-through; still fsync HWM/payload.
         self.tx_height.flush()?;
@@ -837,10 +839,14 @@ impl Store {
     /// `tx_height`, a mid-barrier kill advances tip with missing strong bits;
     /// re-confirm skips those heights and `repair_class_c_above_tip` only clears
     /// **above** tip — permanent unstrong tip txs.
+    ///
+    /// After confirmed is durable, publish soft [`crate::TIP_SEAL_NAME`] so open
+    /// can clamp an incomplete extension that never finished this barrier.
     pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
         self.flush_class_c_pre_tip()?;
         // Commit point on disk: tip advance only after strong/height/header_txs.
         self.confirmed.flush()?;
+        self.publish_tip_seal()?;
         Ok(())
     }
 
@@ -849,7 +855,9 @@ impl Store {
     /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
     /// unstrong / `tx_height` clears. Do not use for connect (would tip-first).
     pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
-        self.confirmed.flush()
+        self.confirmed.flush()?;
+        self.publish_tip_seal()?;
+        Ok(())
     }
 
     /// Class C **disconnect** post-clear barrier: strong + height after tip already

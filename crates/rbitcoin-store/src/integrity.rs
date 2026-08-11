@@ -3,15 +3,94 @@
 //! Default window is [`VERIFY_TIP_BLOCKS`] (6) for both structural checks and
 //! Class A merkle content. Runs after `repair_class_c_above_tip` so tip is the
 //! source of truth before P2P extends it.
+//!
+//! Soft sidecar [`TIP_SEAL_NAME`]: written after a successful connect/disconnect
+//! Class C barrier so a kill that advanced `confirmed` without a complete seal
+//! can be clamped before revalidation.
 
 use crate::error::StoreError;
 use crate::header_table::block_header_hash;
 use crate::store::Store;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
-use rbitcoin_primitives::Height;
+use rbitcoin_primitives::{schema_file_openable, Height, SCHEMA_VERSION, STORE_MAGIC};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::Path;
 
 /// Core `-checkblocks` default: re-read the last N confirmed blocks at open.
 pub const VERIFY_TIP_BLOCKS: u32 = 6;
+
+/// Soft tip seal file under `store/` (not a SCHEMA_VERSION bump).
+pub const TIP_SEAL_NAME: &str = "tip_seal";
+
+/// On-disk tip seal after a complete Class C barrier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TipSeal {
+    pub tip_height: u32,
+    pub tip_hash: [u8; 32],
+    /// `confirmed` length (= tip_height + 1 when non-empty).
+    pub confirmed_len: u64,
+    pub generation: u64,
+}
+
+impl TipSeal {
+    const BYTES: usize = 60;
+
+    pub fn path(dir: &Path) -> std::path::PathBuf {
+        dir.join(TIP_SEAL_NAME)
+    }
+
+    pub fn load(dir: &Path) -> Result<Option<Self>, StoreError> {
+        let p = Self::path(dir);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let mut f = OpenOptions::new()
+            .read(true)
+            .open(&p)
+            .map_err(|e| StoreError::io(&p, e))?;
+        let mut buf = [0u8; Self::BYTES];
+        f.read_exact(&mut buf).map_err(|e| StoreError::io(&p, e))?;
+        if buf[0..4] != STORE_MAGIC {
+            return Err(StoreError::BadMagic);
+        }
+        let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        if !schema_file_openable(ver) {
+            return Err(StoreError::BadSchema(ver));
+        }
+        Ok(Some(Self {
+            tip_height: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            confirmed_len: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            generation: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
+            tip_hash: buf[28..60].try_into().unwrap(),
+        }))
+    }
+
+    pub fn store(&self, dir: &Path) -> Result<(), StoreError> {
+        let p = Self::path(dir);
+        let mut buf = [0u8; Self::BYTES];
+        buf[0..4].copy_from_slice(&STORE_MAGIC);
+        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        // 6..8 reserved
+        buf[8..12].copy_from_slice(&self.tip_height.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.confirmed_len.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.generation.to_le_bytes());
+        buf[28..60].copy_from_slice(&self.tip_hash);
+        let tmp = p.with_extension("tip_seal.tmp");
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|e| StoreError::io(&tmp, e))?;
+            f.write_all(&buf).map_err(|e| StoreError::io(&tmp, e))?;
+            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        }
+        std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+        Ok(())
+    }
+}
 
 /// Result of [`Store::revalidate_tip_window`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -68,6 +147,36 @@ fn hash256_concat(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 impl Store {
+    /// Persist tip seal after a complete Class C tip barrier (connect or disconnect).
+    ///
+    /// Soft: if tip header is not loadable (synthetic Class C barrier tests, or
+    /// mid-repair), skip the seal rather than failing the barrier — open
+    /// revalidate still walks the tip window.
+    pub fn publish_tip_seal(&self) -> Result<(), StoreError> {
+        let Some(tip) = self.confirmed.tip_height() else {
+            // Empty chain: remove seal if present.
+            let p = TipSeal::path(self.path());
+            let _ = std::fs::remove_file(&p);
+            return Ok(());
+        };
+        let Some(fk) = self.confirmed.get(tip)? else {
+            return Ok(());
+        };
+        let Ok(rec) = self.headers.get(fk) else {
+            return Ok(());
+        };
+        let prev_gen = TipSeal::load(self.path())?
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        let seal = TipSeal {
+            tip_height: tip.0,
+            tip_hash: rec.hash,
+            confirmed_len: u64::from(tip.0) + 1,
+            generation: prev_gen.saturating_add(1),
+        };
+        seal.store(self.path())
+    }
+
     /// Revalidate the last [`VERIFY_TIP_BLOCKS`] confirmed heights (structure + merkle).
     ///
     /// On failure: clear bad Class A associations and/or shrink tip to the last
@@ -79,10 +188,35 @@ impl Store {
     /// Same as [`Self::revalidate_tip_window`] with an explicit window (tests).
     pub fn revalidate_tip_window_n(&self, n: u32) -> Result<TipRevalidateReport, StoreError> {
         let mut report = TipRevalidateReport::default();
+
+        // Soft seal: clamp confirmed tip that advanced without a complete seal write.
+        if let Some(seal) = TipSeal::load(self.path())? {
+            if let Some(tip) = self.confirmed.tip_height() {
+                if tip.0 > seal.tip_height {
+                    // Unsealed extension past last barrier seal — drop to sealed tip.
+                    self.shrink_tip_to(Some(seal.tip_height), &mut report)?;
+                } else if tip.0 == seal.tip_height {
+                    if let Some(fk) = self.confirmed.get(tip)? {
+                        if let Ok(rec) = self.headers.get(fk) {
+                            if rec.hash != seal.tip_hash {
+                                // Tip hash disagrees with seal — drop tip block.
+                                let lg = tip.0.checked_sub(1);
+                                self.shrink_tip_to(lg, &mut report)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let Some(tip) = self.confirmed.tip_height() else {
+            report.tip_before = report.tip_before.or(None);
+            report.tip_after = None;
             return Ok(report);
         };
-        report.tip_before = Some(tip.0);
+        if report.tip_before.is_none() {
+            report.tip_before = Some(tip.0);
+        }
         if n == 0 {
             report.tip_after = Some(tip.0);
             return Ok(report);
@@ -113,6 +247,8 @@ impl Store {
         if report.bodies_cleared > 0 {
             self.header_txs.flush()?;
         }
+        // Refresh seal to match post-revalidate tip (best-effort).
+        let _ = self.publish_tip_seal();
         Ok(report)
     }
 
@@ -387,6 +523,34 @@ mod tests {
         assert_eq!(r.first_bad_reason, Some("prev_fk != confirmed parent"));
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
         assert_eq!(r.tip_after, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tip_seal_clamps_unsealed_extension() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let g = hdr(Fk::NULL, [0u8; 32], 0);
+        let g_fk = s.put_header(&g).unwrap();
+        s.confirmed.set(Height(0), g_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        let seal = TipSeal::load(s.path()).unwrap().expect("seal after tip barrier");
+        assert_eq!(seal.tip_height, 0);
+        assert_eq!(seal.tip_hash, g.hash);
+
+        // Extend tip in RAM + flush confirmed only *without* updating seal:
+        // simulate by writing a higher tip then restoring old seal file.
+        let a = hdr(g_fk, g.hash, 1);
+        let a_fk = s.put_header(&a).unwrap();
+        s.confirmed.set(Height(1), a_fk).unwrap();
+        s.confirmed.flush().unwrap();
+        // Overwrite seal with the old tip-0 seal (as if barrier never finished).
+        seal.store(s.path()).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert!(r.tip_shrunk, "seal clamp must shrink: {r:?}");
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

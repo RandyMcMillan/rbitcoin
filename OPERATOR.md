@@ -303,6 +303,13 @@ datadir if corruption is widespread.
 After `--write`, restart the node; expect `Class A rehydrate filled N…` and tip
 advance from the next block.
 
+**Every open:** the node revalidates the last **six** confirmed heights (header
+`prev_fk`/hash chain, Class A range bounds, merkle from `txid.body`) and may
+**shrink tip** or clear a bad body association if something fails. Look for
+`rbitcoin: tip revalidate …` on stderr. That is intentional Core-style
+`checkblocks=6` behavior — not a full reindex. Mid-chain header graph poison
+still needs offline `rbitcoin-rebuild-headers` or a clean datadir.
+
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
 is damaged or an old 4k-slot table was left wedged, stop the node and delete that
 directory — the next start recreates it empty and redownloads unconfirmed txs.

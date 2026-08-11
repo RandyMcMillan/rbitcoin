@@ -41,6 +41,11 @@ updates:
     cooldown:
       default-days: 3
       semver-major-days: 7
+    ignore:
+      # First-party must stay on the hashes major that `bitcoin` 0.32 uses
+      # (0.14). Advance only with the wider rust-bitcoin / bip324 stack —
+      # see docs/reproducible-builds.md § Dependabot.
+      - dependency-name: "bitcoin_hashes"
 
   # --- GitHub Actions (ci.yml, codeql.yml, …) -------------------------------
   - package-ecosystem: "github-actions"
@@ -58,6 +63,10 @@ updates:
       actions:
         patterns:
           - "*"
+    ignore:
+      # Tag encodes rustc version and must match nixpkgs/crane (currently
+      # 1.95.0). Never “latest action” via Dependabot — co-bump with flake.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # --- Nix flakes (flake.lock inputs) ---------------------------------------
   - package-ecosystem: "nix"

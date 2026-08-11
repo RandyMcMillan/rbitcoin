@@ -32,6 +32,17 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 | Verify after bump | `nix develop` → fmt/clippy/test; `nix build .#rbitcoin-musl` static install |
 | Dependabot | [`.github/dependabot.yml`](../.github/dependabot.yml) opens **monthly** Nix PRs (plus weekly Cargo / Actions). Treat flake PRs as proposals — still co-bump and verify as above before merge |
 
+### Dependabot take / skip
+
+| Update | Take? | How |
+|--------|-------|-----|
+| Cargo **patch** / safe **minor** | Yes if CI green | Dependabot PR or hand `cargo update` |
+| Cargo **major** with API or dual-graph risk | Human PR only | Full suite; prefer one stack (e.g. axum + tower-http + tungstenite) |
+| **`bitcoin_hashes`** | **Ignore in Dependabot** | Co-bump with **`bitcoin` / bip324 / rust-bitcoin** only (must match `bitcoin`’s hashes major) |
+| **`dtolnay/rust-toolchain`** | **Ignore in Dependabot** | Tag **is** rustc; co-bump with **nixpkgs / crane / shell llvm** only |
+| Other Actions (`checkout`, `codeql-action`, `rust-cache`) | Yes after CI smoke | Prefer full semver or commit SHA; never rewrite the rustc pin in the same PR without a flake bump |
+| **nixpkgs / crane** | Deliberate only | Monthly Dependabot is a proposal; co-bump CI rustc + docs |
+
 Channel branches advance only after Hydra succeeds ([channel branches](https://wiki.nixos.org/wiki/Channel_branches); status at [status.nixos.org](https://status.nixos.org/)). That is the “tested snapshot” — not a floating `master` commit.
 
 Release builds set remapped path prefixes and strip symbols so digests do not

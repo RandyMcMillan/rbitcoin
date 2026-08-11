@@ -219,6 +219,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Coverage + test thrash one `target/` | **Fixed** — `target/dev` vs `target/cov` (shell, coverage.sh, CI caches) |
 | Monolithic `test` job hid fmt/clippy | **Fixed** — CI jobs `fmt`, `clippy`, `test`, `coverage` (coverage needs the three gates) |
 | No CodeQL / code scanning workflow | **Fixed** — `.github/workflows/codeql.yml` (Rust `build-mode: none` + Actions, `security-extended`, weekly schedule; manual mode is unsupported for Rust) |
+| Dependabot noise (rustc tag / hashes majors) | **Fixed** — ignore `dtolnay/rust-toolchain` + `bitcoin_hashes`; take/skip table in reproducible-builds.md; action SHAs for checkout/codeql/rust-cache |
 | Deps: rayon / xorf / bincode on hot graph | **Fixed** — in-tree fuse8 + script_pool; store Cargo notes |
 
 ### Correctness & adversarial

@@ -98,7 +98,11 @@
             shellHook = ''
               export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
               export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
-              echo "rbitcoin devShell: rustc=$(rustc --version) (pinned nixpkgs via flake)"
+              # Host gnu debug (fmt/clippy/test). Coverage → target/cov; musl → nix/crane.
+              if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
+                export CARGO_TARGET_DIR="$PWD/target/dev"
+              fi
+              echo "rbitcoin devShell: rustc=$(rustc --version) (pinned nixpkgs via flake) CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
             '';
           };
         }

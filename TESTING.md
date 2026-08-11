@@ -44,14 +44,29 @@ do not re-home those into examples.
 ```bash
 nix-shell
 # Warnings are errors (workspace.lints + RUSTFLAGS=-Dwarnings in shell.nix)
+# CARGO_TARGET_DIR defaults to target/dev (see Artifact silos below)
 cargo build --workspace --all-targets
 # Default suite: unit + scenarios + **fast** multi-node only (no --ignored)
 cargo test --workspace
-./scripts/coverage.sh
+./scripts/coverage.sh   # uses target/cov — does not thrash target/dev
 # Guard: no libbitcoinconsensus in the dependency graph
 cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
   (echo "FAIL: bitcoinconsensus still in dependency tree" && cargo tree -i bitcoinconsensus && exit 1)
 ```
+
+### Artifact silos (do not mix)
+
+Host **gnu** objects are not interchangeable with **musl** release or with
+**llvm-cov**-instrumented objects (different triple / profile / RUSTFLAGS).
+
+| Silo | Where | Used by |
+|------|--------|---------|
+| **Dev** | `target/dev` (`CARGO_TARGET_DIR` from `nix-shell` / `nix develop`) | fmt, clippy, `cargo test`, ad-hoc `cargo build` |
+| **Coverage** | `target/cov` (forced in `scripts/coverage.sh`) | `./scripts/coverage.sh` only |
+| **Musl release** | Nix store via crane (`cargoArtifacts` + app) | `nix build .#rbitcoin-musl` — **not** `./target` |
+
+Override dev dir only when intentional: `CARGO_TARGET_DIR=… nix-shell`.  
+Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 **Default vs heavy tiers**
 
@@ -92,7 +107,9 @@ cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
 
 ### Coverage notes
 
-- Default coverage is **incremental** (no `llvm-cov clean`) so repeat runs reuse the instrumented target dir.
+- Coverage uses **`target/cov`**, separate from **`target/dev`**, so instrumented
+  rebuilds do not invalidate plain test/clippy artifacts (and the reverse).
+- Default coverage is **incremental** (no `llvm-cov clean`) so repeat runs reuse the instrumented tree.
 - Force a cold instrumented rebuild: `COVERAGE_CLEAN=1 ./scripts/coverage.sh`
 - Gate: LCOV line coverage **≥ 90%** (`LH`/`LF` from `./scripts/coverage.sh`).
 

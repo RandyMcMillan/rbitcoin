@@ -65,6 +65,19 @@ After the deps layer is in the store, app-only changes rebuild far less.
 **Byte-identity gate** (`./scripts/repro-check.sh`) still forces two clean
 `--rebuild`s — use it for release verification, not every commit.
 
+### Host cargo vs musl (artifact silos)
+
+Do not expect host `cargo test` / coverage to warm the musl release (or the reverse).
+
+| Silo | Location | Command |
+|------|----------|---------|
+| Dev (gnu debug) | `target/dev` | `nix-shell` → fmt / clippy / `cargo test` |
+| Coverage (gnu + llvm-cov) | `target/cov` | `./scripts/coverage.sh` |
+| Musl release | Nix store + install to `target/release/` | `nix build .#rbitcoin-musl` |
+
+`target/dev` and `target/cov` are split so instrumented and uninstrumented
+fingerprints never thrash each other.
+
 ## Requirements
 
 - [Nix](https://nixos.org/download/) 2.18+ with flakes enabled  

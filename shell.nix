@@ -35,6 +35,12 @@ pkgs.mkShell {
   shellHook = ''
     export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
     export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
-    echo "rbitcoin shell.nix: rustc=$(rustc --version) (pinned via flake.lock)"
+    # Host gnu debug artifacts (fmt/clippy/test). Coverage uses target/cov
+    # (scripts/coverage.sh); musl release is nix/crane, not this tree.
+    # Override only if you know why: CARGO_TARGET_DIR=... nix-shell
+    if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
+      export CARGO_TARGET_DIR="$PWD/target/dev"
+    fi
+    echo "rbitcoin shell.nix: rustc=$(rustc --version) (pinned via flake.lock) CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
   '';
 }

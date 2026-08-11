@@ -10,12 +10,18 @@ LINE_MIN_PCT=90
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
+# Instrumented objects must not share a target dir with plain cargo test /
+# clippy (different RUSTFLAGS fingerprints thrash rebuilds). Dev shell uses
+# target/dev; musl release is nix/crane only.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR_COV:-$ROOT/target/cov}"
+echo "coverage: CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found; enter nix-shell first" >&2
   exit 1
 fi
 
-# Ensure bins exist for binary smoke scenarios.
+# Ensure bins exist for binary smoke scenarios (instrumented tree).
 cargo build -p rbitcoin-node -p rbitcoin-cli
 
 # Prefer system llvm-tools when rustup component is unavailable (Nix).

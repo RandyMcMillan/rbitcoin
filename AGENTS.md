@@ -127,7 +127,11 @@ CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
 
 ### Required before each code commit (`test` job)
 
-From `nix-shell` (or the same **rustc 1.95** class CI pins):
+From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets
+`CARGO_TARGET_DIR=target/dev` so host test/clippy objects stay out of the
+coverage tree (`target/cov` via `./scripts/coverage.sh`). Musl ship binaries
+still come only from `nix build .#rbitcoin-musl` → install into
+`target/release/` (operator path; not the cargo debug target).
 
 ```bash
 cargo fmt --all -- --check          # if dirty: cargo fmt --all

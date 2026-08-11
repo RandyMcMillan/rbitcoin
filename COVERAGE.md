@@ -26,6 +26,12 @@ cargo install cargo-llvm-cov --locked
 
 On Nix, prefer `cargo-llvm-cov` from nixpkgs when available, or install into a user cargo bin on `PATH`.
 
+**Target dir:** the script sets `CARGO_TARGET_DIR` to **`target/cov`** (override
+with `CARGO_TARGET_DIR_COV`). Day-to-day `cargo test` / clippy use **`target/dev`**
+from the nix shell so instrumented and uninstrumented artifacts never thrash
+each other. Musl release stays on `nix build .#rbitcoin-musl` (crane), not host
+`target/`.
+
 ## What is measured
 
 All workspace members that contain production code:

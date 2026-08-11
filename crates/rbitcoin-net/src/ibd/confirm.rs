@@ -1385,7 +1385,7 @@ pub(crate) fn spawn_confirm_engine(
                             feed_load.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n % 200 == 0 {
+                            if n <= 3 || n.is_multiple_of(200) {
                                 warn!(
                                     "ibd: confirm load incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
                                 );
@@ -1715,7 +1715,7 @@ pub(crate) fn spawn_confirm_engine(
                         if !retry.is_empty() {
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n % 500 == 0 {
+                            if n <= 3 || n.is_multiple_of(500) {
                                 debug!(
                                     "ibd: confirm lookup empty outcome first={expect_h} n={} \
                                      (path not contiguous / already confirmed; re-queue, count={n})",
@@ -1840,7 +1840,7 @@ pub(crate) fn spawn_confirm_engine(
                             feed.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n % 200 == 0 {
+                            if n <= 3 || n.is_multiple_of(200) {
                                 warn!(
                                     "ibd: confirm lookup incomplete first={expect_h} — re-queue (n={n}): {msg}"
                                 );
@@ -1873,7 +1873,7 @@ pub(crate) fn spawn_confirm_engine(
                             .fetch_add(1, Ordering::Relaxed);
                         static N: AtomicU32 = AtomicU32::new(0);
                         let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n <= 8 || n % 50 == 0 {
+                        if n <= 8 || n.is_multiple_of(50) {
                             warn!("ibd: confirm lookup reject {hash} @ {expect}: {e} (n={n})");
                         }
                         let _ = event_tx.send(ConfirmEvent::Reject {
@@ -1974,7 +1974,7 @@ pub(crate) fn offer_confirm_ready(
             if ht == expect {
                 static REJECT_STUCK: AtomicU32 = AtomicU32::new(0);
                 let n = REJECT_STUCK.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 3 || n % 100 == 0 {
+                if n <= 3 || n.is_multiple_of(100) {
                     warn!(
                         "ibd: confirm stuck: tip+1={ht} {hash} is blacklisted (rejected earlier); \
                          restart with a fixed binary to clear the in-memory reject set (n={n})"

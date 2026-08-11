@@ -115,7 +115,7 @@ store (`No such file or directory` at exec). Details:
 
 ### Dev / CI path
 
-Requires a recent Rust toolchain (workspace `rust-version` 1.74+). Prefer the
+Requires Rust **1.95** (workspace `rust-version`, matching Nix/CI). Prefer the
 **same pin** as release builds for tests and clippy:
 
 ```bash

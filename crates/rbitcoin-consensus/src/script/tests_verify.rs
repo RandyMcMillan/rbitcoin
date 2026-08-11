@@ -1358,7 +1358,7 @@ fn p2wsh_witness_script_larger_than_520_is_valid() {
     for _ in 0..2 {
         redeem.push(0x4d); // OP_PUSHDATA2
         redeem.extend_from_slice(&520u16.to_le_bytes());
-        redeem.extend(std::iter::repeat(0u8).take(520));
+        redeem.extend(std::iter::repeat_n(0u8, 520));
         redeem.push(0x75); // OP_DROP
     }
     redeem.push(0x51); // OP_1

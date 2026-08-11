@@ -271,7 +271,7 @@ fn freeze_bench_unbounded_drain_livelock_shape() {
         // simulate apply cost
         let spin_until = Instant::now() + std::time::Duration::from_micros(apply_us);
         while Instant::now() < spin_until {}
-        if applied % u64::from(produce_every) == 0 {
+        if applied.is_multiple_of(u64::from(produce_every)) {
             q.push_back(produced);
             produced += 1;
         }
@@ -298,7 +298,7 @@ fn freeze_bench_unbounded_drain_livelock_shape() {
         applied += 1;
         let spin_until = Instant::now() + std::time::Duration::from_micros(apply_us);
         while Instant::now() < spin_until {}
-        if applied % u64::from(produce_every) == 0 {
+        if applied.is_multiple_of(u64::from(produce_every)) {
             q.push_back(produced);
             produced += 1;
         }

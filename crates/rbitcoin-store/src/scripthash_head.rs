@@ -210,7 +210,7 @@ impl ScriptHashHead {
 
     fn from_file(file: TableFile) -> Result<Self, StoreError> {
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
-        if body % SH_HEAD_SLOT_SIZE as u64 != 0 || body == 0 {
+        if !body.is_multiple_of(SH_HEAD_SLOT_SIZE as u64) || body == 0 {
             return Err(StoreError::Corrupt("scripthash head size"));
         }
         let slots = body / SH_HEAD_SLOT_SIZE as u64;

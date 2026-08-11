@@ -283,7 +283,7 @@ mod tests {
         // Redeem = OP_TRUE padded with OP_DROP + 521-byte push inside redeem would be
         // redeem-eval path. Here the **scriptSig push** of redeem itself is 521 bytes.
         let mut redeem = vec![0x51]; // OP_TRUE
-        redeem.extend(std::iter::repeat(0x61u8).take(520)); // pad so len=521
+        redeem.extend(std::iter::repeat_n(0x61u8, 520)); // pad so len=521
         assert!(redeem.len() > interpreter::MAX_SCRIPT_ELEMENT_SIZE);
 
         // Minimal encoding of 521-byte push uses PUSHDATA2 (0x4d).

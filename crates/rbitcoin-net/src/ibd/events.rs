@@ -570,7 +570,7 @@ pub(crate) fn apply_confirm_reject(
     // Rate-limit follow-up noise; the confirm engine already logged the reject.
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 8 || n % 50 == 0 {
+    if n <= 8 || n.is_multiple_of(50) {
         warn!("ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})");
     }
 }

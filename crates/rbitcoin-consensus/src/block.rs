@@ -2422,7 +2422,7 @@ mod structure_rule_tests {
             let mut spk = vec![0x6a, 0x4d, 0xff, 0xff]; // OP_RETURN + pushdata2 placeholder
                                                         // Fill with ~900 KiB raw data via OP_RETURN chunking is awkward; use large script
                                                         // bytes rust-bitcoin will count toward base size.
-            spk.extend(std::iter::repeat(0x61).take(900_000)); // OP_NOP filler
+            spk.extend(std::iter::repeat_n(0x61, 900_000)); // OP_NOP filler
             txs.push(Transaction {
                 version: TxVersion::ONE,
                 lock_time: LockTime::ZERO,

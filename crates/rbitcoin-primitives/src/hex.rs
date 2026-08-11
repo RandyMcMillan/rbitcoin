@@ -34,7 +34,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(HexError {
             message: "odd hex length",
         });

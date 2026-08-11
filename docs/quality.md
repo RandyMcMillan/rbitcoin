@@ -68,7 +68,6 @@ level peers cannot ignore**.
 | **Q-02** | **Confirm/store dual-path hygiene** | Soft fallbacks hide load bugs; historical thrash | Invariants on confirm hot path; no spentness soft-path for identity bugs; SH/fuse multi-path only where env/protocol requires |
 | **Q-03** | **Default CI does not run multi-node IBD** | Hardest product surface is `#[ignore]` | Small hermetic multi-node path green in default CI *or* weekly required job with hang fixed |
 | **Q-04** | **Env knobs inventory** | ~40 `RBITCOIN_*` in code vs fewer in OPERATOR | Every public knob in OPERATOR advanced section; private knobs `cfg`/`doc(hidden)` or `RBITCOIN_UNSTABLE_*` |
-| **Q-05** | **MSRV honesty** | `rust-version = "1.74"` untested; real bar is **1.95** class | Either MSRV CI job on 1.74 or raise MSRV to the Nix/CI pin and document |
 
 ### P1 — Maintainability (code that scales with AI + human review)
 
@@ -127,7 +126,7 @@ Re-measure when claiming a maintainability win. Approximate as of post-2026-08 w
 | Largest files | `confirm_run` ~5.4k, `tx_table` ~4.7k, `block` ~4.2k, `query/lib` ~3.3k |
 | `#[test]` count | ~1.0k+ |
 | Coverage gate | **≥90%** first-party LCOV (`LH`/`LF`) — required CI |
-| CI rustc | **1.95.0** pinned (matches nixos-26.05 / shell) |
+| CI / MSRV rustc | **1.95** (`rust-version` + CI pin + nixos-26.05 / shell) |
 | Nix pin | **nixos-26.05** + crane 0.23.x |
 | Host cargo targets | `target/dev` (test) / `target/cov` (coverage) |
 | Release | `nix build .#rbitcoin-musl` → static install |
@@ -220,6 +219,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Monolithic `test` job hid fmt/clippy | **Fixed** — CI jobs `fmt`, `clippy`, `test`, `coverage` (coverage needs the three gates) |
 | No CodeQL / code scanning workflow | **Fixed** — `.github/workflows/codeql.yml` (Rust `build-mode: none` + Actions, `security-extended`, weekly schedule; manual mode is unsupported for Rust) |
 | Dependabot noise (rustc tag / hashes majors) | **Fixed** — ignore `dtolnay/rust-toolchain` + `bitcoin_hashes`; take/skip table in reproducible-builds.md; action SHAs for checkout/codeql/rust-cache |
+| MSRV `1.74` claimed, untested | **Fixed (Q-05)** — workspace `rust-version = "1.95"` matches Nix/CI pin; no fake lower MSRV |
 | Deps: rayon / xorf / bincode on hot graph | **Fixed** — in-tree fuse8 + script_pool; store Cargo notes |
 
 ### Correctness & adversarial
@@ -240,7 +240,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 ### Still intentionally open (see Remaining)
 
-God-files, ignored multi-node IBD in default CI, `allow(dead_code)` bulk_io, `IbdConfig::for_test` in node, cargo deny/SBOM, continuous fuzz in CI, first-hour tutorial, MSRV 1.74 vs 1.95 honesty.
+God-files, ignored multi-node IBD in default CI, `allow(dead_code)` bulk_io, `IbdConfig::for_test` in node, cargo deny/SBOM, continuous fuzz in CI, first-hour tutorial.
 
 ---
 
@@ -263,7 +263,7 @@ God-files, ignored multi-node IBD in default CI, `allow(dead_code)` bulk_io, `Ib
 | Audience | Read |
 |----------|------|
 | Maintainers picking the next refactor | Remaining **P0–P1** |
-| Release engineering | P0 **Q-05**, P2 **Q-20–Q-23** |
+| Release engineering | P2 **Q-20–Q-23** (MSRV/Q-05 closed) |
 | Security / adversarial | P0 **Q-01–Q-03**, P3 **Q-30** |
 | Docs / README | North star + Remaining **Q-04**, **Q-34** |
 | “Are we industry-leading yet?” | North star pillars + grade board |

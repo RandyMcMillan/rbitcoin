@@ -218,7 +218,7 @@ impl IbdWorkState {
     pub(crate) fn hygiene(&mut self) {
         self.hygiene_counter = self.hygiene_counter.wrapping_add(1);
         let bloated = self.ordered.len() > self.ordered_set.len().saturating_mul(4).max(128);
-        if !bloated && self.hygiene_counter % 32 != 0 {
+        if !bloated && !self.hygiene_counter.is_multiple_of(32) {
             return;
         }
         compact_ordered(&mut self.ordered, &self.ordered_set);

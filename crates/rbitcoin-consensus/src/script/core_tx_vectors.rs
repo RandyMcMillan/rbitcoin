@@ -25,7 +25,7 @@ fn fixture(name: &str) -> PathBuf {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let h = s.trim();
-    if h.len() % 2 != 0 {
+    if !h.len().is_multiple_of(2) {
         return Err(format!("odd hex len {}", h.len()));
     }
     let mut out = Vec::with_capacity(h.len() / 2);
@@ -78,7 +78,7 @@ fn assemble_script(src: &str) -> Result<Vec<u8>, String> {
                 i += 1;
             }
             let hex = &src[start..i];
-            if hex.len() % 2 != 0 {
+            if !hex.len().is_multiple_of(2) {
                 return Err(format!("odd hex: {hex}"));
             }
             for j in (0..hex.len()).step_by(2) {

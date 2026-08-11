@@ -111,7 +111,7 @@ fn assemble(src: &str) -> Result<Vec<u8>, String> {
                 i += 1;
             }
             let hex = &src[start..i];
-            if hex.len() % 2 != 0 {
+            if !hex.len().is_multiple_of(2) {
                 return Err(format!("odd hex: {hex}"));
             }
             // Core: 0xHEX is raw script bytes (opcodes + data), not a push.
@@ -600,7 +600,7 @@ fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount, Option<[u
                 continue;
             }
             let hex = s.trim_start_matches("0x").trim_start_matches("0X");
-            if hex.len() % 2 != 0 {
+            if !hex.len().is_multiple_of(2) {
                 return Err(format!("odd witness hex: {s}"));
             }
             // Non-hex tokens (that are not special flags) are hard errors in Core.

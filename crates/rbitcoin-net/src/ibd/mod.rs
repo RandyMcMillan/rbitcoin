@@ -454,7 +454,7 @@ pub async fn ibd_cancellable(
         // Yield occasionally so shutdown can run; every-tick yield_now burned
         // scheduler time while confirm already saturates cores.
         loop_n = loop_n.wrapping_add(1);
-        if loop_n % 8 == 0 {
+        if loop_n.is_multiple_of(8) {
             tokio::task::yield_now().await;
         }
 

@@ -5351,7 +5351,7 @@ fn expected_bits_extending(
         return Ok(genesis_block(params).header.bits);
     }
     let interval = params.difficulty_adjustment_interval();
-    if params.no_pow_retargeting() || height.0 % interval != 0 {
+    if params.no_pow_retargeting() || !height.0.is_multiple_of(interval) {
         return Ok(prev_bits);
     }
     // Period-start may still be above confirmed tip during tip-ahead multi-block

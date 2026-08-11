@@ -117,7 +117,7 @@ impl TxIdx {
             if b.first_fk != a_end {
                 return Err(StoreError::Corrupt("tx.idx segment fk gap/overlap"));
             }
-            if a.body_base % IDX_STRIDE != 0 || b.body_base % IDX_STRIDE != 0 {
+            if !a.body_base.is_multiple_of(IDX_STRIDE) || !b.body_base.is_multiple_of(IDX_STRIDE) {
                 return Err(StoreError::Corrupt("tx.idx body_base unaligned"));
             }
         }
@@ -557,7 +557,7 @@ impl TxIdx {
             return Ok(());
         }
         for &s in starts {
-            if s % IDX_STRIDE != 0 {
+            if !s.is_multiple_of(IDX_STRIDE) {
                 return Err(StoreError::Corrupt("tx.idx start not stride-aligned"));
             }
         }
@@ -596,7 +596,7 @@ impl TxIdx {
                     return Err(StoreError::Corrupt("tx.idx start < body_base"));
                 }
                 let delta = abs - body_base;
-                if delta % IDX_STRIDE != 0 {
+                if !delta.is_multiple_of(IDX_STRIDE) {
                     return Err(StoreError::Corrupt("tx.idx start not on stride"));
                 }
                 let rel = delta / IDX_STRIDE;
@@ -663,7 +663,7 @@ impl TxIdx {
             return Err(StoreError::Corrupt("tx.idx start < body_base"));
         }
         let delta = abs_start - tail.body_base;
-        if delta % IDX_STRIDE != 0 {
+        if !delta.is_multiple_of(IDX_STRIDE) {
             return Err(StoreError::Corrupt("tx.idx start not on stride"));
         }
         let rel = delta / IDX_STRIDE;
@@ -679,7 +679,7 @@ impl TxIdx {
     }
 
     fn roll_segment(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
-        if body_base % IDX_STRIDE != 0 {
+        if !body_base.is_multiple_of(IDX_STRIDE) {
             return Err(StoreError::Corrupt("tx.idx body_base unaligned"));
         }
         let file_id = self
@@ -1214,7 +1214,7 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
         if first_fk == 0 && count > 0 {
             return Err(StoreError::Corrupt("tx.idx.meta first_fk"));
         }
-        if body_base % IDX_STRIDE != 0 {
+        if !body_base.is_multiple_of(IDX_STRIDE) {
             return Err(StoreError::Corrupt("tx.idx.meta body_base"));
         }
         out.push(SegDesc {

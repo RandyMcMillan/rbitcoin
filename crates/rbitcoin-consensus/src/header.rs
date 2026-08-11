@@ -277,7 +277,7 @@ pub fn expected_next_bits(
         .ok_or(ConsensusError::BadPrev)?;
     let prev_bits = CompactTarget::from_consensus(prev_rec.bits);
 
-    if params.no_pow_retargeting() || height.0 % interval != 0 {
+    if params.no_pow_retargeting() || !height.0.is_multiple_of(interval) {
         return Ok(prev_bits);
     }
 

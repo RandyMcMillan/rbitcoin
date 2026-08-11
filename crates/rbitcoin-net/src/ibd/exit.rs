@@ -23,13 +23,13 @@ pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
 /// `streak == 1` and floods the log when many peers reply empty in parallel.
 #[inline]
 pub(crate) fn should_log_empty_headers_lag(streak: u32) -> bool {
-    streak == 1 || (streak > 0 && streak % 64 == 0)
+    streak == 1 || (streak > 0 && streak.is_multiple_of(64))
 }
 
 /// Re-`getheaders` cadence while lagging (one peer, round-robin) after empty replies.
 #[inline]
 pub(crate) fn should_rerequest_headers_on_empty_lag(streak: u32) -> bool {
-    streak == 1 || (streak > 0 && streak % 8 == 0)
+    streak == 1 || (streak > 0 && streak.is_multiple_of(8))
 }
 
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.

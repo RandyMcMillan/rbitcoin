@@ -528,7 +528,7 @@ impl TableFile {
     /// Atomic little-endian `u32` load via pread (tests / diagnostics).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_u32_le(&self, offset: u64) -> Result<u32, StoreError> {
-        if offset % 4 != 0 {
+        if !offset.is_multiple_of(4) {
             return Err(StoreError::Corrupt("load_u32 unaligned"));
         }
         let mut buf = [0u8; 4];
@@ -539,7 +539,7 @@ impl TableFile {
     /// Atomic little-endian `u64` load via pread (tests / diagnostics).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_u64_le(&self, offset: u64) -> Result<u64, StoreError> {
-        if offset % 8 != 0 {
+        if !offset.is_multiple_of(8) {
             return Err(StoreError::Corrupt("load_u64 unaligned"));
         }
         let mut buf = [0u8; 8];

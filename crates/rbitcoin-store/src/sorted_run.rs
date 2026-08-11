@@ -431,7 +431,7 @@ fn write_sorted_run_file(
     if key_len == 0 || rec_len < key_len {
         return Err(StoreError::Corrupt("sorted run: bad key/rec len"));
     }
-    if records.len() % rec_len as usize != 0 {
+    if !records.len().is_multiple_of(rec_len as usize) {
         return Err(StoreError::Corrupt(
             "sorted run: body not multiple of rec_len",
         ));

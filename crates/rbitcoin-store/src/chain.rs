@@ -536,7 +536,7 @@ impl StrongTxTable {
         drop(guard);
         // L0 bulk path (same as before).
         let mut bit = start;
-        if bit % 8 != 0 {
+        if !bit.is_multiple_of(8) {
             let byte_end = (bit + 8) & !7;
             let stop = end.min(byte_end);
             while bit < stop {

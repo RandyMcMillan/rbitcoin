@@ -262,7 +262,7 @@ pub async fn block_txs_0(State(st): State<AppState>, Path(hash_hex): Path<String
 }
 
 fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
-    if start % 25 != 0 {
+    if !start.is_multiple_of(25) {
         return (
             StatusCode::BAD_REQUEST,
             "start_index must be a multiple of 25",

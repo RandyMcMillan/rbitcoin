@@ -350,9 +350,8 @@ impl ChainHub {
 
     /// IBD **load** after lookup denserels ensure: pin + assemble (does not re-lookup).
     ///
-    /// Passes [`ColdPinMode::Forbid`] for planned Class A (denserels via plan-local /
-    /// ranges). When `stamped.plan` is `None` (already-archived rehydrate), consensus
-    /// load forces Allow cold denserels with `txid.body` parent identity.
+    /// Single path: denserels by body range from lookup stamp (plan-local or plan=None
+    /// `ParentPinStamp`). No cold denserels dual path.
     pub fn confirm_wire_load_from_plan(
         &self,
         stamped: PlanStampOutcome,
@@ -365,7 +364,6 @@ impl ChainHub {
             stamped,
             pipeline,
             &ScriptPreverified::new(),
-            rbitcoin_consensus::ColdPinMode::Forbid,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))
     }
@@ -389,25 +387,20 @@ impl ChainHub {
 
     /// Load with optional pipeline caches (reserved create fks + in-flight creates).
     ///
-    /// Cold denserels **allowed** (tests / one-shot). IBD: lookup stamps, load pins.
+    /// One-shot or pipelined load: lookup stamps then pin denserels by range.
     pub fn confirm_wire_load_phase_pipelined(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WireLoadPipeline>,
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
-        self.confirm_wire_load_phase_pipelined_cold(
-            blocks,
-            pipeline,
-            rbitcoin_consensus::ColdPinMode::Allow,
-        )
+        self.confirm_wire_load_phase_pipelined_cold(blocks, pipeline)
     }
 
-    /// One-shot load with explicit cold denserels policy.
+    /// One-shot load (stamp + pin denserels by range + assemble).
     pub fn confirm_wire_load_phase_pipelined_cold(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WireLoadPipeline>,
-        cold_mode: rbitcoin_consensus::ColdPinMode,
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
         let Some(contig) = self.confirm_wire_contig(blocks, pipeline) else {
             return Ok(None);
@@ -419,7 +412,6 @@ impl ChainHub {
             &contig,
             &ScriptPreverified::new(),
             pipeline,
-            cold_mode,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))

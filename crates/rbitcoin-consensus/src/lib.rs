@@ -585,9 +585,9 @@ pub use confirm_run::{
     confirm_wire_lookup_and_ensure_denserels, confirm_wire_lookup_stamp, confirm_wire_run,
     confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
     join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
-    scripts_stage_from_load_channel, ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome,
-    DenserelsWarmStats, LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified,
-    ScriptsBatchMeta, ScriptsPhaseHandle, WireLoadPipeline,
+    scripts_stage_from_load_channel, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats,
+    LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta,
+    ScriptsPhaseHandle, WireLoadPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

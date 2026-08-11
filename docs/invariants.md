@@ -15,9 +15,15 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 | Kind | Examples | Policy |
 |------|----------|--------|
 | **Load miss** | Spend annotate without pin denserels; body decode without `tx.idx` range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix lookup/load |
-| **Environment** | `io_uring` off → pread/pwrite; `RBITCOIN_IO=mmap` demotes to pread; `RBITCOIN_FD_APPEND=0` | Keep modality fallback |
-| **Protocol** | BIP30 multi-spender list; same-block spends; coinbase null create | Real branches |
+| **Environment** | bulk IO backend uring vs pread/pwrite (single backend trait) | Keep modality only |
+| **Protocol** | BIP30 multi-spender confirmed-strong walk; same-block spends; coinbase null create | Real branches (not soft recovery) |
+| **Format migrate** | fuse8 v1 soft-open / always-probe with operator warn | Temporary dual-read only |
 | **API / product** | RPC body from store; Electrum mempool after chain; compact → getdata | Keep |
+
+**Killed dual paths (do not reintroduce):** soft spentness recovery for wrong/missing
+pin identity; unpinned wire-corrected create_fk spentness; load-stage `txid.body`
+identity fill after lookup promised stamp; `ColdPinMode` Allow/Forbid cold denserels
+split on load (load is range denserels only).
 
 ## Failure style
 

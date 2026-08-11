@@ -292,20 +292,12 @@ pub fn confirm_wire_load_phase(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    confirm_wire_load_phase_pipelined(
-        query,
-        params,
-        milestone,
-        blocks,
-        preverified,
-        None,
-        ColdPinMode::Allow,
-    )
+    confirm_wire_load_phase_pipelined(query, params, milestone, blocks, preverified, None)
 }
 
 /// Like [`confirm_wire_load_phase`] with optional pipeline caches for load-ahead.
 ///
-/// `cold_mode`: IBD load after lookup denserels ensure uses [`ColdPinMode::Forbid`].
+/// Single pin path: denserels by body range from lookup stamp (no cold dual path).
 pub fn confirm_wire_load_phase_pipelined(
     query: &Query,
     params: &ChainParams,
@@ -313,7 +305,6 @@ pub fn confirm_wire_load_phase_pipelined(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
     pipeline: Option<&WireLoadPipeline>,
-    cold_mode: ColdPinMode,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
@@ -520,7 +511,6 @@ pub fn confirm_wire_load_phase_pipelined(
         Some(p) => ParentPinStamp::from_plan(p),
         None => stamp_parent_pin_archived(query, &metas, &wire_blocks, inflight)?,
     };
-    let _ = cold_mode;
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -610,31 +600,9 @@ pub fn confirm_wire_run_preverified(
         .collect();
     // Lookup: structure + stamp create_fk + parent ranges (no body denserels).
     let stamped = confirm_wire_lookup_stamp(query, params, milestone, &arcs, None)?;
-    let mat = confirm_wire_load_from_plan(
-        query,
-        params,
-        milestone,
-        stamped,
-        None,
-        preverified,
-        ColdPinMode::Forbid, // legacy arg; load denserels by range only
-    )?;
+    let mat = confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;
     let ok = confirm_scripts_phase(mat.batch)?;
     confirm_write_phase(query, params, milestone, ok.batch)
-}
-
-/// Whether wire pin may cold-load denserels from Class A body.
-///
-/// IBD **lookup** stage ensures external-parent denserels into **plan-local**
-/// state. Load then uses [`ColdPinMode::Forbid`] so cold denserels is never
-/// duplicated on the load thread. Tests / one-shot [`confirm_wire_load_phase`]
-/// use [`ColdPinMode::Allow`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColdPinMode {
-    /// Plan-local miss → `load_creates_once` cold denserels (tests / Allow pin).
-    Allow,
-    /// Miss after lookup ensure → hard `invariant: denserels stage miss` (load after lookup).
-    Forbid,
 }
 
 /// Stats from lookup-stage denserels ensure (external parents → plan-local).
@@ -658,8 +626,8 @@ pub struct DenserelsWarmStats {
 /// resolve here — plan already stamped via batch + head. Same-batch creates are
 /// skipped (pin uses offline denserels).
 ///
-/// Load pin with [`ColdPinMode::Forbid`] must see every external parent covered
-/// via plan-local map, in-flight, or same-batch.
+/// After this returns, load pin must see every external parent covered via
+/// plan-local map, in-flight, or same-batch (no cold denserels dual path on load).
 pub fn ensure_external_parent_denserels_from_plan(
     query: &Query,
     plan: Option<&mut rbitcoin_query::ArchiveWritePlan>,
@@ -1099,10 +1067,13 @@ fn stamp_parent_pin_archived(
             stamp.ranges.insert(id, range);
         }
     }
-    // Identity fallback: sidefile for any create still missing txid (should be rare).
-    for (&id, tid) in stamp.txids.iter_mut() {
+    // Identities are stamped from wire prev_txid at insert time — never soft-fill
+    // from txid.body here (that would be a dual path after lookup promised identity).
+    for (&id, tid) in &stamp.txids {
         if *tid == [0u8; 32] {
-            *tid = known_create_txid_lookup(query, id, None)?;
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: plan=None parent stamp zero create identity",
+            )));
         }
         let _ = id;
     }
@@ -1112,15 +1083,8 @@ fn stamp_parent_pin_archived(
 /// IBD **load** after lookup denserels ensure: pin + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.
-///
-/// **Cold policy:**
-/// - [`ColdPinMode::Forbid`] after denserels ensure when a Class A plan is present
-///   (plan-local / range denserels cover external parents).
-/// - **Already-archived** (`plan=None`): cold denserels are required (no plan-local
-///   pin material). Callers may pass Forbid, but this function **forces Allow** so
-///   rehydrate/tip+1 Class A bodies do not hard-fail with
-///   `invariant: lookup stage miss`. Parent create identity still comes from
-///   dense `txid.body` (schema-13).
+/// Single path: denserels by body range from lookup stamp (plan-local or
+/// plan=None `ParentPinStamp`). Never cold dual-path denserels / txid.body on load.
 pub fn confirm_wire_load_from_plan(
     query: &Query,
     params: &ChainParams,
@@ -1128,7 +1092,6 @@ pub fn confirm_wire_load_from_plan(
     stamped: PlanStampOutcome,
     pipeline: Option<&WireLoadPipeline>,
     preverified: &ScriptPreverified,
-    cold_mode: ColdPinMode,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     let t_work = Instant::now();
     let t_load = Instant::now();
@@ -1141,8 +1104,6 @@ pub fn confirm_wire_load_from_plan(
     } = stamped;
 
     // Load denserels by body range from parent_pin (lookup stamped). Never head/idx.
-    let _ = cold_mode;
-
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
@@ -4244,7 +4205,7 @@ mod write_idempotent_tests {
     fn store_start_states_lookup_load_confirm() {
         use super::{
             confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
-            confirm_write_phase, ColdPinMode, ScriptPreverified,
+            confirm_write_phase, ScriptPreverified,
         };
         use crate::milestone::Milestone;
         use crate::params::ChainParams;
@@ -4408,7 +4369,6 @@ mod write_idempotent_tests {
                 stamped,
                 None,
                 &ScriptPreverified::new(),
-                ColdPinMode::Forbid,
             )
             .expect("S0 load denserels by range");
             let ok = confirm_scripts_phase(mat.batch).expect("S0 scripts");
@@ -4435,7 +4395,6 @@ mod write_idempotent_tests {
                 stamped,
                 None,
                 &ScriptPreverified::new(),
-                ColdPinMode::Forbid,
             )
             .expect("S1 plan=None load");
             let ok = confirm_scripts_phase(mat.batch).expect("S1 scripts");
@@ -4856,7 +4815,8 @@ fn resolve_body_metas(
                 continue;
             }
         }
-        // Store fallback (load miss / hash mismatch).
+        // ConfirmParentCache miss or hash mismatch: load header meta from store
+        // (cold query path — not a soft recovery for a promised plan hit).
         let (header_fk, header_rec) = query
             .get_header_by_hash(&hash)
             .map_err(ConsensusError::from)?

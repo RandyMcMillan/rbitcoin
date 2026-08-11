@@ -3350,22 +3350,21 @@ mod structure_rule_tests {
     }
 
     /// Mainnet tip stall class (961460→961461): already-archived Class A tip+1
-    /// uses `plan=None` pin cold denserels. Schema-13 body has no leading txid;
-    /// load must fill pin identity from `txid.body` so assemble pin-hits match
-    /// wire (not soft spentness recovery for zero-identity pins).
+    /// uses `plan=None` with lookup-stamped parent pin (ranges + wire identity).
+    /// Load pins denserels by range only — no soft spentness recovery for
+    /// zero-identity pins.
     ///
     /// Shipped paths:
     /// - archive body first → `confirm_wire_run` (plan=None) succeeds
-    /// - IBD-style `confirm_wire_load_from_plan(..., Forbid)` with plan=None must
-    ///   still succeed (load forces Allow cold denserels — not
-    ///   `lookup stage miss`)
+    /// - IBD-style `confirm_wire_load_from_plan` with plan=None succeeds via
+    ///   single-path range denserels from stamp
     /// - rapid tip+1/tip+2 accept; genuine double-spend still `PrevoutSpent`
     #[test]
     fn already_archived_schema13_pin_identity_tip_follow() {
         use crate::{
             accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
             confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_write_phase,
-            ColdPinMode, ScriptPreverified,
+            ScriptPreverified,
         };
         use rbitcoin_query::Query;
         use std::sync::Arc;
@@ -3507,9 +3506,8 @@ mod structure_rule_tests {
                 stamped,
                 None,
                 &ScriptPreverified::new(),
-                ColdPinMode::Forbid, // IBD load always passes Forbid
             )
-            .expect("plan=None + Forbid must force Allow cold denserels");
+            .expect("plan=None load pins denserels by range from stamp");
             let ok = confirm_scripts_phase(mat.batch).expect("scripts");
             confirm_write_phase(&q, &params, ms, ok.batch)
                 .expect("plan=None confirm with same-block spends must succeed");

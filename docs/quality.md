@@ -64,7 +64,6 @@ level peers cannot ignore**.
 
 | ID | Item | Why it still matters | Done looks like |
 |----|------|----------------------|-----------------|
-| **Q-02** | **Confirm/store dual-path hygiene** | Soft fallbacks hide load bugs; historical thrash | Invariants on confirm hot path; no spentness soft-path for identity bugs; SH/fuse multi-path only where env/protocol requires |
 | **Q-03** | **Default CI does not run multi-node IBD** | Hardest product surface is `#[ignore]` | Small hermetic multi-node path green in default CI *or* weekly required job with hang fixed |
 | **Q-04** | **Env knobs inventory** | ~40 `RBITCOIN_*` in code vs fewer in OPERATOR | Every public knob in OPERATOR advanced section; private knobs `cfg`/`doc(hidden)` or `RBITCOIN_UNSTABLE_*` |
 
@@ -228,6 +227,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | No external findings process | **Fixed** — `docs/external_findings/` + status on 001–011 (and follow-ups) |
 | Core script/TX allowlist debt | **Fixed (Q-01)** — allowlist concept removed; every Core script/TX row must pass; findings 001–011 have named regressions |
 | External findings process incomplete | **Fixed (Q-01)** — status + Regression links in `docs/external_findings/` |
+| Confirm dual-path soft recovery | **Fixed (Q-02)** — killed load identity soft-fill + `ColdPinMode` dual API; denserels by range only; invariants.md updated |
 | Most-work reorg / tip hole livelocks | **Largely fixed** — multi-hop reorg, tip-hole race, zombie pending, resume seed stack/O(N²) fixes |
 | SH/fuse wipe risk on format | **Fixed** — soft-migrate fuse8; AGENTS on-disk format rules |
 
@@ -264,7 +264,7 @@ God-files, ignored multi-node IBD in default CI, `allow(dead_code)` bulk_io, `Ib
 |----------|------|
 | Maintainers picking the next refactor | Remaining **P0–P1** |
 | Release engineering | P2 **Q-20–Q-23** (MSRV/Q-05 closed) |
-| Security / adversarial | P0 **Q-02–Q-03**, P3 **Q-30** (Q-01 findings/allowlist closed) |
+| Security / adversarial | P0 **Q-03**, P3 **Q-30** (Q-01/Q-02 closed) |
 | Docs / README | North star + Remaining **Q-04**, **Q-34** |
 | “Are we industry-leading yet?” | North star pillars + grade board |
 

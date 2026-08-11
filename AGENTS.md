@@ -122,10 +122,12 @@ land the simplification as a drive-by cleanup.
 ## GitHub CI must stay green (every commit)
 
 CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
-`master`/`main`). **Do not push or leave a commit that would fail the required
-`test` job.** A red CI on `master` is incomplete work.
+`master`/`main`). Required checks are separate jobs so the push/PR UI shows
+which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`coverage`**.
+**Do not push or leave a commit that would fail any of them.** A red CI on
+`master` is incomplete work.
 
-### Required before each code commit (`test` job)
+### Required before each code commit
 
 From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets
 `CARGO_TARGET_DIR=target/dev` so host test/clippy objects stay out of the
@@ -139,11 +141,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-| Gate | Expectation |
-|------|-------------|
-| `cargo fmt --all -- --check` | Clean |
-| `clippy … -D warnings` | Clean under `[workspace.lints.clippy]` allows in root `Cargo.toml` |
-| `cargo test --workspace` | All non-ignored tests pass |
+| CI job | Local command | Expectation |
+|--------|---------------|-------------|
+| **fmt** | `cargo fmt --all -- --check` | Clean (default rustfmt; no project `rustfmt.toml`) |
+| **clippy** | `clippy … -D warnings` | Clean under `[workspace.lints.clippy]` allows in root `Cargo.toml` |
+| **test** | `cargo test --workspace` (+ CI also builds node/cli bins) | All non-ignored tests pass |
+| **coverage** | `./scripts/coverage.sh` | ≥90% first-party LCOV; job waits on fmt+clippy+test |
 
 **Toolchain:** CI pins **rustc 1.95.0** (same class as `nix-shell` / crane via
 `nixos-26.05` in `flake.lock`). Do not rely on host “latest stable” alone.
@@ -158,7 +161,7 @@ When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs
 |-------|-------------|
 | **Each intermediate step** | Targeted tests for crates/modules touched; logical commits with public hygiene. Do **not** require full workspace suite, full coverage, or musl install after every slice. |
 | **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%), **one** musl build + install. |
-| **Push to master** | Still must keep CI green — do not push intermediate commits that fail the required `test` job if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
+| **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
 
 Single-shot turns (one bugfix, no multi-step plan) still follow the full commit
 recipe below including musl when code changes.

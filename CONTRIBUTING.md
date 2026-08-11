@@ -19,7 +19,10 @@
 
 ## Workflow
 
-Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
+Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
+checks are **separate jobs** on every push/PR (`fmt`, `clippy`, `test`,
+`coverage`) so a red run shows which gate failed without digging into a
+monolithic job log. Locally:
 
 ```bash
 nix develop   # or nix-shell — both pin via flake.lock

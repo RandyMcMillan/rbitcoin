@@ -280,7 +280,7 @@ async fn send_json(
     v: &Value,
 ) -> Result<(), ()> {
     let s = v.to_string();
-    sink.send(Message::Text(s)).await.map_err(|_| ())
+    sink.send(Message::Text(s.into())).await.map_err(|_| ())
 }
 
 async fn send_error(
@@ -379,7 +379,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, _permit: OwnedSemaphoreP
                             let _ = send_error(&mut sink, "message too large").await;
                             break;
                         }
-                        match parse_client_msg(&text) {
+                        match parse_client_msg(text.as_str()) {
                             Ok(msg) => {
                                 if handle_client_msg(&st, &mut conn, msg, &mut sink).await.is_err() {
                                     break;

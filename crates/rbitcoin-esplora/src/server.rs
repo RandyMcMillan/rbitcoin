@@ -141,58 +141,62 @@ pub async fn run_esplora(
     };
 
     // REST routes: concurrency / body / timeout apply here only.
+    // axum 0.8 path params use `{name}` (not `:name`).
     let rest = Router::new()
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/blocks", get(handlers::blocks_tip))
-        .route("/blocks/:start", get(handlers::blocks_from_height))
-        .route("/block-height/:height", get(block_height))
-        .route("/block/:hash", get(handlers::block_json))
-        .route("/block/:hash/header", get(block_header))
-        .route("/block/:hash/status", get(handlers::block_status))
-        .route("/block/:hash/raw", get(handlers::block_raw))
-        .route("/block/:hash/txids", get(handlers::block_txids))
-        .route("/block/:hash/txid/:index", get(handlers::block_txid_at))
-        .route("/block/:hash/txs", get(handlers::block_txs_0))
-        .route("/block/:hash/txs/:start", get(handlers::block_txs_start))
-        .route("/tx/:txid", get(tx_full))
-        .route("/tx/:txid/hex", get(tx_hex))
-        .route("/tx/:txid/raw", get(handlers::tx_raw))
-        .route("/tx/:txid/status", get(tx_status))
-        .route("/tx/:txid/merkle-proof", get(handlers::tx_merkle_proof))
+        .route("/blocks/{start}", get(handlers::blocks_from_height))
+        .route("/block-height/{height}", get(block_height))
+        .route("/block/{hash}", get(handlers::block_json))
+        .route("/block/{hash}/header", get(block_header))
+        .route("/block/{hash}/status", get(handlers::block_status))
+        .route("/block/{hash}/raw", get(handlers::block_raw))
+        .route("/block/{hash}/txids", get(handlers::block_txids))
+        .route("/block/{hash}/txid/{index}", get(handlers::block_txid_at))
+        .route("/block/{hash}/txs", get(handlers::block_txs_0))
+        .route("/block/{hash}/txs/{start}", get(handlers::block_txs_start))
+        .route("/tx/{txid}", get(tx_full))
+        .route("/tx/{txid}/hex", get(tx_hex))
+        .route("/tx/{txid}/raw", get(handlers::tx_raw))
+        .route("/tx/{txid}/status", get(tx_status))
+        .route("/tx/{txid}/merkle-proof", get(handlers::tx_merkle_proof))
         .route(
-            "/tx/:txid/merkleblock-proof",
+            "/tx/{txid}/merkleblock-proof",
             get(handlers::tx_merkleblock_proof),
         )
-        .route("/tx/:txid/outspend/:vout", get(handlers::tx_outspend))
-        .route("/tx/:txid/outspends", get(handlers::tx_outspends))
+        .route("/tx/{txid}/outspend/{vout}", get(handlers::tx_outspend))
+        .route("/tx/{txid}/outspends", get(handlers::tx_outspends))
         .route("/tx", post(handlers::post_tx))
         .route("/txs/package", post(handlers::post_tx_package))
-        .route("/address/:addr", get(handlers::address_info))
-        .route("/address/:addr/utxo", get(handlers::address_utxo))
-        .route("/address/:addr/txs", get(handlers::address_txs))
+        .route("/address/{addr}", get(handlers::address_info))
+        .route("/address/{addr}/utxo", get(handlers::address_utxo))
+        .route("/address/{addr}/txs", get(handlers::address_txs))
         .route(
-            "/address/:addr/txs/mempool",
+            "/address/{addr}/txs/mempool",
             get(handlers::address_txs_mempool),
         )
-        .route("/address/:addr/txs/chain", get(handlers::address_txs_chain))
         .route(
-            "/address/:addr/txs/chain/:last",
+            "/address/{addr}/txs/chain",
+            get(handlers::address_txs_chain),
+        )
+        .route(
+            "/address/{addr}/txs/chain/{last}",
             get(handlers::address_txs_chain_cursor),
         )
-        .route("/scripthash/:hash", get(handlers::scripthash_info))
-        .route("/scripthash/:hash/utxo", get(handlers::scripthash_utxo))
-        .route("/scripthash/:hash/txs", get(handlers::scripthash_txs))
+        .route("/scripthash/{hash}", get(handlers::scripthash_info))
+        .route("/scripthash/{hash}/utxo", get(handlers::scripthash_utxo))
+        .route("/scripthash/{hash}/txs", get(handlers::scripthash_txs))
         .route(
-            "/scripthash/:hash/txs/mempool",
+            "/scripthash/{hash}/txs/mempool",
             get(handlers::scripthash_txs_mempool),
         )
         .route(
-            "/scripthash/:hash/txs/chain",
+            "/scripthash/{hash}/txs/chain",
             get(handlers::scripthash_txs_chain),
         )
         .route(
-            "/scripthash/:hash/txs/chain/:last",
+            "/scripthash/{hash}/txs/chain/{last}",
             get(handlers::scripthash_txs_chain_cursor),
         )
         .route("/mempool", get(handlers::mempool_info))
@@ -200,7 +204,10 @@ pub async fn run_esplora(
         .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
         .fallback(fallback_404)
-        .layer(TimeoutLayer::new(timeout))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(ConcurrencyLimitLayer::new(max_conn));
 
@@ -963,7 +970,7 @@ mod tests {
             .expect("ws closed")
             .expect("ws err");
         let text = match frame {
-            WsMsg::Text(t) => t,
+            WsMsg::Text(t) => t.as_str().to_owned(),
             other => panic!("expected text frame, got {other:?}"),
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1031,7 +1038,7 @@ mod tests {
             .expect("closed")
             .expect("err");
         match frame {
-            WsMsg::Text(t) => serde_json::from_str(&t).expect("json"),
+            WsMsg::Text(t) => serde_json::from_str(t.as_str()).expect("json"),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -1121,9 +1128,9 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        ws.send(WsMsg::Text(format!(
-            r#"{{"track-address":"{watch_addr}"}}"#
-        )))
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-address":"{watch_addr}"}}"#)).into(),
+        ))
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1278,9 +1285,11 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{pending_hex}"}}"#)))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-tx":"{pending_hex}"}}"#)).into(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         hub.accept_tx(&pending).expect("accept");
@@ -1389,13 +1398,17 @@ mod tests {
             Address::p2wpkh(&cpk, Network::Regtest).to_string()
         };
 
-        ws.send(WsMsg::Text(format!(r#"{{"track-address":"{a1}"}}"#)))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-address":"{a1}"}}"#)).into(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text(format!(r#"{{"track-address":"{a2}"}}"#)))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-address":"{a2}"}}"#)).into(),
+        ))
+        .await
+        .unwrap();
         let mut saw_addr_cap = false;
         for _ in 0..6 {
             let v = ws_recv_json(&mut ws, 2).await;
@@ -1411,11 +1424,11 @@ mod tests {
 
         let t1 = "11".repeat(32);
         let t2 = "22".repeat(32);
-        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{t1}"}}"#)))
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t1}"}}"#)).into()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{t2}"}}"#)))
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t2}"}}"#)).into()))
             .await
             .unwrap();
         let mut saw_tx_cap = false;
@@ -1495,9 +1508,11 @@ mod tests {
             }],
         };
         let low_hex = display_txid(low.compute_txid());
-        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{low_hex}"}}"#)))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-tx":"{low_hex}"}}"#)).into(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         hub.accept_tx(&low).unwrap();
         // drain unconf
@@ -1544,9 +1559,9 @@ mod tests {
         ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
             .await
             .unwrap();
-        ws.send(WsMsg::Text(format!(
-            r#"{{"track-address":"{watch_addr}"}}"#
-        )))
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"track-address":"{watch_addr}"}}"#)).into(),
+        ))
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;

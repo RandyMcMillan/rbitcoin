@@ -34,7 +34,7 @@ impl StoreSecret {
     /// Cryptographically random secret (datadir create).
     pub fn generate() -> Self {
         let mut bytes = [0u8; SECRET_LEN];
-        getrandom::getrandom(&mut bytes).expect("CSPRNG for store.secret");
+        getrandom::fill(&mut bytes).expect("CSPRNG for store.secret");
         // Reject all-zero (astronomically unlikely) so tests can detect missing entropy.
         if bytes.iter().all(|&b| b == 0) {
             bytes[0] = 1;

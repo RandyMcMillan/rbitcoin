@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-mempool` (`accept.rs`) + consensus helpers not threaded in
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — 0-conf fraud / relay pollution (not consensus)
-**Status:** in progress — structural tip checks + `is_final_tx` / BIP68 (plan 2026-08)
+**Status:** fixed — shipped accept path (2026-08) — structural tip checks + `is_final_tx` / BIP68 (plan 2026-08)
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

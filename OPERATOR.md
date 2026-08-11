@@ -274,6 +274,7 @@ page cache.
 | Annex | empty OK; non-empty only if first data byte after `0x50` is `0x00` |
 | Cluster caps | 64 txs / 101 kWU |
 | Eviction | worst linearization **chunk** when over weight budget |
+| Fee estimate | **10-minute inclusion** (cluster-chunk frontier + confirm-memory floor); see [`docs/mempool-fee-estimation.md`](docs/mempool-fee-estimation.md) |
 | Compaction | DEAD slots reclaimed when wasteful (auto after confirm removes) |
 | Slot table | **131 072** initial records (grows by doubling to 1 048 576); free-slot ensure **before** append |
 

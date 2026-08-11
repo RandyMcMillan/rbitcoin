@@ -384,6 +384,64 @@ impl TxGraph {
         chunks
     }
 
+    /// All mining chunks across clusters, **best feerate first** (inclusion frontier).
+    ///
+    /// Used for fee estimation and future block-template ranking. CPFP packages
+    /// appear as single chunks with combined fee/weight.
+    pub fn mining_chunks_best_first(&self) -> Vec<Chunk> {
+        let mut seen = HashSet::new();
+        let mut chunks = Vec::new();
+        for txid in self.entries.keys() {
+            if seen.contains(txid) {
+                continue;
+            }
+            let Some(c) = self.cluster_of(txid) else {
+                continue;
+            };
+            for m in &c.members {
+                seen.insert(*m);
+            }
+            chunks.extend(c.chunks);
+        }
+        chunks.sort_by(|a, b| {
+            b.fee_rate_sat_per_kvb()
+                .cmp(&a.fee_rate_sat_per_kvb())
+                .then_with(|| b.fee_sat.cmp(&a.fee_sat))
+        });
+        chunks
+    }
+
+    /// Feerate (sat/kvB) of the chunk that fills cumulative weight `target_wu`
+    /// walking best-first. `None` if the pool is empty.
+    ///
+    /// If total pool weight is below `target_wu`, returns the **lowest** chunk
+    /// rate present (still need min-relay floor at the hub).
+    pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
+        let chunks = self.mining_chunks_best_first();
+        if chunks.is_empty() {
+            return None;
+        }
+        let mut cum = 0u64;
+        let mut last_rate = chunks[0].fee_rate_sat_per_kvb();
+        for ch in &chunks {
+            last_rate = ch.fee_rate_sat_per_kvb();
+            cum = cum.saturating_add(ch.weight);
+            if cum >= target_wu {
+                return Some(last_rate.max(1));
+            }
+        }
+        Some(last_rate.max(1))
+    }
+
+    /// Weight (WU) of chunks with feerate strictly greater than `rate_sat_per_kvb`.
+    pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
+        self.mining_chunks_best_first()
+            .into_iter()
+            .filter(|c| c.fee_rate_sat_per_kvb() > rate_sat_per_kvb)
+            .map(|c| c.weight)
+            .sum()
+    }
+
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
         // Representative = min member txid of cluster.
@@ -507,6 +565,46 @@ mod tests {
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.linearization, vec![id]);
         assert_eq!(c.chunks.len(), 1);
+    }
+
+    #[test]
+    fn frontier_prefers_high_rate_chunks_and_depth() {
+        // Two independent txs: high rate then low rate.
+        let mut g = TxGraph::new();
+        let a = spend_op([1u8; 32], 50_000, 40_000); // fee 10k, high rate
+        let b = spend_op([2u8; 32], 50_000, 49_000); // fee 1k, low rate
+        let wa = a.weight().to_wu();
+        let wb = b.weight().to_wu();
+        g.insert(entry_for(&a, 10_000, 0), &a);
+        g.insert(entry_for(&b, 1_000, 1), &b);
+        let chunks = g.mining_chunks_best_first();
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].fee_rate_sat_per_kvb() >= chunks[1].fee_rate_sat_per_kvb());
+        // Small target hits high-rate chunk.
+        let r_hi = g.frontier_feerate_sat_per_kvb(1).unwrap();
+        let r_deep = g.frontier_feerate_sat_per_kvb(wa + wb).unwrap();
+        assert!(r_hi >= r_deep);
+        assert!(g.weight_above_feerate(0) >= wa);
+    }
+
+    fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(seed),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(outv),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
     }
 
     #[test]

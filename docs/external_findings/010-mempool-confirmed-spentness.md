@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-mempool` / `QueryUtxoProvider` (`rbitcoin-net` tx_relay)
 **Audit pin:** `2289578` (redteam zip 2026-08-10)
 **Severity:** medium — 0-conf fraud enablement / mempool pollution (not consensus)
-**Status:** in progress — mempool Coin view + confirmed spentness (plan 2026-08)
+**Status:** fixed — shipped accept path (2026-08) — mempool Coin view + confirmed spentness (plan 2026-08)
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

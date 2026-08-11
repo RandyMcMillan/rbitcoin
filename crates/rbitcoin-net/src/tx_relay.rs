@@ -106,6 +106,8 @@ pub struct MempoolHub {
     announce: broadcast::Sender<MempoolAnnounce>,
     /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
+    /// Recently confirmed package feerates (sat/kvB) for estimate floor.
+    confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
 }
 
 impl MempoolHub {
@@ -130,6 +132,7 @@ impl MempoolHub {
             recent: Mutex::new(std::collections::VecDeque::with_capacity(
                 MEMPOOL_RECENT_CAP,
             )),
+            confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
         }))
     }
 
@@ -287,12 +290,21 @@ impl MempoolHub {
 
     /// Remove confirmed txids (tip connect / archive confirm) and re-try orphans
     /// whose parents just confirmed (Query UTXO view).
+    ///
+    /// Samples removed entries' feerates into confirm-memory for the standard
+    /// 10-minute fee estimate floor.
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
+        // Sample before remove while entries still live.
+        for tid in txids {
+            if let Some(e) = g.graph.get(tid) {
+                self.push_confirm_memory(e.fee_rate_sat_per_kvb());
+            }
+        }
         g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0)
     }
 
@@ -434,49 +446,117 @@ impl MempoolHub {
         delta
     }
 
-    /// Fee histogram buckets for Electrum: `[[feerate_sat_per_kvb, vsize], ...]` descending rate.
+    /// Block weight (WU) used for inclusion-frontier depth.
+    pub const BLOCK_WEIGHT_WU: u64 = 4_000_000;
+
+    /// Product default: **10-minute inclusion** ≈ next 1 block of weight
+    /// (see `docs/mempool-fee-estimation.md`).
+    pub const DEFAULT_HORIZON_BLOCKS: u32 = 1;
+
+    /// Fee histogram buckets for Electrum: `[[feerate_sat_per_kvb, vsize], ...]`
+    /// descending rate, using **mining chunk** rates (CPFP-aware).
     pub fn fee_histogram(&self) -> Vec<(u64, u64)> {
         let g = self.inner.lock().unwrap();
         let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        for (_txid, e) in g.graph.iter() {
-            let rate = e.fee_rate_sat_per_kvb();
-            let vsize = rbitcoin_consensus::policy::get_virtual_size(e.weight);
+        for ch in g.graph.mining_chunks_best_first() {
+            let rate = ch.fee_rate_sat_per_kvb();
+            let vsize = rbitcoin_consensus::policy::get_virtual_size(ch.weight);
             *by_rate.entry(rate).or_insert(0) += vsize;
         }
-        // Electrum expects descending feerate.
         by_rate.into_iter().rev().collect()
     }
 
-    /// Rough `estimatefee` in BTC/kB for target blocks (mempool feerate percentile).
-    /// Returns negative if empty (Electrum convention for “unavailable”).
+    /// Standard / target-depth **inclusion-frontier** fee in BTC/kB.
     ///
-    /// `target_blocks`: 1–2 → ~90th percentile (high fee), 3–6 → median, else ~20th.
+    /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
+    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). Larger targets walk a
+    /// deeper frontier. Empty pool → negative (Electrum “unavailable”).
+    ///
+    /// Floor: Libre min relay. Confirm-memory floor is applied when present
+    /// (see `confirm_feerate_memory`).
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
-        let g = self.inner.lock().unwrap();
-        if g.graph.is_empty() {
-            return -1.0;
-        }
-        let mut rates: Vec<u64> = g
-            .graph
-            .iter()
-            .map(|(_, e)| e.fee_rate_sat_per_kvb())
-            .collect();
-        rates.sort_unstable();
-        let pct = if target_blocks <= 2 {
-            90
-        } else if target_blocks <= 6 {
-            50
+        let depth = if target_blocks == 0 || target_blocks <= 2 {
+            Self::DEFAULT_HORIZON_BLOCKS
         } else {
-            20
+            target_blocks
         };
-        let idx = ((rates.len().saturating_sub(1)) * pct) / 100;
-        let pick = rates[idx.min(rates.len() - 1)];
-        (pick as f64) / 100_000_000.0
+        let target_wu = u64::from(depth).saturating_mul(Self::BLOCK_WEIGHT_WU);
+        let g = self.inner.lock().unwrap();
+        let Some(mut rate) = g.graph.frontier_feerate_sat_per_kvb(target_wu) else {
+            // Empty: optional confirm-memory floor.
+            drop(g);
+            return self
+                .confirm_memory_floor_btc_per_kb()
+                .unwrap_or(-1.0);
+        };
+        let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+        rate = rate.max(min_r);
+        if let Some(floor) = self.confirm_memory_floor_sat_per_kvb() {
+            rate = rate.max(floor);
+        }
+        (rate as f64) / 100_000_000.0
+    }
+
+    /// Mining-order chunk snapshot for diagnostics / future templates.
+    pub fn mining_frontier_snapshot(&self) -> Vec<(u64, u64, u64, usize)> {
+        let g = self.inner.lock().unwrap();
+        g.graph
+            .mining_chunks_best_first()
+            .into_iter()
+            .map(|c| {
+                (
+                    c.fee_rate_sat_per_kvb(),
+                    c.weight,
+                    c.fee_sat,
+                    c.txids.len(),
+                )
+            })
+            .collect()
+    }
+
+    /// Weight (WU) ranking strictly above `rate_sat_per_kvb`.
+    pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .graph
+            .weight_above_feerate(rate_sat_per_kvb)
     }
 
     /// Relay fee in BTC/kB (Libre 0.1 sat/vB = 100 sat/kvB).
     pub fn relay_fee_btc_per_kb() -> f64 {
         rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as f64 / 100_000_000.0
+    }
+
+    // ── Confirm-memory floor (step 5) ─────────────────────────────────────
+
+    /// Ring of recently confirmed package feerates (sat/kvB), newest last.
+    /// Filled from `remove_for_block` when live entries leave the pool.
+    fn confirm_memory_floor_sat_per_kvb(&self) -> Option<u64> {
+        let mem = self.confirm_feerate_memory.lock().unwrap();
+        if mem.is_empty() {
+            return None;
+        }
+        // Median of samples (practical floor).
+        let mut v: Vec<u64> = mem.iter().copied().collect();
+        v.sort_unstable();
+        Some(v[v.len() / 2].max(
+            rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+        ))
+    }
+
+    fn confirm_memory_floor_btc_per_kb(&self) -> Option<f64> {
+        self.confirm_memory_floor_sat_per_kvb()
+            .map(|r| (r as f64) / 100_000_000.0)
+    }
+
+    fn push_confirm_memory(&self, rate_sat_per_kvb: u64) {
+        const CAP: usize = 64;
+        let mut mem = self.confirm_feerate_memory.lock().unwrap();
+        mem.push_back(rate_sat_per_kvb.max(1));
+        while mem.len() > CAP {
+            mem.pop_front();
+        }
     }
 }
 

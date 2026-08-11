@@ -880,7 +880,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "128");
+        // Process-local override under lock (not env — parallel remove_var races).
+        let _env = crate::tx_idx::tests_soft_span_env_lock();
+        crate::tx_idx::test_set_soft_span_bytes(128);
         let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
         // Each record ~100 B → soft 128 forces new segment often.
         for i in 0..12u8 {
@@ -899,7 +901,7 @@ mod tests {
         let t = VarTable::open(&dir, "tx", TableKind::Tx).unwrap();
         assert_eq!(t.count(), 12);
         assert_eq!(t.get_raw(Fk(12)).unwrap()[0], 11);
-        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        crate::tx_idx::test_set_soft_span_bytes(0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

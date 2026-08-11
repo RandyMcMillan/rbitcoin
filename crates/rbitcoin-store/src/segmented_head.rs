@@ -381,6 +381,16 @@ impl SegmentedTxHead {
     /// [`test_set_soft_span_bytes`] overrides env when non-zero so parallel
     /// modules that also poke the env cannot race this path.
     pub fn soft_span_bytes() -> u64 {
+        // Explicit env wins (tests under SOFT_SPAN_ENV_LOCK set this). Process-local
+        // override is only a fallback when env is unset — so parallel env mutators
+        // and override-using tests do not desync each other.
+        if let Some(v) = std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v: &u64| v >= 8)
+        {
+            return v;
+        }
         #[cfg(test)]
         {
             let o = TEST_SOFT_SPAN_OVERRIDE.load(Ordering::Relaxed);
@@ -388,11 +398,7 @@ impl SegmentedTxHead {
                 return o;
             }
         }
-        std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v| v >= 8)
-            .unwrap_or(DEFAULT_SOFT_SPAN)
+        DEFAULT_SOFT_SPAN
     }
 
     /// Test-only soft-span override (`0` = use env/default). Process-local;

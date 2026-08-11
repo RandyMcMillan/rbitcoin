@@ -195,12 +195,22 @@ impl TxIdx {
     }
 
     fn soft_span() -> u64 {
-        std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
+        // Explicit env wins (tests under `tests_soft_span_env_lock` set this).
+        if let Some(v) = std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
             .ok()
             .and_then(|s| s.parse().ok())
-            .filter(|&v| v >= IDX_STRIDE)
-            .unwrap_or(DEFAULT_SOFT_SPAN)
-            .min(HARD_SPAN)
+            .filter(|&v: &u64| v >= IDX_STRIDE)
+        {
+            return v.min(HARD_SPAN);
+        }
+        #[cfg(test)]
+        {
+            let o = TEST_SOFT_SPAN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+            if o >= IDX_STRIDE {
+                return o.min(HARD_SPAN);
+            }
+        }
+        DEFAULT_SOFT_SPAN.min(HARD_SPAN)
     }
 
     /// Absolute body start for 1-based `id` (must be ≤ published count).
@@ -1217,13 +1227,29 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
     Ok(out)
 }
 
+/// Process-local soft-span override (bytes). Used when env is unset so parallel
+/// `remove_var` races cannot clear a concurrent multi-segment test.
+#[cfg(test)]
+static TEST_SOFT_SPAN_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serialize tests that mutate `RBITCOIN_TX_IDX_SOFT_SPAN` (process-global).
+/// Shared with `var_table` multi-segment tests.
+#[cfg(test)]
+pub(crate) fn tests_soft_span_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SOFT_SPAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SOFT_SPAN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Test-only soft-span override (`0` = use env/default). Hold
+/// [`tests_soft_span_env_lock`] while non-zero to avoid races.
+#[cfg(test)]
+pub(crate) fn test_set_soft_span_bytes(bytes: u64) {
+    TEST_SOFT_SPAN_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize tests that mutate `RBITCOIN_TX_IDX_SOFT_SPAN` (process-global).
-    static SOFT_SPAN_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Re-appending the same absolute starts after count advanced must fail
     /// (mainnet double-write of 3330 idx slots).
@@ -1265,7 +1291,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
+        let _env = tests_soft_span_env_lock();
         // Tiny soft span → many segments.
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
         let idx = TxIdx::create(&dir, "tx").unwrap();
@@ -1311,7 +1337,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-txidx-dc-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
+        let _env = tests_soft_span_env_lock();
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "32");
         let idx = TxIdx::create(&dir, "tx").unwrap();
         // A few starts; policy does not depend on multi-segment age.
@@ -1352,7 +1378,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _env = SOFT_SPAN_ENV_LOCK.lock().unwrap();
+        let _env = tests_soft_span_env_lock();
         std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
         {
             let idx = TxIdx::create(&dir, "tx").unwrap();

@@ -2340,7 +2340,8 @@ mod tests {
     #[test]
     fn seal_load_routes_new_keys_to_overflow_main_append_stays() {
         let dir = tmp();
-        let t = ScriptHashTable::create(&dir).unwrap();
+        // Fixed mono 64-slot head — not bare create() (env race on HEAD_SCALE).
+        let t = create_tiny_mono_sh(&dir);
         let mut main_keys = Vec::new();
         // 52 unique keys → load 52/64 = 0.8125 ≥ SH_SEAL_LOAD.
         for i in 0..52u32 {
@@ -2903,6 +2904,13 @@ mod tests {
     #[test]
     fn cold_progress_and_resume_skips_complete_shards() {
         // 4-way head: fill shard 0, abandon, resume from progress, fill rest.
+        // Hold HEAD_SCALE lock and force Tiny so open() does not require 64-way
+        // mainnet layout (parallel tests may set RBITCOIN_HEAD_SCALE=mainnet).
+        let _g = HEAD_SCALE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
+        std::env::remove_var("RBITCOIN_HEAD_SCALE"); // Tiny default under cfg(test)
         let dir = tmp();
         let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
         let payload0 = payload_start(FILE_HEADER_LEN);
@@ -2968,6 +2976,10 @@ mod tests {
         assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
         assert_eq!(t.entries(&key(3, 3)).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+        match prev_scale {
+            Some(v) => std::env::set_var("RBITCOIN_HEAD_SCALE", v),
+            None => std::env::remove_var("RBITCOIN_HEAD_SCALE"),
+        }
     }
 
     #[test]

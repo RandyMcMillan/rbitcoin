@@ -601,4 +601,24 @@ mod tests {
             .copy_from_slice(&(SH_FLAG_BIT | 9).to_le_bytes());
         assert!(sh_page_entries(&page).is_err());
     }
+
+    #[test]
+    fn page_last_fk_rejects_null_and_flagged() {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        assert_eq!(sh_page_last_fk(&page).unwrap(), None);
+        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].copy_from_slice(&1u16.to_le_bytes());
+        page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(sh_page_last_fk(&page).is_err());
+        page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + 8]
+            .copy_from_slice(&(SH_FLAG_BIT | 42).to_le_bytes());
+        assert!(sh_page_last_fk(&page).is_err());
+        // Valid last fk
+        page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + 8].copy_from_slice(&42u64.to_le_bytes());
+        assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(42)));
+        assert_eq!(sh_page_count_for_entries(0), 0);
+        assert_eq!(sh_page_count_for_entries(1), 1);
+        assert_eq!(sh_page_count_for_entries(SH_PAGE_FK_CAP), 1);
+        assert_eq!(sh_page_count_for_entries(SH_PAGE_FK_CAP + 1), 2);
+    }
 }

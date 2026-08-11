@@ -8,7 +8,7 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, UtxoProvider};
+use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, Coin, UtxoProvider};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
@@ -16,24 +16,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-/// Resolve prevouts from the relational archive (confirmed UTXOs).
+/// Resolve prevouts from the relational archive (confirmed **unspent** UTXOs).
+///
+/// Returns no coin when the create is unknown **or** a confirmed-strong spender
+/// exists (finding 010 — mirror Core coins-view spentness).
 pub struct QueryUtxoProvider<'a> {
     pub query: &'a Query,
 }
 
 impl UtxoProvider for QueryUtxoProvider<'_> {
-    fn get_txout(&self, op: &OutPoint) -> Option<TxOut> {
+    fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
         let tid = op.txid.to_byte_array();
-        let (_fk, rec) = self.query.get_tx_by_txid(&tid).ok().flatten()?;
-        let out: OutputRecord = self.query.tx_output(&rec, op.vout).ok()?;
+        let (fk, rec) = self.query.get_tx_by_txid(&tid).ok().flatten()?;
+        // Confirmed-strong spent ⇒ absent (do not admit double-spends of chain UTXOs).
+        if self.query.is_outpoint_spent(&tid, op.vout).ok()? {
+            return None;
+        }
+        let out: OutputRecord = self
+            .query
+            .tx_output_at_fk(fk, &rec, op.vout)
+            .ok()
+            .or_else(|| self.query.tx_output(&rec, op.vout).ok())?;
         let value = if out.value < 0 {
             Amount::ZERO
         } else {
             Amount::from_sat(out.value as u64)
         };
-        Some(TxOut {
-            value,
-            script_pubkey: ScriptBuf::from_bytes(out.script),
+        let create_height = self
+            .query
+            .store()
+            .tx_height
+            .get(fk)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        // Coinbase: first input null prevout when we can load inputs; else height-0 heuristic.
+        let is_coinbase = self
+            .query
+            .tx_input_at_fk(fk, &rec, 0)
+            .ok()
+            .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+            .unwrap_or(false);
+        Some(Coin {
+            txout: TxOut {
+                value,
+                script_pubkey: ScriptBuf::from_bytes(out.script),
+            },
+            create_height,
+            is_coinbase,
         })
     }
 }

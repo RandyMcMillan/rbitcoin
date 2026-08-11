@@ -31,7 +31,7 @@ mod store;
 
 pub use accept::{
     pure_rbfr_pays, rbf_allows_replacement, rbf_pays_for_replacement, AcceptError, AcceptResult,
-    ActiveMempool, MapUtxoProvider, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT,
+    ActiveMempool, ChainTipCtx, Coin, MapUtxoProvider, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT,
     INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, RBFR_RATIO_DEN,
     RBFR_RATIO_NUM,
 };

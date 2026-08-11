@@ -9,18 +9,67 @@ use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
 use std::collections::BTreeSet;
 
+/// Confirmed-chain unspent coin for mempool accept (content + maturity metadata).
+///
+/// Presence implies **unspent on the confirmed chain**. Missing/`None` means
+/// unknown create or confirmed-strong spent (finding 010).
+#[derive(Debug, Clone)]
+pub struct Coin {
+    pub txout: TxOut,
+    /// Class C create height; `0` if unknown (BIP68 fail-closed when needed).
+    pub create_height: u32,
+    pub is_coinbase: bool,
+}
+
+/// Tip snapshot for structural checks (finality / maturity / BIP68).
+///
+/// `height` is the **confirmed tip** height; absolute finality uses `height + 1`
+/// as the next block height (Core mempool convention).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChainTipCtx {
+    pub height: u32,
+    /// BIP113 median time past of the tip (locktime cutoff for time-form nLockTime).
+    pub mtp: u32,
+}
+
 /// Resolve prevouts for mempool acceptance (chain UTXO + in-mempool outputs).
 pub trait UtxoProvider {
-    fn get_txout(&self, op: &OutPoint) -> Option<TxOut>;
+    /// Unspent confirmed coin, or `None` if missing/spent on the confirmed chain.
+    fn get_coin(&self, op: &OutPoint) -> Option<Coin>;
+
+    fn get_txout(&self, op: &OutPoint) -> Option<TxOut> {
+        self.get_coin(op).map(|c| c.txout)
+    }
 }
 
 /// Map-backed provider for tests and simple callers.
 pub struct MapUtxoProvider {
-    pub map: std::collections::HashMap<OutPoint, TxOut>,
+    pub map: std::collections::HashMap<OutPoint, Coin>,
+}
+
+impl MapUtxoProvider {
+    /// Insert bare outputs as non-coinbase coins at height 0 (legacy test helper).
+    pub fn from_txouts(map: std::collections::HashMap<OutPoint, TxOut>) -> Self {
+        Self {
+            map: map
+                .into_iter()
+                .map(|(op, txout)| {
+                    (
+                        op,
+                        Coin {
+                            txout,
+                            create_height: 0,
+                            is_coinbase: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 impl UtxoProvider for MapUtxoProvider {
-    fn get_txout(&self, op: &OutPoint) -> Option<TxOut> {
+    fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
         self.map.get(op).cloned()
     }
 }
@@ -303,8 +352,9 @@ impl ActiveMempool {
                         continue;
                     }
                 }
-            } else if let Some(o) = utxos.get_txout(&op) {
-                o
+            } else if let Some(coin) = utxos.get_coin(&op) {
+                // Confirmed unspent only — spent/missing create → None (finding 010).
+                coin.txout
             } else {
                 missing_parents.insert(op.txid);
                 continue;
@@ -774,6 +824,14 @@ mod tests {
         p
     }
 
+    fn coin(txout: TxOut) -> Coin {
+        Coin {
+            txout,
+            create_height: 0,
+            is_coinbase: false,
+        }
+    }
+
     fn chain_utxo(value: u64) -> (OutPoint, TxOut, MapUtxoProvider) {
         let op = OutPoint {
             txid: Txid::from_byte_array([0xab; 32]),
@@ -784,8 +842,31 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         };
         let mut map = HashMap::new();
-        map.insert(op, txout.clone());
+        map.insert(op, coin(txout.clone()));
         (op, txout, MapUtxoProvider { map })
+    }
+
+    /// Finding 010: provider returns no coin for a spent/missing outpoint → reject.
+    #[test]
+    fn reject_when_provider_has_no_unspent_coin() {
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xcd; 32]),
+            vout: 0,
+        };
+        let tx = spend_tx(op, 1_000);
+        let utxos = MapUtxoProvider {
+            map: HashMap::new(), // spent or unknown → no coin
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos).expect_err("must not admit");
+        // Orphanage parks missing parents; empty map → orphaned or missing.
+        assert!(
+            matches!(err, AcceptError::Orphaned(_) | AcceptError::MissingPrevout(_)),
+            "got {err}"
+        );
+        assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn spend_tx(op: OutPoint, out_value: u64) -> Transaction {
@@ -849,7 +930,7 @@ mod tests {
             script_pubkey: spk,
         };
         let mut map = HashMap::new();
-        map.insert(op, txout);
+        map.insert(op, coin(txout));
         let utxos = MapUtxoProvider { map };
         let tx = spend_tx(op, 99_000); // empty scriptSig + empty witness
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
@@ -1062,7 +1143,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             };
             let mut map = HashMap::new();
-            map.insert(op, txout);
+            map.insert(op, coin(txout));
             let utxos = MapUtxoProvider { map };
             // Vary fees so worst-chunk ordering is defined: low fee first.
             let out = 99_000u64 - u64::from(i) * 100; // higher i → higher fee
@@ -1139,7 +1220,7 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         };
         let mut map = HashMap::new();
-        map.insert(op, txout);
+        map.insert(op, coin(txout));
         let utxos = MapUtxoProvider { map };
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.accept_tx(&tx, &utxos)
@@ -1461,10 +1542,10 @@ mod tests {
             let mut map = HashMap::new();
             map.insert(
                 op,
-                TxOut {
+                coin(TxOut {
                     value: Amount::from_sat(100_000),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-                },
+                }),
             );
             let utxos = MapUtxoProvider { map };
             let tx = spend_tx(op, 99_000);
@@ -1480,10 +1561,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             op,
-            TxOut {
+            coin(TxOut {
                 value: Amount::from_sat(100_000),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            },
+            }),
         );
         let utxos = MapUtxoProvider { map };
         let tx = spend_tx(op, 99_000);

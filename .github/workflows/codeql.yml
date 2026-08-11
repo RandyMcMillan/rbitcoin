@@ -6,9 +6,14 @@
 #
 # Languages: Rust (workspace) + GitHub Actions workflows.
 # Query suite: security-extended (default security + extra high-signal queries).
-# Build: manual cargo build with the same rustc pin as ci.yml for precise results.
+#
+# Rust: CodeQL only supports build-mode `none` (not manual/autobuild). The
+# extractor uses rust-analyzer + cargo for build scripts/macros; a full
+# `cargo build` is not used. Runner needs rustup/cargo on PATH — pin matches
+# ci.yml / Nix shell (1.95 class).
 #
 # https://docs.github.com/code-security/code-scanning
+# https://docs.github.com/en/code-security/reference/code-scanning/codeql/build-options-for-compiled-languages#building-rust
 
 name: codeql
 
@@ -42,15 +47,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Rust: only build-mode `none` is supported (CodeQL 2.x / GA).
           - language: rust
-            # manual = most precise for compiled languages; matches a real build.
-            build-mode: manual
+            build-mode: none
           - language: actions
             build-mode: none
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Required before CodeQL init for Rust: extractor needs rustup + cargo.
+      - name: Install Rust toolchain
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -60,22 +70,6 @@ jobs:
           # security-extended: default security suite + additional queries with
           # lower false-positive rate than the full quality pack.
           queries: security-extended
-
-      # Rust only: produce a real build so CodeQL sees the compiled graph.
-      # Pin matches .github/workflows/ci.yml and the Nix/shell 1.95 class.
-      - name: Install Rust toolchain
-        if: matrix.language == 'rust'
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Build workspace (CodeQL extract)
-        if: matrix.language == 'rust'
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_INCREMENTAL: "0"
-          CARGO_TARGET_DIR: target/codeql
-          # Match CI warning policy without failing extract on style-only noise.
-          RUSTFLAGS: "-D warnings"
-        run: cargo build --workspace --all-targets
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3

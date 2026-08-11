@@ -684,11 +684,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     // Catch-up never finished cleanly — re-run IBD against this peer
                     // (never enter tip mode from a partial download).
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
-                    let retry_cfg = IbdConfig {
-                        target_peers: 1,
-                        peers: Some(std::sync::Arc::clone(&shared_peers)),
-                        ..IbdConfig::for_test()
-                    };
+                    let retry_cfg = catch_up_retry_config(std::sync::Arc::clone(&shared_peers));
                     let cancel = Some(Arc::clone(&shutdown.flag));
                     let retry_peers = [peer];
                     tokio::select! {
@@ -870,10 +866,44 @@ pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> 
     true
 }
 
+/// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).
+///
+/// Uses [`IbdConfig::default`] (window 1024, stall 30s, connect 8s, …) — not
+/// [`IbdConfig::for_test`], which is only for unit/integration test harnesses.
+fn catch_up_retry_config(peers: std::sync::Arc<std::sync::Mutex<AddrMan>>) -> IbdConfig {
+    IbdConfig {
+        target_peers: 1,
+        peers: Some(peers),
+        ..IbdConfig::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn catch_up_retry_config_uses_production_not_for_test() {
+        let peers = std::sync::Arc::new(std::sync::Mutex::new(rbitcoin_net::AddrMan::new()));
+        let cfg = catch_up_retry_config(std::sync::Arc::clone(&peers));
+        let prod = IbdConfig::default();
+        let test = IbdConfig::for_test();
+
+        assert_eq!(cfg.target_peers, 1);
+        assert!(cfg.peers.is_some());
+        // Production class (main catch-up path), not for_test knobs.
+        assert_eq!(cfg.window, prod.window);
+        assert_eq!(cfg.window, rbitcoin_net::DEFAULT_IBD_WINDOW);
+        assert_eq!(cfg.per_peer, prod.per_peer);
+        assert_eq!(cfg.stall, prod.stall);
+        assert_eq!(cfg.connect_timeout, prod.connect_timeout);
+        assert_eq!(cfg.headers_batch, prod.headers_batch);
+        // Guard against reintroducing for_test() base fields.
+        assert_ne!(cfg.window, test.window);
+        assert_ne!(cfg.stall, test.stall);
+        assert_ne!(cfg.connect_timeout, test.connect_timeout);
+    }
 
     #[test]
     fn custom_signet_does_not_use_default_signet_seeds() {

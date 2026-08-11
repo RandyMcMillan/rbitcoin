@@ -77,7 +77,6 @@ MSRV drift, etc.).
 | **Q-10** | **Split god-files** | Still the main velocity tax (see baseline) | Stage/IO modules &lt;~1.5k lines; tests next to stage or in `tests/` without dual oracles |
 | **Q-11** | **Extract longest functions** | IBD main loop, pin batch, `eval_script`, peer frame handlers, perf formatters | Named pure helpers; unit tests on policy tables without full IBD |
 | **Q-12** | **Kill or quarantine `allow(dead_code)`** | `bulk_io` (many), `address_head`, `file`, `uring_session` still allow | Delete unused; or `#[cfg(test)]` only; AGENTS policy holds |
-| **Q-13** | **`IbdConfig::for_test` in node** | `crates/rbitcoin-node/src/run.rs` still uses `..IbdConfig::for_test()` on catch-up retry | Node uses explicit production constructor; `for_test` only under `cfg(test)` / rbitcoin-test |
 | **Q-14** | **Head-module glossary** | address_head / hashhead / sharded / segmented / scripthash_head | One architecture diagram + “when to use which” table in docs |
 | **Q-15** | **RPC crate destiny** | Stub package text honest; still a workspace member with no surface | Either minimal useful node RPC slice *or* remove from default workspace “product” narrative |
 | **Q-16** | **Residual process env** | ~36 `RBITCOIN_*` names still appear in crates (SH/BQ/slots, path-IO **string** leftovers, test-only). Path overrides and confirm queue envs are **dead**; many other reads remain | Either hardcode / CLI-struct remaining production reads, or keep only documented unstable set; no silent “advanced env bible” |
@@ -243,6 +242,13 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Env knob museum | **Fixed (Q-04) primary** — path IO + confirm queue envs removed; CLI first; residual names → **Q-16** |
 | Most-work reorg / tip-hole livelocks | **Largely fixed** — multi-hop reorg, tip-hole, zombie pending, resume O(N²)/stack |
 | SH/fuse wipe risk on format | **Fixed** — soft-migrate fuse8; AGENTS format rules |
+| Node catch-up retry used `IbdConfig::for_test` | **Fixed (Q-13)** — `catch_up_retry_config` uses production `Default` + `target_peers: 1`; `for_test` remains for harnesses only |
+
+### Maintainability (partial P1)
+
+| Was | Resolution |
+|-----|------------|
+| (open) god-files / long fns / dead_code allows | **In progress** — Q-10/Q-11/Q-12 remain |
 
 ### Product surface growth (post-audit)
 
@@ -253,9 +259,9 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 ### Still intentionally open (see Remaining)
 
-God-files (Q-10/Q-11), `allow(dead_code)` (Q-12), `IbdConfig::for_test` in node
-(Q-13), residual env reads (Q-16), cargo deny/SBOM/musl CI (P2), continuous fuzz /
-tutorial / soak (P3), tier-C multinode optional (Q-38).
+God-files (Q-10/Q-11), `allow(dead_code)` (Q-12), residual env reads (Q-16), cargo
+deny/SBOM/musl CI (P2), continuous fuzz / tutorial / soak (P3), tier-C multinode
+optional (Q-38).
 
 ---
 
@@ -278,7 +284,7 @@ tutorial / soak (P3), tier-C multinode optional (Q-38).
 
 | Audience | Read |
 |----------|------|
-| Maintainers picking the next refactor | Remaining **P1** (start **Q-10** / **Q-13**) |
+| Maintainers picking the next refactor | Remaining **P1** (start **Q-10** / **Q-12**) |
 | Release engineering | **P2 Q-20–Q-23** |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** fuzz |
 | Docs / README | **Q-14**, **Q-34** |

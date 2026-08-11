@@ -248,7 +248,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Was | Resolution |
 |-----|------------|
 | Store `allow(dead_code)` hotspots | **Fixed (Q-12)** — live APIs unsilenced; test-only surfaces under `#[cfg(test)]` (`bulk_io` RMW, `address_head` insert fields/`read_entry`, `file` load_u*, `UringSession::new`) |
-| (open) god-files / long fns | **In progress (Q-10a peels)** — tests peeled from `ibd/events`, `confirm_run`, `tx_table`; production stage splits (Q-10/Q-11) remain |
+| (open) god-files / long fns | **In progress** — Q-10a peels: `ibd/events`, `confirm_run`, `tx_table` tests out; Q-11 start: `confirm_run/pin.rs` holds `pin_for_wire_batch` + `ensure_spend_abs_layouts`. Further stage splits remain |
 
 ### Product surface growth (post-audit)
 

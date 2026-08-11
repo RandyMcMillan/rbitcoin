@@ -1440,10 +1440,12 @@ fn store_start_states_lookup_load_confirm() {
         !stamp_fn.contains("IdxBodyMode::OutsDenserels"),
         "lookup stamp must never idx denserels body"
     );
-    let load_pin = src
+    // pin_for_wire_batch lives in pin.rs (Q-11 extract); still denserels-by-range only.
+    let pin_src = include_str!("pin.rs");
+    let load_pin = pin_src
         .split("fn pin_for_wire_batch")
         .nth(1)
-        .and_then(|s| s.split("pub fn confirm_scripts_phase").next())
+        .and_then(|s| s.split("fn ensure_spend_abs_layouts").next())
         .expect("pin fn slice");
     assert!(
         !load_pin.contains("get_fk_by_txid("),

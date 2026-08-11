@@ -25,6 +25,8 @@ pkgs.mkShell {
     llvmPackages.llvm
     cargo-llvm-cov
     pkg-config
+    # used in coverage.sh
+    python3
   ];
 
   RUST_BACKTRACE = "1";

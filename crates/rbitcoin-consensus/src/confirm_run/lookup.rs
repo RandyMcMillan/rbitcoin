@@ -1027,4 +1027,3 @@ pub(super) fn fill_create_txid_load(
     tx.txid = known_create_txid_load(create_fk_id, plan)?;
     Ok(())
 }
-

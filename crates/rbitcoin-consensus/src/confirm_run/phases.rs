@@ -569,4 +569,3 @@ pub(super) fn expected_bits_extending(
         &params.btc,
     ))
 }
-

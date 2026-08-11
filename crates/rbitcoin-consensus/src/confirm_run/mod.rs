@@ -40,37 +40,35 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-mod pin;
 mod lookup;
+mod phases;
+mod pin;
 mod scripts;
 mod write;
-mod phases;
 
-use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
+pub use lookup::lookup_stage_stats;
+pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_and_ensure_denserels,
     confirm_wire_lookup_stamp, ensure_external_parent_denserels_from_plan, DenserelsWarmStats,
     ParentPinStamp, PlanStampOutcome,
 };
-pub use lookup::lookup_stage_stats;
-pub use lookup::plan_stamp_sub_stats;
 use lookup::{known_create_txid_lookup, stamp_parent_pin_archived};
+use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
+pub use scripts::scripts_feed_test_sync;
 pub use scripts::{
     confirm_script_phase, confirm_scripts_feed_ahead, confirm_scripts_phase,
     confirm_scripts_phase_async, join_scripts_polling, scripts_stage_from_load_channel,
     ScriptsBatchMeta, ScriptsPhaseHandle,
 };
-#[cfg(test)]
-pub use scripts::scripts_feed_test_sync;
 pub use write::confirm_write_phase;
-// Private imports are visible to child test modules via super::
+// Production helpers used by orchestration in this module and write stage.
+use phases::{assemble_run, load_confirm_batch, resolve_body_metas, script_wave, wire_rebuild};
+// Test modules reach these via super::
+#[cfg(test)]
+use phases::{check_bip34, expected_bits_extending, post_commit};
+#[cfg(test)]
 use write::write_height_needed;
-use phases::{
-    assemble_run, check_bip34, class_c_commit, expected_bits_extending, load_confirm_batch,
-    post_commit, resolve_body_metas, script_wave, structural_run, wire_rebuild,
-};
-
-
 
 /// Pure-write annotate backend from `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO`.
 #[inline]
@@ -728,7 +726,6 @@ impl ScriptOkBatch {
 }
 
 // ─── phases ───────────────────────────────────────────────────────────────────
-
 
 #[cfg(test)]
 mod write_idempotent_tests;

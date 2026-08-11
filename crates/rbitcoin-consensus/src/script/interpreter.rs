@@ -45,6 +45,17 @@ pub(crate) enum SigVersion {
 ///
 /// If any of these appears in a **tapscript** during decoding, the script is
 /// unconditionally valid.
+/// Classic disabled opcodes (legacy / witness v0) — consensus fail if executed.
+fn is_disabled_legacy(code: u8) -> bool {
+    matches!(
+        code,
+        0x7e | 0x7f | 0x80 | 0x81 | // CAT SUBSTR LEFT RIGHT
+        0x83 | 0x84 | 0x85 | 0x86 | // INVERT AND OR XOR
+        0x8d | 0x8e | // 2MUL 2DIV
+        0x95 | 0x96 | 0x97 | 0x98 | 0x99 // MUL DIV MOD LSHIFT RSHIFT
+    )
+}
+
 fn is_op_success(code: u8) -> bool {
     matches!(
         code,
@@ -67,17 +78,6 @@ fn is_op_success(code: u8) -> bool {
             | 152
             | 153
     ) || (187..=254).contains(&code)
-}
-
-/// Classic disabled opcodes (legacy / witness v0) — consensus fail if executed.
-fn is_disabled_legacy(code: u8) -> bool {
-    matches!(
-        code,
-        0x7e | 0x7f | 0x80 | 0x81 | // CAT SUBSTR LEFT RIGHT
-        0x83 | 0x84 | 0x85 | 0x86 | // INVERT AND OR XOR
-        0x8d | 0x8e | // 2MUL 2DIV
-        0x95 | 0x96 | 0x97 | 0x98 | 0x99 // MUL DIV MOD LSHIFT RSHIFT
-    )
 }
 
 /// BIP342: scan tapscript for OP_SUCCESSx. Returns true if script is immediately valid.

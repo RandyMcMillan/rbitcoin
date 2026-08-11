@@ -4,9 +4,9 @@ This is the **open-source quality backlog** for rbitcoin: what is strong, what
 still blocks “industry-leading,” and what is already closed. It replaces the
 point-in-time audit of 2026-08-06 (`docs/quality-audit-2026-08-06.md`).
 
-**Last reaudit:** 2026-08-11 (post P0 Q-01–Q-05 program). Metrics re-measured
-from the tree; do not trust older line counts or “remaining” rows without
-checking this date.
+**Last reaudit:** 2026-08-11 (post P0 Q-01–Q-05 + P1 Q-10–Q-13 program). Metrics
+re-measured from the tree; do not trust older line counts or “remaining” rows
+without checking this date.
 
 **How to use this doc**
 
@@ -74,8 +74,6 @@ MSRV drift, etc.).
 
 | ID | Item | Why | Done looks like |
 |----|------|-----|-----------------|
-| **Q-10** | **Split god-files** | Still the main velocity tax (see baseline) | Stage/IO modules &lt;~1.5k lines; tests next to stage or in `tests/` without dual oracles |
-| **Q-11** | **Extract longest functions** | IBD main loop, pin batch, `eval_script`, peer frame handlers, perf formatters | Named pure helpers; unit tests on policy tables without full IBD |
 | **Q-14** | **Head-module glossary** | address_head / hashhead / sharded / segmented / scripthash_head | One architecture diagram + “when to use which” table in docs |
 | **Q-15** | **RPC crate destiny** | Stub package text honest; still a workspace member with no surface | Either minimal useful node RPC slice *or* remove from default workspace “product” narrative |
 | **Q-16** | **Residual process env** | ~36 `RBITCOIN_*` names still appear in crates (SH/BQ/slots, path-IO **string** leftovers, test-only). Path overrides and confirm queue envs are **dead**; many other reads remain | Either hardcode / CLI-struct remaining production reads, or keep only documented unstable set; no silent “advanced env bible” |
@@ -124,7 +122,7 @@ MSRV drift, etc.).
 |--------|-------|
 | First-party Rust LOC (`crates/**/*.rs`) | **~121k** |
 | Workspace crates | **14** |
-| Largest source files (lines) | `block` **4186**, `confirm_run/mod` **~3530** (tests peeled), `query/lib` **3314**, `scripthash` **3110**, `scenarios` **2701**, `ibd/confirm` **2668**, `script/interpreter` **2592**, `tx_table/mod` **~2470** (tests peeled), `ibd/events/mod` **~970** (tests peeled) |
+| Largest source files (lines) | `query/lib` **~3240**, `scripthash` **3110**, `scenarios` **~2700**, `interpreter` **~2590**, `block/mod` **~2150** (tests peeled), `ibd/confirm/mod` **~1950** (tests peeled), `tx_table/mod` **~1650** + `packed` **~820**, `confirm_run/*` stage modules all **≲1030** (lookup max), `events/mod` **~970** |
 | `#[test]` / `#[tokio::test]` count | **~1.1k** |
 | Coverage gate | **≥90%** first-party LCOV (`LH`/`LF`) — required CI (last local run ~90.1% class) |
 | CI jobs (required-style) | **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`** (+ CodeQL workflow) |
@@ -143,7 +141,7 @@ MSRV drift, etc.).
 | Architecture clarity | Strong | → |
 | Dependency hygiene | Strong | → |
 | Operator honesty | Strong | ↑ (CLI primary; `env-knobs.md`; MSRV honest) |
-| Code modularity / size | **Weak** | → (god-files still dominate; events/confirm grew) |
+| Code modularity / size | **Medium** | ↑ (Q-10/Q-11: confirm_run stages, peels, tx_table packed; residual: query façade / scripthash / interpreter) |
 | Cross-platform | Weak (honest) | → |
 | Docs consistency | Strong | ↑ (findings, invariants, env policy) |
 | Contributor onboarding | Medium–Strong | → |
@@ -247,8 +245,8 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 | Was | Resolution |
 |-----|------------|
-| Store `allow(dead_code)` hotspots | **Fixed (Q-12)** — live APIs unsilenced; test-only surfaces under `#[cfg(test)]` (`bulk_io` RMW, `address_head` insert fields/`read_entry`, `file` load_u*, `UringSession::new`) |
-| (open) god-files / long fns | **In progress** — Q-10a peels: `ibd/events`, `confirm_run`, `tx_table` tests out; Q-11 start: `confirm_run/pin.rs` holds `pin_for_wire_batch` + `ensure_spend_abs_layouts`. Further stage splits remain |
+| Store `allow(dead_code)` hotspots | **Fixed (Q-12)** — live APIs unsilenced; test-only surfaces under `#[cfg(test)]` |
+| God-files / long confirm fns | **Fixed (Q-10/Q-11)** — test peels (`events`, `confirm_run`, `tx_table`, `block`, `ibd/confirm`); `confirm_run` stage modules (`lookup`/`pin`/`scripts`/`write`/`phases`); `tx_table/packed`; `query/soft_densify`. Residual large files: `scripthash`, `query` Query façade, `interpreter` (optional follow-on) |
 
 ### Product surface growth (post-audit)
 
@@ -259,8 +257,9 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 
 ### Still intentionally open (see Remaining)
 
-God-files (Q-10/Q-11), residual env reads (Q-16), cargo deny/SBOM/musl CI (P2),
-continuous fuzz / tutorial / soak (P3), tier-C multinode optional (Q-38).
+Residual env reads (Q-16), cargo deny/SBOM/musl CI (P2), continuous fuzz /
+tutorial / soak (P3), tier-C multinode optional (Q-38). Optional further splits:
+scripthash / query façade / interpreter tables.
 
 ---
 
@@ -283,7 +282,7 @@ continuous fuzz / tutorial / soak (P3), tier-C multinode optional (Q-38).
 
 | Audience | Read |
 |----------|------|
-| Maintainers picking the next refactor | Remaining **P1** (start **Q-10** / **Q-11**) |
+| Maintainers picking the next refactor | Remaining **P1** (**Q-14** glossary, **Q-16** residual env) |
 | Release engineering | **P2 Q-20–Q-23** |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** fuzz |
 | Docs / README | **Q-14**, **Q-34** |

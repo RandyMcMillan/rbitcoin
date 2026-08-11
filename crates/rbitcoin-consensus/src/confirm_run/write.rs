@@ -1,6 +1,8 @@
 //! Write / Class C commit stage.
 
 use super::*;
+// Parent imports these from phases; access by path for non-glob private imports.
+use super::phases::{class_c_commit, post_commit, structural_run};
 
 pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     match tip {
@@ -216,4 +218,3 @@ pub(super) fn fill_planned_create_layout_after_commit(
     }
     Ok(())
 }
-

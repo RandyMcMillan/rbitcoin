@@ -1354,6 +1354,17 @@ pub(crate) fn structural_validate_spends(
             let Some((old_fk, _)) = row else {
                 continue;
             };
+            // Connected instance at *this* height is ourselves (re-validate /
+            // already-confirmed fixture). BIP30 is an earlier unspent sibling.
+            if query
+                .store()
+                .tx_height
+                .get(old_fk)
+                .map_err(ConsensusError::from)?
+                == Some(ctx.height.0)
+            {
+                continue;
+            }
             let rec = query.store().get_tx(old_fk).map_err(ConsensusError::from)?;
             let mut unspent = false;
             for v in 0..rec.output_count {

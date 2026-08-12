@@ -1124,6 +1124,7 @@ impl Query {
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if self.tx_index_enabled() {
             // body_txid verify only — avoid full packed decode on probe misses.
+            // TipThenAny: RPC / reconstruct may want a never-connected archive row.
             if let Some(fk) = self.store.get_fk_by_txid(txid)? {
                 return Ok(Some(fk));
             }
@@ -1134,6 +1135,14 @@ impl Query {
     /// Public resolve by txid (durable head when index enabled).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
+    }
+
+    /// Confirm / spentness: connected instance only (`tx_height` Some).
+    pub fn tx_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        if self.tx_index_enabled() {
+            return Ok(self.store.get_fk_by_txid_tip(txid)?);
+        }
+        Ok(None)
     }
 
     /// Durable head probe with **body txid only** (no full packed decode).

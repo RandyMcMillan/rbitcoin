@@ -538,7 +538,7 @@ impl Query {
                         // Last chance: single head probe (batch may have missed
                         // a race mid-insert). Still fail if absent.
                         // Range is filled after stamp (idx) so load never re-probes head.
-                        if let Ok(Some(cfk)) = self.store.get_fk_by_txid(&inp.prev_txid) {
+                        if let Ok(Some(cfk)) = self.store.get_fk_by_txid_tip(&inp.prev_txid) {
                             inp.create_fk = cfk;
                             resolved.insert(inp.prev_txid, cfk);
                             if let Some(id) = cfk.get() {

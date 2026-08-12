@@ -287,7 +287,7 @@ impl MempoolHub {
         let mut to_drop: Vec<Txid> = Vec::new();
         for tid in &live {
             let tid_b = tid.to_byte_array();
-            let confirmed = match self.query.store().get_fk_by_txid(&tid_b) {
+            let confirmed = match self.query.store().get_fk_by_txid_tip(&tid_b) {
                 Ok(Some(fk)) => self.query.store().is_confirmed_strong(fk).unwrap_or(false),
                 _ => false,
             };

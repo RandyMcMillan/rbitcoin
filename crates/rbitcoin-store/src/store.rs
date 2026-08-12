@@ -30,6 +30,19 @@ pub struct Store {
     epoch: Mutex<ArchiveEpoch>,
 }
 
+/// How txid → Class A fk picks among rows with the same txid.
+///
+/// Head probe is newest-first. A later **unconnected** row (rejected block)
+/// must not hide an older **connected** instance (`tx_height` Some).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxidResolveMode {
+    /// Connected instance only (`tx_height` set). Else `None`.
+    /// Confirm stamp, structural spends, mempool "confirmed?", annotate.
+    TipOnly,
+    /// Connected if any, else newest unconnected Class A row (RPC / reconstruct).
+    TipThenAny,
+}
+
 impl Store {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         // SH open-address shards open many FDs; raise soft nofile before create.
@@ -354,6 +367,29 @@ impl Store {
         self.tx_height.get_batch(fks)
     }
 
+    /// Among Class A rows for `txid`, prefer a connected fk (`tx_height` Some).
+    pub fn resolve_txid(
+        &self,
+        txid: &[u8; 32],
+        mode: TxidResolveMode,
+    ) -> Result<Option<Fk>, StoreError> {
+        let all = self.txs.get_all_by_txid(txid)?;
+        if all.is_empty() {
+            return Ok(None);
+        }
+        let fks: Vec<Fk> = all.iter().map(|(fk, _)| *fk).collect();
+        let heights = self.tx_height.get_batch(&fks)?;
+        for (fk, h) in fks.iter().zip(heights.iter()) {
+            if h.is_some() {
+                return Ok(Some(*fk));
+            }
+        }
+        match mode {
+            TxidResolveMode::TipOnly => Ok(None),
+            TxidResolveMode::TipThenAny => Ok(Some(all[0].0)),
+        }
+    }
+
     /// Coinbase Class A fk for each confirmed height (or `None` if tip/header missing).
     ///
     /// Uses only Class C dense tables (`confirmed` + `header_txs_first`) — **no**
@@ -429,17 +465,45 @@ impl Store {
     }
 
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
+    ///
+    /// **`TipThenAny`:** RPC / reconstruct (connected if present, else newest).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        self.txs.get_fk_by_txid(txid)
+        self.resolve_txid(txid, TxidResolveMode::TipThenAny)
     }
 
-    /// Batch head resolve for plan stamp: txid → (fk, body_range). Prefer
-    /// primary-slot-sorted `txids`. Short-circuit of Shape A denserels machine.
+    /// Confirm / consensus: connected instance only.
+    pub fn get_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        self.resolve_txid(txid, TxidResolveMode::TipOnly)
+    }
+
+    /// Batch head resolve for plan stamp: txid → (fk, body_range).
+    ///
+    /// Confirm uses **`TipOnly`**: unconnected first-hits are dropped; a connected
+    /// sibling is recovered via [`Self::resolve_txid`] (covers cold-segment
+    /// instances the hot wave would miss after an unconnected hit).
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
-        self.txs.get_fk_by_txid_batch(txids)
+        self.get_fk_by_txid_batch_mode(txids, TxidResolveMode::TipOnly)
+    }
+
+    /// Batch resolve with explicit mode (RPC may use [`TxidResolveMode::TipThenAny`]).
+    ///
+    /// Uses the same hot/cold probe machine as [`TxTable::get_fk_by_txid_batch`]:
+    /// an unconnected hot hit does **not** skip the cold wave, and every
+    /// body_txid match in a wave is considered so a connected sibling wins.
+    pub fn get_fk_by_txid_batch_mode(
+        &self,
+        txids: &[[u8; 32]],
+        mode: TxidResolveMode,
+    ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+        crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
+            &self.txs,
+            &self.tx_height,
+            txids,
+            matches!(mode, TxidResolveMode::TipOnly),
+        )
     }
 
     /// Sparse denserels/outs by known body ranges (prep; skips `tx.idx`).
@@ -1826,6 +1890,57 @@ mod tests {
             assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
             drop(s);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_txid_prefers_connected_over_newer_unconnected() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let txid = [0xABu8; 32];
+        let rec = |lock| TxRecord {
+            txid,
+            version: 1,
+            locktime: lock,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let out = vec![OutputRecord::unspent(1, vec![0x51])];
+        let old = s
+            .put_tx_full_batch_indexed(&[(rec(1), vec![], out.clone())], true)
+            .unwrap()[0];
+        let new = s
+            .put_tx_full_batch_indexed(&[(rec(2), vec![], out)], true)
+            .unwrap()[0];
+        assert_ne!(old, new);
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+            Some(new)
+        );
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
+            None
+        );
+        s.tx_height.set(old, Height(5)).unwrap();
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
+            Some(old),
+            "connected older row must win"
+        );
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+            Some(old)
+        );
+        let batch_tip = s
+            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
+            .unwrap();
+        assert_eq!(batch_tip[0].1.map(|(f, _)| f), Some(old));
+        let batch_any = s
+            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
+            .unwrap();
+        assert_eq!(batch_any[0].1.map(|(f, _)| f), Some(old));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

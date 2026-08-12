@@ -423,18 +423,68 @@ impl MempoolHub {
     }
 
     /// Accept a peer (or local) transaction when relay is enabled.
+    ///
+    /// **Staged:** exclusive lock for prepare + commit only. Consensus script
+    /// verify runs on the shared `rbtc-scripts` path **outside** the mempool
+    /// mutex so concurrent readers are not blocked by interpreter CPU.
     pub fn accept_tx(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
         let t0 = Instant::now();
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
-        let t_lock = Instant::now();
-        let mut g = self.inner.lock().unwrap();
-        let result = g.accept_tx(tx, &utxo, tip);
-        let stages = g.last_accept_stages();
-        let lock_us = t_lock.elapsed().as_micros() as u64;
-        drop(g);
+
+        let mut stages = rbitcoin_mempool::AcceptStageUs::default();
+        let mut lock_us = 0u64;
+
+        // Stage prepare under exclusive lock (resolve + structural + policy).
+        let prep = {
+            let t_lock = Instant::now();
+            let mut g = self.inner.lock().unwrap();
+            g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
+            let r = g.prepare_admit(tx, &utxo, tip);
+            stages.utxo_us = g.last_accept_stages.utxo_us;
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+        let prep = match prep {
+            Ok(p) => p,
+            Err(e) => {
+                let us = t0.elapsed().as_micros() as u64;
+                self.meter_accept_stages(lock_us, stages);
+                return self.finish_accept_err(us, e);
+            }
+        };
+
+        // Script outside lock on shared script_pool / rbtc-scripts worker.
+        let t_script = Instant::now();
+        if let Err(e) =
+            rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
+        {
+            let us = t0.elapsed().as_micros() as u64;
+            stages.script_us = t_script.elapsed().as_micros() as u64;
+            self.meter_accept_stages(lock_us, stages);
+            return self.finish_accept_err(us, AcceptError::Script(e.to_string()));
+        }
+        stages.script_us = t_script.elapsed().as_micros() as u64;
+
+        // Commit under exclusive lock (re-check + durable + orphan promote).
+        let result = {
+            let t_lock = Instant::now();
+            let mut g = self.inner.lock().unwrap();
+            g.last_accept_stages = stages;
+            let r = match g.commit_after_script(tx, prep, &utxo, tip) {
+                Ok(ar) => {
+                    g.promote_orphans_of(ar.txid, &utxo, tip);
+                    Ok(ar)
+                }
+                Err(e) => Err(e),
+            };
+            stages = g.last_accept_stages;
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
         match result {
@@ -444,23 +494,24 @@ impl MempoolHub {
                 self.publish_announce(&r);
                 Ok(r)
             }
-            Err(e) => {
-                // Soft outcomes (already in pool / orphan / full) are not "rejects".
-                let hard = !matches!(
-                    e,
-                    AcceptError::Duplicate(_)
-                        | AcceptError::Orphaned(_)
-                        | AcceptError::Policy("mempool full")
-                );
-                if hard {
-                    self.meter_accept_wall(us, false);
-                } else {
-                    // Still attribute wall time to accept path (avg under accepts=0).
-                    self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
-                }
-                Err(e)
-            }
+            Err(e) => self.finish_accept_err(us, e),
         }
+    }
+
+    fn finish_accept_err(&self, us: u64, e: AcceptError) -> Result<AcceptResult, AcceptError> {
+        // Soft outcomes (already in pool / orphan / full) are not "rejects".
+        let hard = !matches!(
+            e,
+            AcceptError::Duplicate(_)
+                | AcceptError::Orphaned(_)
+                | AcceptError::Policy("mempool full")
+        );
+        if hard {
+            self.meter_accept_wall(us, false);
+        } else {
+            self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+        }
+        Err(e)
     }
 
     /// Accept an ancestor package (local / Electrum path; BIP331 wire later).
@@ -473,7 +524,7 @@ impl MempoolHub {
         let t_lock = Instant::now();
         let mut g = self.inner.lock().unwrap();
         let result = g.accept_package(txs, &utxo, tip);
-        let stages = g.last_accept_stages();
+        let stages = g.last_accept_stages;
         let lock_us = t_lock.elapsed().as_micros() as u64;
         drop(g);
         let us = t0.elapsed().as_micros() as u64;
@@ -1350,18 +1401,20 @@ mod tests {
         assert!(s.accept_utxo_us > 0, "utxo stage (chain coin resolve)");
         assert!(s.accept_script_us > 0, "script stage");
         assert!(s.accept_durable_us > 0, "durable stage");
-        // C0 baseline: exclusive lock still covers script+durable work.
-        assert!(
-            s.accept_lock_us >= s.accept_script_us,
-            "lock_us={} script_us={}",
-            s.accept_lock_us,
-            s.accept_script_us
-        );
+        // C1: script runs outside the exclusive lock (detached rbtc-scripts).
+        // Lock still covers prepare + durable commit; durable stays under lock.
         assert!(
             s.accept_lock_us >= s.accept_durable_us,
             "lock_us={} durable_us={}",
             s.accept_lock_us,
             s.accept_durable_us
+        );
+        // Structural: script time is metered and wall includes it.
+        assert!(
+            s.accept_us >= s.accept_script_us,
+            "wall={} script={}",
+            s.accept_us,
+            s.accept_script_us
         );
         // Sample-and-reset clears.
         let z = hub.sample_reset_perf();

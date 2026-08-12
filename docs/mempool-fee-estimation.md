@@ -25,7 +25,7 @@ Fee APIs **do not** walk the live mempool graph on every Electrum/Esplora reques
 |------|----------|
 | Accept / remove | Marks fee cache **dirty** only (no recompute on the admit critical path). |
 | Refresh | Singleflight: at most one recompute; **one** `mining_chunks_best_first` under a short hub read lock, then pure math off-lock for all depths. |
-| Request | Loads a published `Arc` snapshot (≤ **~1 s** stale when dirty/max-age). |
+| Request | Loads a published `Arc` snapshot (≤ **~1 s** stale when dirty/max-age). Histogram and frontier use the **same** published chunk list. |
 
 This avoids fee-estimates holding the hub lock for multi-second full-pool linearizes (which previously blocked accepts and vice versa). Estimates may lag a short bound after fee spikes; they still apply min-relay and confirm-memory floors on publish.
 

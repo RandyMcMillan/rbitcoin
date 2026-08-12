@@ -101,7 +101,10 @@ jobs:
         with:
           shared-key: ci-coverage
           workspaces: ". -> target/cov"
-      - name: install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked --version 0.6.14
+      # Prebuilt binary — do not `cargo install` (compiles llvm-cov from crates.io).
+      # Pin commit (CodeQL: unpinned 3rd-party Action tags are not immutable).
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: cargo-llvm-cov@0.6.14
       - name: coverage (line gate)
         run: ./scripts/coverage.sh

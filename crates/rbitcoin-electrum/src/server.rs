@@ -1970,14 +1970,10 @@ mod tests {
     #[test]
     fn dispatch_live_mempool_surfaces() {
         use bitcoin::absolute::LockTime;
-        use bitcoin::block::{Header, Version as BlockVersion};
         use bitcoin::hashes::Hash;
         use bitcoin::script::ScriptBuf;
         use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{
-            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
-            TxMerkleNode, TxOut, Witness,
-        };
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
         use rbitcoin_consensus::{accept_and_connect_block, Milestone};
         use rbitcoin_net::MempoolHub;
         use rbitcoin_primitives::Height;
@@ -1989,72 +1985,19 @@ mod tests {
         }
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
-        let ms = Milestone::NONE;
-
-        fn coinbase(height: u32) -> Transaction {
-            let mut ss = if height == 0 {
-                vec![0x00]
-            } else {
-                rbitcoin_consensus::bip34_height_script(height)
-            };
-            while ss.len() < 2 {
-                ss.push(0x00);
-            }
-            Transaction {
-                version: TxVersion::ONE,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint::null(),
-                    script_sig: ScriptBuf::from_bytes(ss),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(50_0000_0000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-                }],
-            }
-        }
-        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
-            let bits = CompactTarget::from_consensus(0x207f_ffff);
-            let header = Header {
-                version: BlockVersion::ONE,
-                prev_blockhash: prev,
-                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-                time,
-                bits,
-                nonce: 0,
-            };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
-            };
-            block.header.merkle_root = block.compute_merkle_root().unwrap();
-            let target = Target::from_compact(bits);
-            for nonce in 0..u32::MAX {
-                block.header.nonce = nonce;
-                if block.header.validate_pow(target).is_ok() {
-                    break;
-                }
-            }
-            block
-        }
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-        let mut tip = genesis.block_hash();
-        let mut tip_time = genesis.header.time;
-        let mut coinbase_txids = Vec::new();
-        // Maturity pad (100) so early coinbases are spendable in mempool.
-        for h in 1u32..=103 {
-            let b = mine(tip, tip_time + 600, h);
-            if h <= 2 {
-                coinbase_txids.push(b.txdata[0].compute_txid());
-            }
-            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-            tip = b.block_hash();
-            tip_time = b.header.time;
-        }
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        // Maturity pad so early coinbases are spendable (shared helper, not a POW remine loop).
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            103,
+            2,
+        );
 
         let q_arc = Arc::new(q);
         let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q_arc)).unwrap();

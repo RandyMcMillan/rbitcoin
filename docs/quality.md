@@ -4,9 +4,9 @@ This is the **open-source quality backlog** for rbitcoin: what is strong, what
 still blocks “industry-leading,” and what is already closed. It replaces the
 point-in-time audit of 2026-08-06 (`docs/quality-audit-2026-08-06.md`).
 
-**Last reaudit:** 2026-08-11 (post P0 Q-01–Q-05 + P1 Q-10–Q-13 program). Metrics
-re-measured from the tree; do not trust older line counts or “remaining” rows
-without checking this date.
+**Last reaudit:** 2026-08-12 (post fee-snapshot `4714473` + ranked operator/contributor
+review). Metrics re-measured from the tree; do not trust older line counts or
+“remaining” rows without checking this date.
 
 **How to use this doc**
 
@@ -64,6 +64,26 @@ level peers cannot ignore**.
 
 ## Remaining work (prioritized — top first)
 
+### Ranked operator/contributor backlog (R-01+)
+
+**Overall rank** (not per category). Tags: code quality, test quality, reliability,
+performance, test speed, build speed.
+
+| ID | Item | Tags | Status | Done looks like |
+|----|------|------|--------|-----------------|
+| **R-01** | Mempool **read-path** decoupling | perf, reliability | **fixed** | Published chunks on fee snapshot; `list_live_meta` |
+| **R-02** | Persistent shared `script_pool` | perf, reliability | **fixed** | Process-wide workers; join does not spawn per admit |
+| **R-03** | Default-suite remine pads → `pad_empty_from` | test speed | **fixed** (Q-37 start) | Electrum + hub use `pad_empty_from` |
+| **R-04** | `TxGraph` mining-chunk cache | perf | **fixed** | Rebuild only after insert/remove |
+| **R-05** | CI coverage: no cold `cargo install cargo-llvm-cov` | build speed | **fixed** (= **Q-22**) | `taiki-e/install-action` `cargo-llvm-cov@0.6.14` |
+| **R-06** | Tip-follow store integrity: null `confirmed[]` slots / mid-confirm `NotFound` | reliability | open | Synthetic heal/refuse + named regression |
+| **R-07** | Continuous differential fuzz | reliability | open (= **Q-30**) | Nightly/weekly script + BIP324 + header wire |
+| **R-08** | `cargo deny` / advisory CI | reliability | open (= **Q-20**) | PR job + documented exceptions |
+| **R-09** | Residual `RBITCOIN_*` env leftovers | code quality | open (= **Q-16**) | CLI/conf or documented unstable set only |
+| **R-10** | Residual god-files — peel **only** when a ranked item needs a seam | code quality | open | No new 2k-line modules; Q-14 glossary when heads are touched |
+
+Fee **request-path** snapshot (`4714473`) is **not** R-01 done: histogram, `list_live` clones, and refresh still linearize under `inner.read()`.
+
 ### P0 — Trust, correctness, honesty
 
 **Empty as of 2026-08-11.** Closed Q-01–Q-05 (see **Resolved**). Do not re-open
@@ -74,9 +94,9 @@ MSRV drift, etc.).
 
 | ID | Item | Why | Done looks like |
 |----|------|-----|-----------------|
-| **Q-14** | **Head-module glossary** | address_head / hashhead / sharded / segmented / scripthash_head | One architecture diagram + “when to use which” table in docs |
+| **Q-14** | **Head-module glossary** | After R-01–R-05; address_head / hashhead / sharded / segmented / scripthash_head | One architecture diagram + “when to use which” table in docs |
 | **Q-15** | **RPC crate destiny** | Stub package text honest; still a workspace member with no surface | Either minimal useful node RPC slice *or* remove from default workspace “product” narrative |
-| **Q-16** | **Residual process env** | ~36 `RBITCOIN_*` names still appear in crates (SH/BQ/slots, path-IO **string** leftovers, test-only). Path overrides and confirm queue envs are **dead**; many other reads remain | Either hardcode / CLI-struct remaining production reads, or keep only documented unstable set; no silent “advanced env bible” |
+| **Q-16** | **Residual process env** (= **R-09**) | ~36 `RBITCOIN_*` names still appear in crates | Either hardcode / CLI-struct remaining production reads, or keep only documented unstable set |
 
 ### P2 — Open-source packaging & supply chain
 
@@ -84,7 +104,7 @@ MSRV drift, etc.).
 |----|------|-----------------|
 | **Q-20** | **`cargo deny` / advisory CI** | `cargo deny check` or `cargo audit` on PR; documented exceptions |
 | **Q-21** | **SBOM for musl release** | CycloneDX/SPDX attached to release assets |
-| **Q-22** | **Cache `cargo-llvm-cov` in CI** | No cold `cargo install` every coverage job |
+| **Q-22** | **Cache `cargo-llvm-cov` in CI** (= **R-05**) | **Fixed** — `taiki-e/install-action` prebuilt `cargo-llvm-cov@0.6.14` |
 | **Q-23** | **Optional `nix build .#rbitcoin-musl` CI job** | Weekly or on release branch; proves crane path |
 | **Q-24** | **CODEOWNERS / issue templates** | When public collaboration grows |
 | **Q-25** | **Publish-ready package metadata** | `repository` / homepage when crates.io is intentional |
@@ -100,7 +120,7 @@ MSRV drift, etc.).
 | **Q-34** | **First-hour tutorial** | Regtest mine → Electrum query → one Esplora GET |
 | **Q-35** | **Mainnet soak narrative** | Documented operator soak checklist; optional public tip height badge |
 | **Q-36** | **Perf log diet** | Shorter default INFO; DEBUG keeps full meters |
-| **Q-37** | **Warm suite &lt;2 min** | Living budget in TESTING.md actually met on CI-class host |
+| **Q-37** | **Warm suite &lt;2 min** | Living budget in TESTING.md. **R-03 started:** electrum/hub default tests use `pad_empty_from`; full ≤3 min wall not re-measured unless cheap |
 | **Q-38** | **Tier-C multinode in CI (optional)** | Heavy mesh / 48-block / multi-hop remain `#[ignore]` + `scripts/integration.sh`; only promote if wall budget fits without flaking |
 
 ### P4 — Explicit non-goals (until a pillar above is green)
@@ -116,13 +136,13 @@ MSRV drift, etc.).
 
 ## Baseline snapshot (living metrics)
 
-**Measured 2026-08-11** (crate `.rs` under `crates/`, excluding build artifacts):
+**Measured 2026-08-12** (crate `.rs` under `crates/`, excluding build artifacts):
 
 | Metric | Value |
 |--------|-------|
-| First-party Rust LOC (`crates/**/*.rs`) | **~121k** |
+| First-party Rust LOC (`crates/**/*.rs`) | **~125k** |
 | Workspace crates | **14** |
-| Largest source files (lines) | `query/lib` **~3240**, `scripthash` **3110**, `scenarios` **~2700**, `interpreter` **~2590**, `block/mod` **~2150** (tests peeled), `ibd/confirm/mod` **~1950** (tests peeled), `tx_table/mod` **~1650** + `packed` **~820**, `confirm_run/*` stage modules all **≲1030** (lookup max), `events/mod` **~970** |
+| Largest source files (lines) | `query/lib` **3294**, `scripthash` **3110**, `scenarios` **2712**, `interpreter` **2592**, `sorted_run` **2577**, `electrum/server` **2434**, `ibd/perf_log` **2403**, `sh_builder` **2331**, `peer` **2137**, `block/mod` **2152**, `scripthash_head` **2051**, `mempool/accept` **1951**, `ibd/confirm/mod` **1947** |
 | `#[test]` / `#[tokio::test]` count | **~1.1k** |
 | Coverage gate | **≥90%** first-party LCOV (`LH`/`LF`) — required CI (last local run ~90.1% class) |
 | CI jobs (required-style) | **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`** (+ CodeQL workflow) |
@@ -141,13 +161,14 @@ MSRV drift, etc.).
 | Architecture clarity | Strong | → |
 | Dependency hygiene | Strong | → |
 | Operator honesty | Strong | ↑ (CLI primary; `env-knobs.md`; MSRV honest) |
-| Code modularity / size | **Medium** | ↑ (Q-10/Q-11: confirm_run stages, peels, tx_table packed; residual: query façade / scripthash / interpreter) |
+| Code modularity / size | **Medium** | → (residual: query façade / scripthash / interpreter / electrum server; peel only with R-10) |
 | Cross-platform | Weak (honest) | → |
 | Docs consistency | Strong | ↑ (findings, invariants, env policy) |
 | Contributor onboarding | Medium–Strong | → |
 | CI fidelity | **Strong** | ↑↑ (split gates + multinode + CodeQL + Dependabot ignores) |
 | Dead / stub surface | Medium–Strong | ↑ (Q-12: store dead_code allows cleared; RPC stub remains) |
-| Test reliability/speed | Medium–Strong | ↑ (tier A multinode default; overflow fix; heavies still ignored) |
+| Test reliability/speed | Medium | → (remine 100-block pads still in electrum/hub default tests — **R-03**; heavies ignored) |
+| Tip-follow mempool APIs | Medium | ↓ then ↑ (fee snapshot shipped; histogram/`list_live`/refresh still lock-linearize — **R-01**) |
 | Adversarial / findings hygiene | **Strong** | ↑↑ (no allowlist; regressions named; dual-path kill) |
 
 ---
@@ -227,6 +248,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Dependabot noise (rustc tag / hashes) | **Fixed** — ignore `dtolnay/rust-toolchain` + `bitcoin_hashes` |
 | MSRV `1.74` untested | **Fixed (Q-05)** — `rust-version = "1.95"` |
 | Deps: rayon / xorf / bincode on hot graph | **Fixed** — in-tree fuse8 + script_pool |
+| Coverage job `cargo install cargo-llvm-cov` | **Fixed (Q-22 / R-05)** — `taiki-e/install-action` prebuilt |
 
 ### Correctness & adversarial
 
@@ -254,12 +276,13 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 |-----|------------|
 | No Esplora | **Added** — REST + wallet-scoped WS |
 | Signet-only custom nets | **Improved** — custom signet / mutinynet |
+| Esplora `/fee-estimates` 11× full-graph linearize under hub lock | **Partial** — published fee table (`4714473`); histogram + refresh + `list_live` still open (**R-01**) |
 
 ### Still intentionally open (see Remaining)
 
-Residual env reads (Q-16), cargo deny/SBOM/musl CI (P2), continuous fuzz /
-tutorial / soak (P3), tier-C multinode optional (Q-38). Optional further splits:
-scripthash / query façade / interpreter tables.
+Ranked **R-01–R-05** this program; residual env (Q-16/R-09), cargo deny/SBOM
+(P2), continuous fuzz / tutorial / soak (P3), tip `confirmed[]` (R-06),
+tier-C multinode optional (Q-38). Optional further splits only when R-10 applies.
 
 ---
 

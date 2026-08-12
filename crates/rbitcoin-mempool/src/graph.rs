@@ -5,6 +5,8 @@
 
 use bitcoin::{OutPoint, Transaction, Txid, Wtxid};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Hard cap on txs in one cluster (Core `DEFAULT_CLUSTER_LIMIT` = 64).
 pub const MAX_CLUSTER_COUNT: usize = 64;
@@ -104,6 +106,11 @@ pub struct TxGraph {
     created: HashSet<OutPoint>,
     /// Sum of live weights (WU) for eviction budget.
     total_weight: u64,
+    /// How many times [`Self::mining_chunks_best_first`] built from clusters
+    /// (not a cache hit). Hub tests pin refresh does one rebuild per dirty window.
+    chunks_rebuilds: AtomicU64,
+    /// Best-first chunks; `None` after mutate until next build.
+    chunk_cache: Mutex<Option<Vec<Chunk>>>,
 }
 
 impl TxGraph {
@@ -113,6 +120,15 @@ impl TxGraph {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Sample-and-reset cluster-linearize count (fee-refresh tests).
+    pub fn take_chunks_rebuilds(&self) -> u64 {
+        self.chunks_rebuilds.swap(0, Ordering::Relaxed)
+    }
+
+    fn invalidate_chunk_cache(&mut self) {
+        *self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -191,6 +207,7 @@ impl TxGraph {
     /// Insert entry and wire parent/child edges. Does **not** enforce cluster limits
     /// (caller checks via [`cluster_of`] after insert, and may remove).
     pub fn insert(&mut self, entry: TxEntry, tx: &Transaction) {
+        self.invalidate_chunk_cache();
         let txid = entry.txid;
         let weight = entry.weight;
         // Wire parents that already exist.
@@ -233,6 +250,7 @@ impl TxGraph {
 
     /// Remove a tx and unlink edges. Returns the removed entry if present.
     pub fn remove(&mut self, txid: &Txid, tx: &Transaction) -> Option<TxEntry> {
+        self.invalidate_chunk_cache();
         let e = self.entries.remove(txid)?;
         self.total_weight = self.total_weight.saturating_sub(e.weight);
         for p in &e.parents {
@@ -417,6 +435,13 @@ impl TxGraph {
     /// Used for fee estimation and future block-template ranking. CPFP packages
     /// appear as single chunks with combined fee/weight.
     pub fn mining_chunks_best_first(&self) -> Vec<Chunk> {
+        {
+            let g = self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = g.as_ref() {
+                return c.clone();
+            }
+        }
+        self.chunks_rebuilds.fetch_add(1, Ordering::Relaxed);
         let mut seen = HashSet::new();
         let mut chunks = Vec::new();
         for txid in self.entries.keys() {
@@ -436,6 +461,7 @@ impl TxGraph {
                 .cmp(&a.fee_rate_sat_per_kvb())
                 .then_with(|| b.fee_sat.cmp(&a.fee_sat))
         });
+        *self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(chunks.clone());
         chunks
     }
 
@@ -483,6 +509,7 @@ impl TxGraph {
 
     /// Rebuild helper: clear and re-insert from an ordered list (parents first best-effort).
     pub fn rebuild_from(&mut self, items: Vec<(TxEntry, Transaction)>) {
+        self.invalidate_chunk_cache();
         self.entries.clear();
         self.spends.clear();
         self.conflicts.clear();
@@ -603,6 +630,16 @@ mod tests {
             g.frontier_feerate_sat_per_kvb(1)
         );
         assert_eq!(weight_above_from_chunks(&ch, 0), g.weight_above_feerate(0));
+        // Cache: after a build, further calls do not increment rebuilds.
+        let _ = g.take_chunks_rebuilds();
+        let a2 = g.mining_chunks_best_first();
+        let b2 = g.mining_chunks_best_first();
+        assert_eq!(a2, b2);
+        assert_eq!(g.take_chunks_rebuilds(), 0);
+        let extra = spend_op([3u8; 32], 50_000, 40_000);
+        g.insert(entry_for(&extra, 2_000, 2), &extra);
+        let _ = g.mining_chunks_best_first();
+        assert_eq!(g.take_chunks_rebuilds(), 1);
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

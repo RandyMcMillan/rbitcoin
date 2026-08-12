@@ -25,6 +25,7 @@
 
 mod accept;
 mod error;
+mod fee_est;
 mod graph;
 mod orphanage;
 mod store;
@@ -36,6 +37,11 @@ pub use accept::{
     MAX_PACKAGE_WEIGHT, RBFR_RATIO_DEN, RBFR_RATIO_NUM,
 };
 pub use error::MempoolError;
+pub use fee_est::{
+    bucket_count, bucket_index, capacity_wu, default_candidate_rates, effective_capacity_wu,
+    horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
+    CAPACITY_SAFETY_DEN, CAPACITY_SAFETY_NUM, FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
+};
 pub use graph::{
     Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT,
 };

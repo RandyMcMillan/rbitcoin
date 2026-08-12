@@ -71,11 +71,11 @@ performance, test speed, build speed.
 
 | ID | Item | Tags | Status | Done looks like |
 |----|------|------|--------|-----------------|
-| **R-01** | Mempool **read-path** decoupling: histogram / frontier / `list_live` / fee refresh must not hold hub lock across `mining_chunks_best_first` | perf, reliability | **this program** | Published `Arc<Chunk>` (same refresh as fees); `list_live_meta` for body-free routes |
-| **R-02** | Persistent shared `script_pool` (no OS thread per mempool admit) | perf, reliability | **this program** | Process-wide workers; `verify_tx_scripts_detached` submit+join |
-| **R-03** | Default-suite remine pads (`1..=100+` POW) → `pad_empty_from` | test speed | **this program** | Electrum + hub tests use shared mature helper; starts **Q-37** |
-| **R-04** | `TxGraph` mining-chunk cache (rebuild only after mutate) | perf | **this program** | Second `mining_chunks_best_first` without insert/remove is cached |
-| **R-05** | CI coverage: no cold `cargo install cargo-llvm-cov` | build speed | **this program** (= **Q-22**) | install-action or cached binary |
+| **R-01** | Mempool **read-path** decoupling | perf, reliability | **fixed** | Published chunks on fee snapshot; `list_live_meta` |
+| **R-02** | Persistent shared `script_pool` | perf, reliability | **fixed** | Process-wide workers; join does not spawn per admit |
+| **R-03** | Default-suite remine pads → `pad_empty_from` | test speed | **fixed** (Q-37 start) | Electrum + hub use `pad_empty_from` |
+| **R-04** | `TxGraph` mining-chunk cache | perf | **fixed** | Rebuild only after insert/remove |
+| **R-05** | CI coverage: no cold `cargo install cargo-llvm-cov` | build speed | **fixed** (= **Q-22**) | `taiki-e/install-action` `cargo-llvm-cov@0.6.14` |
 | **R-06** | Tip-follow store integrity: null `confirmed[]` slots / mid-confirm `NotFound` | reliability | open | Synthetic heal/refuse + named regression |
 | **R-07** | Continuous differential fuzz | reliability | open (= **Q-30**) | Nightly/weekly script + BIP324 + header wire |
 | **R-08** | `cargo deny` / advisory CI | reliability | open (= **Q-20**) | PR job + documented exceptions |
@@ -104,7 +104,7 @@ MSRV drift, etc.).
 |----|------|-----------------|
 | **Q-20** | **`cargo deny` / advisory CI** | `cargo deny check` or `cargo audit` on PR; documented exceptions |
 | **Q-21** | **SBOM for musl release** | CycloneDX/SPDX attached to release assets |
-| **Q-22** | **Cache `cargo-llvm-cov` in CI** (= **R-05**) | No cold `cargo install` every coverage job |
+| **Q-22** | **Cache `cargo-llvm-cov` in CI** (= **R-05**) | **Fixed** — `taiki-e/install-action` prebuilt `cargo-llvm-cov@0.6.14` |
 | **Q-23** | **Optional `nix build .#rbitcoin-musl` CI job** | Weekly or on release branch; proves crane path |
 | **Q-24** | **CODEOWNERS / issue templates** | When public collaboration grows |
 | **Q-25** | **Publish-ready package metadata** | `repository` / homepage when crates.io is intentional |
@@ -248,6 +248,7 @@ Items below were open in the original audit or immediately adjacent. **Do not re
 | Dependabot noise (rustc tag / hashes) | **Fixed** — ignore `dtolnay/rust-toolchain` + `bitcoin_hashes` |
 | MSRV `1.74` untested | **Fixed (Q-05)** — `rust-version = "1.95"` |
 | Deps: rayon / xorf / bincode on hot graph | **Fixed** — in-tree fuse8 + script_pool |
+| Coverage job `cargo install cargo-llvm-cov` | **Fixed (Q-22 / R-05)** — `taiki-e/install-action` prebuilt |
 
 ### Correctness & adversarial
 

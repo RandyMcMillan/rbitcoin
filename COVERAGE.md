@@ -18,13 +18,16 @@ nix-shell
 ./scripts/coverage.sh
 ```
 
-Uses `cargo llvm-cov` with optional branch instrumentation. Install if missing:
+Uses `cargo llvm-cov` with optional branch instrumentation. Local install if missing:
 
 ```bash
 cargo install cargo-llvm-cov --locked
 ```
 
 On Nix, prefer `cargo-llvm-cov` from nixpkgs when available, or install into a user cargo bin on `PATH`.
+
+**CI:** the `coverage` job installs a **prebuilt** `cargo-llvm-cov@0.6.14` via
+`taiki-e/install-action` — it does **not** `cargo install` from crates.io on every PR.
 
 **Target dir:** the script sets `CARGO_TARGET_DIR` to **`target/cov`** (override
 with `CARGO_TARGET_DIR_COV`). Day-to-day `cargo test` / clippy use **`target/dev`**

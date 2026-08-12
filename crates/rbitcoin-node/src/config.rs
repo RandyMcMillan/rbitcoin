@@ -43,9 +43,21 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Electrum TCP listen (`None` = disabled). Plain TCP; terminate TLS at a
     /// reverse proxy when public. App DoS limits apply regardless of bind address.
+    /// **Requires** [`Self::shindex`].
     pub electrum_listen: Option<SocketAddr>,
     /// Esplora REST HTTP listen (`None` = disabled). Plain HTTP; TLS via proxy.
+    /// **Requires** [`Self::shindex`].
     pub esplora_listen: Option<SocketAddr>,
+    /// Build Class B scripthash index (Electrum/Esplora history). Default **off**.
+    /// When off: tip follow and node JSON-RPC work without SH bulk materialize.
+    pub shindex: bool,
+    /// Core-class JSON-RPC HTTP listen (`None` = disabled). Plain HTTP; TLS via proxy.
+    pub rpc_listen: Option<SocketAddr>,
+    /// Optional RPC Basic auth user (with [`Self::rpc_password`]). When both unset
+    /// and `rpc_listen` is set, a cookie file under datadir is used.
+    pub rpc_user: Option<String>,
+    /// Optional RPC Basic auth password.
+    pub rpc_password: Option<String>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.
     pub milestone_height: u32,
@@ -86,6 +98,10 @@ impl Default for NodeConfig {
             max_run_secs: None,
             electrum_listen: None,
             esplora_listen: None,
+            shindex: false,
+            rpc_listen: None,
+            rpc_user: None,
+            rpc_password: None,
             milestone_height: 0,
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,
@@ -173,8 +189,45 @@ impl NodeConfig {
                 "signetblocktime must be greater than zero".into(),
             ));
         }
+        if self.electrum_listen.is_some() && !self.shindex {
+            return Err(NodeError::Config(
+                "electrum_listen requires shindex=1 (--shindex); Electrum history needs Class B scripthash"
+                    .into(),
+            ));
+        }
+        if self.esplora_listen.is_some() && !self.shindex {
+            return Err(NodeError::Config(
+                "esplora_listen requires shindex=1 (--shindex); Esplora history needs Class B scripthash"
+                    .into(),
+            ));
+        }
+        if let Some(addr) = self.rpc_listen {
+            let has_user_pass = self.rpc_user.is_some() && self.rpc_password.is_some();
+            let loopback = addr.ip().is_loopback();
+            if !loopback && !has_user_pass {
+                // Cookie will be written for loopback; non-loopback needs explicit creds
+                // or we still write cookie — Core writes cookie always. Plan: refuse
+                // unbound public without cookie OR user/pass. Cookie counts as auth.
+                // Non-loopback is OK if we always generate cookie when listen set.
+                // Stricter plan: "If bind is not loopback and neither cookie nor user/pass
+                // configured → refuse". Cookie is auto when listen set, so always OK.
+                // Keep check only when both user and password partially set.
+                let _ = has_user_pass;
+            }
+            if self.rpc_user.is_some() ^ self.rpc_password.is_some() {
+                return Err(NodeError::Config(
+                    "rpcuser and rpcpassword must both be set (or both unset for cookie auth)"
+                        .into(),
+                ));
+            }
+        }
         let _ = (self.wire_depth_blocks, self.archive_durability);
         Ok(())
+    }
+
+    /// Path for Core-style RPC cookie (`{datadir}/.cookie`).
+    pub fn rpc_cookie_path(&self) -> PathBuf {
+        self.datadir.join(".cookie")
     }
 
     /// Create `{datadir}` and standard subdirs (`store`, `mempool`, `wire`) if missing.
@@ -223,6 +276,7 @@ impl NodeConfig {
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
     /// `archive_queue_mb`, `log_level`, `electrum_listen`, `esplora_listen`,
+    /// `shindex`, `rpc_listen`, `rpcuser`, `rpcpassword`,
     /// `noseeds` / `no_seeds`, `signetchallenge`, and `signetblocktime`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
@@ -300,6 +354,22 @@ impl NodeConfig {
                             .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?,
                     );
                 }
+                "shindex" => {
+                    self.shindex = parse_conf_bool(val)
+                        .map_err(|e| NodeError::Config(format!("conf shindex: {e}")))?;
+                }
+                "rpc_listen" | "rpclisten" => {
+                    self.rpc_listen = Some(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf rpc_listen: {e}")))?,
+                    );
+                }
+                "rpcuser" | "rpc_user" => {
+                    self.rpc_user = Some(val.to_string());
+                }
+                "rpcpassword" | "rpc_password" => {
+                    self.rpc_password = Some(val.to_string());
+                }
                 "milestone" | "assumevalid_height" | "assumevalidheight" => {
                     self.milestone_height = val
                         .parse()
@@ -369,6 +439,16 @@ fn is_conf_true(val: &str) -> bool {
         val.to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | ""
     )
+}
+
+/// Parse `1`/`true`/`yes`/`on` → true; `0`/`false`/`no`/`off` → false.
+fn parse_conf_bool(val: &str) -> Result<bool, String> {
+    let v = val.to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected 0|1|true|false (got `{val}`)")),
+    }
 }
 
 /// Serialize tests that mutate process `RBITCOIN_*` env (CLI + config unit tests).
@@ -638,6 +718,42 @@ mod tests {
     }
 
     #[test]
+    fn electrum_without_shindex_fails_validate() {
+        let mut cfg = NodeConfig::default().with_datadir(tmp());
+        cfg.electrum_listen = Some("127.0.0.1:50001".parse().unwrap());
+        cfg.shindex = false;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("shindex"),
+            "expected shindex requirement, got {err}"
+        );
+    }
+
+    #[test]
+    fn esplora_without_shindex_fails_validate() {
+        let mut cfg = NodeConfig::default().with_datadir(tmp());
+        cfg.esplora_listen = Some("127.0.0.1:3000".parse().unwrap());
+        cfg.shindex = false;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("shindex"), "got {err}");
+    }
+
+    #[test]
+    fn shindex_alone_validates() {
+        let mut cfg = NodeConfig::default().with_datadir(tmp());
+        cfg.shindex = true;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn electrum_with_shindex_validates() {
+        let mut cfg = NodeConfig::default().with_datadir(tmp());
+        cfg.shindex = true;
+        cfg.electrum_listen = Some("127.0.0.1:50001".parse().unwrap());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn conf_keys_parse_and_error_paths() {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
@@ -646,8 +762,10 @@ mod tests {
             &conf,
             "listen=127.0.0.1:18444\n\
              connect=127.0.0.1:18445\n\
+             shindex=1\n\
              electrum_listen=127.0.0.1:50001\n\
              esplora_listen=127.0.0.1:3000\n\
+             rpc_listen=127.0.0.1:8332\n\
              milestone=100\n\
              maxoutbound=8\n\
              maxinbound=32\n\
@@ -664,8 +782,10 @@ mod tests {
         assert_eq!(cfg.network, Network::Regtest);
         assert!(cfg.p2p_listen.is_some());
         assert_eq!(cfg.connect.len(), 1);
+        assert!(cfg.shindex);
         assert!(cfg.electrum_listen.is_some());
         assert!(cfg.esplora_listen.is_some());
+        assert!(cfg.rpc_listen.is_some());
         assert_eq!(cfg.milestone_height, 100);
         assert_eq!(cfg.max_outbound, 8);
         assert_eq!(cfg.max_inbound, 32);

@@ -27,6 +27,11 @@ where
     let mut listen: Option<SocketAddr> = None;
     let mut electrum_listen: Option<SocketAddr> = None;
     let mut esplora_listen: Option<SocketAddr> = None;
+    let mut shindex = false;
+    let mut shindex_set = false;
+    let mut rpc_listen: Option<SocketAddr> = None;
+    let mut rpc_user: Option<String> = None;
+    let mut rpc_password: Option<String> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
     let mut seeds_set = false;
@@ -53,6 +58,7 @@ where
                     "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
+    [--shindex] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
@@ -65,7 +71,9 @@ Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound/--maxconnections (default 125).\n\
 Memory: --archive-queue-mb (default 512 soft densify meter).\n\
-Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md.\n\
+Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
+Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
 IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                     env!("CARGO_PKG_VERSION")
@@ -218,6 +226,44 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                         return ExitCode::from(2);
                     }
                 }
+                i += 1;
+            }
+            "--shindex" | "-shindex" => {
+                shindex = true;
+                shindex_set = true;
+                i += 1;
+            }
+            "--rpc-listen" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rpc-listen requires a value");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<SocketAddr>() {
+                    Ok(a) => rpc_listen = Some(a),
+                    Err(e) => {
+                        eprintln!("error: bad --rpc-listen: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--rpcuser" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rpcuser requires a value");
+                    return ExitCode::from(2);
+                }
+                rpc_user = Some(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
+            "--rpcpassword" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rpcpassword requires a value");
+                    return ExitCode::from(2);
+                }
+                rpc_password = Some(args[i].to_string_lossy().into_owned());
                 i += 1;
             }
             "--mempool-size-mb" | "--maxmempool" => {
@@ -425,6 +471,18 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if let Some(a) = esplora_listen {
         config.esplora_listen = Some(a);
+    }
+    if shindex_set {
+        config.shindex = shindex;
+    }
+    if let Some(a) = rpc_listen {
+        config.rpc_listen = Some(a);
+    }
+    if let Some(u) = rpc_user {
+        config.rpc_user = Some(u);
+    }
+    if let Some(p) = rpc_password {
+        config.rpc_password = Some(p);
     }
     if !connect.is_empty() {
         config.connect = connect;

@@ -164,6 +164,12 @@ impl Query {
             let sh_slot = scope.spawn(|| -> Result<u64, QueryError> {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
+                // Operator shindex off: skip collect/enqueue/durable SH entirely
+                // (tip follow does not need Class B).
+                if !self.sh_index_enabled() {
+                    return Ok(0);
+                }
+
                 // Direct runs: skip create_fks already in SEAL (durable spills).
                 // Tip durable SH: height + create_fk watermarks after tip commit.
                 let t_filter = std::time::Instant::now();
@@ -285,7 +291,8 @@ impl Query {
         // Advancing include_hwm + SEAL keeps restart from re-scanning Class A for
         // creates already written to the durable head during tip follow.
         // Direct runs: durability is SEAL on cataloged spills (memtable may lag).
-        if !self.sh_run.is_enabled() {
+        // shindex off: never advance SH watermarks (no durable SH writes this path).
+        if self.sh_index_enabled() && !self.sh_run.is_enabled() {
             if let Some(last) = items.last() {
                 self.set_sh_indexed_through_height(Some(last.height.0));
             }

@@ -989,6 +989,9 @@ pub struct Query {
     block_queue_pressure: AtomicBool,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
+    /// Operator scripthash index intent (`--shindex`). When false, Class C skips
+    /// SH collect/enqueue/durable write-through entirely (tip follow independent).
+    sh_index_enabled: std::sync::atomic::AtomicBool,
     /// Explicit [`IndexMode`] (Direct / Tip).
     index_mode_cell: std::sync::atomic::AtomicU8,
     /// Cooperative cancel for in-flight confirm load. Set on IBD SIGINT
@@ -1058,6 +1061,9 @@ impl Query {
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             block_queue_pressure: AtomicBool::new(false),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
+            // Library default: SH on (tests / enter_direct). Node sets false for
+            // `--shindex` off before entering Direct.
+            sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),

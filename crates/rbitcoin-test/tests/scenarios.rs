@@ -245,6 +245,18 @@ fn node_cli_and_surface_smoke() {
         "rbitcoin-node",
         "--milestone"
     ])));
+    // Electrum without --shindex is a config error at start.
+    let no_sh = td.path().join("electrum-no-shindex");
+    assert!(!exit_success(node_cli_main([
+        "rbitcoin-node",
+        "--datadir",
+        no_sh.to_str().unwrap(),
+        "--network",
+        "regtest",
+        "--electrum-listen",
+        "127.0.0.1:0",
+        "--smoke",
+    ])));
     // Happy-path flag combinations (smoke exits after open).
     let flags_ok = td.path().join("flags-ok");
     assert!(exit_success(node_cli_main([
@@ -268,6 +280,7 @@ fn node_cli_and_surface_smoke() {
         "127.0.0.1:0",
         "--connect",
         "127.0.0.1:1",
+        "--shindex",
         "--electrum-listen",
         "127.0.0.1:0",
         "--inhibit-suspend",

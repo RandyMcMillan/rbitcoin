@@ -11,6 +11,7 @@ The **default** fee estimate this node advertises answers:
 |---------|------|
 | Electrum `blockchain.estimatefee` (default / primary) | **10-minute inclusion** |
 | Esplora fee endpoints (primary) | Same |
+| Core-class RPC `estimatesmartfee` | Same product (not Core historical multi-horizon); see [`rpc.md`](./rpc.md) |
 | Optional target-depth knobs | Secondary; same engine, different depth |
 
 We intentionally do **not** present “90th percentile of live txs” as the long-term

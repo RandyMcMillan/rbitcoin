@@ -23,5 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
 
+[dev-dependencies]
+rbitcoin-test = { workspace = true }
+rbitcoin-consensus = { workspace = true }
+
 [lints]
 workspace = true

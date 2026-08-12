@@ -864,4 +864,181 @@ mod tests {
         assert_eq!(r["isvalid"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn all_methods_callable_empty_or_error() {
+        let (ctx, dir) = ctx_empty();
+        // Control / network always succeed on empty store.
+        for m in [
+            "uptime",
+            "getnetworkinfo",
+            "getconnectioncount",
+            "getpeerinfo",
+            "getmempoolinfo",
+            "getrawmempool",
+        ] {
+            let _ = dispatch(&ctx, m, &[]).expect(m);
+        }
+        // Empty store: no tip → difficulty errors.
+        let _ = dispatch(&ctx, "getdifficulty", &[]);
+        let _ = dispatch(&ctx, "getrawmempool", &[json!(true)]).unwrap();
+        let _ = dispatch(&ctx, "help", &[json!("estimatesmartfee")]).unwrap();
+        let _ = dispatch(&ctx, "help", &[json!("getblockchaininfo")]).unwrap();
+        let _ = dispatch(&ctx, "help", &[json!("help")]).unwrap();
+        let _ = dispatch(&ctx, "help", &[json!("unknown_method_xyz")]).unwrap();
+        // Expected errors (missing params / missing blocks).
+        for (m, params) in [
+            ("getblockhash", vec![]),
+            ("getblockhash", vec![json!(99)]),
+            ("getbestblockhash", vec![]),
+            ("getblockheader", vec![]),
+            (
+                "getblockheader",
+                vec![json!("00".repeat(32))],
+            ),
+            ("getblock", vec![]),
+            ("getblock", vec![json!("00".repeat(32))]),
+            ("getrawtransaction", vec![]),
+            ("getrawtransaction", vec![json!("00".repeat(32))]),
+            ("getmempoolentry", vec![]),
+            ("getmempoolentry", vec![json!("00".repeat(32))]),
+            ("sendrawtransaction", vec![]),
+            ("sendrawtransaction", vec![json!("00")]),
+            ("testmempoolaccept", vec![]),
+            ("decoderawtransaction", vec![]),
+            ("decodescript", vec![]),
+            ("validateaddress", vec![]),
+            ("nosuchmethod", vec![]),
+            ("getblocktemplate", vec![]),
+            ("combinerawtransaction", vec![]),
+            ("generatetoaddress", vec![]),
+            ("gettxoutsetinfo", vec![]),
+        ] {
+            let _ = dispatch(&ctx, m, &params);
+        }
+        // decodescript with valid empty-ish hex
+        let _ = dispatch(&ctx, "decodescript", &[json!("51")]).unwrap();
+        // estimatesmartfee default conf
+        let _ = dispatch(&ctx, "estimatesmartfee", &[]).unwrap();
+        let _ = dispatch(&ctx, "estimatesmartfee", &[json!(6)]).unwrap();
+        // handle_request error shapes
+        let _ = handle_request(&ctx, &json!({}));
+        let _ = handle_request(&ctx, &json!({"method":"getblockcount","params":{}}));
+        let _ = handle_request(&ctx, &json!({"method":"getblockcount","params":1}));
+        let _ = handle_request(
+            &ctx,
+            &json!({"id":1,"method":"nosuch","params":[]}),
+        );
+        // no mempool
+        let ctx2 = RpcContext {
+            query: Arc::clone(&ctx.query),
+            mempool: None,
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(0)),
+            initial_block_download: Arc::new(AtomicBool::new(true)),
+        };
+        let _ = dispatch(&ctx2, "getmempoolinfo", &[]).unwrap();
+        let _ = dispatch(&ctx2, "getrawmempool", &[json!(true)]).unwrap();
+        let _ = dispatch(&ctx2, "estimatesmartfee", &[json!(1)]).unwrap();
+        let _ = dispatch(&ctx2, "sendrawtransaction", &[json!("00")]);
+        let info = dispatch(&ctx2, "getblockchaininfo", &[]).unwrap();
+        assert_eq!(info["initialblockdownload"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_methods_against_mined_regtest() {
+        use bitcoin::consensus::encode::serialize_hex;
+        use rbitcoin_consensus::ChainParams;
+        use rbitcoin_test::build_mature_regtest_with_spend;
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-chain-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Arc::new(Query::open_or_create(dir.join("store")).unwrap());
+        let params = ChainParams::for_network(Network::Regtest);
+        let chain = build_mature_regtest_with_spend(&q, &params);
+        let mp =
+            MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
+        mp.set_relay_enabled(true);
+        let ctx = RpcContext {
+            query: Arc::clone(&q),
+            mempool: Some(mp.clone()),
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(1)),
+            initial_block_download: Arc::new(AtomicBool::new(false)),
+        };
+
+        let tip_h = chain.tip_height();
+        let count = dispatch(&ctx, "getblockcount", &[]).unwrap();
+        assert_eq!(count.as_u64().unwrap(), tip_h as u64);
+        let best = dispatch(&ctx, "getbestblockhash", &[]).unwrap();
+        let best_s = best.as_str().unwrap().to_string();
+        let hash = dispatch(&ctx, "getblockhash", &[json!(tip_h)]).unwrap();
+        assert_eq!(hash.as_str().unwrap(), best_s);
+        let hdr = dispatch(&ctx, "getblockheader", &[json!(best_s.clone())]).unwrap();
+        assert_eq!(hdr["height"], tip_h);
+        let hdr_hex = dispatch(
+            &ctx,
+            "getblockheader",
+            &[json!(best_s.clone()), json!(false)],
+        )
+        .unwrap();
+        assert!(hdr_hex.as_str().unwrap().len() > 10);
+        for verb in [0u64, 1, 2] {
+            let blk = dispatch(&ctx, "getblock", &[json!(best_s.clone()), json!(verb)]).unwrap();
+            if verb == 0 {
+                assert!(blk.as_str().unwrap().len() > 20);
+            } else {
+                assert_eq!(blk["height"], tip_h);
+                assert!(blk["tx"].as_array().unwrap().len() >= 1);
+            }
+        }
+        let _ = dispatch(&ctx, "getdifficulty", &[]).unwrap();
+        let info = dispatch(&ctx, "getblockchaininfo", &[]).unwrap();
+        assert_eq!(info["blocks"], tip_h);
+
+        // Coinbase of tip for getrawtransaction
+        let fks = q.block_tx_fks(rbitcoin_primitives::Height(tip_h)).unwrap();
+        let tx = q.reconstruct_tx(fks[0]).unwrap();
+        let txid = rbitcoin_primitives::hex_encode(tx.compute_txid().to_byte_array());
+        let raw = dispatch(&ctx, "getrawtransaction", &[json!(txid.clone())]).unwrap();
+        assert!(raw.as_str().unwrap().len() > 20);
+        let verbose = dispatch(
+            &ctx,
+            "getrawtransaction",
+            &[json!(txid.clone()), json!(true)],
+        )
+        .unwrap();
+        assert_eq!(verbose["txid"], txid);
+
+        let hex = serialize_hex(&tx);
+        let dec = dispatch(&ctx, "decoderawtransaction", &[json!(hex)]).unwrap();
+        assert_eq!(dec["txid"], txid);
+
+        // testmempoolaccept dry path (may reject coinbase — still exercises code)
+        let _ = dispatch(
+            &ctx,
+            "testmempoolaccept",
+            &[json!([hex.clone()])],
+        );
+        let _ = dispatch(&ctx, "sendrawtransaction", &[json!(hex)]);
+
+        // validate a regtest address from OP_TRUE is not standard — use bcrt1
+        // from a known valid bech32 if available; otherwise still hit error path.
+        let _ = dispatch(
+            &ctx,
+            "validateaddress",
+            &[json!("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")],
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

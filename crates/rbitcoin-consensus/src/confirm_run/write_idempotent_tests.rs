@@ -1779,6 +1779,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &bp,
         &mut mtp,
         &mut meta_by_abs,
+        &rbitcoin_query::FkMap::default(),
     )
     .expect_err("pinned without abs must be invariant");
     let msg = format!("{err}");

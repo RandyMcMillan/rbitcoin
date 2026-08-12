@@ -570,6 +570,7 @@ pub fn validate_block_connect(
         &batch_parents,
         &mut mtp_cache,
         &mut meta_by_abs,
+        &FkMap::default(),
     )?;
     Ok(())
 }
@@ -1326,6 +1327,8 @@ pub(crate) fn structural_validate_spends(
     mtp_cache: &mut U32Map<u32>,
     // Structural disk meta for pure-write annotate: abs → (field, flags).
     meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,
+    // Same confirm-run creates (not yet in Class C). Keyed by create fk.
+    run_create_height: &FkMap<u32>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::collections::HashSet;
     use std::time::Instant;
@@ -1571,9 +1574,10 @@ pub(crate) fn structural_validate_spends(
         .zip(durable_heights.into_iter())
         .filter_map(|(fk, h)| {
             let id = fk.get()?;
-            // Missing height: not on the best chain (rejected / never connected).
-            // Do not default to 0 (that treats the coin as ancient/valid).
-            Some((id, h?))
+            // Durable height, else this confirm run's earlier (or same) block.
+            // Missing both: rejected / never-connected Class A (015).
+            let h = h.or_else(|| run_create_height.get(fk).copied())?;
+            Some((id, h))
         })
         .collect();
 

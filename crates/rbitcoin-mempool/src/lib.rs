@@ -26,6 +26,7 @@
 mod accept;
 mod error;
 mod fee_est;
+mod fee_flow;
 mod graph;
 mod orphanage;
 mod store;
@@ -41,6 +42,9 @@ pub use fee_est::{
     bucket_count, bucket_index, capacity_wu, default_candidate_rates, effective_capacity_wu,
     horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
     CAPACITY_SAFETY_DEN, CAPACITY_SAFETY_NUM, FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
+};
+pub use fee_flow::{
+    FeeFlowMeter, ADMIT_HALF_LIFE_SECS, CONFIRM_HALF_LIFE_SECS, WARM_AFTER_ADMITS, WARM_AFTER_SECS,
 };
 pub use graph::{
     Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT,

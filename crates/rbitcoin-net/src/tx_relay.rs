@@ -8,7 +8,10 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin, UtxoProvider};
+use rbitcoin_mempool::{
+    default_candidate_rates, min_rate_for_capacity, AcceptError, AcceptResult, ActiveMempool,
+    ChainTipCtx, Coin, FeeFlowMeter, UtxoProvider,
+};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
@@ -132,6 +135,8 @@ pub struct MempoolHub {
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
+    /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
+    fee_flow: Mutex<FeeFlowMeter>,
     // Tip-follow 5s DEBUG meters (sample-and-reset).
     meter_accepts: AtomicU64,
     meter_rejects: AtomicU64,
@@ -169,6 +174,7 @@ impl MempoolHub {
                 MEMPOOL_RECENT_CAP,
             )),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             meter_accepts: AtomicU64::new(0),
             meter_rejects: AtomicU64::new(0),
             meter_accept_us: AtomicU64::new(0),
@@ -490,11 +496,26 @@ impl MempoolHub {
         match result {
             Ok(r) => {
                 self.meter_accept_wall(us, true);
+                self.note_fee_flow_admit(r.weight, r.fee_sat);
                 self.push_recent(tx, &r);
                 self.publish_announce(&r);
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
+        }
+    }
+
+    fn note_fee_flow_admit(&self, weight: u64, fee_sat: u64) {
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight);
+        if let Ok(mut m) = self.fee_flow.lock() {
+            m.note_admit(weight, rate, Instant::now());
+        }
+    }
+
+    fn note_fee_flow_confirm(&self, weight: u64, fee_sat: u64) {
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight);
+        if let Ok(mut m) = self.fee_flow.lock() {
+            m.note_confirm(weight, rate, Instant::now());
         }
     }
 
@@ -535,6 +556,7 @@ impl MempoolHub {
                 let per = us / (res.len().max(1) as u64);
                 for (tx, r) in txs.iter().zip(res.iter()) {
                     self.meter_accept_wall(per, true);
+                    self.note_fee_flow_admit(r.weight, r.fee_sat);
                     self.push_recent(tx, r);
                     self.publish_announce(r);
                 }
@@ -578,7 +600,9 @@ impl MempoolHub {
         // Sample before remove while entries still live.
         for tid in txids {
             if let Some(e) = g.graph.get(tid) {
-                self.push_confirm_memory(e.fee_rate_sat_per_kvb());
+                let rate = e.fee_rate_sat_per_kvb();
+                self.push_confirm_memory(rate);
+                self.note_fee_flow_confirm(e.weight, e.fee_sat);
             }
         }
         g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0)
@@ -742,14 +766,13 @@ impl MempoolHub {
         by_rate.into_iter().rev().collect()
     }
 
-    /// Standard / target-depth **inclusion-frontier** fee in BTC/kB.
+    /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
     ///
     /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
-    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). Larger targets walk a
-    /// deeper frontier. Empty pool → negative (Electrum “unavailable”).
-    ///
-    /// Floor: Libre min relay. Confirm-memory floor is applied when present
-    /// (see `confirm_feerate_memory`).
+    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). When [`FeeFlowMeter`]
+    /// is warm, rate is `max(projected, frontier, confirm_memory, min_relay)`.
+    /// When cold, live inclusion frontier (v1) + floors. Empty pool → negative
+    /// (Electrum “unavailable”) unless only a confirm-memory floor exists.
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
         let depth = if target_blocks == 0 || target_blocks <= 2 {
             Self::DEFAULT_HORIZON_BLOCKS
@@ -757,13 +780,34 @@ impl MempoolHub {
             target_blocks
         };
         let target_wu = u64::from(depth).saturating_mul(Self::BLOCK_WEIGHT_WU);
-        let g = self.inner.read().unwrap();
-        let Some(mut rate) = g.graph.frontier_feerate_sat_per_kvb(target_wu) else {
-            // Empty: optional confirm-memory floor.
-            drop(g);
-            return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
-        };
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+
+        let g = self.inner.read().unwrap();
+        let frontier = g.graph.frontier_feerate_sat_per_kvb(target_wu);
+        let now = Instant::now();
+        let projected = match self.fee_flow.lock() {
+            Ok(mut flow) if flow.is_warm(now) => {
+                let inflow = flow.admit_rates_wu_s(now);
+                let candidates = default_candidate_rates();
+                min_rate_for_capacity(
+                    |r| g.graph.weight_above_feerate(r),
+                    &inflow,
+                    depth,
+                    &candidates,
+                )
+            }
+            _ => None,
+        };
+        drop(g);
+
+        let mut rate = match (projected, frontier) {
+            (Some(p), Some(f)) => p.max(f),
+            (Some(p), None) => p,
+            (None, Some(f)) => f,
+            (None, None) => {
+                return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
+            }
+        };
         rate = rate.max(min_r);
         if let Some(floor) = self.confirm_memory_floor_sat_per_kvb() {
             rate = rate.max(floor);

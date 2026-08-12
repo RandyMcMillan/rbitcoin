@@ -892,10 +892,7 @@ mod tests {
             ("getblockhash", vec![json!(99)]),
             ("getbestblockhash", vec![]),
             ("getblockheader", vec![]),
-            (
-                "getblockheader",
-                vec![json!("00".repeat(32))],
-            ),
+            ("getblockheader", vec![json!("00".repeat(32))]),
             ("getblock", vec![]),
             ("getblock", vec![json!("00".repeat(32))]),
             ("getrawtransaction", vec![]),
@@ -925,10 +922,7 @@ mod tests {
         let _ = handle_request(&ctx, &json!({}));
         let _ = handle_request(&ctx, &json!({"method":"getblockcount","params":{}}));
         let _ = handle_request(&ctx, &json!({"method":"getblockcount","params":1}));
-        let _ = handle_request(
-            &ctx,
-            &json!({"id":1,"method":"nosuch","params":[]}),
-        );
+        let _ = handle_request(&ctx, &json!({"id":1,"method":"nosuch","params":[]}));
         // no mempool
         let ctx2 = RpcContext {
             query: Arc::clone(&ctx.query),
@@ -1024,11 +1018,7 @@ mod tests {
         assert_eq!(dec["txid"], txid);
 
         // testmempoolaccept dry path (may reject coinbase — still exercises code)
-        let _ = dispatch(
-            &ctx,
-            "testmempoolaccept",
-            &[json!([hex.clone()])],
-        );
+        let _ = dispatch(&ctx, "testmempoolaccept", &[json!([hex.clone()])]);
         let _ = dispatch(&ctx, "sendrawtransaction", &[json!(hex)]);
 
         // validate a regtest address from OP_TRUE is not standard — use bcrt1

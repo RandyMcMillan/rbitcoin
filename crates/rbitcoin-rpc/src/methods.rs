@@ -410,11 +410,11 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         }));
     };
-    let live = mp.list_live();
+    let live = mp.list_live_meta();
     let size = live.len();
     let mut bytes = 0u64;
     let mut total_fee = 0u64;
-    for (_, fee, weight, _) in &live {
+    for (_, fee, weight) in &live {
         bytes += weight / 4;
         total_fee += fee;
     }
@@ -436,11 +436,11 @@ fn getrawmempool(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(if verbose { json!({}) } else { json!([]) });
     };
-    let live = mp.list_live();
+    let live = mp.list_live_meta();
     if !verbose {
         let ids: Vec<String> = live
             .iter()
-            .map(|(t, _, _, _)| hash_hex_display(&t.to_byte_array()))
+            .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
             .collect();
         return Ok(json!(ids));
     }
@@ -478,7 +478,7 @@ fn getmempoolentry(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .mempool
         .as_ref()
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    for (txid, fee, weight, _) in mp.list_live() {
+    for (txid, fee, weight) in mp.list_live_meta() {
         if txid.to_byte_array() == want {
             let vsize = weight / 4;
             return Ok(json!({

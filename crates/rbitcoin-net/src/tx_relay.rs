@@ -11,7 +11,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
     default_candidate_rates, frontier_feerate_from_chunks, min_rate_for_capacity,
-    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin,
+    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Chunk, Coin,
     FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU,
 };
 use rbitcoin_query::Query;
@@ -30,11 +30,13 @@ const FEE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
 /// Esplora `/fee-estimates` keys + common Electrum depths (after 0–2 → default map).
 const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
 
-/// Immutable published fee table (request path never walks the live graph).
+/// Immutable published fee table + mining chunks (request path never walks the graph).
 #[derive(Clone, Debug)]
 struct FeeSnapshot {
     /// BTC/kB by confirm-target depth (post 0–2 mapping). Missing → treat empty.
     by_depth_btc_per_kb: HashMap<u32, f64>,
+    /// Best-first mining chunks from the last refresh (histogram / frontier).
+    chunks: Vec<Chunk>,
     computed_at: Instant,
 }
 
@@ -42,6 +44,7 @@ impl FeeSnapshot {
     fn empty(now: Instant) -> Self {
         Self {
             by_depth_btc_per_kb: HashMap::new(),
+            chunks: Vec::new(),
             computed_at: now,
         }
     }
@@ -51,6 +54,16 @@ impl FeeSnapshot {
             .get(&depth)
             .copied()
             .unwrap_or(-1.0)
+    }
+
+    fn histogram(&self) -> Vec<(u64, u64)> {
+        let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for ch in &self.chunks {
+            let rate = ch.fee_rate_sat_per_kvb();
+            let vsize = rbitcoin_consensus::policy::get_virtual_size(ch.weight);
+            *by_rate.entry(rate).or_insert(0) += vsize;
+        }
+        by_rate.into_iter().rev().collect()
     }
 }
 
@@ -652,6 +665,7 @@ impl MempoolHub {
 
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
             by_depth_btc_per_kb: by_depth,
+            chunks,
             computed_at: t0,
         }));
         self.fee_dirty.store(false, Ordering::Release);
@@ -764,7 +778,7 @@ impl MempoolHub {
             .count()
     }
 
-    /// Snapshot of live txs (for Electrum / RPC).
+    /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
         let g = self.inner.read().unwrap();
         g.graph
@@ -774,6 +788,15 @@ impl MempoolHub {
                     .cloned()
                     .map(|tx| (*txid, e.fee_sat, e.weight, tx))
             })
+            .collect()
+    }
+
+    /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
+    pub fn list_live_meta(&self) -> Vec<(Txid, u64, u64)> {
+        let g = self.inner.read().unwrap();
+        g.graph
+            .iter()
+            .map(|(txid, e)| (*txid, e.fee_sat, e.weight))
             .collect()
     }
 
@@ -892,16 +915,10 @@ impl MempoolHub {
     pub const DEFAULT_HORIZON_BLOCKS: u32 = 1;
 
     /// Fee histogram buckets for Electrum: `[[feerate_sat_per_kvb, vsize], ...]`
-    /// descending rate, using **mining chunk** rates (CPFP-aware).
+    /// descending rate, using **published** mining-chunk rates (same refresh as fees).
     pub fn fee_histogram(&self) -> Vec<(u64, u64)> {
-        let g = self.inner.read().unwrap();
-        let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        for ch in g.graph.mining_chunks_best_first() {
-            let rate = ch.fee_rate_sat_per_kvb();
-            let vsize = rbitcoin_consensus::policy::get_virtual_size(ch.weight);
-            *by_rate.entry(rate).or_insert(0) += vsize;
-        }
-        by_rate.into_iter().rev().collect()
+        self.maybe_refresh_fee_snapshot();
+        self.fee_snapshot.load().histogram()
     }
 
     /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
@@ -919,6 +936,11 @@ impl MempoolHub {
         self.fee_snapshot.load().rate_btc_per_kb(depth)
     }
 
+    /// How many times the live graph rebuilt mining chunks (sample-and-reset).
+    pub fn take_chunks_rebuilds(&self) -> u64 {
+        self.inner.read().unwrap().graph.take_chunks_rebuilds()
+    }
+
     /// All Esplora `/fee-estimates` depths in one Arc load (+ optional refresh).
     pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
         self.maybe_refresh_fee_snapshot();
@@ -931,21 +953,19 @@ impl MempoolHub {
 
     /// Mining-order chunk snapshot for diagnostics / future templates.
     pub fn mining_frontier_snapshot(&self) -> Vec<(u64, u64, u64, usize)> {
-        let g = self.inner.read().unwrap();
-        g.graph
-            .mining_chunks_best_first()
-            .into_iter()
+        self.maybe_refresh_fee_snapshot();
+        self.fee_snapshot
+            .load()
+            .chunks
+            .iter()
             .map(|c| (c.fee_rate_sat_per_kvb(), c.weight, c.fee_sat, c.txids.len()))
             .collect()
     }
 
-    /// Weight (WU) ranking strictly above `rate_sat_per_kvb`.
+    /// Weight (WU) ranking strictly above `rate_sat_per_kvb` (published chunks).
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
-        self.inner
-            .read()
-            .unwrap()
-            .graph
-            .weight_above_feerate(rate_sat_per_kvb)
+        self.maybe_refresh_fee_snapshot();
+        weight_above_from_chunks(&self.fee_snapshot.load().chunks, rate_sat_per_kvb)
     }
 
     /// Relay fee in BTC/kB (Libre 0.1 sat/vB = 100 sat/kvB).
@@ -1629,6 +1649,30 @@ mod tests {
             hub.estimate_fee_btc_per_kb(6),
             hub.fee_estimates_btc_per_kb()[4].1
         );
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Histogram / frontier share one published chunk rebuild per dirty refresh.
+    #[test]
+    fn histogram_and_estimate_share_one_chunks_rebuild() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let _ = hub.take_chunks_rebuilds();
+        let _ = hub.fee_histogram();
+        let _ = hub.estimate_fee_btc_per_kb(2);
+        let _ = hub.mining_frontier_snapshot();
+        let n = hub.take_chunks_rebuilds();
+        assert!(
+            n <= 1,
+            "expected at most one mining_chunks rebuild for one dirty refresh, got {n}"
+        );
+        let _ = hub.fee_histogram();
+        let _ = hub.fee_histogram();
+        assert_eq!(hub.take_chunks_rebuilds(), 0);
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

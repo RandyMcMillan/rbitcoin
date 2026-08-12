@@ -706,11 +706,11 @@ pub async fn mempool_info(State(st): State<AppState>) -> Response {
         }))
         .into_response();
     };
-    let live = mp.list_live();
+    let live = mp.list_live_meta();
     let count = live.len();
     let mut vsize = 0u64;
     let mut total_fee = 0u64;
-    for (_txid, fee, weight, _tx) in &live {
+    for (_txid, fee, weight) in &live {
         total_fee = total_fee.saturating_add(*fee);
         vsize = vsize.saturating_add(weight.saturating_add(3) / 4);
     }
@@ -763,9 +763,9 @@ pub async fn mempool_txids(State(st): State<AppState>) -> Response {
         return Json(json!([])).into_response();
     };
     let ids: Vec<String> = mp
-        .list_live()
+        .list_live_meta()
         .into_iter()
-        .map(|(txid, _, _, _)| block_hash_hex(&txid.to_byte_array()))
+        .map(|(txid, _, _)| block_hash_hex(&txid.to_byte_array()))
         .collect();
     Json(ids).into_response()
 }

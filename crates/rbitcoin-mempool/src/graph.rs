@@ -5,6 +5,7 @@
 
 use bitcoin::{OutPoint, Transaction, Txid, Wtxid};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hard cap on txs in one cluster (Core `DEFAULT_CLUSTER_LIMIT` = 64).
 pub const MAX_CLUSTER_COUNT: usize = 64;
@@ -104,6 +105,9 @@ pub struct TxGraph {
     created: HashSet<OutPoint>,
     /// Sum of live weights (WU) for eviction budget.
     total_weight: u64,
+    /// How many times [`Self::mining_chunks_best_first`] built from clusters
+    /// (not a cache hit). Hub tests pin refresh does one rebuild per dirty window.
+    chunks_rebuilds: AtomicU64,
 }
 
 impl TxGraph {
@@ -113,6 +117,11 @@ impl TxGraph {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Sample-and-reset cluster-linearize count (fee-refresh tests).
+    pub fn take_chunks_rebuilds(&self) -> u64 {
+        self.chunks_rebuilds.swap(0, Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -417,6 +426,7 @@ impl TxGraph {
     /// Used for fee estimation and future block-template ranking. CPFP packages
     /// appear as single chunks with combined fee/weight.
     pub fn mining_chunks_best_first(&self) -> Vec<Chunk> {
+        self.chunks_rebuilds.fetch_add(1, Ordering::Relaxed);
         let mut seen = HashSet::new();
         let mut chunks = Vec::new();
         for txid in self.entries.keys() {

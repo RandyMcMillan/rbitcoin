@@ -17,6 +17,18 @@ We intentionally do **not** present “90th percentile of live txs” as the lon
 story. The 10-minute inclusion question is clearer for wallets and is where we
 intend to stand out versus Core-style historical estimators and crude percentiles.
 
+## Non-blocking vs accept (published snapshot)
+
+Fee APIs **do not** walk the live mempool graph on every Electrum/Esplora request.
+
+| Path | Behavior |
+|------|----------|
+| Accept / remove | Marks fee cache **dirty** only (no recompute on the admit critical path). |
+| Refresh | Singleflight: at most one recompute; **one** `mining_chunks_best_first` under a short hub read lock, then pure math off-lock for all depths. |
+| Request | Loads a published `Arc` snapshot (≤ **~1 s** stale when dirty/max-age). |
+
+This avoids fee-estimates holding the hub lock for multi-second full-pool linearizes (which previously blocked accepts and vice versa). Estimates may lag a short bound after fee spikes; they still apply min-relay and confirm-memory floors on publish.
+
 ## Engine v2 (shipped)
 
 **Temporal flow projection** under the same APIs as v1:

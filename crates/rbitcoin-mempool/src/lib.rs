@@ -47,7 +47,8 @@ pub use fee_flow::{
     FeeFlowMeter, ADMIT_HALF_LIFE_SECS, CONFIRM_HALF_LIFE_SECS, WARM_AFTER_ADMITS, WARM_AFTER_SECS,
 };
 pub use graph::{
-    Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT,
+    frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, TxEntry, TxGraph,
+    MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT,
 };
 pub use orphanage::{
     Orphanage, DEFAULT_ORPHAN_MAX_COUNT, DEFAULT_ORPHAN_MAX_WEIGHT, MAX_ORPHAN_TX_WEIGHT,

@@ -17,6 +17,7 @@ rbitcoin-mempool = { workspace = true }
 bitcoin = { workspace = true }
 bip324 = { workspace = true }
 tokio = { workspace = true }
+arc-swap = { workspace = true }
 
 [lints]
 workspace = true

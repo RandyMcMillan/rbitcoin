@@ -445,7 +445,7 @@ fn getrawmempool(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         return Ok(json!(ids));
     }
     let mut map = serde_json::Map::new();
-    for (txid, fee, weight, _) in live {
+    for (txid, fee, weight) in live {
         let vsize = weight / 4;
         map.insert(
             hash_hex_display(&txid.to_byte_array()),

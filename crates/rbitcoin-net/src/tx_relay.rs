@@ -5,20 +5,54 @@
 //! accept stays on [`rbitcoin_mempool::ActiveMempool::accept_package`]. Unknown
 //! `sendpackages` / package commands are ignored until a bitcoin crate upgrade.
 
+use arc_swap::ArcSwap;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    default_candidate_rates, min_rate_for_capacity, AcceptError, AcceptResult, ActiveMempool,
-    ChainTipCtx, Coin, FeeFlowMeter, UtxoProvider,
+    default_candidate_rates, frontier_feerate_from_chunks, min_rate_for_capacity,
+    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin,
+    FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU,
 };
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+
+/// Max age of a published fee snapshot before refresh (request path is still Arc-load only
+/// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
+const FEE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Esplora `/fee-estimates` keys + common Electrum depths (after 0–2 → default map).
+const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
+
+/// Immutable published fee table (request path never walks the live graph).
+#[derive(Clone, Debug)]
+struct FeeSnapshot {
+    /// BTC/kB by confirm-target depth (post 0–2 mapping). Missing → treat empty.
+    by_depth_btc_per_kb: HashMap<u32, f64>,
+    computed_at: Instant,
+}
+
+impl FeeSnapshot {
+    fn empty(now: Instant) -> Self {
+        Self {
+            by_depth_btc_per_kb: HashMap::new(),
+            computed_at: now,
+        }
+    }
+
+    fn rate_btc_per_kb(&self, depth: u32) -> f64 {
+        self.by_depth_btc_per_kb
+            .get(&depth)
+            .copied()
+            .unwrap_or(-1.0)
+    }
+}
 
 /// Resolve prevouts from the relational archive (confirmed **unspent** UTXOs).
 ///
@@ -137,6 +171,10 @@ pub struct MempoolHub {
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
     fee_flow: Mutex<FeeFlowMeter>,
+    /// Published fee table for Electrum/Esplora (refreshed dirty ∥ max-age, singleflight).
+    fee_snapshot: ArcSwap<FeeSnapshot>,
+    fee_dirty: AtomicBool,
+    fee_refreshing: AtomicBool,
     // Tip-follow 5s DEBUG meters (sample-and-reset).
     meter_accepts: AtomicU64,
     meter_rejects: AtomicU64,
@@ -175,6 +213,9 @@ impl MempoolHub {
             )),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
             fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
+            fee_snapshot: ArcSwap::from_pointee(FeeSnapshot::empty(Instant::now())),
+            fee_dirty: AtomicBool::new(true),
+            fee_refreshing: AtomicBool::new(false),
             meter_accepts: AtomicU64::new(0),
             meter_rejects: AtomicU64::new(0),
             meter_accept_us: AtomicU64::new(0),
@@ -344,6 +385,7 @@ impl MempoolHub {
         }
         if n > 0 {
             let _ = g.maybe_compact();
+            self.mark_fee_dirty();
         }
         n
     }
@@ -510,6 +552,7 @@ impl MempoolHub {
         if let Ok(mut m) = self.fee_flow.lock() {
             m.note_admit(weight, rate, Instant::now());
         }
+        self.mark_fee_dirty();
     }
 
     fn note_fee_flow_confirm(&self, weight: u64, fee_sat: u64) {
@@ -517,6 +560,101 @@ impl MempoolHub {
         if let Ok(mut m) = self.fee_flow.lock() {
             m.note_confirm(weight, rate, Instant::now());
         }
+        self.mark_fee_dirty();
+    }
+
+    fn mark_fee_dirty(&self) {
+        self.fee_dirty.store(true, Ordering::Release);
+    }
+
+    /// Map API target blocks → engine depth (0–2 → default horizon of 1).
+    fn fee_depth(target_blocks: u32) -> u32 {
+        if target_blocks == 0 || target_blocks <= 2 {
+            Self::DEFAULT_HORIZON_BLOCKS
+        } else {
+            target_blocks
+        }
+    }
+
+    /// Lazy singleflight refresh when dirty or older than [`FEE_SNAPSHOT_MAX_AGE`].
+    fn maybe_refresh_fee_snapshot(&self) {
+        let now = Instant::now();
+        let snap = self.fee_snapshot.load_full();
+        let stale = now
+            .checked_duration_since(snap.computed_at)
+            .map(|d| d >= FEE_SNAPSHOT_MAX_AGE)
+            .unwrap_or(true);
+        let dirty = self.fee_dirty.load(Ordering::Acquire);
+        // Always refresh when never populated with real data and dirty (first admit path).
+        if !dirty && !stale {
+            return;
+        }
+        if self
+            .fee_refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another thread is refreshing; callers use the previous Arc.
+            return;
+        }
+        self.refresh_fee_snapshot();
+        self.fee_refreshing.store(false, Ordering::Release);
+    }
+
+    /// One graph linearize under short read lock, then pure math off-lock → publish.
+    fn refresh_fee_snapshot(&self) {
+        let t0 = Instant::now();
+        let chunks = {
+            let g = self.inner.read().unwrap();
+            g.graph.mining_chunks_best_first()
+        };
+
+        let now = Instant::now();
+        let inflow = match self.fee_flow.lock() {
+            Ok(mut flow) if flow.is_warm(now) => Some(flow.admit_rates_wu_s(now)),
+            _ => None,
+        };
+        let candidates = default_candidate_rates();
+        let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+        let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
+
+        let mut by_depth = HashMap::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
+        for &depth in FEE_SNAPSHOT_DEPTHS {
+            let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
+            let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
+            let projected = inflow.as_ref().and_then(|inf| {
+                min_rate_for_capacity(
+                    |r| weight_above_from_chunks(&chunks, r),
+                    inf,
+                    depth,
+                    &candidates,
+                )
+            });
+            let mut rate = match (projected, frontier) {
+                (Some(p), Some(f)) => p.max(f),
+                (Some(p), None) => p,
+                (None, Some(f)) => f,
+                (None, None) => {
+                    // Empty pool: optional confirm-memory floor as BTC/kB.
+                    let v = confirm_floor
+                        .map(|r| (r as f64) / 100_000_000.0)
+                        .unwrap_or(-1.0);
+                    by_depth.insert(depth, v);
+                    continue;
+                }
+            };
+            rate = rate.max(min_r);
+            if let Some(floor) = confirm_floor {
+                rate = rate.max(floor);
+            }
+            by_depth.insert(depth, (rate as f64) / 100_000_000.0);
+        }
+
+        self.fee_snapshot.store(Arc::new(FeeSnapshot {
+            by_depth_btc_per_kb: by_depth,
+            computed_at: t0,
+        }));
+        self.fee_dirty.store(false, Ordering::Release);
     }
 
     fn finish_accept_err(&self, us: u64, e: AcceptError) -> Result<AcceptResult, AcceptError> {
@@ -769,50 +907,26 @@ impl MempoolHub {
     /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
     ///
     /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
-    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). When [`FeeFlowMeter`]
-    /// is warm, rate is `max(projected, frontier, confirm_memory, min_relay)`.
-    /// When cold, live inclusion frontier (v1) + floors. Empty pool → negative
-    /// (Electrum “unavailable”) unless only a confirm-memory floor exists.
+    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks).
+    ///
+    /// **Non-blocking vs accept:** returns from a **published snapshot** (Arc).
+    /// Graph linearize runs only on dirty/stale singleflight **refresh** (≤~1 s
+    /// stale; one `mining_chunks` per refresh for all depths). Request path does
+    /// not hold the hub lock across multi-pass walks.
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
-        let depth = if target_blocks == 0 || target_blocks <= 2 {
-            Self::DEFAULT_HORIZON_BLOCKS
-        } else {
-            target_blocks
-        };
-        let target_wu = u64::from(depth).saturating_mul(Self::BLOCK_WEIGHT_WU);
-        let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+        self.maybe_refresh_fee_snapshot();
+        let depth = Self::fee_depth(target_blocks);
+        self.fee_snapshot.load().rate_btc_per_kb(depth)
+    }
 
-        let g = self.inner.read().unwrap();
-        let frontier = g.graph.frontier_feerate_sat_per_kvb(target_wu);
-        let now = Instant::now();
-        let projected = match self.fee_flow.lock() {
-            Ok(mut flow) if flow.is_warm(now) => {
-                let inflow = flow.admit_rates_wu_s(now);
-                let candidates = default_candidate_rates();
-                min_rate_for_capacity(
-                    |r| g.graph.weight_above_feerate(r),
-                    &inflow,
-                    depth,
-                    &candidates,
-                )
-            }
-            _ => None,
-        };
-        drop(g);
-
-        let mut rate = match (projected, frontier) {
-            (Some(p), Some(f)) => p.max(f),
-            (Some(p), None) => p,
-            (None, Some(f)) => f,
-            (None, None) => {
-                return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
-            }
-        };
-        rate = rate.max(min_r);
-        if let Some(floor) = self.confirm_memory_floor_sat_per_kvb() {
-            rate = rate.max(floor);
-        }
-        (rate as f64) / 100_000_000.0
+    /// All Esplora `/fee-estimates` depths in one Arc load (+ optional refresh).
+    pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
+        self.maybe_refresh_fee_snapshot();
+        let snap = self.fee_snapshot.load_full();
+        FEE_SNAPSHOT_DEPTHS
+            .iter()
+            .map(|&d| (d, snap.rate_btc_per_kb(d)))
+            .collect()
     }
 
     /// Mining-order chunk snapshot for diagnostics / future templates.
@@ -852,11 +966,6 @@ impl MempoolHub {
         let mut v: Vec<u64> = mem.iter().copied().collect();
         v.sort_unstable();
         Some(v[v.len() / 2].max(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB))
-    }
-
-    fn confirm_memory_floor_btc_per_kb(&self) -> Option<f64> {
-        self.confirm_memory_floor_sat_per_kvb()
-            .map(|r| (r as f64) / 100_000_000.0)
     }
 
     fn push_confirm_memory(&self, rate_sat_per_kvb: u64) {
@@ -1488,6 +1597,7 @@ mod tests {
                 for _ in 0..32 {
                     let _ = h.live_count();
                     let _ = h.estimate_fee_btc_per_kb(2);
+                    let _ = h.fee_estimates_btc_per_kb();
                     let _ = h.fee_histogram();
                     let _ = h.list_live();
                     let _ = h.contains_wtxid(&Wtxid::from_byte_array([0u8; 32]));
@@ -1497,6 +1607,28 @@ mod tests {
         for h in handles {
             h.join().expect("reader");
         }
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Fee snapshot covers Esplora depths; request path uses published table.
+    #[test]
+    fn fee_snapshot_bulk_and_estimate_share_table() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        // Empty pool: negative / unavailable for Electrum-style single target.
+        assert!(hub.estimate_fee_btc_per_kb(2) < 0.0);
+        let bulk = hub.fee_estimates_btc_per_kb();
+        assert_eq!(bulk.len(), 11);
+        assert!(bulk.iter().all(|(d, v)| *d >= 1 && *v < 0.0));
+        // Second call hits cache (not dirty/stale immediately) — still consistent.
+        assert_eq!(
+            hub.estimate_fee_btc_per_kb(6),
+            hub.fee_estimates_btc_per_kb()[4].1
+        );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

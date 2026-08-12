@@ -54,6 +54,34 @@ impl Chunk {
     }
 }
 
+/// Frontier feerate from a **best-first** chunk list (no graph walk).
+///
+/// Used by fee snapshot refresh so multi-target estimates share one linearize.
+pub fn frontier_feerate_from_chunks(chunks: &[Chunk], target_wu: u64) -> Option<u64> {
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut cum = 0u64;
+    let mut last_rate = chunks[0].fee_rate_sat_per_kvb();
+    for ch in chunks {
+        last_rate = ch.fee_rate_sat_per_kvb();
+        cum = cum.saturating_add(ch.weight);
+        if cum >= target_wu {
+            return Some(last_rate.max(1));
+        }
+    }
+    Some(last_rate.max(1))
+}
+
+/// Weight strictly above `rate_sat_per_kvb` from a best-first chunk list.
+pub fn weight_above_from_chunks(chunks: &[Chunk], rate_sat_per_kvb: u64) -> u64 {
+    chunks
+        .iter()
+        .filter(|c| c.fee_rate_sat_per_kvb() > rate_sat_per_kvb)
+        .map(|c| c.weight)
+        .sum()
+}
+
 /// Cluster identity: sorted member set fingerprint (min txid as representative).
 #[derive(Debug, Clone)]
 pub struct Cluster {
@@ -417,29 +445,12 @@ impl TxGraph {
     /// If total pool weight is below `target_wu`, returns the **lowest** chunk
     /// rate present (still need min-relay floor at the hub).
     pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
-        let chunks = self.mining_chunks_best_first();
-        if chunks.is_empty() {
-            return None;
-        }
-        let mut cum = 0u64;
-        let mut last_rate = chunks[0].fee_rate_sat_per_kvb();
-        for ch in &chunks {
-            last_rate = ch.fee_rate_sat_per_kvb();
-            cum = cum.saturating_add(ch.weight);
-            if cum >= target_wu {
-                return Some(last_rate.max(1));
-            }
-        }
-        Some(last_rate.max(1))
+        frontier_feerate_from_chunks(&self.mining_chunks_best_first(), target_wu)
     }
 
     /// Weight (WU) of chunks with feerate strictly greater than `rate_sat_per_kvb`.
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
-        self.mining_chunks_best_first()
-            .into_iter()
-            .filter(|c| c.fee_rate_sat_per_kvb() > rate_sat_per_kvb)
-            .map(|c| c.weight)
-            .sum()
+        weight_above_from_chunks(&self.mining_chunks_best_first(), rate_sat_per_kvb)
     }
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
@@ -585,6 +596,13 @@ mod tests {
         let r_deep = g.frontier_feerate_sat_per_kvb(wa + wb).unwrap();
         assert!(r_hi >= r_deep);
         assert!(g.weight_above_feerate(0) >= wa);
+        // Shared-slice helpers match full-graph methods (fee snapshot path).
+        let ch = g.mining_chunks_best_first();
+        assert_eq!(
+            frontier_feerate_from_chunks(&ch, 1),
+            g.frontier_feerate_sat_per_kvb(1)
+        );
+        assert_eq!(weight_above_from_chunks(&ch, 0), g.weight_above_feerate(0));
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

@@ -775,6 +775,7 @@ dependencies = [
 name = "rbitcoin-net"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bip324",
  "bitcoin",
  "rbitcoin-consensus",

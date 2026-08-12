@@ -734,20 +734,26 @@ pub async fn mempool_info(State(st): State<AppState>) -> Response {
 
 pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     let mut obj = serde_json::Map::new();
-    let targets = [1u32, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
-    for t in targets {
-        let btc_kb = st
-            .mempool
-            .as_ref()
-            .map(|m| m.estimate_fee_btc_per_kb(t))
-            .unwrap_or(-1.0);
-        let sat_vb = if btc_kb < 0.0 {
-            1.0 // floor when empty
-        } else {
-            // BTC/kB → sat/vB: * 1e8 / 1000
-            btc_kb * 100_000.0
-        };
-        obj.insert(t.to_string(), json!(sat_vb));
+    // One snapshot refresh + Arc load (not 11× independent graph walks).
+    let pairs: Vec<(u32, f64)> = st
+        .mempool
+        .as_ref()
+        .map(|m| m.fee_estimates_btc_per_kb())
+        .unwrap_or_default();
+    if pairs.is_empty() {
+        for t in [1u32, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008] {
+            obj.insert(t.to_string(), json!(1.0));
+        }
+    } else {
+        for (t, btc_kb) in pairs {
+            let sat_vb = if btc_kb < 0.0 {
+                1.0 // floor when empty
+            } else {
+                // BTC/kB → sat/vB: * 1e8 / 1000
+                btc_kb * 100_000.0
+            };
+            obj.insert(t.to_string(), json!(sat_vb));
+        }
     }
     Json(Value::Object(obj)).into_response()
 }

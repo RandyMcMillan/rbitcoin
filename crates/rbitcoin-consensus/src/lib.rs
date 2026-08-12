@@ -94,6 +94,22 @@ pub mod script_bench {
 // Re-export job type for benches that drive parallel strategies.
 pub use block::ScriptCheckJob;
 
+/// Consensus script verify for a single tx on the shared `rbtc-scripts` path.
+///
+/// Always hops to a detached script worker (same naming/pool family as IBD
+/// confirm scripts). Callers on peer sessions or tokio request threads must use
+/// this (or equivalent) — never run the interpreter on the I/O stack.
+pub fn verify_tx_scripts_detached(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+) -> Result<(), ConsensusError> {
+    script_pool::run_detached_join(move || {
+        let job = script_bench::JobBytes::new(prevouts, tx);
+        script_bench::verify_job(&job)
+    })
+    .unwrap_or_else(|| Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_subsidy, is_final_tx, sequence_locks_satisfied,
     validate_block_connect, validate_block_structure, validate_block_structure_hashed,

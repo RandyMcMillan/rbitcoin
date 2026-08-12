@@ -76,6 +76,23 @@ where
         .spawn(work);
 }
 
+/// Run `work` on a `rbtc-scripts` worker and join the result.
+///
+/// Used by mempool accept so the peer/tokio stack never runs the interpreter
+/// (even for a single input — [`try_for_each_parallel`] would otherwise run
+/// one-item jobs on the caller). Returns `None` if the worker dies before send.
+pub(crate) fn run_detached_join<T, F>(work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    spawn_detached(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

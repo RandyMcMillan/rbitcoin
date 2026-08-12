@@ -8,12 +8,15 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
-use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Coin, UtxoProvider};
+use rbitcoin_mempool::{
+    default_candidate_rates, min_rate_for_capacity, AcceptError, AcceptResult, ActiveMempool,
+    ChainTipCtx, Coin, FeeFlowMeter, UtxoProvider,
+};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -104,6 +107,14 @@ pub struct MempoolPerfSample {
     pub accept_us: u64,
     /// Max single accept_tx wall (µs).
     pub accept_max_us: u64,
+    /// Sum of exclusive mempool-lock hold times (µs) this window.
+    pub accept_lock_us: u64,
+    /// Sum of prevout/UTXO resolve times (µs) this window.
+    pub accept_utxo_us: u64,
+    /// Sum of consensus script verify times (µs) this window.
+    pub accept_script_us: u64,
+    /// Sum of durable append/persist times (µs) this window.
+    pub accept_durable_us: u64,
     /// Tx inventory items seen that we did not already have.
     pub inv_tx: u64,
     /// Tx getdata items we issued.
@@ -114,7 +125,7 @@ pub struct MempoolPerfSample {
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
-    inner: Mutex<ActiveMempool>,
+    inner: RwLock<ActiveMempool>,
     query: Arc<Query>,
     /// When false, peers' tx inv/tx are ignored (IBD / catch-up).
     relay_enabled: AtomicBool,
@@ -124,11 +135,17 @@ pub struct MempoolHub {
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
+    /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
+    fee_flow: Mutex<FeeFlowMeter>,
     // Tip-follow 5s DEBUG meters (sample-and-reset).
     meter_accepts: AtomicU64,
     meter_rejects: AtomicU64,
     meter_accept_us: AtomicU64,
     meter_accept_max_us: AtomicU64,
+    meter_accept_lock_us: AtomicU64,
+    meter_accept_utxo_us: AtomicU64,
+    meter_accept_script_us: AtomicU64,
+    meter_accept_durable_us: AtomicU64,
     meter_inv_tx: AtomicU64,
     meter_getdata_tx: AtomicU64,
     meter_announce: AtomicU64,
@@ -149,7 +166,7 @@ impl MempoolHub {
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
-            inner: Mutex::new(mp),
+            inner: RwLock::new(mp),
             query,
             relay_enabled: AtomicBool::new(false),
             announce,
@@ -157,10 +174,15 @@ impl MempoolHub {
                 MEMPOOL_RECENT_CAP,
             )),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             meter_accepts: AtomicU64::new(0),
             meter_rejects: AtomicU64::new(0),
             meter_accept_us: AtomicU64::new(0),
             meter_accept_max_us: AtomicU64::new(0),
+            meter_accept_lock_us: AtomicU64::new(0),
+            meter_accept_utxo_us: AtomicU64::new(0),
+            meter_accept_script_us: AtomicU64::new(0),
+            meter_accept_durable_us: AtomicU64::new(0),
             meter_inv_tx: AtomicU64::new(0),
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
@@ -202,6 +224,17 @@ impl MempoolHub {
         }
     }
 
+    fn meter_accept_stages(&self, lock_us: u64, stages: rbitcoin_mempool::AcceptStageUs) {
+        self.meter_accept_lock_us
+            .fetch_add(lock_us, Ordering::Relaxed);
+        self.meter_accept_utxo_us
+            .fetch_add(stages.utxo_us, Ordering::Relaxed);
+        self.meter_accept_script_us
+            .fetch_add(stages.script_us, Ordering::Relaxed);
+        self.meter_accept_durable_us
+            .fetch_add(stages.durable_us, Ordering::Relaxed);
+    }
+
     /// Sample-and-reset mempool/relay counters for the tip-follow 5s DEBUG line.
     pub fn sample_reset_perf(&self) -> MempoolPerfSample {
         MempoolPerfSample {
@@ -209,6 +242,10 @@ impl MempoolHub {
             rejects: self.meter_rejects.swap(0, Ordering::Relaxed),
             accept_us: self.meter_accept_us.swap(0, Ordering::Relaxed),
             accept_max_us: self.meter_accept_max_us.swap(0, Ordering::Relaxed),
+            accept_lock_us: self.meter_accept_lock_us.swap(0, Ordering::Relaxed),
+            accept_utxo_us: self.meter_accept_utxo_us.swap(0, Ordering::Relaxed),
+            accept_script_us: self.meter_accept_script_us.swap(0, Ordering::Relaxed),
+            accept_durable_us: self.meter_accept_durable_us.swap(0, Ordering::Relaxed),
             inv_tx: self.meter_inv_tx.swap(0, Ordering::Relaxed),
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
@@ -244,7 +281,7 @@ impl MempoolHub {
     /// Compact durable mempool files (reclaim DEAD slots / body holes).
     pub fn compact(&self) -> Result<(u32, usize), String> {
         self.inner
-            .lock()
+            .write()
             .unwrap()
             .compact()
             .map_err(|e| format!("mempool compact: {e}"))
@@ -278,7 +315,7 @@ impl MempoolHub {
     /// DEAD dominates. Returns how many txs removed.
     pub fn purge_confirmed_on_chain(&self) -> usize {
         let live: Vec<Txid> = {
-            let g = self.inner.lock().unwrap();
+            let g = self.inner.read().unwrap();
             g.graph.iter().map(|(t, _)| *t).collect()
         };
         if live.is_empty() {
@@ -298,7 +335,7 @@ impl MempoolHub {
         if to_drop.is_empty() {
             return 0;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.write().unwrap();
         let mut n = 0usize;
         for tid in &to_drop {
             if g.graph.contains(tid) && g.remove_txid(tid).is_ok() {
@@ -325,7 +362,7 @@ impl MempoolHub {
     }
 
     pub fn live_count(&self) -> usize {
-        self.inner.lock().unwrap().live_count()
+        self.inner.read().unwrap().live_count()
     }
 
     /// Live mempool txids that passed consensus script verify at accept.
@@ -333,7 +370,7 @@ impl MempoolHub {
     /// Tip confirm may skip re-verifying these (same tip-era softfork flags).
     pub fn script_preverified_txids(&self) -> std::collections::HashSet<[u8; 32]> {
         use bitcoin::hashes::Hash;
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         g.graph
             .iter()
             .map(|(txid, _)| txid.to_byte_array())
@@ -341,28 +378,28 @@ impl MempoolHub {
     }
 
     pub fn generation(&self) -> u64 {
-        self.inner.lock().unwrap().generation()
+        self.inner.read().unwrap().generation()
     }
 
     pub fn flush(&self) -> Result<(), String> {
         self.inner
-            .lock()
+            .write()
             .unwrap()
             .flush()
             .map_err(|e| format!("mempool flush: {e}"))
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
-        self.inner.lock().unwrap().graph.contains(txid)
+        self.inner.read().unwrap().graph.contains(txid)
     }
 
     pub fn get_tx(&self, txid: &Txid) -> Option<Transaction> {
-        self.inner.lock().unwrap().get_tx(txid).cloned()
+        self.inner.read().unwrap().get_tx(txid).cloned()
     }
 
     /// Look up a live mempool tx by wtxid (BIP339 / compact v2).
     pub fn get_tx_by_wtxid(&self, wtxid: &Wtxid) -> Option<Transaction> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         for (txid, e) in g.graph.iter() {
             if e.wtxid == *wtxid {
                 return g.get_tx(txid).cloned();
@@ -373,7 +410,7 @@ impl MempoolHub {
 
     /// True if a live mempool entry has this wtxid (BIP339 inv filter).
     pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         let found = g.graph.iter().any(|(_, e)| e.wtxid == *wtxid);
         found
     }
@@ -392,40 +429,110 @@ impl MempoolHub {
     }
 
     /// Accept a peer (or local) transaction when relay is enabled.
+    ///
+    /// **Staged:** exclusive lock for prepare + commit only. Consensus script
+    /// verify runs on the shared `rbtc-scripts` path **outside** the mempool
+    /// mutex so concurrent readers are not blocked by interpreter CPU.
     pub fn accept_tx(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
         let t0 = Instant::now();
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
-        let mut g = self.inner.lock().unwrap();
-        let result = g.accept_tx(tx, &utxo, tip);
-        drop(g);
+
+        let mut stages = rbitcoin_mempool::AcceptStageUs::default();
+        let mut lock_us = 0u64;
+
+        // Stage prepare under exclusive lock (resolve + structural + policy).
+        let prep = {
+            let t_lock = Instant::now();
+            let mut g = self.inner.write().unwrap();
+            g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
+            let r = g.prepare_admit(tx, &utxo, tip);
+            stages.utxo_us = g.last_accept_stages.utxo_us;
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+        let prep = match prep {
+            Ok(p) => p,
+            Err(e) => {
+                let us = t0.elapsed().as_micros() as u64;
+                self.meter_accept_stages(lock_us, stages);
+                return self.finish_accept_err(us, e);
+            }
+        };
+
+        // Script outside lock on shared script_pool / rbtc-scripts worker.
+        let t_script = Instant::now();
+        if let Err(e) =
+            rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
+        {
+            let us = t0.elapsed().as_micros() as u64;
+            stages.script_us = t_script.elapsed().as_micros() as u64;
+            self.meter_accept_stages(lock_us, stages);
+            return self.finish_accept_err(us, AcceptError::Script(e.to_string()));
+        }
+        stages.script_us = t_script.elapsed().as_micros() as u64;
+
+        // Commit under exclusive lock (re-check + durable + orphan promote).
+        let result = {
+            let t_lock = Instant::now();
+            let mut g = self.inner.write().unwrap();
+            g.last_accept_stages = stages;
+            let r = match g.commit_after_script(tx, prep, &utxo, tip) {
+                Ok(ar) => {
+                    g.promote_orphans_of(ar.txid, &utxo, tip);
+                    Ok(ar)
+                }
+                Err(e) => Err(e),
+            };
+            stages = g.last_accept_stages;
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+
         let us = t0.elapsed().as_micros() as u64;
+        self.meter_accept_stages(lock_us, stages);
         match result {
             Ok(r) => {
                 self.meter_accept_wall(us, true);
+                self.note_fee_flow_admit(r.weight, r.fee_sat);
                 self.push_recent(tx, &r);
                 self.publish_announce(&r);
                 Ok(r)
             }
-            Err(e) => {
-                // Soft outcomes (already in pool / orphan / full) are not "rejects".
-                let hard = !matches!(
-                    e,
-                    AcceptError::Duplicate(_)
-                        | AcceptError::Orphaned(_)
-                        | AcceptError::Policy("mempool full")
-                );
-                if hard {
-                    self.meter_accept_wall(us, false);
-                } else {
-                    // Still attribute wall time to accept path (avg under accepts=0).
-                    self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
-                }
-                Err(e)
-            }
+            Err(e) => self.finish_accept_err(us, e),
         }
+    }
+
+    fn note_fee_flow_admit(&self, weight: u64, fee_sat: u64) {
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight);
+        if let Ok(mut m) = self.fee_flow.lock() {
+            m.note_admit(weight, rate, Instant::now());
+        }
+    }
+
+    fn note_fee_flow_confirm(&self, weight: u64, fee_sat: u64) {
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight);
+        if let Ok(mut m) = self.fee_flow.lock() {
+            m.note_confirm(weight, rate, Instant::now());
+        }
+    }
+
+    fn finish_accept_err(&self, us: u64, e: AcceptError) -> Result<AcceptResult, AcceptError> {
+        // Soft outcomes (already in pool / orphan / full) are not "rejects".
+        let hard = !matches!(
+            e,
+            AcceptError::Duplicate(_)
+                | AcceptError::Orphaned(_)
+                | AcceptError::Policy("mempool full")
+        );
+        if hard {
+            self.meter_accept_wall(us, false);
+        } else {
+            self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+        }
+        Err(e)
     }
 
     /// Accept an ancestor package (local / Electrum path; BIP331 wire later).
@@ -435,16 +542,21 @@ impl MempoolHub {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
-        let mut g = self.inner.lock().unwrap();
+        let t_lock = Instant::now();
+        let mut g = self.inner.write().unwrap();
         let result = g.accept_package(txs, &utxo, tip);
+        let stages = g.last_accept_stages;
+        let lock_us = t_lock.elapsed().as_micros() as u64;
         drop(g);
         let us = t0.elapsed().as_micros() as u64;
+        self.meter_accept_stages(lock_us, stages);
         match result {
             Ok(res) => {
                 // Attribute package wall to each accepted member for rate visibility.
                 let per = us / (res.len().max(1) as u64);
                 for (tx, r) in txs.iter().zip(res.iter()) {
                     self.meter_accept_wall(per, true);
+                    self.note_fee_flow_admit(r.weight, r.fee_sat);
                     self.push_recent(tx, r);
                     self.publish_announce(r);
                 }
@@ -484,11 +596,13 @@ impl MempoolHub {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.write().unwrap();
         // Sample before remove while entries still live.
         for tid in txids {
             if let Some(e) = g.graph.get(tid) {
-                self.push_confirm_memory(e.fee_rate_sat_per_kvb());
+                let rate = e.fee_rate_sat_per_kvb();
+                self.push_confirm_memory(rate);
+                self.note_fee_flow_confirm(e.weight, e.fee_sat);
             }
         }
         g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0)
@@ -496,7 +610,7 @@ impl MempoolHub {
 
     /// Unique txs parked waiting on missing parents (Core-class orphanage).
     pub fn orphan_count(&self) -> usize {
-        self.inner.lock().unwrap().orphan_count()
+        self.inner.read().unwrap().orphan_count()
     }
 
     /// Re-admit txs after reorg disconnect (best-effort).
@@ -505,7 +619,7 @@ impl MempoolHub {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.write().unwrap();
         g.reorg_disconnect_reaccept(txs, &utxo, tip)
             .into_iter()
             .filter(|r| r.is_ok())
@@ -514,7 +628,7 @@ impl MempoolHub {
 
     /// Snapshot of live txs (for Electrum / RPC).
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         g.graph
             .iter()
             .filter_map(|(txid, e)| {
@@ -527,7 +641,7 @@ impl MempoolHub {
 
     /// Outpoints spent by any live mempool transaction (confirmed or mempool parents).
     pub fn spent_outpoints(&self) -> std::collections::HashSet<OutPoint> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         let mut set = std::collections::HashSet::new();
         for (txid, _) in g.graph.iter() {
             let Some(tx) = g.get_tx(txid) else { continue };
@@ -541,7 +655,7 @@ impl MempoolHub {
     /// Electrum `blockchain.scripthash.get_mempool` rows for `scripthash` (internal order).
     pub fn scripthash_mempool(&self, scripthash: &[u8; 32]) -> Vec<ElectrumMempoolItem> {
         use rbitcoin_store::script_hash;
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         let mut out = Vec::new();
         for (txid, e) in g.graph.iter() {
             let Some(tx) = g.get_tx(txid) else { continue };
@@ -597,7 +711,7 @@ impl MempoolHub {
     /// Unconfirmed delta for Electrum balance (sats): +mempool outputs − spent confirmed.
     pub fn scripthash_unconfirmed_delta(&self, scripthash: &[u8; 32]) -> i64 {
         use rbitcoin_store::script_hash;
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         let mut delta = 0i64;
         for (txid, _e) in g.graph.iter() {
             let Some(tx) = g.get_tx(txid) else { continue };
@@ -642,7 +756,7 @@ impl MempoolHub {
     /// Fee histogram buckets for Electrum: `[[feerate_sat_per_kvb, vsize], ...]`
     /// descending rate, using **mining chunk** rates (CPFP-aware).
     pub fn fee_histogram(&self) -> Vec<(u64, u64)> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
         for ch in g.graph.mining_chunks_best_first() {
             let rate = ch.fee_rate_sat_per_kvb();
@@ -652,14 +766,13 @@ impl MempoolHub {
         by_rate.into_iter().rev().collect()
     }
 
-    /// Standard / target-depth **inclusion-frontier** fee in BTC/kB.
+    /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
     ///
     /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
-    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). Larger targets walk a
-    /// deeper frontier. Empty pool → negative (Electrum “unavailable”).
-    ///
-    /// Floor: Libre min relay. Confirm-memory floor is applied when present
-    /// (see `confirm_feerate_memory`).
+    /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks). When [`FeeFlowMeter`]
+    /// is warm, rate is `max(projected, frontier, confirm_memory, min_relay)`.
+    /// When cold, live inclusion frontier (v1) + floors. Empty pool → negative
+    /// (Electrum “unavailable”) unless only a confirm-memory floor exists.
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
         let depth = if target_blocks == 0 || target_blocks <= 2 {
             Self::DEFAULT_HORIZON_BLOCKS
@@ -667,13 +780,34 @@ impl MempoolHub {
             target_blocks
         };
         let target_wu = u64::from(depth).saturating_mul(Self::BLOCK_WEIGHT_WU);
-        let g = self.inner.lock().unwrap();
-        let Some(mut rate) = g.graph.frontier_feerate_sat_per_kvb(target_wu) else {
-            // Empty: optional confirm-memory floor.
-            drop(g);
-            return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
-        };
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+
+        let g = self.inner.read().unwrap();
+        let frontier = g.graph.frontier_feerate_sat_per_kvb(target_wu);
+        let now = Instant::now();
+        let projected = match self.fee_flow.lock() {
+            Ok(mut flow) if flow.is_warm(now) => {
+                let inflow = flow.admit_rates_wu_s(now);
+                let candidates = default_candidate_rates();
+                min_rate_for_capacity(
+                    |r| g.graph.weight_above_feerate(r),
+                    &inflow,
+                    depth,
+                    &candidates,
+                )
+            }
+            _ => None,
+        };
+        drop(g);
+
+        let mut rate = match (projected, frontier) {
+            (Some(p), Some(f)) => p.max(f),
+            (Some(p), None) => p,
+            (None, Some(f)) => f,
+            (None, None) => {
+                return self.confirm_memory_floor_btc_per_kb().unwrap_or(-1.0);
+            }
+        };
         rate = rate.max(min_r);
         if let Some(floor) = self.confirm_memory_floor_sat_per_kvb() {
             rate = rate.max(floor);
@@ -683,7 +817,7 @@ impl MempoolHub {
 
     /// Mining-order chunk snapshot for diagnostics / future templates.
     pub fn mining_frontier_snapshot(&self) -> Vec<(u64, u64, u64, usize)> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.read().unwrap();
         g.graph
             .mining_chunks_best_first()
             .into_iter()
@@ -694,7 +828,7 @@ impl MempoolHub {
     /// Weight (WU) ranking strictly above `rate_sat_per_kvb`.
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
         self.inner
-            .lock()
+            .read()
             .unwrap()
             .graph
             .weight_above_feerate(rate_sat_per_kvb)
@@ -1186,6 +1320,183 @@ mod tests {
         assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
         assert!(hub.list_live().len() < 3);
 
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// C0: stage meters accumulate on accept; sample-and-reset clears them.
+    ///
+    /// Also acts as the **baseline microbench harness** for later staged-accept
+    /// work (lock ≈ wall while scripts/durable still run under the hub mutex).
+    #[test]
+    fn accept_stage_meters_and_baseline_harness() {
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Block, CompactTarget, Target, TxMerkleNode};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let mut coinbase_txids = Vec::new();
+        // Maturity pad + a few spends for the harness.
+        const N_SPENDS: u32 = 4;
+        for h in 1u32..=(100 + N_SPENDS) {
+            let b = mine(tip, tip_time + 600, h);
+            if h <= N_SPENDS {
+                coinbase_txids.push(b.txdata[0].compute_txid());
+            }
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let _ = hub.sample_reset_perf(); // clear open noise
+
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
+            let fee = 1_000u64 + i as u64;
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: *cbtxid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - fee),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            hub.accept_tx(&tx).expect("accept harness spend");
+        }
+
+        let s = hub.sample_reset_perf();
+        assert_eq!(s.accepts, N_SPENDS as u64);
+        assert!(s.accept_us > 0, "wall meter");
+        assert!(s.accept_lock_us > 0, "lock meter");
+        assert!(s.accept_utxo_us > 0, "utxo stage (chain coin resolve)");
+        assert!(s.accept_script_us > 0, "script stage");
+        assert!(s.accept_durable_us > 0, "durable stage");
+        // C1: script runs outside the exclusive lock (detached rbtc-scripts).
+        // Lock still covers prepare + durable commit; durable stays under lock.
+        assert!(
+            s.accept_lock_us >= s.accept_durable_us,
+            "lock_us={} durable_us={}",
+            s.accept_lock_us,
+            s.accept_durable_us
+        );
+        // Structural: script time is metered and wall includes it.
+        assert!(
+            s.accept_us >= s.accept_script_us,
+            "wall={} script={}",
+            s.accept_us,
+            s.accept_script_us
+        );
+        // Sample-and-reset clears.
+        let z = hub.sample_reset_perf();
+        assert_eq!(z.accepts, 0);
+        assert_eq!(z.accept_script_us, 0);
+        assert_eq!(z.accept_lock_us, 0);
+
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Concurrent read APIs do not deadlock under RwLock (C2).
+    #[test]
+    fn concurrent_estimate_and_list_reads() {
+        use std::thread;
+
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let h = Arc::clone(&hub);
+            handles.push(thread::spawn(move || {
+                for _ in 0..32 {
+                    let _ = h.live_count();
+                    let _ = h.estimate_fee_btc_per_kb(2);
+                    let _ = h.fee_histogram();
+                    let _ = h.list_live();
+                    let _ = h.contains_wtxid(&Wtxid::from_byte_array([0u8; 32]));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("reader");
+        }
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

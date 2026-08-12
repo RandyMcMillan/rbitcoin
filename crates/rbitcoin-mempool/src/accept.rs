@@ -8,6 +8,20 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
 use std::collections::BTreeSet;
+use std::time::Instant;
+
+/// Stage wall times (µs) for one accept attempt (or sum across package/orphan promote).
+///
+/// Used by tip:perf / microbench harness — not a consensus surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptStageUs {
+    /// Prevout resolve (mempool graph peek + chain `UtxoProvider`).
+    pub utxo_us: u64,
+    /// Consensus script verify.
+    pub script_us: u64,
+    /// Durable slot/body append (coalesced persist when it runs).
+    pub durable_us: u64,
+}
 
 /// Confirmed-chain unspent coin for mempool accept (content + maturity metadata).
 ///
@@ -227,14 +241,30 @@ fn check_mempool_structural(
 
 /// Run consensus script verification for every input (mempool / tip height assumed
 /// post-all-softforks: BIP16/65/66/112 active).
+///
+/// Always uses the shared `rbtc-scripts` detached path (same family as IBD
+/// confirm) so the caller stack — peer session or tokio — never runs the
+/// interpreter.
 fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), AcceptError> {
     if prevouts.len() != tx.input.len() {
         return Err(AcceptError::Script("prevout count mismatch".into()));
     }
-    // `script_bench` mirrors production `ScriptCheckJob` with softfork flags on.
-    let job = rbitcoin_consensus::script_bench::JobBytes::new(prevouts, tx.clone());
-    rbitcoin_consensus::script_bench::verify_job(&job)
+    rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx.clone())
         .map_err(|e| AcceptError::Script(e.to_string()))
+}
+
+/// Result of accept prepare (resolve + policy + structural), before script verify.
+///
+/// Script runs outside the mempool exclusive lock; [`ActiveMempool::commit_after_script`]
+/// re-checks and durable-commits.
+#[derive(Debug, Clone)]
+pub struct PreparedAdmit {
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub prevouts: Vec<TxOut>,
+    pub chain_coins: Vec<Option<Coin>>,
+    pub parent_txids: BTreeSet<Txid>,
+    pub direct_conflicts: BTreeSet<Txid>,
 }
 
 /// Mempool with RAM TxGraph layered on durable store.
@@ -247,6 +277,9 @@ pub struct ActiveMempool {
     pub max_weight: u64,
     /// Side pool of txs waiting on missing parents (Core-class weight budget).
     pub orphanage: Orphanage,
+    /// Stage µs for the most recent top-level [`Self::accept_tx`] / package member
+    /// (includes nested orphan promote for that accept). Sampled by MempoolHub.
+    pub last_accept_stages: AcceptStageUs,
 }
 
 impl ActiveMempool {
@@ -286,6 +319,7 @@ impl ActiveMempool {
             bodies,
             max_weight,
             orphanage: Orphanage::new(),
+            last_accept_stages: AcceptStageUs::default(),
         })
     }
 
@@ -299,6 +333,11 @@ impl ActiveMempool {
 
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.store.flush()
+    }
+
+    /// Best-effort sidecar persist of dirty accepts (no generation bump).
+    pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
+        self.store.persist_if_dirty()
     }
 
     /// Compact durable storage (drop DEAD holes) and rebuild RAM graph.
@@ -360,18 +399,32 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let r = self.accept_tx_inner(tx, utxos, tip)?;
+        self.last_accept_stages = AcceptStageUs::default();
+        let prep = self.prepare_admit(tx, utxos, tip)?;
+        let t_script = Instant::now();
+        let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
+        self.last_accept_stages.script_us = self
+            .last_accept_stages
+            .script_us
+            .saturating_add(t_script.elapsed().as_micros() as u64);
+        script_res?;
+        let r = self.commit_after_script(tx, prep, utxos, tip)?;
         // Promote orphans waiting on this parent (best-effort; nested orphans re-park).
         self.promote_orphans_of(r.txid, utxos, tip);
         Ok(r)
     }
 
-    fn accept_tx_inner(
+    /// Resolve prevouts + structural/policy (no script, no durable write).
+    ///
+    /// For hub staged accept: call under exclusive lock (or after short graph peek),
+    /// then run [`verify_tx_scripts`] / [`rbitcoin_consensus::verify_tx_scripts_detached`]
+    /// **outside** the lock, then [`Self::commit_after_script`].
+    pub fn prepare_admit(
         &mut self,
         tx: &Transaction,
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
-    ) -> Result<AcceptResult, AcceptError> {
+    ) -> Result<PreparedAdmit, AcceptError> {
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
         }
@@ -395,6 +448,7 @@ impl ActiveMempool {
         }
 
         // Resolve prevouts: in-mempool first, then provider (chain).
+        let t_utxo = Instant::now();
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
         let mut chain_coins: Vec<Option<Coin>> = Vec::with_capacity(tx.input.len());
         let mut parent_txids = BTreeSet::new();
@@ -414,6 +468,10 @@ impl ActiveMempool {
                     if let Some(c) = self.graph.conflict_txid(&op) {
                         direct_conflicts.insert(c);
                     } else {
+                        self.last_accept_stages.utxo_us = self
+                            .last_accept_stages
+                            .utxo_us
+                            .saturating_add(t_utxo.elapsed().as_micros() as u64);
                         return Err(AcceptError::Policy("mempool double-spend"));
                     }
                     // Still need the value from the creator's output for fee calc.
@@ -441,6 +499,10 @@ impl ActiveMempool {
             prevouts.push(txout);
             chain_coins.push(chain_coin);
         }
+        self.last_accept_stages.utxo_us = self
+            .last_accept_stages
+            .utxo_us
+            .saturating_add(t_utxo.elapsed().as_micros() as u64);
 
         if !missing_parents.is_empty() {
             // Park when any parent is unknown (Core TX_MISSING_INPUTS → orphanage).
@@ -466,10 +528,70 @@ impl ActiveMempool {
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
         }
 
-        // Consensus script checks (same interpreter as block connect). Policy
-        // alone is not enough — invalid scripts must never enter the pool or
-        // be announced / Electrum-broadcast.
-        verify_tx_scripts(tx, prevouts)?;
+        Ok(PreparedAdmit {
+            fee_sat,
+            weight,
+            prevouts,
+            chain_coins,
+            parent_txids,
+            direct_conflicts,
+        })
+    }
+
+    /// Re-check + RBF + durable insert after scripts verified off-lock.
+    ///
+    /// Fail closed on race (duplicate, conflict set changed, parent gone).
+    pub fn commit_after_script(
+        &mut self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) -> Result<AcceptResult, AcceptError> {
+        let _ = (utxos, tip); // reserved for future chain re-query on race
+        let txid = tx.compute_txid();
+        if self.graph.contains(&txid) {
+            return Err(AcceptError::Duplicate(txid));
+        }
+        if self.orphanage.contains(&txid) {
+            return Err(AcceptError::Orphaned(txid));
+        }
+
+        // Re-resolve conflicts and parent availability (TOCTOU after off-lock script).
+        let mut direct_conflicts = BTreeSet::new();
+        let mut parent_txids = BTreeSet::new();
+        for inp in &tx.input {
+            let op = inp.previous_output;
+            if let Some(c) = self.graph.conflict_txid(&op) {
+                if c != txid {
+                    direct_conflicts.insert(c);
+                }
+            }
+            if let Some(creator) = self.graph.creator(&op) {
+                if !self.graph.mempool_utxo(&op) {
+                    if let Some(c) = self.graph.conflict_txid(&op) {
+                        direct_conflicts.insert(c);
+                    } else {
+                        return Err(AcceptError::Policy("mempool double-spend"));
+                    }
+                }
+                parent_txids.insert(creator);
+                // Parent body must still exist for mempool-created outs.
+                if self.bodies.get(&creator).is_none() {
+                    return Err(AcceptError::Durable("parent body missing".into()));
+                }
+            } else if utxos.get_coin(&op).is_none() {
+                // Chain coin disappeared or was never present — fail closed.
+                return Err(AcceptError::MissingPrevout(op));
+            }
+        }
+        // Prefer re-resolved conflict set; prepared set is a hint only.
+        let _ = prep.direct_conflicts;
+        let _ = prep.parent_txids;
+        let _ = prep.chain_coins;
+
+        let fee_sat = prep.fee_sat;
+        let weight = prep.weight;
 
         // Full RBF (Libre): BIP125-style absolute fee **or** pure replace-by-fee-rate.
         let conflict_set = if !direct_conflicts.is_empty() {
@@ -506,7 +628,6 @@ impl ActiveMempool {
                     members.extend(c.members);
                 }
             }
-            // Exclude conflicts that will be removed.
             members.retain(|m| !conflict_set.contains(m));
             let base_w: u64 = members
                 .iter()
@@ -518,7 +639,6 @@ impl ActiveMempool {
             });
         }
 
-        // Snapshot replaced bodies' output scripthashes **before** removal (WS address RBF).
         let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
         for c in &conflict_set {
             if let Some(old_tx) = self.bodies.get(c) {
@@ -531,19 +651,19 @@ impl ActiveMempool {
         replaced_scripthashes.sort_unstable();
         replaced_scripthashes.dedup();
 
-        // Apply RBF removals first.
         for c in conflict_set.iter().rev() {
-            // Descendants first not required if we remove all independently.
             let _ = self.remove_txid(c);
         }
 
-        // Free a slot before durable write: weight eviction alone used to run
-        // *after* append, so a full LIVE slot table failed as "corrupt".
         self.ensure_free_slot(Some(txid))?;
 
-        // Durable write.
         let raw = serialize(tx);
+        let t_dur = Instant::now();
         let slot = self.store.append_live_tx(&raw, &txid, fee_sat, weight)?;
+        self.last_accept_stages.durable_us = self
+            .last_accept_stages
+            .durable_us
+            .saturating_add(t_dur.elapsed().as_micros() as u64);
 
         let entry = TxEntry {
             txid,
@@ -557,10 +677,8 @@ impl ActiveMempool {
         self.graph.insert(entry, tx);
         self.bodies.insert(txid, tx.clone());
 
-        // Post-check (belt): cluster limits still hold.
         if let Some(c) = self.graph.cluster_of(&txid) {
             if c.members.len() > MAX_CLUSTER_COUNT || c.total_weight > MAX_CLUSTER_WEIGHT {
-                // Roll back RAM + mark slot dead (best-effort).
                 self.graph.remove(&txid, tx);
                 self.bodies.remove(&txid);
                 let _ = self.store.mark_slot_dead(slot);
@@ -571,7 +689,6 @@ impl ActiveMempool {
             }
         }
 
-        // Evict worst chunks until under weight budget (never drop the new tx first).
         self.evict_to_budget(Some(txid))?;
 
         Ok(AcceptResult {
@@ -584,18 +701,46 @@ impl ActiveMempool {
         })
     }
 
+    /// Full prepare → script → commit without resetting stage timers (orphan promote).
+    fn accept_tx_inner(
+        &mut self,
+        tx: &Transaction,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) -> Result<AcceptResult, AcceptError> {
+        let prep = self.prepare_admit(tx, utxos, tip)?;
+        let t_script = Instant::now();
+        let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
+        self.last_accept_stages.script_us = self
+            .last_accept_stages
+            .script_us
+            .saturating_add(t_script.elapsed().as_micros() as u64);
+        script_res?;
+        self.commit_after_script(tx, prep, utxos, tip)
+    }
+
     /// Electrum scripthash = SHA256(scriptPubKey) (same as store `script_hash`).
     fn electrum_scripthash(script: &[u8]) -> [u8; 32] {
         use bitcoin::hashes::{sha256, Hash};
         *sha256::Hash::hash(script).as_byte_array()
     }
 
-    /// Re-try orphans that listed `parent` as missing (recursive via accept_tx).
-    fn promote_orphans_of(&mut self, parent: Txid, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
+    /// Re-try orphans that listed `parent` as missing (recursive via accept_tx_inner).
+    ///
+    /// Uses inner (not top-level accept_tx) so stage timers accumulate on the
+    /// parent admit that unlocked the orphan chain. Public for hub staged commit.
+    pub fn promote_orphans_of(
+        &mut self,
+        parent: Txid,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) {
         let children = self.orphanage.take_children_of(&parent);
         for child in children {
-            // accept_tx re-parks if still missing other parents; ignores soft errors.
-            let _ = self.accept_tx(&child, utxos, tip);
+            // Re-parks if still missing other parents; ignores soft errors.
+            if let Ok(r) = self.accept_tx_inner(&child, utxos, tip) {
+                self.promote_orphans_of(r.txid, utxos, tip);
+            }
         }
     }
 
@@ -724,10 +869,16 @@ impl ActiveMempool {
             }
         }
 
+        // One stage accumulator for the whole package (hub sample-and-reset).
+        self.last_accept_stages = AcceptStageUs::default();
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         for tx in txs {
-            match self.accept_tx(tx, utxos, tip) {
-                Ok(r) => accepted.push(r),
+            // Inner + promote (not top-level accept_tx) so stages are not reset per member.
+            match self.accept_tx_inner(tx, utxos, tip) {
+                Ok(r) => {
+                    self.promote_orphans_of(r.txid, utxos, tip);
+                    accepted.push(r);
+                }
                 Err(e) => {
                     // Roll back this package's accepts (children first).
                     for r in accepted.iter().rev() {
@@ -798,6 +949,8 @@ impl ActiveMempool {
         self.orphanage.erase_for_block(block_txids);
         if n > 0 {
             let _ = self.maybe_compact();
+            // Tip connect: push dirty admits/removes to sidecars before return.
+            let _ = self.store.persist_if_dirty();
         }
         Ok(n)
     }
@@ -1033,6 +1186,23 @@ mod tests {
         };
         mp.accept_tx(&tx, &utxos, tip2)
             .expect("mature at tip 149 (next=150)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage timers are recorded on a successful chain-spend accept.
+    #[test]
+    fn accept_records_stage_us_on_success() {
+        let dir = tmp_dir();
+        let (op, _txout, utxos) = chain_utxo(50_000);
+        let tx = spend_tx(op, 49_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("accept");
+        let s = mp.last_accept_stages;
+        // Detached script hop + durable append should register µs on typical hosts.
+        assert!(
+            s.script_us > 0 || s.durable_us > 0 || s.utxo_us > 0,
+            "expected non-zero stage sample, got {s:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,43 +11,52 @@ The **default** fee estimate this node advertises answers:
 |---------|------|
 | Electrum `blockchain.estimatefee` (default / primary) | **10-minute inclusion** |
 | Esplora fee endpoints (primary) | Same |
-| Core-class RPC `estimatesmartfee` | Same product (not Core historical multi-horizon); see [`rpc.md`](./rpc.md) |
 | Optional target-depth knobs | Secondary; same engine, different depth |
 
 We intentionally do **not** present “90th percentile of live txs” as the long-term
 story. The 10-minute inclusion question is clearer for wallets and is where we
 intend to stand out versus Core-style historical estimators and crude percentiles.
 
-## Engine v1 (this design / current implementation track)
+## Engine v2 (shipped)
 
-**Inclusion frontier** from the live cluster mempool:
+**Temporal flow projection** under the same APIs as v1:
 
-1. Per-cluster mining linearization + chunks (same graph used for eviction).
-2. Best-first fill by chunk feerate; CPFP priced as one chunk rate.
-3. Default 10-minute horizon maps to a fixed product depth `W_default`
-   (documented in code/tests — e.g. next 1–2 blocks of weight at a simple cadence).
-4. **Confirm-memory floor:** short ring of package feerates sampled when txs leave
-   the pool on block connect (`remove_for_block`).  
-   `recommended = max(frontier_default, memory_floor, min_relay)`.
+1. **Clock is mempool flow, not last-block age.** Always plan block *k* at
+   **T + 10 k minutes** (`capacity_wu = N × 4_000_000`). Never stretch by wall
+   time since the last tip.
+2. **Live stock:** mining-chunk weight strictly above candidate rate R
+   (`weight_above_feerate` / frontier).
+3. **Inflow EMA:** per feerate bucket, exponential moving average of admitted
+   package/chunk weight per second (`FeeFlowMeter` on successful accept).
+4. **Include at R** when
+   `stock_above(R) + projected_inflow_above(R, N×600s) ≤ 0.95 × N × 4e6`.
+5. **Recommend** `max(projected, frontier, confirm_memory_floor, min_relay)`.
 
-Also exposed for transparency and future templates (not GBT):
+**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits), the
+estimate is the **v1 inclusion frontier** + confirm-memory + min relay (zero
+inflow ≡ frontier).
 
-- Fee histogram (prefer chunk-aware rates)
-- `weight_above_feerate(r)`
-- `mining_frontier_snapshot()` — ordered chunk summaries
+### Parameters (code constants, not env)
 
-Libre policy floor: never recommend below **0.1 sat/vB** when a rate is defined.
+| Parameter | Value |
+|-----------|--------|
+| Block weight capacity | 4_000_000 WU |
+| Seconds per planned block | 600 |
+| Capacity safety margin | 95% |
+| Admit EMA half-life | ~150 s |
+| Confirm EMA half-life | ~420 s |
+| Warm | 60 s + 32 admits |
+| Bucket edges (sat/kvB) | 100…100000 (+ open top) |
 
-## Engine v2 (follow-up — same standard API)
+### Confirm-memory floor
 
-**Relay-flow / temporal projection** powers the **same** 10-minute endpoint:
+Short ring of package feerates sampled when txs leave the pool on block connect
+(`remove_for_block`). Applied as a floor under both cold and warm paths.
 
-- If admit/evict/relay flows continue, what rate is still inside the inclusion set
-  after 10 minutes.
-- Not a second optional estimator — it becomes (or layers under) the standard answer.
-- Implementation may consume append-only accept/remove/(optional) announce events
-  (time, weight, feerate). v1 keeps the frontier pure and the default API stable
-  so v2 does not require client changes.
+### Histogram / relayfee
+
+Live chunk histogram remains a **stock** snapshot (transparency). Libre min
+relay (0.1 sat/vB) floors any defined number.
 
 ## Template readiness (non-goal: full mining)
 
@@ -58,11 +67,13 @@ construction, or witness nonces.
 ## Non-goals
 
 - Core `estimatesmartfee` historical multi-horizon Bayesian parity
-- Full multi-node flow aggregation / peer bandwidth models (v2 scope TBD)
+- Full multi-node flow aggregation / peer bandwidth models
 - Changing Libre min relay, dust, or full-RBF defaults
+- Persisting flow meters across process restart (process-local)
 
 ## Related
 
 - Mempool admission correctness: findings [010](./external_findings/010-mempool-confirmed-spentness.md),
   [011](./external_findings/011-mempool-structural-chain-context.md)
 - Policy: `rbitcoin-consensus::policy`, OPERATOR Libre table
+- Accept path: staged prepare / script_pool / commit; coalesced durable writes

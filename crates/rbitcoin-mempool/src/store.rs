@@ -57,6 +57,12 @@ pub struct MempoolMeta {
     pub live_count: u32,
 }
 
+/// Coalesce sidecar writes: flush RAM→disk after this many dirty ops (append/dead).
+///
+/// Crash may lose fewer than this many admits since the last persist (relay re-fetch).
+/// Structural ops (slot grow, compact) and [`Mempool::flush`] always persist.
+pub const PERSIST_COALESCE_OPS: u32 = 32;
+
 /// Durable mempool under `dir` (`{datadir}/mempool`) — InRam buffers + file IO.
 pub struct Mempool {
     dir: PathBuf,
@@ -70,6 +76,8 @@ pub struct Mempool {
     generation: u64,
     slot_cap: u32,
     live_count: u32,
+    /// Append/mark_dead ops since last sidecar persist.
+    dirty_ops: u32,
 }
 
 impl Mempool {
@@ -96,6 +104,7 @@ impl Mempool {
             generation,
             slot_cap,
             live_count,
+            dirty_ops: 0,
         })
     }
 
@@ -126,11 +135,13 @@ impl Mempool {
 
     /// Persist buffers, bump generation, and fsync sidecar files.
     ///
-    /// Accept path does **not** fsync per tx; a crash loses at most the last
-    /// uncommitted batch (slots written after the previous flush).
+    /// Accept path coalesces non-fsync writes ([`PERSIST_COALESCE_OPS`]); a crash
+    /// may lose admits since the last persist. [`Self::flush`] is the durable
+    /// checkpoint (generation + fsync).
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_all()?;
+        self.dirty_ops = 0;
         self.meta_file
             .sync_data()
             .map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
@@ -143,10 +154,30 @@ impl Mempool {
         Ok(())
     }
 
+    /// Best-effort sidecar write if dirty (no generation bump / no fsync).
+    pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
+        if self.dirty_ops == 0 {
+            return Ok(());
+        }
+        self.persist_all()?;
+        self.dirty_ops = 0;
+        Ok(())
+    }
+
+    fn note_dirty_op(&mut self) -> Result<(), MempoolError> {
+        self.dirty_ops = self.dirty_ops.saturating_add(1);
+        if self.dirty_ops >= PERSIST_COALESCE_OPS {
+            self.persist_all()?;
+            self.dirty_ops = 0;
+        }
+        Ok(())
+    }
+
     /// Append raw tx bytes + fee/weight prefix; mark a FREE slot LIVE.
     ///
     /// Returns the slot index. Updates `live_count` (not generation — call flush).
-    /// Writes sidecar files without fsync (durable only after [`Self::flush`]).
+    /// RAM is updated immediately; sidecar write is coalesced (see
+    /// [`PERSIST_COALESCE_OPS`]) unless this op trips the threshold.
     pub fn append_live_tx(
         &mut self,
         raw_tx: &[u8],
@@ -166,8 +197,7 @@ impl Mempool {
         let slot = self.alloc_slot()?;
         self.write_slot(slot, SLOT_LIVE, body_off, payload_len as u32, txid)?;
         self.live_count = self.live_count.saturating_add(1);
-        // Best-effort durability without fsync (match prior mmap write-through).
-        self.persist_all()?;
+        self.note_dirty_op()?;
         Ok(slot)
     }
 
@@ -180,7 +210,7 @@ impl Mempool {
         if self.slots[off] == SLOT_LIVE {
             self.slots[off] = SLOT_DEAD;
             self.live_count = self.live_count.saturating_sub(1);
-            self.persist_all()?;
+            self.note_dirty_op()?;
         }
         Ok(())
     }
@@ -243,6 +273,7 @@ impl Mempool {
         self.slots = new_slots;
         self.live_count = next_slot;
         self.persist_all()?;
+        self.dirty_ops = 0;
         Ok((self.live_count, logical))
     }
 
@@ -317,6 +348,7 @@ impl Mempool {
         self.slots[8..12].copy_from_slice(&new_cap.to_le_bytes());
         self.slot_cap = new_cap;
         self.persist_all()?;
+        self.dirty_ops = 0;
         rbitcoin_log::info!(
             "mempool: grew slot table {old_cap} → {new_cap} (live={})",
             self.live_count
@@ -583,6 +615,42 @@ mod tests {
     }
 
     #[test]
+    fn append_coalesces_persist_until_threshold() {
+        let dir = tmp_dir();
+        {
+            let mut mp = Mempool::open_or_create(&dir).unwrap();
+            let tid = Txid::from_byte_array([0x22; 32]);
+            mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                .unwrap();
+            assert_eq!(mp.live_count(), 1);
+            // Dirty but under coalesce threshold — drop without flush.
+        }
+        {
+            let mp = Mempool::open_or_create(&dir).unwrap();
+            // Unpersisted admit is not durable.
+            assert_eq!(mp.live_count(), 0);
+        }
+        {
+            let mut mp = Mempool::open_or_create(&dir).unwrap();
+            for i in 0..PERSIST_COALESCE_OPS {
+                let mut id = [0u8; 32];
+                id[0] = i as u8;
+                id[1] = (i >> 8) as u8;
+                let tid = Txid::from_byte_array(id);
+                mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                    .unwrap();
+            }
+            assert_eq!(mp.live_count(), PERSIST_COALESCE_OPS);
+            // Threshold trip persisted without flush.
+        }
+        {
+            let mp = Mempool::open_or_create(&dir).unwrap();
+            assert_eq!(mp.live_count(), PERSIST_COALESCE_OPS);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn flush_bumps_generation_monotone() {
         let dir = tmp_dir();
         let mut mp = Mempool::open_or_create(&dir).unwrap();
@@ -608,7 +676,8 @@ mod tests {
         let (free, live, dead) = mp.slot_stats();
         assert_eq!(live, 1);
         assert!(free + live + dead >= 1);
-        // Survive reopen without mmap (meta/slot image only; raw is not a real tx).
+        // Coalesced persist: force sidecar write before reopen.
+        mp.persist_if_dirty().unwrap();
         drop(mp);
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         assert_eq!(mp.live_count(), 1);

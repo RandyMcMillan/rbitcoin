@@ -636,7 +636,7 @@ async fn handle_peer_frame(
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                        if !hub.has_block(h) {
+                        if !hub.is_connected(h) && !pending_blocks.contains_key(h) {
                             want.push(Inventory::WitnessBlock(*h));
                         }
                     }
@@ -698,7 +698,7 @@ async fn handle_peer_frame(
                     pending_headers.clear();
                 }
                 pending_headers.insert(hash, *hdr);
-                if !hub.has_block(&hash) {
+                if !hub.is_connected(&hash) && !pending_blocks.contains_key(&hash) {
                     want.push(Inventory::WitnessBlock(hash));
                 }
             }
@@ -721,7 +721,7 @@ async fn handle_peer_frame(
                 *ban_score = ban_score.saturating_add(5);
             } else {
                 pending_blocks.insert(hash, block.clone());
-                drain_pending(hub, pending_blocks, pending_headers)?;
+                drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
             }
         }
         NetworkMessage::CmpctBlock(cb) => {
@@ -731,7 +731,7 @@ async fn handle_peer_frame(
                 // already have
             } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
                 pending_blocks.insert(hash, block);
-                drain_pending(hub, pending_blocks, pending_headers)?;
+                drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
             } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
                 if missing.is_empty() {
                     // Should not happen; fall back.
@@ -776,7 +776,7 @@ async fn handle_peer_frame(
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => {
                         pending_blocks.insert(hash, block);
-                        drain_pending(hub, pending_blocks, pending_headers)?;
+                        drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                     }
                     Err(()) => {
                         *ban_score = ban_score.saturating_add(10);
@@ -861,6 +861,43 @@ fn queue_out(
 /// Try to accept pending blocks that connect to tip or form a better branch.
 fn drain_pending(
     hub: &ChainHub,
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
+    pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
+) -> Result<(), NetError> {
+    // A reorg can make a held block the child of the *new* tip after the
+    // greedy pass already ran. Repeat until the tip is stable.
+    loop {
+        let tip_before = hub.tip_hash();
+        drain_pending_once(hub, pending_blocks, pending_headers)?;
+        if hub.tip_hash() == tip_before {
+            break;
+        }
+    }
+
+    // Pending branch whose root parent is neither connected nor pending can
+    // never attach; the peer announces only its tip. Ask for that one hash.
+    let mut missing: Vec<BlockHash> = Vec::new();
+    for b in pending_blocks.values() {
+        let prev = b.header.prev_blockhash;
+        if prev.to_byte_array() != [0u8; 32]
+            && !hub.is_connected(&prev)
+            && !pending_blocks.contains_key(&prev)
+            && !missing.contains(&prev)
+        {
+            missing.push(prev);
+        }
+    }
+    if !missing.is_empty() {
+        let want: Vec<Inventory> = missing.into_iter().map(Inventory::WitnessBlock).collect();
+        queue_out(out, NetworkMessage::GetData(want))?;
+    }
+    Ok(())
+}
+
+/// One greedy-connect pass followed by a reorg attempt.
+fn drain_pending_once(
+    hub: &ChainHub,
     pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
 ) -> Result<(), NetError> {
@@ -927,7 +964,7 @@ fn try_reorg_from_pending(
     let mut fork_starts: Vec<BlockHash> = Vec::new();
     for (h, b) in pending_blocks.iter() {
         let prev = b.header.prev_blockhash;
-        if hub.has_block(&prev) || prev.to_byte_array() == [0u8; 32] {
+        if hub.is_connected(&prev) || prev.to_byte_array() == [0u8; 32] {
             // parent known
             if hub.tip_hash() != Some(prev) {
                 fork_starts.push(*h);
@@ -1190,7 +1227,8 @@ mod tests {
         // drain_pending empty is a no-op.
         let mut pb = HashMap::new();
         let mut ph = HashMap::new();
-        drain_pending(&hub, &mut pb, &mut ph).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
         try_reorg_from_pending(&hub, &mut pb, &mut ph).unwrap();
 
         // Invalid tip-extending body must not kill the session (001).
@@ -1260,7 +1298,8 @@ mod tests {
         }
         let bh = bad.block_hash();
         pb.insert(bh, bad);
-        drain_pending(&hub, &mut pb, &mut ph).expect("invalid block must not end session");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        drain_pending(&hub, &tx, &mut pb, &mut ph).expect("invalid block must not end session");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2132,6 +2171,149 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), long[3].block_hash());
         // Winning branch removed from pending.
         assert!(!pb.contains_key(&long[3].block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_requests_missing_parent_of_pending_branch() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let (dir, q) = tmp_store("pending-missing-parent");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let missing_parent = BlockHash::from_byte_array([0x42; 32]);
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut orphan = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: missing_parent,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_100,
+                bits,
+                nonce: 0,
+            },
+            txdata: vec![Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }],
+        };
+        orphan.header.merkle_root = orphan.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            orphan.header.nonce = nonce;
+            if orphan.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pb = HashMap::new();
+        pb.insert(orphan.block_hash(), orphan);
+        let mut ph = HashMap::new();
+        drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
+        let msg = rx.try_recv().expect("getdata for missing parent");
+        match msg {
+            NetworkMessage::GetData(inv) => {
+                assert!(
+                    inv.iter()
+                        .any(|i| matches!(i, Inventory::WitnessBlock(h) if *h == missing_parent)),
+                    "expected getdata for {missing_parent}, got {inv:?}"
+                );
+            }
+            other => panic!("expected GetData, got {other:?}"),
+        }
+        assert!(!hub.is_connected(&missing_parent));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_connects_pending_child_of_new_tip_after_reorg() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let (dir, q) = tmp_store("pending-child-after-reorg");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let coinbase = |height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: BlockVersion::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let a1 = mine(gen, 1_300_000_100, 1);
+        hub.accept_block(a1.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(1));
+
+        let b1 = mine(gen, 1_300_001_000, 1);
+        let b2 = mine(b1.block_hash(), 1_300_001_600, 2);
+        let mut pb = HashMap::new();
+        pb.insert(b1.block_hash(), b1.clone());
+        pb.insert(b2.block_hash(), b2.clone());
+        let mut ph = HashMap::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
+        assert_eq!(hub.tip_height(), Some(2), "reorg plus child must connect");
+        assert_eq!(hub.tip_hash().unwrap(), b2.block_hash());
+        assert!(hub.is_connected(&b1.block_hash()));
+        assert!(hub.is_connected(&b2.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

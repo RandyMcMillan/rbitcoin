@@ -12,8 +12,9 @@ use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Co
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::broadcast;
 
 /// Resolve prevouts from the relational archive (confirmed **unspent** UTXOs).
@@ -94,6 +95,23 @@ pub struct MempoolAnnounce {
     pub replaced_scripthashes: Vec<[u8; 32]>,
 }
 
+/// Sample-and-reset window of tip-follow mempool/relay meters (`DEBUG tip: perf`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MempoolPerfSample {
+    pub accepts: u64,
+    pub rejects: u64,
+    /// Sum of accept_tx wall times (µs) this window.
+    pub accept_us: u64,
+    /// Max single accept_tx wall (µs).
+    pub accept_max_us: u64,
+    /// Tx inventory items seen that we did not already have.
+    pub inv_tx: u64,
+    /// Tx getdata items we issued.
+    pub getdata_tx: u64,
+    /// Mempool accept announces published.
+    pub announce: u64,
+}
+
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
     inner: Mutex<ActiveMempool>,
@@ -106,6 +124,14 @@ pub struct MempoolHub {
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
+    // Tip-follow 5s DEBUG meters (sample-and-reset).
+    meter_accepts: AtomicU64,
+    meter_rejects: AtomicU64,
+    meter_accept_us: AtomicU64,
+    meter_accept_max_us: AtomicU64,
+    meter_inv_tx: AtomicU64,
+    meter_getdata_tx: AtomicU64,
+    meter_announce: AtomicU64,
 }
 
 impl MempoolHub {
@@ -131,7 +157,62 @@ impl MempoolHub {
                 MEMPOOL_RECENT_CAP,
             )),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            meter_accepts: AtomicU64::new(0),
+            meter_rejects: AtomicU64::new(0),
+            meter_accept_us: AtomicU64::new(0),
+            meter_accept_max_us: AtomicU64::new(0),
+            meter_inv_tx: AtomicU64::new(0),
+            meter_getdata_tx: AtomicU64::new(0),
+            meter_announce: AtomicU64::new(0),
         }))
+    }
+
+    /// Count peer inv of txs we do not already hold (want → getdata path).
+    pub fn note_inv_tx(&self, n: u64) {
+        if n > 0 {
+            self.meter_inv_tx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Count tx getdata items we issued to peers.
+    pub fn note_getdata_tx(&self, n: u64) {
+        if n > 0 {
+            self.meter_getdata_tx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn meter_accept_wall(&self, us: u64, ok: bool) {
+        if ok {
+            self.meter_accepts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.meter_rejects.fetch_add(1, Ordering::Relaxed);
+        }
+        self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+        let mut cur = self.meter_accept_max_us.load(Ordering::Relaxed);
+        while us > cur {
+            match self.meter_accept_max_us.compare_exchange_weak(
+                cur,
+                us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Sample-and-reset mempool/relay counters for the tip-follow 5s DEBUG line.
+    pub fn sample_reset_perf(&self) -> MempoolPerfSample {
+        MempoolPerfSample {
+            accepts: self.meter_accepts.swap(0, Ordering::Relaxed),
+            rejects: self.meter_rejects.swap(0, Ordering::Relaxed),
+            accept_us: self.meter_accept_us.swap(0, Ordering::Relaxed),
+            accept_max_us: self.meter_accept_max_us.swap(0, Ordering::Relaxed),
+            inv_tx: self.meter_inv_tx.swap(0, Ordering::Relaxed),
+            getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
+            announce: self.meter_announce.swap(0, Ordering::Relaxed),
+        }
     }
 
     fn push_recent(&self, tx: &Transaction, r: &AcceptResult) {
@@ -187,6 +268,7 @@ impl MempoolHub {
             replaced: r.replaced.clone(),
             replaced_scripthashes: r.replaced_scripthashes.clone(),
         });
+        self.meter_announce.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn live_count(&self) -> usize {
@@ -258,32 +340,78 @@ impl MempoolHub {
 
     /// Accept a peer (or local) transaction when relay is enabled.
     pub fn accept_tx(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
+        let t0 = Instant::now();
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        let r = g.accept_tx(tx, &utxo, tip)?;
+        let result = g.accept_tx(tx, &utxo, tip);
         drop(g);
-        self.push_recent(tx, &r);
-        self.publish_announce(&r);
-        Ok(r)
+        let us = t0.elapsed().as_micros() as u64;
+        match result {
+            Ok(r) => {
+                self.meter_accept_wall(us, true);
+                self.push_recent(tx, &r);
+                self.publish_announce(&r);
+                Ok(r)
+            }
+            Err(e) => {
+                // Soft outcomes (already in pool / orphan / full) are not "rejects".
+                let hard = !matches!(
+                    e,
+                    AcceptError::Duplicate(_)
+                        | AcceptError::Orphaned(_)
+                        | AcceptError::Policy("mempool full")
+                );
+                if hard {
+                    self.meter_accept_wall(us, false);
+                } else {
+                    // Still attribute wall time to accept path (avg under accepts=0).
+                    self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Accept an ancestor package (local / Electrum path; BIP331 wire later).
     pub fn accept_package(&self, txs: &[Transaction]) -> Result<Vec<AcceptResult>, AcceptError> {
+        let t0 = Instant::now();
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
         let mut g = self.inner.lock().unwrap();
-        let res = g.accept_package(txs, &utxo, tip)?;
+        let result = g.accept_package(txs, &utxo, tip);
         drop(g);
-        for (tx, r) in txs.iter().zip(res.iter()) {
-            self.push_recent(tx, r);
-            self.publish_announce(r);
+        let us = t0.elapsed().as_micros() as u64;
+        match result {
+            Ok(res) => {
+                // Attribute package wall to each accepted member for rate visibility.
+                let per = us / (res.len().max(1) as u64);
+                for (tx, r) in txs.iter().zip(res.iter()) {
+                    self.meter_accept_wall(per, true);
+                    self.push_recent(tx, r);
+                    self.publish_announce(r);
+                }
+                Ok(res)
+            }
+            Err(e) => {
+                let hard = !matches!(
+                    e,
+                    AcceptError::Duplicate(_)
+                        | AcceptError::Orphaned(_)
+                        | AcceptError::Policy("mempool full")
+                );
+                if hard {
+                    self.meter_accept_wall(us, false);
+                } else {
+                    self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+                }
+                Err(e)
+            }
         }
-        Ok(res)
     }
 
     /// Remove confirmed txids (tip connect / archive confirm) and re-try orphans

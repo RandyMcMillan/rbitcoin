@@ -7,8 +7,8 @@
 mod server;
 
 pub use server::{
-    electrum_scripthash_hex, read_line_capped, run_electrum, ElectrumConfig, ElectrumHandle,
-    ServeLimits, TipNotify, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_BROADCAST_HEX,
+    electrum_scripthash_hex, read_line_capped, run_electrum, sample_reset_perf, ElectrumConfig,
+    ElectrumHandle, ServeLimits, TipNotify, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_BROADCAST_HEX,
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_SCRIPTHASH_SUBS,
 };

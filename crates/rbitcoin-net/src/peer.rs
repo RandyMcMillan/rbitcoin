@@ -631,6 +631,7 @@ async fn handle_peer_frame(
         }
         NetworkMessage::Inv(items) => {
             let mut want = Vec::new();
+            let mut inv_tx_n = 0u64;
             let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false);
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
@@ -646,6 +647,7 @@ async fn handle_peer_frame(
                                     // MSG_TX / MSG_WITNESS_TX inv: fetch by txid (wtxid only
                                     // when the inv type is MSG_WTX — handled below).
                                     want.push(Inventory::WitnessTransaction(*txid));
+                                    inv_tx_n = inv_tx_n.saturating_add(1);
                                 }
                             }
                         }
@@ -655,12 +657,29 @@ async fn handle_peer_frame(
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains_wtxid(wtxid) {
                                     want.push(Inventory::WTx(*wtxid));
+                                    inv_tx_n = inv_tx_n.saturating_add(1);
                                 }
                             }
                         }
                     }
                     _ => {}
                 }
+            }
+            if let Some(mp) = hub.mempool() {
+                mp.note_inv_tx(inv_tx_n);
+                // Count only tx-shaped getdata items (not block getdata from inv).
+                let gd_tx = want
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i,
+                            Inventory::Transaction(_)
+                                | Inventory::WitnessTransaction(_)
+                                | Inventory::WTx(_)
+                        )
+                    })
+                    .count() as u64;
+                mp.note_getdata_tx(gd_tx);
             }
             if !want.is_empty() {
                 queue_out(out_tx, NetworkMessage::GetData(want))?;

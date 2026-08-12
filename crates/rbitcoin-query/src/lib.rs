@@ -994,6 +994,18 @@ pub struct Query {
     /// Cooperative cancel for in-flight confirm load. Set on IBD SIGINT
     /// teardown so the confirm load thread aborts before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
+    /// Confirmed best-chain `hash → height` (kept for process life; ~60 MiB mainnet).
+    ///
+    /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
+    height_by_hash: Mutex<HeightByHashIndex>,
+}
+
+/// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
+#[derive(Default)]
+struct HeightByHashIndex {
+    /// Tip height the map matches (`None` = empty / needs rebuild).
+    tip: Option<u32>,
+    map: HashMap<[u8; 32], u32>,
 }
 
 impl Query {
@@ -1039,7 +1051,12 @@ impl Query {
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
+            height_by_hash: Mutex::new(HeightByHashIndex::default()),
         };
+        // Eager height index so first Esplora/P2P mid-chain lookup is hot.
+        if let Some(tip) = q.tip_height() {
+            let _ = q.ensure_height_by_hash_index(tip);
+        }
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
@@ -2239,11 +2256,14 @@ mod tests {
         assert!(q.is_block_archived(&hashes[2]).unwrap());
         assert!(q.archived_block_count().unwrap() >= 4);
 
-        // height_of_hash: tip and tip-1 fast paths + deeper scan.
+        // height_of_hash: tip/tip-1 fast paths + map for deeper heights.
         assert_eq!(q.height_of_hash(&hashes[3]).unwrap(), Some(Height(3)));
         assert_eq!(q.height_of_hash(&hashes[2]).unwrap(), Some(Height(2)));
         assert_eq!(q.height_of_hash(&hashes[0]).unwrap(), Some(Height(0)));
         assert_eq!(q.height_of_hash(&[0xee; 32]).unwrap(), None);
+        // Mid-chain still works after invalidate + rebuild.
+        q.invalidate_height_by_hash_index();
+        assert_eq!(q.height_of_hash(&hashes[1]).unwrap(), Some(Height(1)));
 
         let hdr = q.wire_header_at_height(Height(1)).unwrap();
         assert_eq!(hdr.time, 2);

@@ -13,8 +13,9 @@ use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Notify, Semaphore};
@@ -23,6 +24,34 @@ use tokio::task::JoinHandle;
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
 const SERVER_VERSION: &str = concat!("rbitcoin ", env!("CARGO_PKG_VERSION"));
+
+/// Tip-follow 5s DEBUG `tip: perf`: JSON-RPC request count this window.
+static METER_REQ: AtomicU64 = AtomicU64::new(0);
+/// Sum of dispatch walls (µs).
+static METER_US: AtomicU64 = AtomicU64::new(0);
+/// Max single dispatch wall (µs).
+static METER_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+/// Sample-and-reset Electrum request meters: `(count, sum_us, max_us)`.
+pub fn sample_reset_perf() -> (u64, u64, u64) {
+    (
+        METER_REQ.swap(0, Ordering::Relaxed),
+        METER_US.swap(0, Ordering::Relaxed),
+        METER_MAX_US.swap(0, Ordering::Relaxed),
+    )
+}
+
+fn meter_dispatch_wall(us: u64) {
+    METER_REQ.fetch_add(1, Ordering::Relaxed);
+    METER_US.fetch_add(us, Ordering::Relaxed);
+    let mut cur = METER_MAX_US.load(Ordering::Relaxed);
+    while us > cur {
+        match METER_MAX_US.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(c) => cur = c,
+        }
+    }
+}
 
 /// Max simultaneous query-surface clients (Electrum / future Esplora).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -376,6 +405,7 @@ where
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                 let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let params_v = req.get("params").cloned().unwrap_or(json!([]));
+                let t0 = Instant::now();
                 let result = dispatch(
                     method,
                     &params_v,
@@ -386,6 +416,7 @@ where
                     &mut header_sub,
                     &mut sh_subs,
                 );
+                meter_dispatch_wall(t0.elapsed().as_micros() as u64);
                 let resp = match result {
                     Ok(v) => json!({"jsonrpc":"2.0","id": id, "result": v}),
                     Err(e) => json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),

@@ -534,6 +534,11 @@ impl ChainHub {
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
     pub fn accept_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
+        // O(1) tip-hash check before set lookup — stops multi-peer re-accept of the
+        // same tip block (mainnet: several UpdateTip lines for one height).
+        if self.tip_hash() == Some(hash) {
+            return Ok(AcceptOutcome::AlreadyHave);
+        }
         if self.has_block(&hash) {
             return Ok(AcceptOutcome::AlreadyHave);
         }

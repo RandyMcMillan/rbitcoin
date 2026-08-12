@@ -17,17 +17,18 @@ impl Query {
     ///
     /// Archive may contain orphan header rows (partial connect failures). Those are
     /// not reported here — only hashes reachable as `confirmed[height]`.
+    ///
+    /// Uses an in-process `hash → height` map (~60 MiB at mainnet tip), rebuilt when
+    /// tip jumps; tip±1 updates are incremental. Avoids O(tip) header body walks.
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
         let Some(tip) = self.tip_height() else {
-            // Only genesis can be "confirmed" with no tip.
             return Ok(None);
         };
-        // Fast path: tip
-        if let Some((tip_fk, rec)) = self.header_at_height(tip)? {
+        // Fast path: tip / tip-1 without index lock.
+        if let Some((_, rec)) = self.header_at_height(tip)? {
             if &rec.hash == hash {
                 return Ok(Some(tip));
             }
-            // Fast path: tip-1 (common parent checks)
             if tip.0 > 0 {
                 if let Some((_, prec)) = self.header_at_height(Height(tip.0 - 1))? {
                     if &prec.hash == hash {
@@ -35,38 +36,57 @@ impl Query {
                     }
                 }
             }
-            let _ = tip_fk;
         }
-        // Must appear in archive at all.
-        let Some((fk, _rec)) = self.get_header_by_hash(hash)? else {
+        // Cheap archive miss before ensuring/using the map.
+        if self.get_header_by_hash(hash)?.is_none() {
             return Ok(None);
-        };
-        // Confirm it is the header at some best-chain height by walking tip→genesis
-        // via confirmed table only (not the orphaned archive row).
-        // Prefer short reverse scan from tip (IBD / locator hot path).
-        const RECENT: u32 = 4096;
-        let start = tip.0.saturating_sub(RECENT);
-        for h in (start..=tip.0).rev() {
-            let height = Height(h);
-            if let Some((hfk, rec)) = self.header_at_height(height)? {
-                if hfk == fk || &rec.hash == hash {
-                    return Ok(Some(height));
+        }
+        self.ensure_height_by_hash_index(tip)?;
+        let g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(g.map.get(hash).copied().map(Height))
+    }
+
+    /// Ensure height index matches `tip` (incremental tip±1 when possible).
+    pub(crate) fn ensure_height_by_hash_index(&self, tip: Height) -> Result<(), QueryError> {
+        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        if g.tip == Some(tip.0) {
+            return Ok(());
+        }
+        if let Some(prev_tip) = g.tip {
+            // Tip extension by one: insert new tip hash only.
+            if tip.0 == prev_tip.saturating_add(1) {
+                if let Some((_, rec)) = self.header_at_height(tip)? {
+                    g.map.insert(rec.hash, tip.0);
+                    g.tip = Some(tip.0);
+                    return Ok(());
                 }
             }
-        }
-        // Full scan only if not in recent window (rare for IBD).
-        if start > 0 {
-            for h in (0..start).rev() {
-                let height = Height(h);
-                if let Some((hfk, rec)) = self.header_at_height(height)? {
-                    if hfk == fk || &rec.hash == hash {
-                        return Ok(Some(height));
-                    }
-                }
+            // Single-height disconnect: remove old tip hash.
+            if prev_tip == tip.0.saturating_add(1) {
+                // Old tip header may still be loadable via archive by walking map keys —
+                // drop any entry whose height is prev_tip.
+                g.map.retain(|_, h| *h != prev_tip);
+                g.tip = Some(tip.0);
+                return Ok(());
             }
         }
-        // Present in archive but not on best chain (orphan header row).
-        Ok(None)
+        // Full rebuild (open, reorg, first use).
+        g.map.clear();
+        g.map.reserve((tip.0 as usize).saturating_add(1));
+        for h in 0..=tip.0 {
+            if let Some((_, rec)) = self.header_at_height(Height(h))? {
+                g.map.insert(rec.hash, h);
+            }
+        }
+        g.tip = Some(tip.0);
+        Ok(())
+    }
+
+    /// Drop height index (tests / multi-height reorg / offline confirmed rewrite).
+    pub fn invalidate_height_by_hash_index(&self) {
+        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        g.tip = None;
+        g.map.clear();
     }
 
     /// Wire header for a confirmed height (resolves prev hash from archive).

@@ -3,8 +3,9 @@
 use crate::handlers;
 use crate::tx_json::{build_tx_json, tx_status_json};
 use crate::ws;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -17,15 +18,47 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
+
+/// Tip-follow 5s DEBUG `tip: perf`: REST request count this window.
+static METER_REQ: AtomicU64 = AtomicU64::new(0);
+/// Sum of REST handler walls (µs).
+static METER_US: AtomicU64 = AtomicU64::new(0);
+/// Max single REST request wall (µs).
+static METER_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+/// Sample-and-reset Esplora REST request meters: `(count, sum_us, max_us)`.
+pub fn sample_reset_perf() -> (u64, u64, u64) {
+    (
+        METER_REQ.swap(0, Ordering::Relaxed),
+        METER_US.swap(0, Ordering::Relaxed),
+        METER_MAX_US.swap(0, Ordering::Relaxed),
+    )
+}
+
+async fn meter_rest(req: Request, next: Next) -> Response {
+    let t0 = Instant::now();
+    let resp = next.run(req).await;
+    let us = t0.elapsed().as_micros() as u64;
+    METER_REQ.fetch_add(1, Ordering::Relaxed);
+    METER_US.fetch_add(us, Ordering::Relaxed);
+    let mut cur = METER_MAX_US.load(Ordering::Relaxed);
+    while us > cur {
+        match METER_MAX_US.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(c) => cur = c,
+        }
+    }
+    resp
+}
 
 /// Default concurrent upgraded WebSocket sockets (separate from REST concurrency).
 pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 64;
@@ -204,6 +237,8 @@ pub async fn run_esplora(
         .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
         .fallback(fallback_404)
+        // Outer → inner: concurrency → body → timeout → meter (around handler).
+        .layer(middleware::from_fn(meter_rest))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             timeout,

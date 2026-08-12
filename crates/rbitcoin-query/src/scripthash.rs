@@ -330,19 +330,23 @@ impl Query {
     }
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.
+    ///
+    /// Single expand of creates (avoids a second full history walk).
     pub fn scripthash_chain_stats(
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        let hist = self.scripthash_history(scripthash)?;
+        use std::collections::HashSet;
         let creates = self.scripthash_create_outpoints(scripthash)?;
         let mut funded_n = 0u32;
         let mut funded_sum = 0i64;
         let mut spent_n = 0u32;
         let mut spent_sum = 0i64;
-        for rec in creates {
+        let mut txids: HashSet<[u8; 32]> = HashSet::new();
+        for rec in &creates {
             funded_n = funded_n.saturating_add(1);
             funded_sum = funded_sum.saturating_add(rec.value);
+            txids.insert(rec.txid);
             let spent = if self.spend_index_enabled() {
                 self.store
                     .has_confirmed_strong_spender(&rec.txid, rec.vout)?
@@ -352,10 +356,18 @@ impl Query {
             if spent {
                 spent_n = spent_n.saturating_add(1);
                 spent_sum = spent_sum.saturating_add(rec.value);
+                if self.spend_index_enabled() {
+                    for p in self.store.spenders(&rec.txid, rec.vout)? {
+                        if self.store.is_confirmed_strong(p.spending_tx_fk)? {
+                            let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
+                            txids.insert(spend_tx.txid);
+                        }
+                    }
+                }
             }
         }
         Ok(ScriptHashChainStats {
-            tx_count: hist.len() as u32,
+            tx_count: txids.len() as u32,
             funded_txo_count: funded_n,
             funded_txo_sum: funded_sum,
             spent_txo_count: spent_n,

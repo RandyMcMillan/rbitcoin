@@ -3,7 +3,7 @@ use crate::error::NodeError;
 use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_esplora::{run_esplora, EsploraConfig};
-use rbitcoin_log::{info, warn};
+use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
@@ -576,7 +576,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         const STALE_TIP_SECS: u64 = 600;
         // How often to re-check staleness when no tip event arrives.
         const STALE_POLL_SECS: u64 = 60;
+        // DEBUG tip: perf cadence (mirror IBD 5s sample-and-reset).
+        const TIP_PERF_SECS: u64 = 5;
         let mut tip_rx = node.hub.subscribe_tips();
+        let mut perf_tick = tokio::time::interval(Duration::from_secs(TIP_PERF_SECS));
+        perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick fires immediately — skip so window is a full 5s.
+        perf_tick.tick().await;
+        let mut window_blocks: u64 = 0;
 
         loop {
             if shutdown.requested() {
@@ -591,11 +598,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             enum Wake {
                 Tip(TipEvent),
                 Poll,
+                Perf,
                 Stop,
             }
+            // Prefer shutdown, then the 5s perf tick when both ready. Do **not**
+            // put tip_rx ahead of perf under `biased` — multi-block catch-up can
+            // keep tip events always ready and starve meters (no tip: perf lines).
             let wake = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => Wake::Stop,
+                _ = perf_tick.tick() => Wake::Perf,
                 ev = tip_rx.recv() => match ev {
                     Ok(e) => Wake::Tip(e),
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -610,6 +622,41 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 break;
             }
 
+            if matches!(wake, Wake::Perf) {
+                // Always sample-and-reset so DEBUG-off windows do not accumulate.
+                let mp = mempool.sample_reset_perf();
+                let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
+                let (el_n, el_us, el_max) = rbitcoin_electrum::sample_reset_perf();
+                let blks = std::mem::take(&mut window_blocks);
+                if enabled(Level::Debug) {
+                    let live = mempool.live_count();
+                    let follow_live = node.follow_live_count();
+                    let acc_avg = if mp.accepts + mp.rejects > 0 {
+                        mp.accept_us / (mp.accepts + mp.rejects)
+                    } else if mp.accept_us > 0 {
+                        mp.accept_us
+                    } else {
+                        0
+                    };
+                    let esp_avg = if esp_n > 0 { esp_us / esp_n } else { 0 };
+                    let el_avg = if el_n > 0 { el_us / el_n } else { 0 };
+                    debug!(
+                        "tip: perf follow_live={follow_live} blocks={blks} \
+                         mempool live={live} accepts={} rejects={} accept_avg_us={acc_avg} \
+                         accept_max_us={} inv_tx={} getdata_tx={} announce={} \
+                         esplora req={esp_n} avg_us={esp_avg} max_us={esp_max} \
+                         electrum req={el_n} avg_us={el_avg} max_us={el_max}",
+                        mp.accepts,
+                        mp.rejects,
+                        mp.accept_max_us,
+                        mp.inv_tx,
+                        mp.getdata_tx,
+                        mp.announce
+                    );
+                }
+                continue;
+            }
+
             let tip = node.tip_height().unwrap_or(0);
             let elapsed = started.elapsed().as_secs().max(1);
             let delta = tip.saturating_sub(start_tip);
@@ -619,10 +666,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 // Prefer event height when present (same as store tip after accept).
                 let h = ev.height;
                 if h != last_tip {
-                    let rate = delta as f64 / elapsed as f64;
+                    // No blk/s: tip-follow only validates blocks as peers deliver them.
                     info!(
-                        "node: tip={h} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow_live={follow_live})"
+                        "node: tip={h} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                     );
+                    window_blocks =
+                        window_blocks.saturating_add(h.saturating_sub(last_tip) as u64);
                     last_tip = h;
                     last_tip_change = Instant::now();
                 }
@@ -631,10 +680,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
             // Poll path: tip advance without event (shouldn't be common), or staleness.
             if tip != last_tip {
-                let rate = delta as f64 / elapsed as f64;
                 info!(
-                    "node: tip={tip} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow_live={follow_live})"
+                    "node: tip={tip} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                 );
+                window_blocks =
+                    window_blocks.saturating_add(tip.saturating_sub(last_tip) as u64);
                 last_tip = tip;
                 last_tip_change = Instant::now();
                 continue;

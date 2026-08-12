@@ -297,6 +297,11 @@ impl Query {
         crate::class_c_phase_stats::TIP_NS
             .fetch_add(t_tip.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        // Keep hash→height map current (tip+1 insert when single-height tip follow).
+        if let Some(tip) = self.tip_height() {
+            let _ = self.ensure_height_by_hash_index(tip);
+        }
+
         Ok(out)
     }
 
@@ -506,6 +511,12 @@ impl Query {
         // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
         self.store.flush_confirmed_only()?;
+        // Height index: tip−1 remove when map was current; else rebuild on next ensure.
+        if let Some(new_tip) = self.tip_height() {
+            let _ = self.ensure_height_by_hash_index(new_tip);
+        } else {
+            self.invalidate_height_by_hash_index();
+        }
 
         // 3. Only after tip is durable lower: clear strong + height for disconnected txs.
         for &tx_fk in &tx_fks {

@@ -95,6 +95,17 @@ UpdateTip: new best=<hash> height=<n> version=<v> tx=<n> date=<unix> progress=ti
 Emitted from the tip-follow / wire accept path (`ChainHub::connect_at`). IBD bulk
 confirm does **not** spam this line per block — use the periodic IBD status below.
 
+### Tip-follow status lines (after catch-up + tip SH ready)
+
+| Line | Level | Use |
+|------|-------|-----|
+| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs |
+| `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH breakdown (not emitted on reject) |
+| `UpdateTip` | INFO | New best hash/height after connect |
+| `node: tip=…` | INFO | Tip height change summary (follow_live) |
+
+Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: perf` instead. Enable `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
+
 ### IBD status lines (every ~5s)
 
 | Line | Level | Use |

@@ -62,10 +62,12 @@ pub fn try_reconstruct(
 
     let mut slots: Vec<Option<Transaction>> = vec![None; total];
     let mut prefilled_set = std::collections::HashSet::new();
+    let mut placed: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
     for (abs, tx) in prefilled_absolute_indexes(hsi) {
         if abs >= total {
             return Err(Vec::new());
         }
+        placed.insert(tx.compute_txid());
         slots[abs] = Some(tx.clone());
         prefilled_set.insert(abs);
     }
@@ -85,6 +87,13 @@ pub fn try_reconstruct(
         short_i += 1;
         match available.get(&sid) {
             Some(cands) if cands.len() == 1 => {
+                let txid = cands[0].compute_txid();
+                // Repeat short-id / same candidate in two slots → duplicate
+                // txid block. Mark missing so getblocktxn / getdata can recover.
+                if !placed.insert(txid) {
+                    missing.push(abs as u64);
+                    continue;
+                }
                 slots[abs] = Some(cands[0].clone());
             }
             Some(cands) if cands.len() > 1 => {
@@ -156,10 +165,12 @@ pub fn apply_block_transactions(
 
     let mut slots: Vec<Option<Transaction>> = vec![None; total];
     let mut prefilled_set = std::collections::HashSet::new();
+    let mut placed: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
     for (abs, tx) in prefilled_absolute_indexes(hsi) {
         if abs >= total {
             return Err(Vec::new());
         }
+        placed.insert(tx.compute_txid());
         slots[abs] = Some(tx.clone());
         prefilled_set.insert(abs);
     }
@@ -171,6 +182,10 @@ pub fn apply_block_transactions(
             continue;
         }
         if let Some(tx) = forced.get(&abs) {
+            let txid = tx.compute_txid();
+            if !placed.insert(txid) {
+                return Err(missing.to_vec());
+            }
             slots[abs] = Some((*tx).clone());
             // Still consume the corresponding short_id slot.
             if short_i < hsi.short_ids.len() {
@@ -186,6 +201,11 @@ pub fn apply_block_transactions(
         short_i += 1;
         match available.get(&sid) {
             Some(cands) if cands.len() == 1 => {
+                let txid = cands[0].compute_txid();
+                if !placed.insert(txid) {
+                    still_missing.push(abs as u64);
+                    continue;
+                }
                 slots[abs] = Some(cands[0].clone());
             }
             _ => still_missing.push(abs as u64),
@@ -298,6 +318,26 @@ mod tests {
         let missing = try_reconstruct(&hsi, &empty, 2).unwrap_err();
         // coinbase prefilled; one short id missing at abs index 1
         assert_eq!(missing, vec![1]);
+    }
+
+    #[test]
+    fn repeated_short_id_is_requested_not_duplicated() {
+        let b1 = spend(7);
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![coinbase(), b1.clone(), b1.clone()],
+        };
+        let hsi = HeaderAndShortIds::from_block(&block, 3, 2, &[]).unwrap();
+        let avail = shortid_map_from_txs(&block.header, hsi.nonce, 2, [&b1]);
+        let missing = try_reconstruct(&hsi, &avail, 2).expect_err("repeat must not fully fill");
+        assert!(
+            !missing.is_empty(),
+            "second slot of the same short-id must be missing"
+        );
+        assert!(
+            missing.contains(&2) || missing == vec![2] || missing.contains(&1),
+            "expected a missing index for the duplicate slot, got {missing:?}"
+        );
     }
 
     #[test]

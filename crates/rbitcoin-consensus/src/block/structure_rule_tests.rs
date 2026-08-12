@@ -1266,7 +1266,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     {
         use super::structural_validate_spends;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, U32Map, U64Map};
+        use rbitcoin_query::{BatchParents, FkMap, U32Map, U64Map};
         use std::collections::HashSet;
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
@@ -1286,6 +1286,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &parents,
             &mut mtp,
             &mut meta,
+            &FkMap::default(),
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");
@@ -1335,9 +1336,9 @@ fn bip16_from_prev_mtp_exception_and_time() {
         &BIP16_EXCEPTION_MAINNET,
         u32::MAX,
     ));
-    // Pre-bip16_time MTP → inactive.
-    assert!(!bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
-    // At/after bip16_time → active.
+    // Buried: active even when prev MTP predates the historical BIP16 time.
+    assert!(bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
+    // At/after bip16_time → still active.
     assert!(bip16_active_from_prev_mtp(
         p,
         170_000,

@@ -1,6 +1,7 @@
 //! Shared confirm phase helpers (load/assemble/structural/script/commit).
 
 use super::*;
+use rbitcoin_query::FkMap;
 
 /// Load Class A + pin parents + thin edges for the claimed batch.
 pub(super) fn load_confirm_batch(
@@ -325,6 +326,12 @@ pub(super) fn structural_run(
     // MTP of height H reused across blocks/spends in this write run.
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     let mut tot = StructuralPhaseNs::default();
+    let mut run_create_height: FkMap<u32> = FkMap::default();
+    for p in prepared {
+        for fk in &p.tx_fks {
+            run_create_height.insert(*fk, p.height.0);
+        }
+    }
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
         let ph = structural_validate_spends(
@@ -338,6 +345,7 @@ pub(super) fn structural_run(
             batch_parents,
             &mut mtp_cache,
             meta_by_abs,
+            &run_create_height,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);

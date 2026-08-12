@@ -335,7 +335,7 @@ pub fn confirm_wire_lookup_stamp(
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_pin = match plan.as_ref() {
         Some(p) => ParentPinStamp::from_plan(p),
-        None => stamp_parent_pin_archived(query, &metas, &wire_blocks, ifo)?,
+        None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, ifo)?,
     };
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
@@ -354,6 +354,7 @@ pub fn confirm_wire_lookup_stamp(
 /// via head/idx/txid.body so load never probes those tables.
 pub(super) fn stamp_parent_pin_archived(
     query: &Query,
+    params: &ChainParams,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlightView>,
@@ -381,6 +382,13 @@ pub(super) fn stamp_parent_pin_archived(
                 if prev != [0u8; 32] {
                     need_external.insert(prev, ());
                 }
+            }
+        }
+        // BIP30 (pre-BIP34): same head wave as parents. TipOnly returns a
+        // connected sibling if this create would overwrite a live txid.
+        if !params.bip34_active_at(m.height.0) {
+            for tx in &block.txdata {
+                need_external.insert(tx.compute_txid().to_byte_array(), ());
             }
         }
     }

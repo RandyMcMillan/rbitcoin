@@ -17,6 +17,7 @@
 //!
 //! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
 
+use crate::chain::TxHeightTable;
 use crate::error::StoreError;
 use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
 use crate::io_backend::{self, ReadIoBackend};
@@ -36,16 +37,39 @@ pub fn resolve_fk_and_range_batch(
     table: &TxTable,
     txids: &[[u8; 32]],
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+    resolve_fk_and_range_batch_opts(table, txids, None, false)
+}
+
+/// Like [`resolve_fk_and_range_batch`], but prefer a **connected** Class A row
+/// (`tx_height` Some). Unconnected hot hits do **not** skip the cold wave.
+///
+/// `tip_only`: result is connected-or-None (confirm). Otherwise connected else
+/// newest unconnected (RPC).
+pub fn resolve_fk_and_range_batch_with_tip(
+    table: &TxTable,
+    heights: &TxHeightTable,
+    txids: &[[u8; 32]],
+    tip_only: bool,
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+    resolve_fk_and_range_batch_opts(table, txids, Some(heights), tip_only)
+}
+
+fn resolve_fk_and_range_batch_opts(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    heights: Option<&TxHeightTable>,
+    tip_only: bool,
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     if txids.is_empty() {
         return Ok(Vec::new());
     }
     match io_backend::head_resolve_io_backend() {
-        ReadIoBackend::Uring => match resolve_fk_and_range_uring(table, txids) {
+        ReadIoBackend::Uring => match resolve_fk_and_range_uring(table, txids, heights, tip_only) {
             Ok(v) => Ok(v),
             // Ring open fail (agent 9p / disabled): sync depth-first fallback.
-            Err(_) => resolve_fk_and_range_pread(table, txids),
+            Err(_) => resolve_fk_and_range_pread(table, txids, heights, tip_only),
         },
-        ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids),
+        ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
     }
 }
 
@@ -82,6 +106,8 @@ pub fn resolve_fk_and_denserels_batch(
 fn resolve_fk_and_range_pread(
     table: &TxTable,
     txids: &[[u8; 32]],
+    heights: Option<&TxHeightTable>,
+    tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
@@ -90,6 +116,7 @@ fn resolve_fk_and_range_pread(
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
+    let mut connected = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
@@ -108,6 +135,8 @@ fn resolve_fk_and_range_pread(
         &hot_cands,
         side,
         &mut winner,
+        &mut connected,
+        heights,
         /*skip_if_won=*/ false,
         &mut body_lookups,
         &mut miss_peeks,
@@ -118,11 +147,17 @@ fn resolve_fk_and_range_pread(
         None,
     )?;
 
-    // Wave 2: full cold depth for keys that missed hot (no further short-circuit).
+    // Wave 2: cold depth for keys that are still unfinished.
+    // With tip-aware resolve, "unconnected hot hit" is not finished.
     let mut need_cold = false;
     let mut active = vec![false; txids.len()];
-    for (i, w) in winner.iter().enumerate() {
-        if w.is_none() {
+    for i in 0..txids.len() {
+        let done = if heights.is_some() {
+            connected[i]
+        } else {
+            winner[i].is_some()
+        };
+        if !done {
             active[i] = true;
             need_cold = true;
         }
@@ -138,6 +173,8 @@ fn resolve_fk_and_range_pread(
             &cold_cands,
             side,
             &mut winner,
+            &mut connected,
+            heights,
             /*skip_if_won=*/ true,
             &mut body_lookups,
             &mut miss_peeks,
@@ -147,6 +184,13 @@ fn resolve_fk_and_range_pread(
             &mut local_age,
             None,
         )?;
+    }
+    if tip_only && heights.is_some() {
+        for (i, w) in winner.iter_mut().enumerate() {
+            if !connected[i] {
+                *w = None;
+            }
+        }
     }
 
     crate::head_resolve_stats::add_probe(probe_ns);
@@ -305,12 +349,28 @@ fn body_range_no_nested_tls(
 ///
 /// When `session` is `Some`, ID + IDX page preads ride that **already-held**
 /// plan ring. When `None`, libc pread for ID and normal `record_range` for IDX.
+fn key_done(
+    ki: usize,
+    skip_if_won: bool,
+    winner: &[Option<(Fk, (u64, u64))>],
+    connected: &[bool],
+    heights: Option<&TxHeightTable>,
+) -> bool {
+    if heights.is_some() {
+        connected[ki]
+    } else {
+        skip_if_won && winner[ki].is_some()
+    }
+}
+
 fn id_idx_wave(
     table: &TxTable,
     txids: &[[u8; 32]],
     cands_by_key: &[Vec<Fk>],
     side: &TxidBody,
     winner: &mut [Option<(Fk, (u64, u64))>],
+    connected: &mut [bool],
+    heights: Option<&TxHeightTable>,
     skip_if_won: bool,
     body_lookups: &mut u64,
     miss_peeks: &mut u64,
@@ -323,7 +383,7 @@ fn id_idx_wave(
     // ── ID stage: page-grouped bulk fill for all active cands ─────────────
     let mut all_fks: Vec<Fk> = Vec::new();
     for (ki, cands) in cands_by_key.iter().enumerate() {
-        if skip_if_won && winner[ki].is_some() {
+        if key_done(ki, skip_if_won, winner, connected, heights) {
             continue;
         }
         all_fks.extend_from_slice(cands);
@@ -336,11 +396,15 @@ fn id_idx_wave(
     *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
     *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
 
-    // ── RAM depth-first match + IDX ───────────────────────────────────────
+    // ── RAM match + IDX ──────────────────────────────────────────────────
+    // With a height table: collect every body_txid match in this wave, then
+    // pick the newest connected (`tx_height` Some). First-match-and-stop would
+    // hide an older connected sibling behind a just-archived unconnected row.
     for (ki, cands) in cands_by_key.iter().enumerate() {
-        if skip_if_won && winner[ki].is_some() {
+        if key_done(ki, skip_if_won, winner, connected, heights) {
             continue;
         }
+        let mut matches: Vec<Fk> = Vec::new();
         for (rank0, &fk) in cands.iter().enumerate() {
             let rank = (rank0 + 1) as u64;
             let Some(id) = fk.get() else {
@@ -356,14 +420,38 @@ fn id_idx_wave(
                 continue;
             }
             crate::head_resolve_stats::add_hit_rank(rank);
-            let t_idx = Instant::now();
-            if let Some(range) = body_range_no_nested_tls(table, fk, session.as_deref_mut())? {
-                winner[ki] = Some((fk, range));
-                crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
-            }
-            *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-            break; // depth-first short-circuit within this wave's cands
+            matches.push(fk);
         }
+        if matches.is_empty() {
+            continue;
+        }
+        let chosen = if let Some(ht) = heights {
+            // Per-slot pread (`get`), never `get_batch`: we may be inside the
+            // held resolve ring (AGENTS.md: do not nest TLS io_uring).
+            let mut picked = None;
+            for &fk in &matches {
+                if ht.get(fk)?.is_some() {
+                    picked = Some(fk);
+                    break;
+                }
+            }
+            if let Some(fk) = picked {
+                connected[ki] = true;
+                fk
+            } else if winner[ki].is_some() {
+                continue;
+            } else {
+                matches[0]
+            }
+        } else {
+            matches[0]
+        };
+        let t_idx = Instant::now();
+        if let Some(range) = body_range_no_nested_tls(table, chosen, session.as_deref_mut())? {
+            winner[ki] = Some((chosen, range));
+            crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, chosen.0);
+        }
+        *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
     }
     Ok(())
 }
@@ -382,7 +470,7 @@ fn resolve_denserels_pread(
     StoreError,
 > {
     // Identity + range first (depth-first), then one denserels wave for winners.
-    let ranges = resolve_fk_and_range_pread(table, txids)?;
+    let ranges = resolve_fk_and_range_pread(table, txids, None, false)?;
     let mut dens_ns = 0u64;
     let mut dens_decoded: std::collections::HashMap<
         usize,
@@ -433,12 +521,14 @@ fn resolve_denserels_pread(
 fn resolve_fk_and_range_uring(
     table: &TxTable,
     txids: &[[u8; 32]],
+    heights: Option<&TxHeightTable>,
+    tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
     // TLS ring for head probe waves; sidefile ID is page-grouped pread.
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        resolve_fk_and_range_uring_on(session, table, txids)
+        resolve_fk_and_range_uring_on(session, table, txids, heights, tip_only)
     })?
 }
 
@@ -446,6 +536,8 @@ fn resolve_fk_and_range_uring_on(
     session: &mut UringSession,
     table: &TxTable,
     txids: &[[u8; 32]],
+    heights: Option<&TxHeightTable>,
+    tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
@@ -453,6 +545,7 @@ fn resolve_fk_and_range_uring_on(
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
 
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
+    let mut connected = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
@@ -475,6 +568,8 @@ fn resolve_fk_and_range_uring_on(
         &hot_cands,
         side,
         &mut winner,
+        &mut connected,
+        heights,
         /*skip_if_won=*/ false,
         &mut body_lookups,
         &mut miss_peeks,
@@ -485,11 +580,16 @@ fn resolve_fk_and_range_uring_on(
         Some(session),
     )?;
 
-    // ── Wave 2: full cold head for survivors + ID/IDX ─────────────────────
+    // ── Wave 2: full cold head for unfinished keys + ID/IDX ───────────────
     let mut need_cold = false;
     let mut active = vec![false; txids.len()];
-    for (i, w) in winner.iter().enumerate() {
-        if w.is_none() {
+    for i in 0..txids.len() {
+        let done = if heights.is_some() {
+            connected[i]
+        } else {
+            winner[i].is_some()
+        };
+        if !done {
             active[i] = true;
             need_cold = true;
         }
@@ -509,6 +609,8 @@ fn resolve_fk_and_range_uring_on(
             &cold_cands,
             side,
             &mut winner,
+            &mut connected,
+            heights,
             /*skip_if_won=*/ true,
             &mut body_lookups,
             &mut miss_peeks,
@@ -518,6 +620,13 @@ fn resolve_fk_and_range_uring_on(
             &mut local_age,
             Some(session),
         )?;
+    }
+    if tip_only && heights.is_some() {
+        for (i, w) in winner.iter_mut().enumerate() {
+            if !connected[i] {
+                *w = None;
+            }
+        }
     }
 
     crate::head_resolve_stats::add_probe(probe_ns);
@@ -550,7 +659,7 @@ fn resolve_denserels_uring(
 > {
     // fk+range via the fused TLS machine, then denserels body for winners
     // (separate bulk pipeline — range already known, no re-idx).
-    let ranges = resolve_fk_and_range_uring(table, txids)?;
+    let ranges = resolve_fk_and_range_uring(table, txids, None, false)?;
     let mut dens_ns = 0u64;
     let mut dens_decoded: std::collections::HashMap<
         usize,
@@ -647,7 +756,7 @@ mod tests {
     #[test]
     fn uring_fk_and_range_matches_pread() {
         let (dir, t, txids) = seed_table(40);
-        let pread = resolve_fk_and_range_pread(&t, &txids).unwrap();
+        let pread = resolve_fk_and_range_pread(&t, &txids, None, false).unwrap();
         // Public entry (uring when available, else pread) must match pure pread.
         let via = resolve_fk_and_range_batch(&t, &txids).unwrap();
         assert_eq!(pread.len(), via.len());

@@ -157,6 +157,19 @@ impl ChainHub {
         self.confirmed.read().unwrap().contains(hash)
     }
 
+    /// True if `hash` is connected on the best chain (has a height).
+    ///
+    /// Download / fork-start decisions must use this, not [`Self::has_block`]:
+    /// the RAM body cache can evict, and `confirmed` is insert-only across
+    /// reorgs. A stale "we have it" would permanently suppress getdata.
+    pub fn is_connected(&self, hash: &BlockHash) -> bool {
+        self.query
+            .height_of_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// True if the full block body is in Class A (may not be confirmed yet).
     pub fn is_archived(&self, hash: &BlockHash) -> bool {
         if self.has_block(hash) {

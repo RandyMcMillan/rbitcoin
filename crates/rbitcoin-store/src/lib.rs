@@ -108,7 +108,7 @@ pub use sorted_run::{
     SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME, FANIN_TARGET_STREAM_RUNS,
 };
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
-pub use store::Store;
+pub use store::{Store, TxidResolveMode};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{

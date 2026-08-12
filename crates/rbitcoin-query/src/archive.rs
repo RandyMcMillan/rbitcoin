@@ -496,7 +496,10 @@ impl Query {
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            let hits = self.store.get_fk_by_txid_batch_mode(
+                &need_head,
+                rbitcoin_store::TxidResolveMode::TipThenAny,
+            )?;
             for (txid, row) in hits {
                 if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);

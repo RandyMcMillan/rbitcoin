@@ -694,12 +694,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     debug!(
                         "tip: perf follow_live={follow_live} blocks={blks} \
                          mempool live={live} accepts={} rejects={} accept_avg_us={acc_avg} \
-                         accept_max_us={} inv_tx={} getdata_tx={} announce={} \
+                         accept_max_us={} accept_lock_us={} accept_utxo_us={} \
+                         accept_script_us={} accept_durable_us={} \
+                         inv_tx={} getdata_tx={} announce={} \
                          esplora req={esp_n} avg_us={esp_avg} max_us={esp_max} \
                          electrum req={el_n} avg_us={el_avg} max_us={el_max}",
                         mp.accepts,
                         mp.rejects,
                         mp.accept_max_us,
+                        mp.accept_lock_us,
+                        mp.accept_utxo_us,
+                        mp.accept_script_us,
+                        mp.accept_durable_us,
                         mp.inv_tx,
                         mp.getdata_tx,
                         mp.announce

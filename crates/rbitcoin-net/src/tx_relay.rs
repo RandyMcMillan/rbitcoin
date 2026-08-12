@@ -104,6 +104,14 @@ pub struct MempoolPerfSample {
     pub accept_us: u64,
     /// Max single accept_tx wall (µs).
     pub accept_max_us: u64,
+    /// Sum of exclusive mempool-lock hold times (µs) this window.
+    pub accept_lock_us: u64,
+    /// Sum of prevout/UTXO resolve times (µs) this window.
+    pub accept_utxo_us: u64,
+    /// Sum of consensus script verify times (µs) this window.
+    pub accept_script_us: u64,
+    /// Sum of durable append/persist times (µs) this window.
+    pub accept_durable_us: u64,
     /// Tx inventory items seen that we did not already have.
     pub inv_tx: u64,
     /// Tx getdata items we issued.
@@ -129,6 +137,10 @@ pub struct MempoolHub {
     meter_rejects: AtomicU64,
     meter_accept_us: AtomicU64,
     meter_accept_max_us: AtomicU64,
+    meter_accept_lock_us: AtomicU64,
+    meter_accept_utxo_us: AtomicU64,
+    meter_accept_script_us: AtomicU64,
+    meter_accept_durable_us: AtomicU64,
     meter_inv_tx: AtomicU64,
     meter_getdata_tx: AtomicU64,
     meter_announce: AtomicU64,
@@ -161,6 +173,10 @@ impl MempoolHub {
             meter_rejects: AtomicU64::new(0),
             meter_accept_us: AtomicU64::new(0),
             meter_accept_max_us: AtomicU64::new(0),
+            meter_accept_lock_us: AtomicU64::new(0),
+            meter_accept_utxo_us: AtomicU64::new(0),
+            meter_accept_script_us: AtomicU64::new(0),
+            meter_accept_durable_us: AtomicU64::new(0),
             meter_inv_tx: AtomicU64::new(0),
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
@@ -202,6 +218,17 @@ impl MempoolHub {
         }
     }
 
+    fn meter_accept_stages(&self, lock_us: u64, stages: rbitcoin_mempool::AcceptStageUs) {
+        self.meter_accept_lock_us
+            .fetch_add(lock_us, Ordering::Relaxed);
+        self.meter_accept_utxo_us
+            .fetch_add(stages.utxo_us, Ordering::Relaxed);
+        self.meter_accept_script_us
+            .fetch_add(stages.script_us, Ordering::Relaxed);
+        self.meter_accept_durable_us
+            .fetch_add(stages.durable_us, Ordering::Relaxed);
+    }
+
     /// Sample-and-reset mempool/relay counters for the tip-follow 5s DEBUG line.
     pub fn sample_reset_perf(&self) -> MempoolPerfSample {
         MempoolPerfSample {
@@ -209,6 +236,10 @@ impl MempoolHub {
             rejects: self.meter_rejects.swap(0, Ordering::Relaxed),
             accept_us: self.meter_accept_us.swap(0, Ordering::Relaxed),
             accept_max_us: self.meter_accept_max_us.swap(0, Ordering::Relaxed),
+            accept_lock_us: self.meter_accept_lock_us.swap(0, Ordering::Relaxed),
+            accept_utxo_us: self.meter_accept_utxo_us.swap(0, Ordering::Relaxed),
+            accept_script_us: self.meter_accept_script_us.swap(0, Ordering::Relaxed),
+            accept_durable_us: self.meter_accept_durable_us.swap(0, Ordering::Relaxed),
             inv_tx: self.meter_inv_tx.swap(0, Ordering::Relaxed),
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
@@ -398,10 +429,14 @@ impl MempoolHub {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
+        let t_lock = Instant::now();
         let mut g = self.inner.lock().unwrap();
         let result = g.accept_tx(tx, &utxo, tip);
+        let stages = g.last_accept_stages();
+        let lock_us = t_lock.elapsed().as_micros() as u64;
         drop(g);
         let us = t0.elapsed().as_micros() as u64;
+        self.meter_accept_stages(lock_us, stages);
         match result {
             Ok(r) => {
                 self.meter_accept_wall(us, true);
@@ -435,10 +470,14 @@ impl MempoolHub {
             query: self.query.as_ref(),
         };
         let tip = self.chain_tip_ctx();
+        let t_lock = Instant::now();
         let mut g = self.inner.lock().unwrap();
         let result = g.accept_package(txs, &utxo, tip);
+        let stages = g.last_accept_stages();
+        let lock_us = t_lock.elapsed().as_micros() as u64;
         drop(g);
         let us = t0.elapsed().as_micros() as u64;
+        self.meter_accept_stages(lock_us, stages);
         match result {
             Ok(res) => {
                 // Attribute package wall to each accepted member for rate visibility.
@@ -1185,6 +1224,150 @@ mod tests {
         // Remove confirmed + reorg reaccept empty already covered; remove live.
         assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
         assert!(hub.list_live().len() < 3);
+
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// C0: stage meters accumulate on accept; sample-and-reset clears them.
+    ///
+    /// Also acts as the **baseline microbench harness** for later staged-accept
+    /// work (lock ≈ wall while scripts/durable still run under the hub mutex).
+    #[test]
+    fn accept_stage_meters_and_baseline_harness() {
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Block, CompactTarget, Target, TxMerkleNode};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let mut coinbase_txids = Vec::new();
+        // Maturity pad + a few spends for the harness.
+        const N_SPENDS: u32 = 4;
+        for h in 1u32..=(100 + N_SPENDS) {
+            let b = mine(tip, tip_time + 600, h);
+            if h <= N_SPENDS {
+                coinbase_txids.push(b.txdata[0].compute_txid());
+            }
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let _ = hub.sample_reset_perf(); // clear open noise
+
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
+            let fee = 1_000u64 + i as u64;
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: *cbtxid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - fee),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            hub.accept_tx(&tx).expect("accept harness spend");
+        }
+
+        let s = hub.sample_reset_perf();
+        assert_eq!(s.accepts, N_SPENDS as u64);
+        assert!(s.accept_us > 0, "wall meter");
+        assert!(s.accept_lock_us > 0, "lock meter");
+        assert!(s.accept_utxo_us > 0, "utxo stage (chain coin resolve)");
+        assert!(s.accept_script_us > 0, "script stage");
+        assert!(s.accept_durable_us > 0, "durable stage");
+        // C0 baseline: exclusive lock still covers script+durable work.
+        assert!(
+            s.accept_lock_us >= s.accept_script_us,
+            "lock_us={} script_us={}",
+            s.accept_lock_us,
+            s.accept_script_us
+        );
+        assert!(
+            s.accept_lock_us >= s.accept_durable_us,
+            "lock_us={} durable_us={}",
+            s.accept_lock_us,
+            s.accept_durable_us
+        );
+        // Sample-and-reset clears.
+        let z = hub.sample_reset_perf();
+        assert_eq!(z.accepts, 0);
+        assert_eq!(z.accept_script_us, 0);
+        assert_eq!(z.accept_lock_us, 0);
 
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);

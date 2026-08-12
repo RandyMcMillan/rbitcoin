@@ -8,6 +8,20 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
 use std::collections::BTreeSet;
+use std::time::Instant;
+
+/// Stage wall times (µs) for one accept attempt (or sum across package/orphan promote).
+///
+/// Used by tip:perf / microbench harness — not a consensus surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptStageUs {
+    /// Prevout resolve (mempool graph peek + chain `UtxoProvider`).
+    pub utxo_us: u64,
+    /// Consensus script verify.
+    pub script_us: u64,
+    /// Durable slot/body append (includes persist_all today).
+    pub durable_us: u64,
+}
 
 /// Confirmed-chain unspent coin for mempool accept (content + maturity metadata).
 ///
@@ -247,6 +261,9 @@ pub struct ActiveMempool {
     pub max_weight: u64,
     /// Side pool of txs waiting on missing parents (Core-class weight budget).
     pub orphanage: Orphanage,
+    /// Stage µs for the most recent top-level [`Self::accept_tx`] / package member
+    /// (includes nested orphan promote for that accept). Sampled by MempoolHub.
+    last_accept_stages: AcceptStageUs,
 }
 
 impl ActiveMempool {
@@ -286,7 +303,13 @@ impl ActiveMempool {
             bodies,
             max_weight,
             orphanage: Orphanage::new(),
+            last_accept_stages: AcceptStageUs::default(),
         })
+    }
+
+    /// Stage timers from the last top-level accept (see field docs).
+    pub fn last_accept_stages(&self) -> AcceptStageUs {
+        self.last_accept_stages
     }
 
     pub fn live_count(&self) -> usize {
@@ -360,6 +383,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
+        self.last_accept_stages = AcceptStageUs::default();
         let r = self.accept_tx_inner(tx, utxos, tip)?;
         // Promote orphans waiting on this parent (best-effort; nested orphans re-park).
         self.promote_orphans_of(r.txid, utxos, tip);
@@ -395,6 +419,7 @@ impl ActiveMempool {
         }
 
         // Resolve prevouts: in-mempool first, then provider (chain).
+        let t_utxo = Instant::now();
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
         let mut chain_coins: Vec<Option<Coin>> = Vec::with_capacity(tx.input.len());
         let mut parent_txids = BTreeSet::new();
@@ -414,6 +439,10 @@ impl ActiveMempool {
                     if let Some(c) = self.graph.conflict_txid(&op) {
                         direct_conflicts.insert(c);
                     } else {
+                        self.last_accept_stages.utxo_us = self
+                            .last_accept_stages
+                            .utxo_us
+                            .saturating_add(t_utxo.elapsed().as_micros() as u64);
                         return Err(AcceptError::Policy("mempool double-spend"));
                     }
                     // Still need the value from the creator's output for fee calc.
@@ -441,6 +470,10 @@ impl ActiveMempool {
             prevouts.push(txout);
             chain_coins.push(chain_coin);
         }
+        self.last_accept_stages.utxo_us = self
+            .last_accept_stages
+            .utxo_us
+            .saturating_add(t_utxo.elapsed().as_micros() as u64);
 
         if !missing_parents.is_empty() {
             // Park when any parent is unknown (Core TX_MISSING_INPUTS → orphanage).
@@ -469,7 +502,13 @@ impl ActiveMempool {
         // Consensus script checks (same interpreter as block connect). Policy
         // alone is not enough — invalid scripts must never enter the pool or
         // be announced / Electrum-broadcast.
-        verify_tx_scripts(tx, prevouts)?;
+        let t_script = Instant::now();
+        let script_res = verify_tx_scripts(tx, prevouts);
+        self.last_accept_stages.script_us = self
+            .last_accept_stages
+            .script_us
+            .saturating_add(t_script.elapsed().as_micros() as u64);
+        script_res?;
 
         // Full RBF (Libre): BIP125-style absolute fee **or** pure replace-by-fee-rate.
         let conflict_set = if !direct_conflicts.is_empty() {
@@ -543,7 +582,12 @@ impl ActiveMempool {
 
         // Durable write.
         let raw = serialize(tx);
+        let t_dur = Instant::now();
         let slot = self.store.append_live_tx(&raw, &txid, fee_sat, weight)?;
+        self.last_accept_stages.durable_us = self
+            .last_accept_stages
+            .durable_us
+            .saturating_add(t_dur.elapsed().as_micros() as u64);
 
         let entry = TxEntry {
             txid,
@@ -590,12 +634,17 @@ impl ActiveMempool {
         *sha256::Hash::hash(script).as_byte_array()
     }
 
-    /// Re-try orphans that listed `parent` as missing (recursive via accept_tx).
+    /// Re-try orphans that listed `parent` as missing (recursive via accept_tx_inner).
+    ///
+    /// Uses inner (not top-level accept_tx) so stage timers accumulate on the
+    /// parent admit that unlocked the orphan chain.
     fn promote_orphans_of(&mut self, parent: Txid, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
         let children = self.orphanage.take_children_of(&parent);
         for child in children {
-            // accept_tx re-parks if still missing other parents; ignores soft errors.
-            let _ = self.accept_tx(&child, utxos, tip);
+            // Re-parks if still missing other parents; ignores soft errors.
+            if let Ok(r) = self.accept_tx_inner(&child, utxos, tip) {
+                self.promote_orphans_of(r.txid, utxos, tip);
+            }
         }
     }
 
@@ -724,10 +773,16 @@ impl ActiveMempool {
             }
         }
 
+        // One stage accumulator for the whole package (hub sample-and-reset).
+        self.last_accept_stages = AcceptStageUs::default();
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         for tx in txs {
-            match self.accept_tx(tx, utxos, tip) {
-                Ok(r) => accepted.push(r),
+            // Inner + promote (not top-level accept_tx) so stages are not reset per member.
+            match self.accept_tx_inner(tx, utxos, tip) {
+                Ok(r) => {
+                    self.promote_orphans_of(r.txid, utxos, tip);
+                    accepted.push(r);
+                }
                 Err(e) => {
                     // Roll back this package's accepts (children first).
                     for r in accepted.iter().rev() {
@@ -1033,6 +1088,26 @@ mod tests {
         };
         mp.accept_tx(&tx, &utxos, tip2)
             .expect("mature at tip 149 (next=150)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage timers are recorded on a successful chain-spend accept.
+    #[test]
+    fn accept_records_stage_us_on_success() {
+        let dir = tmp_dir();
+        let (op, _txout, utxos) = chain_utxo(50_000);
+        let tx = spend_tx(op, 49_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("accept");
+        let s = mp.last_accept_stages();
+        // MapUtxo is RAM-fast; utxo/script/durable may be 0µs on a fast host for
+        // tiny fixtures — still require at least one stage counter path ran
+        // (durable append always touches files; allow 0 on very fast FS).
+        // Script always runs the interpreter for OP_TRUE.
+        assert!(
+            s.script_us > 0 || s.durable_us > 0 || s.utxo_us > 0,
+            "expected non-zero stage sample, got {s:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

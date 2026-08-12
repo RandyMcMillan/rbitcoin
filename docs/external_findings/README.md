@@ -16,6 +16,20 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [009](./009-witness-commitment-reserved.md) | medium | Witness commitment empty/multi-item coinbase witness | fixed | `block::tests::s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
 | [010](./010-mempool-confirmed-spentness.md) | medium | Mempool no confirmed-chain spentness check | fixed | `rbitcoin-mempool` `accept::tests::reject_when_provider_has_no_unspent_coin` |
 | [011](./011-mempool-structural-chain-context.md) | medium | Mempool no structural chain-context validation | fixed | `accept::tests::reject_non_final_locktime_height`, `reject_immature_coinbase` |
+| [012](./012-p2sh-redeem-not-executed.md) | high | P2SH redeem skipped when BIP16 looks off | fixed | `bip16_from_prev_mtp_exception_and_time` |
+| [013](./013-bip68-unresolved-age-fail-open.md) | high | BIP68 unresolved coin age fails open | fixed | `bip68_unresolved_coin_age_fails_closed` |
+| [014](./014-stranded-on-peer-reorg.md) | high | Stranded when peer reorgs (sync) | fixed | `drain_requests_missing_parent_of_pending_branch` |
+| [015](./015-spend-rejected-block-outputs.md) | high | Spend outputs of a rejected block | fixed | cluster 017/019 + structural fail-closed |
+| [016](./016-unknown-taproot-leaf-rejected.md) | critical | Unknown tapleaf version rejected | fixed | `script_path_accepts_unknown_taproot_leaf_version` |
+| [017](./017-duplicate-txid-unconnected-instance.md) | medium | Txid resolve hits unconnected instance | fixed | `resolve_txid_prefers_connected_over_newer_unconnected` |
+| [018](./018-compact-block-duplicate-tx.md) | high | Compact block duplicates a tx | fixed | `repeated_short_id_is_requested_not_duplicated` |
+| [019](./019-bip30-not-enforced.md) | critical | BIP30 not enforced | fixed | cluster 015/017 + BIP34-gated batch |
+| [020](./020-pending-child-after-reorg.md) | high | Pending child not connected after reorg | fixed | `drain_connects_pending_child_of_new_tip_after_reorg` |
+| [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
+
+**012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
+`8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30
+(015/017/019) is one cluster (`TipOnly` confirm lookup + fail-closed height).
 
 **Policy:** Core `script_tests` / `tx_valid` / `tx_invalid` corpora must pass **every**
 data row with **no allowlist**. Do not commit if those tests fail. Findings stay

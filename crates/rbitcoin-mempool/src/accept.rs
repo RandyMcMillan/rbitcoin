@@ -19,7 +19,7 @@ pub struct AcceptStageUs {
     pub utxo_us: u64,
     /// Consensus script verify.
     pub script_us: u64,
-    /// Durable slot/body append (includes persist_all today).
+    /// Durable slot/body append (coalesced persist when it runs).
     pub durable_us: u64,
 }
 
@@ -333,6 +333,11 @@ impl ActiveMempool {
 
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.store.flush()
+    }
+
+    /// Best-effort sidecar persist of dirty accepts (no generation bump).
+    pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
+        self.store.persist_if_dirty()
     }
 
     /// Compact durable storage (drop DEAD holes) and rebuild RAM graph.
@@ -944,6 +949,8 @@ impl ActiveMempool {
         self.orphanage.erase_for_block(block_txids);
         if n > 0 {
             let _ = self.maybe_compact();
+            // Tip connect: push dirty admits/removes to sidecars before return.
+            let _ = self.store.persist_if_dirty();
         }
         Ok(n)
     }

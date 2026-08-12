@@ -43,7 +43,7 @@ pub use orphanage::{
     Orphanage, DEFAULT_ORPHAN_MAX_COUNT, DEFAULT_ORPHAN_MAX_WEIGHT, MAX_ORPHAN_TX_WEIGHT,
     ORPHAN_PEER_BUDGET, ORPHAN_RESERVED_WEIGHT_PER_PEER,
 };
-pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA};
+pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA, PERSIST_COALESCE_OPS};
 
 pub fn crate_name() -> &'static str {
     "rbitcoin-mempool"

@@ -106,6 +106,36 @@ fn bip68_disable_flag_and_time_type() {
     ));
 }
 
+/// Unresolved coin age (missing slice or height/MTP 0) must fail *closed*.
+/// Same-block callers pass spend height / prev MTP — never 0.
+#[test]
+fn bip68_unresolved_coin_age_fails_closed() {
+    let type_flag = 1u32 << 22;
+    let tx_h = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(10));
+    let tx_t = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(type_flag | 2));
+    // Missing height entry.
+    assert!(!sequence_locks_satisfied(&tx_h, &[], &[0], 110, 1_000_000));
+    // Height 0 = unresolved (not genesis spendable).
+    assert!(!sequence_locks_satisfied(&tx_h, &[0], &[0], 110, 1_000_000));
+    // Time-type with MTP 0 / missing.
+    assert!(!sequence_locks_satisfied(
+        &tx_t,
+        &[100],
+        &[0],
+        200,
+        1_000_000
+    ));
+    assert!(!sequence_locks_satisfied(
+        &tx_t,
+        &[100],
+        &[],
+        200,
+        1_000_000
+    ));
+    // Control: known ages still work.
+    assert!(sequence_locks_satisfied(&tx_h, &[100], &[0], 110, 0));
+}
+
 /// Height-type locks ignore coin MTP (write path may leave mtps as 0).
 #[test]
 fn bip68_height_type_ignores_zero_mtp() {

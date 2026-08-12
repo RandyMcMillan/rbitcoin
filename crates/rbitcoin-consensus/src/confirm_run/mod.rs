@@ -537,7 +537,7 @@ pub fn confirm_wire_load_phase_pipelined(
     let parent_store = pipeline.map(|p| &p.parent_store);
     let parent_pin = match plan.as_ref() {
         Some(p) => ParentPinStamp::from_plan(p),
-        None => stamp_parent_pin_archived(query, &metas, &wire_blocks, inflight)?,
+        None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, inflight)?,
     };
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,

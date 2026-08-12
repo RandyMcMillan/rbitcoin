@@ -143,9 +143,12 @@ fn verify_script_path(
         return Err(ConsensusError::Script("p2tr bip341 tweak mismatch".into()));
     }
 
-    // Only tapscript (leaf version 0xc0) is executed today.
+    // BIP341: only tapscript (0xc0) is executed. Any other leaf version is
+    // reserved for future soft forks and **succeeds** after the commitment
+    // check (above). Core rejects unknown leaves only under mempool
+    // SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION — never on blocks.
     if control.leaf_version != bitcoin::taproot::LeafVersion::TapScript {
-        return Err(ConsensusError::Script("p2tr leaf version".into()));
+        return Ok(());
     }
 
     let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript);
@@ -236,6 +239,71 @@ mod bip341_tests {
     fn script_path_accepts_with_valid_bip341_tweak() {
         let (job, _) = make_script_path_spend();
         script::verify_job_all_inputs(&job).expect("p2tr script path");
+    }
+
+    /// BIP341: after commitment verify, a non-tapscript leaf version succeeds
+    /// without executing the leaf (upgrade path). Block validation must not
+    /// reject this — Core only discourages it as mempool policy.
+    #[test]
+    fn script_path_accepts_unknown_taproot_leaf_version() {
+        let secp = Secp256k1::new();
+        let internal_sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
+        let (internal_xonly, _) = internal_kp.x_only_public_key();
+
+        let leaf = ScriptBuf::from_bytes(vec![0x51]);
+        let ver = LeafVersion::from_consensus(0xc2).expect("0xc2 is a valid leaf version");
+        let builder = TaprootBuilder::new()
+            .add_leaf_with_ver(0, leaf.clone(), ver)
+            .expect("leaf");
+        let spend_info = builder.finalize(&secp, internal_xonly).expect("finalize");
+        let output_key = spend_info.output_key().to_x_only_public_key();
+        let control = spend_info
+            .control_block(&(leaf.clone(), ver))
+            .expect("control");
+        assert!(control.verify_taproot_commitment(&secp, output_key, leaf.as_script()));
+        assert_ne!(control.leaf_version, LeafVersion::TapScript);
+
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(output_key),
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::from_slice(&[leaf.as_bytes(), control.serialize().as_slice()]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let job = ScriptCheckJob {
+            txid: [0u8; 32],
+            prevouts: vec![prevout],
+            tx: crate::block::JobTx::owned(tx),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+            minimal_if: false,
+            nullfail: false,
+            low_s: false,
+            strictenc: false,
+            null_dummy: false,
+            minimal_data: false,
+            witness_pubkeytype: false,
+            witness_active: true,
+            discourage_upgradable_witness: false,
+            const_scriptcode: false,
+        };
+        script::verify_job_all_inputs(&job)
+            .expect("unknown tapleaf must succeed after BIP341 commitment");
     }
 
     #[test]

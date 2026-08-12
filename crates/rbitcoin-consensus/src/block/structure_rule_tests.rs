@@ -1335,9 +1335,9 @@ fn bip16_from_prev_mtp_exception_and_time() {
         &BIP16_EXCEPTION_MAINNET,
         u32::MAX,
     ));
-    // Pre-bip16_time MTP → inactive.
-    assert!(!bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
-    // At/after bip16_time → active.
+    // Buried: active even when prev MTP predates the historical BIP16 time.
+    assert!(bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
+    // At/after bip16_time → still active.
     assert!(bip16_active_from_prev_mtp(
         p,
         170_000,

@@ -611,8 +611,12 @@ pub(crate) fn bip16_active_from_prev_mtp(
     if height == 0 {
         return false;
     }
-    // Core: previous block's median-time-past >= bip16_time.
-    prev_mtp >= params.btc.bip16_time
+    // Modern Core buries P2SH: validation.cpp sets SCRIPT_VERIFY_P2SH on every
+    // block except the named BIP16Exception (handled above). The historical
+    // "prev MTP >= 2012-04-01" gate is gone — keeping it splits from Core on
+    // regtest and any early-MTP chain (redeemScript never runs).
+    let _ = (params, prev_mtp);
+    true
 }
 
 /// Transaction held by a [`ScriptCheckJob`].
@@ -1073,7 +1077,12 @@ fn assemble_block_prevouts_mode(
                     .and_then(|t| t.get(ii))
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
-                    .or_else(|| query.tx_fk_by_txid(op.txid.as_byte_array()).ok().flatten());
+                    .or_else(|| {
+                        query
+                            .tx_fk_by_txid_tip(op.txid.as_byte_array())
+                            .ok()
+                            .flatten()
+                    });
                 let pin_live = match prev_fk {
                     Some(fk) => batch_parents.has_parent_out(fk, op.vout),
                     None => false,
@@ -1326,6 +1335,43 @@ pub(crate) fn structural_validate_spends(
         FkMap::with_capacity_and_hasher(spends.len().min(256), BuildHasherDefault::default());
     let maturity = ctx.params.coinbase_maturity();
 
+    // BIP30: Core skips once BIP34 is active. Before that, a connected
+    // instance with any unspent output may not be overwritten.
+    // One TipOnly batch for the block's create txids — not a per-tx head probe.
+    // Just-archived self is unconnected, so it is not a hit; only a real
+    // connected sibling comes back.
+    if !ctx.params.bip34_active_at(ctx.height.0) {
+        let create_txids: Vec<[u8; 32]> = block
+            .txdata
+            .iter()
+            .map(|tx| tx.compute_txid().to_byte_array())
+            .collect();
+        let hits = query
+            .store()
+            .get_fk_by_txid_batch(&create_txids)
+            .map_err(ConsensusError::from)?;
+        for (_txid, row) in hits {
+            let Some((old_fk, _)) = row else {
+                continue;
+            };
+            let rec = query.store().get_tx(old_fk).map_err(ConsensusError::from)?;
+            let mut unspent = false;
+            for v in 0..rec.output_count {
+                let spent = query
+                    .store()
+                    .has_confirmed_strong_spender_create(old_fk, v, None)
+                    .map_err(ConsensusError::from)?;
+                if !spent {
+                    unspent = true;
+                    break;
+                }
+            }
+            if unspent {
+                return Err(ConsensusError::BadTx("bad-txns-BIP30"));
+            }
+        }
+    }
+
     // ── Spentness (durable + same-run pending) ─────────────────────────────
     // Authority is on-disk spender meta (bulk mmap). Pin only supplies abs.
     // Cold body walk is forbidden on write — spent_cold must stay 0.
@@ -1514,7 +1560,9 @@ pub(crate) fn structural_validate_spends(
         .zip(durable_heights.into_iter())
         .filter_map(|(fk, h)| {
             let id = fk.get()?;
-            Some((id, h.unwrap_or(0)))
+            // Missing height: not on the best chain (rejected / never connected).
+            // Do not default to 0 (that treats the coin as ancient/valid).
+            Some((id, h?))
         })
         .collect();
 
@@ -1539,7 +1587,9 @@ pub(crate) fn structural_validate_spends(
         if !seen_create.insert(id) {
             continue;
         }
-        let durable_h = height_by_id.get(&id).copied().unwrap_or(0);
+        let Some(&durable_h) = height_by_id.get(&id) else {
+            return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
+        };
 
         // Pin-proven non-coinbase: height only (no body).
         if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
@@ -1773,11 +1823,25 @@ pub fn sequence_locks_satisfied(
         if seq & DISABLE != 0 {
             continue;
         }
-        let coin_h = prev_heights.get(i).copied().unwrap_or(0);
+        // Missing or zero coin height/MTP is unresolved (genesis CB is
+        // unspendable). Defaulting to 0 fails *open* for time locks (epoch MTP
+        // is below any real prev MTP). Callers pass spend height / prev MTP for
+        // same-block creates — never 0.
+        let Some(&coin_h) = prev_heights.get(i) else {
+            return false;
+        };
+        if coin_h == 0 {
+            return false;
+        }
         let rel = (seq & MASK) as i64;
         if seq & TYPE_FLAG != 0 {
-            let coin_mtp = prev_coin_mtps.get(i).copied().unwrap_or(0) as i64;
-            min_time = min_time.max(coin_mtp + (rel << GRANULARITY) - 1);
+            let Some(&raw_mtp) = prev_coin_mtps.get(i) else {
+                return false;
+            };
+            if raw_mtp == 0 {
+                return false;
+            }
+            min_time = min_time.max(i64::from(raw_mtp) + (rel << GRANULARITY) - 1);
         } else {
             min_height = min_height.max(i64::from(coin_h) + rel - 1);
         }
@@ -1931,7 +1995,7 @@ fn resolve_prevout(
     // Cold path: create-fk candidates (thin → durable head / store).
     let t_fk = Instant::now();
     let head_fk = query
-        .tx_fk_by_txid(&prev_txid)
+        .tx_fk_by_txid_tip(&prev_txid)
         .map_err(ConsensusError::from)?;
     confirm_phase_stats::ASM_PREV_FK_NS
         .fetch_add(t_fk.elapsed().as_nanos() as u64, Ordering::Relaxed);

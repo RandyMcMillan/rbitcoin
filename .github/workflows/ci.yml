@@ -76,12 +76,14 @@ jobs:
           shared-key: ci-multinode
           workspaces: ". -> target/dev"
       - name: multi-node IBD (tier A)
+        # One TESTNAME per `cargo test` invocation (second free arg is an error on
+        # rustc 1.95+). Run the two tier-A cases as separate commands.
         run: |
+          set -euo pipefail
           cargo test -p rbitcoin-test --test integration_multinode \
-            two_node_header_and_block_sync \
-            serve_after_restart_via_reconstruct \
-            -- --nocapture
-
+            two_node_header_and_block_sync -- --nocapture
+          cargo test -p rbitcoin-test --test integration_multinode \
+            serve_after_restart_via_reconstruct -- --nocapture
   # Line-coverage gate (≥90% first-party LCOV LH/LF). Slow; waits for the
   # fast gates so a red fmt/clippy/test does not start this job. Required.
   coverage:

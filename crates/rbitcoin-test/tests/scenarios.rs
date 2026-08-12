@@ -480,6 +480,8 @@ fn chain_connect_reorg_and_growth() {
     let q = Query::open_or_create(td.store_path()).unwrap();
 
     // Default hash head is 64 slots; 80 blocks (header+tx keys) forces rehash.
+    // Merkle root must match the Class A txid(s) so tip-window revalidate on reopen
+    // (VERIFY_TIP_BLOCKS) does not false-positive shrink the tip.
     const N: u32 = 80;
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
@@ -488,14 +490,13 @@ fn chain_connect_reorg_and_growth() {
         let timestamp = h;
         let bits = 1;
         let nonce = h;
-        let mut merkle = [0u8; 32];
-        merkle[0..4].copy_from_slice(&h.to_le_bytes());
-        let hash = match parent_hash {
-            None => merkle,
-            Some(ph) => {
-                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
-            }
-        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        // Single-tx "block": merkle root == coinbase txid (internal byte order).
+        let merkle = txid;
+        let ph = parent_hash.unwrap_or([0u8; 32]);
+        let hash = rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce);
         let header = HeaderRecord {
             prev_fk: prev,
             version,
@@ -505,9 +506,6 @@ fn chain_connect_reorg_and_growth() {
             merkle_root: merkle,
             hash,
         };
-        let mut txid = [0u8; 32];
-        txid[0..4].copy_from_slice(&h.to_le_bytes());
-        txid[31] = 0xcb;
         let ta = TxApply {
             tx: TxRecord {
                 txid,

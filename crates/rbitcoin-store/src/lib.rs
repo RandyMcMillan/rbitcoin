@@ -21,9 +21,9 @@ mod head_resolve_denserels;
 pub mod head_resolve_stats;
 mod header_table;
 mod ibd_io_policy;
-mod integrity;
 mod idx_body_pipeline;
 mod int_map;
+mod integrity;
 mod io_backend;
 mod open_address;
 mod point_table;
@@ -68,11 +68,11 @@ pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
+pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
+pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{
     merkle_root_from_txids, TipRevalidateReport, TipSeal, TIP_SEAL_NAME, VERIFY_TIP_BLOCKS,
 };
-pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
-pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use io_backend::{
     class_a_append_uses_pwrite, class_c_io_backend, head_resolve_io_backend, pin_io_backend,
     spend_ann_io_backend, spend_meta_io_backend, ReadIoBackend, WriteIoBackend,

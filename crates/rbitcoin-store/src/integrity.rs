@@ -262,11 +262,7 @@ impl Store {
         tx_count: u64,
         report: &mut TipRevalidateReport,
     ) -> Result<(), &'static str> {
-        let Some(fk) = self
-            .confirmed
-            .get(height)
-            .map_err(|_| "confirmed read")?
-        else {
+        let Some(fk) = self.confirmed.get(height).map_err(|_| "confirmed read")? else {
             return Err("confirmed null header_fk");
         };
         let rec = match self.headers.get(fk) {
@@ -534,7 +530,9 @@ mod tests {
         let g_fk = s.put_header(&g).unwrap();
         s.confirmed.set(Height(0), g_fk).unwrap();
         s.flush_class_c_tip().unwrap();
-        let seal = TipSeal::load(s.path()).unwrap().expect("seal after tip barrier");
+        let seal = TipSeal::load(s.path())
+            .unwrap()
+            .expect("seal after tip barrier");
         assert_eq!(seal.tip_height, 0);
         assert_eq!(seal.tip_hash, g.hash);
 

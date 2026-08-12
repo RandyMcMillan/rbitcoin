@@ -6,6 +6,7 @@ use rbitcoin_esplora::{run_esplora, EsploraConfig};
 use rbitcoin_log::{info, warn};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
+use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle};
 use rbitcoin_store::StoreError;
 use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
@@ -158,11 +159,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
     // Index mode selection on restart:
-    // - **Tip-ready** (durable SH covers Class A tip, no residual runs): stay Tip —
-    //   tip-follow only a few blocks behind must not Class A recollect / rematerialize.
-    // - Otherwise Direct IBD: archive tx.head, confirm spends, SH runs → bulk at tip.
-    let sh_tip_ready = handle.query.sh_is_tip_ready();
-    if sh_tip_ready {
+    // - **shindex + tip-ready** (durable SH covers Class A tip): stay Tip with SH
+    //   write-through — tip-follow only a few blocks behind must not recollect.
+    // - Otherwise Direct IBD: archive tx.head, confirm spends; SH runs only if shindex.
+    handle.query.set_sh_index_enabled(config.shindex);
+    if config.shindex && handle.query.sh_is_tip_ready() {
         let _ = handle.query.sync_sh_seal_from_include_hwm();
         handle.query.enter_tip_index_mode();
         info!(
@@ -172,11 +173,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else {
         handle
             .query
-            .enter_direct_index_mode()
+            .enter_direct_index_mode_sh(config.shindex)
             .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
-        info!(
-            "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
-        );
+        if config.shindex {
+            info!(
+                "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
+            );
+        } else {
+            info!(
+                "ibd: IndexMode::Direct without scripthash (shindex off; tip follow independent of SH)"
+            );
+        }
     }
     let listen = config
         .p2p_listen
@@ -367,40 +374,39 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     // ── Steady state: tip tracking + block relay ────────────────────────────
-    // After true catch-up: SH bulk materialize + IndexMode::Tip, then long-lived
-    // follow peers (inv/headers + announce). `tx.head` and spend annotations are
+    // After true catch-up: enter tip index mode (always), optionally SH bulk when
+    // shindex, then long-lived follow peers. `tx.head` and spend annotations are
     // already correct from Direct IBD — tip entry does not re-scan Class A.
     //
-    // Only when catch_up_complete: mid-chain peer death must not enter tip mode
-    // (would bulk-load SH while still behind horizon).
-    // Tip SH materialize must succeed before follow peers / Electrum. A failed
-    // materialize (e.g. ENOSPC mid-cold) leaves reinit'd or residual SH — do not
-    // accept tip blocks or serve history until finalize is tip-ready.
-    let mut tip_indexes_ready = false;
+    // **tip_follow_ready ≠ sh_tip_ready:** follow peers + mempool relay do not
+    // wait on SH materialize. Electrum/Esplora require shindex && sh_tip_ready.
+    let mut tip_follow_ready = false;
+    let mut sh_tip_ready = false;
     if catch_up_complete && !shutdown.requested() {
-        let sh_ok = enter_tip_mode(&node.hub.query, Some(Arc::clone(&shutdown.flag)));
-        if sh_ok && !shutdown.requested() {
-            tip_indexes_ready = true;
+        let gates = enter_tip_mode(
+            &node.hub.query,
+            Some(Arc::clone(&shutdown.flag)),
+            config.shindex,
+        );
+        tip_follow_ready = gates.tip_follow_ready;
+        sh_tip_ready = gates.sh_tip_ready;
+        if tip_follow_ready && !shutdown.requested() {
             // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
             mempool.set_relay_enabled(true);
             info!(
-                "node: catch-up complete tip={:?} — tip tracking + block/tx relay (mempool live={})",
+                "node: catch-up complete tip={:?} — tip tracking + block/tx relay \
+                 (mempool live={}, shindex={}, sh_tip_ready={})",
                 node.tip_height(),
-                mempool.live_count()
+                mempool.live_count(),
+                config.shindex,
+                sh_tip_ready
             );
         } else if shutdown.requested() {
-            warn!(
-                "node: tip SH materialize interrupted — restart to resume (CHECKPOINT/READY kept under scripthash.runs/merge/)"
-            );
-        } else {
-            warn!(
-                "node: tip SH not ready after materialize — skip follow peers and Electrum; \
-                 free disk / fix store and restart to retry finalize"
-            );
+            warn!("node: tip entry interrupted — restart to resume");
         }
     } else if !catch_up_complete && !shutdown.requested() {
         warn!(
-            "node: catch-up not complete tip={:?} — skip tip mode / Electrum materialize; restart to resume IBD",
+            "node: catch-up not complete tip={:?} — skip tip mode; restart to resume IBD",
             node.tip_height()
         );
     }
@@ -408,8 +414,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Persistent follow: stay connected for tip relay after catch-up.
     // Bound each connect so a single dead seed cannot stall post-IBD for minutes
     // (OS TCP timeouts are often 2+ min; IBD dial already uses 8s).
-    // Each session actively getheaders from tip (fills gaps after SH materialize).
-    if tip_indexes_ready && !shutdown.requested() {
+    // Each session actively getheaders from tip.
+    if tip_follow_ready && !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
         const FOLLOW_CONNECT_SECS: u64 = 8;
         for (i, peer) in targets.iter().take(follow_n).enumerate() {
@@ -447,10 +453,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     // Electrum: share Query + mempool; bridge ChainHub tip events → header push.
-    // Only when SH tip indexes are ready (same gate as follow peers).
+    // Requires shindex and durable SH tip-ready (not tip_follow alone).
     let mut electrum_handles = Vec::new();
     let mut electrum_bridge = None;
-    if tip_indexes_ready {
+    if sh_tip_ready {
         if let Some(addr) = config.electrum_listen {
             if !shutdown.requested() {
                 let q = node.hub.query.clone();
@@ -507,10 +513,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     // Esplora REST + wallet WebSocket (plain HTTP; TLS via reverse proxy).
     // Tip bridge is independent of Electrum so want:blocks works with Electrum off.
-    // Still requires tip SH ready — history endpoints need durable scripthash.
+    // Requires shindex + SH tip-ready — history endpoints need durable scripthash.
     let mut esplora_handles = Vec::new();
     let mut esplora_tip_bridge = None;
-    if tip_indexes_ready {
+    if sh_tip_ready {
         if let Some(addr) = config.esplora_listen {
             if !shutdown.requested() {
                 let q = node.hub.query.clone();
@@ -555,15 +561,49 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }
         }
-    } // tip_indexes_ready (esplora)
+    } // sh_tip_ready (esplora)
+
+    // Core-class JSON-RPC (independent of SH / Electrum). Default off.
+    let mut rpc_handle: Option<RpcHandle> = None;
+    if let Some(addr) = config.rpc_listen {
+        if !shutdown.requested() {
+            let rcfg = RpcConfig {
+                listen: addr,
+                datadir: config.datadir.clone(),
+                network: config.network,
+                rpc_user: config.rpc_user.clone(),
+                rpc_password: config.rpc_password.clone(),
+                cookie_path: Some(config.rpc_cookie_path()),
+            };
+            match run_rpc(rcfg, Arc::clone(&node.hub.query), Some(mempool.clone())).await {
+                Ok(h) => {
+                    h.initial_block_download
+                        .store(!tip_follow_ready, Ordering::SeqCst);
+                    h.connections
+                        .store(node.follow_live_count() as u64, Ordering::Relaxed);
+                    info!(
+                        "rpc: listening on {} (auth={})",
+                        h.local_addr,
+                        if config.rpc_user.is_some() {
+                            "rpcuser/rpcpassword"
+                        } else {
+                            "cookie"
+                        }
+                    );
+                    rpc_handle = Some(h);
+                }
+                Err(e) => warn!("rpc start warning: {e}"),
+            }
+        }
+    }
 
     // Tip-follow loop until max_run (`Some(0)` = exit after catch-up + tip mode)
     // or until a shutdown signal.
     //
     // Quiet like Core: log **tip updates** only; when tip looks stale open an
     // extra outbound (log that). No periodic "at tip" heartbeat.
-    // Requires tip SH ready — otherwise stay idle (or exit) until restart.
-    if tip_indexes_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
+    // Independent of SH / Electrum readiness.
+    if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
         let deadline = config
             .max_run_secs
             .map(|s| Instant::now() + Duration::from_secs(s));
@@ -606,6 +646,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 },
                 _ = tokio::time::sleep(Duration::from_secs(STALE_POLL_SECS)) => Wake::Poll,
             };
+            // RPC `stop` method.
+            if let Some(ref h) = rpc_handle {
+                if h.stop.load(Ordering::SeqCst) {
+                    info!("rpc: stop — shutting down");
+                    shutdown.request();
+                    break;
+                }
+                h.connections
+                    .store(node.follow_live_count() as u64, Ordering::Relaxed);
+                h.initial_block_download.store(false, Ordering::SeqCst);
+            }
             if matches!(wake, Wake::Stop) {
                 break;
             }
@@ -748,6 +799,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         h.abort();
         let _ = h.await;
     }
+    if let Some(h) = rpc_handle {
+        // Honour RPC `stop` if requested before process signal.
+        if h.stop.load(Ordering::SeqCst) {
+            info!("rpc: stop requested via JSON-RPC");
+        }
+        h.shutdown().await;
+    }
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {
@@ -773,35 +831,61 @@ fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
     config.use_seeds && config.connect.is_empty() && config.signet_challenge.is_none()
 }
 
+/// Result of post-IBD tip entry: follow/mempool gates vs Electrum SH gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TipModeGates {
+    /// Class A + spends ready: follow peers, tip loop, mempool tip-relay.
+    pub tip_follow_ready: bool,
+    /// Durable SH tip-ready: Electrum / Esplora may start.
+    pub sh_tip_ready: bool,
+}
+
 /// Enter steady-state tip mode after true catch-up.
 ///
 /// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
 /// wrote durable **`tx.head`** (archive) and **spend annotations** (confirm).
 /// Incomplete IBD must not call this (`catch_up_complete` only after full horizon).
 ///
-/// **Work here:** the only deferred Direct index is **scripthash** — merge remaining
-/// runs and cold bulk-load durable SH tables, then flip [`IndexMode::Tip`].
+/// **Always:** flip [`IndexMode::Tip`] so tip follow and mempool relay work without
+/// waiting on scripthash (`tip_follow_ready`).
 ///
-/// No automatic `tx.head` / spend backfill: those paths are recovery tools
-/// ([`Query::backfill_tx_index`] for future head rehash rebuild; spend rewrite is
-/// not part of tip entry). Corrupt head/spends ⇒ reindex, not silent tip repair.
-/// Enter tip index mode after SH materialize.
+/// **When `shindex`:** merge SH runs + cold bulk-load; `sh_tip_ready` only if
+/// materialize succeeds. Electrum/Esplora use that gate alone.
 ///
-/// Returns `false` if SH materialize failed or was cancelled (do not treat as
-/// Electrum-ready). On SIGINT mid-reduce, a fan-in **CHECKPOINT** is left so the
-/// next process resumes from the last completed pass.
-pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> bool {
+/// **When `!shindex`:** skip SH bulk; `sh_tip_ready = false`.
+pub(crate) fn enter_tip_mode(
+    query: &Query,
+    cancel: Option<Arc<AtomicBool>>,
+    shindex: bool,
+) -> TipModeGates {
+    query.set_sh_index_enabled(shindex);
+    // Tip index flags first — follow peers must not wait on SH.
+    query.enter_tip_index_mode();
+    info!(
+        "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
+        query.index_mode()
+    );
+
+    if !shindex {
+        info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
+        return TipModeGates {
+            tip_follow_ready: true,
+            sh_tip_ready: false,
+        };
+    }
+
     // Fast path: already materialized and watermarks cover tip (near-tip restart).
     if query.sh_is_tip_ready() {
         let _ = query.sync_sh_seal_from_include_hwm();
-        query.enter_tip_index_mode();
         info!(
-            "node: scripthash tip-ready — skip bulk materialize; mode={:?} rows={}",
-            query.index_mode(),
+            "node: scripthash tip-ready — skip bulk materialize; rows={}",
             query.scripthash_entry_count()
         );
         info!("node: tip-mode complete — safe to start Electrum");
-        return true;
+        return TipModeGates {
+            tip_follow_ready: true,
+            sh_tip_ready: true,
+        };
     }
 
     // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
@@ -817,7 +901,7 @@ pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> 
             warn!("node: scripthash bulk materialize cancelled ({msg})");
             warn!(
                 "node: partial fan-in progress kept (merge/CHECKPOINT or READY) — \
-                 restart to resume; Electrum not ready yet"
+                 restart to resume; Electrum not ready yet (tip follow still on)"
             );
             false
         }
@@ -826,44 +910,49 @@ pub(crate) fn enter_tip_mode(query: &Query, cancel: Option<Arc<AtomicBool>>) -> 
             warn!(
                 "node: Electrum history incomplete until materialize succeeds — \
                  keep store/scripthash.runs (incl. *.run.mat / merge/) and restart; \
-                 finalize will reinit SH tables and cold-load from claims"
+                 tip follow continues without Electrum"
             );
             false
         }
     };
     if !sh_ok {
-        return false;
+        return TipModeGates {
+            tip_follow_ready: true,
+            sh_tip_ready: false,
+        };
     }
 
-    // Fail closed when Class A exists: residual runs mean creates not yet in
-    // durable SH. Empty / genesis-only store has tip_max=0 and is never
-    // "tip-ready" by that metric — still allow Tip index flags.
+    // Fail closed for Electrum when Class A exists: residual runs mean creates
+    // not yet in durable SH. Tip follow already enabled above.
     let tip_max = query.store().txs.count();
     let leftover = query.scripthash_run_count();
     if leftover > 0 {
         warn!(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
-             refusing tip-follow / Electrum until drain succeeds (restart finalize)"
+             Electrum deferred until drain succeeds (restart finalize); tip follow on"
         );
-        return false;
+        return TipModeGates {
+            tip_follow_ready: true,
+            sh_tip_ready: false,
+        };
     }
     if tip_max > 0 && !query.sh_is_tip_ready() {
-        warn!("node: scripthash materialize returned ok but not tip-ready — refusing tip mode");
-        return false;
+        warn!("node: scripthash materialize returned ok but not tip-ready — Electrum deferred");
+        return TipModeGates {
+            tip_follow_ready: true,
+            sh_tip_ready: false,
+        };
     }
 
-    query.enter_tip_index_mode();
-    info!(
-        "node: IndexMode::Tip (tx.head + spend annotations already live; SH durable) mode={:?}",
-        query.index_mode()
-    );
     info!(
         "node: scripthash rows={} (thin creates from runs; spentness = confirmed-strong annotations)",
         query.scripthash_entry_count()
     );
-
     info!("node: tip-mode complete — safe to start Electrum");
-    true
+    TipModeGates {
+        tip_follow_ready: true,
+        sh_tip_ready: true,
+    }
 }
 
 /// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).
@@ -928,10 +1017,38 @@ mod tests {
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
 
-        enter_tip_mode(&q, None);
+        let g = enter_tip_mode(&q, None, true);
+        assert!(g.tip_follow_ready);
+        // Empty store: SH not "tip-ready" by watermark metric, but follow is on.
         assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_tip_mode_shindex_off_skips_sh_and_enables_follow() {
+        use rbitcoin_query::IndexMode;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tip-nosh-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        q.enter_direct_index_mode_sh(false).unwrap();
+        assert!(!q.sh_index_enabled());
+        assert!(!q.sh_run_enabled());
+
+        let g = enter_tip_mode(&q, None, false);
+        assert!(g.tip_follow_ready, "tip follow must not wait on SH");
+        assert!(
+            !g.sh_tip_ready,
+            "Electrum gate stays closed without shindex"
+        );
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        assert!(!q.sh_index_enabled());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1017,6 +1134,7 @@ mod tests {
         cfg.use_seeds = false;
         cfg.connect.clear();
         cfg.milestone_height = 100; // exercise milestone log branch
+        cfg.shindex = true;
         cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
         // max_run_secs=0 exits after catch-up/tip (tip-follow loop uses 60s poll sleeps).
         cfg.max_run_secs = Some(0);
@@ -1039,6 +1157,7 @@ mod tests {
             .with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.use_seeds = false;
         cfg.connect.clear();
+        cfg.shindex = true;
         cfg.esplora_listen = Some("127.0.0.1:0".parse().unwrap());
         cfg.max_run_secs = Some(0);
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
@@ -1083,7 +1202,8 @@ mod tests {
         let q = Query::open_or_create(dir.join("store")).unwrap();
         q.enter_direct_index_mode().unwrap();
         // Empty store: finalize has no runs; still flips to tip.
-        enter_tip_mode(&q, None);
+        let g = enter_tip_mode(&q, None, true);
+        assert!(g.tip_follow_ready);
         assert_eq!(q.index_mode(), IndexMode::Tip);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1134,6 +1254,7 @@ mod tests {
         // (would stall IBD). Empty connect + no seeds → catch-up complete immediately.
         cfg.connect.clear();
         cfg.max_run_secs = Some(0);
+        cfg.shindex = true;
         cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
         cfg.milestone_height = 50;
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
@@ -1220,6 +1341,7 @@ mod tests {
             .with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.use_seeds = false;
         cfg.connect.clear();
+        cfg.shindex = true;
         cfg.electrum_listen = Some(addr); // already bound → fail
         cfg.max_run_secs = Some(0);
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;

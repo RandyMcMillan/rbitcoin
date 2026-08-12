@@ -56,8 +56,31 @@ impl Query {
         self.index_mode_cell.store(mode as u8, Ordering::SeqCst);
     }
 
+    /// Whether Class C builds scripthash (runs in Direct; durable write-through in Tip).
+    ///
+    /// Operator `--shindex` / conf `shindex=1`. Library default is **on** so unit
+    /// tests that call [`Self::enter_direct_index_mode`] keep SH. The node sets
+    /// this **off** when shindex is disabled before Direct enter.
+    #[inline]
+    pub fn sh_index_enabled(&self) -> bool {
+        self.sh_index_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Enable or disable scripthash indexing for subsequent Class C / tip work.
+    pub fn set_sh_index_enabled(&self, on: bool) {
+        self.sh_index_enabled.store(on, Ordering::SeqCst);
+    }
+
+    /// Enter **direct** IBD with scripthash indexing **on** (library / test default).
+    ///
+    /// Prefer [`Self::enter_direct_index_mode_sh`] when the operator knobs `shindex`.
+    pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
+        self.enter_direct_index_mode_sh(true)
+    }
+
     /// Enter **direct** IBD: durable `tx.head` on archive, spend annotations on
-    /// confirm (batch), SH target-sized runs + SEAL (bulk at tip).
+    /// confirm (batch). When `shindex` is true: SH target-sized runs + SEAL (bulk
+    /// at tip). When false: no SH worker, no run enqueue, no Class A recollect.
     ///
     /// Best-effort removes leftover `ibd_utxo.map` / point+tx run dirs from old
     /// Catchup datadirs. Re-collects Class A creates only for a **small** SEAL gap
@@ -66,16 +89,23 @@ impl Query {
     ///
     /// When the durable SH head already covers tip creates (`include_hwm` / SEAL),
     /// skips Class A recollect entirely (tip-follow restart must not re-scan).
-    pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
+    pub fn enter_direct_index_mode_sh(&self, shindex: bool) -> Result<(), QueryError> {
         use crate::sh_builder::{
             durable_sh_inclusion_floor, should_defer_direct_recollect, SH_DIRECT_RECOLLECT_MAX_GAP,
         };
 
+        self.set_sh_index_enabled(shindex);
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
         self.set_tx_index(true);
-        self.sh_run.enable();
         self.drop_legacy_catchup_artifacts()?;
+        if !shindex {
+            rbitcoin_log::info!(
+                "ibd: IndexMode::Direct without scripthash index (shindex off; no SH runs)"
+            );
+            return Ok(());
+        }
+        self.sh_run.enable();
         self.sh_run.refresh_seal();
         let mut seal = self.sh_run.sealed_max_create_fk();
         let tip_max = self.store.txs.count();
@@ -105,7 +135,10 @@ impl Query {
         Ok(())
     }
 
-    /// Flip durable index flags on for tip-follow (after SH bulk materialize).
+    /// Flip durable index flags on for tip-follow (after SH bulk when shindex on).
+    ///
+    /// Does **not** require scripthash readiness — tip follow and mempool relay
+    /// use Class A + spends only.
     pub fn enter_tip_index_mode(&self) {
         self.set_index_mode(IndexMode::Tip);
         self.set_spend_index(true);
@@ -383,6 +416,11 @@ impl Query {
     /// On-disk scripthash sorted-run count (Direct IBD cache).
     pub fn scripthash_run_count(&self) -> usize {
         self.sh_run.on_disk_run_count()
+    }
+
+    /// Whether the Direct-IBD SH run worker is currently enabled.
+    pub fn sh_run_enabled(&self) -> bool {
+        self.sh_run.is_enabled()
     }
 
     /// Re-collect thin SH creates for confirmed txs with `create_fk > SEAL`.

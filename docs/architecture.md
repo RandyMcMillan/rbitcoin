@@ -45,8 +45,11 @@ for unknown-height bodies (mark missing → re-getdata).
 - **Consensus scripts** are verified in **pure Rust** (secp256k1 only as the
   crypto primitive via the rust-bitcoin stack — **no** `libbitcoinconsensus`
   dual-eval).
-- **Electrum** is **native** to the store (scripthash tables), not a second
-  process re-indexing blk files.
+- **Electrum** is **native** to the store (optional **scripthash** tables via
+  `--shindex`, default off), not a second process re-indexing blk files.
+  Tip-follow does **not** wait on SH materialize; Electrum/Esplora do.
+- **JSON-RPC** (optional) is a Core-class **subset** over archive + mempool —
+  see [`rpc.md`](./rpc.md).
 
 ---
 

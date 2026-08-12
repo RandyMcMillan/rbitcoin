@@ -53,8 +53,11 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | | `info` |
 | `--no-seeds` | `--noseeds` | seeds on |
-| `--electrum-listen ADDR` | | disabled |
-| `--esplora-listen ADDR` | | disabled (Esplora REST; plain HTTP) |
+| `--shindex` | conf `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--electrum-listen ADDR` | | disabled (**requires** `--shindex`) |
+| `--esplora-listen ADDR` | | disabled (Esplora REST; **requires** `--shindex`) |
+| `--rpc-listen ADDR` | conf `rpc_listen` | disabled — Core-class JSON-RPC subset |
+| `--rpcuser` / `--rpcpassword` | conf `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
 | `--inhibit-suspend` | | off |
 
 Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
@@ -326,6 +329,27 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - Package accept: `ActiveMempool::accept_package`; experimental wire command `rbtpkg`
   (BIP331 not yet in rust-bitcoin 0.32 `NetworkMessage`).
 
+## Scripthash index (`--shindex`)
+
+Class B **scripthash** reverse index is **optional** (default **off**), analogous
+in *operator spirit* to Core’s heavy reverse indexes — **not** the same as
+Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
+
+| Mode | Behavior |
+|------|----------|
+| **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
+| **on** (`--shindex` / `shindex=1`) | Direct IBD SH runs + tip bulk materialize; Electrum/Esplora may start when SH is tip-ready. |
+
+**Electrum or Esplora without `--shindex` fails at process start** (clear config error).
+
+Order-of-magnitude costs (mainnet-class SSD; not a warranty):
+
+- **During IBD with shindex=1:** modest extra work (run stream); after IBD, bulk materialize is typically **tens of minutes to a few hours**.
+- **Enable after tip already synced:** full recollect/materialize from Class A — **often multi-hour**; tip follow continues; Electrum waits until SH ready.
+- **Disable later:** tables are **left on disk** (no automatic purge). Re-enable may rematerialize.
+
+Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` ≠ `sh_tip_ready`).
+
 ## Electrum
 
 Internet-facing Electrum is supported as a **wallet-client backend** (Electrum,
@@ -334,6 +358,8 @@ reverse proxy**, and rely on the node’s **app DoS limits** always being on. A
 loopback-only bind is convenient with a local proxy, but it is **not** the
 security model by itself.
 
+**Requires `--shindex`.** Without it the node refuses to start.
+
 **Not a graphical explorer.** We serve clients that already know their
 scripthashes / txids; we do **not** aim to back block-explorer search UIs.
 
@@ -341,6 +367,7 @@ scripthashes / txids; we do **not** aim to back block-explorer search UIs.
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
+  --shindex \
   --electrum-listen 127.0.0.1:50001 \
   --log-level info
 ```
@@ -382,6 +409,8 @@ Blockstream-**compatible** **plain HTTP** API for **wallet clients and APIs**
 block-explorer backend. Same internet-facing model as Electrum: app DoS limits
 always on; terminate TLS at a reverse proxy.
 
+**Requires `--shindex`.** Without it the node refuses to start.
+
 **Explicit non-goals:** explorer search/`address-prefix`, Liquid, mining
 templates, mempool.space-style catalogue UI APIs.
 
@@ -389,11 +418,27 @@ templates, mempool.space-style catalogue UI APIs.
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
+  --shindex \
   --esplora-listen 127.0.0.1:3000 \
   --log-level info
 ```
 
-Conf: `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
+Conf: `shindex=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
+
+## Core-class JSON-RPC
+
+Optional HTTP JSON-RPC subset (default **off**). Auth: cookie file under
+`{datadir}/.cookie` or `--rpcuser`/`--rpcpassword`. Does **not** require
+`--shindex` (chain/mempool/rawtx by id only). See [`docs/rpc.md`](./docs/rpc.md)
+and [`COMPAT.md`](./COMPAT.md).
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir ./datadir-mainnet \
+  --network mainnet \
+  --rpc-listen 127.0.0.1:8332 \
+  --log-level info
+```
 
 | Feature | Behavior |
 |---------|----------|

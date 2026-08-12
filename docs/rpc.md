@@ -1,0 +1,90 @@
+# Core-class JSON-RPC (rbitcoin)
+
+rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
+This is **not** full Core parity: no wallet, no mining GBT, no `scantxoutset`,
+no `createrawtransaction`. Prefer **Electrum / Esplora** (with `--shindex`) for
+address/script history.
+
+## Operator knobs
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `--rpc-listen ADDR` / conf `rpc_listen` | **off** | Bind HTTP JSON-RPC |
+| `--rpcuser` / `--rpcpassword` | unset | HTTP Basic credentials |
+| Cookie | **on** when listen set and no user/pass | `{datadir}/.cookie` as `user:password` |
+| `--shindex` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
+
+TLS is external (reverse proxy). Non-loopback binds still use cookie or user/pass
+(always authenticated).
+
+### curl example (cookie)
+
+```bash
+# After node start with --rpc-listen 127.0.0.1:8332
+USERPASS=$(cat datadir/.cookie)
+curl --user "$USERPASS" --data-binary \
+  '{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}' \
+  -H 'content-type: application/json' http://127.0.0.1:8332/
+```
+
+### curl example (user/pass)
+
+```bash
+rbitcoin-node --rpc-listen 127.0.0.1:8332 --rpcuser u --rpcpassword p ...
+curl --user u:p --data-binary \
+  '{"jsonrpc":"1.0","id":"1","method":"getblockchaininfo","params":[]}' \
+  -H 'content-type: application/json' http://127.0.0.1:8332/
+```
+
+## shindex matrix
+
+| Capability | `shindex=0` (default) | `shindex=1` |
+|------------|----------------------|-------------|
+| IBD, tip follow, P2P, mempool relay | Yes | Yes |
+| Node JSON-RPC (by height/hash/txid) | Yes | Yes |
+| Electrum / Esplora listen | **Refuse start** | Yes after SH tip-ready |
+| SH run enqueue / tip bulk | **Skip** | On |
+
+Tip-follow readiness is **independent** of scripthash materialize. Electrum/Esplora
+still wait for durable SH when shindex is on.
+
+## Supported methods (Tier 1)
+
+| Method | Notes |
+|--------|-------|
+| `help` / `getrpcinfo` / `uptime` / `stop` | Control |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
+| `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
+| `getdifficulty` | From tip bits |
+| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | Best-effort; BIP324 v2-only; peer detail stub |
+| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub |
+| `getrawtransaction` | Class A + mempool |
+| `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
+| `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
+| `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
+
+## Permanent gaps (will not match Core)
+
+| Method / area | Why |
+|---------------|-----|
+| Wallet RPC | No keystore |
+| Mining / GBT / `generatetoaddress` | Non-goal |
+| `createrawtransaction` / `combinerawtransaction` | Wallet-adjacent footgun; use external tools |
+| `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate |
+| Address history via Core method names | Use Electrum/Esplora with `--shindex` |
+| Exact Core JSON field-for-field | Best-effort |
+| Multi-user `rpcauth` / method whitelist | Future |
+
+## Auth (current / future)
+
+| Now | Future (not v1) |
+|-----|-----------------|
+| Cookie under datadir | `rpcauth=` multi-user |
+| `--rpcuser` / `--rpcpassword` | `rpcwhitelist` |
+| Always Basic auth when listen set | `rpcallowip` / unix socket |
+
+## Related
+
+- [`COMPAT.md`](../COMPAT.md) — product surface
+- [`OPERATOR.md`](../OPERATOR.md) — flags and shindex tradeoffs
+- [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) — fee product

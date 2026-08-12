@@ -12,8 +12,9 @@ contrasts: [`docs/architecture.md`](./docs/architecture.md). Lab mainnet:
 Full **P2P participant** (blocks + tip-mode tx relay) and **wallet-client
 backends**: in-process **Electrum** (confirmed + unconfirmed, libre-relay-class
 admission) and optional **Esplora-compatible REST** for the same role (history,
-UTXO, broadcast, block/tx fetch by id). Not full Core JSON-RPC / Core wallet /
-mining parity.
+UTXO, broadcast, block/tx fetch by id). Optional **Core-class JSON-RPC subset**
+(see [`docs/rpc.md`](./docs/rpc.md)) — not full Core wallet / mining parity.
+**Scripthash index (`--shindex`) defaults off**; Electrum/Esplora require it.
 
 ### Query surface intent: wallet clients, not graphical explorers
 
@@ -40,8 +41,25 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | Package relay wire | `accept_package` + experimental `rbtpkg` | BIP331 |
 | Pruning / GUI / mining | Not supported | Supported |
-| Wallets | Electrum clients | Descriptor + legacy |
-| Scripthash index | Native on confirm | External ElectrumX / Fulcrum |
+| Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
+| Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass | Full Core RPC |
+
+## Core-class JSON-RPC (subset)
+
+| Method group | Status | Notes |
+|--------------|--------|-------|
+| Control (`help`, `uptime`, `stop`, `getrpcinfo`) | done | |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`) | done | Archive reconstruct |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`) | partial | BIP324 v2-only; peer detail stub |
+| Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy |
+| Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |
+| Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |
+| Wallet / mining / GBT | **never** | Non-goal |
+| `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
+| `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB |
+
+Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 
 ## Electrum surface
 

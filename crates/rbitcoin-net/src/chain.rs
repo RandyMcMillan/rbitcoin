@@ -510,14 +510,19 @@ impl ChainHub {
     }
 
     fn note_confirmed_tip(&self, need_meta: &[(u32, BlockHash)]) -> Result<(), NetError> {
+        // Mempool strip only when tip-mode relay is on. During IBD catch-up,
+        // remove_for_block is a no-op (relay off); purge runs at set_relay_enabled.
         if let Some(mp) = self.mempool() {
-            for &(_height, hash) in need_meta {
-                if let Ok(Some(block)) = self.query.reconstruct_block_by_hash(&hash.to_byte_array())
-                {
-                    let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
-                    let n = mp.remove_for_block(&ids);
-                    if n > 0 {
-                        rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ {hash}");
+            if mp.relay_enabled() {
+                for &(_height, hash) in need_meta {
+                    if let Ok(Some(block)) =
+                        self.query.reconstruct_block_by_hash(&hash.to_byte_array())
+                    {
+                        let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+                        let n = mp.remove_for_block(&ids);
+                        if n > 0 {
+                            rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ {hash}");
+                        }
                     }
                 }
             }
@@ -730,6 +735,7 @@ impl ChainHub {
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
+        // Tip-mode only: remove_for_block no-ops while relay is off (IBD).
         if let Some(mp) = self.mempool() {
             let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
             let n = mp.remove_for_block(&ids);

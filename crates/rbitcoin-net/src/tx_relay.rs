@@ -250,12 +250,65 @@ impl MempoolHub {
             .map_err(|e| format!("mempool compact: {e}"))
     }
 
+    /// Enable/disable peer tx inv/accept (false during IBD catch-up).
+    ///
+    /// **False → true:** bulk-strip txs that are already confirmed-strong on the
+    /// best chain. Per-block [`Self::remove_for_block`] is skipped while relay is
+    /// off so catch-up is not paced by a large durable mempool (mainnet: 40k+
+    /// live after offline). One purge at tip-mode entry is enough before relay.
     pub fn set_relay_enabled(&self, on: bool) {
-        self.relay_enabled.store(on, Ordering::SeqCst);
+        let was = self.relay_enabled.swap(on, Ordering::SeqCst);
+        if on && !was {
+            let n = self.purge_confirmed_on_chain();
+            if n > 0 {
+                rbitcoin_log::info!(
+                    "mempool: purged {n} confirmed tx(s) at tip-mode entry (deferred during IBD)"
+                );
+            }
+        }
     }
 
     pub fn relay_enabled(&self) -> bool {
         self.relay_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Drop every live mempool entry whose create is confirmed-strong on tip.
+    ///
+    /// Used once when enabling relay after catch-up. Compacts durable slots if
+    /// DEAD dominates. Returns how many txs removed.
+    pub fn purge_confirmed_on_chain(&self) -> usize {
+        let live: Vec<Txid> = {
+            let g = self.inner.lock().unwrap();
+            g.graph.iter().map(|(t, _)| *t).collect()
+        };
+        if live.is_empty() {
+            return 0;
+        }
+        let mut to_drop: Vec<Txid> = Vec::new();
+        for tid in &live {
+            let tid_b = tid.to_byte_array();
+            let confirmed = match self.query.store().get_fk_by_txid(&tid_b) {
+                Ok(Some(fk)) => self.query.store().is_confirmed_strong(fk).unwrap_or(false),
+                _ => false,
+            };
+            if confirmed {
+                to_drop.push(*tid);
+            }
+        }
+        if to_drop.is_empty() {
+            return 0;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let mut n = 0usize;
+        for tid in &to_drop {
+            if g.graph.contains(tid) && g.remove_txid(tid).is_ok() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            let _ = g.maybe_compact();
+        }
+        n
     }
 
     pub fn subscribe_announces(&self) -> broadcast::Receiver<MempoolAnnounce> {
@@ -419,7 +472,14 @@ impl MempoolHub {
     ///
     /// Samples removed entries' feerates into confirm-memory for the standard
     /// 10-minute fee estimate floor.
+    ///
+    /// **No-op while relay is disabled** (IBD catch-up). Callers must not rely
+    /// on per-block strip until [`Self::set_relay_enabled`]`(true)` has run the
+    /// deferred [`Self::purge_confirmed_on_chain`].
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
+        if !self.relay_enabled() {
+            return 0;
+        }
         let utxo = QueryUtxoProvider {
             query: self.query.as_ref(),
         };
@@ -750,6 +810,27 @@ mod tests {
         let decoded = decode_len_prefixed_package(&payload).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].compute_txid(), tx.compute_txid());
+    }
+
+    /// While relay is off, per-block remove is deferred; enabling relay runs purge.
+    #[test]
+    fn remove_for_block_skipped_until_relay_then_purge() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        assert!(!mp.relay_enabled());
+        let dummy = Txid::from_byte_array([9u8; 32]);
+        // No-op while relay off (IBD catch-up must not strip per block).
+        assert_eq!(mp.remove_for_block(&[dummy]), 0);
+        // Enabling relay runs purge (empty → 0) and arms per-block strip.
+        mp.set_relay_enabled(true);
+        assert!(mp.relay_enabled());
+        assert_eq!(mp.purge_confirmed_on_chain(), 0);
+        // Still no-op for unknown txid, but path is live.
+        assert_eq!(mp.remove_for_block(&[dummy]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]

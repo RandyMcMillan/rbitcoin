@@ -132,8 +132,9 @@ which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`cove
 From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets
 `CARGO_TARGET_DIR=target/dev` so host test/clippy objects stay out of the
 coverage tree (`target/cov` via `./scripts/coverage.sh`). Musl ship binaries
-still come only from `nix build .#rbitcoin-musl` → install into
-`target/release/` (operator path; not the cargo debug target).
+come only from `nix build .#rbitcoin-musl` → install into `target/release/`
+(operator path; not the cargo debug target) — and **only on `master` after
+commit** (see below).
 
 ```bash
 cargo fmt --all -- --check          # if dirty: cargo fmt --all
@@ -160,11 +161,11 @@ When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs
 | Phase | Expectation |
 |-------|-------------|
 | **Each intermediate step** | Targeted tests for crates/modules touched; logical commits with public hygiene. Do **not** require full workspace suite, full coverage, or musl install after every slice. |
-| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%), **one** musl build + install. |
+| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%). **Musl only if** the work is finished **on `master` after commit** (merge/rebase first if the plan lived on a feature branch). |
 | **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `multinode` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
 
-Single-shot turns (one bugfix, no multi-step plan) still follow the full commit
-recipe below including musl when code changes.
+Single-shot turns (one bugfix, no multi-step plan) follow the commit recipe
+below; musl only when that commit lands on **`master`**.
 
 ### Coverage job
 
@@ -199,15 +200,30 @@ Whenever a turn **changes code** (or you finish a multi-step coding task in that
    workspace suite when finishing a plan or for single-shot turns). A commit that
    would fail GitHub Actions `test` is incomplete work if pushed.
 2. **Commit** following the public hygiene table above. Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-3. **Musl install:** for **single-shot** code-changing turns, rebuild and install
-   the portable static musl release so `./target/release/rbitcoin-node` matches
-   the tree. For **multi-step plan execution**, defer musl to the **final plan
-   step** (with full suite + coverage) — do not `nix build .#rbitcoin-musl` after
-   every intermediate slice.
+3. **Musl install (strict):** build and install the portable static musl release
+   **only when both** hold:
+   - current branch is **`master`** (or `main` if that is the default); and
+   - the tree is **clean after a successful commit** of the change (or the
+     commit that finished a multi-step plan on master).
 
-### Required recipe (only this — single `nix build`)
+   | Situation | Musl? |
+   |-----------|--------|
+   | Feature / plan branch (`rpc/…`, `feat/…`, …) | **No** — even at plan end on that branch |
+   | On `master`, after commit of code that ships in the node/cli | **Yes** — one `nix build .#rbitcoin-musl` + install (recipe below) |
+   | Uncommitted dirty tree | **No** — commit first; never install from uncommitted work |
+   | Cannot commit (hooks, secrets, user said not to) | **No** musl; say the tree was not committed and ship binary was **not** refreshed |
+   | Pure docs/discussion, no compile-affecting edits | Skip commit and musl |
+
+   Multi-step plans: no musl on intermediate slices; at plan end, full suite +
+   coverage on the plan branch as usual, then **merge/rebase to master, commit
+   if needed, then one musl** so `./target/release/rbitcoin-node` matches master.
+
+### Required recipe (only this — single `nix build`; **master + post-commit only**)
 
 ```bash
+# Preconditions (do not skip):
+#   git branch --show-current   # must be master (or main)
+#   git status -sb              # clean working tree after the commit
 nix build .#rbitcoin-musl --out-link result
 mkdir -p target/release
 install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
@@ -225,9 +241,12 @@ build --release`.
 |---------|------|
 | `./scripts/repro-check.sh` | **Release / digest gate only** — realize + **two** forced `--rebuild`s. Slow by design. Never as the post-edit install step. |
 | `./scripts/repro-check.sh both` | Even heavier (musl + glibc). Release only. |
+| `nix build .#rbitcoin-musl` on a feature branch | Agent workflow: **never** — only on master after commit |
+| `nix build .#rbitcoin-musl` with uncommitted edits | **Never** — commit first |
 
-Day-to-day portable install = **one** `nix build .#rbitcoin-musl` (recipe above).
-Byte-identity claims for a revision = `./scripts/repro-check.sh` once at release.
+On master after commit, portable install = **one** `nix build .#rbitcoin-musl`
+(recipe above). Byte-identity claims for a revision = `./scripts/repro-check.sh`
+once at release.
 
 ### Forbidden for the operator binary
 
@@ -238,11 +257,8 @@ Byte-identity claims for a revision = `./scripts/repro-check.sh` once at release
 | Leaving `target/release/` as the last **debug** or glibc build | User restarts IBD from that path |
 
 `nix-shell` / `cargo test` for **tests** is fine. Only the **shipped** node/cli
-under `target/release/` must come from `nix build .#rbitcoin-musl`.
-
-Skip commit/build only when the turn was pure discussion with no
-compile-affecting edits. If you cannot commit (hooks, secrets, user said not
-to), still do the static musl install and say the tree was **not** committed.
+under `target/release/` must come from `nix build .#rbitcoin-musl` (and only
+refreshed from master post-commit per the table above).
 
 ## How we plan
 

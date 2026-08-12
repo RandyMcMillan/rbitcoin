@@ -1253,9 +1253,7 @@ mod tests {
     /// wtxid lookup, package announce, and spent outpoints.
     #[test]
     fn hub_live_accept_fee_scripthash_and_package() {
-        use bitcoin::block::{Header, Version as BlockVersion};
         use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Block, CompactTarget, Target, TxMerkleNode};
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
         use rbitcoin_store::script_hash;
@@ -1267,72 +1265,19 @@ mod tests {
         let mp_dir = tmp();
         let q = Query::open_or_create(&store_dir).unwrap();
         let params = ChainParams::regtest();
-        let ms = Milestone::NONE;
-
-        fn coinbase(height: u32) -> Transaction {
-            let mut ss = if height == 0 {
-                vec![0x00]
-            } else {
-                rbitcoin_consensus::bip34_height_script(height)
-            };
-            while ss.len() < 2 {
-                ss.push(0x00);
-            }
-            Transaction {
-                version: TxVersion::ONE,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint::null(),
-                    script_sig: ScriptBuf::from_bytes(ss),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(50_0000_0000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE
-                }],
-            }
-        }
-        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
-            let bits = CompactTarget::from_consensus(0x207f_ffff);
-            let header = Header {
-                version: BlockVersion::ONE,
-                prev_blockhash: prev,
-                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-                time,
-                bits,
-                nonce: 0,
-            };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
-            };
-            block.header.merkle_root = block.compute_merkle_root().unwrap();
-            let target = Target::from_compact(bits);
-            for nonce in 0..u32::MAX {
-                block.header.nonce = nonce;
-                if block.header.validate_pow(target).is_ok() {
-                    break;
-                }
-            }
-            block
-        }
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-        let mut tip = genesis.block_hash();
-        let mut tip_time = genesis.header.time;
-        // Early coinbases + maturity pad so mempool coinbase maturity (100) is met.
-        let mut coinbase_txids = Vec::new();
-        for h in 1u32..=103 {
-            let b = mine(tip, tip_time + 600, h);
-            if h <= 3 {
-                coinbase_txids.push(b.txdata[0].compute_txid());
-            }
-            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-            tip = b.block_hash();
-            tip_time = b.header.time;
-        }
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        // Early coinbases + maturity pad (shared helper).
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            103,
+            3,
+        );
 
         let q_arc = Arc::new(q);
         let hub = MempoolHub::open(&mp_dir, Arc::clone(&q_arc)).unwrap();
@@ -1459,9 +1404,7 @@ mod tests {
     /// work (lock ≈ wall while scripts/durable still run under the hub mutex).
     #[test]
     fn accept_stage_meters_and_baseline_harness() {
-        use bitcoin::block::{Header, Version as BlockVersion};
         use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Block, CompactTarget, Target, TxMerkleNode};
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
 
@@ -1472,73 +1415,19 @@ mod tests {
         let mp_dir = tmp();
         let q = Query::open_or_create(&store_dir).unwrap();
         let params = ChainParams::regtest();
-        let ms = Milestone::NONE;
-
-        fn coinbase(height: u32) -> Transaction {
-            let mut ss = if height == 0 {
-                vec![0x00]
-            } else {
-                rbitcoin_consensus::bip34_height_script(height)
-            };
-            while ss.len() < 2 {
-                ss.push(0x00);
-            }
-            Transaction {
-                version: TxVersion::ONE,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint::null(),
-                    script_sig: ScriptBuf::from_bytes(ss),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(50_0000_0000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-                }],
-            }
-        }
-        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
-            let bits = CompactTarget::from_consensus(0x207f_ffff);
-            let header = Header {
-                version: BlockVersion::ONE,
-                prev_blockhash: prev,
-                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-                time,
-                bits,
-                nonce: 0,
-            };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
-            };
-            block.header.merkle_root = block.compute_merkle_root().unwrap();
-            let target = Target::from_compact(bits);
-            for nonce in 0..u32::MAX {
-                block.header.nonce = nonce;
-                if block.header.validate_pow(target).is_ok() {
-                    break;
-                }
-            }
-            block
-        }
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-        let mut tip = genesis.block_hash();
-        let mut tip_time = genesis.header.time;
-        let mut coinbase_txids = Vec::new();
-        // Maturity pad + a few spends for the harness.
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         const N_SPENDS: u32 = 4;
-        for h in 1u32..=(100 + N_SPENDS) {
-            let b = mine(tip, tip_time + 600, h);
-            if h <= N_SPENDS {
-                coinbase_txids.push(b.txdata[0].compute_txid());
-            }
-            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-            tip = b.block_hash();
-            tip_time = b.header.time;
-        }
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            100 + N_SPENDS,
+            N_SPENDS,
+        );
 
         let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
         hub.set_relay_enabled(true);

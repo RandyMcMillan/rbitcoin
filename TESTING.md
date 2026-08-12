@@ -116,6 +116,10 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 ### Mature-chain fixtures
 
+Electrum hub tests and `MempoolHub` accept harnesses use
+`rbitcoin_consensus::pad_empty_from` for coinbase-maturity pads (not a local
+`1..=103` POW remine loop).
+
 Do **not** re-mine a 100-block maturity pad with per-height `confirm_wire_run`. Use:
 
 ```rust

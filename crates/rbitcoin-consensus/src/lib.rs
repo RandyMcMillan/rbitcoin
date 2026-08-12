@@ -8,6 +8,7 @@ mod header;
 mod milestone;
 mod params;
 pub mod policy;
+mod regtest_pad;
 mod script;
 mod script_pool;
 mod signet;
@@ -121,6 +122,7 @@ pub use header::{expected_next_bits, median_time_past, validate_header};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
 pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
+pub use regtest_pad::{mine_empty_regtest, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 
 pub fn crate_name() -> &'static str {

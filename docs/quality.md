@@ -120,7 +120,7 @@ MSRV drift, etc.).
 | **Q-34** | **First-hour tutorial** | Regtest mine → Electrum query → one Esplora GET |
 | **Q-35** | **Mainnet soak narrative** | Documented operator soak checklist; optional public tip height badge |
 | **Q-36** | **Perf log diet** | Shorter default INFO; DEBUG keeps full meters |
-| **Q-37** | **Warm suite &lt;2 min** | Living budget in TESTING.md actually met on CI-class host. **R-03** removes remine pads (start); full ≤3 min wall not re-measured unless cheap |
+| **Q-37** | **Warm suite &lt;2 min** | Living budget in TESTING.md. **R-03 started:** electrum/hub default tests use `pad_empty_from`; full ≤3 min wall not re-measured unless cheap |
 | **Q-38** | **Tier-C multinode in CI (optional)** | Heavy mesh / 48-block / multi-hop remain `#[ignore]` + `scripts/integration.sh`; only promote if wall budget fits without flaking |
 
 ### P4 — Explicit non-goals (until a pillar above is green)

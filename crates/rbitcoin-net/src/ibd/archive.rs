@@ -292,8 +292,8 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
             if ht == path_lo && hub.tip_height().is_some() {
                 warn!(
                     "ibd: tip+1={ht} {hash} is in confirmed-set while tip={} — \
-                     confirmed[] likely maps an earlier height to tip+1; run \
-                     rbitcoin-rebuild-headers --write (scrubs stolen tip+1)",
+                     confirmed[] likely maps an earlier height to tip+1; \
+                     restart after tip revalidate / open repair (or fresh datadir)",
                     hub.tip_height().unwrap_or(0)
                 );
             }

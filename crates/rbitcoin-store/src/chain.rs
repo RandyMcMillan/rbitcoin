@@ -982,6 +982,21 @@ mod chain_table_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn header_txs_contains_tx_range_edges() {
+        let dir = tmp();
+        let ht = HeaderTxsTable::create(&dir).unwrap();
+        assert!(!ht.contains_tx(Fk(1), Fk::NULL).unwrap());
+        assert!(!ht.contains_tx(Fk(1), Fk(1)).unwrap(), "no body");
+        ht.put_range(Fk(1), Fk(10), 3).unwrap();
+        assert!(ht.contains_tx(Fk(1), Fk(10)).unwrap());
+        assert!(ht.contains_tx(Fk(1), Fk(12)).unwrap());
+        assert!(!ht.contains_tx(Fk(1), Fk(9)).unwrap());
+        assert!(!ht.contains_tx(Fk(1), Fk(13)).unwrap());
+        assert!(!ht.contains_tx(Fk(2), Fk(10)).unwrap(), "other header");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Per-header **contiguous** tx_fk range (Class A archive body association).
@@ -1117,6 +1132,20 @@ impl HeaderTxsTable {
 
     pub fn has_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
         Ok(self.get_range(header_fk)?.is_some())
+    }
+
+    /// True if `tx_fk` is in this header's contiguous Class A body range.
+    pub fn contains_tx(&self, header_fk: Fk, tx_fk: Fk) -> Result<bool, StoreError> {
+        let Some(tid) = tx_fk.get() else {
+            return Ok(false);
+        };
+        let Some((first, n)) = self.get_range(header_fk)? else {
+            return Ok(false);
+        };
+        let Some(lo) = first.get() else {
+            return Ok(false);
+        };
+        Ok(tid >= lo && tid < lo.saturating_add(u64::from(n)))
     }
 
     /// Drop Class A body association for `header_fk` (does not free tx rows).

@@ -286,40 +286,18 @@ Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block c
 
 | Symptom | Cause | Fix |
 |---------|--------|-----|
-| `known≈982k` while peers ~961k, absurd resume walk | False `prev_fk` / duplicate header edges | `rbitcoin-rebuild-headers` below |
-| `tip=H` but tip **hash** is a short orphan sibling; peers ahead; store already has a longer mainnet header path | Stale confirmed tip; need most-work **explore + reorg** | Restart a node with sibling-fork resume (no rebuild-headers). If tip hash ≠ best header at that height, expect reorg once bodies densify |
+| `known≈982k` while peers ~961k, absurd resume walk | False `prev_fk` / duplicate header edges | Prefer a **fresh datadir**; header rows are hash-unique on write |
+| `tip=H` but tip **hash** is a short orphan sibling; peers ahead | Stale confirmed tip; most-work **explore + reorg** | Restart; expect reorg once bodies densify |
+| Stuck on tip+1: `prevout already spent` / many re-rejects of same block | Orphan Class C (second Class A+C copy at tip height) | Fixed on open: `repair_orphan_class_c` + confirmed-strong **membership** |
 
-**Header graph repair (false `prev_fk` only):** If IBD
-resume seeds an absurd `ready_to` far above peer horizon (e.g. `known≈982k` while
-peers advertise ~961k) and logs `empty headers but lag=…`, the Class A header
-table may contain **false parent edges** (duplicate rows / `prev_fk` that does
-not match the prev committed in the block hash). Stop the node and run:
-
-```bash
-# from a nix develop / built store bin
-cargo run -p rbitcoin-store --release --bin rbitcoin-rebuild-headers -- \
-  --datadir ./datadir-mainnet --dry-run
-cargo run -p rbitcoin-store --release --bin rbitcoin-rebuild-headers -- \
-  --datadir ./datadir-mainnet --write
-```
-
-The tool re-links the confirmed chain when safe, **nulls** every non-null
-`prev_fk` whose hash does not verify against the parent row, and **scrubs**
-confirmed heights that wrongly point at tip / tip+1 (that made `has_block(tip+1)`
-true while tip stayed mid-chain — confirm never claimed tip+1). Resume walk
-should drop from a poisoned multi-tens-of-thousands path to the real unconfirmed
-extension. New writes go through a unique-by-hash header gate. Prefer a fresh
-datadir if corruption is widespread.
-
-After `--write`, restart the node; expect `Class A rehydrate filled N…` and tip
-advance from the next block.
-
-**Every open:** the node revalidates the last **six** confirmed heights (header
-`prev_fk`/hash chain, Class A range bounds, merkle from `txid.body`) and may
-**shrink tip** or clear a bad body association if something fails. Look for
+**Every open:** the node (1) repairs Class C **above** tip, (2) repairs **orphan**
+Class C at `h ≤ tip` not linked from `confirmed[h]`’s `header_txs`, (3) revalidates
+the last **six** confirmed heights (header `prev_fk`/hash chain, Class A range
+bounds, merkle from `txid.body`) and may **shrink tip** or clear a bad body if
+something fails. Look for `rbitcoin: repaired … orphan Class C` and
 `rbitcoin: tip revalidate …` on stderr. That is intentional Core-style
-`checkblocks=6` behavior — not a full reindex. Mid-chain header graph poison
-still needs offline `rbitcoin-rebuild-headers` or a clean datadir.
+`checkblocks=6` + crash/race healing — not a full reindex. Widespread mid-chain
+header graph poison still means a clean datadir.
 
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
 is damaged or an old 4k-slot table was left wedged, stop the node and delete that

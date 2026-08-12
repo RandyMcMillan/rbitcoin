@@ -27,7 +27,6 @@ mod integrity;
 mod io_backend;
 mod open_address;
 mod point_table;
-pub mod rebuild_headers;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;

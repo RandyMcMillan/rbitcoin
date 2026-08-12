@@ -24,9 +24,6 @@ getrandom = "0.4"
 name = "rbitcoin-store-bench"
 path = "src/bin/store_bench.rs"
 
-[[bin]]
-name = "rbitcoin-rebuild-headers"
-path = "src/bin/rebuild_headers.rs"
 
 [[bench]]
 name = "spend_batch"

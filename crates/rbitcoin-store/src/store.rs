@@ -648,12 +648,17 @@ impl Store {
         self.spenders.count()
     }
 
-    /// True if `tx_fk` is strong **and** its create height is on the confirmed tip.
+    /// True if `tx_fk` is strong **and** sits on the confirmed tip chain.
     ///
     /// Class C writes set `strong_tx` / `tx_height` before advancing `confirmed[]`
     /// (tip is the commit point). After a hard kill mid-batch, strong bits may sit
     /// above tip; those must not count as best-chain spent (else re-confirm of
     /// tip+1 fails with PrevoutSpent).
+    ///
+    /// Height ≤ tip alone is insufficient: the tx must appear in `header_txs` of
+    /// `confirmed[height]`. A concurrent tip accept can leave a second Class A+C
+    /// copy with the same height but not linked from `confirmed[]` — those
+    /// orphans must not poison spentness.
     pub fn is_confirmed_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         self.is_confirmed_strong_at(tx_fk, tip)
@@ -670,9 +675,19 @@ impl Store {
             return Ok(false);
         };
         match tip {
-            Some(tip) if h <= tip => Ok(true),
-            _ => Ok(false),
+            Some(t) if h <= t => {}
+            _ => return Ok(false),
         }
+        let Some(header_fk) = self.confirmed.get(Height(h))? else {
+            return Ok(false);
+        };
+        self.header_body_contains(header_fk, tx_fk)
+    }
+
+    /// True if `tx_fk` is in the Class A body association for `header_fk`.
+    #[inline]
+    pub fn header_body_contains(&self, header_fk: Fk, tx_fk: Fk) -> Result<bool, StoreError> {
+        self.header_txs.contains_tx(header_fk, tx_fk)
     }
 
     /// True if any annotated spender for this outpoint is confirmed-strong.
@@ -812,6 +827,81 @@ impl Store {
             }
         }
         Ok(cleared)
+    }
+
+    /// Clear `strong_tx` + `tx_height` for Class C at `h ≤ tip` not in
+    /// `header_txs` of `confirmed[h]` (orphan second Class A+C copy).
+    ///
+    /// Complements [`Self::repair_class_c_above_tip`] (`h > tip` only).
+    pub fn repair_orphan_class_c(&self) -> Result<u64, StoreError> {
+        let Some(tip) = self.confirmed.tip_height().map(|t| t.0) else {
+            return Ok(0);
+        };
+        // Precompute contiguous body ranges for 0..=tip (O(tip) once; membership O(1)).
+        let mut ranges: Vec<Option<(u64, u64)>> = Vec::with_capacity(tip as usize + 1);
+        for h in 0..=tip {
+            let r = match self.confirmed.get(Height(h))? {
+                Some(hfk) => self
+                    .header_txs
+                    .get_range(hfk)?
+                    .and_then(|(f, n)| f.get().map(|lo| (lo, lo.saturating_add(u64::from(n))))),
+                None => None,
+            };
+            ranges.push(r);
+        }
+        let mut to_clear: Vec<u64> = Vec::new();
+        self.tx_height.for_each_set(|tx_fk, h| {
+            if h > tip {
+                return Ok(());
+            }
+            let Some(id) = tx_fk.get() else {
+                return Ok(());
+            };
+            let in_body = match ranges.get(h as usize).and_then(|o| o.as_ref()) {
+                Some(&(lo, hi)) => id >= lo && id < hi,
+                None => false,
+            };
+            if !in_body {
+                to_clear.push(id);
+            }
+            Ok(())
+        })?;
+        if to_clear.is_empty() {
+            return Ok(0);
+        }
+        to_clear.sort_unstable();
+        let mut cleared = 0u64;
+        let mut run_start = to_clear[0];
+        let mut run_end = to_clear[0] + 1;
+        for &id in to_clear.iter().skip(1) {
+            if id == run_end {
+                run_end = id + 1;
+                continue;
+            }
+            cleared += self.clear_class_c_run(run_start, run_end)?;
+            run_start = id;
+            run_end = id + 1;
+        }
+        cleared += self.clear_class_c_run(run_start, run_end)?;
+        Ok(cleared)
+    }
+
+    fn clear_class_c_run(&self, start: u64, end: u64) -> Result<u64, StoreError> {
+        if end <= start {
+            return Ok(0);
+        }
+        let count = end - start;
+        if count <= u64::from(u32::MAX) {
+            let n = count as u32;
+            self.strong_tx.set_unstrong_range(Fk(start), n)?;
+            self.tx_height.clear_range(Fk(start), n)?;
+        } else {
+            for id in start..end {
+                self.strong_tx.set_unstrong(Fk(id))?;
+                self.tx_height.clear(Fk(id))?;
+            }
+        }
+        Ok(count)
     }
 
     /// Flush Class C **except** `confirmed[]` (pre-tip half of the barrier).
@@ -1245,8 +1335,15 @@ mod tests {
         s.put_spend_batch_by_create_ranged(&[(create_fk, 1, spend_fk, off, len)])
             .unwrap();
 
-        // Class C: confirm spenders + heights.
+        // Class C: confirm spenders + heights. Body list must include spend_fk
+        // (membership is part of is_confirmed_strong).
         s.confirmed.set(Height(0), hfk).unwrap();
+        // Contiguous body covering create..spend (sequential put order).
+        let body_first = create_fk.0.min(spend_fk.0);
+        let body_last = create_fk.0.max(spend_fk.0);
+        s.header_txs
+            .put_range(hfk, Fk(body_first), (body_last - body_first + 1) as u32)
+            .unwrap();
         s.strong_tx.set_strong(spend_fk, hfk).unwrap();
         s.tx_height.set(spend_fk, Height(0)).unwrap();
         assert!(s.is_confirmed_strong(spend_fk).unwrap());
@@ -1276,7 +1373,6 @@ mod tests {
         let heights = s.tx_height_get_batch(&[spend_fk, create_fk]).unwrap();
         assert_eq!(heights[0], Some(0));
 
-        s.header_txs.put_range(hfk, create_fk, 1).unwrap();
         assert_eq!(s.archived_block_count().unwrap(), 1);
         s.flush_header_archive().unwrap();
         s.flush_index_tables().unwrap();
@@ -1431,6 +1527,7 @@ mod tests {
             let s = Store::create(&dir).unwrap();
             // Genesis tip: height 0 → header fk 1, one strong tx.
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1474,6 +1571,7 @@ mod tests {
         {
             let s = Store::create(&dir).unwrap();
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1481,6 +1579,7 @@ mod tests {
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
             s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
             s.flush_class_c_tip().unwrap();
         }
         let s = Store::open(&dir).unwrap();
@@ -1504,6 +1603,7 @@ mod tests {
         {
             let s = Store::create(&dir).unwrap();
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1531,9 +1631,11 @@ mod tests {
             let s = Store::create(&dir).unwrap();
             // Tip 0 + tip 1 fully durable.
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
             s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1571,9 +1673,11 @@ mod tests {
         {
             let s = Store::create(&dir).unwrap();
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
             s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1601,9 +1705,11 @@ mod tests {
         {
             let s = Store::create(&dir).unwrap();
             s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
             s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.header_txs.put_range(Fk(2), Fk(2), 1).unwrap();
             s.strong_tx.set_strong(Fk(2), Fk(2)).unwrap();
             s.tx_height.set(Fk(2), Height(1)).unwrap();
             s.flush_class_c_tip().unwrap();
@@ -1621,6 +1727,70 @@ mod tests {
         assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
         assert!(!s.is_confirmed_strong(Fk(2)).unwrap());
         assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Orphan Class C at tip height (second body not in confirmed header_txs)
+    /// must not count as confirmed-strong, and repair_orphan_class_c clears it.
+    #[test]
+    fn orphan_class_c_at_tip_height_not_confirmed_strong_and_repairable() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        // Real tip body: txs 1..=2 under header 1.
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
+        s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
+        s.tx_height.set_range(Fk(1), 2, Height(0)).unwrap();
+        // Orphan second copy: txs 3..=4 strong at same height, not in header_txs.
+        s.strong_tx.set_strong_range(Fk(3), 2, Fk(99)).unwrap();
+        s.tx_height.set_range(Fk(3), 2, Height(0)).unwrap();
+        s.flush_class_c_tip().unwrap();
+
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        assert!(s.is_confirmed_strong(Fk(2)).unwrap());
+        assert!(
+            !s.is_confirmed_strong(Fk(3)).unwrap(),
+            "orphan at tip height must not be confirmed-strong"
+        );
+        assert!(!s.is_confirmed_strong(Fk(4)).unwrap());
+
+        let n = s.repair_orphan_class_c().unwrap();
+        assert!(n >= 2, "cleared={n}");
+        assert!(!s.strong_tx.is_strong(Fk(3)).unwrap());
+        assert_eq!(s.tx_height.get(Fk(3)).unwrap(), None);
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        assert_eq!(s.repair_orphan_class_c().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No tip → repair is a no-op; gapped orphans clear as separate runs.
+    #[test]
+    fn repair_orphan_class_c_empty_tip_and_gapped_orphans() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            assert_eq!(s.repair_orphan_class_c().unwrap(), 0);
+            // Tip body 1..=2; orphans 5 and 10 (non-adjacent → two clear runs).
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
+            s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
+            s.tx_height.set_range(Fk(1), 2, Height(0)).unwrap();
+            s.strong_tx.set_strong(Fk(5), Fk(99)).unwrap();
+            s.tx_height.set(Fk(5), Height(0)).unwrap();
+            s.strong_tx.set_strong(Fk(10), Fk(99)).unwrap();
+            s.tx_height.set(Fk(10), Height(0)).unwrap();
+            s.flush_class_c_tip().unwrap();
+            let n = s.repair_orphan_class_c().unwrap();
+            assert_eq!(n, 2, "cleared gapped orphans");
+            assert!(!s.strong_tx.is_strong(Fk(5)).unwrap());
+            assert!(!s.strong_tx.is_strong(Fk(10)).unwrap());
+            assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+            // Height above tip is left for repair_class_c_above_tip.
+            s.strong_tx.set_strong(Fk(20), Fk(1)).unwrap();
+            s.tx_height.set(Fk(20), Height(9)).unwrap();
+            assert_eq!(s.repair_orphan_class_c().unwrap(), 0);
+            assert!(s.strong_tx.is_strong(Fk(20)).unwrap());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -731,18 +731,16 @@ pub(super) fn wire_lookup_phase(
                 .archive_plan_batch_owned(&mut need)
                 .map_err(ConsensusError::from)?,
         };
+        // Expand each header body range to ordered create fks.
         let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
         for &(hfk, first, n) in &plan.per_header_ranges {
             let Some(hid) = hfk.get() else { continue };
-            let start = plan
-                .planned_fks
-                .iter()
-                .position(|f| *f == first)
-                .unwrap_or(0);
-            let n = n as usize;
-            let slice = plan.planned_fks
-                [start..start.saturating_add(n).min(plan.planned_fks.len())]
-                .to_vec();
+            let mut slice = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                slice.push(rbitcoin_primitives::Fk(
+                    first.0.saturating_add(u64::from(i)),
+                ));
+            }
             by_header.insert(hid, slice);
         }
         for (i, m) in metas.iter_mut().enumerate() {

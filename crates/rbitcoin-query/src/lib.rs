@@ -1020,6 +1020,16 @@ impl Query {
                 "rbitcoin: repaired {repaired} Class C tx rows above confirmed tip (partial confirm / kill -9)"
             );
         }
+        // Orphan Class C at h≤tip not linked from confirmed[h] header_txs
+        // (concurrent tip accept double Class A+C). Poison spentness otherwise.
+        let orphan = store.repair_orphan_class_c()?;
+        if orphan > 0 {
+            eprintln!(
+                "rbitcoin: repaired {orphan} orphan Class C tx rows (strong/height not on confirmed header_txs)"
+            );
+            let _ = store.strong_tx.flush();
+            let _ = store.tx_height.flush();
+        }
         // Core checkblocks-style tip window (structure + Class A merkle) before
         // any P2P tip extension. Shrinks tip / clears bad bodies on failure.
         let reval = store.revalidate_tip_window()?;

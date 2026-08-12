@@ -48,6 +48,8 @@ pub struct ChainHub {
     tip_tx: broadcast::Sender<TipEvent>,
     /// Best-chain confirmed block hashes (O(1) `has_block` for IBD hot path).
     confirmed: Arc<RwLock<HashSet<BlockHash>>>,
+    /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
+    connect_lock: std::sync::Mutex<()>,
     /// Optional cluster mempool (tip-mode tx relay + confirm remove).
     ///
     /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
@@ -70,6 +72,7 @@ impl ChainHub {
             notify: Arc::new(Notify::new()),
             tip_tx,
             confirmed,
+            connect_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
         }
     }
@@ -95,6 +98,10 @@ impl ChainHub {
     /// Peers never re-serve genesis via `getheaders` after the common ancestor;
     /// an empty store must start with height 0 locally.
     pub fn ensure_genesis(&self) -> Result<(), NetError> {
+        if self.tip_height().is_some() {
+            return Ok(());
+        }
+        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.tip_height().is_some() {
             return Ok(());
         }
@@ -534,12 +541,15 @@ impl ChainHub {
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
     pub fn accept_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
-        // O(1) tip-hash check before set lookup — stops multi-peer re-accept of the
-        // same tip block (mainnet: several UpdateTip lines for one height).
-        if self.tip_hash() == Some(hash) {
+        // Fast path without lock (common AlreadyHave).
+        if self.tip_hash() == Some(hash) || self.has_block(&hash) {
             return Ok(AcceptOutcome::AlreadyHave);
         }
-        if self.has_block(&hash) {
+
+        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Same hash already tip/confirmed (or won a concurrent accept): drop —
+        // do not plan Class A or assign create fks a second time (I4).
+        if self.tip_hash() == Some(hash) || self.has_block(&hash) {
             return Ok(AcceptOutcome::AlreadyHave);
         }
 
@@ -601,6 +611,7 @@ impl ChainHub {
     /// Connect a contiguous branch `[blocks[0]…blocks[n]]` where `blocks[0].prev` is on our chain.
     /// Reorgs if the new path has strictly more work than our path from the fork.
     pub fn accept_branch(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
+        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
         if blocks.is_empty() {
             return Err(NetError::Protocol("empty branch"));
         }
@@ -1216,6 +1227,60 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// Multi-peer concurrent accept of the same tip block: exactly one Accepted,
+    /// rest AlreadyHave; single tip height; no orphan Class C outside tip body.
+    #[test]
+    fn concurrent_same_block_accept_no_orphan_class_c() {
+        use std::sync::Arc;
+        let (dir, hub) = tmp_hub();
+        let hub = Arc::new(hub);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_000, 1);
+        let n = 8usize;
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let h = Arc::clone(&hub);
+            let b = b1.clone();
+            handles.push(std::thread::spawn(move || h.accept_block(b)));
+        }
+        let mut accepted = 0u32;
+        let mut already = 0u32;
+        for h in handles {
+            match h.join().unwrap().unwrap() {
+                AcceptOutcome::Accepted { height: 1 } => accepted += 1,
+                AcceptOutcome::AlreadyHave => already += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one Accepted");
+        assert_eq!(already, (n as u32) - 1);
+        assert_eq!(hub.tip_height(), Some(1));
+        // Tip body membership: every strong+height tx at tip is in header_txs.
+        let tip_fks = hub
+            .query
+            .block_tx_fks(rbitcoin_primitives::Height(1))
+            .unwrap();
+        let tip_set: std::collections::HashSet<u64> =
+            tip_fks.iter().filter_map(|f| f.get()).collect();
+        hub.query
+            .store()
+            .tx_height
+            .for_each_set(|fk, h| {
+                if h == 1 {
+                    let id = fk.get().unwrap();
+                    assert!(
+                        tip_set.contains(&id),
+                        "orphan Class C fk={id} at tip height not in header_txs"
+                    );
+                    assert!(hub.query.store().is_confirmed_strong(fk).unwrap());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Load batch N+1 must succeed while N is only loaded (not committed).

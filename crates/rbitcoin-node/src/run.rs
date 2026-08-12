@@ -670,8 +670,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     info!(
                         "node: tip={h} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                     );
-                    window_blocks =
-                        window_blocks.saturating_add(h.saturating_sub(last_tip) as u64);
+                    window_blocks = window_blocks.saturating_add(h.saturating_sub(last_tip) as u64);
                     last_tip = h;
                     last_tip_change = Instant::now();
                 }
@@ -683,8 +682,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 info!(
                     "node: tip={tip} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                 );
-                window_blocks =
-                    window_blocks.saturating_add(tip.saturating_sub(last_tip) as u64);
+                window_blocks = window_blocks.saturating_add(tip.saturating_sub(last_tip) as u64);
                 last_tip = tip;
                 last_tip_change = Instant::now();
                 continue;

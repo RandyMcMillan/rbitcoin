@@ -381,7 +381,9 @@ impl Query {
         let mut next_tx = next_tx_start.max(1);
         let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
 
-        // Pass 1: assign create fks + build batch_map (txid → create_fk).
+        // Pass 1: assign contiguous create fks + batch_map (for parent resolve only).
+        // No durable tx.head create reuse; no cross-block body reuse. Duplicate
+        // hash must be dropped before plan (has_body / mid-pipeline).
         let t_assign = Instant::now();
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
@@ -394,11 +396,21 @@ impl Query {
             if txs.is_empty() {
                 continue;
             }
+            // Same block hash must not reach here twice: caller drops duplicates
+            // mid-pipeline / has_body. Fresh contiguous create fks for this body.
             let first_tx_fk = Fk(next_tx);
             let n_txs = txs.len() as u32;
+            let mut seen_in_block: HashSet<[u8; 32]> = HashSet::with_capacity(txs.len());
             for ta in txs.drain(..) {
                 let n_in = ta.inputs.len() as u32;
                 let n_out = ta.outputs.len() as u32;
+                // Duplicate txid in one block is a consensus violation — hard error.
+                if !seen_in_block.insert(ta.tx.txid) {
+                    return Err(StoreError::Corrupt(
+                        "duplicate txid in block body (consensus violation)",
+                    )
+                    .into());
+                }
                 let tx_fk = Fk(next_tx);
                 next_tx += 1;
 

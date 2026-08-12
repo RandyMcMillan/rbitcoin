@@ -42,13 +42,19 @@ impl Query {
             return Ok(None);
         }
         self.ensure_height_by_hash_index(tip)?;
-        let g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Ok(g.map.get(hash).copied().map(Height))
     }
 
     /// Ensure height index matches `tip` (incremental tip±1 when possible).
     pub(crate) fn ensure_height_by_hash_index(&self, tip: Height) -> Result<(), QueryError> {
-        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if g.tip == Some(tip.0) {
             return Ok(());
         }
@@ -84,7 +90,10 @@ impl Query {
 
     /// Drop height index (tests / multi-height reorg / offline confirmed rewrite).
     pub fn invalidate_height_by_hash_index(&self) {
-        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         g.tip = None;
         g.map.clear();
     }

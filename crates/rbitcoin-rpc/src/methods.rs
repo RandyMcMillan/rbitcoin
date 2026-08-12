@@ -11,6 +11,31 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Core / Electrum / Esplora **display order** hex for a 32-byte hash or txid.
+///
+/// Store and rust-bitcoin `to_byte_array()` use **internal** byte order; RPC
+/// clients expect the reversed hex (same as `BlockHash`/`Txid` `Display`).
+fn hash_hex_display(h: &[u8; 32]) -> String {
+    let mut rev = *h;
+    rev.reverse();
+    hex_encode(rev)
+}
+
+/// Parse Core display-order 32-byte hex → internal byte order.
+fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
+    let mut b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    if b.len() != 32 {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMS,
+            "hash/txid must be 32 bytes hex",
+        ));
+    }
+    b.reverse();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
 /// Shared process context for RPC handlers.
 pub struct RpcContext {
     pub query: Arc<Query>,
@@ -168,7 +193,7 @@ fn getbestblockhash(ctx: &RpcContext) -> Result<Value, Value> {
         .header_at_height(tip)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_MISC, "tip header missing"))?;
-    Ok(json!(hex_encode(rec.hash)))
+    Ok(json!(hash_hex_display(&rec.hash)))
 }
 
 fn getblockhash(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
@@ -181,7 +206,7 @@ fn getblockhash(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .header_at_height(Height(height))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_MISC, "Block height out of range"))?;
-    Ok(json!(hex_encode(rec.hash)))
+    Ok(json!(hash_hex_display(&rec.hash)))
 }
 
 fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
@@ -191,7 +216,7 @@ fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
             .header_at_height(h)
             .ok()
             .flatten()
-            .map(|(_, r)| hex_encode(r.hash))
+            .map(|(_, r)| hash_hex_display(&r.hash))
             .unwrap_or_default()
     } else {
         String::new()
@@ -251,7 +276,7 @@ fn getblockheader(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "blockhash required"))?;
     let verbose = params.get(1).and_then(|v| v.as_bool()).unwrap_or(true);
-    let hash = parse_block_hash(hash_hex)?;
+    let hash = parse_hash32_display(hash_hex)?;
     let height = ctx
         .query
         .height_of_hash(&hash)
@@ -277,18 +302,18 @@ fn getblockheader(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
             .header_at_height(Height(height.0 - 1))
             .ok()
             .flatten()
-            .map(|(_, r)| hex_encode(r.hash))
+            .map(|(_, r)| hash_hex_display(&r.hash))
             .unwrap_or_default()
     } else {
         String::new()
     };
     Ok(json!({
-        "hash": hex_encode(rec.hash),
+        "hash": hash_hex_display(&rec.hash),
         "confirmations": confirmations(ctx, height),
         "height": height.0,
         "version": rec.version,
         "versionHex": format!("{:08x}", rec.version),
-        "merkleroot": hex_encode(rec.merkle_root),
+        "merkleroot": hash_hex_display(&rec.merkle_root),
         "time": rec.timestamp,
         "mediantime": rec.timestamp,
         "nonce": rec.nonce,
@@ -305,7 +330,7 @@ fn getblock(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "blockhash required"))?;
     let verbosity = params.get(1).and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-    let hash = parse_block_hash(hash_hex)?;
+    let hash = parse_hash32_display(hash_hex)?;
     let height = ctx
         .query
         .height_of_hash(&hash)
@@ -325,14 +350,14 @@ fn getblock(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
     let txids: Vec<String> = block
         .txdata
         .iter()
-        .map(|tx| hex_encode(tx.compute_txid().to_byte_array()))
+        .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
         .collect();
     let mut obj = json!({
-        "hash": hex_encode(hash),
+        "hash": hash_hex_display(&hash),
         "confirmations": confirmations(ctx, height),
         "height": height.0,
         "version": block.header.version.to_consensus(),
-        "merkleroot": block.header.merkle_root.to_string(),
+        "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
         "time": block.header.time,
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", block.header.bits.to_consensus()),
@@ -415,7 +440,7 @@ fn getrawmempool(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
     if !verbose {
         let ids: Vec<String> = live
             .iter()
-            .map(|(t, _, _, _)| hex_encode(t.to_byte_array()))
+            .map(|(t, _, _, _)| hash_hex_display(&t.to_byte_array()))
             .collect();
         return Ok(json!(ids));
     }
@@ -423,7 +448,7 @@ fn getrawmempool(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
     for (txid, fee, weight, _) in live {
         let vsize = weight / 4;
         map.insert(
-            hex_encode(txid.to_byte_array()),
+            hash_hex_display(&txid.to_byte_array()),
             json!({
                 "vsize": vsize,
                 "weight": weight,
@@ -448,7 +473,7 @@ fn getmempoolentry(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .first()
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
-    let want = parse_txid(hex)?;
+    let want = parse_hash32_display(hex)?;
     let mp = ctx
         .mempool
         .as_ref()
@@ -473,7 +498,7 @@ fn getrawtransaction(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value>
         .and_then(|v| v.as_str())
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
     let verbose = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-    let want = parse_txid(hex)?;
+    let want = parse_hash32_display(hex)?;
 
     if let Some(mp) = ctx.mempool.as_ref() {
         for (txid, _fee, _w, tx) in mp.list_live() {
@@ -518,7 +543,7 @@ fn sendrawtransaction(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value
         ));
     }
     match mp.accept_tx(&tx) {
-        Ok(_) => Ok(json!(hex_encode(tx.compute_txid().to_byte_array()))),
+        Ok(_) => Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array()))),
         Err(e) => Err(rpc_error(ERR_MISC, e.to_string())),
     }
 }
@@ -538,7 +563,7 @@ fn testmempoolaccept(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value>
             .as_str()
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtx hex required"))?;
         let tx = decode_tx_hex(hex)?;
-        let txid = hex_encode(tx.compute_txid().to_byte_array());
+        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
         // Dry-run: accept then remove if we admitted (best-effort). Prefer not
         // mutating — use accept and if ok, remove_for_block to roll back.
         match mp.accept_tx(&tx) {
@@ -646,31 +671,17 @@ fn estimatesmartfee(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> 
     }))
 }
 
-fn parse_block_hash(hex: &str) -> Result<[u8; 32], Value> {
-    let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    if b.len() != 32 {
-        return Err(rpc_error(ERR_INVALID_PARAMS, "blockhash must be 32 bytes"));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&b);
-    Ok(out)
-}
-
-fn parse_txid(hex: &str) -> Result<[u8; 32], Value> {
-    parse_block_hash(hex)
-}
-
 fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
     let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
 }
 
 fn tx_to_json(tx: &Transaction, extra: Option<Value>) -> Value {
-    let txid = hex_encode(tx.compute_txid().to_byte_array());
+    let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
     let mut vin = Vec::new();
     for (i, inp) in tx.input.iter().enumerate() {
         vin.push(json!({
-            "txid": hex_encode(inp.previous_output.txid.to_byte_array()),
+            "txid": hash_hex_display(&inp.previous_output.txid.to_byte_array()),
             "vout": inp.previous_output.vout,
             "sequence": inp.sequence.to_consensus_u32(),
             "n": i,
@@ -689,7 +700,7 @@ fn tx_to_json(tx: &Transaction, extra: Option<Value>) -> Value {
     }
     let mut obj = json!({
         "txid": txid,
-        "hash": hex_encode(tx.compute_wtxid().to_byte_array()),
+        "hash": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
         "version": tx.version.0,
         "size": tx.total_size(),
         "vsize": tx.vsize(),
@@ -866,6 +877,22 @@ mod tests {
     }
 
     #[test]
+    fn hash_hex_display_matches_blockhash_display_and_reverses_parse() {
+        // Fixed non-palindrome internal bytes.
+        let mut internal = [0u8; 32];
+        for (i, b) in internal.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let disp = hash_hex_display(&internal);
+        let via_type = bitcoin::BlockHash::from_byte_array(internal).to_string();
+        assert_eq!(disp, via_type);
+        let back = parse_hash32_display(&disp).unwrap();
+        assert_eq!(back, internal);
+        // Raw internal hex is not equal to display.
+        assert_ne!(disp, rbitcoin_primitives::hex_encode(internal));
+    }
+
+    #[test]
     fn all_methods_callable_empty_or_error() {
         let (ctx, dir) = ctx_empty();
         // Control / network always succeed on empty store.
@@ -973,12 +1000,38 @@ mod tests {
         let tip_h = chain.tip_height();
         let count = dispatch(&ctx, "getblockcount", &[]).unwrap();
         assert_eq!(count.as_u64().unwrap(), tip_h as u64);
+
+        // Pin: getbestblockhash matches rust-bitcoin BlockHash Display (Core order).
+        let tip_hash = chain.tip_hash();
+        let tip_display = tip_hash.to_string();
+        let internal = tip_hash.to_byte_array();
+        assert_ne!(
+            tip_display,
+            rbitcoin_primitives::hex_encode(internal),
+            "regtest tip Display must differ from raw internal hex (non-palindrome)"
+        );
+        assert_eq!(
+            tip_display,
+            hash_hex_display(&internal),
+            "hash_hex_display must match BlockHash Display"
+        );
+
         let best = dispatch(&ctx, "getbestblockhash", &[]).unwrap();
         let best_s = best.as_str().unwrap().to_string();
+        assert_eq!(
+            best_s, tip_display,
+            "getbestblockhash must be Core/display order, not internal"
+        );
         let hash = dispatch(&ctx, "getblockhash", &[json!(tip_h)]).unwrap();
         assert_eq!(hash.as_str().unwrap(), best_s);
+        // Lookup must accept display-order hex from Core clients.
         let hdr = dispatch(&ctx, "getblockheader", &[json!(best_s.clone())]).unwrap();
         assert_eq!(hdr["height"], tip_h);
+        assert_eq!(hdr["hash"], best_s);
+        // Merkleroot field must also be display order (consistent with hash).
+        let mr = hdr["merkleroot"].as_str().unwrap();
+        assert_eq!(mr.len(), 64);
+        assert_eq!(mr, hash_hex_display(&parse_hash32_display(mr).unwrap()));
         let hdr_hex = dispatch(
             &ctx,
             "getblockheader",
@@ -992,30 +1045,44 @@ mod tests {
                 assert!(blk.as_str().unwrap().len() > 20);
             } else {
                 assert_eq!(blk["height"], tip_h);
+                assert_eq!(blk["hash"], best_s);
                 assert!(blk["tx"].as_array().unwrap().len() >= 1);
             }
         }
         let _ = dispatch(&ctx, "getdifficulty", &[]).unwrap();
         let info = dispatch(&ctx, "getblockchaininfo", &[]).unwrap();
         assert_eq!(info["blocks"], tip_h);
+        assert_eq!(info["bestblockhash"], best_s);
 
-        // Coinbase of tip for getrawtransaction
+        // Coinbase of tip for getrawtransaction — use Txid Display (Core order).
         let fks = q.block_tx_fks(rbitcoin_primitives::Height(tip_h)).unwrap();
         let tx = q.reconstruct_tx(fks[0]).unwrap();
-        let txid = rbitcoin_primitives::hex_encode(tx.compute_txid().to_byte_array());
-        let raw = dispatch(&ctx, "getrawtransaction", &[json!(txid.clone())]).unwrap();
+        let txid_display = tx.compute_txid().to_string();
+        let txid_internal = tx.compute_txid().to_byte_array();
+        assert_eq!(txid_display, hash_hex_display(&txid_internal));
+        // Internal-order hex must NOT be accepted as a Core-form getrawtransaction id
+        // when it differs from display (typical for real txids).
+        let internal_hex = rbitcoin_primitives::hex_encode(txid_internal);
+        if internal_hex != txid_display {
+            let miss = dispatch(&ctx, "getrawtransaction", &[json!(internal_hex)]);
+            assert!(
+                miss.is_err(),
+                "internal-order hex must not resolve as Core display txid"
+            );
+        }
+        let raw = dispatch(&ctx, "getrawtransaction", &[json!(txid_display.clone())]).unwrap();
         assert!(raw.as_str().unwrap().len() > 20);
         let verbose = dispatch(
             &ctx,
             "getrawtransaction",
-            &[json!(txid.clone()), json!(true)],
+            &[json!(txid_display.clone()), json!(true)],
         )
         .unwrap();
-        assert_eq!(verbose["txid"], txid);
+        assert_eq!(verbose["txid"], txid_display);
 
         let hex = serialize_hex(&tx);
         let dec = dispatch(&ctx, "decoderawtransaction", &[json!(hex)]).unwrap();
-        assert_eq!(dec["txid"], txid);
+        assert_eq!(dec["txid"], txid_display);
 
         // testmempoolaccept dry path (may reject coinbase — still exercises code)
         let _ = dispatch(&ctx, "testmempoolaccept", &[json!([hex.clone()])]);

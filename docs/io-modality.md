@@ -58,7 +58,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (`RBITCOIN_TX_HEAD_ACCESS=map` ignored) |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
-| **`scripthash.head` / body** | L0+L1 | 4 KiB chunk cache; body slabs |
+| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed main: page idx in RAM, data FdOnly, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf: idx+fuse8. Body slabs L0 |
 | **Spenders** | L0 | Linear append |
 | `confirmed` / `header_txs_*` / `strong_tx` | **L2** | InRam write-behind; barrier = `Store::flush_class_c_tip` |
 | `tx_height` | L0 | Stays fd (too large for default L2) |

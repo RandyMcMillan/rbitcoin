@@ -45,7 +45,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     tx_height.body               # Class C: tx_fk → create height (u32 slots)
     header_txs_first.body        # header_fk-1 → first_tx_fk
     header_txs_count.body        # header_fk-1 → tx count
-    scripthash.body / scripthash.head/NN[.fuse8][.idx]  # Class B (slabs + sorted heads)
+    scripthash.body / scripthash.head/NN[.idx]        # Class B (slabs + sorted heads; no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     archive_epoch
@@ -354,18 +354,19 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
 - Record = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
-- Main is a **sealed sorted** file per shard (`scripthash.head/NN`) plus `.fuse8` (BF8R v2)
-  and `.idx` (16 B key + 8 B off per 128 records / 4 KiB page). Record count is
-  immutable after seal. Existing keys update `value16` in place. New keys are
-  **not** punched into main.
+- Main is a **sealed sorted** file per shard (`scripthash.head/NN`) plus `.idx`
+  (16 B key + 8 B off per 128 records / 4 KiB page). **No** main `.fuse8` —
+  misses pay one 4 KiB data pread. Record count is immutable after seal.
+  Existing keys update `value16` in place. New keys are **not** punched into main.
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
   one shard band at a time). Cold load writes packed records (no 2 GiB OA image).
 - **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
   2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
   (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
   disjoint records). **Do not fold ovf into main.** Body offs are not copied.
-- Lookup: shard main fuse → idx → data; then sealed ovf newest→oldest (fuse skip);
-  then ingest OA. A key has **exactly one** home.
+- Lookup (tip / sorted main): **ingest OA → sealed ovf newest→oldest (fuse
+  skip) → main idx → data**. Post-seal new keys live only on overflow, so they
+  skip the main page. A key has **exactly one** home.
 
 | Mode | When | Value (`w0`, `w1`) |
 |------|------|---------------------|

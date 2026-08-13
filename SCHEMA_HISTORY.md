@@ -32,7 +32,8 @@ Versions below are listed **newest → oldest** after the summary table.
 ## v15 (current)
 
 See [`SCHEMA.md`](./SCHEMA.md). Class B: geometric slabs + delta fks,
-sealed sorted heads with fuse8+idx, one global ingest OA. Empty 13/14 SH
+sealed sorted heads with idx (main has no fuse8; sealed ovf keeps fuse8),
+one global ingest OA. Empty 13/14 SH
 upgrades `meta` silently; a materialized page-era index is refused
 (wipe `store/scripthash*` and rematerialize). Class A is split:
 `txout` + `inwit` + `spent` (refuse packed `tx.body` with creates).

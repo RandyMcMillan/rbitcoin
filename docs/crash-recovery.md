@@ -60,7 +60,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 - Schema 15: head holds ≤2 inline creates, a geometric **slab** (3–256 fks, ULEB128
   deltas), or a megakey **page chain** (≥257). Size-class freelist reuses freed slabs.
-  Main heads are sealed sorted+fuse+idx; new keys go to global ingest OA.
+  Main heads are sealed sorted+idx (no fuse); new keys go to global ingest OA.
 - **No spend columns** — spentness from points + Class C at query time.
 - Creates written on confirm (before tip advance).
 - **Kill-safe without chain walks:** first confirm after open **sequentially scans**

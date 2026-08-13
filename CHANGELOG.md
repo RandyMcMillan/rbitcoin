@@ -16,7 +16,9 @@ before 1.0).
   read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in
   [`SCHEMA.md`](./SCHEMA.md).
 - **Schema 15 Class B SH:** geometric slabs + megakey pages; sealed
-  sorted+fuse+idx main; global ingest OA. Page-era durable SH is refused.
+  sorted+idx main (**no** main fuse); global ingest OA; sealed ovf keeps
+  fuse8. Tip lookup is overflow (ingest + ovf fuse) then main. Page-era
+  durable SH is refused.
 - **Electrum / RPC:** skip O(mempool) API walks; overlap Electrum dispatch;
   thin `--sptweaks` serve is idx→body uring, not a packed span.
 - **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so

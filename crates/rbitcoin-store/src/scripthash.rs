@@ -29,7 +29,7 @@ use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
     slab_class_for_n_fks_with_slack, SH_MEGAKEY_MIN_FKS,
 };
-use crate::scripthash_sorted_head::SortedHead;
+use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
@@ -259,7 +259,7 @@ fn open_sorted_main_shards(
     for i in 0..n {
         let p = sorted_main_shard_path(dir, i, n);
         if file_starts_with_shsr(&p) {
-            out.push(Some(SortedHead::open(&p)?));
+            out.push(Some(SortedHead::open(&p, SortedHeadFilter::None)?));
         } else {
             out.push(None);
         }
@@ -291,7 +291,7 @@ fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError> {
     for id in ids {
         let p = sealed_ovf_path(dir, id);
         if file_starts_with_shsr(&p) {
-            out.push(SortedHead::open(p)?);
+            out.push(SortedHead::open(p, SortedHeadFilter::Fuse8)?);
         }
     }
     Ok(out)
@@ -763,76 +763,80 @@ impl ScriptHashTable {
     }
 
     /// Head value for a key (process-cache seed / disconnect refresh).
-    ///
-    /// Probes main head first, then overflow stack (open + sealed, fuse-gated).
     pub fn head_value(&self, scripthash: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
-        let hk = head_key_from_full(scripthash);
-        {
-            let g = self.sorted_main.lock().unwrap();
-            if !g.is_empty() {
-                let si = self.head.shard_index(scripthash);
-                if let Some(Some(h)) = g.get(si) {
-                    if let Some(v) = h.get(&hk)? {
-                        return Ok(Some(v));
-                    }
-                }
-            }
-        }
-        for h in self.sealed_ovf.lock().unwrap().iter().rev() {
-            if let Some(v) = h.get(&hk)? {
-                return Ok(Some(v));
-            }
-        }
-        if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
-            return Ok(Some(v));
-        }
-        if self.has_sorted_main() {
-            return Ok(None);
-        }
-        if let Some(v) = self.head.get(scripthash)? {
-            return Ok(Some(v));
-        }
-        let g = self.overflow.lock().unwrap();
-        g.get(scripthash)
+        Ok(self.locate_head(scripthash)?.map(|(v, _)| v))
     }
 
     /// Which head segment holds `scripthash` (if any).
     fn key_home(&self, scripthash: &[u8; 32]) -> Result<KeyHome, StoreError> {
-        let hk = head_key_from_full(scripthash);
-        {
-            let g = self.sorted_main.lock().unwrap();
-            if !g.is_empty() {
+        Ok(self
+            .locate_head(scripthash)?
+            .map(|(_, h)| h)
+            .unwrap_or(KeyHome::Absent))
+    }
+
+    /// Tip-mode probe: overflow first (ingest OA, then sealed ovf fuse), then main.
+    ///
+    /// Post-seal new keys live only on ingest / sealed ovf. Checking those
+    /// (fuse-gated ovf, small OA) avoids a 4 KiB main-page pread on every miss.
+    /// Historical keys pay a few RAM fuse checks then one main idx+page.
+    /// One walk returns both value and home so seed + route share the pread.
+    fn locate_head(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<Option<(ShHeadValue, KeyHome)>, StoreError> {
+        let sorted_on = self.has_sorted_main();
+        if sorted_on {
+            if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
+                return Ok(Some((v, KeyHome::Ingest)));
+            }
+            let hk = head_key_from_full(scripthash);
+            for h in self.sealed_ovf.lock().unwrap().iter().rev() {
+                if let Some(v) = h.get(&hk)? {
+                    return Ok(Some((v, KeyHome::Overflow(u32::MAX))));
+                }
+            }
+            {
+                let g = self.sorted_main.lock().unwrap();
                 let si = self.head.shard_index(scripthash);
                 if let Some(Some(h)) = g.get(si) {
-                    if h.get(&hk)?.is_some() {
-                        return Ok(KeyHome::Main);
+                    if let Some(v) = h.get(&hk)? {
+                        return Ok(Some((v, KeyHome::Main)));
                     }
                 }
             }
+            return Ok(None);
         }
-        for h in self.sealed_ovf.lock().unwrap().iter() {
-            if h.get(&hk)?.is_some() {
-                return Ok(KeyHome::Overflow(u32::MAX));
-            }
-        }
-        if self.ingest.lock().unwrap().get(scripthash)?.is_some() {
-            return Ok(KeyHome::Ingest);
-        }
-        if self.has_sorted_main() {
-            return Ok(KeyHome::Absent);
-        }
-        if self.head.get(scripthash)?.is_some() {
-            return Ok(KeyHome::Main);
+        if let Some(v) = self.head.get(scripthash)? {
+            return Ok(Some((v, KeyHome::Main)));
         }
         let g = self.overflow.lock().unwrap();
-        if let Some((id, _)) = g.get_with_home(scripthash)? {
-            return Ok(KeyHome::Overflow(id));
+        if let Some((id, v)) = g.get_with_home(scripthash)? {
+            return Ok(Some((v, KeyHome::Overflow(id))));
         }
-        Ok(KeyHome::Absent)
+        Ok(None)
     }
 
     fn has_sorted_main(&self) -> bool {
         self.sorted_main.lock().unwrap().iter().any(|s| s.is_some())
+    }
+
+    #[cfg(test)]
+    fn sorted_main_pread_count(&self, shard: usize) -> u64 {
+        self.sorted_main
+            .lock()
+            .unwrap()
+            .get(shard)
+            .and_then(|s| s.as_ref())
+            .map(|h| h.pread_count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn reset_sorted_main_preads(&self) {
+        for h in self.sorted_main.lock().unwrap().iter().flatten() {
+            h.reset_pread_count();
+        }
     }
 
     /// Test-only: set alloc `live_count = 0` without clearing head slots.
@@ -1091,9 +1095,9 @@ impl ScriptHashTable {
             missing.sort_unstable();
             if self.has_sorted_main() {
                 for key in missing {
-                    if let Some(v) = self.head_value(&key)? {
+                    if let Some((v, kh)) = self.locate_head(&key)? {
                         heads.insert(key, v);
-                        home.insert(key, self.key_home(&key)?);
+                        home.insert(key, kh);
                     } else {
                         home.insert(key, KeyHome::Absent);
                     }
@@ -1350,7 +1354,7 @@ impl ScriptHashTable {
                 "scripthash.ovf: seal path occupied by non-sorted segment",
             ));
         }
-        let sealed = SortedHead::write(&path, &recs)?;
+        let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::Fuse8)?;
         self.sealed_ovf.lock().unwrap().push(sealed);
         // Replace ingest with a fresh empty OA.
         let p = ingest_path(&self.store_dir);
@@ -1414,7 +1418,7 @@ impl ScriptHashTable {
                 .saturating_add(1)
         };
         let path = sealed_ovf_path(&self.store_dir, id);
-        let merged = SortedHead::write(&path, &recs)?;
+        let merged = SortedHead::write(&path, &recs, SortedHeadFilter::Fuse8)?;
         let old = {
             let mut g = self.sealed_ovf.lock().unwrap();
             std::mem::replace(&mut *g, vec![merged])
@@ -1744,8 +1748,7 @@ impl ScriptHashTable {
         create_tx_fk: Fk,
         _vout: u32,
     ) -> Result<bool, StoreError> {
-        let home = self.key_home(scripthash)?;
-        let Some(val) = self.head_value(scripthash)? else {
+        let Some((val, home)) = self.locate_head(scripthash)? else {
             return Ok(false);
         };
         let mut live = self.collect_entries(scripthash, &val)?;
@@ -2234,7 +2237,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let sealed = SortedHead::write(&path, &recs)?;
+                let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
                 let mut g = self.table.sorted_main.lock().unwrap();
                 if g.len() < n_shards {
                     g.resize_with(n_shards, || None);
@@ -3367,7 +3370,10 @@ mod tests {
         let mut fuse = shard_p.as_os_str().to_os_string();
         fuse.push(".fuse8");
         assert!(PathBuf::from(idx).is_file());
-        assert!(PathBuf::from(fuse).is_file());
+        assert!(
+            !PathBuf::from(fuse).is_file(),
+            "main shards must not write a fuse"
+        );
 
         t.put_create(&rec(sh_main, 3, 0)).unwrap();
         assert_eq!(t.entries(&sh_main).unwrap().len(), 3);
@@ -3376,9 +3382,17 @@ mod tests {
         t.put_create(&rec(sh_new, 10, 0)).unwrap();
         assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert!(matches!(t.key_home(&sh_new).unwrap(), KeyHome::Ingest));
+        // First create of a never-seen key must still miss on main (prove Absent).
+        // Later hits live on ingest and must not touch the main page.
+        t.reset_sorted_main_preads();
         t.put_create(&rec(sh_new, 11, 0)).unwrap();
         assert_eq!(t.entries(&sh_new).unwrap().len(), 2);
         assert!(matches!(t.key_home(&sh_new).unwrap(), KeyHome::Ingest));
+        assert_eq!(
+            t.sorted_main_pread_count(t.head.shard_index(&sh_new)),
+            0,
+            "key already on ingest must not pread the main page"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

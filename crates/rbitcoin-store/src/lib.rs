@@ -96,7 +96,7 @@ pub use scripthash_slabs::{
     page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
     slab_class_for_n_fks_with_slack, SH_MEGAKEY_MIN_FKS,
 };
-pub use scripthash_sorted_head::{SortedHead, SH_SORTED_RECS_PER_PAGE};
+pub use scripthash_sorted_head::{SortedHead, SortedHeadFilter, SH_SORTED_RECS_PER_PAGE};
 pub use segmented_head::{
     sample_lookup_stats as sample_head_lookup_stats,
     snapshot_lookup_stats as snapshot_head_lookup_stats, HeadLookupStats, SegmentedTxHead,

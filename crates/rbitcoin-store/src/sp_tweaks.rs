@@ -99,7 +99,7 @@ impl SpTweaksTable {
                 Ok(t)
             }
             (false, false) => {
-                rbitcoin_log::warn!(
+                rbitcoin_log::info!(
                     "sp_tweaks: creating empty index origin={} dir={}",
                     origin.0,
                     dir.display()

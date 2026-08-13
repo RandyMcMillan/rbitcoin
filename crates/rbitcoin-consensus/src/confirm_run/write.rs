@@ -240,8 +240,13 @@ fn index_sp_tweaks_batch(
         let recs = match records_from_wire(p, block, parents) {
             Some(r) => r,
             None => {
-                rbitcoin_log::warn!("sp_tweaks: skip height {} (missing parent pin)", p.height.0);
-                continue;
+                // Same-block and unpinned parents are not a hole. Store path
+                // runs after Class A commit (packed bodies + parent outs).
+                rbitcoin_log::debug!(
+                    "sp_tweaks: h={} wire pins incomplete; store fallback",
+                    p.height.0
+                );
+                records_aligned_from_store(query, params, p, block)?
             }
         };
         query.put_sp_tweaks_block(p.height, p.header_fk, &recs)?;
@@ -249,13 +254,25 @@ fn index_sp_tweaks_batch(
     Ok(())
 }
 
+/// Per-tx tweak or `None` (ineligible). Same-block prevouts come from `block`.
+///
+/// Returns `None` only when an **external** spend has no pin (caller falls back
+/// to store). A height with no eligible txs is `Some` of `None`s — that is
+/// not a skip.
 fn records_from_wire(
     p: &Prepared,
     block: &Block,
     parents: &rbitcoin_query::BatchParents,
 ) -> Option<Vec<Option<[u8; 33]>>> {
     use crate::silent_payments::tweak_from_tx;
+    use bitcoin::hashes::Hash;
     use bitcoin::{Amount, ScriptBuf, TxOut};
+    use std::collections::HashMap;
+
+    let mut by_txid: HashMap<[u8; 32], usize> = HashMap::with_capacity(block.txdata.len());
+    for (i, tx) in block.txdata.iter().enumerate() {
+        by_txid.insert(tx.compute_txid().to_byte_array(), i);
+    }
 
     let mut recs = Vec::with_capacity(block.txdata.len());
     for tx in &block.txdata {
@@ -270,6 +287,12 @@ fn records_from_wire(
             }
             let tid = inp.previous_output.txid.to_byte_array();
             let vout = inp.previous_output.vout;
+            if let Some(&ti) = by_txid.get(&tid) {
+                let parent = &block.txdata[ti];
+                let out = parent.output.get(vout as usize)?;
+                prevouts.push(out.clone());
+                continue;
+            }
             let create_fk = p.spends.iter().find_map(|(pt, pv, _, cfk)| {
                 if *pt == tid && *pv == vout {
                     Some(*cfk)
@@ -277,6 +300,9 @@ fn records_from_wire(
                     None
                 }
             })?;
+            if create_fk.is_null() {
+                return None;
+            }
             let (val, script, _) = parents.get_parent_txout_parts(create_fk, vout)?;
             let value = if val < 0 {
                 Amount::ZERO
@@ -291,4 +317,114 @@ fn records_from_wire(
         recs.push(tweak_from_tx(tx, &prevouts).map(|t| t.tweak));
     }
     Some(recs)
+}
+
+fn records_aligned_from_store(
+    query: &Query,
+    params: &ChainParams,
+    p: &Prepared,
+    block: &Block,
+) -> Result<Vec<Option<[u8; 33]>>, ConsensusError> {
+    use crate::silent_payments::tweaks_for_height;
+    use bitcoin::hashes::Hash;
+
+    let map = tweaks_for_height(query, params, p.height)?;
+    Ok(block
+        .txdata
+        .iter()
+        .map(|tx| {
+            let id = tx.compute_txid().to_byte_array();
+            map.get(&id).map(|t| t.tweak)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod records_from_wire_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxMerkleNode, TxOut, Witness,
+    };
+    use rbitcoin_primitives::Fk;
+
+    fn dummy_header() -> Header {
+        Header {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        }
+    }
+
+    fn coinbase() -> Transaction {
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    fn prepared(height: u32, spends: Vec<([u8; 32], u32, Fk, Fk)>) -> Prepared {
+        Prepared {
+            height: Height(height),
+            header_fk: Fk(1),
+            tx_fks: vec![],
+            jobs: vec![],
+            spends,
+            fees: 0,
+            check_scripts: false,
+            time: 0,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            hash: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn same_block_spend_does_not_need_parent_pin() {
+        let cb = coinbase();
+        let cb_id = cb.compute_txid();
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cb_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![cb, child],
+        };
+        let p = prepared(10, vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL)]);
+        let parents = rbitcoin_query::BatchParents::new();
+        let recs = records_from_wire(&p, &block, &parents)
+            .expect("same-block prevout is on the wire; pin must not be required");
+        assert_eq!(recs.len(), 2);
+        assert!(recs.iter().all(|t| t.is_none()), "no P2TR → no tweaks");
+    }
 }

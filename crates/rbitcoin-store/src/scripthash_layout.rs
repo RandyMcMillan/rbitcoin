@@ -2,16 +2,18 @@
 //!
 //! Head key = first 16 B of SHA256(spk). Value = two u64s.
 //!
-//! **Schema 14:** Empty / Inline (≤2 FKs) / **Paged** (first+last 4 KiB page offs).
+//! **Schema 15:** Empty / Inline (≤2 FKs) / **Slab** `{class,used,off}` /
+//! **Paged** (megakey first+last 4 KiB page offs).
 //! Bit 63 of each value word is a flag; payload in low 63 bits. See
 //! [`crate::scripthash_pages`] for page buffer layout.
 //!
-//! Schema-13 **slab** encoding is rejected on decode (rebuild SH on upgrade).
+//! Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
+//! store open refuses a durable pre-15 SH index.
 
 use crate::error::StoreError;
 use crate::scripthash_pages::{
-    sh_decode_paged_head, sh_encode_paged_head, sh_head_value_mode, sh_word_payload,
-    ShHeadValueMode,
+    sh_decode_paged_head, sh_decode_slab_head, sh_encode_paged_head, sh_encode_slab_head,
+    sh_head_value_mode, sh_word_payload, ShHeadValueMode,
 };
 use rbitcoin_primitives::Fk;
 
@@ -29,14 +31,19 @@ pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
 pub const SH_SLAB_MARKER: u64 = 1u64 << 63;
 /// Alloc header magic after the RBT1 file header.
 pub const SH_ALLOC_MAGIC: [u8; 4] = *b"SHAL";
-pub const SH_ALLOC_VERSION: u16 = 2;
-/// Fixed alloc control page (includes freelist heads).
-pub const SH_ALLOC_HEADER_LEN: usize = 4096;
+/// v3 = schema 15 (slabs + combined RBT1/SHAL prefix). v2 = schema-14 pages. v1 = schema-13.
+pub const SH_ALLOC_VERSION: u16 = 3;
+/// Combined RBT1 + SHAL prefix. Payload starts here (no 4112 hole).
+pub const SH_PREFIX_PAGE: usize = 4096;
+/// SHAL field region after a 16 B RBT1 header (ends at [`SH_PREFIX_PAGE`]).
+pub const SH_ALLOC_HEADER_LEN: usize = SH_PREFIX_PAGE - 16;
 
 /// Legacy size-class constants (page freelist reuses class index for 4 KiB pages).
 /// Class 7: `4 << 7` entries × 8 B = 4096.
 pub const SH_SLAB_BASE: u32 = 4;
 pub const SH_MAX_CLASS: u8 = 24;
+/// Largest relocating geometric class (256 fks / 2 KiB). Class 7 is a page.
+pub const SH_MAX_SLAB_CLASS: u8 = 6;
 /// Slab class whose byte size equals one SH page ([`crate::scripthash_pages::SH_PAGE_SIZE`]).
 pub const SH_PAGE_SLAB_CLASS: u8 = 7;
 
@@ -97,6 +104,12 @@ pub enum ShHeadValue {
         entries: [ShEntry; SH_INLINE_CAP],
         used: u8,
     },
+    /// Geometric slab: `used` fks at `off`, size class `class` (0–6).
+    Slab {
+        class: u8,
+        used: u16,
+        off: u64,
+    },
     /// 4 KiB page chain; head stores first and last page file offsets only.
     Paged {
         first_page: u64,
@@ -109,6 +122,7 @@ impl ShHeadValue {
         match self {
             ShHeadValue::Empty => 0,
             ShHeadValue::Inline { used, .. } => u32::from(*used),
+            ShHeadValue::Slab { used, .. } => u32::from(*used),
             // Count not stored in head; callers that need n walk pages.
             ShHeadValue::Paged { .. } => u32::MAX,
         }
@@ -120,6 +134,10 @@ impl ShHeadValue {
 
     pub fn is_paged(&self) -> bool {
         matches!(self, ShHeadValue::Paged { .. })
+    }
+
+    pub fn is_slab(&self) -> bool {
+        matches!(self, ShHeadValue::Slab { .. })
     }
 
     pub fn encode(&self) -> [u8; SH_HEAD_VALUE_LEN] {
@@ -141,6 +159,10 @@ impl ShHeadValue {
                 debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
                 out[8..16].copy_from_slice(&w1.to_le_bytes());
+            }
+            ShHeadValue::Slab { class, used, off } => {
+                out = sh_encode_slab_head(*class, *used, *off)
+                    .expect("slab head encode (fields validated at write)");
             }
             ShHeadValue::Paged {
                 first_page,
@@ -183,6 +205,13 @@ impl ShHeadValue {
                 }
                 Ok(ShHeadValue::inline_two(e0, e1))
             }
+            ShHeadValueMode::Slab => {
+                let (class, used, off) = sh_decode_slab_head(
+                    buf.try_into()
+                        .map_err(|_| StoreError::Corrupt("short scripthash head value"))?,
+                )?;
+                Ok(ShHeadValue::Slab { class, used, off })
+            }
             ShHeadValueMode::Paged => {
                 let (first, last) = sh_decode_paged_head(
                     buf.try_into()
@@ -216,6 +245,10 @@ impl ShHeadValue {
         }
     }
 
+    pub fn slab(class: u8, used: u16, off: u64) -> Self {
+        ShHeadValue::Slab { class, used, off }
+    }
+
     /// Collect live entries from an inline value (oldest→newest).
     pub fn inline_entries(&self) -> &[ShEntry] {
         match self {
@@ -233,9 +266,12 @@ impl ShHeadValue {
     }
 }
 
-/// Payload region starts after RBT1 header + alloc page.
-pub fn payload_start(file_header_len: usize) -> u64 {
-    (file_header_len + SH_ALLOC_HEADER_LEN) as u64
+/// Payload region starts at the combined RBT1+SHAL prefix page (offset 4096).
+///
+/// `file_header_len` is accepted so call sites stay stable; schema 15 does not
+/// place SHAL in a second unaligned page after RBT1.
+pub fn payload_start(_file_header_len: usize) -> u64 {
+    SH_PREFIX_PAGE as u64
 }
 
 #[cfg(test)]
@@ -254,6 +290,12 @@ mod tests {
 
         let paged = ShHeadValue::paged(4096, 8192);
         assert_eq!(ShHeadValue::decode(&paged.encode()).unwrap(), paged);
+
+        let slab = ShHeadValue::slab(1, 5, 4096);
+        assert_eq!(ShHeadValue::decode(&slab.encode()).unwrap(), slab);
+        assert_eq!(slab.used(), 5);
+        assert!(slab.is_slab());
+        assert!(!slab.is_paged());
 
         assert!(ShHeadValue::decode(&ShHeadValue::Empty.encode())
             .unwrap()
@@ -344,8 +386,13 @@ mod tests {
         let paged = ShHeadValue::paged(4096, 8192);
         assert_eq!(paged.used(), u32::MAX);
         assert!(paged.is_paged());
+        assert!(!paged.is_slab());
         assert!(paged.inline_entries().is_empty());
         assert!(paged.inline_fks().is_empty());
+        let slab = ShHeadValue::slab(0, 4, 4096);
+        assert_eq!(slab.used(), 4);
+        assert!(slab.is_slab());
+        assert!(!slab.is_paged());
     }
 
     #[test]

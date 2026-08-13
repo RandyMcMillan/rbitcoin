@@ -327,16 +327,17 @@ impl ScriptHashTable {
             main_fuse: Mutex::new(fuse),
             alloc: Mutex::new(state),
         };
-        // Alloc v1 = schema-13 geometric slabs; v2 = schema-14 page chains.
-        // Header field layout is the same; only empty v1 can upgrade silently.
-        if alloc_ver == 1 {
+        // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15 slabs.
+        // Field layout is the same; only an empty older header upgrades silently.
+        if alloc_ver != SH_ALLOC_VERSION {
             if table.has_durable_index() {
                 return Err(StoreError::Corrupt(
-                    "scripthash alloc v1 (schema-13 slab body); wipe store/scripthash* and rematerialize for schema 14",
+                    "scripthash alloc is a pre-schema-15 body; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize",
                 ));
             }
-            // Empty SH: rewrite header to current alloc version (silent 13→14 body stamp).
-            let g = table.alloc.lock().unwrap();
+            // Empty SH: stamp current alloc version and combined-prefix bump.
+            let mut g = table.alloc.lock().unwrap();
+            g.bump = g.bump.max(payload_start(FILE_HEADER_LEN));
             write_alloc_header(&table.body, &g)?;
         }
         Ok(table)
@@ -693,6 +694,7 @@ impl ScriptHashTable {
         match val {
             ShHeadValue::Empty => Ok(Vec::new()),
             ShHeadValue::Inline { .. } => Ok(val.inline_entries().to_vec()),
+            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
             ShHeadValue::Paged { first_page, .. } => self.collect_page_chain(*first_page),
         }
     }
@@ -732,6 +734,7 @@ impl ScriptHashTable {
                 let ents = val.inline_entries();
                 Ok(ents.iter().map(|e| e.create_tx_fk).max_by_key(|f| f.0))
             }
+            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
             ShHeadValue::Paged { last_page, .. } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
                 self.body.read_at(*last_page, &mut page)?;
@@ -1103,6 +1106,7 @@ impl ScriptHashTable {
                 let (first, last) = self.write_new_page_chain(alloc, &live)?;
                 Ok(ShHeadValue::paged(first, last))
             }
+            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
             ShHeadValue::Paged {
                 first_page,
                 last_page,
@@ -1205,15 +1209,21 @@ impl ScriptHashTable {
     }
 
     fn free_if_paged(&self, alloc: &mut AllocState, old: &ShHeadValue) -> Result<(), StoreError> {
-        if let ShHeadValue::Paged { first_page, .. } = old {
-            let mut off = *first_page;
-            while off != 0 {
-                let mut page = [0u8; SH_PAGE_SIZE];
-                self.body.read_at(off, &mut page)?;
-                let (next, _) = sh_page_decode_slice(&page)?;
-                self.free_slab(alloc, SH_PAGE_SLAB_CLASS, off)?;
-                off = next;
+        match old {
+            ShHeadValue::Paged { first_page, .. } => {
+                let mut off = *first_page;
+                while off != 0 {
+                    let mut page = [0u8; SH_PAGE_SIZE];
+                    self.body.read_at(off, &mut page)?;
+                    let (next, _) = sh_page_decode_slice(&page)?;
+                    self.free_slab(alloc, SH_PAGE_SLAB_CLASS, off)?;
+                    off = next;
+                }
             }
+            ShHeadValue::Slab { class, off, .. } => {
+                self.free_slab(alloc, *class, *off)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1822,8 +1832,8 @@ fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> 
         ));
     }
     let ver = u16::from_le_bytes([buf[4], buf[5]]);
-    // v1 = geometric slabs (schema 13); v2 = page chains (schema 14). Same fields.
-    if ver != 1 && ver != SH_ALLOC_VERSION {
+    // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15. Same fields.
+    if ver != 1 && ver != 2 && ver != SH_ALLOC_VERSION {
         return Err(StoreError::Corrupt("unsupported scripthash alloc version"));
     }
     let live_count = u64::from_le_bytes(buf[8..16].try_into().unwrap());

@@ -6,12 +6,10 @@
 
 use crate::compact::{read_uleb128, uleb128_len, write_uleb128};
 use crate::error::StoreError;
-use crate::scripthash_layout::{slab_bytes, slab_cap, SH_INLINE_CAP};
+use crate::scripthash_layout::{slab_bytes, slab_cap, SH_INLINE_CAP, SH_MAX_SLAB_CLASS};
 use crate::scripthash_pages::{sh_page_count_for_entries, SH_FLAG_BIT, SH_PAGE_SIZE};
 use rbitcoin_primitives::Fk;
 
-/// Largest geometric class that is still a relocating slab (256 fks / 2 KiB).
-pub const SH_MAX_SLAB_CLASS: u8 = 6;
 /// First fk count that freezes into a megakey page chain (class 6 cap + 1).
 pub const SH_MEGAKEY_MIN_FKS: u32 = 257;
 

@@ -86,12 +86,13 @@ impl Store {
         } else {
             ScriptHashTable::create(&path)?
         };
-        // Schema 13→14: Class A layout matches. Only a *materialized* SH head
-        // (slab values) is incompatible — empty / missing SH upgrades silently.
-        if meta_ver == 13 && SCHEMA_VERSION == 14 {
+        // Schema 13/14→15: Class A layout matches. Only a *materialized* SH
+        // index (page-era or schema-13 slabs) is incompatible — empty / missing
+        // SH upgrades silently.
+        if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION == 15 {
             if scripthash.has_durable_index() {
                 return Err(StoreError::Corrupt(
-                    "schema 13 store has a materialized scripthash index; wipe store/scripthash* (or full datadir) and rematerialize for schema 14",
+                    "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
                 ));
             }
             rewrite_meta_current(&path)?;
@@ -1548,6 +1549,74 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.header_count(), 0);
         drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 14 with empty SH is Class-A compatible: open succeeds and meta
+    /// is rewritten to 15. Page-era SHAL stays empty (no dual-read of pages).
+    #[test]
+    fn open_schema14_empty_scripthash_upgrades_meta_to_15() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            assert!(!s.scripthash.has_durable_index());
+            s.flush().unwrap();
+        }
+        // Real schema-14 stores have SHAL alloc v2 on scripthash.body.
+        {
+            use crate::file::{TableFile, FILE_HEADER_LEN};
+            use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
+            use rbitcoin_primitives::TableKind;
+            let body_path = dir.join("scripthash.body");
+            let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
+            let mut page = vec![0u8; SH_ALLOC_HEADER_LEN];
+            body.read_at(FILE_HEADER_LEN as u64, &mut page).unwrap();
+            page[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
+            page[4..6].copy_from_slice(&2u16.to_le_bytes());
+            body.write_at(FILE_HEADER_LEN as u64, &page).unwrap();
+            body.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 14);
+        assert_eq!(read_store_meta_ver(&dir), 14);
+
+        let s = Store::open(&dir).unwrap();
+        assert!(!s.scripthash.has_durable_index());
+        drop(s);
+        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.header_count(), 0);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 14 with a durable page-era SH index cannot open.
+    #[test]
+    fn open_schema14_with_materialized_scripthash_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let sh = [0xcdu8; 32];
+            s.scripthash
+                .put_create(&crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)))
+                .unwrap();
+            assert!(s.scripthash.has_durable_index());
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 14);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema 14 with durable SH"),
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("wipe store/scripthash") || m.contains("schema 14"),
+                    "{m}"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        // Meta left at 14 (no silent bump on refuse).
+        assert_eq!(read_store_meta_ver(&dir), 14);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

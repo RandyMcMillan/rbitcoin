@@ -18,17 +18,20 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **15:** Class B SH = geometric slabs + ULEB128 fks + sorted/fuse/idx heads;
+///         refuse a materialized schema-14 page-era SH index.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 14;
+pub const SCHEMA_VERSION: u16 = 15;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **13** files are layout-compatible with **14** except for a **materialized**
-/// scripthash head (slab values). Empty / missing SH is upgraded silently to 14.
+/// Schema **13**/**14** Class A is layout-compatible with **15**. A **materialized**
+/// page-era (or schema-13 slab) SH index is refused at store open; empty / missing
+/// SH is upgraded silently to 15.
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 14 && ver == 13)
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 15 && (ver == 14 || ver == 13))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -244,8 +247,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(15));
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));

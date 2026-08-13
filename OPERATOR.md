@@ -347,7 +347,15 @@ Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` �
 
 Optional **thin** BIP-352 index for Cake-compatible `blockchain.tweaks.subscribe`.
 Default **off**. The Electrum method still exists when off (naive per-height
-walk). Flag on = persist + serve-from-index + background backfill.
+walk). Flag on = persist + serve-from-index.
+
+**Not built during Direct IBD** (the write thread stays Class A + annotate).
+After catch-up, **SH materialize first** (if `--shindex`), then a background
+walker fills `origin..=live tip` from Class A. Tip write-through only when
+`height == next_height`; if confirm is ahead, backfill owns the hole. Kill
+is safe: `next_height` is the last complete put; restart in Tip (or after
+the next Direct catch-up reaches tip) resumes the walker. Electrum during
+the hole uses the naive path.
 
 On disk (schema 14 side files, no `SCHEMA_VERSION` bump):
 
@@ -361,8 +369,8 @@ On disk (schema 14 side files, no `SCHEMA_VERSION` bump):
 sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
 **not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
 
-Confirm writes 65 B-class records from already-pinned parents
-(**10–50 ms/block** CPU). Reorg truncates with tip. Historical backfill is
+Tip follow writes 65 B-class records from already-pinned parents when the
+cursor is caught up. Reorg truncates with tip. Post-IBD backfill is
 IO-bound (**hours** on SSD; 9p/spinning rust longer). Progress is the idx
 itself (kill-safe).
 

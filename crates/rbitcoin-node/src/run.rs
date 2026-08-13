@@ -213,19 +213,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let mut node = P2PNode::start(listen, query, params.clone(), milestone)
         .await
         .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
-    if config.sptweaks {
-        let q = Arc::clone(&node.hub.query);
-        let p = params.clone();
-        std::thread::Builder::new()
-            .name("sptweaks-backfill".into())
-            .spawn(
-                move || match rbitcoin_consensus::backfill_sp_tweaks(&q, &p) {
-                    Ok(n) => info!("sp_tweaks: backfill wrote {n} heights"),
-                    Err(e) => warn!("sp_tweaks: backfill: {e}"),
-                },
-            )
-            .ok();
-    }
 
     let mempool = MempoolHub::open_with_weight(
         config.mempool_path(),
@@ -252,6 +239,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
+    // Tweaks are not write-through in Direct. Backfill only in Tip
+    // (SH-warm restart here; post-IBD after enter_tip_mode). Once so both
+    // sites do not launch two walkers.
+    if config.sptweaks && node.hub.query.index_mode().is_tip() {
+        spawn_sptweaks_backfill(
+            Arc::clone(&node.hub.query),
+            params.clone(),
+            Arc::clone(&shutdown.flag),
+        );
+    }
 
     // Persisted peer book (discovered addrs + PeerFlags) under datadir.
     let peers_path = config.datadir.join("peers");
@@ -412,6 +409,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
+            if config.sptweaks {
+                spawn_sptweaks_backfill(
+                    Arc::clone(&node.hub.query),
+                    params.clone(),
+                    Arc::clone(&shutdown.flag),
+                );
+            }
             // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
             mempool.set_relay_enabled(true);
             info!(
@@ -904,6 +908,30 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
 fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
     config.use_seeds && config.connect.is_empty() && config.signet_challenge.is_none()
+}
+
+/// One walker per process: SH-warm start and post-IBD `enter_tip_mode` both call this.
+fn spawn_sptweaks_backfill(
+    query: Arc<Query>,
+    params: rbitcoin_consensus::ChainParams,
+    cancel: Arc<AtomicBool>,
+) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(move || {
+        std::thread::Builder::new()
+            .name("sptweaks-backfill".into())
+            .spawn(move || {
+                match rbitcoin_consensus::backfill_sp_tweaks_cancellable(
+                    &query,
+                    &params,
+                    Some(cancel.as_ref()),
+                ) {
+                    Ok(n) => info!("sp_tweaks: backfill wrote {n} heights"),
+                    Err(e) => warn!("sp_tweaks: backfill: {e}"),
+                }
+            })
+            .ok();
+    });
 }
 
 /// Result of post-IBD tip entry: follow/mempool gates vs Electrum SH gate.

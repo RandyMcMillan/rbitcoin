@@ -167,7 +167,7 @@ Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/writ
 | `class_c=` | strong + tip tables + `flush_class_c_tip` (**not** the SH join wait) |
 | `sh=` | SH filter+collect (Direct enqueue / tip durable append). Parallel with strong. |
 | `spend=` | spend annotate (`ann=` / `pread_skip`) |
-| `tweaks=` | `index_sp_tweaks_batch` (`--sptweaks`; ~0 when off) |
+| `tweaks=` | Tip write-through `index_sp_tweaks_batch` only (`--sptweaks`; **0 in Direct** — backfill after IBD) |
 | `tip_gc=` | `advance_parent_cache_tip` |
 
 Known leftover on `confirm write slow` **Instant** vs named (18:43 run, after `tweaks=`): **~100–300 ms/batch** (~5% of wall). That is SH enqueue / `thread::scope` join, **not** another multi-second silent index. Do not treat it as the 17:47 hole. If a future change makes that leftover large, meter SH enqueue/join explicitly.

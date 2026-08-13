@@ -12,7 +12,7 @@ pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
 }
 
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
-/// → optional SP tweak index.
+/// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
 ///
 /// When `batch.archive_plan` is set (wire lookup/load path), Class A is appended in this
 /// same stage before structural/annotate — single ordered commit era.
@@ -136,7 +136,7 @@ pub fn confirm_write_phase(
         post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
     let t_tweak = Instant::now();
-    if query.sptweaks_enabled() {
+    if query.sptweaks_enabled() && query.index_mode().is_tip() {
         if let Err(e) = index_sp_tweaks_batch(
             query,
             params,
@@ -239,10 +239,29 @@ fn index_sp_tweaks_batch(
     wires: &[Arc<Block>],
     parents: &rbitcoin_query::BatchParents,
 ) -> Result<(), ConsensusError> {
+    // Tip write-through only. Direct IBD leaves the sequential cursor at origin
+    // (or last backfill slot); post-IBD `backfill_sp_tweaks` owns the hole.
     let origin = params.taproot_height();
+    let mut next = query
+        .sptweaks_next_height()
+        .unwrap_or(rbitcoin_primitives::Height(origin));
+    if next.0 < origin {
+        next = rbitcoin_primitives::Height(origin);
+    }
     for (p, block) in prepared.iter().zip(wires.iter()) {
         if p.height.0 < origin {
             continue;
+        }
+        if p.height < next {
+            continue;
+        }
+        if p.height > next {
+            rbitcoin_log::debug!(
+                "sp_tweaks: h={} > next={} (backfill owns hole)",
+                p.height.0,
+                next.0
+            );
+            return Ok(());
         }
         let recs = match records_from_wire(p, block, parents) {
             Some(r) => r,
@@ -257,6 +276,7 @@ fn index_sp_tweaks_batch(
             }
         };
         query.put_sp_tweaks_block(p.height, p.header_fk, &recs)?;
+        next = rbitcoin_primitives::Height(next.0.saturating_add(1));
     }
     Ok(())
 }

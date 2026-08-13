@@ -124,42 +124,66 @@ pub fn tweaks_at_height(
     tweaks_for_height(query, params, height)
 }
 
-/// Sequential hole fill from the table’s next height through tip.
+/// Sequential hole fill from the table’s next height through **live** tip.
+///
+/// Re-reads tip after each snapshot so tip-follow during backfill does not
+/// leave a tail. Stop when `next_height > tip`. Safe to resume after kill
+/// (`next_height` is the last complete `put`).
 pub fn backfill_sp_tweaks(query: &Query, params: &ChainParams) -> Result<u32, ConsensusError> {
+    backfill_sp_tweaks_cancellable(query, params, None)
+}
+
+/// Like [`backfill_sp_tweaks`], stopping when `cancel` is set (process exit).
+pub fn backfill_sp_tweaks_cancellable(
+    query: &Query,
+    params: &ChainParams,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<u32, ConsensusError> {
     if !query.sptweaks_enabled() {
         return Ok(0);
     }
-    let Some(tip) = query.tip_height() else {
-        return Ok(0);
-    };
     let origin = query.sptweaks_origin();
     let mut wrote = 0u32;
-    let mut h = query
-        .sptweaks_next_height()
-        .unwrap_or(origin)
-        .0
-        .max(origin.0);
-    while h <= tip.0 {
-        let height = Height(h);
-        let Some(header_fk) = query.store().confirmed.get(height)? else {
-            break;
-        };
-        let fks = match query.block_tx_fks(height) {
-            Ok(f) => f,
-            Err(StoreError::NotFound) => break,
-            Err(e) => return Err(e.into()),
-        };
-        let map = tweaks_for_height(query, params, height)?;
-        let mut recs = Vec::with_capacity(fks.len());
-        for fk in fks {
-            let txid = query.store().txs.body_txid(fk)?;
-            recs.push(map.get(&txid).map(|t| t.tweak));
+    loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Ok(wrote);
         }
-        query.put_sp_tweaks_block(height, header_fk, &recs)?;
-        wrote = wrote.saturating_add(1);
-        h = h.saturating_add(1);
+        let Some(tip) = query.tip_height() else {
+            return Ok(wrote);
+        };
+        let mut h = query
+            .sptweaks_next_height()
+            .unwrap_or(origin)
+            .0
+            .max(origin.0);
+        if h > tip.0 {
+            return Ok(wrote);
+        }
+        let snapshot = tip.0;
+        while h <= snapshot {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Ok(wrote);
+            }
+            let height = Height(h);
+            let Some(header_fk) = query.store().confirmed.get(height)? else {
+                return Ok(wrote);
+            };
+            let fks = match query.block_tx_fks(height) {
+                Ok(f) => f,
+                Err(StoreError::NotFound) => return Ok(wrote),
+                Err(e) => return Err(e.into()),
+            };
+            let map = tweaks_for_height(query, params, height)?;
+            let mut recs = Vec::with_capacity(fks.len());
+            for fk in fks {
+                let txid = query.store().txs.body_txid(fk)?;
+                recs.push(map.get(&txid).map(|t| t.tweak));
+            }
+            query.put_sp_tweaks_block(height, header_fk, &recs)?;
+            wrote = wrote.saturating_add(1);
+            h = h.saturating_add(1);
+        }
     }
-    Ok(wrote)
 }
 
 /// Confirmed height → eligible txid (internal order) → tweak.
@@ -956,6 +980,32 @@ mod tests {
     }
 
     #[test]
+    fn backfill_cancellable_stops_before_walk() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.enter_direct_index_mode().unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        let cancel = AtomicBool::new(true);
+        assert_eq!(
+            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
+            0
+        );
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
+            1
+        );
+        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn backfill_noop_when_flag_off() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
@@ -999,6 +1049,100 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         assert!(q.load_thin_tweaks(Height(1)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_confirm_does_not_index_tweaks() {
+        use rbitcoin_query::IndexMode;
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.enter_direct_index_mode().unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        assert_eq!(q.index_mode(), IndexMode::Direct);
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+
+        assert_eq!(
+            q.sptweaks_next_height(),
+            Some(Height(0)),
+            "Direct IBD must not write-through tweaks"
+        );
+        assert!(
+            q.load_thin_tweaks(Height(0)).unwrap().is_none(),
+            "no thin row until post-IBD backfill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_after_direct_indexes_through_tip_then_tip_write_through() {
+        use rbitcoin_query::IndexMode;
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.enter_direct_index_mode().unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+
+        let n = backfill_sp_tweaks(&q, &params).unwrap();
+        assert_eq!(
+            n, 2,
+            "resume/restart backfill fills Direct gap origin..=tip"
+        );
+        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
+        assert!(q.load_thin_tweaks(Height(0)).unwrap().is_some());
+        assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
+
+        q.enter_tip_index_mode();
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        let b2 = crate::mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+        crate::accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
+        assert_eq!(
+            q.sptweaks_next_height(),
+            Some(Height(3)),
+            "Tip write-through after backfill caught up"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tip_write_skips_when_next_lags_backfill_owns_the_hole() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.enter_direct_index_mode().unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+
+        q.enter_tip_index_mode();
+        let b2 = crate::mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+        crate::accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
+        assert_eq!(
+            q.sptweaks_next_height(),
+            Some(Height(0)),
+            "Tip write must not put height 2 while next is 0"
+        );
+
+        let n = backfill_sp_tweaks(&q, &params).unwrap();
+        assert_eq!(
+            n, 3,
+            "backfill fills origin..=live tip including skipped write"
+        );
+        assert_eq!(q.sptweaks_next_height(), Some(Height(3)));
+        assert!(q.load_thin_tweaks(Height(2)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,6 +11,12 @@ before 1.0).
 
 ### Changed
 
+- **`--sptweaks` during IBD:** Direct confirm no longer write-throughs the
+  thin BIP-352 index (it was 50–80% of fat-era write). After tip, SH
+  materialize (if `--shindex`) then a sequential backfill to live tip;
+  Tip write-through only when `height == next_height`. Restart resumes
+  from `next_height`.
+
 - **Schema 15 Class A split:** `txout.body` (outs) + `inwit.body` (ins+witness)
   + `spent.body` (9 B×n_out). Packed `tx.body` with creates is refused. Pin/SH
   read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in

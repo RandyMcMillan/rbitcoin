@@ -11,7 +11,8 @@ pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     }
 }
 
-/// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC.
+/// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
+/// → optional SP tweak index.
 ///
 /// When `batch.archive_plan` is set (wire lookup/load path), Class A is appended in this
 /// same stage before structural/annotate — single ordered commit era.
@@ -134,6 +135,7 @@ pub fn confirm_write_phase(
     let (spend_ann_ns, tip_gc_ns) =
         post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
+    let t_tweak = Instant::now();
     if query.sptweaks_enabled() {
         if let Err(e) = index_sp_tweaks_batch(
             query,
@@ -144,6 +146,10 @@ pub fn confirm_write_phase(
         ) {
             rbitcoin_log::warn!("sp_tweaks: skip confirm batch: {e}");
         }
+    }
+    let tweak_ns = t_tweak.elapsed().as_nanos() as u64;
+    if tweak_ns > 0 {
+        confirm_phase_stats::TWEAK_NS.fetch_add(tweak_ns, Ordering::Relaxed);
     }
 
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
@@ -160,6 +166,7 @@ pub fn confirm_write_phase(
         class_c_ns,
         spend_ann_ns,
         tip_gc_ns,
+        tweak_ns,
     });
     Ok(out)
 }

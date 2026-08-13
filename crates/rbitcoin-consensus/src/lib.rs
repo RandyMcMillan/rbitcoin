@@ -180,6 +180,10 @@ pub mod confirm_phase_stats {
     /// Body/head/header_txs. Also mirrored in
     /// [`rbitcoin_query::archive_phase_stats`] write_* subtimers.
     pub static CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
+    /// Write-stage BIP-352 thin tweak index (`index_sp_tweaks_batch`) wall.
+    ///
+    /// Zero when `--sptweaks` is off. Not inside `UTXO_APPLY_NS` / `spend=`.
+    pub static TWEAK_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage denserels/abs ensure after Class A (fill planned + ensure spends).
     pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: creates filled from pin layout (no Class A body IO).
@@ -269,6 +273,7 @@ pub mod confirm_phase_stats {
     static LAST_WRITE_CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SPEND_ANN_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_TIP_GC_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_TWEAK_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_WALL_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Snapshot of the most recent successful [`super::confirm_write_phase`].
@@ -287,6 +292,8 @@ pub mod confirm_phase_stats {
         pub class_c_ns: u64,
         pub spend_ann_ns: u64,
         pub tip_gc_ns: u64,
+        /// BIP-352 thin tweak index (`index_sp_tweaks_batch`) after annotate.
+        pub tweak_ns: u64,
     }
 
     impl LastWritePhases {
@@ -309,6 +316,7 @@ pub mod confirm_phase_stats {
         LAST_WRITE_CLASS_C_NS.store(p.class_c_ns, Ordering::Relaxed);
         LAST_WRITE_SPEND_ANN_NS.store(p.spend_ann_ns, Ordering::Relaxed);
         LAST_WRITE_TIP_GC_NS.store(p.tip_gc_ns, Ordering::Relaxed);
+        LAST_WRITE_TWEAK_NS.store(p.tweak_ns, Ordering::Relaxed);
     }
 
     pub fn last_write_phases() -> LastWritePhases {
@@ -324,6 +332,7 @@ pub mod confirm_phase_stats {
             class_c_ns: LAST_WRITE_CLASS_C_NS.load(Ordering::Relaxed),
             spend_ann_ns: LAST_WRITE_SPEND_ANN_NS.load(Ordering::Relaxed),
             tip_gc_ns: LAST_WRITE_TIP_GC_NS.load(Ordering::Relaxed),
+            tweak_ns: LAST_WRITE_TWEAK_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -348,6 +357,12 @@ pub mod confirm_phase_stats {
             CLASS_A_NS.swap(0, Ordering::Relaxed),
             ENSURE_LAYOUT_NS.swap(0, Ordering::Relaxed),
         )
+    }
+
+    /// Sample and reset write-stage SP tweak index wall.
+    #[inline]
+    pub fn sample_tweak_and_reset() -> u64 {
+        TWEAK_NS.swap(0, Ordering::Relaxed)
     }
 
     /// `(ensure_res_hit, ensure_cold_n)` for write ensure mix.
@@ -892,12 +907,18 @@ mod coverage_tests {
             class_c_ns: 400_000,
             spend_ann_ns: 300_000,
             tip_gc_ns: 10_000,
+            tweak_ns: 2_500_000,
         });
         let p = last_write_phases();
         assert_eq!(p.n_blocks, 2);
         assert_eq!(LastWritePhases::ms(p.wall_ns), 3);
         assert_eq!(LastWritePhases::ms(p.class_a_ns), 0); // 500_000 ns → 0 ms
         assert_eq!(p.class_a_ns, 500_000);
+        assert_eq!(p.tweak_ns, 2_500_000);
+        assert_eq!(LastWritePhases::ms(p.tweak_ns), 2);
+        TWEAK_NS.store(42, Ordering::Relaxed);
+        assert_eq!(sample_tweak_and_reset(), 42);
+        assert_eq!(sample_tweak_and_reset(), 0);
         RECONSTRUCT_NS.store(5, Ordering::Relaxed);
         RECONSTRUCT_WIRE_NS.store(7, Ordering::Relaxed);
         CONNECT_NS.store(1, Ordering::Relaxed);

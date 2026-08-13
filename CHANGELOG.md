@@ -41,6 +41,10 @@ before 1.0).
 
 ### Added
 
+- **IBD write meters:** `tweaks=` on `ibd: perf` / `perf_dbg` and `confirm write slow`
+  (BIP-352 index wall after spend annotate). Makes the `--sptweaks` write-thread
+  cost visible in the fat-era IBD hole.
+
 - **`--sptweaks`:** optional thin BIP-352 index (`sp_tweaks.idx` / `.body`).
   Persist is `len:tweak` only (0 or 33-byte compressed `A_tweak`). Cake outs
   join `txout`. Confirm appends; reorg truncates; background backfill.

@@ -22,7 +22,7 @@
 //! - **lookup** = structure + stamp create_fk (`plan_ms` / lookup_thr)
 //! - **load** = pre-assemble (`LOAD_NS`: pin denserels) + assemble (`CONNECT_NS`)
 //! - **script** = `SCRIPT_NS`
-//! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tip GC
+//! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tweaks + tip GC
 //!
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
 //! `loadq`/`scriptq` stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
@@ -108,6 +108,8 @@ pub(crate) struct IbdPerfSample {
     pub sh_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
     pub utxo_ms: u64,
+    /// Write-stage BIP-352 tweak index wall (logged as `tweaks=` ms).
+    pub tweak_ms: u64,
     /// Write structural total (spentness+maturity+BIP68+subsidy); not load `connect`.
     pub structural_ms: u64,
     /// Structural sub: durable spentness probes.
@@ -162,6 +164,7 @@ pub(crate) struct IbdPerfSample {
     pub sh_ns: u64,
     pub tip_ns: u64,
     pub utxo_apply_ns: u64,
+    pub tweak_ns: u64,
     pub structural_ns: u64,
     pub structural_spent_ns: u64,
     pub structural_create_h_ns: u64,
@@ -401,6 +404,7 @@ impl Default for IbdPerfSample {
             strong_ms: 0,
             sh_ms: 0,
             utxo_ms: 0,
+            tweak_ms: 0,
             structural_ms: 0,
             structural_spent_ms: 0,
             spent_abs_ms: 0,
@@ -437,6 +441,7 @@ impl Default for IbdPerfSample {
             sh_ns: 0,
             tip_ns: 0,
             utxo_apply_ns: 0,
+            tweak_ns: 0,
             structural_ns: 0,
             structural_spent_ns: 0,
             structural_create_h_ns: 0,
@@ -732,6 +737,7 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
     let (ann_ns, ann_n, ann_pread_skip, ann_pread) =
@@ -821,6 +827,7 @@ pub(crate) fn sample(
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
+        tweak_ms: ns_ms(tweak_ns),
         structural_ms: ns_ms(structural_ns),
         structural_spent_ms: ns_ms(structural_spent_ns),
         spent_abs_ms: ns_ms(spent_abs_ns),
@@ -857,6 +864,7 @@ pub(crate) fn sample(
         sh_ns,
         tip_ns,
         utxo_apply_ns,
+        tweak_ns,
         structural_ns,
         structural_spent_ns,
         structural_create_h_ns,
@@ -1043,7 +1051,7 @@ fn plan_batch_ms(s: &IbdPerfSample) -> u64 {
 ///
 /// Class A + denserels ensure + structural + **Class C tables** (strong+tip) +
 /// **SH** (parallel with strong on tip; was previously folded into a join-wall
-/// `class_c`) + spend annotate + tip GC.
+/// `class_c`) + spend annotate + SP tweaks + tip GC.
 fn write_stage_ms(s: &IbdPerfSample) -> u64 {
     s.class_a_ms
         .saturating_add(s.ensure_ms)
@@ -1051,6 +1059,7 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
         .saturating_add(s.class_c_ms)
         .saturating_add(s.sh_ms)
         .saturating_add(s.utxo_ms)
+        .saturating_add(s.tweak_ms)
         .saturating_add(s.cache_tip_ms)
 }
 
@@ -1296,11 +1305,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         out.push_str(&format!(" miss_p={}", s.load_missing_parents));
     }
 
-    // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tip GC.
+    // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tweaks / tip GC.
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tip_gc={}ms \
+         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
         s.class_a_ms,
@@ -1318,6 +1327,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.class_c_ms,
         s.sh_ms,
         s.utxo_ms,
+        s.tweak_ms,
         s.cache_tip_ms,
         s.ann_ms,
         s.ann_n,
@@ -1391,11 +1401,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         .saturating_add(s.class_c_ns)
         .saturating_add(s.sh_ns)
         .saturating_add(s.utxo_apply_ns)
+        .saturating_add(s.tweak_ns)
         .saturating_add(s.cache_tip_ns);
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
-         spend={}(r={} i={} skip={}) tip_gc={}",
+         spend={}(r={} i={} skip={}) tweaks={} tip_gc={}",
         us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
@@ -1413,6 +1424,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.spend_ranged,
         s.spend_idx,
         s.spend_skip,
+        us(s.tweak_ns),
         us(s.cache_tip_ns),
     );
     append_nz(&mut out, "recon_us", us(s.recon_ns));
@@ -1781,9 +1793,10 @@ mod tests {
         s.class_c_ms = 40; // tables only
         s.sh_ms = 100; // SH exclusive (parallel with strong; counted separately)
         s.utxo_ms = 25;
+        s.tweak_ms = 80;
         s.cache_tip_ms = 5;
-        // 15+2+50+40+100+25+5 = 237
-        assert_eq!(write_stage_ms(&s), 237);
+        // 15+2+50+40+100+25+80+5 = 317
+        assert_eq!(write_stage_ms(&s), 317);
     }
 
     #[test]
@@ -1806,6 +1819,7 @@ mod tests {
         s.ensure_ms = 3;
         s.class_c_ms = 40;
         s.utxo_ms = 25;
+        s.tweak_ms = 7;
         s.cache_tip_ms = 5;
         s.dominant = "confirm";
         s.live = Some((100, 32, 8000, 1500));
@@ -1833,12 +1847,13 @@ mod tests {
             !line.contains("connect="),
             "assemble is inside load, not a peer stage: {line}"
         );
-        // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25)+tip_gc(5) = 85
-        assert!(line.contains("write=85ms"), "{line}");
+        // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25)+tweaks(7)+tip_gc(5) = 92
+        assert!(line.contains("write=92ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");
         assert!(line.contains("ensure=3ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
         assert!(line.contains("spend=25ms"), "{line}");
+        assert!(line.contains("tweaks=7ms"), "{line}");
         assert!(line.contains("struct=0ms"), "{line}");
         assert!(line.contains("recon_ms=100"), "{line}"); // non-zero only
         assert!(!line.contains("prefetch"), "{line}");
@@ -1892,8 +1907,8 @@ mod tests {
             line.contains("spent_sub(abs=20 strong=5 cold=3 pending=2)"),
             "{line}"
         );
-        // write = 12+3+50+40+25+5 = 135
-        assert!(line.contains("write=135ms"), "{line}");
+        // write = 12+3+50+40+25+7+5 = 142
+        assert!(line.contains("write=142ms"), "{line}");
         assert!(line.contains("class_a_sub(body=7 head=2"), "{line}");
         assert!(line.contains("pre_asm=30ms"), "{line}");
         assert!(line.contains("assemble=8ms"), "{line}");
@@ -2100,6 +2115,7 @@ mod tests {
         s.phase_blks = 10;
         s.recon_ns = 10_000_000; // 1ms/blk → 1000 us/blk
         s.utxo_apply_ns = 5_000_000; // 500 us/blk
+        s.tweak_ns = 3_000_000; // 300 us/blk
         s.spend_ranged = 10;
         s.spend_idx = 2;
         s.spend_skip = 0;
@@ -2138,6 +2154,7 @@ mod tests {
         assert!(line.contains("ensure="), "{line}");
         assert!(line.contains("write="), "{line}");
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}");
+        assert!(line.contains("tweaks=300"), "{line}");
         assert!(!line.contains("prefetch="), "{line}");
         assert!(!line.contains("wave body="), "{line}");
         assert!(!line.contains("sh seed="), "{line}");

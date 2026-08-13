@@ -12,7 +12,7 @@ use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network};
-use rbitcoin_primitives::Height;
+use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::{HistoryFilter, Query};
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
@@ -36,13 +36,41 @@ fn best_chain_block(
     Ok((height, block))
 }
 
+/// Packed-body span + 80-byte header. Not wire-identical to Core/Esplora when
+/// Class A packing differs from consensus encoding; clients that need exact
+/// size/weight use `/block/:hash/raw`.
+fn packed_block_size_weight(
+    query: &Query,
+    header_fk: Fk,
+    tx_count: u32,
+) -> Result<(u64, u64), rbitcoin_query::QueryError> {
+    let packed = if tx_count == 0 {
+        0
+    } else if let Some((first, n)) = query.store().header_txs.get_range(header_fk)? {
+        let last = Fk(first.0.saturating_add(u64::from(n.saturating_sub(1))));
+        match (
+            query.store().tx_body_range(first),
+            query.store().tx_body_range(last),
+        ) {
+            (Ok((o0, _)), Ok((o1, l1))) if o1 >= o0 => o1.saturating_add(l1).saturating_sub(o0),
+            _ => u64::from(n),
+        }
+    } else {
+        0
+    };
+    let size = 80u64.saturating_add(packed.max(1));
+    Ok((size, size.saturating_mul(4)))
+}
+
 /// Esplora `GET /block/:hash` JSON for a **best-chain** header hash.
 pub(crate) fn block_summary_json(
     query: &Query,
     hash: &[u8; 32],
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let (height, block) = best_chain_block(query, hash)?;
-    let (_fk, rec) = query
+    let Some(height) = query.height_of_hash(hash)? else {
+        return Err(rbitcoin_store::StoreError::NotFound);
+    };
+    let (header_fk, rec) = query
         .header_at_height(height)?
         .ok_or(rbitcoin_store::StoreError::NotFound)?;
     let prev_hash = if rec.prev_fk.is_null() {
@@ -50,8 +78,13 @@ pub(crate) fn block_summary_json(
     } else {
         query.store().get_header(rec.prev_fk)?.hash
     };
-    let raw = serialize(&block);
-    let weight = block.weight().to_wu();
+    let tx_count = query
+        .store()
+        .header_txs
+        .get_range(header_fk)?
+        .map(|(_, n)| n)
+        .unwrap_or(0);
+    let (size, weight) = packed_block_size_weight(query, header_fk, tx_count)?;
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
@@ -60,8 +93,8 @@ pub(crate) fn block_summary_json(
         "height": height.0,
         "version": rec.version,
         "timestamp": rec.timestamp,
-        "tx_count": block.txdata.len(),
-        "size": raw.len(),
+        "tx_count": tx_count,
+        "size": size,
         "weight": weight,
         "merkle_root": block_hash_hex(&rec.merkle_root),
         "previousblockhash": if height.0 == 0 {
@@ -95,9 +128,11 @@ pub async fn block_json(State(st): State<AppState>, Path(hash_hex): Path<String>
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    match block_summary_json(&st.query, &hash) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => store_err(e),
+    let q = std::sync::Arc::clone(&st.query);
+    match tokio::task::spawn_blocking(move || block_summary_json(&q, &hash)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => store_err(e),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -105,8 +140,9 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    match best_chain_block(&st.query, &hash) {
-        Ok((_h, block)) => {
+    let q = std::sync::Arc::clone(&st.query);
+    match tokio::task::spawn_blocking(move || best_chain_block(&q, &hash)).await {
+        Ok(Ok((_h, block))) => {
             let raw = serialize(&block);
             (
                 StatusCode::OK,
@@ -115,7 +151,8 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
             )
                 .into_response()
         }
-        Err(e) => store_err(e),
+        Ok(Err(e)) => store_err(e),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -188,12 +225,16 @@ pub async fn block_txid_at(
 
 /// `GET /blocks` — 10 newest from tip.
 pub async fn blocks_tip(State(st): State<AppState>) -> Response {
-    blocks_from(&st, None)
+    tokio::task::spawn_blocking(move || blocks_from(&st, None))
+        .await
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
 /// `GET /blocks/:start_height` — 10 blocks starting at `start_height` downward.
 pub async fn blocks_from_height(State(st): State<AppState>, Path(start): Path<u32>) -> Response {
-    blocks_from(&st, Some(start))
+    tokio::task::spawn_blocking(move || blocks_from(&st, Some(start)))
+        .await
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
 fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
@@ -1015,8 +1056,19 @@ mod pure_helper_tests {
         assert!(summary["previousblockhash"].is_null());
         assert!(summary["id"].as_str().unwrap().len() == 64);
         assert!(summary["difficulty"].as_f64().unwrap() > 0.0);
+        assert!(summary["size"].as_u64().unwrap() > 80);
+        assert!(summary["weight"].as_u64().unwrap() > 0);
         // Unknown hash → NotFound class error.
         assert!(block_summary_json(&q, &[0x11; 32]).is_err());
+        let _ = q.sample_reset_reconstruct_archived();
+        let _ = block_summary_json(&q, &hash).expect("summary again");
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "block JSON must not reconstruct wire"
+        );
+        assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
+        assert!(q.sample_reset_reconstruct_archived() >= 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

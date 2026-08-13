@@ -1008,6 +1008,8 @@ pub struct Query {
     ///
     /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
     height_by_hash: Mutex<HeightByHashIndex>,
+    /// `reconstruct_archived_block` calls (Esplora summary must stay 0).
+    reconstruct_archived: AtomicU64,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1092,6 +1094,7 @@ impl Query {
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
+            reconstruct_archived: AtomicU64::new(0),
         };
         // Eager height index so first Esplora/P2P mid-chain lookup is hot.
         if let Some(tip) = q.tip_height() {
@@ -1176,6 +1179,16 @@ impl Query {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Sample-and-reset archived wire-block reconstructs (Esplora `/raw` vs summary).
+    pub fn sample_reset_reconstruct_archived(&self) -> u64 {
+        self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn note_reconstruct_archived(&self) {
+        self.reconstruct_archived
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {

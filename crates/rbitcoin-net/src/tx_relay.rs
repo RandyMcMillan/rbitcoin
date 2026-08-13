@@ -214,6 +214,13 @@ pub struct MempoolPerfSample {
     /// Confirmed-chain prevouts resolved by Electrum unconfirmed-balance.
     /// Unused scripthash (sh_index miss) must stay 0.
     pub delta_prevouts: u64,
+    /// Live mempool bodies loaded while building the spent-outpoint set.
+    /// Unused-scripthash `listunspent` must stay 0 (use `graph.conflicts`).
+    pub spent_body_loads: u64,
+    /// Calls to [`MempoolHub::list_live`] (clones every live body).
+    pub list_live: u64,
+    /// Calls to [`MempoolHub::list_live_meta`] (full live-set scan).
+    pub list_live_meta: u64,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -248,6 +255,12 @@ pub struct MempoolHub {
     meter_announce: AtomicU64,
     /// Chain prevouts resolved by [`Self::scripthash_unconfirmed_delta`].
     meter_delta_prevouts: AtomicU64,
+    /// Bodies loaded by [`Self::spent_outpoints`] (must stay 0 after conflict-map).
+    meter_spent_body_loads: AtomicU64,
+    /// Full live-set clones ([`Self::list_live`]).
+    meter_list_live: AtomicU64,
+    /// Full live-set meta scans ([`Self::list_live_meta`]).
+    meter_list_live_meta: AtomicU64,
     /// Live mempool txs by Electrum scripthash (updated on accept/remove).
     sh_index: Mutex<MempoolShIndex>,
 }
@@ -291,6 +304,9 @@ impl MempoolHub {
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
             meter_delta_prevouts: AtomicU64::new(0),
+            meter_spent_body_loads: AtomicU64::new(0),
+            meter_list_live: AtomicU64::new(0),
+            meter_list_live_meta: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
         };
         hub.reindex_live_scripthashes();
@@ -412,6 +428,9 @@ impl MempoolHub {
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
             delta_prevouts: self.meter_delta_prevouts.swap(0, Ordering::Relaxed),
+            spent_body_loads: self.meter_spent_body_loads.swap(0, Ordering::Relaxed),
+            list_live: self.meter_list_live.swap(0, Ordering::Relaxed),
+            list_live_meta: self.meter_list_live_meta.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -927,6 +946,7 @@ impl MempoolHub {
 
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
+        self.meter_list_live.fetch_add(1, Ordering::Relaxed);
         let g = self.inner.read().unwrap();
         g.graph
             .iter()
@@ -940,6 +960,7 @@ impl MempoolHub {
 
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
     pub fn list_live_meta(&self) -> Vec<(Txid, u64, u64)> {
+        self.meter_list_live_meta.fetch_add(1, Ordering::Relaxed);
         let g = self.inner.read().unwrap();
         g.graph
             .iter()
@@ -947,17 +968,27 @@ impl MempoolHub {
             .collect()
     }
 
+    /// Fee/weight for one live mempool txid (no live-set scan).
+    pub fn get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
+        self.inner
+            .read()
+            .unwrap()
+            .graph
+            .get(txid)
+            .map(|e| (e.fee_sat, e.weight))
+    }
+
+    /// True if a live mempool tx spends `op` (RBF conflict map; no body load).
+    pub fn spends_outpoint(&self, op: &OutPoint) -> bool {
+        self.inner.read().unwrap().graph.conflict_txid(op).is_some()
+    }
+
     /// Outpoints spent by any live mempool transaction (confirmed or mempool parents).
+    ///
+    /// Uses the RBF conflict map — no live-body walk.
     pub fn spent_outpoints(&self) -> std::collections::HashSet<OutPoint> {
         let g = self.inner.read().unwrap();
-        let mut set = std::collections::HashSet::new();
-        for (txid, _) in g.graph.iter() {
-            let Some(tx) = g.get_tx(txid) else { continue };
-            for inp in &tx.input {
-                set.insert(inp.previous_output);
-            }
-        }
-        set
+        g.graph.conflict_outpoints().collect()
     }
 
     /// Electrum `blockchain.scripthash.get_mempool` rows for `scripthash` (internal order).

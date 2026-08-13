@@ -854,6 +854,7 @@ mod tests {
             .expect("listen");
         let addr = handle.local_addr;
 
+        let _ = q.sample_reset_reconstruct_archived();
         let h1 = block_hash_hex(&hashes[1]);
         let (st, body) = http_get(addr, &format!("/block/{h1}")).await;
         assert_eq!(st, 200, "block json {body}");
@@ -866,6 +867,11 @@ mod tests {
         assert!(bj.get("difficulty").is_some());
         assert!(bj.get("mediantime").is_some());
         assert_eq!(bj["previousblockhash"], block_hash_hex(&hashes[0]));
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "/block JSON must not reconstruct wire"
+        );
 
         // Raw block binary (HTTP body after headers — use binary-aware read).
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -887,6 +893,10 @@ mod tests {
         // Fixture headers use lab hashes; wire block still has 1 coinbase.
         assert_eq!(block.txdata.len(), 1);
         assert!(raw.len() > 80);
+        assert!(
+            q.sample_reset_reconstruct_archived() >= 1,
+            "/block/:hash/raw must reconstruct wire"
+        );
 
         let (st, body) = http_get(addr, &format!("/block/{h1}/status")).await;
         assert_eq!(st, 200, "{body}");
@@ -913,6 +923,11 @@ mod tests {
         let list1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(list1[0]["height"], 1);
         assert_eq!(list1.len(), 2);
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "/blocks must not reconstruct wire"
+        );
 
         let txid0 = block_hash_hex(&coinbase_txids[0]);
         // Binary raw tx

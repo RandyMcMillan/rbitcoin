@@ -2,7 +2,7 @@
 
 use bitcoin::consensus::{deserialize, encode::serialize_hex, Encodable};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network as BtcNetwork, ScriptBuf, Transaction};
+use bitcoin::{Address, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{hex_decode, hex_encode, Height, Network};
 use rbitcoin_query::Query;
@@ -478,16 +478,15 @@ fn getmempoolentry(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value> {
         .mempool
         .as_ref()
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    for (txid, fee, weight) in mp.list_live_meta() {
-        if txid.to_byte_array() == want {
-            let vsize = weight / 4;
-            return Ok(json!({
-                "vsize": vsize,
-                "weight": weight,
-                "fee": (fee as f64) / 100_000_000.0,
-                "modifiedfee": (fee as f64) / 100_000_000.0,
-            }));
-        }
+    let tid = Txid::from_byte_array(want);
+    if let Some((fee, weight)) = mp.get_live_meta(&tid) {
+        let vsize = weight / 4;
+        return Ok(json!({
+            "vsize": vsize,
+            "weight": weight,
+            "fee": (fee as f64) / 100_000_000.0,
+            "modifiedfee": (fee as f64) / 100_000_000.0,
+        }));
     }
     Err(rpc_error(ERR_MISC, "Transaction not in mempool"))
 }
@@ -501,13 +500,12 @@ fn getrawtransaction(ctx: &RpcContext, params: &[Value]) -> Result<Value, Value>
     let want = parse_hash32_display(hex)?;
 
     if let Some(mp) = ctx.mempool.as_ref() {
-        for (txid, _fee, _w, tx) in mp.list_live() {
-            if txid.to_byte_array() == want {
-                if !verbose {
-                    return Ok(json!(serialize_hex(&tx)));
-                }
-                return Ok(tx_to_json(&tx, Some(json!({ "in_mempool": true }))));
+        let tid = Txid::from_byte_array(want);
+        if let Some(tx) = mp.get_tx(&tid) {
+            if !verbose {
+                return Ok(json!(serialize_hex(&tx)));
             }
+            return Ok(tx_to_json(&tx, Some(json!({ "in_mempool": true }))));
         }
     }
 
@@ -1096,6 +1094,94 @@ mod tests {
             &[json!("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")],
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Single-txid mempool RPC must not scan/clone the live set.
+    #[test]
+    fn mempool_txid_lookups_do_not_list_live() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (ctx, dir) = ctx_empty();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(
+            &ctx.query,
+            &params,
+            Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        const N_SPENDS: u32 = 3;
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &ctx.query,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            100 + N_SPENDS,
+            N_SPENDS,
+        );
+        let mp = ctx.mempool.as_ref().expect("mempool");
+        mp.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let mut live = Vec::new();
+        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
+            let fee = 1_000u64 + i as u64;
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: *cbtxid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - fee),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            mp.accept_tx(&tx).expect("accept");
+            live.push(tx);
+        }
+        let want = live[1].compute_txid();
+        let want_hex = hash_hex_display(&want.to_byte_array());
+        let _ = mp.sample_reset_perf();
+
+        let entry = dispatch(&ctx, "getmempoolentry", &[json!(want_hex.clone())]).unwrap();
+        assert!(entry["weight"].as_u64().unwrap() > 0);
+        let raw = dispatch(&ctx, "getrawtransaction", &[json!(want_hex.clone())]).unwrap();
+        assert!(raw.as_str().unwrap().len() > 20);
+        let verb = dispatch(&ctx, "getrawtransaction", &[json!(want_hex), json!(true)]).unwrap();
+        assert_eq!(verb["txid"], format!("{want}"));
+
+        let s = mp.sample_reset_perf();
+        assert_eq!(s.list_live, 0, "getrawtransaction must not list_live");
+        assert_eq!(
+            s.list_live_meta, 0,
+            "getmempoolentry must not list_live_meta"
+        );
+
+        let miss = dispatch(&ctx, "getmempoolentry", &[json!("00".repeat(32))]).unwrap_err();
+        assert_eq!(miss["message"], "Transaction not in mempool");
+        let miss_raw = dispatch(&ctx, "getrawtransaction", &[json!("11".repeat(32))]).unwrap_err();
+        assert_eq!(
+            miss_raw["message"],
+            "No such mempool or blockchain transaction"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

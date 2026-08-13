@@ -170,6 +170,11 @@ impl TxGraph {
         self.conflicts.get(op).copied()
     }
 
+    /// Outpoints spent by any live mempool tx (chain + mempool parents).
+    pub fn conflict_outpoints(&self) -> impl Iterator<Item = OutPoint> + '_ {
+        self.conflicts.keys().copied()
+    }
+
     /// Conflict set for RBF: conflicting txs plus all their descendants.
     pub fn conflict_set(&self, direct: &[Txid]) -> BTreeSet<Txid> {
         let mut set = BTreeSet::new();

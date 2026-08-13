@@ -454,16 +454,53 @@ where
                     continue;
                 }
                 let t0 = Instant::now();
-                let result = dispatch(
-                    method,
-                    &params_v,
-                    &query,
-                    &config,
-                    &params,
-                    mempool.as_deref(),
-                    &mut header_sub,
-                    &mut sh_subs,
-                );
+                let result = if method_stays_on_worker(method) {
+                    dispatch(
+                        method,
+                        &params_v,
+                        &query,
+                        &config,
+                        &params,
+                        mempool.as_deref(),
+                        &mut header_sub,
+                        &mut sh_subs,
+                    )
+                } else {
+                    let q = Arc::clone(&query);
+                    let cfg = Arc::clone(&config);
+                    let p = Arc::clone(&params);
+                    let mp = mempool.clone();
+                    let method_owned = method.to_string();
+                    let params_owned = params_v.clone();
+                    let mut hs = header_sub;
+                    let mut shs = sh_subs.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let r = dispatch(
+                            &method_owned,
+                            &params_owned,
+                            &q,
+                            &cfg,
+                            &p,
+                            mp.as_deref(),
+                            &mut hs,
+                            &mut shs,
+                        );
+                        (r, hs, shs)
+                    })
+                    .await
+                    {
+                        Ok((r, hs, shs)) => {
+                            header_sub = hs;
+                            sh_subs = shs;
+                            r
+                        }
+                        Err(e) => {
+                            return Err(std::io::Error::other(format!(
+                                "electrum dispatch join: {e}"
+                            )));
+                        }
+                    }
+                };
                 let wall_ms = t0.elapsed().as_millis() as u64;
                 meter_dispatch_wall(t0.elapsed().as_micros() as u64);
                 let params_s = serde_json::to_string(&params_v).unwrap_or_else(|_| "[]".into());
@@ -674,6 +711,21 @@ async fn write_rpc_result<W: AsyncWrite + Unpin>(
     write_raw_line(writer, &s).await
 }
 
+/// Instant methods that must stay on the connection task so a 1-worker runtime
+/// can answer `server.ping` while another socket is in `spawn_blocking`.
+fn method_stays_on_worker(method: &str) -> bool {
+    matches!(
+        method,
+        "server.ping"
+            | "server.version"
+            | "server.banner"
+            | "server.donation_address"
+            | "server.features"
+            | "server.peers.subscribe"
+            | "blockchain.relayfee"
+    )
+}
+
 fn dispatch(
     method: &str,
     params: &Value,
@@ -773,8 +825,6 @@ fn dispatch(
             let u = query
                 .scripthash_listunspent(&sh)
                 .map_err(|e| e.to_string())?;
-            // Outpoints spent by mempool txs (confirmed or other mempool parents).
-            let spent = mempool.map(|m| m.spent_outpoints()).unwrap_or_default();
             let mut arr: Vec<Value> = u
                 .iter()
                 .filter(|x| {
@@ -783,7 +833,7 @@ fn dispatch(
                         txid: bitcoin::Txid::from_byte_array(x.tx_hash),
                         vout: x.tx_pos,
                     };
-                    !spent.contains(&op)
+                    !mempool.map(|m| m.spends_outpoint(&op)).unwrap_or(false)
                 })
                 .map(|x| {
                     json!({
@@ -807,7 +857,7 @@ fn dispatch(
                             txid: tid,
                             vout: vout as u32,
                         };
-                        if spent.contains(&op) {
+                        if mp.spends_outpoint(&op) {
                             continue;
                         }
                         arr.push(json!({
@@ -1544,6 +1594,98 @@ mod tests {
         .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 2);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a 1-worker runtime, ping must complete while another socket is inside
+    /// a real blocking store query (`blockchain.block.headers`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ping_overlaps_blocking_headers_on_one_worker() {
+        use rbitcoin_consensus::{accept_and_connect_block, Milestone};
+        use rbitcoin_primitives::Height;
+        use std::sync::atomic::AtomicU64;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        // Enough headers that a serial walk stays in-flight after ping is scheduled.
+        let _ = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            256,
+            0,
+        );
+        let q = Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let mut a = TcpStream::connect(addr).await.unwrap();
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let a_started = Arc::new(AtomicBool::new(false));
+        let a_done_us = Arc::new(AtomicU64::new(0));
+        let b_done_us = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+
+        let a_started_c = Arc::clone(&a_started);
+        let a_done_c = Arc::clone(&a_done_us);
+        let ha = tokio::spawn(async move {
+            let req = json!({
+                "jsonrpc":"2.0","id":10,
+                "method":"blockchain.block.headers","params":[0, 2016]
+            });
+            let mut line = serde_json::to_string(&req).unwrap();
+            line.push('\n');
+            a.write_all(line.as_bytes()).await.unwrap();
+            a_started_c.store(true, Ordering::SeqCst);
+            let mut reader = BufReader::new(a);
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.unwrap();
+            a_done_c.store(t0.elapsed().as_micros() as u64, Ordering::SeqCst);
+            let v: Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(v["id"], 10);
+            assert!(v["result"]["count"].as_u64().unwrap() > 50);
+        });
+
+        let a_started_c = Arc::clone(&a_started);
+        let b_done_c = Arc::clone(&b_done_us);
+        let hb = tokio::spawn(async move {
+            while !a_started_c.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let req = json!({"jsonrpc":"2.0","id":11,"method":"server.ping","params":[]});
+            let mut line = serde_json::to_string(&req).unwrap();
+            line.push('\n');
+            b.write_all(line.as_bytes()).await.unwrap();
+            let mut reader = BufReader::new(b);
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.unwrap();
+            b_done_c.store(t0.elapsed().as_micros() as u64, Ordering::SeqCst);
+            let v: Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(v["id"], 11);
+            assert!(v.get("result").is_some());
+        });
+
+        ha.await.expect("headers task");
+        hb.await.expect("ping task");
+        let a_done = a_done_us.load(Ordering::SeqCst);
+        let b_done = b_done_us.load(Ordering::SeqCst);
+        assert!(
+            b_done < a_done,
+            "ping finished at {b_done}µs, headers at {a_done}µs (expected overlap)"
+        );
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -2488,6 +2630,111 @@ mod tests {
         let st = scripthash_status_full(&q_arc, &mp, &sh_bytes).unwrap();
         assert!(!st.is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unused scripthash listunspent must not rebuild mempool spentness from
+    /// every live body. Confirmed UTXOs spent by the mempool still drop.
+    #[test]
+    fn listunspent_unused_sh_does_not_load_mempool_bodies() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, Milestone};
+        use rbitcoin_net::MempoolHub;
+        use rbitcoin_primitives::Height;
+        use std::sync::Arc;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        const N_SPENDS: u32 = 4;
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            100 + N_SPENDS,
+            N_SPENDS,
+        );
+        let q_arc = Arc::new(q);
+        let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q_arc)).unwrap();
+        mp.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
+            let fee = 1_000u64 + i as u64;
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: *cbtxid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - fee),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            mp.accept_tx(&tx).expect("accept spend");
+        }
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let unused = electrum_scripthash_hex(&[0x00]);
+        let _ = mp.sample_reset_perf();
+        let empty = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([unused]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+        let s = mp.sample_reset_perf();
+        assert_eq!(
+            s.spent_body_loads, 0,
+            "unused scripthash must not load mempool bodies (got {})",
+            s.spent_body_loads
+        );
+
+        // Spent coinbase of the used script must drop; mempool parent out remains.
+        let sh = electrum_scripthash_hex(spk.as_bytes());
+        let unspent = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let rows = unspent.as_array().unwrap();
+        let spent_cb = format!("{}", coinbase_txids[0]);
+        assert!(
+            rows.iter().all(|r| r["tx_hash"] != spent_cb),
+            "mempool-spent coinbase must drop: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["height"] == 0),
+            "mempool output must remain: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

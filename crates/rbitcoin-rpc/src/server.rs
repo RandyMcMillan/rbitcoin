@@ -155,12 +155,19 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             return (StatusCode::OK, axum::Json(err)).into_response();
         }
     };
-    if let Some(arr) = parsed.as_array() {
-        let out: Vec<_> = arr.iter().map(|req| rpc_one(&state.ctx, req)).collect();
-        return (StatusCode::OK, axum::Json(out)).into_response();
+    let ctx = Arc::clone(&state.ctx);
+    let joined = tokio::task::spawn_blocking(move || {
+        if let Some(arr) = parsed.as_array() {
+            serde_json::Value::Array(arr.iter().map(|req| rpc_one(&ctx, req)).collect())
+        } else {
+            rpc_one(&ctx, &parsed)
+        }
+    })
+    .await;
+    match joined {
+        Ok(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("rpc join: {e}")).into_response(),
     }
-    let resp = rpc_one(&state.ctx, &parsed);
-    (StatusCode::OK, axum::Json(resp)).into_response()
 }
 
 fn rpc_one(ctx: &RpcContext, req: &serde_json::Value) -> serde_json::Value {

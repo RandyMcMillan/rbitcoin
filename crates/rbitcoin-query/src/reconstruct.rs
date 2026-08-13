@@ -211,6 +211,7 @@ impl Query {
     }
 
     pub fn reconstruct_archived_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
+        self.note_reconstruct_archived();
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };

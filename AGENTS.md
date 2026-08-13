@@ -183,7 +183,7 @@ which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`cove
 **Do not push or leave a commit that would fail any of them.** A red CI on
 `master` is incomplete work.
 
-### Required before each code commit
+### Required before a code commit
 
 From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets
 `CARGO_TARGET_DIR=target/dev` so host test/clippy objects stay out of the
@@ -191,6 +191,17 @@ coverage tree (`target/cov` via `./scripts/coverage.sh`). Musl ship binaries
 come only from `nix build .#rbitcoin-musl` → install into `target/release/`
 (operator path; not the cargo debug target) — and **only on `master` after
 commit** (see below).
+
+What you must run **before that commit** depends on whether this is a
+single-shot change or one slice of a multi-step plan on local `master`:
+
+| Work | Before commit | After the last commit |
+|------|---------------|------------------------|
+| **Single-shot** (one bugfix / one docs rule) | Full local gates below | Musl if on `master` (recipe below) |
+| **Multi-step plan on local `master`** | **New/targeted tests only** for that slice, then commit | After the **last** slice: full gates, then **one** musl |
+
+Do **not** run workspace test / coverage / musl after every intermediate
+slice. Prefer finishing the plan on `master`, then one full gate + musl.
 
 ```bash
 cargo fmt --all -- --check          # if dirty: cargo fmt --all
@@ -210,18 +221,19 @@ cargo test --workspace
 Expand clippy allows only for real noise after a toolchain bump — prefer
 fixing the code.
 
-### Multi-step plan execution (targeted mid-plan; full gates at end)
+### Multi-step plan execution (local master: tests per step, gates at end)
 
-When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs/how-we-plan.md)):
+When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs/how-we-plan.md)),
+including work that lives entirely on **local `master`**:
 
 | Phase | Expectation |
 |-------|-------------|
-| **Each intermediate step** | Targeted tests for crates/modules touched; logical commits with public hygiene. Do **not** require full workspace suite, full coverage, or musl install after every slice. |
-| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%). **Musl only if** the work is finished **on `master` after commit** (merge/rebase first if the plan lived on a feature branch). |
+| **Each intermediate step** | Red → green targeted tests for crates/modules touched; **one logical commit** with public hygiene. Do **not** require full workspace suite, full coverage, or musl after every slice. |
+| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%). **Then** musl if that last commit is on **`master`** (merge/rebase first if the plan lived on a feature branch). |
 | **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `multinode` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
 
-Single-shot turns (one bugfix, no multi-step plan) follow the commit recipe
-below; musl only when that commit lands on **`master`**.
+Single-shot turns (one bugfix, no multi-step plan) follow the full gate list
+above before commit; musl only when that commit lands on **`master`**.
 
 ### Coverage job
 

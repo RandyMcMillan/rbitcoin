@@ -612,8 +612,8 @@ mod tests {
         drop(s);
 
         let path = dir.join("confirmed.body");
-        let f = crate::file::TableFile::open(&path, rbitcoin_primitives::TableKind::Confirmed)
-            .unwrap();
+        let f =
+            crate::file::TableFile::open(&path, rbitcoin_primitives::TableKind::Confirmed).unwrap();
         let n = (f.logical_len() - crate::file::FILE_HEADER_LEN as u64) / 8;
         assert_eq!(n, 4, "four real confirmed heights");
         let extra = 20u64;

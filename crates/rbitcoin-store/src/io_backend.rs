@@ -223,10 +223,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "uring");
-        assert_eq!(
-            resolve_read("unused"),
-            effective_read(ReadIoBackend::Uring)
-        );
+        assert_eq!(resolve_read("unused"), effective_read(ReadIoBackend::Uring));
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "pread");
         assert_eq!(resolve_read("unused"), ReadIoBackend::Pread);

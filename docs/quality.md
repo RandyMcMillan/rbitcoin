@@ -77,18 +77,17 @@ same leverage rule. Do not recreate a second R-table or P0/P1/P2 split.
 | 2 | **Q-37** | Warm default suite **≤3 min** (stretch **&lt;2 min**) on a CI-class host | test-speed | Re-measure `cargo test --workspace` after R-03; record wall in TESTING.md. If still over budget, cut more; if inside, close. No new default remine-100 / &gt;2 s tests without justification |
 | 3 | **Q-14** | Head-module glossary | docs | One diagram + “when to use which” for address_head / hashhead / sharded / segmented / scripthash_head (and confirm lookup/load/scripts/write) |
 | 4 | **Q-23** | Optional musl CI | ci | Weekly or release-branch `nix build .#rbitcoin-musl` (proves crane; not every PR) |
-| 5 | **Q-40** | Host `rust-toolchain` pin | ci | Root `rust-toolchain.toml` (or `rust-toolchain`) at **1.95** so rust-analyzer / host `cargo` match CI + Nix; still ignore Dependabot on `dtolnay/rust-toolchain` |
-| 6 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
-| 7 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
-| 8 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
-| 9 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
-| 10 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
-| 11 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
-| 12 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
-| 13 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
-| 14 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
-| 15 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
-| 16 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
+| 5 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
+| 6 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
+| 7 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
+| 8 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
+| 9 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
+| 10 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
+| 11 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
+| 12 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
+| 13 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
+| 14 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
+| 15 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
 
 **P0 trust/correctness (Q-01–Q-05) stays empty.** Do not reopen without new
 evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
@@ -109,7 +108,7 @@ R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed id is in
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 16 |
+| R-10 | **R-10** | Open rank 15 |
 
 ---
 
@@ -120,6 +119,7 @@ audit closures. Do not reopen without new evidence.
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-40** | Host `rust-toolchain` pin | Root `rust-toolchain.toml` channel **1.95.0** |
 | **Q-21** | SBOM for musl release | `scripts/sbom.sh` / `scripts/sbom.py` emit CycloneDX 1.5 from `Cargo.lock` |
 | **Q-39** | Operator/docs vs shipped model | OPERATOR body-queue → confirm; README crate map; COVERAGE workspace members; findings 001–021; CONTRIBUTING lists deny/multinode |
 | **Q-16** | Residual `RBITCOIN_*` env | Unstable set listed in `env-knobs.md`; dead path-IO / `FD_APPEND` / `BLOCK_QUEUE_MB` strings deleted |
@@ -188,7 +188,7 @@ audit closures. Do not reopen without new evidence.
 | `#[test]` / `#[tokio::test]` | **~1.15k** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
 | Required CI | `fmt`, `deny`, `clippy`, `test`, `multinode`, `coverage` (+ CodeQL workflow) |
-| rustc | **1.95** (`Cargo.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell); no root `rust-toolchain.toml` yet (**Q-40**) |
+| rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |
 | Release | `nix build .#rbitcoin-musl` → static install |
@@ -206,7 +206,7 @@ audit closures. Do not reopen without new evidence.
 | Code modularity | Medium | Confirm peeled; residual giants only via **R-10** |
 | Cross-platform | Weak (honest) | Linux-shaped IO |
 | Docs consistency | Strong | SCHEMA, findings, env-knobs; OPERATOR matches body-queue path |
-| Contributor onboarding | Medium–Strong | how-we-plan + TDD; tutorial still **Q-34**; host rustc unpinned (**Q-40**) |
+| Contributor onboarding | Medium–Strong | how-we-plan + TDD; tutorial still **Q-34** |
 | CI fidelity | Strong | Split gates, CodeQL, pinned Actions |
 | Dead / stub surface | Medium–Strong | RPC exists; `rbitcoin-cli` + `getpeerinfo` still stub (**Q-15**) |
 | Test reliability/speed | Medium–Strong | **R-03** removed worst remine pads; **Q-37** wall not re-measured |

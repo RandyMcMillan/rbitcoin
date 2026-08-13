@@ -25,7 +25,7 @@ checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`, `test`,
 into a monolithic job log. Locally:
 
 ```bash
-nix develop   # or nix-shell — both pin via flake.lock
+nix develop   # or nix-shell — both pin via flake.lock (rust-toolchain.toml is 1.95.0)
 cargo fmt --all -- --check
 # rustc warnings are denied via workspace.lints + RUSTFLAGS=-Dwarnings
 cargo build --workspace --all-targets

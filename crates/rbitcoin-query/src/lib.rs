@@ -1010,6 +1010,8 @@ pub struct Query {
     height_by_hash: Mutex<HeightByHashIndex>,
     /// `reconstruct_archived_block` calls (Esplora summary must stay 0).
     reconstruct_archived: AtomicU64,
+    /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
+    thin_tweak_body_bytes: AtomicU64,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1095,6 +1097,7 @@ impl Query {
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
             reconstruct_archived: AtomicU64::new(0),
+            thin_tweak_body_bytes: AtomicU64::new(0),
         };
         // Eager height index so first Esplora/P2P mid-chain lookup is hot.
         if let Some(tip) = q.tip_height() {
@@ -1189,6 +1192,18 @@ impl Query {
     pub(crate) fn note_reconstruct_archived(&self) {
         self.reconstruct_archived
             .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Sample-and-reset packed body bytes read by thin BIP-352 serve.
+    pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
+        self.thin_tweak_body_bytes.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn note_thin_tweak_body_bytes(&self, n: u64) {
+        if n > 0 {
+            self.thin_tweak_body_bytes
+                .fetch_add(n, AtomicOrdering::Relaxed);
+        }
     }
 
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {

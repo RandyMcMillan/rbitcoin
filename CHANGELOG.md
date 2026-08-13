@@ -9,6 +9,12 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Electrum `get_balance`:** unconfirmed delta uses the mempool scripthash
+  index instead of store-resolving every live chain input. Empty Cake keys were
+  ~1.5 s each on a mainnet mempool.
+
 ### Changed
 
 - **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so

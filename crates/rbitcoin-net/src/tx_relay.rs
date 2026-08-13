@@ -211,6 +211,9 @@ pub struct MempoolPerfSample {
     pub getdata_tx: u64,
     /// Mempool accept announces published.
     pub announce: u64,
+    /// Confirmed-chain prevouts resolved by Electrum unconfirmed-balance.
+    /// Unused scripthash (sh_index miss) must stay 0.
+    pub delta_prevouts: u64,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -243,6 +246,8 @@ pub struct MempoolHub {
     meter_inv_tx: AtomicU64,
     meter_getdata_tx: AtomicU64,
     meter_announce: AtomicU64,
+    /// Chain prevouts resolved by [`Self::scripthash_unconfirmed_delta`].
+    meter_delta_prevouts: AtomicU64,
     /// Live mempool txs by Electrum scripthash (updated on accept/remove).
     sh_index: Mutex<MempoolShIndex>,
 }
@@ -285,6 +290,7 @@ impl MempoolHub {
             meter_inv_tx: AtomicU64::new(0),
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
+            meter_delta_prevouts: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
         };
         hub.reindex_live_scripthashes();
@@ -405,6 +411,7 @@ impl MempoolHub {
             inv_tx: self.meter_inv_tx.swap(0, Ordering::Relaxed),
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
+            delta_prevouts: self.meter_delta_prevouts.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -984,18 +991,29 @@ impl MempoolHub {
     }
 
     /// Unconfirmed delta for Electrum balance (sats): +mempool outputs − spent confirmed.
+    ///
+    /// Uses [`MempoolShIndex`] (same as `scripthash_mempool`). A full-graph walk
+    /// plus chain `get_txout` per input is ~1.5 s per empty Cake key on a live
+    /// mainnet mempool.
     pub fn scripthash_unconfirmed_delta(&self, scripthash: &[u8; 32]) -> i64 {
         use rbitcoin_store::script_hash;
+        let want: Vec<Txid> = self.sh_index.lock().unwrap().txs_for(scripthash).collect();
+        if want.is_empty() {
+            return 0;
+        }
         let g = self.inner.read().unwrap();
         let mut delta = 0i64;
-        for (txid, _e) in g.graph.iter() {
-            let Some(tx) = g.get_tx(txid) else { continue };
+        let provider = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        for txid in want {
+            let Some(tx) = g.get_tx(&txid) else { continue };
             for (vout, o) in tx.output.iter().enumerate() {
                 if script_hash(o.script_pubkey.as_bytes()) != *scripthash {
                     continue;
                 }
                 let op = OutPoint {
-                    txid: *txid,
+                    txid,
                     vout: vout as u32,
                 };
                 if g.graph.mempool_utxo(&op) {
@@ -1008,9 +1026,7 @@ impl MempoolHub {
                 if g.graph.creator(&op).is_some() {
                     continue;
                 }
-                let provider = QueryUtxoProvider {
-                    query: self.query.as_ref(),
-                };
+                self.meter_delta_prevouts.fetch_add(1, Ordering::Relaxed);
                 if let Some(txout) = provider.get_txout(&op) {
                     if script_hash(txout.script_pubkey.as_bytes()) == *scripthash {
                         delta = delta.saturating_sub(txout.value.to_sat() as i64);
@@ -1602,14 +1618,84 @@ mod tests {
         assert!(rows.len() >= 2);
         assert!(rows.iter().any(|r| r.height == -1)); // child of mempool parent
         let delta = hub.scripthash_unconfirmed_delta(&sh);
-        // Parent output still live until child spent it; child holds OP_TRUE UTXO.
-        // Net: +child_out - coinbase (parent spent chain UTXO) roughly non-zero path.
-        let _ = delta;
+        // Parent spent chain coinbase; child spent parent (mempool) and holds OP_TRUE.
+        // Second spends another OP_TRUE coinbase to a different script.
+        // unconfirmed = +(50e8-2000) - 50e8 - 50e8
+        assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
 
         // Remove confirmed + reorg reaccept empty already covered; remove live.
         assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
         assert!(hub.list_live().len() < 3);
 
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Electrum get_balance must not store-resolve every mempool chain input for
+    /// a scripthash the mempool index does not mention (Cake empty-key path).
+    #[test]
+    fn unconfirmed_delta_unknown_sh_does_not_resolve_chain_prevouts() {
+        use bitcoin::transaction::Version as TxVersion;
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::script_hash;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        const N_SPENDS: u32 = 4;
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            100 + N_SPENDS,
+            N_SPENDS,
+        );
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let mut fee_sum = 0i64;
+        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
+            let fee = 1_000u64 + i as u64;
+            fee_sum += fee as i64;
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: *cbtxid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - fee),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            hub.accept_tx(&tx).expect("accept spend");
+        }
+        let _ = hub.sample_reset_perf();
+        let unused = script_hash(&[0x00]);
+        assert_eq!(hub.scripthash_unconfirmed_delta(&unused), 0);
+        let s = hub.sample_reset_perf();
+        assert_eq!(
+            s.delta_prevouts, 0,
+            "unknown scripthash must not resolve mempool chain prevouts (got {})",
+            s.delta_prevouts
+        );
+        let sh = script_hash(spk.as_bytes());
+        assert_eq!(hub.scripthash_unconfirmed_delta(&sh), -fee_sum);
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

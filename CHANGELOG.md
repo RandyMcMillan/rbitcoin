@@ -38,7 +38,7 @@ before 1.0).
 - **Fee snapshot / mempool APIs:** published fee table and mining chunks so
   Electrum/Esplora estimates do not block accepts (R-01–R-04).
 - **Quality gates:** `cargo deny` on PR (Q-20); coverage uses prebuilt
-  `cargo-llvm-cov` (Q-22).
+  `cargo-llvm-cov` (Q-22); `scripts/sbom.sh` emits CycloneDX from Cargo.lock.
 
 ### Fixed
 

@@ -112,6 +112,11 @@ nix build .#rbitcoin-musl
 mkdir -p target/release
 install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
 
+# CycloneDX 1.5 from Cargo.lock (not a crane output — lockfile only):
+./scripts/sbom.sh                    # writes ./rbitcoin.cdx.json
+# or: python3 scripts/sbom.py --out rbitcoin.cdx.json
+
+
 # Helper (same attr; default target is musl)
 ./scripts/repro-build.sh
 # or: ./scripts/repro-build.sh musl

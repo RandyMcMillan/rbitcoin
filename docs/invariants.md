@@ -14,7 +14,7 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 
 | Kind | Examples | Policy |
 |------|----------|--------|
-| **Load miss** | Spend annotate without pin denserels; body decode without `tx.idx` range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix lookup/load |
+| **Load miss** | Spend annotate without `spent_range` abs; body decode without idx range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix lookup/load |
 | **Environment** | bulk IO backend uring vs pread/pwrite (single backend trait) | Keep modality only |
 | **Protocol** | BIP30 multi-spender confirmed-strong walk; same-block spends; coinbase null create | Real branches (not soft recovery) |
 | **Format migrate** | fuse8 v1 soft-open / always-probe with operator warn | Temporary dual-read only |
@@ -23,7 +23,8 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 **Killed dual paths (do not reintroduce):** soft spentness recovery for wrong/missing
 pin identity; unpinned wire-corrected create_fk spentness; load-stage `txid.body`
 identity fill after lookup promised stamp; `ColdPinMode` Allow/Forbid cold denserels
-split on load (load is range denserels only).
+split on load (load is range **outs** only); denserels-as-spender-abs (schema 15
+abs is `spent_off+9×vout` only).
 
 ## Failure style
 
@@ -39,32 +40,32 @@ header plan after lookup planned it, stamped `create_fk`, etc.).
 
 ```
 wire / body-queue
-  → lookup (stamp create_fk + parent body_range + parent txid;
-            IO: tx.head, tx.idx, txid.body — NEVER tx.body denserels)
-  → load / pin (BatchParents denserels by known range only;
-            IO: tx.body — NEVER head / idx / txid.body)
+  → lookup (stamp create_fk + parent txout/spent ranges + parent txid;
+            IO: tx.head, txout.idx/spent.idx, txid.body — NEVER body decode)
+  → load / pin (BatchParents outs by known txout range only;
+            IO: txout.body — NEVER head / idx / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present)
-  → ensure abs (pin layout → Class A denserels body; post-condition: every spend has abs)
-  → structural spentness (pin abs bulk pread; multi-list protocol cold only)
+  → ensure abs (stamp spent_range; post-condition: every spend has abs)
+  → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
-  → abs spend annotate (put_spend_batch_by_abs_meta only)
+  → abs spend annotate (put_spend_batch_by_abs_meta on spent.body only)
 ```
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
-| **lookup** | `tx.head`, `tx.idx` (fk + body_range), `txid.body`, headers | **`tx.body` denserels** |
-| **load** | **`tx.body` denserels by range** (from lookup stamp) | head, idx, `txid.body` |
+| **lookup** | `tx.head`, `txout.idx` / `spent.idx` (fk + ranges), `txid.body`, headers | **`txout`/`inwit` decode** |
+| **load** | **`txout.body` outs by range** (from lookup stamp) | head, idx, `txid.body`, `inwit` |
 | **scripts** | none | any store IO |
 
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
-| Load body denserels | By range only from lookup stamp; incomplete denserels → hard Err | **No** idx cold denserels on load |
-| Ensure (write) | Every non-null spend edge has denserels/abs after ensure returns | Residency then denserels body to **complete** load-ahead; incomplete → `invariant:` |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `inwit` on pin |
+| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
-| Pin create identity | Schema-13 denserels pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
-| Tip already-archived | `plan=None`: lookup still stamps parent pin material; load denserels by range | Soft spentness recovery for zero pin identity is **not** OK |
+| Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
+| Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
 | Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
 | Spend annotate | Abs-only `put_spend_batch_by_abs_meta`; cold OOB/IO is hard Err | No ranged/by_create annotate tiers |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |

@@ -9,6 +9,22 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **Schema 15 Class A split:** `txout.body` (outs) + `inwit.body` (ins+witness)
+  + `spent.body` (9 B×n_out). Packed `tx.body` with creates is refused. Pin/SH
+  read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in
+  [`SCHEMA.md`](./SCHEMA.md).
+- **Schema 15 Class B SH:** geometric slabs + megakey pages; sealed
+  sorted+fuse+idx main; global ingest OA. Page-era durable SH is refused.
+- **Electrum / RPC:** skip O(mempool) API walks; overlap Electrum dispatch;
+  thin `--sptweaks` serve is idx→body uring, not a packed span.
+- **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
+  Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
+- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
+  `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
+- **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`.
+
 ### Fixed
 
 - **Electrum tweaks subscribe:** stream remaining heights as notifications
@@ -22,23 +38,8 @@ before 1.0).
 
 - **`--sptweaks`:** optional thin BIP-352 index (`sp_tweaks.idx` / `.body`).
   Persist is `len:tweak` only (0 or 33-byte compressed `A_tweak`). Cake outs
-  join packed Class A. Confirm appends; reorg truncates; background backfill.
+  join `txout`. Confirm appends; reorg truncates; background backfill.
   Electrum still serves naive when the flag is off or a height is a hole.
-
-### Changed
-
-- **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
-  Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
-  Current Cake scan isolate still hardcodes `electrs.cakewallet.com`.
-
-- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
-  `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
-  Explicit CLI/conf knobs publish to env; omitting them **preserves** advanced
-  `RBITCOIN_*` exports. Normal sync does not require any env export.
-- **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`
-  (IBD keeps periodic progress/perf lines only).
-- **Docs hygiene:** removed abandoned plans/forensics notes from the release
-  surface; COMPAT documents BIP324 short-ID live-set vs deferred Core IDs.
 
 ## [0.1.0] — 2026-07-26
 

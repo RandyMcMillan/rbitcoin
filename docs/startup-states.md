@@ -16,22 +16,22 @@ See [`crash-recovery.md`](./crash-recovery.md).
 
 | Stage | Allowed store IO | Forbidden |
 |-------|------------------|-----------|
-| **lookup** | `tx.head`, `txid.body`, `tx.idx` (fk + body_range), header tables | **`tx.body`** (no denserels decode) |
-| **load** | **`tx.body` only** (denserels/outs by known range) | `tx.head`, `txid.body`, `tx.idx` |
+| **lookup** | `tx.head`, `txid.body`, `txout.idx` / `spent.idx` (fk + ranges), header tables | **body decode** (`txout` / `inwit`) |
+| **load** | **`txout.body` only** (outs by known range) | `tx.head`, `txid.body`, idx, `inwit` |
 | **scripts** | none | any store IO |
 | **write** | Class A append + annotate + tip (own era) | re-resolve parents via head |
 
-Warmup that needs body denserels before a pipeline start is **outside** the
-pipeline (not on lookup). Lookup hands load: create_fk stamps + body ranges +
-parent txids (RAM reverse map from wire / sidefile).
+Warmup that needs body outs before a pipeline start is **outside** the
+pipeline (not on lookup). Lookup hands load: create_fk stamps + `txout` /
+`spent` ranges + parent txids (RAM reverse map from wire / sidefile).
 
 ## Store start states (intake at confirm start)
 
 | State | Class A for tip+1 | Headers | Parent head | Handler (lookup cleans) |
 |-------|-------------------|---------|-------------|-------------------------|
-| **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+range+txid; load body denserels by range |
-| **S1 already-archived** | body present (plan=None) | present | parents on head | lookup still stamps parent fk+range+txid (idx/head); load body denserels only |
-| **S2 tip-ahead pack** | prior pack uncommitted | — | parents in in_flight | plan uses in_flight create_fk; **must** also stamp body_range (idx) when body exists, or use offline CreatePin denserels |
+| **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+txout/spent range+txid; load `txout` by range |
+| **S1 already-archived** | body present (plan=None) | present | parents on head | lookup still stamps parent fk+ranges+txid (idx/head); load `txout` only |
+| **S2 tip-ahead pack** | prior pack uncommitted | — | parents in in_flight | plan uses in_flight create_fk; **must** also stamp ranges (idx) when body exists, or use offline CreatePin |
 | **S3 short catch-up** | mixed S0/S1 over gap | present | mostly cold | ordered claim tip+1 only for write; lookup may plan ahead with reserved HWM |
 | **S4 cascade fail** | tip+1 blacklisted or write failed | — | — | tip-ahead write may hit `fk mismatch` / `connect height not tip+1` → **soft requeue**, not permanent blacklist |
 
@@ -39,7 +39,7 @@ parent txids (RAM reverse map from wire / sidefile).
 
 | Error | State | Root | Fix |
 |-------|-------|------|-----|
-| `lookup stage miss (load cold denserels forbidden)` @961466 | S0/S3 | Load Forbid + parents without plan range (in_flight / last-chance head without idx range fill); denserels body was incorrectly gated | Lookup always fills `external_parent_ranges` for every stamped external create_fk; load denserels by range only (body); never idx cold on load |
+| `lookup stage miss (load cold denserels forbidden)` @961466 | S0/S3 | Load Forbid + parents without plan range (in_flight / last-chance head without idx range fill); outs body was incorrectly gated | Lookup always fills `external_parent_ranges` for every stamped external create_fk; load outs by `txout` range only; never idx cold on load |
 | `put_full_batch fk mismatch` @961468 | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
 | `parent create_fk unresolved` | S2 | Creates-only in_flight lag | Keep soft requeue + creates-only publish |
 | false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup txid.body only |

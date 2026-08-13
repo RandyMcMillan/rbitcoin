@@ -49,12 +49,12 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ## Spends (v5: annotation on create outputs)
 
-- Sole spender: `output.spender_field = spending_tx_fk`. Multi: `MULTI_SPENDER` + `spenders.body` list.
+- Sole spender: 9 B slot on **`spent.body`**. Multi: `MULTI_SPENDER` + `spenders.body` list.
 - Annotations may remain after disconnect / for non-strong spenders.
 - Best-chain spentness: annotation + `is_confirmed_strong(spender)`.
 - Kill-safe: stale/non-strong fields do not false-positive if filter is applied.
 - No `point.head` (v4 open-hash multimap removed).
-- Class A bodies are **packed-only**; non-packed bare meta rows are rejected as corrupt.
+- Class A is **three stems** (`txout` / `inwit` / `spent`); bare-meta puts are rejected. Packed `tx.body` with creates is refused on open.
 
 ## Thin scripthash (Electrum outpoint pointers)
 

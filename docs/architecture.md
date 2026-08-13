@@ -90,7 +90,7 @@ Deep layout: [`SCHEMA.md`](../SCHEMA.md). Crash / tip commit:
 
 | Class | Role | Mutation style |
 |-------|------|----------------|
-| **A** | Canonical archive: headers, packed txs (`tx.body` / `tx.idx/` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
+| **A** | Canonical archive: headers, split txs (`txout` / `inwit` / `spent` + `txid.body` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
 | **B** | Forever-open indexes (e.g. Electrum scripthash) | Append + head updates; may grow forever per key |
 | **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, `tx_height` | Tip advance is the **commit**; may lead/lag slightly across crash |
 
@@ -101,7 +101,7 @@ a LevelDB bag.
 
 ### Reconstruct + tip wire ring
 
-- **Historical blocks** are rebuilt from Class A (packed full txs) rather than
+- **Historical blocks** are rebuilt from Class A (zip `txout` + `inwit`) rather than
   kept forever as raw wire `blk` files.
 - After IBD, a **wire-format ring** covers the soft tip window for serve,
   reorg, and recovery ([crash recovery](./crash-recovery.md)).
@@ -136,7 +136,7 @@ sibling tip; that is replaced by the design above.)
 ### Identity without fat keys
 
 `tx.head/` is a **segmented keyless address table** of dense create foreign
-keys (txid identity verified against body): fixed **25-bit** open-address heads
+keys (txid identity verified against **`txid.body`**): fixed **25-bit** open-address heads
 with **4 B relative** ids, roll at 80% load / body soft span, and **binary fuse8**
 built only on seal. Open segments always probe; sealed segments are fuse-gated.
 See SCHEMA.
@@ -163,7 +163,7 @@ Roles and locks: [`docs/concurrency.md`](./concurrency.md). IO modality:
    (and optional absolute byte ceiling) limit new densify `getdata` — **not**
    peer TCP accept of already-requested blocks (see ibd-memory).
 5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
-   batch** backends for body denserels, head-resolve body prefix, spend paths
+   batch** backends for `txout` pin, `txid.body` identity, `spent` annotate, spend paths
    (thread-local ring depth 128). **Table files** are always **fd** (page-/chunk-
    coalesced pread/pwrite); compact Class C is **L2 write-behind**; mempool is
    private InRam+sidecar. Head resolve **page-batches multi-key probes**.

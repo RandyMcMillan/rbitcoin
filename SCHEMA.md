@@ -101,11 +101,12 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 ## Growable var records (`*.body` + `*.idx`)
 
-Used for headers and packed txs.
+Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`).
 
 - **body:** append-oriented **unframed** payloads (no per-record length prefix).
-- **idx:** dense `u64` absolute offsets into body; count = `(logical_len − 16) / 8`.
-- Record length = `idx[i+1] − idx[i]` (last: body logical end − start).
+- **idx:** segmented **u32 stride-8** relatives (`{stem}.idx/`); see Class A index below.
+  Header hash lookup is a separate `HashHead`, not this idx.
+- Record length = `start(fk+1) − start(fk)` (last: published body end − start).
 - FK = 1-based index into idx.
 
 ---
@@ -212,18 +213,30 @@ Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 
 
 Legacy `LOCAL_PREV` is **rejected** on decode.
 
-**Soft `prev_txid`:** RAM-only for wire rebuild; filled from the create body’s packed txid when needed. Not stored in the input stream.
+**Soft `prev_txid`:** RAM-only for wire rebuild; filled from **`txid.body`**
+(or the create’s known identity) when needed. Not stored in the input stream.
 
 **Decision:** stamp `create_fk` at archive (batch map → sticky → `tx.head`) so confirm/cache can skip head probes on already-resolved edges.
 
-### Output encoding (embedded)
+### Output encoding (`txout.body`)
 
 ```text
-spender_field:u64 LE | flags:u8 | uleb128 value | [script…]
+flags:u8 | uleb128 value | [CompactSize script…]
 ```
 
-| `MULTI_SPENDER` (flags bit 2) | `spender_field` |
-|-------------------------------|-----------------|
+No spender bytes. `MULTI_SPENDER` on a `txout` output is corrupt.
+
+### Sole-spender slot (`spent.body`)
+
+9 B per vout at `Ss + 9×vout`:
+
+| Offset | Field |
+|--------|-------|
+| 0–7 | `spender_field` u64 LE (0 = unspent; else sole `spending_tx_fk` or multi-list head) |
+| 8 | flags (`MULTI_SPENDER` bit 2) |
+
+| `MULTI_SPENDER` | `spender_field` |
+|-----------------|-----------------|
 | 0 | 0 = unspent; else sole **spending_tx_fk** |
 | 1 | head fk into `spenders.body` |
 
@@ -415,6 +428,26 @@ On open: `repair_class_c_above_tip` clears strong/height above tip.
 ## Archive epoch (`archive_epoch`)
 
 Small control file (~32 B): magic, schema version, archive_mode flag, optional finalized_height, wire_depth. Coordinates durable-archive soft/hard zones with the tip wire ring.
+
+---
+
+## Mainnet census (this tree’s reference datadir, 2026-08-13)
+
+Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
+~2.46 in / **2.70 out**. Exact HWM; outs ±2%; witness/in_base split ±10%.
+
+| File | Packed 13/14 | Schema 15 |
+|------|--------------|-----------|
+| `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (16 B meta + outs, no spender) |
+| `inwit.body` | — | **~486 GiB** (ins + witness; cold) |
+| `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** |
+| `{stem}.idx` | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** (grow-tight; do not 256 MiB-slab each) |
+| `txid.body` / `tx.head` | 42.23 / 8.23 GiB | unchanged |
+
+Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
+(~129+32+16+42+8 ≈ **227 GiB**) vs packed **tx.body + idx + txid + head**
+(~663+5+42+8 ≈ **718 GiB**). Reconstruct / `getrawtransaction` also needs
+`inwit` (~486 GiB), which pin/SH/Cake do **not** open.
 
 ---
 

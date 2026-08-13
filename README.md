@@ -39,8 +39,8 @@ Operator-order facts (mainnet tip moves; treat as ballpark, not a warranty):
 - **Reproducible static musl** builds for ordinary Linux hosts
 
 1. **On-disk archive** — **map-free** Class A/B/C tables (pread/pwrite + fallocate
-   grow; kernel page cache as L0): packed txs, keyless `tx.head`, spend
-   annotations, native scripthash. Historical blocks are **reconstructed** from
+   grow; kernel page cache as L0): split Class A (`txout` / `inwit` / `spent`),
+   keyless `tx.head`, spend annotations, native scripthash. Historical blocks are **reconstructed** from
    the archive; tip keeps a **wire ring** and Class C tip durability after catch-up.
    Confirm/mempool prevouts use the archive (and in-mempool parents), not a
    separate UTXO hash table. Layout: [`SCHEMA.md`](./SCHEMA.md); IO:

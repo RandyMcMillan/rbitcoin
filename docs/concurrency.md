@@ -8,18 +8,18 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 |------|-----------|--------------|
 | Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
 | Confirm **lookup** | 1 OS thread | load wire from **body queue**; structure + stamp create_fk (Class A planned only) |
-| Confirm **load** | 1 OS thread | pin denserels + assemble from owned stamped plan (no re-lookup / no head resolve) |
+| Confirm **load** | 1 OS thread | pin `txout` outs + assemble from owned stamped plan (no re-lookup / no head resolve) |
 | Confirm **scripts** | 1 OS thread + rayon | **none** — pure CPU |
-| Confirm **write** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
+| Confirm **write** | 1 OS thread | **sole Class A appender** (`txout`+`inwit`+`spent`) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → **lookup** (structure + stamp create_fk) → **load** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Load must **not** re-run lookup head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → Forbid cold denserels on load). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
+**Height-ordered unified pipeline (current):** peer → **body queue** → **lookup** (structure + stamp create_fk) → **load** (pin `txout` + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Load must **not** re-run lookup head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → no cold idx on load). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
 **Lookup pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do not assume large multi-dozen block waves.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** (when implemented) also calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. See [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 
-**Wire retained on the pipeline batch only:** lookup/load pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Class A packed form is planned once and committed in the write stage.
+**Wire retained on the pipeline batch only:** lookup/load pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Split Class A (`txout` / `inwit` / `spent`) is planned once and committed in the write stage.
 
 **Body queue:** process-local **in-RAM** payload FIFO (same shape as the former on-disk queue: id / height / hash / header_fk / payload). **Why RAM:** avoid **double disk write** of every block (queue then Class A); accept **redownload on restart** and peak RAM of soft depth. **Primary capacity is soft densify assign** (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). Height horizon (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) caps densify/receive walk. **Offer** on peer Block → RAM; load **reads** by height; **dequeue** after confirm-commit. Restart starts empty (legacy `store/block_queue/` is best-effort removed).
 
@@ -91,6 +91,6 @@ are small. See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline
 
-Cold parent `tx.idx` / `tx.body` on the **load** thread uses
+Cold parent `txout.idx` / `txout.body` on the **load** thread uses
 **FdOnly idx + bulk body** (`idx_body_pipeline` → `bulk_io` uring/pread). Batch
 creates come from **wire**, not a second Class A full-decode pass.

@@ -27,7 +27,7 @@ do not hold both a decoded `Block` and the wire bytes.
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
 | **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft densify / far-scale meter only; **no** job charge/release on the unified path (without a charger it stays empty — in-RAM BQ soft depth is the primary densify gate) |
-| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` / plan-local external parents only | Drop with batch. Cold denserels for ancient parents use Class A into plan-local maps |
+| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` / plan-local external parents only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into plan-local maps |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
@@ -92,3 +92,22 @@ Grep:
 ```bash
 grep 'ibd: sizes' mainnet.log
 ```
+
+## Hard RAM (page-cache working set)
+
+Process heap (BQ + L2 Class C + pins + mempool) is **a few GiB**. The
+**hard** requirement is kernel page cache for the files each mode actually
+touches. Census: [`SCHEMA.md`](../SCHEMA.md) (tip 962298, 1.42 B creates).
+
+| Mode | Must stay hot | Approx | Cold (fault OK) |
+|------|---------------|--------|-----------------|
+| **Tip follow / Electrum serve** | Open `tx.head` + recent `txout`/`spent`/`txid` tails + SH main fuse/idx + mempool | **8–16 GiB** page cache + **2–4 GiB** process | `inwit` (except `getrawtransaction`), sealed `tx.head` older than fuse-skip, archive `txout` |
+| **Comfortable serve** (busy wallets, Cake, RPC reconstruct) | Above + more `txout` + SH body slabs + `txid.body` | **16–32 GiB** | `inwit` except rawtx |
+| **IBD pin+annotate (no thrash)** | **All** `txout` + **all** `spent` + three `*.idx` + `txid.body` + `tx.head` | **~227 GiB** | **`inwit` (~486 GiB)** — wire still holds witness |
+| **IBD + reconstruct/getdata** | Previous + `inwit` | **~710 GiB** (same order as old packed `tx.body`) | — |
+| **SH tip materialize** | Streaming write of sorted shards; ingest OA **~128 MiB** (2²²×32 B) | **≪1 GiB** extra heap | No 0.5–1 GiB OA image per shard |
+
+Packed schema 13/14 needed the whole **`tx.body` (~663 GiB)** hot for the same
+pin/annotate work. Split Class A drops that to **~161 GiB** (`txout`+`spent`)
+plus idx/identity. A **16 GiB** host can tip-follow (OPERATOR §16 GiB) but IBD
+parent pin will be **disk-bound** on `txout`/`spent`.

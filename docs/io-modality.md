@@ -12,7 +12,7 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
-| **Bulk batch** | `RBITCOIN_IO` (+ path overrides) | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (body denserels, head-resolve body prefix, spend meta/ann, Class C bulk) |
+| **Bulk batch** | `RBITCOIN_IO` (+ path overrides) | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
 | **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
 
 **`RBITCOIN_IO=uring` only selects the bulk batch backend.** Legacy token
@@ -28,7 +28,7 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 | **L1** | 4 KiB head pages / 3–4 KiB SH chunks (working-set caches) | Write-back dirty page/chunk with one pwrite |
 | **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full `Vec` in process | **Write-behind:** RAM mutate during commit; complete-or-fail body image on `flush_class_c_tip` **before** body-queue dequeue |
 
-**Never L2:** `tx.body`, full `tx.head`/`tx.idx`, default `tx_height` (~700 MiB). Cap: `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256).
+**Never L2:** `txout` / `inwit` / `spent`, full `tx.head` / `*.idx`, default `tx_height` (~700 MiB). Cap: `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256).
 
 ---
 
@@ -38,12 +38,12 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 
 | Path | Env | Syscalls |
 |------|-----|----------|
-| Pin denserels / body pipeline | `RBITCOIN_PIN_IO` → global | uring/pread on **`tx.body` FD** |
-| Head-resolve body prefix ≤32 B | `RBITCOIN_HEAD_RESOLVE_IO` | uring/pread on body FD |
-| Spend-meta 9 B peeks | `RBITCOIN_SPEND_META` | uring/pread on body FD |
-| Spend pure-write annotate | `RBITCOIN_SPEND_ANN` | uring/pwrite or pwrite on body FD |
+| Pin outs / body pipeline | `RBITCOIN_PIN_IO` → global | uring/pread on **`txout.body` FD** (Full also zips `inwit`) |
+| Head-resolve identity | `RBITCOIN_HEAD_RESOLVE_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
+| Spend-meta 9 B peeks | `RBITCOIN_SPEND_META` | uring/pread on **`spent.body` FD** |
+| Spend pure-write annotate | `RBITCOIN_SPEND_ANN` | uring/pwrite or pwrite on **`spent.body` FD** |
 | Class C create-height bulk | `RBITCOIN_CLASS_C_IO` | uring/pread |
-| Class A body/idx **linear append** | always | **pwrite** |
+| Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 
 Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 
@@ -51,8 +51,10 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 
 | Object | Tier | Notes |
 |--------|------|--------|
-| **`tx.body`** | L0 | pread/pwrite/uring; fallocate grow |
-| **`tx.idx` segments** | L0 | Append pwrite; reads pread |
+| **`txout.body`** | L0 | Hot outs (pin / SH / Cake); pread/pwrite/uring |
+| **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
+| **`spent.body`** | L0 | 9 B×n_out sole-spender; annotate RMW |
+| **`txout.idx` / `inwit.idx` / `spent.idx`** | L0 | Append pwrite; reads pread; **grow-tight** (~1 MiB) |
 | **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (`RBITCOIN_TX_HEAD_ACCESS=map` ignored) |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
@@ -67,7 +69,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | Path | Table part | Fd/uring bulk part |
 |------|------------|---------------------|
 | Head resolve stream | FdOnly **page-batched** head probe + FdOnly idx | uring/pread body prefix |
-| Pin denserels | FdOnly idx ranges | uring/pread body bytes |
+| Pin outs | FdOnly `txout.idx` ranges | uring/pread `txout` bytes (4 KiB first page, extend if short) |
 
 ---
 
@@ -232,8 +234,8 @@ Live node rollback: set **`RBITCOIN_TX_HEAD_ACCESS=map`** before open/create
 
 - `rbitcoin-mempool` uses process buffers + normal file IO under
   `{datadir}/mempool/` (`meta` / `slots` / `tx.body`).
-- **Not** Class A: confirmed archive remains `{datadir}/store/tx.body` with
-  confirm as sole writer.
+- **Not** Class A: confirmed archive is `{datadir}/store/txout.body` (+ `inwit` /
+  `spent`) with confirm as sole writer.
 - Tip script skip for live mempool txs unchanged (`script_preverified_txids`).
 - No `memmap2` in the mempool crate.
 

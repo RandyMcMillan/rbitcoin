@@ -137,10 +137,11 @@ tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 `class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 
 **Archive head resolve:** streaming — **FdOnly** page-coalesced head probe +
-**FdOnly** `tx.idx` + body prefix via **io_uring or pread** (deepest-cand-first).
-**Class A `tx.body` / `tx.idx` / `tx.head`, header head, SH head/body, and
-spenders are FdOnly** ([`TableAccess::FdOnly`](docs/io-modality.md)). Full
-modality matrix and demap plan: [`docs/io-modality.md`](docs/io-modality.md).
+**FdOnly** `txout.idx` + **`txid.body`** identity via **io_uring or pread**
+(deepest-cand-first).
+**Class A `txout` / `inwit` / `spent` + their `*.idx`, `tx.head`, header head,
+SH head/body, and spenders are FdOnly** ([`TableAccess::FdOnly`](docs/io-modality.md)).
+Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
 
@@ -157,11 +158,11 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 
-**RWF_DONTCACHE (fixed):** only spend-annotate `tx.body` **pwrites** set the flag when the kernel supports it. Class A append and load body reads do not.
+**RWF_DONTCACHE (fixed):** only spend-annotate **`spent.body` pwrites** set the flag when the kernel supports it. Class A append and load body reads do not.
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO.
-- Class A **`tx.body` / `tx.idx` linear appends always pwrite**.
+- Class A **`txout` / `inwit` / `spent` + `*.idx` linear appends always pwrite**.
 
 ## Defaults and memory budgets
 
@@ -175,7 +176,7 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 | Archive queue RAM | **512 MiB** | `--archive-queue-mb` **or** advanced `RBITCOIN_ARCHIVE_QUEUE_MB` (CLI only overwrites when flag/conf set) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
-| Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
+| Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. Legacy mono-head datadirs require reindex |
 | Confirm stages | **lookup · load · scripts · write** | Pipeline queues **hardcoded** loadq=8 · scriptq=4 · writeq=20. Lookup packs tip-contiguous waves by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
@@ -196,15 +197,16 @@ start (before seeds), updated after IBD and on shutdown. Seeds are merged in
 without clearing known flags.
 
 **Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
-packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
-after Class C. Those two indexes are **complete before tip** — catch-up must
-finish; tip entry does not backfill them. Scripthash is **not** progressively
-materialized into heads: confirm only enqueues sorted runs (background flush +
-merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
-tables before Electrum (the only deferred index work). Tip SH materialize
-**streams catalog runs with direct k-way merge** (up to ~4096 open files;
-default max direct merge) into a **live in-RAM open-address image per prefix
-shard** (final-sized, ~0.5–1 GiB peak on mainnet 64-way). Fan-in reduce is
+split Class A (`txout` / `inwit` / `spent`) + durable **`tx.head`**; confirm
+batch-writes **spend annotations** on **`spent.body`** after Class C. Those
+indexes are **complete before tip** — catch-up must finish; tip entry does not
+backfill them. Scripthash is **not** progressively materialized into heads:
+confirm only enqueues sorted runs (background flush + merge). At tip the node
+**merges remaining runs and cold bulk-loads** durable SH tables before Electrum
+(the only deferred index work). Tip SH materialize **streams catalog runs with
+direct k-way merge** (up to ~4096 open files) into **sealed sorted+fuse+idx
+main shards** (no 0.5–1 GiB in-RAM OA image per shard). New keys after seal go
+to one **global ingest OA** (mainnet 2²² slots ≈ 128 MiB). Fan-in reduce is
 **fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
 only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
 catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs
@@ -236,19 +238,16 @@ Deferred/residual runs batch warm-apply (10s status). On enter Direct, leftover
 `scripthash.head.legacy-*`, empty 64-way + tip rebuild from runs). No runs left
 ⇒ reindex.
 
-**Schema 14 SH layout:** durable scripthash head values are Empty / Inline / **Paged**
-(4 KiB page chains). Schema-13 **slab** head bytes are rejected (corrupt + rebuild).
-**Open upgrade:** a schema-**13** store with **no materialized scripthash head**
-opens on this binary and **silently rewrites** store `meta` to 14 (Class A is
-compatible). Empty `scripthash.body` still stamped **SHAL alloc v1** (pre–page-chain)
-is rewritten to **alloc v2** on open. If schema-13 SH is already durable
-(occupied head / live creates / alloc v1 with data), open is **refused** — wipe
-`store/scripthash*` (or full store) and rematerialize from `scripthash.runs` /
-reindex; there is **no dual-read** of old slabs as paged.
-After main load ≥ ~0.80, main seals and **new** keys land in **`scripthash.ovf/`**
-mono segments sized to **one main shard** (not a second 64-way head). Open ovf
-seals at ~0.8 with a real fuse and rolls the next segment. Legacy full-size
-`scripthash.ovf.head` is removed on open. Existing main keys still append on main.
+**Schema 15 SH layout:** durable values are Empty / Inline / geometric **slab**
+(3–256 fks) / megakey **pages** (≥257). Main shards are **sealed sorted+fuse+idx**;
+new keys land in **`scripthash.ovf/ingest`**. ≥8 sealed ovf files compact-merge.
+**Open upgrade:** empty Class A + empty/missing SH may silently rewrite `meta`
+13/14→15. A packed `tx.body` **with creates**, or a durable page-era (or
+schema-13 slab) SH index, is **refused** — wipe `store/scripthash*` (and/or
+Class A) and rematerialize / redo IBD; there is **no dual-read**.
+After ingest load ≥ ~0.80, ingest seals to sorted ovf and rolls. Legacy
+full-size `scripthash.ovf.head` is removed on open. Existing main keys update
+`value16` in place.
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
@@ -260,15 +259,18 @@ double-hash within the page (one 4 KiB IO @ 4 B). Capacity ends at
 resize thread). Open segment has **no** filter (always probed); sealed segments
 are fuse-gated newest→oldest. Legacy monolithic `tx.head` / `.new` / `.resize` /
 `.overflow` are **refused** — reindex. **tx_height** uses 4 B height slots.
-Dense Class A fk + segmented **tx.idx** retained. Packed Class A only. Spends are
-schema-v5 annotations on create outputs (no `point.head`).
+Dense Class A fk + segmented **`txout.idx` / `inwit.idx` / `spent.idx`**.
+Class A is **split** (outs / ins+wit / sole-spender). Spends are schema-v5
+annotations on **`spent.body`** (no `point.head`). Inputs store **`create_fk` +
+vout** (soft `prev_txid` in RAM only).
 
 **Memory rule:** Direct IBD writes durable segmented `tx.head.*` live and spend
-annotations on confirm. Class A is packed full-tx bodies; inputs always store
-**external** `prev_txid`. Parent resolve uses parent cache + `tx.head` (open +
-fuse-gated sealed). SH create dedupe is an **O(1) height watermark**; durable SH
-tables bulk-load at tip. Do not raise archive queues without watching RSS vs
-page cache.
+annotations on confirm. Pin/SH/Cake read **`txout` only**; annotate dirties
+**`spent`**. Parent resolve uses parent cache + `tx.head` (open + fuse-gated
+sealed). SH create dedupe is an **O(1) height watermark**; durable SH tables
+bulk-load at tip as sorted files (ingest OA is the only large SH heap). Do not
+raise archive queues without watching RSS vs page cache. Working-set sizes:
+[`SCHEMA.md`](./SCHEMA.md) (mainnet census) and [`docs/ibd-memory.md`](docs/ibd-memory.md).
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 
@@ -355,9 +357,9 @@ On disk (schema 14 side files, no `SCHEMA_VERSION` bump):
 | `store/sp_tweaks.body` | Per tx: `len=0` or `len=33` + compressed `A_tweak` (~3–6 GiB mainnet) |
 
 **Not stored:** txids, Taproot outs, values, parent scripts. Cake
-`output_pubkeys` are joined from this block’s packed Class A body (~12 ms
-sequential on a 4k-tx 9p block). Indexed serve does **not** parent-peek
-(~40–80 blk/s vs ~1.5–3 naive on that VM).
+`output_pubkeys` are joined from this block’s **`txout`** body (~12 ms
+sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
+**not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
 
 Confirm writes 65 B-class records from already-pinned parents
 (**10–50 ms/block** CPU). Reorg truncates with tip. Historical backfill is

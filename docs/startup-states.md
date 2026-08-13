@@ -56,5 +56,6 @@ pipeline (not on lookup). Lookup hands load: create_fk stamps + `txout` /
 
 One published Class A window was a **bit-identical copy** of the previous
 3330 idx starts (fk 1412912844..6173 == 1412909514..2843). No live heal —
-`end < start` is hard `Corrupt`. Offline compact repair removes the ghost
-window; `append_starts` rejects starts that fall inside already-published body.
+`TxIdx::open` refuses a non-monotone tail (`IDX_OPEN_DOUBLE_APPEND`, names
+`txout.idx` / siblings). Offline compact: `scripts/repair-idx-double-append.py`.
+`append_starts` still rejects new clones into already-published body.

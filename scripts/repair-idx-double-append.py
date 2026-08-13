@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Offline repair: remove a double-appended tx.idx window (clone of prior starts).
+"""Offline repair: remove a double-appended idx window (clone of prior starts).
+
+Schema 15 stems are txout.idx / inwit.idx / spent.idx (coupled). Packed tx.idx
+is historic (schema ≤14). The node refuses a non-monotone tail on TxIdx::open;
+this script is the optional compact, not an in-process heal.
 
 Mainnet 2026-08-07 pattern (verified offline):
   source fks [L-W+1, L] identical u32 starts as ghost fks [L+1, L+W]

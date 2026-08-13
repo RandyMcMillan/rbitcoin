@@ -37,6 +37,16 @@ pub const DEFAULT_SOFT_SPAN: u64 = 16 << 30;
 /// Hard max: `u32::MAX` stride units × 8.
 pub const HARD_SPAN: u64 = (u32::MAX as u64) * IDX_STRIDE;
 
+/// Open-time refuse when published starts are not strictly monotone
+/// (already-written double-append / clone window).
+pub const IDX_OPEN_DOUBLE_APPEND: &str =
+    "tx.idx starts not monotone (double-append class); wipe store/txout.idx \
+     (or inwit.idx / spent.idx) or run scripts/repair-idx-double-append.py — \
+     do not recreate tx.head";
+
+/// Tail slots checked on open (page-grouped). Joins between segments always.
+const OPEN_MONOTONE_TAIL: u64 = 8192;
+
 /// OS page size for idx coalesced reads (Linux default; matches head probe pages).
 pub const IDX_OS_PAGE: u64 = 4096;
 
@@ -122,6 +132,7 @@ impl TxIdx {
                 return Err(StoreError::Corrupt("tx.idx body_base unaligned"));
             }
         }
+        check_published_starts_monotone(&segs)?;
         Ok(Self {
             dir,
             stem,
@@ -957,6 +968,51 @@ fn decode_slot_abs(page: &[u8], rel: u16, body_base: u64) -> Result<u64, StoreEr
         .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
+/// Segment joins + last [`OPEN_MONOTONE_TAIL`] starts must be strictly increasing.
+fn check_published_starts_monotone(segs: &[Segment]) -> Result<(), StoreError> {
+    for w in segs.windows(2) {
+        let a = &w[0];
+        let b = &w[1];
+        if a.count == 0 || b.count == 0 {
+            continue;
+        }
+        let last_a = read_start(a, a.count - 1, false)?;
+        let first_b = read_start(b, 0, false)?;
+        if first_b <= last_a {
+            return Err(StoreError::Corrupt(IDX_OPEN_DOUBLE_APPEND));
+        }
+    }
+    let total: u64 = segs.iter().map(|s| s.count).sum();
+    if total < 2 {
+        return Ok(());
+    }
+    let want = total.min(OPEN_MONOTONE_TAIL);
+    let mut starts = Vec::with_capacity(want as usize);
+    let mut remain = want;
+    for seg in segs.iter().rev() {
+        if remain == 0 {
+            break;
+        }
+        let take = remain.min(seg.count);
+        if take == 0 {
+            continue;
+        }
+        let i0 = seg.count - take;
+        let i1 = seg.count - 1;
+        let mut chunk = Vec::with_capacity(take as usize);
+        read_starts_page_aligned(seg, i0, i1, &mut chunk, false)?;
+        remain = remain.saturating_sub(chunk.len() as u64);
+        starts.extend(chunk.into_iter().rev());
+    }
+    starts.reverse();
+    for w in starts.windows(2) {
+        if w[1] <= w[0] {
+            return Err(StoreError::Corrupt(IDX_OPEN_DOUBLE_APPEND));
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn slot_file_off(slot_i: u64) -> u64 {
     FILE_HEADER_LEN as u64 + slot_i * 4
@@ -1301,6 +1357,43 @@ mod tests {
         // Legitimate next batch is past last start.
         idx.append_starts(4, &[48u64, 56]).unwrap();
         assert_eq!(idx.slot_count(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Already-written clone window must fail `TxIdx::open` (append guard is write-only).
+    #[test]
+    fn open_refuses_cloned_starts_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-txidx-open-clone-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = TxIdx::create(&dir, "txout").unwrap();
+        idx.append_starts(0, &[16u64, 24, 32, 40]).unwrap();
+        idx.append_starts(4, &[48u64, 56, 64, 72]).unwrap();
+        drop(idx);
+
+        let seg = segment_path(&dir, "txout", 0);
+        let mut raw = std::fs::read(&seg).unwrap();
+        // Copy first 4 u32 slots over the last 4 (clone the prior window).
+        let hdr = FILE_HEADER_LEN;
+        let src = raw[hdr..hdr + 16].to_vec();
+        raw[hdr + 16..hdr + 32].copy_from_slice(&src);
+        std::fs::write(&seg, &raw).unwrap();
+
+        let err = match TxIdx::open(&dir, "txout") {
+            Ok(_) => panic!("clone must refuse on open"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("double-append") || msg.contains("repair-idx-double-append"),
+            "operator one-liner missing: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

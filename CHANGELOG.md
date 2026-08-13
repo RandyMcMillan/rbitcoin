@@ -18,6 +18,13 @@ before 1.0).
   index instead of store-resolving every live chain input. Empty Cake keys were
   ~1.5 s each on a mainnet mempool.
 
+### Added
+
+- **`--sptweaks`:** optional thin BIP-352 index (`sp_tweaks.idx` / `.body`).
+  Persist is `len:tweak` only (0 or 33-byte compressed `A_tweak`). Cake outs
+  join packed Class A. Confirm appends; reorg truncates; background backfill.
+  Electrum still serves naive when the flag is off or a height is a hole.
+
 ### Changed
 
 - **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so

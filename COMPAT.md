@@ -66,6 +66,7 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | Method | Status | Notes |
 |--------|--------|-------|
 | server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()` will probe tweaks |
+| blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; outs from packed Class A). Isolate may still hardcode `electrs.cakewallet.com` |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full** |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce |

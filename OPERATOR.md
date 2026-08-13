@@ -55,6 +55,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--api-log PATH` | conf `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
 | `--no-seeds` | `--noseeds` | seeds on |
 | `--shindex` | conf `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--sptweaks` | conf `sptweaks=1` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--electrum-listen ADDR` | | disabled (**requires** `--shindex`) |
 | `--esplora-listen ADDR` | | disabled (Esplora REST; **requires** `--shindex`) |
 | `--rpc-listen ADDR` | conf `rpc_listen` | disabled — Core-class JSON-RPC subset |
@@ -340,6 +341,32 @@ Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 
 Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` ≠ `sh_tip_ready`).
 
+## Silent payment tweaks (`--sptweaks`)
+
+Optional **thin** BIP-352 index for Cake-compatible `blockchain.tweaks.subscribe`.
+Default **off**. The Electrum method still exists when off (naive per-height
+walk). Flag on = persist + serve-from-index + background backfill.
+
+On disk (schema 14 side files, no `SCHEMA_VERSION` bump):
+
+| File | Contents |
+|------|----------|
+| `store/sp_tweaks.idx` | Per height from taproot activation: `header_fk` + `u32` body off (~3 MiB at today’s tip) |
+| `store/sp_tweaks.body` | Per tx: `len=0` or `len=33` + compressed `A_tweak` (~3–6 GiB mainnet) |
+
+**Not stored:** txids, Taproot outs, values, parent scripts. Cake
+`output_pubkeys` are joined from this block’s packed Class A body (~12 ms
+sequential on a 4k-tx 9p block). Indexed serve does **not** parent-peek
+(~40–80 blk/s vs ~1.5–3 naive on that VM).
+
+Confirm writes 65 B-class records from already-pinned parents
+(**10–50 ms/block** CPU). Reorg truncates with tip. Historical backfill is
+IO-bound (**hours** on SSD; 9p/spinning rust longer). Progress is the idx
+itself (kill-safe).
+
+Cake’s scan isolate may still hardcode `electrs.cakewallet.com` even after a
+successful probe — see `COMPAT.md`.
+
 ## Electrum
 
 Internet-facing Electrum is supported as a **wallet-client backend** (Electrum,
@@ -358,6 +385,7 @@ scripthashes / txids; we do **not** aim to back block-explorer search UIs.
   --datadir ./datadir-mainnet \
   --network mainnet \
   --shindex \
+  --sptweaks \
   --electrum-listen 127.0.0.1:50001 \
   --log-level info
 ```

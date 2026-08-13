@@ -169,7 +169,7 @@ audit closures. Do not reopen without new evidence.
 |----|--------|
 | Close work by **moving the Open row into Completed** in the same edit as the landing change | Leave `Status: fixed` in Open, or start a second table |
 | New item: next unused **Q-id (Q-41+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
-| Keep product research in `docs/future-features/` (BIP331, BIP352, …) | Add those to Open or Completed |
+| Keep product research in `docs/future-features/` | Add those to Open or Completed |
 | God-file peels only when a higher Open row needs a seam (**R-10**) | Split `query/lib` / `interpreter.rs` as a standalone “modularity” project |
 | Suite: no new remine-100 / default test **&gt;2 s** without justification ([TESTING.md](../TESTING.md)) | Time the full workspace as a planning spike |
 | Differentials / crashes → `docs/external_findings/` + named regression | Soft dual paths on confirm identity / denserels / Class A load |

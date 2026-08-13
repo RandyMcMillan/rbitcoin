@@ -2,11 +2,10 @@
 
 **Version:** `SCHEMA_VERSION = 15` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — most layout changes are reindex-only.  
-**13/14→15 open:** Class A matches schema 14. A store with `meta` 13 or 14 and
-**no materialized scripthash index** opens and silently rewrites `meta` to 15.
-A store with a durable page-era (or schema-13 slab) SH index is refused:
-wipe `store/scripthash*` (head, body, ovf, runs, include_hwm, cold_progress)
-and rematerialize.  
+**13/14→15 open:** Empty Class A (no creates) + empty/missing SH may silently
+rewrite `meta` to 15. A packed `tx.body` **with creates**, or a durable page-era
+(or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
+`txout` + `inwit` + `spent` (not a single packed `tx.body`).  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -17,7 +16,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Class A body | **Packed** full tx in one `tx.body` record (**no** leading txid) | One IO for outs/payload; identity is not body-bound |
+| Class A body | **Split** `txout` (outs) + `inwit` (ins+wit) + `spent` (9 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
 | Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand without Prefix33 body peeks |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
 | Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
@@ -34,7 +33,10 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
-    tx.body / tx.idx.meta / tx.idx.NNNNNN           # Class A + segmented idx
+    txout.body / txout.idx/                         # Class A outs (hot)
+    inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
+    spent.body / spent.idx/                         # sole-spender 9 B × n_out
+    tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head.meta / tx.head.NNNNNN [/ .fuse8]        # segmented 25-bit heads + sealed fuse8
     spenders.body                # multi-spender list nodes only
@@ -64,7 +66,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **14** |
+| 4 | 2 | Schema version (u16) — **15** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -74,7 +76,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |------|------|
 | 1 | meta |
 | 2 | header |
-| 3 | tx |
+| 3 | txout (`txout.body`; was `tx` through schema 14) |
 | 4 | input *(legacy kind id; no standalone tables)* |
 | 5 | output *(legacy kind id; no standalone tables)* |
 | 6 | point *(legacy kind id; no point.head)* |
@@ -85,6 +87,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | 11 | scripthash |
 | 14 | txid_body (`txid.body`) |
 | 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
+| 16 | inwit (`inwit.body`) |
+| 17 | spent (`spent.body`) |
 
 ---
 
@@ -137,21 +141,28 @@ offset 0..32    — 32-byte file header (standard 16-byte TableFile header + 16 
 offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
 ```
 
-Append-published with Class A body/idx on the sole Class A write path. Count must match `tx.body` entry count. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
+Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `inwit` / `spent` / `txid.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
 
 **IO policy (RWF_DONTCACHE):** sidefile peeks do **not** set `RWF_DONTCACHE` (permanent spend-annotate body pwrite only).
 
-### Packed body (schema 13+)
+### Split bodies (schema 15)
 
-Each `tx.body` record starts at an absolute offset `S` with:
+Each create_fk has three 8-aligned var records (coupled idx `first_fk` / `file_id`):
 
 ```text
-S (8-byte aligned only):
-  body_meta (32 B)             # version, locktime, null I/O fks, counts — NO txid
-  inputs…
-  outputs…
-  [optional 0x00 …]            # pad to next record start (included in idx length)
+txout.body  S:  meta 16B (version, locktime, in_count, out_count) | outputs (no spender)
+inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
+spent.body Ss:  9 B × out_count  (spender u64 + flags). Multi overflow → spenders.body
 ```
+
+Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
+Pin / SH / Cake read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 9×vout`).
+Reconstruct zips `txout` + `inwit`. First-page Outs reads are 4 KiB; truncated outs extend
+to the full idx span.
+
+Packed `tx.body` (schema 13–14: 32 B meta | inputs+witness | outputs) is **refused** if it contains creates.
+
+### Packed body (schema 13–14, historic)
 
 There is **no** leading magic byte and **no** leading txid (schema 11–12 stored txid at `[S, S+32)`). There are **no** standalone `input.body` / `output.body` tables.
 
@@ -159,12 +170,12 @@ There is **no** leading magic byte and **no** leading txid (schema 11–12 store
 
 Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt.
 
-**Body meta (32 B):** version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
-On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload). Soft `TxRecord.txid` is filled from the sidefile on get paths.
+**Body meta (schema 15, 16 B):** version, locktime, `input_count`, `output_count`.
+`input_start_fk` / `output_start_fk` stay null in RAM. Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-**IO policy (RWF_DONTCACHE):** permanent **spend-annotate `tx.body` pwrites only** (fd-only drop after spender meta write — not `madvise`). Class A append, confirm/load body reads, generic body reads, and head/idx/sidefile peeks do **not** set the flag. Kernel ENOTSUP demotes capability for the process.
+**IO policy (RWF_DONTCACHE):** permanent **spend-annotate `spent.body` pwrites only** (fd-only drop after spender meta write — not `madvise`). Class A append, confirm/load body reads, generic body reads, and head/idx/sidefile peeks do **not** set the flag. Kernel ENOTSUP demotes capability for the process.
 
-### Segmented body index (`tx.idx.*`)
+### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
 
 ```text
 tx.idx.meta                 # segment map

@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **15** | SH slabs + ULEB128 fks + sealed sorted/fuse/idx heads; global ingest ovf; refuse page-era SH | **Current** |
+| **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | **Current** |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
 | **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
@@ -31,10 +31,11 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ## v15 (current)
 
-See [`SCHEMA.md`](./SCHEMA.md). Class B only: geometric slabs + delta fks,
+See [`SCHEMA.md`](./SCHEMA.md). Class B: geometric slabs + delta fks,
 sealed sorted heads with fuse8+idx, one global ingest OA. Empty 13/14 SH
 upgrades `meta` silently; a materialized page-era index is refused
-(wipe `store/scripthash*` and rematerialize). Class A is unchanged from 14.
+(wipe `store/scripthash*` and rematerialize). Class A is split:
+`txout` + `inwit` + `spent` (refuse packed `tx.body` with creates).
 
 ## v14
 

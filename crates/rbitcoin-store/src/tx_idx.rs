@@ -92,6 +92,7 @@ impl TxIdx {
             // FdOnly: multi‑GiB idx segments use pread/pwrite (no full MAP_SHARED).
             let file =
                 TableFile::open_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+            file.set_grow_tight(true);
             let slot_bytes = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
             if slot_bytes % 4 != 0 {
                 return Err(StoreError::Corrupt("tx.idx segment size"));
@@ -195,20 +196,19 @@ impl TxIdx {
     }
 
     fn soft_span() -> u64 {
-        // Explicit env wins (tests under `tests_soft_span_env_lock` set this).
-        if let Some(v) = std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v: &u64| v >= IDX_STRIDE)
-        {
-            return v.min(HARD_SPAN);
-        }
         #[cfg(test)]
         {
             let o = TEST_SOFT_SPAN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
             if o >= IDX_STRIDE {
                 return o.min(HARD_SPAN);
             }
+        }
+        if let Some(v) = std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v: &u64| v >= IDX_STRIDE)
+        {
+            return v.min(HARD_SPAN);
         }
         DEFAULT_SOFT_SPAN.min(HARD_SPAN)
     }
@@ -678,6 +678,29 @@ impl TxIdx {
         Ok(())
     }
 
+    pub(crate) fn would_roll(&self, first_new_fk: u64, abs_start: u64) -> bool {
+        let _ = first_new_fk;
+        let segs = self.segments_snapshot();
+        if segs.is_empty() {
+            return true;
+        }
+        let tail = segs.last().unwrap();
+        if abs_start < tail.body_base {
+            return true;
+        }
+        let delta = abs_start - tail.body_base;
+        if !delta.is_multiple_of(IDX_STRIDE) {
+            return true;
+        }
+        let rel = delta / IDX_STRIDE;
+        let soft = Self::soft_span();
+        rel > u32::MAX as u64 || (tail.count > 0 && delta > soft)
+    }
+
+    pub(crate) fn force_roll(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
+        self.roll_segment(first_fk, body_base)
+    }
+
     fn roll_segment(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
         if !body_base.is_multiple_of(IDX_STRIDE) {
             return Err(StoreError::Corrupt("tx.idx body_base unaligned"));
@@ -689,6 +712,7 @@ impl TxIdx {
         // Replace if empty leftover.
         let _ = std::fs::remove_file(&path);
         let file = TableFile::create_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        file.set_grow_tight(true);
         debug_assert_eq!(file.access(), TableAccess::FdOnly);
         let seg = Segment {
             first_fk,
@@ -1292,8 +1316,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _env = tests_soft_span_env_lock();
-        // Tiny soft span → many segments.
-        std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
+        // Tiny soft span → many segments (override wins over parallel env races).
+        test_set_soft_span_bytes(64);
         let idx = TxIdx::create(&dir, "tx").unwrap();
         // Three batches that force rolls (span > 64).
         let s1 = [16u64, 24, 32, 40];
@@ -1315,7 +1339,7 @@ mod tests {
         let ranges = idx.record_ranges(1, 6, 6, 16 + 128 + 16 + 8).unwrap();
         assert_eq!(ranges.len(), 6);
         assert_eq!(ranges[0].0, 16);
-        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        test_set_soft_span_bytes(0);
         drop(_env);
         // New layout lives under tx.idx/
         assert!(dir.join("tx.idx").join("meta").is_file());

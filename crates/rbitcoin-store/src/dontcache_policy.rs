@@ -270,9 +270,8 @@ mod tests {
         let flags = bulk_io::test_take_last_read_dontcache();
         assert!(!flags.is_empty() && flags.iter().all(|&d| !d));
 
-        let (off, len) = t.body_range(fks[0]).unwrap();
-        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
-        let abs = off + u64::from(decoded[0].as_ref().unwrap().2[0]);
+        let (off, _len) = t.spent_range(fks[0]).unwrap();
+        let abs = crate::tx_table::spent_abs(off, 0);
         let _ = bulk_io::test_take_last_read_dontcache();
         let _ = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
         let flags = bulk_io::test_take_last_read_dontcache();

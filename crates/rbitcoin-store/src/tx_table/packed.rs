@@ -376,18 +376,17 @@ pub(super) fn xor_script_regions_in_input(
     }
 }
 
-/// XOR scriptPubKey bytes inside an already-encoded output record.
+/// XOR scriptPubKey bytes inside an already-encoded `txout` output record.
 pub(super) fn xor_script_region_in_output(
     buf: &mut [u8],
     start: usize,
     secret: &crate::store_secret::StoreSecret,
 ) {
-    if start + 9 > buf.len() {
+    if start >= buf.len() {
         return;
     }
-    // spender u64 + flags u8
-    let flags = buf[start + 8];
-    let mut off = start + 9;
+    let flags = buf[start];
+    let mut off = start + 1;
     // uleb128 value
     loop {
         if off >= buf.len() {
@@ -442,11 +441,11 @@ pub fn next_tx_body_start(cursor: u64) -> u64 {
     cursor.saturating_add(7) & !7u64
 }
 
-/// Encode a full Class A tx as one var payload (schema **13+**).
+/// Encode `txout.body` payload (schema **15**): `meta(16) || output_run`.
 ///
-/// Layout: `body_meta(32) || input_run || output_run` — **no** leading txid.
-/// Identity is stored in `txid.body`. Production put paths use
-/// [`encode_packed_tx_with_secret`].
+/// Inputs/witness go to [`encode_inwit_with_secret`]. Spender slots go to
+/// [`encode_spent_zeros`]. `inputs` is accepted for call-site compatibility
+/// (count assert only).
 pub fn encode_packed_tx(
     tx: &TxRecord,
     inputs: &[InputRecord],
@@ -456,7 +455,7 @@ pub fn encode_packed_tx(
     encode_packed_tx_with_secret(tx, inputs, outputs, out, None);
 }
 
-/// Encode with optional at-rest XOR of scriptSig / witness / scriptPubKey.
+/// Encode `txout` with optional at-rest XOR of scriptPubKey.
 pub fn encode_packed_tx_with_secret(
     tx: &TxRecord,
     inputs: &[InputRecord],
@@ -466,38 +465,70 @@ pub fn encode_packed_tx_with_secret(
 ) {
     debug_assert_eq!(inputs.len() as u32, tx.input_count);
     debug_assert_eq!(outputs.len() as u32, tx.output_count);
-    // I/O fks are unused for packed rows (body is self-contained).
     let mut meta = tx.clone();
     meta.input_start_fk = Fk::NULL;
     meta.output_start_fk = Fk::NULL;
     meta.encode_body_meta_into(out);
-    encode_input_run_secret(inputs, out, secret);
     encode_output_run_secret(outputs, out, secret);
 }
 
-/// Dense relative offsets of each output's start within a packed Class A payload.
-///
-/// Matches [`decode_packed_tx_with_spender_rels`] denserels. Computed from exact
-/// encode layout (`encoded_len_exact`) — no full encode+decode. Secret XOR does
-/// not change field lengths. Used at plan finish for prep-ahead pin.
-pub fn denserels_from_packed_records(
-    tx: &TxRecord,
+/// Encode `inwit.body` payload (input-side + witness).
+pub fn encode_inwit_with_secret(
     inputs: &[InputRecord],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
+    encode_input_run_secret(inputs, out, secret);
+}
+
+/// Encode a zeroed `spent.body` run (`9 × n_out` bytes).
+pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
+    let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
+    out.resize(out.len().saturating_add(n), 0);
+}
+
+/// Removed: spender abs is `spent_abs(spent_off, vout)`. Kept so leftover tests compile out.
+#[allow(dead_code)]
+pub fn denserels_from_packed_records(
+    _tx: &TxRecord,
+    _inputs: &[InputRecord],
     outputs: &[OutputRecord],
 ) -> Vec<u32> {
-    debug_assert_eq!(inputs.len() as u32, tx.input_count);
-    debug_assert_eq!(outputs.len() as u32, tx.output_count);
-    // Body meta is fixed-width (no txid); fk NULLs on encode do not change length.
-    let mut off = TxRecord::BODY_META_LEN;
-    for inp in inputs {
-        off = off.saturating_add(inp.encoded_len_exact());
+    let _ = outputs;
+    Vec::new()
+}
+
+/// Spent abs for `vout` given the create's `spent.body` range start.
+#[inline]
+pub fn spent_abs(spent_off: u64, vout: u32) -> u64 {
+    spent_off.saturating_add(u64::from(vout).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64))
+}
+
+/// Decode `inwit.body` payload into input records (script_sig + witness).
+pub fn decode_inwit_secret(
+    raw: &[u8],
+    in_count: u32,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<Vec<InputRecord>, StoreError> {
+    if in_count == 0 {
+        return Ok(Vec::new());
     }
-    let mut dens = Vec::with_capacity(outputs.len());
-    for out in outputs {
-        dens.push(off as u32);
-        off = off.saturating_add(out.encoded_len_exact());
+    let (mut inputs, used) = decode_input_run_prefix(raw, in_count)?;
+    check_trailing_zero_pad(raw, used)?;
+    if let Some(sec) = secret {
+        for inp in &mut inputs {
+            if !inp.script_sig.is_empty() {
+                sec.xor_bytes(0, &mut inp.script_sig);
+            }
+            for (wi, item) in inp.witness.iter_mut().enumerate() {
+                sec.xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, item);
+            }
+        }
     }
-    dens
+    if inputs.len() as u32 != in_count {
+        return Err(StoreError::Corrupt("inwit count mismatch"));
+    }
+    Ok(inputs)
 }
 
 /// After walking a packed payload to `logical_end`, accept only zero pad to `raw.len()`.
@@ -512,153 +543,72 @@ pub(super) fn check_trailing_zero_pad(raw: &[u8], logical_end: usize) -> Result<
     Ok(())
 }
 
-/// Decode packed Class A; `raw` is the full var payload (may include zero pad).
+/// Decode `txout.body` (meta + outputs). Inputs are empty — use [`decode_inwit_secret`].
 pub fn decode_packed_tx(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
-    let (meta, inputs, outputs, _rels) = decode_packed_tx_with_spender_rels(raw)?;
-    Ok((meta, inputs, outputs))
+    let (meta, _ins, outputs, _rels) = decode_packed_tx_with_spender_rels(raw)?;
+    Ok((meta, Vec::new(), outputs))
 }
 
-/// Full packed decode plus dense relative offsets of each output's 9-byte
-/// spender meta (field + flags) within the payload.
-///
-/// **Spender fields on returned outs are cleared** (same as outs-only denserels
-/// path) so pin/residency never treat pin-time annotations as durable authority.
+/// `txout` decode. The `Vec<u32>` rels are always empty (spender lives in `spent.body`).
 pub fn decode_packed_tx_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
     decode_packed_tx_with_spender_rels_secret(raw, None)
 }
 
-/// Decode with optional de-obfuscation of script/witness (schema 12 production).
+/// Decode `txout` with optional de-obfuscation of scriptPubKey.
 pub fn decode_packed_tx_with_spender_rels_secret(
     raw: &[u8],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return Err(StoreError::Corrupt("short packed Class A tx"));
-    }
-    // Schema 13: body meta only; txid filled by sidefile on get paths.
-    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-    let mut off = TxRecord::BODY_META_LEN;
-    let (mut inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
-    off += in_used;
-    let n_out = meta.output_count as usize;
-    let mut outputs = Vec::with_capacity(n_out);
-    let mut spender_rels = Vec::with_capacity(n_out);
-    for _ in 0..n_out {
-        if off >= raw.len() {
-            return Err(StoreError::Corrupt("packed outputs short"));
-        }
-        spender_rels.push(off as u32);
-        let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
-        off += used;
-        rec.spender_field = Fk::NULL;
-        rec.multi_spender = false;
-        outputs.push(rec);
-    }
-    check_trailing_zero_pad(raw, off)?;
-    // De-obfuscate by re-encoding layout walk is unnecessary: scripts were
-    // XOR'd only when stored as raw payload (not OP_TRUE / empty flags). Apply
-    // the same in-buffer XOR walk to a mutable copy of script bytes only when
-    // the decode path materialised them from disk payload lengths.
-    if let Some(sec) = secret {
-        deobfuscate_decoded_inputs_outputs(&mut inputs, &mut outputs, sec, raw, meta.input_count);
-    }
-    if inputs.len() as u32 != meta.input_count || outputs.len() as u32 != meta.output_count {
-        return Err(StoreError::Corrupt("packed Class A count mismatch"));
-    }
-    Ok((meta, inputs, outputs, spender_rels))
+    let (meta, outputs, rels) = decode_packed_tx_outs_with_spender_rels_secret(raw, secret)?;
+    Ok((meta, Vec::new(), outputs, rels))
 }
 
-/// De-XOR scripts/witness that were stored as opaque payloads (skip OP_TRUE / empty).
-pub(super) fn deobfuscate_decoded_inputs_outputs(
-    inputs: &mut [InputRecord],
-    outputs: &mut [OutputRecord],
-    secret: &crate::store_secret::StoreSecret,
-    raw: &[u8],
-    input_count: u32,
-) {
-    // Walk raw layout to know which scripts were on-disk payloads.
+/// True when `raw` contains a complete `txout` meta+outs walk (first-page probe).
+///
+/// Used by [`crate::idx_body_pipeline`] to decide whether a 4 KiB Outs read must
+/// be extended to the full idx span.
+pub fn txout_first_page_complete(raw: &[u8]) -> bool {
     if raw.len() < TxRecord::BODY_META_LEN {
-        return;
+        return false;
     }
+    let Ok(meta) = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN]) else {
+        return false;
+    };
     let mut off = TxRecord::BODY_META_LEN;
-    for i in 0..input_count as usize {
-        if off >= raw.len() || i >= inputs.len() {
-            return;
+    for _ in 0..meta.output_count {
+        match OutputRecord::skip_at(&raw[off..]) {
+            Ok(n) => off += n,
+            Err(_) => return false,
         }
-        let start = off;
-        let flags = raw[off];
-        off += 1;
-        if flags & input_flags::NULL_PREV == 0 {
-            off += 8;
-            if let Ok((_, n)) = read_compact_size(&raw[off..]) {
-                off += n;
-            } else {
-                return;
-            }
-        }
-        if flags & input_flags::SEQ_FINAL == 0 {
-            off += 4;
-        }
-        if flags & input_flags::EMPTY_SCRIPT == 0 {
-            if let Ok((slen, n)) = read_compact_size(&raw[off..]) {
-                off += n + slen as usize;
-                secret.xor_bytes(0, &mut inputs[i].script_sig);
-            } else {
-                return;
-            }
-        }
-        if flags & input_flags::EMPTY_WITNESS == 0 {
-            if let Ok((nw, n)) = read_compact_size(&raw[off..]) {
-                off += n;
-                for wi in 0..nw as usize {
-                    if let Ok((ilen, n)) = read_compact_size(&raw[off..]) {
-                        off += n + ilen as usize;
-                        if wi < inputs[i].witness.len() {
-                            secret.xor_bytes(
-                                u64::from(wi as u32).saturating_add(1) << 16,
-                                &mut inputs[i].witness[wi],
-                            );
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            } else {
-                return;
-            }
-        }
-        let _ = start;
     }
-    for o in outputs.iter_mut() {
-        // Only de-xor non-empty, non-OP_TRUE scripts (those had payload on disk).
-        if o.script.is_empty() || o.script == [0x51] {
-            continue;
-        }
-        secret.xor_bytes(0, &mut o.script);
-    }
+    true
 }
 
-/// Packed meta + input create edges only (skip scripts, witnesses, and outputs).
+/// Prevout edges from an `inwit.body` payload (`in_count` from `txout` meta).
 ///
 /// Each edge is `(create_fk, vout)`; coinbase → `(Fk::NULL, u32::MAX)`.
+pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, StoreError> {
+    let mut off = 0usize;
+    let mut prevouts = Vec::with_capacity(in_count as usize);
+    for _ in 0..in_count {
+        let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        off += used;
+        prevouts.push((create_fk, prev_index));
+    }
+    Ok(prevouts)
+}
+
+/// [`scan_inwit_prevouts`] plus meta from a `txout` record (meta only uses first 16 B).
 pub fn scan_packed_meta_and_prevouts(raw: &[u8]) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
     if raw.len() < TxRecord::BODY_META_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
     let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-    let mut off = TxRecord::BODY_META_LEN;
-    let mut prevouts = Vec::with_capacity(meta.input_count as usize);
-    for _ in 0..meta.input_count {
-        let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
-        off += used;
-        prevouts.push((create_fk, prev_index));
-    }
-    let _ = off;
-    Ok((meta, prevouts))
+    Ok((meta, Vec::new()))
 }
 
 /// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
@@ -684,10 +634,6 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
     }
     let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
     let mut off = TxRecord::BODY_META_LEN;
-    for _ in 0..meta.input_count {
-        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
-        off += used;
-    }
     let n_out = meta.output_count as usize;
     let mut outputs = Vec::with_capacity(n_out);
     let mut spender_rels = Vec::with_capacity(n_out);
@@ -729,20 +675,16 @@ pub fn scan_packed_p2tr_outs(
     }
     let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
     let mut off = TxRecord::BODY_META_LEN;
-    for _ in 0..meta.input_count {
-        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
-        off += used;
-    }
     let mut out = Vec::new();
     for vout in 0..meta.output_count {
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
-        if raw.len() - off < 9 {
+        if raw.len() - off < 2 {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let flags = raw[off + 8];
-        let mut o = off + 9;
+        let flags = raw[off];
+        let mut o = off + 1;
         let (v, n) = read_uleb128(&raw[o..])?;
         o += n;
         let value = if v > i64::MAX as u64 { 0 } else { v as u64 };
@@ -790,10 +732,6 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
     }
     let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
     let mut off = TxRecord::BODY_META_LEN;
-    for _ in 0..meta.input_count {
-        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
-        off += used;
-    }
     let n_out = meta.output_count;
     // Empty need → all vouts (full materialize path without a second full decode).
     let take_all = need_vouts.is_empty();

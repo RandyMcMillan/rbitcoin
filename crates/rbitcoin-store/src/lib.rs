@@ -123,13 +123,14 @@ pub use store::{Store, TxidResolveMode};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{
-    clear_output_spender_fields, decode_packed_tx,
+    clear_output_spender_fields, decode_inwit_secret, decode_packed_tx,
     decode_packed_tx_need_outs_with_spender_rels_secret, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
-    decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records, encode_packed_tx,
-    encode_packed_tx_with_secret, is_packed_tx_payload, next_tx_body_start,
-    scan_packed_meta_and_prevouts, spend_meta_backend, InputRecord, OutputRecord, SpendMetaBackend,
-    TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
+    decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records,
+    encode_inwit_with_secret, encode_packed_tx, encode_packed_tx_with_secret, encode_spent_zeros,
+    is_packed_tx_payload, next_tx_body_start, scan_inwit_prevouts, scan_packed_meta_and_prevouts,
+    spend_meta_backend, spent_abs, InputRecord, OutputRecord, SpendMetaBackend, TxRecord,
+    BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
 pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_DONTCACHE_FROM_TAIL, TXID_ENTRY_LEN};
 pub use uring_session::RWF_DONTCACHE;

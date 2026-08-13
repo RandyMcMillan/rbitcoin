@@ -86,13 +86,17 @@ impl Store {
         } else {
             ScriptHashTable::create(&path)?
         };
-        // Schema 13/14→15: Class A layout matches. Only a *materialized* SH
-        // index (page-era or schema-13 slabs) is incompatible — empty / missing
-        // SH upgrades silently.
+        // Schema 13/14→15: empty Class A + empty SH may rewrite meta. Packed
+        // tx.body with creates, or a materialized SH index, is refused.
         if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION == 15 {
             if scripthash.has_durable_index() {
                 return Err(StoreError::Corrupt(
                     "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
+                ));
+            }
+            if class_a_has_creates(&path) {
+                return Err(StoreError::Corrupt(
+                    "schema 15 refuses packed Class A with creates; wipe datadir and redo IBD",
                 ));
             }
             rewrite_meta_current(&path)?;
@@ -200,7 +204,7 @@ impl Store {
         self.txs.get(fk)
     }
 
-    /// Full Class A body by fk: **one** `tx.body` read (packed only).
+    /// Full Class A body by fk: zip `txout` + `inwit`.
     pub fn get_tx_full(
         &self,
         fk: Fk,
@@ -227,6 +231,16 @@ impl Store {
     /// Absolute body `(offset, len)` for `fk` (for cache idx cache).
     pub fn tx_body_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.txs.body_range(fk)
+    }
+
+    /// Absolute `spent.body` `(offset, len)` for `fk` (annotate / unspent).
+    pub fn tx_spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.txs.spent_range(fk)
+    }
+
+    /// Absolute `inwit.body` `(offset, len)` for `fk`.
+    pub fn tx_inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.txs.inwit.record_range(fk)
     }
 
     /// Full tx decode from a cached body range (no idx read).
@@ -267,11 +281,11 @@ impl Store {
 
     /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
     ///
-    /// `pin` is `(TxRecord, outs, denserels)`; denserels are ignored for encode.
+    /// `pin` is `(TxRecord, outs)`.
     pub fn put_tx_full_batch_from_pins(
         &self,
         items: &[(
-            std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+            std::sync::Arc<(TxRecord, Vec<OutputRecord>)>,
             Vec<InputRecord>,
         )],
         index: bool,
@@ -551,6 +565,10 @@ impl Store {
         self.txs.body_range_batch(fks)
     }
 
+    pub fn tx_spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        self.txs.spent_range_batch(fks)
+    }
+
     /// Completion-driven idx→body io_uring pipeline (confirm load / prep).
     ///
     /// Jobs with pre-known `range` skip idx. See [`crate::run_idx_body_pipeline`].
@@ -560,6 +578,14 @@ impl Store {
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
         crate::run_idx_body_pipeline(&self.txs.body, jobs, mode)
+    }
+
+    pub fn idx_inwit_pipeline(
+        &self,
+        jobs: &mut [crate::IdxBodyJob],
+        mode: crate::IdxBodyMode,
+    ) -> Result<(), StoreError> {
+        crate::run_idx_body_pipeline(&self.txs.inwit, jobs, mode)
     }
 
     /// Bulk full packed decode from known ranges (confirm load).
@@ -672,10 +698,10 @@ impl Store {
         }
         let tip = self.confirmed.tip_height().map(|t| t.0);
         let metas: Vec<(u32, bool, Fk)> = match body_range {
+            // `body_range` here is the create's **spent.body** span (schema 15).
             Some((off, len)) => self.txs.get_output_spender_metas_at(off, len, vouts)?,
             None => {
-                // Resolve create_fk → body via tx.idx once, then one packed walk.
-                if let Ok((off, len)) = self.txs.body_range(create_tx_fk) {
+                if let Ok((off, len)) = self.txs.spent.record_range(create_tx_fk) {
                     self.txs.get_output_spender_metas_at(off, len, vouts)?
                 } else {
                     let mut out = Vec::with_capacity(vouts.len());
@@ -1089,6 +1115,29 @@ impl Store {
     }
 }
 
+fn class_a_has_creates(dir: &Path) -> bool {
+    fn published_len(path: &Path) -> u64 {
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return 0;
+        };
+        let mut hdr = [0u8; 16];
+        if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
+            return 0;
+        }
+        u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]))
+    }
+    if published_len(&dir.join("txout.body")) > 16 {
+        return true;
+    }
+    if published_len(&dir.join("txid.body")) > 32 {
+        return true;
+    }
+    if published_len(&dir.join("tx.body")) > 16 {
+        return true;
+    }
+    false
+}
+
 fn write_meta(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
     let mut f = OpenOptions::new()
@@ -1311,7 +1360,7 @@ mod tests {
         // Body alone has zero txid; identity is sidefile / get_tx_full.
         assert_eq!(s.get_tx_full_at(off, len).unwrap().0.txid, [0u8; 32]);
         assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
-        assert_eq!(s.get_tx_meta_and_prevouts_at(off, len).unwrap().1.len(), 1);
+        assert_eq!(s.get_tx_meta_and_prevouts(create_fk).unwrap().1.len(), 1);
         assert_eq!(s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(), 2);
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
         assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
@@ -1393,11 +1442,12 @@ mod tests {
         s.put_spend_batch_by_create(&[(create_fk, 1, spend2_fk)])
             .unwrap();
         let (off, len) = s.tx_body_range(create_fk).unwrap();
-        s.put_spend_create_at(create_fk, 1, spend3_fk, off, len)
+        let (soff, slen) = s.tx_spent_range(create_fk).unwrap();
+        s.put_spend_create_at(create_fk, 1, spend3_fk, soff, slen)
             .unwrap();
         s.put_spend_batch_by_create_ranged(&[]).unwrap();
         // Re-annotate vout1 with ranged multi path already multi.
-        s.put_spend_batch_by_create_ranged(&[(create_fk, 1, spend_fk, off, len)])
+        s.put_spend_batch_by_create_ranged(&[(create_fk, 1, spend_fk, soff, slen)])
             .unwrap();
 
         // Class C: confirm spenders + heights. Body list must include spend_fk
@@ -1414,11 +1464,11 @@ mod tests {
         assert!(s.is_confirmed_strong(spend_fk).unwrap());
         assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
         assert!(s
-            .has_confirmed_strong_spender_create(create_fk, 0, Some((off, len)))
+            .has_confirmed_strong_spender_create(create_fk, 0, Some((soff, slen)))
             .unwrap());
         assert!(s.has_confirmed_strong_spender(&[10u8; 32], 0).unwrap());
         let unspent = s
-            .unspent_create_vouts(create_fk, &[0, 1], Some((off, len)))
+            .unspent_create_vouts(create_fk, &[0, 1], Some((soff, slen)))
             .unwrap();
         // vout 0 has confirmed strong spender; vout1 multi without strong may still be unspent
         assert!(!unspent.contains(&0));
@@ -1549,6 +1599,66 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.header_count(), 0);
         drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_tx_refused_and_inwit_prevouts_at() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let rec = TxRecord {
+            txid: [9u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        assert!(matches!(s.put_tx(&rec), Err(StoreError::Corrupt(_))));
+        let item = (
+            TxRecord {
+                txid: [8u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        );
+        let fk = s.put_tx_full_batch_indexed(&[item], true).unwrap()[0];
+        let (off, len) = s.tx_body_range(fk).unwrap();
+        let (m, prevs) = s.get_tx_meta_and_prevouts_at(off, len).unwrap();
+        assert_eq!(m.input_count, 1);
+        assert!(prevs.is_empty());
+        assert!(s.tx_inwit_range(fk).unwrap().1 > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema14_packed_tx_body_with_creates_refused() {
+        use crate::file::{TableFile, FILE_HEADER_LEN};
+        use rbitcoin_primitives::TableKind;
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        let path = dir.join("tx.body");
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
+        f.write_at(FILE_HEADER_LEN as u64, &[0xABu8; 16]).unwrap();
+        f.flush().unwrap();
+        write_store_meta_ver(&dir, 14);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for packed tx.body"),
+            Err(StoreError::Corrupt(m)) => {
+                assert!(m.contains("packed Class A") || m.contains("tx.body"), "{m}");
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

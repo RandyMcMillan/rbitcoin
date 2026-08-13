@@ -331,6 +331,22 @@ impl VarTable {
         Ok(())
     }
 
+    /// Next 8-aligned body start for a following append.
+    pub fn next_aligned_start(&self) -> u64 {
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        next_aligned_tx_start(start)
+    }
+
+    /// True if appending at `abs_start` for `first_new_fk` would open a new idx segment.
+    pub fn idx_would_roll(&self, first_new_fk: u64, abs_start: u64) -> bool {
+        self.idx.would_roll(first_new_fk, abs_start)
+    }
+
+    /// Force an idx segment roll (coupled Class A stems).
+    pub fn force_idx_roll(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
+        self.idx.force_roll(first_fk, body_base)
+    }
+
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
@@ -390,6 +406,12 @@ impl VarTable {
             starts.push(cursor);
             let before = body_blob.len();
             encode(i, &mut body_blob);
+            // Idx starts must be strictly monotone. Zero-length payloads (empty
+            // inwit / zero-out spent) get an 8-byte zero pad so the next start
+            // advances one stride. Decode treats trailing zeros as pad.
+            if body_blob.len() == before {
+                body_blob.resize(body_blob.len().saturating_add(8), 0);
+            }
             cursor += (body_blob.len() - before) as u64;
         }
         // Single appender: count must still equal base.
@@ -569,7 +591,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-var-fd-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         let fks = t
             .put_batch_encode(3, 64, |i, buf| {
                 buf.extend_from_slice(&[i as u8 + 1; 16]);
@@ -596,7 +618,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::Tx).unwrap());
+        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::TxOut).unwrap());
 
         let barrier = Arc::new(Barrier::new(5));
         let mut handles = Vec::new();
@@ -671,7 +693,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::Tx).unwrap());
+        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::TxOut).unwrap());
         let stop = Arc::new(AtomicU64::new(0));
         let t_w = Arc::clone(&t);
         let stop_w = Arc::clone(&stop);
@@ -716,7 +738,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         t.put_batch_encode(5, 256, |i, buf| {
             buf.extend_from_slice(&vec![i as u8; 8 + i * 3]);
         })
@@ -758,7 +780,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         t.put_batch_encode(6, 512, |i, buf| {
             buf.extend_from_slice(&vec![0xA0 + i as u8; 32 + i * 8]);
         })
@@ -791,7 +813,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         t.put_batch_encode(20, 256, |i, buf| {
             buf.extend_from_slice(&vec![i as u8; 10 + (i % 5)]);
         })
@@ -841,7 +863,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         for batch in 0..10u8 {
             let payload = vec![batch; 16 + batch as usize];
             t.put_batch_encode(3, 128, |_i, buf| {
@@ -883,7 +905,7 @@ mod tests {
         // Process-local override under lock (not env — parallel remove_var races).
         let _env = crate::tx_idx::tests_soft_span_env_lock();
         crate::tx_idx::test_set_soft_span_bytes(128);
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         // Each record ~100 B → soft 128 forces new segment often.
         for i in 0..12u8 {
             t.put_batch_encode(1, 128, |_j, buf| {
@@ -898,7 +920,7 @@ mod tests {
             assert!(raw.len() >= 100);
         }
         drop(t);
-        let t = VarTable::open(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
         assert_eq!(t.count(), 12);
         assert_eq!(t.get_raw(Fk(12)).unwrap()[0], 11);
         crate::tx_idx::test_set_soft_span_bytes(0);
@@ -916,7 +938,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         assert_eq!(t.count(), 0);
         assert!(t.body_logical_len() >= FILE_HEADER_LEN as u64);
         t.advise_body_dont_need(0, 0);
@@ -963,7 +985,7 @@ mod tests {
         t.flush().unwrap();
         t.flush_async().unwrap();
         drop(t);
-        let t = VarTable::open(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
         assert_eq!(t.count(), 3);
         assert!(t.get_raw(Fk(2)).unwrap().len() >= 16);
         // Corrupt meta magic.
@@ -972,7 +994,7 @@ mod tests {
             std::fs::write(&meta, b"XXXX").unwrap();
         }
         assert!(matches!(
-            VarTable::open(&dir, "tx", TableKind::Tx),
+            VarTable::open(&dir, "tx", TableKind::TxOut),
             Err(StoreError::Corrupt(_)) | Err(StoreError::Io { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -985,7 +1007,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-var-trunc-{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
         let fks = t
             .put_batch_encode(5, 64, |i, buf| {
                 buf.extend_from_slice(&[i as u8; 16]);

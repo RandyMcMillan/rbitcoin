@@ -8,13 +8,12 @@ use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 
-/// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
+/// Class A tx row (no wire blob — reconstruct from txout + inwit).
 ///
-/// On-disk packed bodies (schema **13+**): **meta without leading txid**
-/// ([`Self::BODY_META_LEN`]) then inputs/outputs. Identity lives in
-/// [`crate::txid_body::TxidBody`]. `txid` is filled in-memory from the sidefile
-/// (or caller) after decode. `input_start_fk` / `output_start_fk` are always
-/// [`Fk::NULL`] on write.
+/// On-disk `txout.body` (schema **15**): **16 B meta** then outputs (no spender).
+/// Identity lives in [`crate::txid_body::TxidBody`]. `txid` is filled in-memory
+/// from the sidefile (or caller) after decode. `input_start_fk` / `output_start_fk`
+/// stay [`Fk::NULL`] in RAM (legacy split-run address unused).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
     pub txid: [u8; 32],
@@ -29,8 +28,8 @@ pub struct TxRecord {
 }
 
 impl TxRecord {
-    /// On-disk packed meta length (schema 13+: no leading txid).
-    pub const BODY_META_LEN: usize = 4 + 4 + 8 + 4 + 8 + 4; // 32
+    /// On-disk `txout` meta length (schema 15: version, locktime, counts).
+    pub const BODY_META_LEN: usize = 4 + 4 + 4 + 4; // 16
     /// Full in-memory encode size (txid + body meta); used for estimates only.
     pub const ENCODED_LEN: usize = 32 + Self::BODY_META_LEN;
 
@@ -41,14 +40,12 @@ impl TxRecord {
         self.encode_body_meta_into(out);
     }
 
-    /// Encode body meta only (schema 13 packed Class A payload prefix).
+    /// Encode `txout` body meta (schema 15: no I/O fks).
     pub fn encode_body_meta_into(&self, out: &mut Vec<u8>) {
         out.reserve(Self::BODY_META_LEN);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.locktime.to_le_bytes());
-        out.extend_from_slice(&self.input_start_fk.0.to_le_bytes());
         out.extend_from_slice(&self.input_count.to_le_bytes());
-        out.extend_from_slice(&self.output_start_fk.0.to_le_bytes());
         out.extend_from_slice(&self.output_count.to_le_bytes());
     }
 
@@ -68,7 +65,7 @@ impl TxRecord {
         Ok(rec)
     }
 
-    /// Decode packed body meta (schema 13); `txid` left zero for caller fill.
+    /// Decode `txout` body meta (schema 15); `txid` left zero for caller fill.
     pub fn decode_body_meta(buf: &[u8]) -> Result<Self, StoreError> {
         if buf.len() < Self::BODY_META_LEN {
             return Err(StoreError::Corrupt("short tx body meta"));
@@ -77,10 +74,10 @@ impl TxRecord {
             txid: [0u8; 32],
             version: i32::from_le_bytes(buf[0..4].try_into().unwrap()),
             locktime: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            input_start_fk: Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
-            input_count: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            output_start_fk: Fk(u64::from_le_bytes(buf[20..28].try_into().unwrap())),
-            output_count: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            input_start_fk: Fk::NULL,
+            input_count: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            output_start_fk: Fk::NULL,
+            output_count: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         })
     }
 }
@@ -106,19 +103,15 @@ impl OutputRecord {
         }
     }
 
+    /// Encode `txout` payload (schema 15: **no** spender bytes; those live in `spent.body`).
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.spender_field.0.to_le_bytes());
         let mut flags = 0u8;
         if self.script.is_empty() {
             flags |= output_flags::EMPTY_SCRIPT;
         } else if self.script == [0x51] {
             flags |= output_flags::OP_TRUE;
         }
-        if self.multi_spender {
-            flags |= output_flags::MULTI_SPENDER;
-        }
         out.push(flags);
-        // Non-negative sats as uleb128 (Bitcoin values are ≥ 0).
         let v = if self.value < 0 {
             0u64
         } else {
@@ -132,20 +125,23 @@ impl OutputRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 1 + 10 + self.script.len());
+        let mut out = Vec::with_capacity(1 + 10 + 9 + self.script.len());
         self.encode_into(&mut out);
         out
     }
 
-    /// Decode one output; returns (record, bytes_consumed).
+    /// Decode one `txout` output; spender fields are left null (load from `spent.body`).
     pub fn decode_at(buf: &[u8]) -> Result<(Self, usize), StoreError> {
-        if buf.len() < 9 {
+        if buf.is_empty() {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let spender_field = Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
-        let flags = buf[8];
-        let multi_spender = flags & output_flags::MULTI_SPENDER != 0;
-        let mut off = 9usize;
+        let flags = buf[0];
+        if flags & output_flags::MULTI_SPENDER != 0 {
+            return Err(StoreError::Corrupt(
+                "txout output must not carry MULTI_SPENDER",
+            ));
+        }
+        let mut off = 1usize;
         let (v, n) = read_uleb128(&buf[off..])?;
         off += n;
         if v > i64::MAX as u64 {
@@ -171,20 +167,20 @@ impl OutputRecord {
             Self {
                 value,
                 script,
-                spender_field,
-                multi_spender,
+                spender_field: Fk::NULL,
+                multi_spender: false,
             },
             off,
         ))
     }
 
-    /// Bytes consumed by one packed output starting at `buf` (no script alloc).
+    /// Bytes consumed by one `txout` output starting at `buf` (no script alloc).
     pub fn skip_at(buf: &[u8]) -> Result<usize, StoreError> {
-        if buf.len() < 9 {
+        if buf.is_empty() {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let flags = buf[8];
-        let mut off = 9usize;
+        let flags = buf[0];
+        let mut off = 1usize;
         let (_v, n) = read_uleb128(&buf[off..])?;
         off += n;
         if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) == 0 {
@@ -209,10 +205,10 @@ impl OutputRecord {
 
     /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
-        8 + 1 + 10 + 9 + self.script.len()
+        1 + 10 + 9 + self.script.len()
     }
 
-    /// Exact on-wire length matching [`Self::encode_into`] (for denserels layout).
+    /// Exact on-wire length matching [`Self::encode_into`].
     #[inline]
     pub fn encoded_len_exact(&self) -> usize {
         use crate::compact::{compact_size_len, uleb128_len};
@@ -221,21 +217,28 @@ impl OutputRecord {
         } else {
             self.value as u64
         };
-        let mut n = 8 + 1 + uleb128_len(v);
+        let mut n = 1 + uleb128_len(v);
         if self.script.is_empty() || self.script == [0x51] {
-            // EMPTY_SCRIPT / OP_TRUE — no script payload.
         } else {
             n += compact_size_len(self.script.len() as u64) + self.script.len();
         }
         n
     }
+
+    /// Sole-spender slot length in `spent.body`.
+    pub const SPENT_SLOT_LEN: usize = 9;
 }
 
 mod packed;
 pub use packed::*;
 
 pub struct TxTable {
+    /// `txout.body` — meta + outputs (hot).
     pub(crate) body: VarTable,
+    /// `inwit.body` — inputs + witness (cold).
+    pub(crate) inwit: VarTable,
+    /// `spent.body` — 9 B × n_out sole-spender slots.
+    pub(crate) spent: VarTable,
     /// Segmented fixed-bits heads + seal-time fuse8.
     pub(crate) head: SegmentedTxHead,
     /// Dense create_fk-ordered txids (schema 13+).
@@ -280,7 +283,9 @@ impl TxTable {
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let layout = HeadLayout::with_entry_bytes(layout.bits, 4)?;
         Ok(Self {
-            body: VarTable::create(dir, "tx", TableKind::Tx)?,
+            body: VarTable::create(dir, "txout", TableKind::TxOut)?,
+            inwit: VarTable::create(dir, "inwit", TableKind::Inwit)?,
+            spent: VarTable::create(dir, "spent", TableKind::Spent)?,
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
             secret,
@@ -288,29 +293,70 @@ impl TxTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let body = VarTable::open(dir, "tx", TableKind::Tx)?;
-        let txids = crate::txid_body::TxidBody::open(dir)?;
+        if dir.join("tx.body").exists() && !dir.join("txout.body").exists() {
+            let legacy = VarTable::open(dir, "tx", TableKind::TxOut)?;
+            if legacy.count() > 0 {
+                return Err(StoreError::Corrupt(
+                    "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
+                ));
+            }
+        }
+        let had_txout = dir.join("txout.body").exists();
+        let had_inwit = dir.join("inwit.body").exists();
+        let had_spent = dir.join("spent.body").exists();
+        let body = if had_txout {
+            VarTable::open(dir, "txout", TableKind::TxOut)?
+        } else {
+            VarTable::create(dir, "txout", TableKind::TxOut)?
+        };
+        if had_txout && body.count() > 0 && (!had_inwit || !had_spent) {
+            return Err(StoreError::Corrupt(
+                "schema 15 Class A missing inwit/spent for existing txout creates; wipe + IBD",
+            ));
+        }
+        let inwit = if had_inwit {
+            VarTable::open(dir, "inwit", TableKind::Inwit)?
+        } else {
+            VarTable::create(dir, "inwit", TableKind::Inwit)?
+        };
+        let spent = if had_spent {
+            VarTable::open(dir, "spent", TableKind::Spent)?
+        } else {
+            VarTable::create(dir, "spent", TableKind::Spent)?
+        };
+        let txids = if dir.join("txid.body").exists() {
+            crate::txid_body::TxidBody::open(dir)?
+        } else {
+            crate::txid_body::TxidBody::create(dir)?
+        };
         let n_bodies = body.count();
         let n_txids = txids.count();
-        if n_txids != n_bodies {
-            // Incomplete Class A publish is the usual cause: body→idx→count then
-            // txid.body append. Crash between them leaves body/idx ahead of
-            // identity (or rarely the reverse). Align to the **common prefix**
-            // instead of demanding a full reindex for a few-thousand-row skew.
-            let n = n_bodies.min(n_txids);
+        let n_inwit = inwit.count();
+        let n_spent = spent.count();
+        if n_txids != n_bodies || n_inwit != n_bodies || n_spent != n_bodies {
+            let n = n_bodies.min(n_txids).min(n_inwit).min(n_spent);
             rbitcoin_log::warn!(
-                "store: Class A count skew body/idx={n_bodies} txid.body={n_txids} — \
-                 truncating to {n} (incomplete last batch; not full reindex)"
+                "store: Class A count skew txout={n_bodies} inwit={n_inwit} spent={n_spent} \
+                 txid.body={n_txids} — truncating to {n}"
             );
             if n_bodies > n {
                 body.truncate_to_count(n)?;
             }
+            if n_inwit > n {
+                inwit.truncate_to_count(n)?;
+            }
+            if n_spent > n {
+                spent.truncate_to_count(n)?;
+            }
             if n_txids > n {
                 txids.truncate_to_count(n)?;
             }
-            if body.count() != txids.count() {
+            if body.count() != txids.count()
+                || body.count() != inwit.count()
+                || body.count() != spent.count()
+            {
                 return Err(StoreError::Corrupt(
-                    "txid.body count != tx body count after repair (reindex required for schema 13)",
+                    "Class A stem counts still mismatch after repair (reindex required)",
                 ));
             }
         }
@@ -349,6 +395,8 @@ impl TxTable {
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let t = Self {
             body,
+            inwit,
+            spent,
             head,
             txids,
             secret,
@@ -518,9 +566,9 @@ impl TxTable {
     ///
     /// Used by load: discover parents without full parse into RAM.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        let (mut tx, prevs) = self
-            .body
-            .with_raw(fk, |raw| scan_packed_meta_and_prevouts(raw))?;
+        let mut tx = self.get(fk)?;
+        let inwit = self.inwit.get_raw(fk)?;
+        let prevs = scan_inwit_prevouts(&inwit, tx.input_count)?;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, prevs))
     }
@@ -569,28 +617,10 @@ impl TxTable {
     }
 
     pub fn put_batch_indexed(&self, recs: &[TxRecord], index: bool) -> Result<Vec<Fk>, StoreError> {
-        if recs.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Bare-meta rows: body meta only + sidefile identity (schema 13).
-        let est: usize = recs.len() * (TxRecord::BODY_META_LEN + 16);
-        let base = self.body.count();
-        let fks = self
-            .body
-            .put_batch_encode_aligned(recs.len(), est, |i, buf| {
-                recs[i].encode_body_meta_into(buf);
-            })?;
-        let ids: Vec<[u8; 32]> = recs.iter().map(|r| r.txid).collect();
-        self.txids.append_batch(base, &ids)?;
-        if index {
-            let heads: Vec<([u8; 32], Fk)> = recs
-                .iter()
-                .zip(fks.iter())
-                .map(|(r, fk)| (r.txid, *fk))
-                .collect();
-            self.head_insert_many(&heads)?;
-        }
-        Ok(fks)
+        let _ = (recs, index);
+        Err(StoreError::Corrupt(
+            "bare-meta Class A put is refused; use put_full_batch_indexed",
+        ))
     }
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
@@ -625,7 +655,8 @@ impl TxTable {
         &self.txids
     }
 
-    /// Relative byte offset of output `vout`'s `spender_field` inside a packed tx payload.
+    #[allow(dead_code)]
+    /// Relative byte offset of output `vout`'s start inside a `txout` payload.
     ///
     /// Input walk uses [`InputRecord::decode_prevout_at`] (no script/witness alloc).
     fn packed_output_spender_rel(raw: &[u8], vout: u32) -> Result<u64, StoreError> {
@@ -637,7 +668,8 @@ impl TxTable {
             .ok_or(StoreError::NotFound)
     }
 
-    /// One packed walk: for each requested `vout`, relative offset of its spender_field.
+    #[allow(dead_code)]
+    /// One packed walk: for each requested `vout`, relative offset of its `txout` start.
     ///
     /// `vouts` need not be sorted; results are returned in ascending vout order.
     /// Missing vouts are omitted (caller treats as NotFound).
@@ -660,11 +692,6 @@ impl TxTable {
             return Err(StoreError::NotFound);
         }
         let mut off = TxRecord::BODY_META_LEN;
-        // Skip inputs without materializing script/witness.
-        for _ in 0..meta.input_count {
-            let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
-            off += used;
-        }
         let mut out = Vec::with_capacity(want.len());
         let mut wi = 0usize;
         for i in 0..=max_v {
@@ -786,7 +813,7 @@ impl TxTable {
         run_idx_body_pipeline_backend(
             &self.body,
             &mut jobs,
-            BodyMode::OutsDenserels,
+            BodyMode::Outs,
             crate::io_backend::pin_io_backend(),
         )?;
         let body_ns = t_body.elapsed().as_nanos() as u64;
@@ -849,6 +876,16 @@ impl TxTable {
         self.body.record_range_batch(fks)
     }
 
+    /// `spent.body` range for one create.
+    pub fn spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.spent.record_range(fk)
+    }
+
+    /// `spent.body` ranges (same fk order as [`Self::body_range_batch`]).
+    pub fn spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        self.spent.record_range_batch(fks)
+    }
+
     /// Bulk full packed decode from known ranges.
     ///
     /// Thin decode wrapper over [`crate::idx_body_pipeline`] (body-only jobs).
@@ -870,8 +907,13 @@ impl TxTable {
             })
             .collect();
         run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Full)?;
+        let mut in_jobs: Vec<IdxBodyJob> = ranges
+            .iter()
+            .map(|(fk, _, _)| IdxBodyJob::new(fk.get().unwrap_or(0), None))
+            .collect();
+        run_idx_body_pipeline(&self.inwit, &mut in_jobs, BodyMode::Full)?;
         let mut out = Vec::with_capacity(jobs.len());
-        for (j, (fk, _, _)) in jobs.into_iter().zip(ranges.iter()) {
+        for ((j, ij), (fk, _, _)) in jobs.into_iter().zip(in_jobs.into_iter()).zip(ranges.iter()) {
             if !j.ok {
                 out.push(None);
                 continue;
@@ -879,6 +921,13 @@ impl TxTable {
             let mut decoded =
                 decode_packed_tx_with_spender_rels_secret(&j.body, Some(&self.secret)).ok();
             if let Some(ref mut d) = decoded {
+                if ij.ok {
+                    if let Ok(ins) =
+                        decode_inwit_secret(&ij.body, d.0.input_count, Some(&self.secret))
+                    {
+                        d.1 = ins;
+                    }
+                }
                 if let Ok(tid) = self.txids.get(*fk) {
                     d.0.txid = tid;
                 }
@@ -906,7 +955,7 @@ impl TxTable {
             .enumerate()
             .map(|(i, &(off, len))| IdxBodyJob::new((i as u64).saturating_add(1), Some((off, len))))
             .collect();
-        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::OutsDenserels)?;
+        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Outs)?;
         let mut out = Vec::with_capacity(jobs.len());
         for j in jobs {
             if !j.ok {
@@ -955,14 +1004,14 @@ impl TxTable {
             }
         }
         // --- mmap fallback (same sole/multi semantics) ---
-        let body_pub = self.body.body_published_len();
+        let body_pub = self.spent.body_published_len();
         let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
         for &(abs, create_fk, vout, spend_fk) in abs_edges {
             if abs.saturating_add(META_LEN) > body_pub {
                 cold.push((create_fk, vout, spend_fk));
                 continue;
             }
-            let cur = self.body.with_bytes_at(abs, META_LEN, |raw| {
+            let cur = self.spent.with_bytes_at(abs, META_LEN, |raw| {
                 if raw.len() < 9 {
                     return Err(StoreError::Corrupt("spender meta short"));
                 }
@@ -994,7 +1043,7 @@ impl TxTable {
             } else {
                 meta[8] = flags & !output_flags::MULTI_SPENDER;
             }
-            if let Err(_) = self.body.write_body_abs(abs, &meta) {
+            if let Err(_) = self.spent.write_body_abs(abs, &meta) {
                 cold.push((create_fk, vout, spend_fk));
             }
         }
@@ -1059,9 +1108,9 @@ impl TxTable {
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         const META_LEN: usize = 9;
-        let body_fd = self.body.body_read_fd();
-        let body_pub = self.body.body_published_len();
-        let body_path = self.body.body_file_path();
+        let body_fd = self.spent.body_read_fd();
+        let body_pub = self.spent.body_published_len();
+        let body_path = self.spent.body_file_path();
 
         let mut bufs: Vec<[u8; META_LEN]> = vec![[0u8; META_LEN]; abs_offs.len()];
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
@@ -1134,8 +1183,8 @@ impl TxTable {
         create_tx_fk: Fk,
         vout: u32,
     ) -> Result<(bool, Fk), StoreError> {
-        let raw = self.body.get_raw(create_tx_fk)?;
-        Self::spender_meta_from_raw(&raw, vout)
+        let (off, len) = self.spent.record_range(create_tx_fk)?;
+        self.get_output_spender_meta_at(off, len, vout)
     }
 
     /// Like [`Self::get_output_spender_meta`] but uses a cache-held body range (no idx).
@@ -1145,8 +1194,18 @@ impl TxTable {
         body_len: u64,
         vout: u32,
     ) -> Result<(bool, Fk), StoreError> {
-        self.body.with_bytes_at(body_off, body_len, |raw| {
-            Self::spender_meta_from_raw(raw, vout)
+        let abs = spent_abs(body_off, vout);
+        let end = body_off.saturating_add(body_len);
+        if abs.saturating_add(9) > end {
+            return Err(StoreError::Corrupt("spent slot OOB"));
+        }
+        self.spent.with_bytes_at(abs, 9, |raw| {
+            if raw.len() < 9 {
+                return Err(StoreError::Corrupt("spent meta short"));
+            }
+            let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
+            let multi = raw[8] & output_flags::MULTI_SPENDER != 0;
+            Ok((multi, field))
         })
     }
 
@@ -1162,30 +1221,13 @@ impl TxTable {
         if vouts.is_empty() {
             return Ok(Vec::new());
         }
-        self.body.with_bytes_at(body_off, body_len, |raw| {
-            let rels = Self::packed_output_spender_rels(raw, vouts)?;
-            let mut out = Vec::with_capacity(rels.len());
-            for (v, rel) in rels {
-                let fo = rel as usize;
-                if raw.len() < fo + 9 {
-                    return Err(StoreError::Corrupt("packed spender meta short"));
-                }
-                let field = Fk(u64::from_le_bytes(raw[fo..fo + 8].try_into().unwrap()));
-                let multi = raw[fo + 8] & output_flags::MULTI_SPENDER != 0;
+        let mut out = Vec::with_capacity(vouts.len());
+        for &v in vouts {
+            if let Ok((multi, field)) = self.get_output_spender_meta_at(body_off, body_len, v) {
                 out.push((v, multi, field));
             }
-            Ok(out)
-        })
-    }
-
-    fn spender_meta_from_raw(raw: &[u8], vout: u32) -> Result<(bool, Fk), StoreError> {
-        let rel = Self::packed_output_spender_rel(raw, vout)? as usize;
-        if raw.len() < rel + 9 {
-            return Err(StoreError::Corrupt("packed spender meta short"));
         }
-        let field = Fk(u64::from_le_bytes(raw[rel..rel + 8].try_into().unwrap()));
-        let multi = raw[rel + 8] & output_flags::MULTI_SPENDER != 0;
-        Ok((multi, field))
+        Ok(out)
     }
 
     /// Patch multi + spender_field on create tx output (packed Class A body).
@@ -1196,7 +1238,7 @@ impl TxTable {
         multi: bool,
         field: Fk,
     ) -> Result<(), StoreError> {
-        let (off, len) = self.body.record_range(create_tx_fk)?;
+        let (off, len) = self.spent.record_range(create_tx_fk)?;
         self.set_output_spender_meta_at(off, len, vout, multi, field)
     }
 
@@ -1209,34 +1251,32 @@ impl TxTable {
         multi: bool,
         field: Fk,
     ) -> Result<(), StoreError> {
-        let (rel, flag0) = self.body.with_bytes_at(body_off, body_len, |raw| {
-            let rel = Self::packed_output_spender_rel(raw, vout)?;
-            let fo = rel as usize + 8;
-            if fo >= raw.len() {
-                return Err(StoreError::Corrupt("packed flags missing"));
-            }
-            Ok((rel, raw[fo]))
-        })?;
-        self.body
-            .write_body_abs(body_off + rel, &field.0.to_le_bytes())?;
-        let mut flags = [flag0];
-        if multi {
-            flags[0] |= output_flags::MULTI_SPENDER;
-        } else {
-            flags[0] &= !output_flags::MULTI_SPENDER;
+        let abs = spent_abs(body_off, vout);
+        let end = body_off.saturating_add(body_len);
+        if abs.saturating_add(9) > end {
+            return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        self.body.write_body_abs(body_off + rel + 8, &flags)?;
+        let mut slot = [0u8; 9];
+        slot[0..8].copy_from_slice(&field.0.to_le_bytes());
+        slot[8] = if multi {
+            output_flags::MULTI_SPENDER
+        } else {
+            0
+        };
+        self.spent.write_body_abs(abs, &slot)?;
         Ok(())
     }
 
-    /// Full tx body in **one** `tx.body` read (packed Class A only).
+    /// Full tx: `txout` + `inwit` zip.
     pub fn get_full(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
         let raw = self.body.get_raw(fk)?;
-        let (mut tx, ins, outs, _) =
+        let (mut tx, _ins, outs, _) =
             decode_packed_tx_with_spender_rels_secret(&raw, Some(&self.secret))?;
+        let inwit = self.inwit.get_raw(fk)?;
+        let ins = decode_inwit_secret(&inwit, tx.input_count, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, ins, outs))
     }
@@ -1253,7 +1293,7 @@ impl TxTable {
         Ok((tx, outs))
     }
 
-    /// Append packed full-tx records (one var payload per tx = one body IO on read).
+    /// Append Class A rows: `txout` + `inwit` + zero `spent` + `txid.body`.
     pub fn put_full_batch_indexed(
         &self,
         items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
@@ -1262,24 +1302,46 @@ impl TxTable {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        // Worst-case pad ≤ 8 + page-skip gap before each record.
-        let est: usize = items
+        let est_out: usize = items
             .iter()
-            .map(|(_tx, ins, outs)| {
-                16 + TxRecord::BODY_META_LEN
-                    + ins.iter().map(|i| i.encoded_len()).sum::<usize>()
-                    + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
+            .map(|(_tx, _ins, outs)| {
+                16 + TxRecord::BODY_META_LEN + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
             })
             .sum();
+        let est_inwit: usize = items
+            .iter()
+            .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
+            .sum();
+        let est_spent: usize = items
+            .iter()
+            .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
+            .sum();
         let base = self.body.count();
+        if self.inwit.count() != base || self.spent.count() != base {
+            return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
+        }
+        self.maybe_coupled_roll(items.len() as u64)?;
         let fks = self
             .body
-            .put_batch_encode_aligned(items.len(), est, |i, buf| {
+            .put_batch_encode_aligned(items.len(), est_out, |i, buf| {
                 let (tx, ins, outs) = &items[i];
-                // Schema 13: XOR scripts at rest; body meta without leading txid.
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
             })?;
-        // Identity sidefile (same create_fk order as body append).
+        let fks_in = self
+            .inwit
+            .put_batch_encode_aligned(items.len(), est_inwit, |i, buf| {
+                encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret));
+            })?;
+        let fks_sp = self
+            .spent
+            .put_batch_encode_aligned(items.len(), est_spent, |i, buf| {
+                encode_spent_zeros(items[i].2.len() as u32, buf);
+            })?;
+        if fks != fks_in || fks != fks_sp {
+            return Err(StoreError::Corrupt(
+                "Class A append fk mismatch across stems",
+            ));
+        }
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -1298,7 +1360,7 @@ impl TxTable {
     pub fn put_full_batch_from_pins(
         &self,
         items: &[(
-            std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+            std::sync::Arc<(TxRecord, Vec<OutputRecord>)>,
             Vec<InputRecord>,
         )],
         index: bool,
@@ -1306,23 +1368,52 @@ impl TxTable {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let est: usize = items
+        let est_out: usize = items
             .iter()
-            .map(|(pin, ins)| {
-                let (_tx, outs, _dens) = pin.as_ref();
-                16 + TxRecord::BODY_META_LEN
-                    + ins.iter().map(|i| i.encoded_len()).sum::<usize>()
-                    + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
+            .map(|(pin, _ins)| {
+                let (_tx, outs) = pin.as_ref();
+                16 + TxRecord::BODY_META_LEN + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
+            })
+            .sum();
+        let est_inwit: usize = items
+            .iter()
+            .map(|(_pin, ins)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
+            .sum();
+        let est_spent: usize = items
+            .iter()
+            .map(|(pin, _ins)| {
+                let (_tx, outs) = pin.as_ref();
+                16 + outs.len() * OutputRecord::SPENT_SLOT_LEN
             })
             .sum();
         let base = self.body.count();
+        if self.inwit.count() != base || self.spent.count() != base {
+            return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
+        }
+        self.maybe_coupled_roll(items.len() as u64)?;
         let fks = self
             .body
-            .put_batch_encode_aligned(items.len(), est, |i, buf| {
+            .put_batch_encode_aligned(items.len(), est_out, |i, buf| {
                 let (pin, ins) = &items[i];
-                let (tx, outs, _dens) = pin.as_ref();
+                let (tx, outs) = pin.as_ref();
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
             })?;
+        let fks_in = self
+            .inwit
+            .put_batch_encode_aligned(items.len(), est_inwit, |i, buf| {
+                encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret));
+            })?;
+        let fks_sp = self
+            .spent
+            .put_batch_encode_aligned(items.len(), est_spent, |i, buf| {
+                let (_tx, outs) = items[i].0.as_ref();
+                encode_spent_zeros(outs.len() as u32, buf);
+            })?;
+        if fks != fks_in || fks != fks_sp {
+            return Err(StoreError::Corrupt(
+                "Class A append fk mismatch across stems",
+            ));
+        }
         let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.0.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -1334,6 +1425,27 @@ impl TxTable {
             self.head_insert_many(&heads)?;
         }
         Ok(fks)
+    }
+
+    /// Roll all three idx stems together when any body would exceed the soft span.
+    fn maybe_coupled_roll(&self, _n_records: u64) -> Result<(), StoreError> {
+        // Independent idx append already rolls per-stem on soft span. Coupled
+        // first_fk is preserved when we roll all three at the same next fk
+        // before the batch if *any* tail would roll on its next start.
+        let next_fk = self.body.count().saturating_add(1);
+        let next_out = self.body.next_aligned_start();
+        let next_in = self.inwit.next_aligned_start();
+        let next_sp = self.spent.next_aligned_start();
+        let roll = self.body.idx_would_roll(next_fk, next_out)
+            || self.inwit.idx_would_roll(next_fk, next_in)
+            || self.spent.idx_would_roll(next_fk, next_sp);
+        if !roll {
+            return Ok(());
+        }
+        self.body.force_idx_roll(next_fk, next_out)?;
+        self.inwit.force_idx_roll(next_fk, next_in)?;
+        self.spent.force_idx_roll(next_fk, next_sp)?;
+        Ok(())
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
@@ -1362,15 +1474,13 @@ impl TxTable {
         Ok(out)
     }
 
-    /// One body pin: apply many spend annotations `(vout, spending_tx_fk)` on one create.
-    ///
-    /// Walks inputs once (prevout-only) and outputs up to max needed vout once,
-    /// then patches each output's spender field.
+    /// Annotate many vouts on one create. `spent_off`/`spent_len` are the
+    /// `spent.body` range (not `txout`).
     pub fn put_spends_on_create_at(
         &self,
         spenders: &crate::spender_table::SpenderTable,
-        body_off: u64,
-        body_len: u64,
+        spent_off: u64,
+        spent_len: u64,
         edges: &[(u32, Fk)],
     ) -> Result<(), StoreError> {
         if edges.is_empty() {
@@ -1381,36 +1491,8 @@ impl TxTable {
                 return Err(StoreError::InvalidFk);
             }
         }
-        let vouts: Vec<u32> = {
-            let mut v: Vec<u32> = edges.iter().map(|(v, _)| *v).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-        let metas: Vec<(u32, u64, bool, Fk)> =
-            self.body.with_bytes_at(body_off, body_len, |raw| {
-                let rels = Self::packed_output_spender_rels(raw, &vouts)?;
-                let mut out = Vec::with_capacity(rels.len());
-                for (v, rel) in rels {
-                    let fo = rel as usize;
-                    if raw.len() < fo + 9 {
-                        return Err(StoreError::Corrupt("packed spender meta short"));
-                    }
-                    let field = Fk(u64::from_le_bytes(raw[fo..fo + 8].try_into().unwrap()));
-                    let multi = raw[fo + 8] & output_flags::MULTI_SPENDER != 0;
-                    out.push((v, rel, multi, field));
-                }
-                Ok(out)
-            })?;
-        let mut by_vout: crate::U32Map<(u64, bool, Fk)> =
-            crate::U32Map::with_capacity_and_hasher(metas.len(), Default::default());
-        for (v, rel, multi, field) in metas {
-            by_vout.insert(v, (rel, multi, field));
-        }
         for &(vout, spend_fk) in edges {
-            let Some(&(rel, multi, field)) = by_vout.get(&vout) else {
-                return Err(StoreError::NotFound);
-            };
+            let (multi, field) = self.get_output_spender_meta_at(spent_off, spent_len, vout)?;
             let (new_multi, new_field) = if !multi && field.is_null() {
                 (false, spend_fk)
             } else if !multi && field == spend_fk {
@@ -1423,23 +1505,7 @@ impl TxTable {
                 let e = spenders.append(spend_fk, field)?;
                 (true, e)
             };
-            self.body
-                .write_body_abs(body_off + rel, &new_field.0.to_le_bytes())?;
-            let flag0 = self.body.with_bytes_at(body_off, body_len, |raw| {
-                let fo = rel as usize + 8;
-                if fo >= raw.len() {
-                    return Err(StoreError::Corrupt("packed flags missing"));
-                }
-                Ok(raw[fo])
-            })?;
-            let mut flags = [flag0];
-            if new_multi {
-                flags[0] |= output_flags::MULTI_SPENDER;
-            } else {
-                flags[0] &= !output_flags::MULTI_SPENDER;
-            }
-            self.body.write_body_abs(body_off + rel + 8, &flags)?;
-            by_vout.insert(vout, (rel, new_multi, new_field));
+            self.set_output_spender_meta_at(spent_off, spent_len, vout, new_multi, new_field)?;
         }
         Ok(())
     }
@@ -1614,9 +1680,15 @@ impl TxTable {
         if first_fk == 0 || last_fk < first_fk {
             return Ok(0);
         }
-        let (off0, _) = self.body.record_range(Fk(first_fk))?;
-        let (off1, len1) = self.body.record_range(Fk(last_fk))?;
-        Ok(off1.saturating_add(len1).saturating_sub(off0))
+        let span = |t: &VarTable| -> Result<u64, StoreError> {
+            let (off0, _) = t.record_range(Fk(first_fk))?;
+            let (off1, len1) = t.record_range(Fk(last_fk))?;
+            Ok(off1.saturating_add(len1).saturating_sub(off0))
+        };
+        // Coupled stems: roll/seal when any of txout / inwit / spent exceeds soft.
+        Ok(span(&self.body)?
+            .max(span(&self.inwit)?)
+            .max(span(&self.spent)?))
     }
 
     pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
@@ -1660,12 +1732,16 @@ impl TxTable {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
+        self.inwit.flush()?;
+        self.spent.flush()?;
         self.head.flush()?;
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
+        self.inwit.flush_async()?;
+        self.spent.flush_async()?;
         self.head.flush_async()?;
         Ok(())
     }

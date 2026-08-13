@@ -57,9 +57,9 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
     }
 
-    let body_fd: RawFd = txs.body.body_read_fd();
-    let body_path = txs.body.body_file_path().to_path_buf();
-    let body_pub = txs.body.body_published_len();
+    let body_fd: RawFd = txs.spent.body_read_fd();
+    let body_path = txs.spent.body_file_path().to_path_buf();
+    let body_pub = txs.spent.body_published_len();
 
     // Work list; OOB goes straight to cold.
     let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
@@ -424,7 +424,7 @@ pub fn put_spend_batch_by_abs_meta_known(
     let mut order: Vec<usize> = (0..abs_edges.len()).collect();
     order.sort_unstable_by_key(|&i| abs_edges[i].0);
 
-    let body_pub = txs.body.body_published_len();
+    let body_pub = txs.spent.body_published_len();
     let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
     // (abs, create_fk, vout, spend_fk, payload) for non-skip
     let mut writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])> = Vec::with_capacity(order.len());
@@ -460,7 +460,7 @@ fn put_spend_batch_pure_write_pwrite(
 ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
     for &(abs, cfk, vout, sfk, meta) in writes {
         // write_at_pwrite on body file via VarTable path: use body write helper.
-        if let Err(_) = txs.body.write_body_abs_pwrite(abs, &meta) {
+        if let Err(_) = txs.spent.write_body_abs_pwrite(abs, &meta) {
             cold.push((cfk, vout, sfk));
         }
     }
@@ -476,8 +476,8 @@ fn put_spend_batch_pure_write_uring(
     if writes.is_empty() {
         return Ok(cold);
     }
-    let body_fd: RawFd = txs.body.body_read_fd();
-    let body_path = txs.body.body_file_path().to_path_buf();
+    let body_fd: RawFd = txs.spent.body_read_fd();
+    let body_path = txs.spent.body_file_path().to_path_buf();
 
     // Stable payload buffers for in-flight pwrites (outside TLS open so fallback
     // can still use `writes` / `cold` if the ring is unavailable).
@@ -589,7 +589,7 @@ fn put_spend_batch_pure_write_uring(
                 "store: spend annotate pure-write uring error ({e}); pwrite fallback"
             );
             for &(abs, cfk, vout, sfk, meta) in writes {
-                if txs.body.write_body_abs_pwrite(abs, &meta).is_err() {
+                if txs.spent.write_body_abs_pwrite(abs, &meta).is_err() {
                     cold.push((cfk, vout, sfk));
                 }
             }
@@ -600,7 +600,7 @@ fn put_spend_batch_pure_write_uring(
                 "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
             );
             for &(abs, cfk, vout, sfk, meta) in writes {
-                if txs.body.write_body_abs_pwrite(abs, &meta).is_err() {
+                if txs.spent.write_body_abs_pwrite(abs, &meta).is_err() {
                     cold.push((cfk, vout, sfk));
                 }
             }
@@ -648,7 +648,7 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
             .unwrap()[0];
-        let (off, len) = t.body_range(fk).unwrap();
+        let (off, len) = t.spent_range_batch(&[fk]).unwrap()[0].unwrap();
         (fk, off, len)
     }
 
@@ -656,10 +656,8 @@ mod tests {
     fn pure_write_known_null_mmap_and_uring() {
         for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
             let (dir, t, spenders) = temp_table();
-            let (cfk, off, len) = put_one(&t);
-            let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
-            let (_m, _o, rels) = decoded[0].as_ref().unwrap();
-            let abs = off + u64::from(rels[0]);
+            let (cfk, off, _len) = put_one(&t);
+            let abs = crate::tx_table::spent_abs(off, 0);
             let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
             let (field, flags) = bulk[0].expect("meta");
             assert!(field.is_null());
@@ -694,8 +692,8 @@ mod tests {
         }
         let (dir, t, spenders) = temp_table();
         let (cfk, off, len) = put_one(&t);
-        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
-        let abs = off + u64::from(decoded[0].as_ref().unwrap().2[0]);
+        let _ = len;
+        let abs = crate::tx_table::spent_abs(off, 0);
         let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
         let (field, flags) = bulk[0].unwrap();
         let _ = uring_session::test_take_last_sqe_rw_flags();
@@ -731,8 +729,8 @@ mod tests {
     fn pure_write_idempotent_skip() {
         let (dir, t, spenders) = temp_table();
         let (cfk, off, len) = put_one(&t);
-        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
-        let abs = off + u64::from(decoded[0].as_ref().unwrap().2[0]);
+        let _ = len;
+        let abs = crate::tx_table::spent_abs(off, 0);
         let sfk = Fk(77);
         let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
         let (field, flags) = bulk[0].unwrap();

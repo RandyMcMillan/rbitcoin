@@ -83,6 +83,8 @@ pub struct TableFile {
     kind: TableKind,
     /// Payload/HWM written since last successful `sync_data` (Class C barrier skip).
     needs_sync: AtomicBool,
+    /// When true, grow to `need + 1 MiB` instead of 64–256 MiB slabs (idx files).
+    grow_tight: AtomicBool,
 }
 
 impl TableFile {
@@ -135,6 +137,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
+            grow_tight: AtomicBool::new(false),
         })
     }
 
@@ -165,6 +168,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
+            grow_tight: AtomicBool::new(false),
         };
         s.write_trailer(initial)?;
         Ok(s)
@@ -220,6 +224,7 @@ impl TableFile {
                 trailing_ext,
                 kind,
                 needs_sync: AtomicBool::new(false),
+                grow_tight: AtomicBool::new(false),
             },
             trailing_ext,
         ))
@@ -354,6 +359,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
+            grow_tight: AtomicBool::new(false),
         })
     }
 
@@ -548,6 +554,11 @@ impl TableFile {
     }
 
     /// Ensure the file covers at least `need` bytes (fallocate / set_len only).
+    /// Idx / dense u32 tables: grow in ~1 MiB steps, not 256 MiB slabs.
+    pub fn set_grow_tight(&self, tight: bool) {
+        self.grow_tight.store(tight, Ordering::Release);
+    }
+
     pub fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
         if need <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
@@ -560,6 +571,10 @@ impl TableFile {
         let cur = self.file_cap.load(Ordering::Acquire);
         if need <= cur {
             return Ok(());
+        }
+        if self.grow_tight.load(Ordering::Acquire) {
+            let target = need.saturating_add(1 << 20).max(need);
+            return self.grow_to(target);
         }
         let (headroom, step) = if cur >= 8 * 1024 * 1024 * 1024 {
             (1024 * 1024 * 1024u64, 512 * 1024 * 1024u64)
@@ -580,8 +595,13 @@ impl TableFile {
                 .saturating_mul(step)
                 .max(need)
         };
+        self.grow_to(new_cap)
+    }
+
+    /// Fallocate/`set_len` to `new_cap` and publish `file_cap`.
+    fn grow_to(&self, new_cap: u64) -> Result<(), StoreError> {
         let file = self.file.lock().unwrap();
-        if need <= self.file_cap.load(Ordering::Acquire) {
+        if new_cap <= self.file_cap.load(Ordering::Acquire) {
             return Ok(());
         }
         if try_fallocate(&file, new_cap).is_err() {
@@ -730,12 +750,32 @@ mod advise_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
+    fn grow_tight_adds_one_mib_not_slab() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-grow-tight-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::ArrayLink).unwrap();
+        f.set_grow_tight(true);
+        let payload = vec![0x11u8; 2048];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        // need ≈ 16+2048; tight grow is need+1MiB, never a 64–256 MiB slab.
+        assert!(on_disk > 2048);
+        assert!(
+            on_disk < 2 * 1024 * 1024,
+            "tight grow should stay near 1 MiB, got {on_disk}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn advise_dont_need_is_best_effort() {
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-advise-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         let payload = vec![0xabu8; 16 * 1024];
         f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
         f.advise_dont_need(FILE_HEADER_LEN as u64, payload.len() as u64);
@@ -750,11 +790,11 @@ mod advise_tests {
     fn table_access_always_fd_only() {
         assert!(TableAccess::FdOnly.is_fd_only());
         assert_eq!(
-            TableAccess::for_kind(TableKind::Tx, false),
+            TableAccess::for_kind(TableKind::TxOut, false),
             TableAccess::FdOnly
         );
         assert_eq!(
-            TableAccess::for_kind(TableKind::Tx, true),
+            TableAccess::for_kind(TableKind::TxOut, true),
             TableAccess::FdOnly
         );
         assert_eq!(
@@ -769,7 +809,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-access-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         assert_eq!(f.access(), TableAccess::FdOnly);
         let _ = std::fs::remove_file(&path);
         let path2 = std::env::temp_dir().join(format!("rbitcoin-access-h-{id}"));
@@ -809,7 +849,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-epoch-stress-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = Arc::new(TableFile::create(&path, TableKind::Tx).unwrap());
+        let f = Arc::new(TableFile::create(&path, TableKind::TxOut).unwrap());
 
         let seed = vec![0x11u8; 64];
         f.write_at(FILE_HEADER_LEN as u64, &seed).unwrap();
@@ -886,7 +926,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-file-atomics-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         let payload = [0u8; 64];
         f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
         let off32 = FILE_HEADER_LEN as u64;
@@ -920,7 +960,7 @@ mod advise_tests {
             )
             .unwrap();
             assert!(matches!(
-                TableFile::open(&bad, TableKind::Tx),
+                TableFile::open(&bad, TableKind::TxOut),
                 Err(StoreError::BadMagic)
             ));
             let _ = std::fs::remove_file(&bad);
@@ -945,7 +985,7 @@ mod advise_tests {
                 Err(StoreError::Corrupt(_))
             ));
             assert!(matches!(
-                TableFile::open_trailing_header(&th, TableKind::Tx, data_bytes),
+                TableFile::open_trailing_header(&th, TableKind::TxOut, data_bytes),
                 Err(StoreError::BadKind { .. })
             ));
             let (mut f3, _ext) =
@@ -999,7 +1039,7 @@ mod advise_tests {
         {
             let lead = std::env::temp_dir().join(format!("rbitcoin-file-lead-{id}"));
             let _ = std::fs::remove_file(&lead);
-            let mut f = TableFile::create(&lead, TableKind::Tx).unwrap();
+            let mut f = TableFile::create(&lead, TableKind::TxOut).unwrap();
             assert!(matches!(
                 f.set_trailing_ext([0; 16]),
                 Err(StoreError::Corrupt(_))
@@ -1010,7 +1050,7 @@ mod advise_tests {
         {
             let p = std::env::temp_dir().join(format!("rbitcoin-file-readpast-{id}"));
             let _ = std::fs::remove_file(&p);
-            let f = TableFile::create(&p, TableKind::Tx).unwrap();
+            let f = TableFile::create(&p, TableKind::TxOut).unwrap();
             let mut big = [0u8; 8];
             assert!(matches!(
                 f.read_at(FILE_HEADER_LEN as u64 + 1000, &mut big),
@@ -1033,38 +1073,39 @@ mod advise_tests {
         let short = dir.join("short");
         std::fs::write(&short, b"tiny").unwrap();
         assert!(matches!(
-            TableFile::open_trailing_header_from_end(&short, TableKind::Tx),
+            TableFile::open_trailing_header_from_end(&short, TableKind::TxOut),
             Err(StoreError::Corrupt(_))
         ));
         let bad_magic = dir.join("badmag");
         std::fs::write(&bad_magic, vec![0u8; TRAILING_FOOTER_LEN]).unwrap();
         assert!(matches!(
-            TableFile::open_trailing_header_from_end(&bad_magic, TableKind::Tx),
+            TableFile::open_trailing_header_from_end(&bad_magic, TableKind::TxOut),
             Err(StoreError::BadMagic)
         ));
         let good = dir.join("good");
-        let f = TableFile::create_trailing_header(&good, TableKind::Tx).unwrap();
+        let f = TableFile::create_trailing_header(&good, TableKind::TxOut).unwrap();
         f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64)
             .unwrap();
         f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64)
             .unwrap();
         drop(f);
-        let (_f2, _ext) = TableFile::open_trailing_header_from_end(&good, TableKind::Tx).unwrap();
+        let (_f2, _ext) =
+            TableFile::open_trailing_header_from_end(&good, TableKind::TxOut).unwrap();
         assert!(matches!(
             TableFile::open_trailing_header_from_end(&good, TableKind::Header),
             Err(StoreError::BadKind { .. })
         ));
         let good2 = dir.join("good2");
-        let f = TableFile::create_trailing_header(&good2, TableKind::Tx).unwrap();
+        let f = TableFile::create_trailing_header(&good2, TableKind::TxOut).unwrap();
         f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64)
             .unwrap();
         f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64)
             .unwrap();
         drop(f);
-        let (_f3, _) = TableFile::open_trailing_header(&good2, TableKind::Tx, 1024).unwrap();
-        assert!(TableFile::open_trailing_header(&good2, TableKind::Tx, 50_000).is_err());
+        let (_f3, _) = TableFile::open_trailing_header(&good2, TableKind::TxOut, 1024).unwrap();
+        assert!(TableFile::open_trailing_header(&good2, TableKind::TxOut, 50_000).is_err());
         let path = dir.join("normal");
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         f.write_at(FILE_HEADER_LEN as u64, &[1, 2, 3, 4, 5, 6, 7, 8])
             .unwrap();
         let u = f.load_u32_le(FILE_HEADER_LEN as u64).unwrap();
@@ -1091,7 +1132,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-pwrite-vis-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         let payload = b"fd-append-payload-0123456789abcdef";
         let off = FILE_HEADER_LEN as u64;
         f.write_at_pwrite(off, payload).unwrap();
@@ -1116,7 +1157,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-hwm-pub-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         let payload = vec![0x5Au8; 1024];
         f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
         f.flush().unwrap();
@@ -1128,7 +1169,7 @@ mod advise_tests {
         assert_eq!(hwm, published);
         assert_eq!(hwm, FILE_HEADER_LEN as u64 + 1024);
         // Reopen sees full payload, nothing past HWM.
-        let f2 = TableFile::open(&path, TableKind::Tx).unwrap();
+        let f2 = TableFile::open(&path, TableKind::TxOut).unwrap();
         assert_eq!(f2.logical_len(), published);
         let mut got = vec![0u8; 1024];
         f2.read_at(FILE_HEADER_LEN as u64, &mut got).unwrap();
@@ -1144,7 +1185,7 @@ mod advise_tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-file-surface-{id}"));
         let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
         assert!(f.logical_len() >= FILE_HEADER_LEN as u64);
         let payload = b"hello-table";
         f.write_at(FILE_HEADER_LEN as u64, payload).unwrap();
@@ -1161,7 +1202,7 @@ mod advise_tests {
         let fd = f.read_fd();
         assert!(fd >= 0);
         drop(f);
-        let f = TableFile::open(&path, TableKind::Tx).unwrap();
+        let f = TableFile::open(&path, TableKind::TxOut).unwrap();
         let mut buf2 = vec![0u8; payload.len()];
         f.read_at(FILE_HEADER_LEN as u64, &mut buf2).unwrap();
         assert_eq!(&buf2, payload);

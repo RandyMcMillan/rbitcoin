@@ -202,8 +202,8 @@ mod tests {
         for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_| unreachable!()).unwrap();
         for_each_spender_create(&txs, &spenders, create, 1, |_| unreachable!()).unwrap();
 
-        // body_range path
-        let (off, len) = txs.body_range(create).unwrap();
+        // spent.body range path
+        let (off, len) = txs.spent_range(create).unwrap();
         put_spend_on_create_at(&txs, &spenders, create, 1, s1, Some((off, len))).unwrap();
         let mut one = None;
         for_each_spender_create(&txs, &spenders, create, 1, |fk| {

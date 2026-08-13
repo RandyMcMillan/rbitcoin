@@ -18,11 +18,11 @@ use rbitcoin_primitives::Fk;
 /// What body bytes to fetch after the range is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
-    /// Full packed Class A payload (confirm create decode).
+    /// Full record (txout or inwit).
     Full,
-    /// Full packed payload for denserels/outs-only decode (pin_new).
-    OutsDenserels,
-    /// Leading ≤32 body bytes (txid at record start / head resolve).
+    /// `txout` first page (outs / pin). Alias kept as `OutsDenserels` in re-exports.
+    Outs,
+    /// Leading ≤32 body bytes (retired; tests only).
     Prefix33,
 }
 
@@ -30,7 +30,8 @@ impl BodyMode {
     #[inline]
     fn body_len(self, range_len: u64) -> u64 {
         match self {
-            BodyMode::Full | BodyMode::OutsDenserels => range_len,
+            BodyMode::Full => range_len,
+            BodyMode::Outs => range_len.min(4096),
             BodyMode::Prefix33 => range_len.min(32),
         }
     }
@@ -167,6 +168,75 @@ pub fn run_idx_body_pipeline_backend(
             jobs[i].ok = true;
         }
     }
+    if mode == BodyMode::Outs {
+        extend_truncated_txout_jobs(table, jobs, backend)?;
+    }
+    Ok(())
+}
+
+/// Second wave: when a 4 KiB Outs read does not cover every output, pread the
+/// remainder of the idx span. Common txs stay on the first page.
+fn extend_truncated_txout_jobs(
+    table: &VarTable,
+    jobs: &mut [IdxBodyJob],
+    backend: ReadIoBackend,
+) -> Result<(), StoreError> {
+    let mut rest: Vec<(usize, usize)> = Vec::new();
+    let body_pub = table.body_published_len();
+    for (i, j) in jobs.iter_mut().enumerate() {
+        if !j.ok {
+            continue;
+        }
+        let Some((off, full_len)) = j.range else {
+            continue;
+        };
+        if (j.body.len() as u64) >= full_len {
+            continue;
+        }
+        if crate::tx_table::txout_first_page_complete(&j.body) {
+            continue;
+        }
+        if off.saturating_add(full_len) > body_pub {
+            j.ok = false;
+            continue;
+        }
+        let have = j.body.len();
+        j.body.resize(full_len as usize, 0);
+        rest.push((i, have));
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let body_fd = table.body_read_fd();
+    let body_path = table.body_file_path();
+    // SAFETY: each jobs[i].body[have..] is a distinct allocation remainder.
+    let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(rest.len());
+    for &(i, have) in &rest {
+        let off = jobs[i].range.unwrap().0.saturating_add(have as u64);
+        let len = jobs[i].body.len().saturating_sub(have);
+        let ptr = unsafe { jobs[i].body.as_mut_ptr().add(have) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        ops.push(ReadOp {
+            fd: body_fd,
+            offset: off,
+            buf: slice,
+            result: i32::MIN,
+            dontcache: crate::dontcache_policy::body_read_confirm(),
+        });
+    }
+    bulk_io::pread_batch_backend(&mut ops, backend);
+    for (ro, &(i, have)) in ops.iter().zip(rest.iter()) {
+        if ro.result < 0 {
+            return Err(StoreError::io(
+                body_path,
+                std::io::Error::from_raw_os_error(-ro.result),
+            ));
+        }
+        let want = jobs[i].body.len().saturating_sub(have);
+        if ro.result as usize != want {
+            jobs[i].ok = false;
+        }
+    }
     Ok(())
 }
 
@@ -221,6 +291,48 @@ mod tests {
             );
         }
         fks
+    }
+
+    #[test]
+    fn from_fk_and_empty_pipeline() {
+        assert!(IdxBodyJob::from_fk(Fk::NULL, None).is_none());
+        assert!(IdxBodyJob::from_fk(Fk(0), None).is_none());
+        let j = IdxBodyJob::from_fk(Fk(7), Some((16, 8))).unwrap();
+        assert_eq!(j.id, 7);
+        assert_eq!(j.range, Some((16, 8)));
+        let (dir, t) = temp_tx();
+        run_idx_body_pipeline(&t.body, &mut [], BodyMode::Full).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipeline_outs_extends_past_first_page() {
+        let (dir, t) = temp_tx();
+        let tx = TxRecord {
+            txid: [0x7eu8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let outs = vec![OutputRecord::unspent(1, vec![0x51; 6000])];
+        let fk = t
+            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
+            .unwrap()[0];
+        let (_off, full_len) = t.body.record_range(fk).unwrap();
+        assert!(full_len > 4096, "fixture must exceed first-page cap");
+        let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
+        run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
+        assert!(jobs[0].ok);
+        assert_eq!(jobs[0].body.len() as u64, full_len);
+        let (meta, decoded, _) =
+            crate::tx_table::decode_packed_tx_outs_with_spender_rels(&jobs[0].body).unwrap();
+        assert_eq!(meta.output_count, 1);
+        assert_eq!(decoded[0].script.len(), 6000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// uring / pread body backends produce identical Full payloads.
@@ -290,7 +402,7 @@ mod tests {
             assert!(!j.body.is_empty());
         }
         let mut jobs2: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
-        run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::OutsDenserels).unwrap();
+        run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Outs).unwrap();
         for j in &jobs2 {
             assert!(j.ok);
             let (_tx, outs, rels) =

@@ -489,7 +489,7 @@ fn resolve_denserels_pread(
             .iter()
             .map(|(_, fk, range)| IdxBodyJob::new(fk.0, Some(*range)))
             .collect();
-        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::OutsDenserels)?;
+        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::Outs)?;
         dens_ns = t_dens.elapsed().as_nanos() as u64;
         for ((ki, fk, _), job) in need.into_iter().zip(jobs.into_iter()) {
             if !job.ok || job.body.is_empty() {
@@ -678,7 +678,7 @@ fn resolve_denserels_uring(
             .iter()
             .map(|(_, fk, range)| IdxBodyJob::new(fk.0, Some(*range)))
             .collect();
-        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::OutsDenserels)?;
+        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::Outs)?;
         dens_ns = t_dens.elapsed().as_nanos() as u64;
         for ((ki, fk, _), job) in need.into_iter().zip(jobs.into_iter()) {
             if !job.ok || job.body.is_empty() {

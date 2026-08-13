@@ -8,9 +8,10 @@
 //! Mempool admits hop via [`run_detached_join`] onto a **process-wide** worker
 //! set (not one OS thread per tx).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 
 use crate::error::ConsensusError;
@@ -72,38 +73,51 @@ where
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct ScriptWorkers {
-    tx: Mutex<mpsc::Sender<Job>>,
+    jobs: Mutex<VecDeque<Job>>,
+    cv: Condvar,
 }
 
 static WORKERS: OnceLock<ScriptWorkers> = OnceLock::new();
 static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+fn recv_job(pool: &ScriptWorkers) -> Job {
+    let mut g = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if let Some(job) = g.pop_front() {
+            return job;
+        }
+        #[cfg(test)]
+        IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
+        g = pool.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn workers() -> &'static ScriptWorkers {
-    WORKERS.get_or_init(|| {
+    static SPAWN: OnceLock<()> = OnceLock::new();
+    let pool = WORKERS.get_or_init(|| ScriptWorkers {
+        jobs: Mutex::new(VecDeque::new()),
+        cv: Condvar::new(),
+    });
+    SPAWN.get_or_init(|| {
         let n = thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4)
             .max(1);
-        let (tx, rx) = mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(Mutex::new(rx));
         for i in 0..n {
-            let rx = std::sync::Arc::clone(&rx);
             let _ = thread::Builder::new()
                 .name(format!("rbtc-scripts-{i}"))
                 .spawn(move || loop {
-                    let job = {
-                        let g = rx.lock().unwrap_or_else(|p| p.into_inner());
-                        g.recv()
-                    };
-                    match job {
-                        Ok(f) => f(),
-                        Err(_) => return,
-                    }
+                    let f = recv_job(pool);
+                    f();
                 });
             WORKER_SPAWNS.fetch_add(1, Ordering::Relaxed);
         }
-        ScriptWorkers { tx: Mutex::new(tx) }
-    })
+    });
+    pool
 }
 
 /// How many OS worker threads the process pool has started (tests).
@@ -113,14 +127,23 @@ pub(crate) fn worker_spawn_count() -> usize {
     WORKER_SPAWNS.load(Ordering::Relaxed)
 }
 
+/// Workers currently blocked in the idle wait (recv / condvar), not in a job.
+#[cfg(test)]
+fn idle_waiter_count() -> usize {
+    IDLE_WAITERS.load(Ordering::SeqCst)
+}
+
 /// Submit `work` to the process-wide `rbtc-scripts` pool (IBD feed-ahead).
 pub(crate) fn spawn_detached<F>(work: F)
 where
     F: FnOnce() + Send + 'static,
 {
     let pool = workers();
-    let tx = pool.tx.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = tx.send(Box::new(work));
+    {
+        let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        q.push_back(Box::new(work));
+    }
+    pool.cv.notify_one();
 }
 
 /// Run `work` on the shared `rbtc-scripts` pool and join the result.
@@ -203,5 +226,65 @@ mod tests {
             before,
             "pool must not spawn a thread per mempool-style join"
         );
+    }
+
+    /// All `rbtc-scripts-*` workers must be able to sit in the idle wait at
+    /// once. `Mutex<mpsc::Receiver>` holds the lock across `recv`, so only one
+    /// waiter is in recv; the rest block on `lock()` and do not count as idle.
+    #[test]
+    fn pool_waiters_run_concurrently() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        let n = worker_spawn_count();
+        assert!(n >= 1);
+        let start = Instant::now();
+        while idle_waiter_count() < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "only {} of {n} workers idle-waiting (recv mutex serializes waiters)",
+                idle_waiter_count()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let inside = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..n {
+            let inside = Arc::clone(&inside);
+            let gate = Arc::clone(&gate);
+            let done = Arc::clone(&done);
+            spawn_detached(move || {
+                inside.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*g {
+                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let start = Instant::now();
+        while inside.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "only {} of {n} workers entered a job (recv mutex serializes waiters)",
+                inside.load(Ordering::SeqCst)
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+        let start = Instant::now();
+        while done.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "workers did not finish after release"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }

@@ -1,0 +1,13 @@
+{
+  "850000": {
+    "0185a62484ca086b1a620552c770f852fb2303ff26f85849beb66f767da4e078": {
+      "output_pubkeys": {
+        "1": [
+          "5f94ca3effa19817039eda99ebce0be1a2a338dad1eb87961ef036a025e8dd7f",
+          5410
+        ]
+      },
+      "tweak": "02d092672ad97a476b27c7e58ff229d94dc2f644517913d316f0cd873132d57b26"
+    }
+  }
+}

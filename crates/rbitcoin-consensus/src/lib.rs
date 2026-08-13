@@ -12,6 +12,7 @@ mod regtest_pad;
 mod script;
 mod script_pool;
 mod signet;
+pub mod silent_payments;
 
 /// Thin public helpers for `script_verify` benches (no UTXO; explicit prevouts only).
 pub mod script_bench {
@@ -124,6 +125,7 @@ pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoin
 pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
 pub use regtest_pad::{mine_empty_regtest, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
+pub use silent_payments::{tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak};
 
 pub fn crate_name() -> &'static str {
     "rbitcoin-consensus"

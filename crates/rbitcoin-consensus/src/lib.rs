@@ -690,12 +690,16 @@ pub fn accept_and_connect_block_preverified(
     if let Some(fk) = fks.into_iter().next() {
         return Ok(fk);
     }
-    // Write skipped heights ≤ tip (idempotent race).
+    // Write skipped heights ≤ tip (idempotent race). A body we just ran
+    // through lookup/load must have a header — missing is an invariant, not
+    // a soft NotFound (inflated confirmed[] used to hit this on tip+1).
     query
         .get_header_by_hash(&hash)
         .map_err(ConsensusError::from)?
         .map(|(fk, _)| fk)
-        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::NotFound))
+        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: confirm write skipped but header missing",
+        )))
 }
 
 /// Archive a block body (Class A) without confirming.

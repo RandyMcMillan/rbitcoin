@@ -438,6 +438,79 @@ fn load_batch_empty_and_resolve_metas_fallback() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Trailing null `confirmed[]` + reopen must still connect real tip+1
+/// (`NotFound` was the inflated-HWM miss on a valid body).
+#[test]
+fn tip_plus_one_after_trailing_null_heal_is_not_notfound() {
+    use crate::accept_and_connect_block;
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use crate::regtest_pad::{mine_empty_regtest, pad_empty_from};
+    use rbitcoin_primitives::Height;
+    use rbitcoin_query::Query;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-confirm-tip1-heal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let (tip, tip_time, _) = pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        3,
+        0,
+    );
+    drop(q);
+
+    let conf = path.join("confirmed.body");
+    let mut raw = std::fs::read(&conf).unwrap();
+    assert!(raw.len() >= 16);
+    let logical = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let extra = vec![0u8; 20 * 8];
+    let new_logical = logical + extra.len() as u64;
+    if (raw.len() as u64) < new_logical {
+        raw.resize(new_logical as usize, 0);
+    }
+    raw[8..16].copy_from_slice(&new_logical.to_le_bytes());
+    std::fs::write(&conf, &raw).unwrap();
+
+    let q = Query::open_or_create(&path).unwrap();
+    assert_eq!(q.tip_height().map(|h| h.0), Some(3));
+    let nxt = mine_empty_regtest(tip, tip_time + 600, 4);
+    let r = accept_and_connect_block(&q, &params, Height(4), &nxt, Milestone::NONE);
+    match r {
+        Ok(_) => {}
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                !s.to_ascii_lowercase().contains("not found"),
+                "valid tip+1 must not be Store NotFound: {e}"
+            );
+            panic!("tip+1 confirm failed: {e}");
+        }
+    }
+    assert_eq!(q.tip_height().map(|h| h.0), Some(4));
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn expected_bits_extending_height0_and_no_retarget() {
     use super::expected_bits_extending;

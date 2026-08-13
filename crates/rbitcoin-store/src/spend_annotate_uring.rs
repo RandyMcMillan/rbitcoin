@@ -344,9 +344,9 @@ fn next_ready(
 /// Selected via `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
-    /// Store 9 B via io_uring pwrite only (no pread).
+    /// Page-RMW via io_uring (pread page, poke 9 B slots, pwrite page).
     Uring,
-    /// Store 9 B via libc `pwrite` (positional, no ring).
+    /// Page-RMW via libc pread + pwrite (positional, no ring).
     Pwrite,
 }
 
@@ -398,9 +398,114 @@ fn decide_annotate(
     Ok(AnnotateOp::Write(meta))
 }
 
+/// One RMW window on `spent.body` (usually one 4 KiB page, clipped to the
+/// published range and past the 16-byte file header).
+struct SpentPageGroup {
+    off: u64,
+    len: usize,
+    writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>,
+}
+
+/// Page span covering the 9-byte slot at `abs` (`[lo, hi)`).
+#[inline]
+fn spent_meta_page_span(abs: u64) -> (u64, u64) {
+    let page = crate::tx_table::BODY_PAGE_SIZE;
+    let lo = abs & !(page - 1);
+    let last = abs.saturating_add(META_LEN as u64 - 1);
+    let hi = (last & !(page - 1)).saturating_add(page);
+    (lo, hi)
+}
+
+#[inline]
+fn clip_spent_page_window(span_lo: u64, span_hi: u64, body_pub: u64) -> Option<(u64, usize)> {
+    let off = span_lo.max(crate::file::FILE_HEADER_LEN as u64);
+    let end = span_hi.min(body_pub);
+    if end <= off {
+        return None;
+    }
+    Some((off, (end - off) as usize))
+}
+
+/// Group abs-sorted writes into non-overlapping `spent.body` page spans.
+///
+/// Same-page slots share one RMW. A 9 B slot that straddles a page boundary
+/// extends the span so the next page's writes merge (no overlapping in-flight
+/// RMWs). Adjacent pages without a straddle stay separate.
+fn group_writes_by_spent_page(
+    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
+    body_pub: u64,
+) -> Vec<SpentPageGroup> {
+    let mut groups = Vec::new();
+    let mut cur_lo = 0u64;
+    let mut cur_hi = 0u64;
+    let mut cur: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])> = Vec::new();
+
+    let flush = |groups: &mut Vec<SpentPageGroup>,
+                 lo: u64,
+                 hi: u64,
+                 cur: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>| {
+        if cur.is_empty() {
+            return;
+        }
+        let Some((off, len)) = clip_spent_page_window(lo, hi, body_pub) else {
+            return;
+        };
+        groups.push(SpentPageGroup {
+            off,
+            len,
+            writes: cur,
+        });
+    };
+
+    for &w in writes {
+        let (lo, hi) = spent_meta_page_span(w.0);
+        if cur.is_empty() {
+            cur_lo = lo;
+            cur_hi = hi;
+            cur.push(w);
+            continue;
+        }
+        if lo < cur_hi {
+            cur_hi = cur_hi.max(hi);
+            cur.push(w);
+        } else {
+            flush(&mut groups, cur_lo, cur_hi, std::mem::take(&mut cur));
+            cur_lo = lo;
+            cur_hi = hi;
+            cur.push(w);
+        }
+    }
+    flush(&mut groups, cur_lo, cur_hi, cur);
+    groups
+}
+
+fn poke_spent_page(
+    buf: &mut [u8],
+    off: u64,
+    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
+) -> Result<(), StoreError> {
+    for &(abs, _, _, _, meta) in writes {
+        let i = abs.saturating_sub(off) as usize;
+        if i.saturating_add(META_LEN) > buf.len() {
+            return Err(StoreError::Corrupt(
+                "spend annotate poke outside page window",
+            ));
+        }
+        buf[i..i + META_LEN].copy_from_slice(&meta);
+    }
+    Ok(())
+}
+
+fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk)>, writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])]) {
+    for &(_, cfk, vout, sfk, _) in writes {
+        cold.push((cfk, vout, sfk));
+    }
+}
+
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// Sorts by abs for mmap locality. Returns OOB edges as cold (caller must hard-fail).
+/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 9 B slots →
+/// pwrite page). Returns OOB edges as cold (caller must hard-fail).
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,
@@ -452,62 +557,93 @@ pub fn put_spend_batch_by_abs_meta_known(
     }
 }
 
-/// libc pwrite-only (no pread, no ring) for prepared 9-byte metas.
+/// libc page-RMW (pread + pwrite, no ring) for prepared 9-byte metas.
 fn put_spend_batch_pure_write_pwrite(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
     mut cold: Vec<(Fk, u32, Fk)>,
 ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
-    for &(abs, cfk, vout, sfk, meta) in writes {
-        // write_at_pwrite on body file via VarTable path: use body write helper.
-        if let Err(_) = txs.spent.write_body_abs_pwrite(abs, &meta) {
-            cold.push((cfk, vout, sfk));
+    let body_pub = txs.spent.body_published_len();
+    let groups = group_writes_by_spent_page(writes, body_pub);
+    for g in &groups {
+        let mut buf = vec![0u8; g.len];
+        if txs
+            .spent
+            .read_prefix_at(g.off, g.len as u64, &mut buf)
+            .is_err()
+        {
+            cold_group_edges(&mut cold, &g.writes);
+            continue;
+        }
+        poke_spent_page(&mut buf, g.off, &g.writes)?;
+        if txs.spent.write_body_abs_pwrite(g.off, &buf).is_err() {
+            cold_group_edges(&mut cold, &g.writes);
         }
     }
     Ok(cold)
 }
 
-/// io_uring pwrite-only (no pread) for prepared 9-byte metas.
+/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 9-byte metas.
 fn put_spend_batch_pure_write_uring(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-    mut cold: Vec<(Fk, u32, Fk)>,
+    cold: Vec<(Fk, u32, Fk)>,
 ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
     if writes.is_empty() {
+        return Ok(cold);
+    }
+    let body_pub = txs.spent.body_published_len();
+    let groups = group_writes_by_spent_page(writes, body_pub);
+    if groups.is_empty() {
         return Ok(cold);
     }
     let body_fd: RawFd = txs.spent.body_read_fd();
     let body_path = txs.spent.body_file_path().to_path_buf();
 
-    // Stable payload buffers for in-flight pwrites (outside TLS open so fallback
-    // can still use `writes` / `cold` if the ring is unavailable).
-    let mut bufs: Vec<[u8; META_LEN]> = writes.iter().map(|w| w.4).collect();
+    struct PageSlot {
+        group_i: usize,
+        phase: Phase,
+        buf: Vec<u8>,
+    }
+
     let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        let mut pending: VecDeque<usize> = (0..writes.len()).collect();
-        let mut free_slots: Vec<usize> = (0..MAX_SLOTS.min(writes.len().max(1))).collect();
-        let mut slots: Vec<Option<usize>> = (0..free_slots.len()).map(|_| None).collect();
+        let mut pending: VecDeque<usize> = (0..groups.len()).collect();
+        let nslots = MAX_SLOTS.min(groups.len().max(1));
+        let mut free_slots: Vec<usize> = (0..nslots).collect();
+        let mut slots: Vec<Option<PageSlot>> = (0..nslots).map(|_| None).collect();
         let mut in_flight = 0usize;
         let mut cold_local = cold.clone();
 
         let arm = |session: &mut UringSession,
                    free_slots: &mut Vec<usize>,
-                   slots: &mut [Option<usize>],
+                   slots: &mut [Option<PageSlot>],
                    pending: &mut VecDeque<usize>,
-                   bufs: &mut [[u8; META_LEN]],
-                   writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
+                   groups: &[SpentPageGroup],
                    in_flight: &mut usize,
                    body_fd: RawFd|
          -> Result<(), StoreError> {
             while *in_flight < slots.len() && session.free_sq() > 0 && !free_slots.is_empty() {
-                let Some(wi) = pending.pop_front() else {
+                let Some(gi) = pending.pop_front() else {
                     break;
                 };
                 let slot = free_slots.pop().unwrap();
-                slots[slot] = Some(wi);
-                let abs = writes[wi].0;
-                // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
-                let flags = crate::dontcache_policy::body_sqe_write_flags();
-                session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, flags)?;
+                slots[slot] = Some(PageSlot {
+                    group_i: gi,
+                    phase: Phase::Reading,
+                    buf: vec![0u8; groups[gi].len],
+                });
+                {
+                    let s = slots[slot].as_mut().unwrap();
+                    // Page stays cached for the following pwrite.
+                    let flags = crate::dontcache_policy::body_sqe_read_flags();
+                    session.push_pread_flags(
+                        body_fd,
+                        groups[gi].off,
+                        &mut s.buf,
+                        slot as u64,
+                        flags,
+                    )?;
+                }
                 *in_flight += 1;
             }
             Ok(())
@@ -518,8 +654,7 @@ fn put_spend_batch_pure_write_uring(
             &mut free_slots,
             &mut slots,
             &mut pending,
-            &mut bufs,
-            writes,
+            &groups,
             &mut in_flight,
             body_fd,
         )?;
@@ -537,29 +672,86 @@ fn put_spend_batch_pure_write_uring(
                 if slot >= slots.len() {
                     return Err(StoreError::Corrupt("spend pure-write bad user_data"));
                 }
-                let wi = slots[slot]
+                let mut st = slots[slot]
                     .take()
                     .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
                 in_flight = in_flight.saturating_sub(1);
-                if res < 0 {
-                    if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                        crate::bulk_io::note_rwf_dontcache_unsupported();
-                        slots[slot] = Some(wi);
-                        let abs = writes[wi].0;
-                        session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, 0)?;
+                let gi = st.group_i;
+                match st.phase {
+                    Phase::Reading => {
+                        if res < 0 {
+                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                                crate::bulk_io::note_rwf_dontcache_unsupported();
+                                slots[slot] = Some(st);
+                                {
+                                    let s = slots[slot].as_mut().unwrap();
+                                    session.push_pread_flags(
+                                        body_fd,
+                                        groups[gi].off,
+                                        &mut s.buf,
+                                        slot as u64,
+                                        0,
+                                    )?;
+                                }
+                                in_flight += 1;
+                                continue;
+                            }
+                            free_slots.push(slot);
+                            return Err(StoreError::io(
+                                &body_path,
+                                std::io::Error::from_raw_os_error(-res),
+                            ));
+                        }
+                        if res as usize != st.buf.len() {
+                            free_slots.push(slot);
+                            cold_group_edges(&mut cold_local, &groups[gi].writes);
+                            continue;
+                        }
+                        poke_spent_page(&mut st.buf, groups[gi].off, &groups[gi].writes)?;
+                        st.phase = Phase::Writing;
+                        slots[slot] = Some(st);
+                        {
+                            let s = slots[slot].as_mut().unwrap();
+                            let flags = crate::dontcache_policy::body_sqe_write_flags();
+                            session.push_pwrite_flags(
+                                body_fd,
+                                groups[gi].off,
+                                &s.buf,
+                                slot as u64,
+                                flags,
+                            )?;
+                        }
                         in_flight += 1;
-                        continue;
                     }
-                    free_slots.push(slot);
-                    return Err(StoreError::io(
-                        &body_path,
-                        std::io::Error::from_raw_os_error(-res),
-                    ));
-                }
-                free_slots.push(slot);
-                if res as usize != META_LEN {
-                    let (_, cfk, vout, sfk, _) = writes[wi];
-                    cold_local.push((cfk, vout, sfk));
+                    Phase::Writing => {
+                        if res < 0 {
+                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                                crate::bulk_io::note_rwf_dontcache_unsupported();
+                                slots[slot] = Some(st);
+                                {
+                                    let s = slots[slot].as_mut().unwrap();
+                                    session.push_pwrite_flags(
+                                        body_fd,
+                                        groups[gi].off,
+                                        &s.buf,
+                                        slot as u64,
+                                        0,
+                                    )?;
+                                }
+                                in_flight += 1;
+                                continue;
+                            }
+                            free_slots.push(slot);
+                            return Err(StoreError::io(
+                                &body_path,
+                                std::io::Error::from_raw_os_error(-res),
+                            ));
+                        }
+                        if res as usize != st.buf.len() {
+                            cold_group_edges(&mut cold_local, &groups[gi].writes);
+                        }
+                        free_slots.push(slot);
+                    }
                 }
             }
             arm(
@@ -567,8 +759,7 @@ fn put_spend_batch_pure_write_uring(
                 &mut free_slots,
                 &mut slots,
                 &mut pending,
-                &mut bufs,
-                writes,
+                &groups,
                 &mut in_flight,
                 body_fd,
             )?;
@@ -576,9 +767,8 @@ fn put_spend_batch_pure_write_uring(
             let _ = session.submit();
         }
 
-        while let Some(wi) = pending.pop_front() {
-            let (_, cfk, vout, sfk, _) = writes[wi];
-            cold_local.push((cfk, vout, sfk));
+        while let Some(gi) = pending.pop_front() {
+            cold_group_edges(&mut cold_local, &groups[gi].writes);
         }
         Ok(cold_local)
     });
@@ -588,23 +778,13 @@ fn put_spend_batch_pure_write_uring(
             rbitcoin_log::debug!(
                 "store: spend annotate pure-write uring error ({e}); pwrite fallback"
             );
-            for &(abs, cfk, vout, sfk, meta) in writes {
-                if txs.spent.write_body_abs_pwrite(abs, &meta).is_err() {
-                    cold.push((cfk, vout, sfk));
-                }
-            }
-            Ok(cold)
+            put_spend_batch_pure_write_pwrite(txs, writes, cold)
         }
         Err(e) => {
             rbitcoin_log::debug!(
                 "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
             );
-            for &(abs, cfk, vout, sfk, meta) in writes {
-                if txs.spent.write_body_abs_pwrite(abs, &meta).is_err() {
-                    cold.push((cfk, vout, sfk));
-                }
-            }
-            Ok(cold)
+            put_spend_batch_pure_write_pwrite(txs, writes, cold)
         }
     }
 }
@@ -626,15 +806,15 @@ mod tests {
         (dir, t, s)
     }
 
-    fn put_one(t: &TxTable) -> (Fk, u64, u64) {
+    fn put_n_outs(t: &TxTable, n_out: u32, txid_byte: u8) -> (Fk, u64, u64) {
         let tx = TxRecord {
-            txid: [0x11; 32],
+            txid: [txid_byte; 32],
             version: 1,
             locktime: 0,
             input_start_fk: Fk::NULL,
             input_count: 1,
             output_start_fk: Fk::NULL,
-            output_count: 1,
+            output_count: n_out,
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
@@ -644,12 +824,16 @@ mod tests {
             script_sig: vec![0x01],
             witness: vec![],
         }];
-        let outputs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let outputs = vec![OutputRecord::unspent(50, vec![0x51]); n_out as usize];
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
             .unwrap()[0];
         let (off, len) = t.spent_range_batch(&[fk]).unwrap()[0].unwrap();
         (fk, off, len)
+    }
+
+    fn put_one(t: &TxTable) -> (Fk, u64, u64) {
+        put_n_outs(t, 1, 0x11)
     }
 
     #[test]
@@ -754,5 +938,182 @@ mod tests {
         let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
         assert_eq!(bulk2[0].unwrap().0, sfk);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two vouts on one page: both land; a third slot on that page is unchanged.
+    #[test]
+    fn pure_write_two_vouts_same_page_preserves_neighbor() {
+        for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
+            let (dir, t, spenders) = temp_table();
+            let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
+            let abs0 = crate::tx_table::spent_abs(off, 0);
+            let abs1 = crate::tx_table::spent_abs(off, 1);
+            let abs2 = crate::tx_table::spent_abs(off, 2);
+            assert_eq!(
+                abs0 & !0xfff,
+                abs2 & !0xfff,
+                "fixture must keep vout 0 and 2 on one 4 KiB page"
+            );
+
+            let sentinel = Fk(0x51);
+            let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
+            let cold_s = put_spend_batch_by_abs_meta_known(
+                &t,
+                &spenders,
+                &[(abs1, cfk, 1, sentinel)],
+                &[known1],
+                backend,
+            )
+            .unwrap();
+            assert!(cold_s.is_empty());
+
+            let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+            let known2 = t.get_spender_meta_at_abs_batch(&[abs2]).unwrap()[0].unwrap();
+            let mut hdr_before = [0u8; crate::file::FILE_HEADER_LEN];
+            t.spent
+                .read_prefix_at(0, crate::file::FILE_HEADER_LEN as u64, &mut hdr_before)
+                .unwrap();
+            let cold = put_spend_batch_by_abs_meta_known(
+                &t,
+                &spenders,
+                &[(abs0, cfk, 0, Fk(10)), (abs2, cfk, 2, Fk(12))],
+                &[known0, known2],
+                backend,
+            )
+            .unwrap();
+            assert!(cold.is_empty());
+
+            let bulk = t
+                .get_spender_meta_at_abs_batch(&[abs0, abs1, abs2])
+                .unwrap();
+            assert_eq!(bulk[0].unwrap().0, Fk(10));
+            assert_eq!(
+                bulk[1].unwrap().0,
+                sentinel,
+                "neighbor slot must be preserved"
+            );
+            assert_eq!(bulk[2].unwrap().0, Fk(12));
+
+            let mut hdr_after = [0u8; crate::file::FILE_HEADER_LEN];
+            t.spent
+                .read_prefix_at(0, crate::file::FILE_HEADER_LEN as u64, &mut hdr_after)
+                .unwrap();
+            assert_eq!(
+                hdr_before, hdr_after,
+                "page 0 RMW must not rewrite file header"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Vouts whose abs straddle a 4 KiB page both persist.
+    #[test]
+    fn pure_write_two_pages_both_land() {
+        for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
+            let (dir, t, spenders) = temp_table();
+            // 500 × 9 B from file offset 16 crosses 4096.
+            let (cfk, off, _len) = put_n_outs(&t, 500, 0x33);
+            let abs0 = crate::tx_table::spent_abs(off, 0);
+            let abs_last = crate::tx_table::spent_abs(off, 499);
+            assert_ne!(
+                abs0 & !0xfff,
+                abs_last & !0xfff,
+                "fixture must straddle a 4 KiB page"
+            );
+            let k0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+            let k1 = t.get_spender_meta_at_abs_batch(&[abs_last]).unwrap()[0].unwrap();
+            let cold = put_spend_batch_by_abs_meta_known(
+                &t,
+                &spenders,
+                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 499, Fk(2))],
+                &[k0, k1],
+                backend,
+            )
+            .unwrap();
+            assert!(cold.is_empty());
+            let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs_last]).unwrap();
+            assert_eq!(bulk[0].unwrap().0, Fk(1));
+            assert_eq!(bulk[1].unwrap().0, Fk(2));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Same-page pair is one page-window write, not two 9 B pwrites.
+    #[test]
+    fn pure_write_same_page_is_one_page_write() {
+        if !crate::bulk_io::io_uring_enabled() {
+            return;
+        }
+        let (dir, t, spenders) = temp_table();
+        let (cfk, off, _len) = put_n_outs(&t, 3, 0x44);
+        let abs0 = crate::tx_table::spent_abs(off, 0);
+        let abs2 = crate::tx_table::spent_abs(off, 2);
+        let k0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+        let k2 = t.get_spender_meta_at_abs_batch(&[abs2]).unwrap()[0].unwrap();
+        let _ = uring_session::test_take_last_sqe_lens();
+        let cold = put_spend_batch_by_abs_meta_known(
+            &t,
+            &spenders,
+            &[(abs0, cfk, 0, Fk(3)), (abs2, cfk, 2, Fk(4))],
+            &[k0, k2],
+            SpendAnnBackend::Uring,
+        )
+        .unwrap();
+        assert!(cold.is_empty());
+        let lens = uring_session::test_take_last_sqe_lens();
+        assert!(
+            !lens.is_empty(),
+            "uring spend annotate must push at least one SQE"
+        );
+        // Page 0 is clipped past the 16 B file header; the write is the published
+        // page window (here the whole 3-slot spent record), never one 9 B SQE per vout.
+        let writes: Vec<u32> = lens.into_iter().filter(|&n| n != META_LEN as u32).collect();
+        assert!(
+            writes.iter().any(|&n| n >= 3 * META_LEN as u32),
+            "expected a page-window write covering both slots; sqe lens={writes:?} (9 B-only is the old path)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_writes_by_spent_page_merges_same_page() {
+        let meta = [1u8; META_LEN];
+        let writes = [
+            (16u64, Fk(1), 0, Fk(10), meta),
+            (34u64, Fk(1), 2, Fk(12), meta),
+        ];
+        let g = group_writes_by_spent_page(&writes, 16 + 27);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
+        assert_eq!(g[0].len, 27);
+        assert_eq!(g[0].writes.len(), 2);
+    }
+
+    #[test]
+    fn group_writes_by_spent_page_keeps_distinct_pages() {
+        let meta = [1u8; META_LEN];
+        let writes = [
+            (16u64, Fk(1), 0, Fk(10), meta),
+            (4096u64 + 16, Fk(2), 0, Fk(12), meta),
+        ];
+        let g = group_writes_by_spent_page(&writes, 4096 + 16 + 9);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
+        assert_eq!(g[1].off, 4096);
+    }
+
+    #[test]
+    fn group_writes_by_spent_page_merges_straddle() {
+        let meta = [1u8; META_LEN];
+        // 4093..4102 crosses the 4 KiB boundary; next slot starts at 4102.
+        let writes = [
+            (4093u64, Fk(1), 0, Fk(10), meta),
+            (4102u64, Fk(1), 1, Fk(11), meta),
+        ];
+        let g = group_writes_by_spent_page(&writes, 4111);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].writes.len(), 2);
+        assert!(g[0].off <= 4093);
+        assert!(g[0].off + g[0].len as u64 >= 4111);
     }
 }

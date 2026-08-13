@@ -111,7 +111,7 @@ impl UringSession {
         rw_flags: i32,
     ) -> Result<(), StoreError> {
         #[cfg(test)]
-        test_note_sqe_rw_flags(rw_flags);
+        test_note_sqe(rw_flags, buf.len() as u32);
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -165,7 +165,7 @@ impl UringSession {
         rw_flags: i32,
     ) -> Result<(), StoreError> {
         #[cfg(test)]
-        test_note_sqe_rw_flags(rw_flags);
+        test_note_sqe(rw_flags, buf.len() as u32);
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -367,22 +367,31 @@ pub fn with_thread_local<R>(
     }
 }
 
-// Test hook: last SQE rw_flags values from push_*_flags.
+// Test hook: last SQE rw_flags + buffer lengths from push_*_flags.
 #[cfg(test)]
 thread_local! {
     static LAST_SQE_RW_FLAGS: std::cell::RefCell<Vec<i32>> =
         std::cell::RefCell::new(Vec::new());
+    static LAST_SQE_LENS: std::cell::RefCell<Vec<u32>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
 #[cfg(test)]
-fn test_note_sqe_rw_flags(rw_flags: i32) {
+fn test_note_sqe(rw_flags: i32, len: u32) {
     LAST_SQE_RW_FLAGS.with(|c| c.borrow_mut().push(rw_flags));
+    LAST_SQE_LENS.with(|c| c.borrow_mut().push(len));
 }
 
 /// Drain recorded SQE rw_flags (tests only).
 #[cfg(test)]
 pub fn test_take_last_sqe_rw_flags() -> Vec<i32> {
     LAST_SQE_RW_FLAGS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Drain recorded SQE buffer lengths (tests only).
+#[cfg(test)]
+pub fn test_take_last_sqe_lens() -> Vec<u32> {
+    LAST_SQE_LENS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).

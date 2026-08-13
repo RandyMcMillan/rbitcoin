@@ -69,6 +69,13 @@ impl SortedHead {
         self.fuse.is_some()
     }
 
+    /// Durability barrier (shutdown / SH flush). Data already pwrite'd.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.file
+            .sync_data()
+            .map_err(|e| StoreError::io(&self.path, e))
+    }
+
     /// Write a sealed sorted head. `recs` must be unique and sorted by key16.
     pub fn write(
         path: impl AsRef<Path>,

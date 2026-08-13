@@ -6,12 +6,11 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
 use crate::scripthash_head::{
-    sh_per_shard_key_budget, sh_unique_hint_default, LiveShardTable, ScriptHashHead,
-    ShardedScriptHashHead, SH_HEAD_SHARD_COUNT_MISMATCH,
+    sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead, ShardedScriptHashHead,
+    SH_HEAD_SHARD_COUNT_MISMATCH,
 };
 use crate::scripthash_layout::{
     head_key_from_full, payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
@@ -36,7 +35,7 @@ use crate::sorted_run::{
 };
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -208,12 +207,12 @@ pub struct ScriptHashTable {
     ingest: Mutex<ScriptHashHead>,
     /// Sealed global ovf (sorted+fuse+idx), newest last.
     sealed_ovf: Mutex<Vec<SortedHead>>,
-    /// Mono overflow segment stack (`scripthash.ovf/NNNNNN`) after main seals.
+    /// Mono OA overflow stack — only when main is still OA (no sorted shards).
     overflow: Mutex<ShOverflowStack>,
     /// Main head no longer accepts **new** keys (still updates existing).
     main_sealed: std::sync::atomic::AtomicBool,
-    /// Optional main membership filter after seal (no FN for keys at build).
-    main_fuse: Mutex<Option<SealedFuse8>>,
+    /// At least one sealed sorted main shard is installed.
+    sorted_main_on: std::sync::atomic::AtomicBool,
     alloc: Mutex<AllocState>,
 }
 
@@ -310,42 +309,27 @@ fn open_or_create_ingest(dir: &Path) -> Result<ScriptHashHead, StoreError> {
 }
 
 const MAIN_SEALED_NAME: &str = "scripthash.main_sealed";
-const MAIN_FUSE_NAME: &str = "scripthash.head.fuse8";
 
-/// Fuse key from full Electrum scripthash (uses 16 B head prefix + zero pad).
-#[inline]
-fn sh_fuse_key(full: &[u8; 32]) -> u64 {
-    let mut pad = [0u8; 32];
-    pad[..16].copy_from_slice(&full[..16]);
-    fuse_key_from_mixed(&pad)
+fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
+    let n = n_shards.max(1);
+    (0..n).any(|i| file_starts_with_shsr(&sorted_main_shard_path(dir, i, n)))
 }
 
-/// Load main seal fuse if a valid BF8R file exists (placeholder bytes → None).
-fn load_main_fuse(dir: &Path) -> Option<SealedFuse8> {
-    let path = dir.join(MAIN_FUSE_NAME);
-    if !path.is_file() {
-        return None;
+fn open_or_create_oa_stub(
+    stub: &Path,
+    n_shards: usize,
+) -> Result<ShardedScriptHashHead, StoreError> {
+    let n = n_shards.max(1);
+    if stub.exists() {
+        let head = ShardedScriptHashHead::open_for_role(stub, HeadRole::ScriptHash)?;
+        if head.shard_count() == n {
+            return Ok(head);
+        }
+        return Err(StoreError::Corrupt(
+            "scripthash.head.oa_stub shard count mismatch (delete stub and reopen)",
+        ));
     }
-    SealedFuse8::read_from(&path).ok()
-}
-
-/// Open main head from disk, fold **16 B OA head keys** into fuse u64s, write BF8R.
-///
-/// Not Class A / `tx.body` txids — SH head slots only store Electrum prefix keys.
-fn build_main_fuse_from_disk(dir: &Path) -> Result<(), StoreError> {
-    let head_path = dir.join("scripthash.head");
-    let head = ShardedScriptHashHead::open_for_role(&head_path, HeadRole::ScriptHash)?;
-    let mut set: HashSet<u64> = HashSet::new();
-    head.for_each_occupied(|full, _val| {
-        // `full` is head_key[16] zero-padded to 32 (see ScriptHashHead::for_each_occupied).
-        set.insert(sh_fuse_key(&full));
-        Ok(())
-    })?;
-    let mut keys: Vec<u64> = set.into_iter().collect();
-    keys.sort_unstable();
-    let fuse = SealedFuse8::build(&keys)?;
-    fuse.write_to(&dir.join(MAIN_FUSE_NAME))?;
-    Ok(())
+    ShardedScriptHashHead::create_sharded(stub, n, 64)
 }
 
 /// Where a scripthash key lives for head upsert routing.
@@ -353,8 +337,10 @@ fn build_main_fuse_from_disk(dir: &Path) -> Result<(), StoreError> {
 enum KeyHome {
     /// Already present on main OA or sealed sorted main.
     Main,
-    /// Present on overflow segment `id` (update stays on that segment).
-    Overflow(u32),
+    /// Present on a sealed sorted global ovf file.
+    SealedOvf,
+    /// Present on OA overflow segment `id` (update stays on that segment).
+    OaOverflow(u32),
     /// Present on the global ingest OA.
     Ingest,
     /// Not yet in either head.
@@ -388,7 +374,7 @@ impl ScriptHashTable {
             sealed_ovf: Mutex::new(Vec::new()),
             overflow: Mutex::new(ShOverflowStack::empty(dir)),
             main_sealed: std::sync::atomic::AtomicBool::new(false),
-            main_fuse: Mutex::new(None),
+            sorted_main_on: std::sync::atomic::AtomicBool::new(false),
             alloc: Mutex::new(state),
         })
     }
@@ -408,13 +394,9 @@ impl ScriptHashTable {
                 }
             }
         }
-        if file_starts_with_shsr(&head_path) {
+        if sorted_main_present(dir, expected) {
             let stub = dir.join("scripthash.head.oa_stub");
-            let head = if stub.exists() {
-                ShardedScriptHashHead::open_for_role(&stub, HeadRole::ScriptHash)?
-            } else {
-                ShardedScriptHashHead::create_sharded(&stub, 1, 64)?
-            };
+            let head = open_or_create_oa_stub(&stub, expected)?;
             return Self::from_body_and_head(dir, body, head);
         }
         match ShardedScriptHashHead::open_for_role(&head_path, HeadRole::ScriptHash) {
@@ -438,10 +420,10 @@ impl ScriptHashTable {
         let sealed = dir.join(MAIN_SEALED_NAME).is_file();
         // Opens segmented `scripthash.ovf/`; wipes legacy full-size ovf.head.
         let overflow = ShOverflowStack::open(dir)?;
-        let fuse = load_main_fuse(dir);
         let n_shards = head.shard_count();
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
+        let sorted_on = sorted_main.iter().any(|s| s.is_some());
         let table = Self {
             store_dir: dir.to_path_buf(),
             body,
@@ -451,7 +433,7 @@ impl ScriptHashTable {
             sealed_ovf: Mutex::new(sealed_ovf),
             overflow: Mutex::new(overflow),
             main_sealed: std::sync::atomic::AtomicBool::new(sealed),
-            main_fuse: Mutex::new(fuse),
+            sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
             alloc: Mutex::new(state),
         };
         // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15 slabs.
@@ -503,39 +485,7 @@ impl ScriptHashTable {
         let _ = std::fs::write(&marker, b"1");
         self.main_sealed
             .store(true, std::sync::atomic::Ordering::Release);
-        // Fuse8 is **background** only: seal must not block tip/write while walking
-        // multi‑GiB main OA + building a huge filter. Until the product lands,
-        // sealed routing uses try-upsert (update-only) — slower, never blocks.
-        self.spawn_main_fuse_build();
         Ok(())
-    }
-
-    /// Best-effort bg walk of main head (16 B keys) → BF8R file. Does not touch
-    /// `self.main_fuse` from this thread; [`Self::main_fuse_opt`] reloads when ready.
-    fn spawn_main_fuse_build(&self) {
-        let dir = self.store_dir.clone();
-        let _ = std::thread::Builder::new()
-            .name("sh-main-fuse".into())
-            .spawn(move || {
-                if let Err(e) = build_main_fuse_from_disk(&dir) {
-                    rbitcoin_log::warn!(
-                        "store: scripthash main fuse build failed (try-upsert until retry): {e}"
-                    );
-                }
-            });
-    }
-
-    /// In-memory fuse if ready; otherwise try load BF8R written by the bg builder.
-    fn main_fuse_opt(&self) -> Option<SealedFuse8> {
-        {
-            let g = self.main_fuse.lock().unwrap();
-            if g.is_some() {
-                return g.clone();
-            }
-        }
-        let loaded = load_main_fuse(&self.store_dir)?;
-        *self.main_fuse.lock().unwrap() = Some(loaded.clone());
-        Some(loaded)
     }
 
     /// Seal open overflow segment at load ≥ seal threshold (real BF8R + roll).
@@ -693,6 +643,8 @@ impl ScriptHashTable {
         self.body.set_logical_len(payload0)?;
         self.head.reinit_empty()?;
         *self.sorted_main.lock().unwrap() = (0..self.head.shard_count()).map(|_| None).collect();
+        self.sorted_main_on
+            .store(false, std::sync::atomic::Ordering::Release);
         debug_assert!(self.head.is_empty());
         Ok(())
     }
@@ -793,7 +745,7 @@ impl ScriptHashTable {
             let hk = head_key_from_full(scripthash);
             for h in self.sealed_ovf.lock().unwrap().iter().rev() {
                 if let Some(v) = h.get(&hk)? {
-                    return Ok(Some((v, KeyHome::Overflow(u32::MAX))));
+                    return Ok(Some((v, KeyHome::SealedOvf)));
                 }
             }
             {
@@ -812,13 +764,14 @@ impl ScriptHashTable {
         }
         let g = self.overflow.lock().unwrap();
         if let Some((id, v)) = g.get_with_home(scripthash)? {
-            return Ok(Some((v, KeyHome::Overflow(id))));
+            return Ok(Some((v, KeyHome::OaOverflow(id))));
         }
         Ok(None)
     }
 
     fn has_sorted_main(&self) -> bool {
-        self.sorted_main.lock().unwrap().iter().any(|s| s.is_some())
+        self.sorted_main_on
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1118,7 +1071,7 @@ impl ScriptHashTable {
                     for key in still {
                         if let Some((id, v)) = g.get_with_home(&key)? {
                             heads.insert(key, v);
-                            home.insert(key, KeyHome::Overflow(id));
+                            home.insert(key, KeyHome::OaOverflow(id));
                         } else {
                             home.insert(key, KeyHome::Absent);
                         }
@@ -1222,7 +1175,6 @@ impl ScriptHashTable {
         // Home-segment updates (id → upserts).
         let mut ovf_home: HashMap<u32, Vec<([u8; 32], ShHeadValue)>> = HashMap::new();
 
-        let fuse = self.main_fuse_opt();
         let sealed = self.main_is_sealed();
         let sorted_on = self.has_sorted_main();
 
@@ -1234,10 +1186,10 @@ impl ScriptHashTable {
                 KeyHome::Ingest => {
                     ingest_ups.push((*key, val.clone()));
                 }
-                KeyHome::Overflow(id) if *id == u32::MAX => {
+                KeyHome::SealedOvf => {
                     sealed_ovf_ups.push((*key, val.clone()));
                 }
-                KeyHome::Overflow(id) => {
+                KeyHome::OaOverflow(id) => {
                     ovf_home.entry(*id).or_default().push((*key, val.clone()));
                 }
                 KeyHome::Main if sorted_on => {
@@ -1259,12 +1211,6 @@ impl ScriptHashTable {
                 }
                 KeyHome::Absent => {
                     if sealed {
-                        if let Some(ref f) = fuse {
-                            if !f.contains(sh_fuse_key(key)) {
-                                ovf_new.push((*key, val.clone()));
-                                continue;
-                            }
-                        }
                         main_try.push((*key, val.clone()));
                     } else if self.main_accepts_new_key() {
                         main_try.push((*key, val.clone()));
@@ -1768,8 +1714,8 @@ impl ScriptHashTable {
                 let updated_sorted = {
                     let g = self.sorted_main.lock().unwrap();
                     match g.get(si).and_then(|s| s.as_ref()) {
-                        Some(h) if !new_val.is_empty() => h.update_value(&hk, &new_val)?,
-                        _ => false,
+                        Some(h) => h.update_value(&hk, &new_val)?,
+                        None => false,
                     }
                 };
                 if !updated_sorted {
@@ -1788,7 +1734,23 @@ impl ScriptHashTable {
                     g.insert(scripthash, &new_val)?;
                 }
             }
-            KeyHome::Overflow(_) => {
+            KeyHome::SealedOvf => {
+                let hk = head_key_from_full(scripthash);
+                let g = self.sealed_ovf.lock().unwrap();
+                let mut hit = false;
+                for h in g.iter().rev() {
+                    if h.update_value(&hk, &new_val)? {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    return Err(StoreError::Corrupt(
+                        "scripthash: sealed ovf unlink missed home",
+                    ));
+                }
+            }
+            KeyHome::OaOverflow(_) => {
                 let g = self.overflow.lock().unwrap();
                 if g.is_empty() {
                     return Err(StoreError::Corrupt(
@@ -1812,6 +1774,10 @@ impl ScriptHashTable {
         }
         self.body.flush()?;
         self.head.flush()?;
+        self.ingest.lock().unwrap().flush()?;
+        for h in self.sealed_ovf.lock().unwrap().iter() {
+            h.flush()?;
+        }
         let g = self.overflow.lock().unwrap();
         g.flush()?;
         Ok(())
@@ -1824,6 +1790,10 @@ impl ScriptHashTable {
         }
         self.body.flush_async()?;
         self.head.flush_async()?;
+        self.ingest.lock().unwrap().flush_async()?;
+        for h in self.sealed_ovf.lock().unwrap().iter() {
+            h.flush()?;
+        }
         let g = self.overflow.lock().unwrap();
         g.flush_async()?;
         Ok(())
@@ -1857,10 +1827,8 @@ impl ScriptHashTable {
             (a.bump, a.live_count)
         };
         rbitcoin_log::info!(
-            "store: scripthash bulk_session live OA n_shards={n_shards} unique_hint={hint} \
-             per_shard_keys≈{key_budget} table_MiB≈{:.1}",
-            (crate::scripthash_head::sh_slots_for_keys(key_budget) as f64 * 32.0)
-                / (1024.0 * 1024.0)
+            "store: scripthash bulk_session n_shards={n_shards} unique_hint={hint} \
+             per_shard_keys≈{key_budget} (stream sorted recs; no live OA image)"
         );
         Ok(ScriptHashBulkSession {
             table: self,
@@ -1872,7 +1840,7 @@ impl ScriptHashTable {
             committed_keys: 0,
             resume_from_shard: 0,
             active_shard: None,
-            live: None,
+            recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
             body_write_off: bump,
@@ -1919,11 +1887,9 @@ impl ScriptHashTable {
         let bump = progress.body_bump.max(payload0);
         rbitcoin_log::info!(
             "store: scripthash bulk_session resume next_shard={start}/{n_shards} \
-             bump={bump} live_count={} keys≈{} table_MiB≈{:.1}",
+             bump={bump} live_count={} keys≈{} (stream sorted recs; no live OA image)",
             progress.live_count,
-            progress.keys_written,
-            (crate::scripthash_head::sh_slots_for_keys(key_budget) as f64 * 32.0)
-                / (1024.0 * 1024.0)
+            progress.keys_written
         );
         Ok(ScriptHashBulkSession {
             table: self,
@@ -1935,7 +1901,7 @@ impl ScriptHashTable {
             committed_keys: progress.keys_written,
             resume_from_shard: progress.next_shard,
             active_shard: None,
-            live: None,
+            recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
             body_write_off: bump,
@@ -1957,10 +1923,9 @@ impl ScriptHashTable {
 /// Live-OA bulk writer for cold SH materialize.
 ///
 /// Stream **scripthash-sorted** [`put_chain`] calls. Prefix sharding makes that
-/// order contiguous per head shard: body slabs buffer (~16 MiB); each key is
-/// probe-inserted into a **pre-sized** in-RAM OA image for the active shard.
-/// On shard boundary the image is written once and freed. Peak head RAM ≈ one
-/// final-sized shard table.
+/// order contiguous per head shard: body slabs buffer (~16 MiB); packed
+/// `(key16,value16)` recs accumulate for the active shard and seal to
+/// `SortedHead` on the boundary. Peak head RAM ≈ unique keys in one shard × 32 B.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     /// Directory for [`ColdProgress`] file.
@@ -1974,8 +1939,9 @@ pub struct ScriptHashBulkSession<'a> {
     /// Skip installing keys for shards `< resume_from_shard` (stream may still deliver them).
     resume_from_shard: u32,
     active_shard: Option<usize>,
-    live: Option<LiveShardTable>,
-    /// Unique-key budget used to size each live table (final size).
+    /// Packed sorted recs for the active shard (not an OA image).
+    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
     body_buf: Vec<u8>,
     body_write_off: u64,
@@ -1986,7 +1952,7 @@ pub struct ScriptHashBulkSession<'a> {
     pub body_flush_ns: u64,
     /// Wall time spent installing head shards (write of live image).
     pub head_fill_ns: u64,
-    /// Peak live OA table allocation (bytes) — test/bench meter.
+    /// Peak packed-rec buffer (bytes) — test/bench meter.
     pub peak_table_bytes: usize,
 }
 
@@ -2072,24 +2038,20 @@ impl<'a> ScriptHashBulkSession<'a> {
             ShHeadValue::paged(first, last)
         };
 
-        let live = self
-            .live
-            .as_mut()
-            .ok_or(StoreError::Corrupt("scripthash bulk: no live shard"))?;
-        live.insert(&key, &val)?;
+        debug_assert!(self.active_shard == Some(si));
+        self.recs.push((head_key_from_full(&key), val.encode()));
+        self.peak_table_bytes = self
+            .peak_table_bytes
+            .max(self.recs.len().saturating_mul(32));
         Ok(())
     }
 
     fn start_live_shard(&mut self, si: usize) -> Result<(), StoreError> {
-        let live = LiveShardTable::with_key_budget(self.key_budget);
-        self.peak_table_bytes = self.peak_table_bytes.max(live.table_bytes());
+        self.recs.clear();
         rbitcoin_log::info!(
-            "store: scripthash live shard start id={si} slots={} table_MiB≈{:.1} key_budget={}",
-            live.slots(),
-            live.table_bytes() as f64 / (1024.0 * 1024.0),
+            "store: scripthash live shard start id={si} key_budget={} (stream recs)",
             self.key_budget
         );
-        self.live = Some(live);
         self.active_shard = Some(si);
         Ok(())
     }
@@ -2224,13 +2186,12 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         // Body slabs for this shard's keys must be durable before head points at them.
         self.flush_body()?;
-        if let Some(live) = self.live.take() {
+        if self.active_shard.is_some() {
             let t0 = std::time::Instant::now();
-            let keys = live.keys();
-            let slots = live.slots();
-            let table_mib = live.table_bytes() as f64 / (1024.0 * 1024.0);
-            let occ = live.occupied();
-            let recs = live.collect_sorted_recs();
+            let mut recs = std::mem::take(&mut self.recs);
+            recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            recs.dedup_by(|a, b| a.0 == b.0);
+            let keys = recs.len() as u64;
             if !recs.is_empty() {
                 let n_shards = self.table.head.shard_count();
                 let path = sorted_main_shard_path(&self.table.store_dir, si, n_shards);
@@ -2243,8 +2204,9 @@ impl<'a> ScriptHashBulkSession<'a> {
                     g.resize_with(n_shards, || None);
                 }
                 g[si] = Some(sealed);
-            } else {
-                self.table.head.install_live_shard(si, live)?;
+                self.table
+                    .sorted_main_on
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
             // Publish alloc so complete shards survive kill before finish().
             let state = AllocState {
@@ -2272,8 +2234,9 @@ impl<'a> ScriptHashBulkSession<'a> {
             self.head_fill_ns = self.head_fill_ns.saturating_add(elapsed.as_nanos() as u64);
             self.shards_flushed = self.shards_flushed.saturating_add(1);
             rbitcoin_log::info!(
-                "store: scripthash live shard done id={si} keys={keys} occupied={occ} \
-                 slots={slots} table_MiB≈{table_mib:.1} write={elapsed:?} next_shard={next}"
+                "store: scripthash live shard done id={si} keys={keys} \
+                 recs_MiB≈{:.1} write={elapsed:?} next_shard={next}",
+                (keys as f64 * 32.0) / (1024.0 * 1024.0)
             );
             let _ = self.table.head.shard_advise_dont_need(si);
         }
@@ -2285,7 +2248,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     ///
     /// Call on cooperative cancel so Drop does not install a partial shard.
     pub fn abandon_incomplete(mut self) {
-        self.live = None;
+        self.recs.clear();
         self.active_shard = None;
         self.body_buf.clear();
         self.bump = self.committed_bump;
@@ -2343,8 +2306,8 @@ impl Drop for ScriptHashBulkSession<'_> {
         if self.finished {
             return;
         }
-        // Panic / cancel without abandon: do **not** install partial live shard.
-        self.live = None;
+        // Panic / cancel without abandon: do **not** install a partial shard.
+        self.recs.clear();
         self.active_shard = None;
         self.body_buf.clear();
         let state = AllocState {
@@ -2858,42 +2821,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After seal, fuse excludes new keys → overflow without main get-then-insert.
+    /// After seal, new keys go overflow; existing main keys still update on main.
     #[test]
-    fn sealed_fuse_absent_goes_overflow_try_upsert_updates_main() {
+    fn sealed_absent_goes_overflow_try_upsert_updates_main() {
         let dir = tmp();
-        // Fixed mono 64-slot head — not `create()` alone (env race on HEAD_SCALE).
         let t = create_tiny_mono_sh(&dir);
         let _n_main = fill_until_main_sealed(&t, 0xd0);
         assert!(t.main_is_sealed());
-        // fill_until_main_sealed: tag + i LE bytes; first key is i=0.
         let sh0 = script_hash(&[0xd0, 0, 0, 0x7e]);
-        // Fuse is built asynchronously — wait for BF8R product (tiny heads are quick).
-        for _ in 0..200 {
-            if dir.join(MAIN_FUSE_NAME).is_file() && load_main_fuse(&dir).is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            load_main_fuse(&dir).is_some(),
-            "bg fuse must write valid BF8R (not placeholder)"
-        );
-        assert!(
-            t.main_fuse_opt().is_some(),
-            "main_fuse_opt reloads when ready"
-        );
 
         let sh_new = script_hash(&[0xd1, 0xaa, 0xbb, 0xcc]);
         t.put_create(&rec(sh_new, 7_777, 0)).unwrap();
         assert!(
             t.head.get(&sh_new).unwrap().is_none(),
-            "fuse-absent key must not land on main"
+            "sealed absent key must not land on main"
         );
         assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert!(t.contains_create(&sh_new, Fk(7_777)).unwrap());
 
-        // Existing main key: try-upsert path (fuse says present) updates main.
         t.put_create(&rec(sh0, 8_888, 1)).unwrap();
         assert!(t.head.get(&sh0).unwrap().is_some());
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
@@ -2901,10 +2846,6 @@ mod tests {
 
         drop(t);
         let t = ScriptHashTable::open(&dir).unwrap();
-        assert!(
-            t.main_fuse_opt().is_some() || load_main_fuse(&dir).is_some(),
-            "fuse reloads on open"
-        );
         assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2918,13 +2859,9 @@ mod tests {
         let t = create_tiny_mono_sh(&dir);
         let n_main = fill_until_main_sealed(&t, 0xe0);
         assert!(t.main_is_sealed());
-        // Free slots remain (~0.8 of 64); drop fuse so Absent is forced through
-        // try-upsert (not fuse-absent short-circuit).
-        *t.main_fuse.lock().unwrap() = None;
-        let _ = std::fs::remove_file(dir.join(MAIN_FUSE_NAME));
 
         let sh_new = script_hash(&[0xe1, 0x11, 0x22, 0x33]);
-        // Public put: KeyHome::Absent, sealed, no fuse → try main update-only.
+        // Public put: KeyHome::Absent, sealed → try main update-only.
         t.put_create(&rec(sh_new, 42_042, 0)).unwrap();
 
         assert!(
@@ -3018,17 +2955,6 @@ mod tests {
         assert!(
             dir.join(MAIN_SEALED_NAME).is_file() || ratio >= ShardedScriptHashHead::SH_SEAL_LOAD,
             "seal marker or load gate"
-        );
-        // Bg fuse (may lag); sealed routing is correct via try-upsert until ready.
-        for _ in 0..200 {
-            if load_main_fuse(&dir).is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            load_main_fuse(&dir).is_some(),
-            "bg main fuse BF8R after seal (tiny head)"
         );
 
         drop(t);
@@ -3393,6 +3319,62 @@ mod tests {
             0,
             "key already on ingest must not pread the main page"
         );
+        t.flush().unwrap();
+        drop(t);
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t.entries(&sh_main).unwrap().len(), 3);
+        assert_eq!(t.entries(&sh_new).unwrap().len(), 2);
+        assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+        assert!(matches!(t.key_home(&sh_new).unwrap(), KeyHome::Ingest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_after_ingest_seal_and_unlink_homes() {
+        let _g = HEAD_SCALE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh_main = script_hash(&[0x10]);
+        let mut session = t.bulk_session(8).unwrap();
+        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+        session.finish().unwrap();
+
+        let mut first_new = [0u8; 32];
+        for i in 0..210u32 {
+            let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
+            if i == 0 {
+                first_new = sh;
+            }
+            t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
+        }
+        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+        assert!(matches!(
+            t.key_home(&first_new).unwrap(),
+            KeyHome::SealedOvf
+        ));
+
+        t.unlink_create(&sh_main, Fk(1), 0).unwrap();
+        assert!(t.entries(&sh_main).unwrap().is_empty());
+        t.unlink_create(&first_new, Fk(1000), 0).unwrap();
+        assert!(t.entries(&first_new).unwrap().is_empty());
+
+        t.flush().unwrap();
+        drop(t);
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert!(t.entries(&sh_main).unwrap().is_empty());
+        assert!(t.entries(&first_new).unwrap().is_empty());
+        assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+        assert!(matches!(
+            t.key_home(&first_new).unwrap(),
+            KeyHome::SealedOvf
+        ));
+        if let Some(v) = prev_scale {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", v);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3672,10 +3654,8 @@ mod tests {
         assert_eq!(creates, u64::from(N));
         assert_eq!(keys, u64::from(N));
         assert_eq!(t.entry_count(), u64::from(N));
-        // Peak live table sized from unique_hint, not a multi-GiB create-count bug.
-        let budget = crate::scripthash_head::sh_per_shard_key_budget(u64::from(N), 1);
-        let expect_slots = crate::scripthash_head::sh_slots_for_keys(budget);
-        assert_eq!(peak, (expect_slots as usize) * 32);
+        // Peak is packed recs (32 B/key), not a 2 GiB OA slot table.
+        assert_eq!(peak, (N as usize) * 32);
         // Spot-check a few keys survive live install.
         for i in [0u32, 1, 65_535, 70_000, N - 1] {
             let ents = t.entries(&key(i)).unwrap();
@@ -3778,9 +3758,7 @@ mod tests {
         session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
         let peak = session.peak_table_bytes;
         let _ = session.finish().unwrap();
-        let budget = crate::scripthash_head::sh_per_shard_key_budget(1_000, 1);
-        let expect = (crate::scripthash_head::sh_slots_for_keys(budget) as usize) * 32;
-        assert_eq!(peak, expect);
+        assert_eq!(peak, 32, "one streamed rec is 32 B, not an OA image");
         assert!(
             peak < 16 * 1024 * 1024,
             "peak {peak} looks like create-count sizing"

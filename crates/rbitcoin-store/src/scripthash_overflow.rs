@@ -45,6 +45,15 @@ pub fn ovf_fuse_path(store_dir: &Path, id: u32) -> PathBuf {
     ovf_dir(store_dir).join(format!("{id:06}.fuse8"))
 }
 
+fn file_is_shsr(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    matches!(f.read_exact(&mut magic), Ok(())) && magic == *b"SHSR"
+}
+
 /// Fuse key from full Electrum scripthash (16 B head prefix + zero pad).
 #[inline]
 pub fn sh_ovf_fuse_key(full: &[u8; 32]) -> u64 {
@@ -128,6 +137,11 @@ impl ShOverflowStack {
             .collect();
         ids.sort_unstable();
         ids.dedup();
+        // Sorted sealed ovf (SHSR + .idx + .fuse8) is ScriptHashTable::sealed_ovf.
+        ids.retain(|id| !file_is_shsr(&ovf_seg_path(store_dir, *id)));
+        if ids.is_empty() {
+            return Ok(Self::empty(store_dir));
+        }
         let mut segs = Vec::with_capacity(ids.len());
         for (i, id) in ids.iter().enumerate() {
             if i > 0 && *id != ids[i - 1] + 1 {
@@ -210,6 +224,7 @@ impl ShOverflowStack {
     }
 
     /// Probe open then sealed newest→oldest (fuse skip when present).
+    #[cfg(test)]
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         for seg in self.segs.iter().rev() {
             if let Some(ref f) = seg.fuse {

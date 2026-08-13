@@ -1355,6 +1355,7 @@ impl ShardedScriptHashHead {
     }
 
     /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
+    #[cfg(test)]
     pub fn install_live_shard(&self, shard: usize, live: LiveShardTable) -> Result<(), StoreError> {
         if shard >= self.shards.len() {
             return Err(StoreError::Corrupt(

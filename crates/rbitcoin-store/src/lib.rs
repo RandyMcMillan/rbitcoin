@@ -35,6 +35,7 @@ mod scripthash_pages;
 mod segmented_head;
 mod sharded_hashhead;
 mod sorted_run;
+mod sp_tweaks;
 pub mod spend_annotate_uring;
 mod spender_table;
 mod store;
@@ -107,6 +108,7 @@ pub use sorted_run::{
     write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult, RunWritePolicy,
     SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME, FANIN_TARGET_STREAM_RUNS,
 };
+pub use sp_tweaks::{SpTweaksSlot, SpTweaksTable, TWEAK_LEN};
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
 pub use store::{Store, TxidResolveMode};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};

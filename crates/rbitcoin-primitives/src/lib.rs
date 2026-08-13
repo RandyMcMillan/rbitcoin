@@ -163,6 +163,8 @@ pub enum TableKind {
     Spender = 13,
     /// Dense create_fk-ordered txid sidefile (`txid.body`).
     TxidBody = 14,
+    /// Optional BIP-352 thin tweak body (`sp_tweaks.body`). Schema 14 side product.
+    SpTweaks = 15,
 }
 
 impl TableKind {
@@ -182,6 +184,7 @@ impl TableKind {
             12 => Some(TableKind::TxHeight),
             13 => Some(TableKind::Spender),
             14 => Some(TableKind::TxidBody),
+            15 => Some(TableKind::SpTweaks),
             _ => None,
         }
     }
@@ -227,7 +230,7 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in 1u16..=14 {
+        for v in 1u16..=15 {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
@@ -235,6 +238,7 @@ mod tests {
         assert!(TableKind::from_u16(99).is_none());
         assert_eq!(TableKind::Spender.as_u16(), 13);
         assert_eq!(TableKind::TxidBody.as_u16(), 14);
+        assert_eq!(TableKind::SpTweaks.as_u16(), 15);
     }
 
     #[test]

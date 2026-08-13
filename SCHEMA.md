@@ -45,6 +45,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.ovf/NNNNNN[.fuse8] # mono ovf segments (1 main-shard slots; seal+roll)
     archive_epoch
     scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
+    sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
   wire/                          # tip wire ring (soft zone)
 ```
 
@@ -80,6 +81,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | 10 | hash_head |
 | 11 | scripthash |
 | 14 | txid_body (`txid.body`) |
+| 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
 
 ---
 
@@ -225,6 +227,29 @@ Only when an outpoint has **≥2** annotated spenders.
 - `header_txs_first[header_fk − 1]` = first_tx_fk (0 = no body)
 - `header_txs_count[header_fk − 1]` = n  
 Contiguous assignment required: block membership is an arithmetic range.
+
+### Optional BIP-352 thin tweaks (`sp_tweaks.*`)
+
+Schema **14** side product — **no** `SCHEMA_VERSION` bump. Soft-open: missing
+files are empty (not `Corrupt`, not a head recreate). Created when `--sptweaks`
+is on.
+
+`sp_tweaks.idx` (kind array_link): after the 16-byte header, `origin_height:u32`
++ 4-byte pad, then dense slots from `origin` (`ChainParams::taproot_height`):
+
+```text
+slot[i] = block_fk:u64  ‖  off:u32
+          header_fk        absolute start in sp_tweaks.body
+```
+
+`n_tx` is **not** stored (`header_txs_count[block_fk]`). `block_fk` must match
+`confirmed[h]` or the slot is a hole (naive fallback).
+
+`sp_tweaks.body` (kind 15): per tx in `header_txs` order, `u8 len` then `len`
+bytes. `len=0` = no tweak; `len=33` = compressed `A_tweak`. No txids, outs, or
+parent scripts.
+
+Reorg: truncate slots above the new tip (same era as SH HWM).
 
 ---
 

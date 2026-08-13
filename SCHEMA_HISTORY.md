@@ -32,6 +32,12 @@ Versions below are listed **newest → oldest** after the summary table.
 
 See [`SCHEMA.md`](./SCHEMA.md).
 
+### Side product: `sp_tweaks.*` thin BIP-352 index (still schema 14)
+
+Optional `sp_tweaks.idx` + `sp_tweaks.body`. Soft-open; missing files are empty.
+Not a `SCHEMA_VERSION` bump. Persist is `len:tweak` only (`0` or `33` +
+compressed `A_tweak`); Cake outs join Class A packed body.
+
 ### Side format: sealed fuse8 payload v1 → v2 (still schema 14)
 
 Not a full `SCHEMA_VERSION` bump — Class A / `tx.head` OA layout unchanged.

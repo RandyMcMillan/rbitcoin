@@ -32,6 +32,7 @@ mod scripthash_head;
 mod scripthash_layout;
 mod scripthash_overflow;
 mod scripthash_pages;
+mod scripthash_slabs;
 mod segmented_head;
 mod sharded_hashhead;
 mod sorted_run;
@@ -88,6 +89,11 @@ pub use scripthash_head::{
     LiveShardTable,
 };
 pub use scripthash_layout::ShHeadValue;
+pub use scripthash_slabs::{
+    decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream, encode_slab_payload,
+    page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
+    slab_class_for_n_fks_with_slack, SH_MAX_SLAB_CLASS, SH_MEGAKEY_MIN_FKS,
+};
 pub use segmented_head::{
     sample_lookup_stats as sample_head_lookup_stats,
     snapshot_lookup_stats as snapshot_head_lookup_stats, HeadLookupStats, SegmentedTxHead,

@@ -51,13 +51,13 @@ pub fn head_key_from_full(full: &[u8; 32]) -> ShHeadKey {
 }
 
 #[inline]
-pub fn slab_cap(class: u8) -> u32 {
+pub const fn slab_cap(class: u8) -> u32 {
     SH_SLAB_BASE << class
 }
 
 #[inline]
-pub fn slab_bytes(class: u8) -> u64 {
-    u64::from(slab_cap(class)) * SH_ENTRY_LEN as u64
+pub const fn slab_bytes(class: u8) -> u64 {
+    slab_cap(class) as u64 * SH_ENTRY_LEN as u64
 }
 
 /// One thin create: create_tx_fk only (vout recovered from Class A).

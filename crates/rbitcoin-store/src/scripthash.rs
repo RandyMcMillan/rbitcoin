@@ -1602,12 +1602,7 @@ impl ScriptHashTable {
         } else {
             slab_class_for_n_fks(n)
         }?;
-        for c in start..=SH_MAX_SLAB_CLASS {
-            if slab_bytes(c) as usize >= packed_len {
-                return Some(c);
-            }
-        }
-        None
+        (start..=SH_MAX_SLAB_CLASS).find(|&c| slab_bytes(c) as usize >= packed_len)
     }
 
     fn read_slab(&self, class: u8, off: u64) -> Result<Vec<ShEntry>, StoreError> {

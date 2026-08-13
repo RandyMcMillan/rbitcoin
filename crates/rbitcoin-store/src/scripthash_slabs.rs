@@ -23,12 +23,7 @@ pub fn slab_class_for_n_fks(n: u32) -> Option<u8> {
     if n as usize <= SH_INLINE_CAP || n > slab_cap(SH_MAX_SLAB_CLASS) {
         return None;
     }
-    for c in 0..=SH_MAX_SLAB_CLASS {
-        if slab_cap(c) >= n {
-            return Some(c);
-        }
-    }
-    None
+    (0..=SH_MAX_SLAB_CLASS).find(|&c| slab_cap(c) >= n)
 }
 
 /// Tip-grow picker: hold `n` with one spare slot when a larger class exists.

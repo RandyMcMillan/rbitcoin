@@ -1162,6 +1162,20 @@ mod tests {
     }
 
     #[test]
+    fn sh_index_insert_overwrite_and_remove_miss() {
+        let mut idx = MempoolShIndex::new();
+        let t = Txid::from_byte_array([1u8; 32]);
+        let sh = [2u8; 32];
+        idx.insert(t, vec![sh]);
+        idx.insert(t, vec![sh]); // overwrite same mapping
+        assert_eq!(idx.txs_for(&sh).count(), 1);
+        idx.remove(&t);
+        idx.remove(&t); // miss
+        assert_eq!(idx.txs_for(&sh).count(), 0);
+        assert!(idx.txs_for(&[3u8; 32]).next().is_none());
+    }
+
+    #[test]
     fn package_codec_roundtrip() {
         let tx = Transaction {
             version: Version::TWO,
@@ -1207,6 +1221,94 @@ mod tests {
         // Still no-op for unknown txid, but path is live.
         assert_eq!(mp.remove_for_block(&[dummy]), 0);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Accept → persist → reopen rebuilds the scripthash index; remove unindexes.
+    #[test]
+    fn sh_index_reopen_and_remove_unindexes() {
+        use bitcoin::transaction::Version as TxVersion;
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::script_hash;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            103,
+            1,
+        );
+        let q = Arc::new(q);
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let mut rx = hub.subscribe_announces();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = script_hash(spk.as_bytes());
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: spk,
+            }],
+        };
+        hub.accept_tx(&parent).expect("accept");
+        let ann = rx.try_recv().expect("announce");
+        assert!(ann.scripthashes.contains(&sh), "announce lists output sh");
+        // Child spends mempool parent — indexes input SH via graph.creator.
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9998_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        hub.accept_tx(&child).expect("child");
+        assert!(hub.scripthash_mempool(&sh).len() >= 2);
+        hub.flush().unwrap();
+        drop(hub);
+
+        // Reopen: reindex_live_scripthashes must restore the mapping.
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        assert!(hub.scripthash_mempool(&sh).len() >= 2);
+        assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+        // Child remains indexed until removed.
+        assert!(!hub.scripthash_mempool(&sh).is_empty());
+        assert!(hub.remove_for_block(&[child.compute_txid()]) >= 1);
+        assert!(hub.scripthash_mempool(&sh).is_empty());
+        let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 

@@ -51,6 +51,9 @@ pub struct NodeConfig {
     /// Build Class B scripthash index (Electrum/Esplora history). Default **off**.
     /// When off: tip follow and node JSON-RPC work without SH bulk materialize.
     pub shindex: bool,
+    /// Persist / serve BIP-352 tweaks from `sp_tweaks.*`. Default **off**.
+    /// Electrum `blockchain.tweaks.subscribe` still works naive when off.
+    pub sptweaks: bool,
     /// Core-class JSON-RPC HTTP listen (`None` = disabled). Plain HTTP; TLS via proxy.
     pub rpc_listen: Option<SocketAddr>,
     /// Optional RPC Basic auth user (with [`Self::rpc_password`]). When both unset
@@ -101,6 +104,7 @@ impl Default for NodeConfig {
             electrum_listen: None,
             esplora_listen: None,
             shindex: false,
+            sptweaks: false,
             rpc_listen: None,
             rpc_user: None,
             rpc_password: None,
@@ -360,6 +364,10 @@ impl NodeConfig {
                 "shindex" => {
                     self.shindex = parse_conf_bool(val)
                         .map_err(|e| NodeError::Config(format!("conf shindex: {e}")))?;
+                }
+                "sptweaks" => {
+                    self.sptweaks = parse_conf_bool(val)
+                        .map_err(|e| NodeError::Config(format!("conf sptweaks: {e}")))?;
                 }
                 "rpc_listen" | "rpclisten" => {
                     self.rpc_listen = Some(
@@ -760,6 +768,18 @@ mod tests {
     }
 
     #[test]
+    fn sptweaks_conf_parses() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("sp.conf");
+        std::fs::write(&conf, "sptweaks=1\n").unwrap();
+        let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
+        cfg.merge_conf_file(&conf).unwrap();
+        assert!(cfg.sptweaks);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn electrum_with_shindex_validates() {
         let mut cfg = NodeConfig::default().with_datadir(tmp());
         cfg.shindex = true;
@@ -797,6 +817,7 @@ mod tests {
         assert!(cfg.p2p_listen.is_some());
         assert_eq!(cfg.connect.len(), 1);
         assert!(cfg.shindex);
+        assert!(!cfg.sptweaks);
         assert!(cfg.electrum_listen.is_some());
         assert!(cfg.esplora_listen.is_some());
         assert!(cfg.rpc_listen.is_some());

@@ -86,10 +86,71 @@ pub fn tweak_from_tx(tx: &Transaction, prevouts: &[TxOut]) -> Option<TxTweak> {
     })
 }
 
+/// Prefer the thin index (no parent peeks). Hole / no table → [`tweaks_for_height`].
+pub fn tweaks_at_height(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+) -> Result<BTreeMap<[u8; 32], TxTweak>, ConsensusError> {
+    if !params.taproot_active_at(height.0) {
+        return Ok(BTreeMap::new());
+    }
+    match query.load_thin_tweaks(height) {
+        Ok(Some(rows)) => {
+            let mapped: Vec<([u8; 32], Option<[u8; 33]>, Option<&[OutputRecord]>)> = rows
+                .iter()
+                .map(|r| (r.txid, r.tweak, r.outputs.as_deref()))
+                .collect();
+            return tweaks_from_thin_and_body(&mapped).map_err(Into::into);
+        }
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+    tweaks_for_height(query, params, height)
+}
+
+/// Sequential hole fill from the table’s next height through tip.
+pub fn backfill_sp_tweaks(query: &Query, params: &ChainParams) -> Result<u32, ConsensusError> {
+    if !query.sptweaks_enabled() {
+        return Ok(0);
+    }
+    let Some(tip) = query.tip_height() else {
+        return Ok(0);
+    };
+    let origin = query.sptweaks_origin();
+    let mut wrote = 0u32;
+    let mut h = query
+        .sptweaks_next_height()
+        .unwrap_or(origin)
+        .0
+        .max(origin.0);
+    while h <= tip.0 {
+        let height = Height(h);
+        let Some(header_fk) = query.store().confirmed.get(height)? else {
+            break;
+        };
+        let fks = match query.block_tx_fks(height) {
+            Ok(f) => f,
+            Err(StoreError::NotFound) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let map = tweaks_for_height(query, params, height)?;
+        let mut recs = Vec::with_capacity(fks.len());
+        for fk in fks {
+            let txid = query.store().txs.body_txid(fk)?;
+            recs.push(map.get(&txid).map(|t| t.tweak));
+        }
+        query.put_sp_tweaks_block(height, header_fk, &recs)?;
+        wrote = wrote.saturating_add(1);
+        h = h.saturating_add(1);
+    }
+    Ok(wrote)
+}
+
 /// Confirmed height → eligible txid (internal order) → tweak.
 ///
 /// Pre-Taproot and missing heights return an empty map (no error). Does not
-/// reconstruct a wire block.
+/// reconstruct a wire block. Walks packed bodies **and parent outs**.
 pub fn tweaks_for_height(
     query: &Query,
     params: &ChainParams,
@@ -165,6 +226,54 @@ pub fn tweaks_for_height(
         }
     }
     Ok(out)
+}
+
+/// Cake `TxTweak` from a stored 33-byte tweak + this tx’s packed outs.
+///
+/// No parent IO. `Some(tweak)` with missing packed outs is corrupt.
+pub fn tweaks_from_thin_and_body(
+    rows: &[([u8; 32], Option<[u8; 33]>, Option<&[OutputRecord]>)],
+) -> Result<BTreeMap<[u8; 32], TxTweak>, StoreError> {
+    let mut out = BTreeMap::new();
+    for (txid, tweak, outs) in rows {
+        let Some(tweak) = tweak else {
+            continue;
+        };
+        let Some(outs) = outs else {
+            return Err(StoreError::Corrupt(
+                "invariant: thin tweak missing packed body",
+            ));
+        };
+        out.insert(
+            *txid,
+            TxTweak {
+                tweak: *tweak,
+                output_pubkeys: taproot_outs_from_records(outs),
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn taproot_outs_from_records(outputs: &[OutputRecord]) -> Vec<TaprootOut> {
+    let mut out = Vec::new();
+    for (i, o) in outputs.iter().enumerate() {
+        if !is_p2tr(&o.script) {
+            continue;
+        }
+        if o.script.len() < 34 {
+            continue;
+        }
+        let mut xonly = [0u8; 32];
+        xonly.copy_from_slice(&o.script[2..34]);
+        let value = if o.value < 0 { 0 } else { o.value as u64 };
+        out.push(TaprootOut {
+            vout: i as u32,
+            xonly,
+            value,
+        });
+    }
+    out
 }
 
 fn build_tx_and_prevouts(
@@ -437,6 +546,7 @@ fn is_p2sh_p2wpkh_redeem(script_sig: &Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Milestone;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::deserialize;
     use bitcoin::hashes::Hash;
@@ -742,6 +852,95 @@ mod tests {
     }
 
     #[test]
+    fn thin_compose_matches_engine_outs_without_parents() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        // Reuse the P2WPKH→P2TR spend from the walk test via a tiny local chain.
+        use bitcoin::hashes::hash160;
+        use bitcoin::secp256k1::SecretKey;
+        let secp_ctx = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
+        let ser = pk.serialize();
+        let h160 = hash160::Hash::hash(&ser);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(h160.as_ref());
+        let (xonly, _) = pk.x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&xonly.serialize());
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: genesis_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
+                }],
+            )
+            .unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let h1 = header(1, fk0, Some(h0.hash));
+        q.connect_block(
+            Height(1),
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 2,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: genesis_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![vec![0u8; 64], ser.to_vec()],
+                }],
+                outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr.clone())],
+            }],
+        )
+        .unwrap();
+
+        let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
+        let t = naive.get(&spend_txid).unwrap();
+        let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+        let (_rec, _ins, outs) = q.store().get_tx_full(spend_fk).unwrap();
+        let composed =
+            tweaks_from_thin_and_body(&[(spend_txid, Some(t.tweak), Some(outs.as_slice()))])
+                .unwrap();
+        let c = composed.get(&spend_txid).unwrap();
+        assert_eq!(c.tweak, t.tweak);
+        assert_eq!(c.output_pubkeys, t.output_pubkeys);
+
+        let miss = tweaks_from_thin_and_body(&[(spend_txid, Some(t.tweak), None)]);
+        assert!(
+            matches!(miss, Err(StoreError::Corrupt(m)) if m.contains("invariant")),
+            "got {miss:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tweaks_for_height_unknown_is_empty() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
@@ -752,6 +951,116 @@ mod tests {
         assert!(tweaks_for_height(&q, &main, Height(100))
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_hook_writes_thin_and_reorg_truncates() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
+        let thin0 = q.load_thin_tweaks(Height(0)).unwrap().expect("indexed");
+        assert_eq!(thin0.len(), 1);
+        assert!(thin0[0].tweak.is_none(), "coinbase is not eligible");
+
+        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
+
+        q.disconnect_tip().unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
+        assert!(q.load_thin_tweaks(Height(1)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexed_serve_matches_naive_without_parent_walk() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        // Build the P2WPKH→P2TR spend via connect_block, then backfill.
+        use bitcoin::hashes::hash160;
+        use bitcoin::secp256k1::SecretKey;
+        let secp_ctx = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
+        let ser = pk.serialize();
+        let h160 = hash160::Hash::hash(&ser);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(h160.as_ref());
+        let (xonly, _) = pk.x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&xonly.serialize());
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: genesis_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+                }],
+            )
+            .unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let h1 = header(1, fk0, Some(h0.hash));
+        q.connect_block(
+            Height(1),
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 2,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: genesis_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![vec![0u8; 64], ser.to_vec()],
+                }],
+                outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
+            }],
+        )
+        .unwrap();
+
+        let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
+        assert_eq!(naive.len(), 1);
+        let n = backfill_sp_tweaks(&q, &params).unwrap();
+        assert_eq!(n, 2);
+        let indexed = tweaks_at_height(&q, &params, Height(1)).unwrap();
+        assert_eq!(
+            indexed.get(&spend_txid).unwrap().tweak,
+            naive.get(&spend_txid).unwrap().tweak
+        );
+        assert_eq!(
+            indexed.get(&spend_txid).unwrap().output_pubkeys,
+            naive.get(&spend_txid).unwrap().output_pubkeys
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

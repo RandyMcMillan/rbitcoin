@@ -1,6 +1,6 @@
 //! Cake-compatible `blockchain.tweaks.subscribe` (naive, uncached).
 
-use rbitcoin_consensus::{tweaks_for_height, ChainParams, TxTweak};
+use rbitcoin_consensus::{tweaks_at_height, ChainParams, TxTweak};
 use rbitcoin_primitives::{hex_encode, Height};
 use rbitcoin_query::Query;
 use serde_json::{json, Map, Value};
@@ -36,7 +36,7 @@ pub fn height_map(query: &Query, chain: &ChainParams, h: u32) -> Result<Value, S
     if tip.is_none_or(|t| h > t) {
         return Ok(json!({ h.to_string(): {} }));
     }
-    let tweaks = tweaks_for_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
+    let tweaks = tweaks_at_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
     Ok(json!({ h.to_string(): height_object(&tweaks) }))
 }
 

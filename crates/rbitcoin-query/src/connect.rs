@@ -534,6 +534,7 @@ impl Query {
 
         // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
         self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
+        self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         Ok(())
     }
 }

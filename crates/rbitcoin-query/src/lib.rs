@@ -15,6 +15,7 @@ mod run_builder_core;
 mod scripthash;
 mod sh_builder;
 mod soft_densify;
+mod sp_tweaks;
 mod wave_prevout;
 
 pub use combined_stage::{body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate};
@@ -22,6 +23,7 @@ pub use soft_densify::{
     soft_assign_restricted, soft_confirm_window_covered, soft_confirm_window_n,
     soft_densify_band_hi, BQ_SOFT_CONFIRM_SECS, BQ_SOFT_FREE_BYTES,
 };
+pub use sp_tweaks::ThinTweakRow;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -33,12 +35,12 @@ use bitcoin::{
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
-    script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
-    StoreError, TxRecord,
+    script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
+    SpTweaksTable, Store, StoreError, TxRecord,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub type QueryError = StoreError;
@@ -992,6 +994,11 @@ pub struct Query {
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
     sh_index_enabled: std::sync::atomic::AtomicBool,
+    /// Optional BIP-352 thin tweak index (`--sptweaks`). Files may exist when off.
+    sp_tweaks: Mutex<Option<SpTweaksTable>>,
+    sptweaks_enabled: AtomicBool,
+    /// `taproot_height` used when creating the table. 0 until enabled / opened.
+    sptweaks_origin: AtomicU32,
     /// Explicit [`IndexMode`] (Direct / Tip).
     index_mode_cell: std::sync::atomic::AtomicU8,
     /// Cooperative cancel for in-flight confirm load. Set on IBD SIGINT
@@ -1049,6 +1056,20 @@ impl Query {
             );
         }
         let store_path = store.path().to_path_buf();
+        let (sp_tweaks, sptweaks_origin) = if SpTweaksTable::files_present(&store_path) {
+            match SpTweaksTable::open(&store_path) {
+                Ok(t) => {
+                    let origin = t.origin_height().0;
+                    (Some(t), origin)
+                }
+                Err(e) => {
+                    eprintln!("rbitcoin: sp_tweaks open failed ({e}); treating as empty");
+                    (None, 0)
+                }
+            }
+        } else {
+            (None, 0)
+        };
         // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
         let sh_through = store.tip_height().map(|h| h.0 as u64).unwrap_or(u64::MAX);
         let q = Self {
@@ -1064,6 +1085,9 @@ impl Query {
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
+            sp_tweaks: Mutex::new(sp_tweaks),
+            sptweaks_enabled: AtomicBool::new(false),
+            sptweaks_origin: AtomicU32::new(sptweaks_origin),
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),

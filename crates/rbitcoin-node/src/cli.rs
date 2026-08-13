@@ -29,6 +29,8 @@ where
     let mut esplora_listen: Option<SocketAddr> = None;
     let mut shindex = false;
     let mut shindex_set = false;
+    let mut sptweaks = false;
+    let mut sptweaks_set = false;
     let mut rpc_listen: Option<SocketAddr> = None;
     let mut rpc_user: Option<String> = None;
     let mut rpc_password: Option<String> = None;
@@ -59,7 +61,7 @@ where
                     "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
-    [--shindex] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
+    [--shindex] [--sptweaks] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
@@ -74,6 +76,7 @@ Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound/--maxconnections (default 125).\n\
 Memory: --archive-queue-mb (default 512 soft densify meter).\n\
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
 RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
 Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
@@ -233,6 +236,11 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
             "--shindex" | "-shindex" => {
                 shindex = true;
                 shindex_set = true;
+                i += 1;
+            }
+            "--sptweaks" | "-sptweaks" => {
+                sptweaks = true;
+                sptweaks_set = true;
                 i += 1;
             }
             "--rpc-listen" => {
@@ -496,6 +504,9 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if shindex_set {
         config.shindex = shindex;
+    }
+    if sptweaks_set {
+        config.sptweaks = sptweaks;
     }
     if let Some(a) = rpc_listen {
         config.rpc_listen = Some(a);

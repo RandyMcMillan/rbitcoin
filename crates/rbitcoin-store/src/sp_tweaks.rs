@@ -297,6 +297,18 @@ impl SpTweaksTable {
         } else {
             u64::from(new_tip.0 - self.origin + 1)
         };
+        self.truncate_keep_slots(keep)
+    }
+
+    /// `tip == None` drops every slot (empty chain).
+    pub fn truncate_through_tip(&self, tip: Option<Height>) -> Result<(), StoreError> {
+        match tip {
+            None => self.truncate_keep_slots(0),
+            Some(h) => self.truncate_above(h),
+        }
+    }
+
+    fn truncate_keep_slots(&self, keep: u64) -> Result<(), StoreError> {
         let n = self.slot_count();
         if keep >= n {
             return Ok(());

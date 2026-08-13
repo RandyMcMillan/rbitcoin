@@ -125,7 +125,10 @@ pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoin
 pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
 pub use regtest_pad::{mine_empty_regtest, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
-pub use silent_payments::{tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak};
+pub use silent_payments::{
+    backfill_sp_tweaks, tweak_from_tx, tweaks_at_height, tweaks_for_height,
+    tweaks_from_thin_and_body, TaprootOut, TxTweak,
+};
 
 pub fn crate_name() -> &'static str {
     "rbitcoin-consensus"

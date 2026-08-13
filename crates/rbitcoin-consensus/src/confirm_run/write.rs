@@ -134,6 +134,18 @@ pub fn confirm_write_phase(
     let (spend_ann_ns, tip_gc_ns) =
         post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
+    if query.sptweaks_enabled() {
+        if let Err(e) = index_sp_tweaks_batch(
+            query,
+            params,
+            &batch.prepared,
+            &batch.wire_blocks,
+            &batch.batch_parents,
+        ) {
+            rbitcoin_log::warn!("sp_tweaks: skip confirm batch: {e}");
+        }
+    }
+
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     confirm_phase_stats::note_last_write(confirm_phase_stats::LastWritePhases {
@@ -217,4 +229,72 @@ pub(super) fn fill_planned_create_layout_after_commit(
         batch_parents.set_layout(fk, (off, len), dense_rels);
     }
     Ok(())
+}
+
+fn index_sp_tweaks_batch(
+    query: &Query,
+    params: &ChainParams,
+    prepared: &[Prepared],
+    wires: &[Arc<Block>],
+    parents: &rbitcoin_query::BatchParents,
+) -> Result<(), ConsensusError> {
+    let origin = params.taproot_height();
+    for (p, block) in prepared.iter().zip(wires.iter()) {
+        if p.height.0 < origin {
+            continue;
+        }
+        let recs = match records_from_wire(p, block, parents) {
+            Some(r) => r,
+            None => {
+                rbitcoin_log::warn!("sp_tweaks: skip height {} (missing parent pin)", p.height.0);
+                continue;
+            }
+        };
+        query.put_sp_tweaks_block(p.height, p.header_fk, &recs)?;
+    }
+    Ok(())
+}
+
+fn records_from_wire(
+    p: &Prepared,
+    block: &Block,
+    parents: &rbitcoin_query::BatchParents,
+) -> Option<Vec<Option<[u8; 33]>>> {
+    use crate::silent_payments::tweak_from_tx;
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+
+    let mut recs = Vec::with_capacity(block.txdata.len());
+    for tx in &block.txdata {
+        let mut prevouts = Vec::with_capacity(tx.input.len());
+        for inp in &tx.input {
+            if inp.previous_output.is_null() {
+                prevouts.push(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new(),
+                });
+                continue;
+            }
+            let tid = inp.previous_output.txid.to_byte_array();
+            let vout = inp.previous_output.vout;
+            let create_fk = p.spends.iter().find_map(|(pt, pv, _, cfk)| {
+                if *pt == tid && *pv == vout {
+                    Some(*cfk)
+                } else {
+                    None
+                }
+            })?;
+            let (val, script, _) = parents.get_parent_txout_parts(create_fk, vout)?;
+            let value = if val < 0 {
+                Amount::ZERO
+            } else {
+                Amount::from_sat(val as u64)
+            };
+            prevouts.push(TxOut {
+                value,
+                script_pubkey: ScriptBuf::from_bytes(script),
+            });
+        }
+        recs.push(tweak_from_tx(tx, &prevouts).map(|t| t.tweak));
+    }
+    Some(recs)
 }

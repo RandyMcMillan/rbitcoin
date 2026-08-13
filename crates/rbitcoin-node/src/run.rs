@@ -163,6 +163,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     //   write-through — tip-follow only a few blocks behind must not recollect.
     // - Otherwise Direct IBD: archive tx.head, confirm spends; SH runs only if shindex.
     handle.query.set_sh_index_enabled(config.shindex);
+    if let Err(e) = handle.query.set_sptweaks_enabled(
+        config.sptweaks,
+        rbitcoin_primitives::Height(params.taproot_height()),
+    ) {
+        warn!("sp_tweaks: enable failed: {e}");
+    } else if config.sptweaks {
+        info!("sp_tweaks: enabled origin={}", params.taproot_height());
+    }
     if config.shindex && handle.query.sh_is_tip_ready() {
         let _ = handle.query.sync_sh_seal_from_include_hwm();
         handle.query.enter_tip_index_mode();
@@ -205,6 +213,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let mut node = P2PNode::start(listen, query, params.clone(), milestone)
         .await
         .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    if config.sptweaks {
+        let q = Arc::clone(&node.hub.query);
+        let p = params.clone();
+        std::thread::Builder::new()
+            .name("sptweaks-backfill".into())
+            .spawn(
+                move || match rbitcoin_consensus::backfill_sp_tweaks(&q, &p) {
+                    Ok(n) => info!("sp_tweaks: backfill wrote {n} heights"),
+                    Err(e) => warn!("sp_tweaks: backfill: {e}"),
+                },
+            )
+            .ok();
+    }
 
     let mempool = MempoolHub::open_with_weight(
         config.mempool_path(),

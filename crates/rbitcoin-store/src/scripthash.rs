@@ -1633,8 +1633,14 @@ impl<'a> ScriptHashBulkSession<'a> {
             } else {
                 ShHeadValue::inline_two(sorted[0], sorted[1])
             }
+        } else if n < SH_MEGAKEY_MIN_FKS {
+            self.flush_body()?;
+            let (val, new_bump) = Self::bulk_write_slab(&self.table.body, self.bump, &sorted)?;
+            self.bump = new_bump;
+            self.body_write_off = new_bump;
+            val
         } else {
-            // Flush streaming body, then write page chain at bump (aligned).
+            // Megakey: flush then write page chain at bump (4 KiB aligned).
             self.flush_body()?;
             let (first, last, new_bump) =
                 Self::bulk_write_page_chain(&self.table.body, self.bump, &sorted)?;
@@ -1698,6 +1704,31 @@ impl<'a> ScriptHashBulkSession<'a> {
             self.put_chain(key, &live)?;
         }
         Ok(written)
+    }
+
+    /// Write one exact-class slab at `bump` (no 4 KiB pad). Returns (value, new_bump).
+    fn bulk_write_slab(
+        body: &TableFile,
+        bump: u64,
+        entries: &[ShEntry],
+    ) -> Result<(ShHeadValue, u64), StoreError> {
+        let n = entries.len() as u32;
+        let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
+        let payload = encode_slab_payload(&fks)?;
+        let Some(class) = ScriptHashTable::slab_class_fitting(n, payload.len(), false) else {
+            return Self::bulk_write_page_chain(body, bump, entries)
+                .map(|(first, last, end)| (ShHeadValue::paged(first, last), end));
+        };
+        let need = slab_bytes(class);
+        let end = bump.saturating_add(need);
+        body.ensure_capacity(end)?;
+        if end > body.logical_len() {
+            body.set_logical_len(end)?;
+        }
+        let mut buf = vec![0u8; need as usize];
+        buf[..payload.len()].copy_from_slice(&payload);
+        body.write_at(bump, &buf)?;
+        Ok((ShHeadValue::slab(class, n as u16, bump), end))
     }
 
     /// Write a full page chain at `bump` (4 KiB aligned). Returns (first, last, new_bump).
@@ -2871,6 +2902,66 @@ mod tests {
             other => panic!("expected slab, got {other:?}"),
         };
         assert_eq!(off1, off2, "slab freelist should reuse offset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_session_packs_exact_class_from_count() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let mut session = t.bulk_session(16).unwrap();
+        let cases: &[(u8, u32)] = &[(0x01, 1), (0x02, 2), (0x06, 6), (0x14, 20), (0x60, 600)];
+        for &(tag, n) in cases {
+            let mut sh = [0u8; 32];
+            sh[0] = tag;
+            let ents: Vec<_> = (1..=u64::from(n)).map(|i| ShEntry::new(Fk(i))).collect();
+            session.put_chain(sh, &ents).unwrap();
+        }
+        let (creates, keys, _, _) = session.finish().unwrap();
+        assert_eq!(keys, 5);
+        assert_eq!(creates, 1 + 2 + 6 + 20 + 600);
+
+        let sh = |tag: u8| {
+            let mut k = [0u8; 32];
+            k[0] = tag;
+            k
+        };
+        assert!(matches!(
+            t.head_value(&sh(0x01)).unwrap().unwrap(),
+            ShHeadValue::Inline { used: 1, .. }
+        ));
+        assert!(matches!(
+            t.head_value(&sh(0x02)).unwrap().unwrap(),
+            ShHeadValue::Inline { used: 2, .. }
+        ));
+        match t.head_value(&sh(0x06)).unwrap().unwrap() {
+            ShHeadValue::Slab { class, used, .. } => {
+                assert_eq!(class, 1, "6 fks exact class 1");
+                assert_eq!(used, 6);
+            }
+            other => panic!("expected class-1 slab, got {other:?}"),
+        }
+        match t.head_value(&sh(0x14)).unwrap().unwrap() {
+            ShHeadValue::Slab { class, used, .. } => {
+                assert_eq!(class, 3, "20 fks exact class 3");
+                assert_eq!(used, 20);
+            }
+            other => panic!("expected class-3 slab, got {other:?}"),
+        }
+        assert!(matches!(
+            t.head_value(&sh(0x60)).unwrap().unwrap(),
+            ShHeadValue::Paged { .. }
+        ));
+        assert_eq!(t.entries(&sh(0x06)).unwrap().len(), 6);
+        assert_eq!(t.entries(&sh(0x60)).unwrap().len(), 600);
+
+        let payload = t.body.logical_len().saturating_sub(4096);
+        // Tight: class1 64 + class3 256 + two 4 KiB pages.
+        let tight = 64 + 256 + 2 * 4096;
+        assert!(
+            payload <= 2 * tight,
+            "cold body {payload} must stay within 2× tight {tight} (not 4 KiB × paged keys)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

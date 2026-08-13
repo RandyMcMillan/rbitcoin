@@ -24,7 +24,8 @@ jobs:
       # Prebuilt cargo-deny — do not cargo install. Pin Action commit (CodeQL).
       - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
-          tool: cargo-deny@0.18.5
+          # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
+          tool: cargo-deny@0.20.2
       - name: cargo deny check
         run: cargo deny check
 

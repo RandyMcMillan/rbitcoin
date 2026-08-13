@@ -22,6 +22,7 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "CC0-1.0",           # rust-bitcoin / hashes
+    "MITNFA",            # hex_lit via bitcoin 0.32
     "BSL-1.0",
     "OpenSSL",           # ring / rustls stack
     "CDLA-Permissive-2.0",

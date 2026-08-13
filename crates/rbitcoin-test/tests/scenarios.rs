@@ -414,7 +414,7 @@ fn store_table_header_and_idx_corrupt() {
         s.flush().unwrap();
     }
     let mut hb = std::fs::read(store_dir.join("header.body")).unwrap();
-    hb[6..8].copy_from_slice(&TableKind::Tx.as_u16().to_le_bytes());
+    hb[6..8].copy_from_slice(&TableKind::TxOut.as_u16().to_le_bytes());
     std::fs::write(store_dir.join("header.body"), &hb).unwrap();
     match Store::open(&store_dir) {
         Err(StoreError::BadKind { .. }) => {}

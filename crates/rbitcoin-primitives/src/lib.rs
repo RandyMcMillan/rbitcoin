@@ -18,17 +18,17 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **15:** Class B SH = geometric slabs + ULEB128 fks + sorted/fuse/idx heads;
-///         refuse a materialized schema-14 page-era SH index.
+/// **15:** Class A split (`txout` / `inwit` / `spent`) + Class B SH slabs / sorted heads.
+///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
 pub const SCHEMA_VERSION: u16 = 15;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **13**/**14** Class A is layout-compatible with **15**. A **materialized**
-/// page-era (or schema-13 slab) SH index is refused at store open; empty / missing
-/// SH is upgraded silently to 15.
+/// Schema **13**/**14** may open only when Class A is empty and SH is empty/missing
+/// (silent meta rewrite). A **materialized** page-era SH index, or a packed
+/// `tx.body` with creates, is refused (wipe + IBD).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
     ver == SCHEMA_VERSION || (SCHEMA_VERSION == 15 && (ver == 14 || ver == 13))
@@ -149,7 +149,8 @@ impl std::error::Error for ParseNetworkError {}
 pub enum TableKind {
     Meta = 1,
     Header = 2,
-    Tx = 3,
+    /// Class A outputs body (`txout.body`); was `Tx` through schema 14.
+    TxOut = 3,
     Input = 4,
     Output = 5,
     /// Legacy id (v4 point multimap); new stores use [`TableKind::Spender`].
@@ -168,6 +169,10 @@ pub enum TableKind {
     TxidBody = 14,
     /// Optional BIP-352 thin tweak body (`sp_tweaks.body`). Schema 14 side product.
     SpTweaks = 15,
+    /// Class A input-side + witness (`inwit.body`).
+    Inwit = 16,
+    /// Class A sole-spender slots (`spent.body`, 9 B × n_out).
+    Spent = 17,
 }
 
 impl TableKind {
@@ -175,7 +180,7 @@ impl TableKind {
         match v {
             1 => Some(TableKind::Meta),
             2 => Some(TableKind::Header),
-            3 => Some(TableKind::Tx),
+            3 => Some(TableKind::TxOut),
             4 => Some(TableKind::Input),
             5 => Some(TableKind::Output),
             6 => Some(TableKind::Point),
@@ -188,6 +193,8 @@ impl TableKind {
             13 => Some(TableKind::Spender),
             14 => Some(TableKind::TxidBody),
             15 => Some(TableKind::SpTweaks),
+            16 => Some(TableKind::Inwit),
+            17 => Some(TableKind::Spent),
             _ => None,
         }
     }
@@ -233,15 +240,18 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in 1u16..=15 {
+        for v in 1u16..=17 {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
         assert!(TableKind::from_u16(0).is_none());
         assert!(TableKind::from_u16(99).is_none());
+        assert_eq!(TableKind::TxOut.as_u16(), 3);
         assert_eq!(TableKind::Spender.as_u16(), 13);
         assert_eq!(TableKind::TxidBody.as_u16(), 14);
         assert_eq!(TableKind::SpTweaks.as_u16(), 15);
+        assert_eq!(TableKind::Inwit.as_u16(), 16);
+        assert_eq!(TableKind::Spent.as_u16(), 17);
     }
 
     #[test]

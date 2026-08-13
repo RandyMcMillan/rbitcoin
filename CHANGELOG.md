@@ -17,8 +17,11 @@ before 1.0).
   [`SCHEMA.md`](./SCHEMA.md).
 - **Schema 15 Class B SH:** geometric slabs + megakey pages; sealed
   sorted+idx main (**no** main fuse); global ingest OA; sealed ovf keeps
-  fuse8. Tip lookup is overflow (ingest + ovf fuse) then main. Page-era
-  durable SH is refused.
+  fuse8. Tip lookup is overflow (ingest + ovf fuse) then main. Open
+  rematerialized SHSR shards via an OA stub; sealed ovf files are not
+  opened as OA. Unlink writes the home `locate_head` found. Cold bulk
+  streams packed recs (no per-shard OA image). Page-era durable SH is
+  refused. The OA global `scripthash.head.fuse8` builder is gone.
 - **Electrum / RPC:** skip O(mempool) API walks; overlap Electrum dispatch;
   thin `--sptweaks` serve is idx→body uring, not a packed span.
 - **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so

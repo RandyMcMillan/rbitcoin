@@ -179,9 +179,8 @@ Decode walks meta + runs to a logical end; any remaining bytes in the idx span m
 ### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
 
 ```text
-tx.idx.meta                 # segment map
-tx.idx.000000               # dense u32 LE stride units
-tx.idx.000001
+{txout,inwit,spent}.idx/meta     # segment map (coupled first_fk / file_id)
+{txout,inwit,spent}.idx/000000   # dense u32 LE stride units
 …
 ```
 
@@ -197,7 +196,7 @@ i = fk - first_fk
 | `first_fk` | 1-based inclusive start of the range |
 | `count` | number of u32 slots in the segment file |
 | `body_base` | absolute body base (8-aligned) for relatives |
-| `file_id` | maps to `tx.idx.{file_id:06}` |
+| `file_id` | maps to `{stem}.idx/{file_id:06}` |
 
 Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
 
@@ -321,7 +320,7 @@ Used where the key is a 32 B hash and the value is a single fk (or multi-list)
 - Identity: `get_all` candidates + **body verify**.
 - Rehash when load would exceed **7/8**.
 
-**Not** used for `tx.head` (keyless address) or for scripthash **create lists** (those use page chains).
+**Not** used for `tx.head` (keyless address) or for scripthash **create lists** (slabs; megakey page chains).
 
 ---
 

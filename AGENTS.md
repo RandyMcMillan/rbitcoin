@@ -398,7 +398,7 @@ Same goes for #[cfg(test)].
 **Full rules:** `docs/ibd-memory.md`. Summary for agents:
 
 1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire,
-   in-RAM body queue) from **kernel page cache** under store mmaps (`RssFile`).
+   in-RAM body queue) from **kernel page cache** under FdOnly table files (`RssFile`).
    Do not “fix” RSS by gutting intentional caches (body queue, ConfirmParentCache header plans).
 2. **Unified path only:** peer → in-RAM **body queue** → confirm lookup/load/
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.

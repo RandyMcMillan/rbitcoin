@@ -156,12 +156,11 @@ find result -name 'rbitcoin-store-bench' 2>/dev/null
 
 | Flag | Meaning |
 |------|---------|
-| `--access map` | [`TableAccess::MapFull`](../crates/rbitcoin-store/src/file.rs) only |
-| `--access fd` | [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs) only |
-| `--access both` | Sequential A/B (default) |
+| `--access map` | Historical. `MapFull` is **removed**; the bench flag is ignored. |
+| `--access fd` | [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs) (only live mode) |
+| `--access both` | Historical A/B; map arm is gone |
 
-Live node rollback: set **`RBITCOIN_TX_HEAD_ACCESS=map`** before open/create
-(default **`fd`** / unset). Prefer `--access both` on the store-bench for A/B.
+`RBITCOIN_TX_HEAD_ACCESS=map` is ignored (one-time warn). Heads are FdOnly.
 
 ---
 

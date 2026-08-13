@@ -60,7 +60,7 @@ for unknown-height bodies (mark missing → re-getdata).
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
 | Primary store | **Map-free** Class A/B/C tables (fd pread/pwrite + heads; page cache L0) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
-| Historical block serve | **Reconstruct** from packed tx archive; tip soft zone keeps a **wire ring** | Serve raw blk files / undo |
+| Historical block serve | **Reconstruct** from `txout`+`inwit`; tip soft zone keeps a **wire ring** | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
 | Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |
 | Transport | **BIP324 v2 only** | v1 + v2 |

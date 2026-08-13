@@ -1,8 +1,8 @@
 # IBD memory: intentional caches vs process leaks
 
 This document is the developer/AI contract for **process-owned** memory on the
-IBD path. It is **not** about kernel page cache under store mmaps (those count
-in RSS when faulted but are not Rust heap leaks).
+IBD path. It is **not** about kernel page cache under FdOnly store files
+(those count in RSS when faulted but are not Rust heap leaks).
 
 ## Primary IBD wire path (current)
 

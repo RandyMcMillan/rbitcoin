@@ -89,7 +89,7 @@ Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_sea
   - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
   - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats or sticky FORCE).
   Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: empty/tiny residual runs are normal post-consume; missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); clamp SEAL to HWM only when `0 < hwm < SEAL`. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.
-  **SH head open:** sealed sorted shards load `.idx` (one entry per 128 records) and
-  BF8R; occupancy scan is not used on those files. A schema-14 page-era durable
-  index is **refused** (wipe `store/scripthash*` and rematerialize). Ingest OA
-  still uses `{ingest}.occ` like any ScriptHashHead.
+  **SH head open:** sealed **main** shards load `.idx` only (one entry per 128
+  records; no fuse). Sealed **ovf** loads `.idx` + BF8R. Occupancy scan is not
+  used on those files. A schema-14 page-era durable index is **refused** (wipe
+  `store/scripthash*` and rematerialize). Ingest OA still uses `{ingest}.occ`.

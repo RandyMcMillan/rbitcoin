@@ -941,6 +941,14 @@ mod tests {
     }
 
     #[test]
+    fn backfill_noop_when_flag_off() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tweaks_for_height_unknown_is_empty() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();

@@ -19,7 +19,6 @@ pub const TWEAK_LEN: u8 = 33;
 /// Idx bytes after the 16-byte table header: `origin_height:u32` + pad.
 const IDX_PREFIX: u64 = FILE_HEADER_LEN as u64 + 8;
 const SLOT: u64 = 12;
-const HOLE_OFF: u32 = u32::MAX;
 
 /// One SP-era height: confirmed `header_fk` + start of that block’s body run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,17 +261,12 @@ impl SpTweaksTable {
             return Ok(None);
         }
         let slot = self.read_slot(i)?;
-        if slot.block_fk != block_fk || slot.off == HOLE_OFF {
+        if slot.block_fk != block_fk {
             return Ok(None);
         }
         let start = u64::from(slot.off);
         let end = if i + 1 < n {
-            let nxt = self.read_slot(i + 1)?;
-            if nxt.off == HOLE_OFF {
-                self.body.logical_len()
-            } else {
-                u64::from(nxt.off)
-            }
+            u64::from(self.read_slot(i + 1)?.off)
         } else {
             self.body.logical_len()
         };
@@ -456,6 +450,100 @@ mod tests {
         let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
         let err = t.put_block(Height(2), Fk(1), &[None]).unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_or_create_repairs_incomplete_and_checks_origin() {
+        let dir = tmp_dir();
+        fs::write(SpTweaksTable::idx_path(&dir), b"partial").unwrap();
+        let t = SpTweaksTable::open_or_create(&dir, Height(3)).unwrap();
+        assert_eq!(t.origin_height(), Height(3));
+        drop(t);
+        let Err(err) = SpTweaksTable::open_or_create(&dir, Height(9)) else {
+            panic!("expected origin mismatch");
+        };
+        assert!(
+            matches!(err, StoreError::Corrupt(m) if m.contains("origin")),
+            "{err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_rejects_truncated_idx() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        t.flush().unwrap();
+        drop(t);
+        // Keep header but wipe origin prefix.
+        let p = SpTweaksTable::idx_path(&dir);
+        let mut raw = fs::read(&p).unwrap();
+        raw.truncate(FILE_HEADER_LEN);
+        fs::write(&p, &raw).unwrap();
+        let Err(err) = SpTweaksTable::open(&dir) else {
+            panic!("expected truncated idx");
+        };
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_null_fk_and_below_origin() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(5)).unwrap();
+        assert!(matches!(
+            t.put_block(Height(5), Fk::NULL, &[None]),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.put_block(Height(4), Fk(1), &[None]),
+            Err(StoreError::Corrupt(_))
+        ));
+        t.put_block(Height(5), Fk(1), &[None]).unwrap();
+        // Wrong n_tx vs stored bytes.
+        let err = t.get_block(Height(5), Fk(1), 2).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        t.truncate_through_tip(None).unwrap();
+        assert_eq!(t.slot_count(), 0);
+        t.truncate_above(Height(99)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_short_tweak_and_n_tx_mismatch() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        let mut tw = [0u8; 33];
+        tw[0] = 0x02;
+        t.put_block(Height(0), Fk(1), &[Some(tw)]).unwrap();
+        t.flush().unwrap();
+        drop(t);
+        let p = SpTweaksTable::body_path(&dir);
+        let mut raw = fs::read(&p).unwrap();
+        // Truncate payload so 33-byte tweak is short.
+        raw.truncate(FILE_HEADER_LEN + 1 + 8);
+        fs::write(&p, &raw).unwrap();
+        let t = SpTweaksTable::open(&dir).unwrap();
+        let err = t.get_block(Height(0), Fk(1), 1).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_two_heights_uses_next_slot_off() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        t.put_block(Height(0), Fk(1), &[None]).unwrap();
+        t.put_block(Height(1), Fk(2), &[None, None]).unwrap();
+        assert_eq!(
+            t.get_block(Height(0), Fk(1), 1).unwrap().unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            t.get_block(Height(1), Fk(2), 2).unwrap().unwrap(),
+            vec![None, None]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

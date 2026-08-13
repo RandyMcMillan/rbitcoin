@@ -138,3 +138,46 @@ impl Query {
         Ok(Some(rows))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_q() -> (std::path::PathBuf, Query) {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-q-sptweaks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let q = Query::open_or_create(&path).unwrap();
+        (path, q)
+    }
+
+    #[test]
+    fn put_and_load_noop_when_disabled() {
+        let (dir, q) = tmp_q();
+        assert!(!q.sptweaks_enabled());
+        assert!(q.sptweaks_next_height().is_none());
+        q.put_sp_tweaks_block(Height(0), Fk(1), &[None]).unwrap();
+        q.truncate_sp_tweaks_through_tip(None).unwrap();
+        assert!(q.load_thin_tweaks(Height(0)).unwrap().is_none());
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        assert!(q.sptweaks_enabled());
+        assert_eq!(q.sptweaks_origin(), Height(0));
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        // No confirmed header → hole.
+        assert!(q.load_thin_tweaks(Height(0)).unwrap().is_none());
+        // Not next height is a no-op.
+        q.put_sp_tweaks_block(Height(3), Fk(1), &[None]).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -35,9 +35,15 @@ before 1.0).
 - **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
   `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
 - **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`.
+- **Fee snapshot / mempool APIs:** published fee table and mining chunks so
+  Electrum/Esplora estimates do not block accepts (R-01–R-04).
+- **Quality gates:** `cargo deny` on PR (Q-20); coverage uses prebuilt
+  `cargo-llvm-cov` (Q-22).
 
 ### Fixed
 
+- **Findings 012–021** (fuzzamoto differential): identity/BIP30 cluster,
+  tapleaf, compact-block, reorg drain — all closed with named regressions.
 - **Mainnet BIP30:** skip the two Core `IsBIP30Repeat` overwrites (91842 /
   91880 hashes). Those coinbases were overwritten while still unspent, not
   fully spent. IBD `bad-txns-BIP30` at logged `@91859` was the first height

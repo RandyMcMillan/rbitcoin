@@ -8,10 +8,10 @@ Electrum confirmed + unconfirmed (TLS via reverse proxy). **Mainnet is experimen
 before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
 that height; use `--milestone 0` for full scripts.
 
-Architecture: **archive-before-confirm** — block bodies land in Class A as peers
-deliver them; tip **confirm** (Class C) walks contiguous archived runs. Download
-defaults to **1024** concurrent getdata (not a tip-distance cap), max **16** blocks
-in transit per peer.
+Architecture: peer wire lands in an **in-RAM body queue**; confirm
+(lookup → load → scripts → write) is the **sole Class A appender** and
+advances Class C tip in the same era. Download defaults to **1024** concurrent
+getdata (not a tip-distance cap), max **16** blocks in transit per peer.
 
 ## Build
 

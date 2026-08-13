@@ -143,7 +143,9 @@ mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 | `rbitcoin-net` | P2P + IBD (modular `ibd/`), tip follow, relay |
 | `rbitcoin-mempool` | Cluster graph + libre admission |
 | `rbitcoin-electrum` | Electrum TCP server |
-| `rbitcoin-rpc` | Minimal node JSON-RPC (stub) |
+| `rbitcoin-esplora` | Esplora REST + wallet-scoped WS (opt-in) |
+| `rbitcoin-log` | Leveled stderr logger |
+| `rbitcoin-rpc` | Documented Core-class JSON-RPC subset (not full Core) |
 | `rbitcoin-cli` | CLI client |
 | `rbitcoin-node` | Node binary |
 | `rbitcoin-test` | High-level test harness |

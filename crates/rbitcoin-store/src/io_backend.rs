@@ -5,9 +5,7 @@
 //! - `RBITCOIN_IO=mmap` (legacy) → demoted to **pread** (one-time warn).
 //! - `RBITCOIN_IO_URING=0` → **pread** when `RBITCOIN_IO` unset (deprecated alias).
 //!
-//! Per-path env overrides (`RBITCOIN_PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`,
-//! `SPEND_ANN`, `CLASS_C_IO`) are **removed** — they ignored any value and used
-//! the global switch only (no dual-path matrix).
+//! Per-path env overrides are **removed** — one global `RBITCOIN_IO` only.
 //!
 //! Class A **tx.body** payload is always pread/pwrite/uring — never mmap.
 
@@ -195,16 +193,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_io_envs() {
-        for k in [
-            "RBITCOIN_IO",
-            "RBITCOIN_IO_URING",
-            "RBITCOIN_PIN_IO",
-            "RBITCOIN_HEAD_RESOLVE_IO",
-            "RBITCOIN_SPEND_META",
-            "RBITCOIN_SPEND_ANN",
-            "RBITCOIN_CLASS_C_IO",
-            "RBITCOIN_FD_APPEND",
-        ] {
+        for k in ["RBITCOIN_IO", "RBITCOIN_IO_URING"] {
             std::env::remove_var(k);
         }
     }
@@ -233,14 +222,14 @@ mod tests {
     fn path_env_ignored_global_only() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_io_envs();
-        // Path overrides removed: PIN_IO=pread must not beat global uring.
         std::env::set_var("RBITCOIN_IO", "uring");
-        std::env::set_var("RBITCOIN_PIN_IO", "pread");
-        let got = resolve_read("RBITCOIN_PIN_IO");
-        assert_eq!(got, effective_read(ReadIoBackend::Uring));
+        assert_eq!(
+            resolve_read("unused"),
+            effective_read(ReadIoBackend::Uring)
+        );
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "pread");
-        assert_eq!(resolve_read("RBITCOIN_PIN_IO"), ReadIoBackend::Pread);
+        assert_eq!(resolve_read("unused"), ReadIoBackend::Pread);
         clear_io_envs();
     }
 

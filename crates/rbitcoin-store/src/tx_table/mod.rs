@@ -249,7 +249,7 @@ pub struct TxTable {
 
 /// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
 ///
-/// Selected via `RBITCOIN_SPEND_META` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
+/// Selected via global `RBITCOIN_IO` (see [`crate::io_backend`]).
 /// Body peeks are never mmap'd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendMetaBackend {
@@ -1053,7 +1053,7 @@ impl TxTable {
     /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
-    /// Backend from [`spend_meta_backend`] / `RBITCOIN_SPEND_META` /
+    /// Backend from [`spend_meta_backend`] / global `RBITCOIN_IO` /
     /// global `RBITCOIN_IO` (`uring` \| `pread`). Out-of-range / short → `None`.
     pub fn get_spender_meta_at_abs_batch(
         &self,

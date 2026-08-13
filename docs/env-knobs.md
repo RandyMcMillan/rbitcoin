@@ -1,8 +1,8 @@
-# `RBITCOIN_*` inventory and policy (Q-04)
+# `RBITCOIN_*` inventory and policy (Q-16)
 
-Operator configuration is **CLI / conf first**. Most historical env knobs are
-**hardcoded**, **test-only**, or **removed**. Do not grow process-env surface
-without a damn-good reason.
+Operator configuration is **CLI / conf first**. Process env is only for
+bootstrap, a single IO field hatch, and an **unstable** debug set listed
+below. Do not grow env surface without a damn-good reason.
 
 ## Survivors (production)
 
@@ -22,26 +22,48 @@ CLI still sets process env for library readers where needed today:
 
 Long term: pass config structs; drop `set_var` bridges.
 
+## Unstable (honored, not advertised)
+
+Rare operator/debug reads. Prefer changing defaults in code. Not required
+for signet/mainnet sync. **Not** CLI.
+
+| Env | Default | Role |
+|-----|---------|------|
+| `RBITCOIN_BLOCK_QUEUE_GB` | unlimited | Absolute in-RAM body-queue ceiling (GiB) |
+| `RBITCOIN_BLOCK_QUEUE_BYTES` | unlimited | Same ceiling in bytes (wins over GB) |
+| `RBITCOIN_BULK_IO_WORKERS` | backend default | pread worker count when `RBITCOIN_IO=pread` |
+| `RBITCOIN_CLASS_C_INRAM_MAX_MB` | 256 | L2 Class C image cap; over → fd L0 |
+| `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
+| `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Idx segment soft rollover (bytes) |
+| `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots |
+| `RBITCOIN_HEAD_SLOTS_TX` | scale default | Tx hash-head initial slots |
+| `RBITCOIN_HEAD_SLOTS_SCRIPTHASH` | scale default | SH hash-head initial slots |
+| `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
+| `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
+| `RBITCOIN_SH_RECOLLECT_WORKERS` | default | SH recollect parallelism |
+| `RBITCOIN_SH_MAX_DIRECT_MERGE` | default | SH direct-merge cap |
+| `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
+| `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
+| `RBITCOIN_SH_MEMTABLE_CAP` | default | SH memtable cap |
+| `RBITCOIN_SH_MERGE_WORKERS` | default | SH merge workers |
+
 ## Hardcoded (no env)
 
 | Former env | Production default |
 |------------|--------------------|
 | Confirm `loadq` / `scriptq` / `writeq` | 8 / 4 / 20 |
 | `RBITCOIN_CONFIRM_BATCH_INPUTS` | 8000 soft inputs/pack |
-| Per-path IO (`PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`, `SPEND_ANN`, `CLASS_C_IO`) | Follow **`RBITCOIN_IO` only** |
-| `RBITCOIN_TX_HEAD_ACCESS=map` | Ignored (FdOnly); warn once |
-
-Other store/SH knobs (`BLOCK_QUEUE_*`, `BULK_IO_WORKERS`, `CLASS_C_INRAM_*`,
-`SH_*`, `TX_HEAD_BITS`, `TX_IDX_SOFT_SPAN`, `HEAD_SLOTS_*`, `FD_APPEND`) remain
-readable for rare operator/debug use today but are **not** advertised in OPERATOR
-as required knobs. Prefer changing defaults in code; treat as unstable.
+| Per-path IO (`PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`, `SPEND_ANN`, `CLASS_C_IO`) | Follow **`RBITCOIN_IO` only** (strings deleted) |
+| `RBITCOIN_TX_HEAD_ACCESS=map` | Ignored (FdOnly); warn once if exported |
+| `RBITCOIN_FD_APPEND` | Never read (deleted) |
+| `RBITCOIN_BLOCK_QUEUE_MB` | Never read (deleted; use `_BYTES` / `_GB`) |
 
 ## Test-only (not operator)
 
 | Env | Use |
 |-----|-----|
-| `RBITCOIN_HEAD_SCALE` | Tiny heads under `cargo test` |
-| `RBITCOIN_TEST_*` | Node/store test fixtures |
+| `RBITCOIN_HEAD_SCALE` | Tiny heads under `cargo test` (honored if exported — do not set on operators) |
+| `RBITCOIN_TEST_*` | Node/store test fixtures (`TEST_DROP_STORE`, `TEST_NO_SUCH_CAP`) |
 | `RBITCOIN_DIAG_DATADIR` | Offline diagnostic tests |
 | `RBITCOIN_CAND_FK_FIXTURE` | Store fixture |
 

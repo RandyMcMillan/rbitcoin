@@ -341,7 +341,7 @@ fn next_ready(
 
 /// Annotate backend for pure-write path (Class A body never mmap'd).
 ///
-/// Selected via `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
+/// Selected via global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
     /// Page-RMW via io_uring (pread page, poke 9 B slots, pwrite page).

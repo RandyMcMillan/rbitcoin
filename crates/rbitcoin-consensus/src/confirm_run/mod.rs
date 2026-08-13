@@ -70,7 +70,7 @@ use phases::{check_bip34, expected_bits_extending, post_commit};
 #[cfg(test)]
 use write::write_height_needed;
 
-/// Pure-write annotate backend from `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO`.
+/// Pure-write annotate backend from global `RBITCOIN_IO`.
 #[inline]
 fn spend_ann_backend_next() -> SpendAnnBackend {
     rbitcoin_store::spend_annotate_uring::spend_ann_backend()

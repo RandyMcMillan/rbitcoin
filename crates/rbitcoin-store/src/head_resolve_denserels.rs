@@ -15,7 +15,7 @@
 //! page-grouped bulk pread (one read per OS page of `txid.body`). Nested TLS
 //! uring remains a hard error.
 //!
-//! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
+//! Backend: global `RBITCOIN_IO` (`uring` \| `pread`).
 
 use crate::chain::TxHeightTable;
 use crate::error::StoreError;

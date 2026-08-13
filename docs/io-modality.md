@@ -12,7 +12,7 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
-| **Bulk batch** | `RBITCOIN_IO` (+ path overrides) | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
+| **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
 | **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
 
 **`RBITCOIN_IO=uring` only selects the bulk batch backend.** Legacy token
@@ -38,11 +38,11 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 
 | Path | Env | Syscalls |
 |------|-----|----------|
-| Pin outs / body pipeline | `RBITCOIN_PIN_IO` → global | uring/pread on **`txout.body` FD** (Full also zips `inwit`) |
-| Head-resolve identity | `RBITCOIN_HEAD_RESOLVE_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
-| Spend-meta 9 B peeks | `RBITCOIN_SPEND_META` | uring/pread on **`spent.body` FD** |
-| Spend pure-write annotate | `RBITCOIN_SPEND_ANN` | uring/pwrite or pwrite on **`spent.body` FD** |
-| Class C create-height bulk | `RBITCOIN_CLASS_C_IO` | uring/pread |
+| Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `inwit`) |
+| Head-resolve identity | `RBITCOIN_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
+| Spend-meta 9 B peeks | `RBITCOIN_IO` | uring/pread on **`spent.body` FD** |
+| Spend pure-write annotate | `RBITCOIN_IO` | uring/pwrite or pwrite on **`spent.body` FD** |
+| Class C create-height bulk | `RBITCOIN_IO` | uring/pread |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 
 Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.

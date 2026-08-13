@@ -2,7 +2,7 @@
 //!
 //! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
 //! [`crate::file::TableAccess::FdOnly`] pread). Body backend from
-//! [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` / global
+//! [`crate::io_backend::pin_io_backend`] (global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!
 //! **Concurrency:** read-only on published ranges; prep + confirm-load may run

@@ -223,7 +223,7 @@ impl TxHeightTable {
 
     /// Bulk `get` for many tx fks (confirm write create-height).
     ///
-    /// Backend: `RBITCOIN_CLASS_C_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
+    /// Backend: global `RBITCOIN_IO` (`uring` \| `pread`).
     /// Returns one `Option<height>` per input fk (invalid/null fk → `None`).
     pub fn get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};

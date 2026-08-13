@@ -439,7 +439,7 @@ pub(super) fn class_c_commit(
 /// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
 ///
 /// Pure-write annotate: body meta from `meta_by_abs` (structural snapshot);
-/// no body pread. Backend from `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO`.
+/// no body pread. Backend from global `RBITCOIN_IO`.
 pub(super) fn post_commit(
     query: &Query,
     prepared: &[Prepared],

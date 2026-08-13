@@ -66,33 +66,31 @@ Not Open, not Completed — do not add them to either list.
 **One list.** Rank is overall operator + contributor leverage, not a category.
 Tags are scan hints only.
 
-The 2026-08-12 **R-01–R-10** program lives here: **R-01–R-06 are in
-Completed**; leftover R-ids keep their relative order (R-07/Q-30 before
-R-08/Q-20 before R-09/Q-16; **R-10 last**). Older Q-ids that were never
-R-ids sit among them by the same leverage rule. Do not recreate a second
-R-table or P0/P1/P2 split.
+The 2026-08-12 **R-01–R-10** program lives here: **R-01–R-06 and Q-16/Q-20
+are in Completed**; leftover R-ids keep their relative order (R-07/Q-30;
+**R-10 last**). Older Q-ids that were never R-ids sit among them by the
+same leverage rule. Do not recreate a second R-table or P0/P1/P2 split.
 
 | Rank | ID | Item | Tag | Done looks like |
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | Nightly/weekly script + BIP324 + header/block wire (fuzzamoto-class or in-tree); crashes → `docs/external_findings/` + regression |
-| 2 | **Q-16** | Residual `RBITCOIN_*` env (~36 names still in crates) | operator | Production reads are CLI/conf or the documented unstable set in `env-knobs.md`; dead string leftovers deleted |
-| 3 | **Q-37** | Warm default suite **≤3 min** (stretch **&lt;2 min**) on a CI-class host | test-speed | Re-measure `cargo test --workspace` after R-03; record wall in TESTING.md. If still over budget, cut more; if inside, close. No new default remine-100 / &gt;2 s tests without justification |
-| 4 | **Q-39** | Operator/docs inventory vs shipped model | docs | `OPERATOR.md` matches body-queue → confirm (no “archive-before-confirm”); README crate map lists Esplora + log and stops calling RPC a stub; `COVERAGE.md` crate list matches `--workspace`; `rust-bitcoin-limitations.md` findings **001–021**; `CHANGELOG` Unreleased covers landed work; `CONTRIBUTING.md` names the required **`multinode`** job |
-| 5 | **Q-14** | Head-module glossary | docs | One diagram + “when to use which” for address_head / hashhead / sharded / segmented / scripthash_head (and confirm lookup/load/scripts/write) |
-| 6 | **Q-21** | SBOM for musl release | supply-chain | CycloneDX/SPDX on release assets |
-| 7 | **Q-23** | Optional musl CI | ci | Weekly or release-branch `nix build .#rbitcoin-musl` (proves crane; not every PR) |
-| 8 | **Q-40** | Host `rust-toolchain` pin | ci | Root `rust-toolchain.toml` (or `rust-toolchain`) at **1.95** so rust-analyzer / host `cargo` match CI + Nix; still ignore Dependabot on `dtolnay/rust-toolchain` |
-| 9 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
-| 10 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
-| 11 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
-| 12 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
-| 13 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
-| 14 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
-| 15 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
-| 16 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
-| 17 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
-| 18 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
-| 19 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
+| 2 | **Q-37** | Warm default suite **≤3 min** (stretch **&lt;2 min**) on a CI-class host | test-speed | Re-measure `cargo test --workspace` after R-03; record wall in TESTING.md. If still over budget, cut more; if inside, close. No new default remine-100 / &gt;2 s tests without justification |
+| 3 | **Q-39** | Operator/docs inventory vs shipped model | docs | `OPERATOR.md` matches body-queue → confirm (no “archive-before-confirm”); README crate map lists Esplora + log and stops calling RPC a stub; `COVERAGE.md` crate list matches `--workspace`; `rust-bitcoin-limitations.md` findings **001–021**; `CHANGELOG` Unreleased covers landed work; `CONTRIBUTING.md` names the required **`multinode`** job |
+| 4 | **Q-14** | Head-module glossary | docs | One diagram + “when to use which” for address_head / hashhead / sharded / segmented / scripthash_head (and confirm lookup/load/scripts/write) |
+| 5 | **Q-21** | SBOM for musl release | supply-chain | CycloneDX/SPDX on release assets |
+| 6 | **Q-23** | Optional musl CI | ci | Weekly or release-branch `nix build .#rbitcoin-musl` (proves crane; not every PR) |
+| 7 | **Q-40** | Host `rust-toolchain` pin | ci | Root `rust-toolchain.toml` (or `rust-toolchain`) at **1.95** so rust-analyzer / host `cargo` match CI + Nix; still ignore Dependabot on `dtolnay/rust-toolchain` |
+| 8 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
+| 9 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
+| 10 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
+| 11 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
+| 12 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
+| 13 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
+| 14 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
+| 15 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
+| 16 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
+| 17 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
+| 18 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
 
 **P0 trust/correctness (Q-01–Q-05) stays empty.** Do not reopen without new
 evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
@@ -112,8 +110,8 @@ R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed id is in
 | R-06 | **R-06** | Completed |
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
-| R-09 | **Q-16** | Open rank 2 |
-| R-10 | **R-10** | Open rank 19 |
+| R-09 | **Q-16** | Completed |
+| R-10 | **R-10** | Open rank 18 |
 
 ---
 
@@ -124,6 +122,7 @@ audit closures. Do not reopen without new evidence.
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-16** | Residual `RBITCOIN_*` env | Unstable set listed in `env-knobs.md`; dead path-IO / `FD_APPEND` / `BLOCK_QUEUE_MB` strings deleted |
 | **Q-20** | `cargo deny` / advisory CI | `deny.toml` + required `deny` job (`taiki-e/install-action` `cargo-deny@0.18.5`) |
 | **R-06** | Tip-follow store integrity (`confirmed[]` null tail; tip+1 `NotFound`; idx clone) | Open trims trailing null `confirmed[]`; tip+1 after heal is not `NotFound`; `TxIdx::open` refuses non-monotone starts (`IDX_OPEN_DOUBLE_APPEND`) |
 | — | IBD tip-hole cover + relative-slow disconnect | Tip-hole getdata ranks live `speed_sample` bps; stale inflight **6s** re-race (avoid last holders); `far_slots_per_peer=2` while `hole>0`; relative-slow outlier disconnect (`OUTLIER_RATIO=2` + cluster-spread + hysteresis) |
@@ -195,7 +194,7 @@ audit closures. Do not reopen without new evidence.
 | Release | `nix build .#rbitcoin-musl` → static install |
 | Core corpora | **No allowlist** |
 | Findings 001–021 | All **fixed** |
-| Residual `RBITCOIN_*` in crates | **~36** (**Q-16**) |
+| Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
 
 ### Grade board (subjective; 2026-08-12)
 

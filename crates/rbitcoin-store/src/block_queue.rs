@@ -478,14 +478,7 @@ mod tests {
         let _ = q.load_all().unwrap();
         assert!(q.dequeue(id).unwrap());
         assert!(!q.contains_height(7));
-        // budget_from_env with unset
-        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_MB");
-        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_MB");
         let _ = BlockQueue::budget_from_env();
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_MB", v),
-            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_MB"),
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

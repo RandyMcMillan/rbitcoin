@@ -1074,6 +1074,24 @@ impl LiveShardTable {
         self.table.len()
     }
 
+    /// Occupied `(key16, value16)` records in key order (cold seal into SortedHead).
+    pub fn collect_sorted_recs(&self) -> Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> {
+        let mut recs = Vec::with_capacity(self.occupied as usize);
+        for s in 0..self.slots {
+            let off = (s as usize) * SH_HEAD_SLOT_SIZE;
+            let k: ShHeadKey = self.table[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
+            let v: [u8; SH_HEAD_VALUE_LEN] = self.table
+                [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                .try_into()
+                .unwrap();
+            if !is_empty_slot(&k, &v) {
+                recs.push((k, v));
+            }
+        }
+        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        recs
+    }
+
     /// Insert one head value (full Electrum scripthash). Overwrites same key16.
     pub fn insert(&mut self, full: &[u8; 32], val: &ShHeadValue) -> Result<(), StoreError> {
         if val.is_empty() {

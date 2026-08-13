@@ -161,6 +161,26 @@ impl SortedHead {
         Ok(true)
     }
 
+    /// Visit every record (cold walks / seal-merge). Sequential reads, not the get path.
+    pub fn for_each_occupied(
+        &self,
+        mut f: impl FnMut(ShHeadKey, ShHeadValue) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut rec = [0u8; SH_HEAD_SLOT_SIZE];
+        for slot in 0..self.count {
+            let off = DATA_HEADER_LEN + slot * SH_HEAD_SLOT_SIZE as u64;
+            self.file
+                .read_at(&mut rec, off)
+                .map_err(|e| StoreError::io(&self.path, e))?;
+            let k: ShHeadKey = rec[0..SH_HEAD_KEY_LEN].try_into().unwrap();
+            let val = ShHeadValue::decode(&rec[SH_HEAD_KEY_LEN..])?;
+            if !val.is_empty() {
+                f(k, val)?;
+            }
+        }
+        Ok(())
+    }
+
     /// New keys are not punched into a sealed sorted file.
     pub fn insert_new(&self, _key: &ShHeadKey, _value: &ShHeadValue) -> Result<(), StoreError> {
         Err(StoreError::Corrupt(

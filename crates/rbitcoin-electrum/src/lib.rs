@@ -5,6 +5,7 @@
 //! know their scripthashes / txids.
 
 mod server;
+mod tweaks;
 
 pub use server::{
     electrum_scripthash_hex, read_line_capped, run_electrum, sample_reset_perf, ElectrumConfig,

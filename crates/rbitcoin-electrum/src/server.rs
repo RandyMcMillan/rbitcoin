@@ -463,6 +463,11 @@ fn dispatch(
             "server_version": SERVER_VERSION,
             "hash_function": "sha256",
             "pruning": null,
+            // Cake probes the tweaks method, not features. Other clients (and
+            // future Cake) can see SP without a dummy RPC. Cake electrs does
+            // not implement server.features.
+            "silent_payments": [0],
+            "tweaks": true,
         })),
         "blockchain.headers.subscribe" => {
             *header_sub = true;
@@ -718,6 +723,7 @@ fn dispatch(
             Ok(Value::Array(arr))
         }
         "server.peers.subscribe" => Ok(json!([])),
+        "blockchain.tweaks.subscribe" => crate::tweaks::subscribe(query, params, chain),
         other => Err(format!("unknown method: {other}")),
     }
 }
@@ -1032,6 +1038,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(features["protocol_min"], PROTOCOL_MIN);
+        assert_eq!(features["silent_payments"], json!([0]));
+        assert_eq!(features["tweaks"], json!(true));
+
+        let probe = dispatch(
+            "blockchain.tweaks.subscribe",
+            &json!([0, 1, false]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(probe, json!({"0": {}}));
 
         assert!(dispatch(
             "server.donation_address",
@@ -2373,5 +2394,216 @@ mod tests {
         assert_eq!(cfg.limits, lim);
         assert_eq!(cfg.max_connections(), DEFAULT_MAX_CONNECTIONS);
         assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn tweaks_count_clamped_to_eight() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..12u32 {
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xec;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(1, &ph, &merkle, h + 1, 0x207fffff, h)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207fffff,
+                nonce: h,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![h as u8], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            parent_hash = Some(hash);
+        }
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let v = dispatch(
+            "blockchain.tweaks.subscribe",
+            &json!([0, 100, true]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), crate::tweaks::MAX_TWEAK_COUNT as usize);
+        assert!(obj.contains_key("0"));
+        assert!(obj.contains_key("7"));
+        assert!(!obj.contains_key("8"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tweaks_subscribe_matches_engine_on_p2wpkh_spend() {
+        use bitcoin::hashes::{hash160, Hash};
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::tweak_from_tx;
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let ser = pk.serialize();
+        let h160 = hash160::Hash::hash(&ser);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(h160.as_ref());
+        let (xonly, _) = pk.x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&xonly.serialize());
+
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let mut merkle0 = [0u8; 32];
+        merkle0[5] = 0xec;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle0,
+            hash: merkle0,
+        };
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid: genesis_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
+        };
+        let fk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: fk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let ta1 = TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: genesis_txid,
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![vec![0u8; 64], ser.to_vec()],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr.clone())],
+        };
+        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let v = dispatch(
+            "blockchain.tweaks.subscribe",
+            &json!([1, 1, false]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+
+        let engine_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(genesis_txid),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[&[0u8; 64][..], &ser[..]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(p2tr),
+            }],
+        };
+        let engine_prev = vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(p2wpkh),
+        }];
+        let expect = tweak_from_tx(&engine_tx, &engine_prev).unwrap();
+        let mut disp = spend_txid;
+        disp.reverse();
+        let key = rbitcoin_primitives::hex_encode(disp);
+        assert_eq!(
+            v["1"][key]["tweak"],
+            json!(rbitcoin_primitives::hex_encode(expect.tweak))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

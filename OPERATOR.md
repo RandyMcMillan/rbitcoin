@@ -373,6 +373,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — **naive**, computed per request from Class A + parent outs. No tweak index. `count` is **capped at 8**. Cake capability = this method succeeding (probe `[0, 1, false]` → `{"0": {}}`). `server.features` includes `silent_payments` / `tweaks`. On 9p-class IO expect ~1–3 blocks/s; local disk is faster. Some Cake builds still scan `electrs.cakewallet.com` even after a successful probe. |
 
 ### App DoS floor (always on)
 

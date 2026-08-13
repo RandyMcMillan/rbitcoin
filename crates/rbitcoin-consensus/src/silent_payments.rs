@@ -97,13 +97,28 @@ pub fn tweaks_at_height(
     }
     match query.load_thin_tweaks(height) {
         Ok(Some(rows)) => {
-            let mapped: Vec<([u8; 32], Option<[u8; 33]>, Option<&[OutputRecord]>)> = rows
-                .iter()
-                .map(|r| (r.txid, r.tweak, r.outputs.as_deref()))
-                .collect();
-            return tweaks_from_thin_and_body(&mapped).map_err(Into::into);
+            let mut out = BTreeMap::new();
+            for r in rows {
+                out.insert(
+                    r.txid,
+                    TxTweak {
+                        tweak: r.tweak,
+                        output_pubkeys: r
+                            .p2tr
+                            .into_iter()
+                            .map(|(vout, xonly, value)| TaprootOut { vout, xonly, value })
+                            .collect(),
+                    },
+                );
+            }
+            return Ok(out);
         }
-        Ok(None) => {}
+        Ok(None) => {
+            rbitcoin_log::debug!(
+                "sp_tweaks: naive fallback h={} (hole or index off)",
+                height.0
+            );
+        }
         Err(e) => return Err(e.into()),
     }
     tweaks_for_height(query, params, height)

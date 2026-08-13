@@ -717,6 +717,63 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
     Ok((meta, outputs, spender_rels))
 }
 
+/// BIP341 P2TR outs only: no `OutputRecord` heap, no script alloc for other types.
+///
+/// `(vout, x-only, value_sats)`. Used by thin BIP-352 serve.
+pub fn scan_packed_p2tr_outs(
+    raw: &[u8],
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<Vec<(u32, [u8; 32], u64)>, StoreError> {
+    if raw.len() < TxRecord::BODY_META_LEN {
+        return Err(StoreError::Corrupt("short packed Class A tx"));
+    }
+    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
+    let mut off = TxRecord::BODY_META_LEN;
+    for _ in 0..meta.input_count {
+        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        off += used;
+    }
+    let mut out = Vec::new();
+    for vout in 0..meta.output_count {
+        if off >= raw.len() {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        }
+        if raw.len() - off < 9 {
+            return Err(StoreError::Corrupt("short output record"));
+        }
+        let flags = raw[off + 8];
+        let mut o = off + 9;
+        let (v, n) = read_uleb128(&raw[o..])?;
+        o += n;
+        let value = if v > i64::MAX as u64 { 0 } else { v as u64 };
+        if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) != 0 {
+            off = o;
+            continue;
+        }
+        let (slen, n) = read_compact_size(&raw[o..])?;
+        o += n;
+        let slen = slen as usize;
+        if raw.len() < o + slen {
+            return Err(StoreError::Corrupt("output script truncated"));
+        }
+        if slen == 34 {
+            let mut sc = [0u8; 34];
+            sc.copy_from_slice(&raw[o..o + 34]);
+            if let Some(sec) = secret {
+                sec.xor_bytes(0, &mut sc);
+            }
+            if sc[0] == 0x51 && sc[1] == 0x20 {
+                let mut xonly = [0u8; 32];
+                xonly.copy_from_slice(&sc[2..]);
+                out.push((vout, xonly, value));
+            }
+        }
+        off = o + slen;
+    }
+    check_trailing_zero_pad(raw, off)?;
+    Ok(out)
+}
+
 /// Sparse pin decode: only materialize `need_vouts` scripts + denserel slots.
 ///
 /// Walks the full packed layout (inputs skipped, non-need outs skipped without

@@ -501,10 +501,17 @@ impl TxTable {
         self.body.with_bytes_at(offset, len, f)
     }
 
-    /// Packed outs from a body slice already in RAM (applies script XOR).
-    pub fn packed_outs_from_raw(&self, raw: &[u8]) -> Result<Vec<OutputRecord>, StoreError> {
-        decode_packed_tx_outs_with_spender_rels_secret(raw, Some(&self.secret))
-            .map(|(_, outs, _)| outs)
+    /// Contiguous Class A body `(offset, len)` for create_fks `first..=last`.
+    pub fn body_ranges(&self, first: u64, last: u64) -> Result<Vec<(u64, u64)>, StoreError> {
+        self.body.record_ranges(first, last)
+    }
+
+    /// P2TR outs from a packed body slice (stack XOR; no `OutputRecord` heap).
+    pub fn packed_p2tr_from_raw(
+        &self,
+        raw: &[u8],
+    ) -> Result<Vec<(u32, [u8; 32], u64)>, StoreError> {
+        scan_packed_p2tr_outs(raw, Some(&self.secret))
     }
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).

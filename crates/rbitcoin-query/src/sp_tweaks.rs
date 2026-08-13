@@ -3,13 +3,12 @@
 use super::*;
 use rbitcoin_store::SpTweaksTable;
 
-/// One tx in a height, aligned with `header_txs`. Packed outs only when a tweak
-/// is stored (serve path; no parent scripts).
+/// Eligible tx after thin-index join (P2TR outs only).
 #[derive(Clone, Debug)]
 pub struct ThinTweakRow {
     pub txid: [u8; 32],
-    pub tweak: Option<[u8; 33]>,
-    pub outputs: Option<Vec<OutputRecord>>,
+    pub tweak: [u8; 33],
+    pub p2tr: Vec<(u32, [u8; 32], u64)>,
 }
 
 impl Query {
@@ -96,62 +95,43 @@ impl Query {
         let Some((first_fk, n_tx)) = self.store.header_txs.get_range(header_fk)? else {
             return Ok(None);
         };
-        let recs = {
+        let elig = {
             let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
             let Some(t) = g.as_ref() else {
                 return Ok(None);
             };
-            match t.get_block(height, header_fk, n_tx)? {
+            match t.get_eligible(height, header_fk, n_tx)? {
                 Some(r) => r,
                 None => return Ok(None),
             }
         };
-        if recs.len() != n_tx as usize {
-            return Err(StoreError::Corrupt(
-                "invariant: thin tweak n_tx != header_txs",
-            ));
-        }
-        let mut elig: Vec<(usize, [u8; 33])> = Vec::new();
-        for (i, tw) in recs.iter().enumerate() {
-            if let Some(t) = tw {
-                elig.push((i, *t));
-            }
-        }
         if elig.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let first_id = first_fk.get().ok_or(StoreError::InvalidFk)?;
-        let last_id = first_id.saturating_add(u64::from(n_tx.saturating_sub(1)));
-        let txids = self.store.txs.body_txid_range(first_id, last_id)?;
-        if txids.len() != n_tx as usize {
-            return Err(StoreError::Corrupt("invariant: txid.body span != n_tx"));
+        let i0 = u64::from(elig[0].0);
+        let i1 = u64::from(elig[elig.len() - 1].0);
+        let txids = self
+            .store
+            .txs
+            .body_txid_range(first_id + i0, first_id + i1)?;
+        let ranges = self.store.txs.body_ranges(first_id + i0, first_id + i1)?;
+        if txids.len() != ranges.len() || ranges.is_empty() {
+            return Err(StoreError::Corrupt("invariant: thin span idx"));
         }
-        let need_fks: Vec<Fk> = elig.iter().map(|(i, _)| Fk(first_id + *i as u64)).collect();
-        let ranges = self.store.txs.body_range_batch(&need_fks)?;
-        if ranges.len() != elig.len() {
-            return Err(StoreError::Corrupt("invariant: body range count"));
-        }
-        let mut span_lo = u64::MAX;
-        let mut span_hi = 0u64;
-        let mut resolved: Vec<(usize, [u8; 33], u64, u64)> = Vec::with_capacity(elig.len());
-        for (j, r) in ranges.iter().enumerate() {
-            let Some((off, len)) = *r else {
-                return Err(StoreError::Corrupt(
-                    "invariant: thin tweak missing packed body",
-                ));
-            };
-            span_lo = span_lo.min(off);
-            span_hi = span_hi.max(off.saturating_add(len));
-            resolved.push((elig[j].0, elig[j].1, off, len));
-        }
+        let span_lo = ranges[0].0;
+        let (last_off, last_len) = ranges[ranges.len() - 1];
+        let span_hi = last_off.saturating_add(last_len);
         if span_hi < span_lo {
             return Err(StoreError::Corrupt("invariant: packed body span"));
         }
         self.store
             .txs
             .with_body_span(span_lo, span_hi - span_lo, |blob| {
-                let mut rows = Vec::with_capacity(resolved.len());
-                for (i, tweak, off, len) in resolved {
+                let mut rows = Vec::with_capacity(elig.len());
+                for &(tx_i, tweak) in &elig {
+                    let rel_i = (u64::from(tx_i) - i0) as usize;
+                    let (off, len) = ranges[rel_i];
                     let rel = (off - span_lo) as usize;
                     let end = rel.saturating_add(len as usize);
                     if end > blob.len() {
@@ -159,11 +139,11 @@ impl Query {
                             "invariant: packed body slice out of span",
                         ));
                     }
-                    let outs = self.store.txs.packed_outs_from_raw(&blob[rel..end])?;
+                    let p2tr = self.store.txs.packed_p2tr_from_raw(&blob[rel..end])?;
                     rows.push(ThinTweakRow {
-                        txid: txids[i],
-                        tweak: Some(tweak),
-                        outputs: Some(outs),
+                        txid: txids[rel_i],
+                        tweak,
+                        p2tr,
                     });
                 }
                 Ok(Some(rows))

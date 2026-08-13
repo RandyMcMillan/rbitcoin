@@ -1,9 +1,13 @@
 //! Cake-compatible `blockchain.tweaks.subscribe` (naive, uncached).
 
-use rbitcoin_consensus::{tweaks_at_height, ChainParams, TxTweak};
-use rbitcoin_primitives::{hex_encode, Height};
+use rbitcoin_consensus::{tweaks_for_height, ChainParams, TxTweak};
+#[cfg(test)]
+use rbitcoin_primitives::hex_encode;
+use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
-use serde_json::{json, Map, Value};
+#[cfg(test)]
+use serde_json::Map;
+use serde_json::{json, Value};
 use std::time::Instant;
 
 /// Parsed `blockchain.tweaks.subscribe` window.
@@ -32,21 +36,129 @@ pub fn last_height(start: u32, count: u32, tip: Option<u32>) -> Option<u32> {
 
 /// One height key → txs. Cake `fromJson` uses the **last** map key as `block`.
 pub fn height_map(query: &Query, chain: &ChainParams, h: u32) -> Result<Value, String> {
-    let tip = query.tip_height().map(|t| t.0);
-    if tip.is_none_or(|t| h > t) {
-        return Ok(json!({ h.to_string(): {} }));
-    }
-    let tweaks = tweaks_at_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
-    Ok(json!({ h.to_string(): height_object(&tweaks) }))
+    let s = height_map_json(query, chain, h)?;
+    serde_json::from_str(&s).map_err(|e| e.to_string())
 }
 
-/// Cake isolate notification: `params[0]` is the height map.
-pub fn height_notify(map: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "method": "blockchain.tweaks.subscribe",
-        "params": [map],
-    })
+/// Cake height map as JSON text (no `serde_json::Value` tree).
+pub fn height_map_json(query: &Query, chain: &ChainParams, h: u32) -> Result<String, String> {
+    let tip = query.tip_height().map(|t| t.0);
+    if tip.is_none_or(|t| h > t) || !chain.taproot_active_at(h) {
+        return Ok(empty_height_json(h));
+    }
+    match query.load_thin_tweaks(Height(h)) {
+        Ok(Some(rows)) => Ok(encode_thin_height_json(h, &rows)),
+        Ok(None) => {
+            let tweaks = tweaks_for_height(query, chain, Height(h)).map_err(|e| e.to_string())?;
+            let mut s = String::new();
+            s.push('{');
+            push_quoted_u32(&mut s, h);
+            s.push(':');
+            push_height_object_json(&mut s, &tweaks);
+            s.push('}');
+            Ok(s)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Electrum notify line for one height (json-rpc wrapper + newline not included).
+pub fn height_notify_json(query: &Query, chain: &ChainParams, h: u32) -> Result<String, String> {
+    let map = height_map_json(query, chain, h)?;
+    let mut s = String::with_capacity(map.len() + 80);
+    s.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.tweaks.subscribe\",\"params\":[");
+    s.push_str(&map);
+    s.push_str("]}");
+    Ok(s)
+}
+
+fn empty_height_json(h: u32) -> String {
+    let mut s = String::with_capacity(16);
+    s.push('{');
+    push_quoted_u32(&mut s, h);
+    s.push_str(":{}}");
+    s
+}
+
+pub(crate) fn encode_thin_height_json(h: u32, rows: &[rbitcoin_query::ThinTweakRow]) -> String {
+    let mut s = String::with_capacity(64 + rows.len() * 192);
+    s.push('{');
+    push_quoted_u32(&mut s, h);
+    s.push_str(":{");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        push_txid_display_hex(&mut s, &r.txid);
+        s.push_str("\":{\"tweak\":\"");
+        push_hex(&mut s, &r.tweak);
+        s.push_str("\",\"output_pubkeys\":{");
+        for (j, (vout, xonly, value)) in r.p2tr.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{vout}"));
+            s.push_str("\":[\"");
+            push_hex(&mut s, xonly);
+            s.push_str("\",");
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{value}"));
+            s.push(']');
+        }
+        s.push_str("}}");
+    }
+    s.push_str("}}");
+    s
+}
+
+fn push_height_object_json(s: &mut String, tweaks: &std::collections::BTreeMap<[u8; 32], TxTweak>) {
+    s.push('{');
+    for (i, (txid, t)) in tweaks.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        push_txid_display_hex(s, txid);
+        s.push_str("\":{\"tweak\":\"");
+        push_hex(s, &t.tweak);
+        s.push_str("\",\"output_pubkeys\":{");
+        for (j, o) in t.output_pubkeys.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            let _ = core::fmt::Write::write_fmt(s, format_args!("{}", o.vout));
+            s.push_str("\":[\"");
+            push_hex(s, &o.xonly);
+            s.push_str("\",");
+            let _ = core::fmt::Write::write_fmt(s, format_args!("{}", o.value));
+            s.push(']');
+        }
+        s.push_str("}}");
+    }
+    s.push('}');
+}
+
+fn push_quoted_u32(s: &mut String, n: u32) {
+    s.push('"');
+    let _ = core::fmt::Write::write_fmt(s, format_args!("{n}"));
+    s.push('"');
+}
+
+fn push_hex(s: &mut String, data: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    s.reserve(data.len() * 2);
+    for &b in data {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+}
+
+fn push_txid_display_hex(s: &mut String, txid: &[u8; 32]) {
+    let mut r = *txid;
+    r.reverse();
+    push_hex(s, &r);
 }
 
 /// Cake `noData` / resubscribe signal (`fromJson` catch path reads `message`).
@@ -74,6 +186,7 @@ pub fn subscribe(query: &Query, params: &Value, chain: &ChainParams) -> Result<V
     Ok(map)
 }
 
+#[cfg(test)]
 pub fn height_object(tweaks: &std::collections::BTreeMap<[u8; 32], TxTweak>) -> Value {
     let mut txs = Map::new();
     for (txid, t) in tweaks {
@@ -82,6 +195,7 @@ pub fn height_object(tweaks: &std::collections::BTreeMap<[u8; 32], TxTweak>) -> 
     Value::Object(txs)
 }
 
+#[cfg(test)]
 pub fn encode_tx_tweak(t: &TxTweak) -> Value {
     let mut outs = Map::new();
     for o in &t.output_pubkeys {
@@ -93,6 +207,7 @@ pub fn encode_tx_tweak(t: &TxTweak) -> Value {
     })
 }
 
+#[cfg(test)]
 fn txid_display_hex(txid: &[u8; 32]) -> String {
     let mut r = *txid;
     r.reverse();
@@ -162,6 +277,34 @@ mod tests {
         let v = done_notify();
         assert_eq!(v["method"], "blockchain.tweaks.subscribe");
         assert_eq!(v["params"][0]["message"], "done");
+    }
+
+    #[test]
+    fn thin_json_matches_value_encoder() {
+        let mut tweak = [0u8; 33];
+        tweak[0] = 0x02;
+        tweak[1] = 0xaa;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x11;
+        let row = rbitcoin_query::ThinTweakRow {
+            txid,
+            tweak,
+            p2tr: vec![(1, [0x5f; 32], 5410)],
+        };
+        let s = encode_thin_height_json(850_000, &[row]);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        let t = TxTweak {
+            tweak,
+            output_pubkeys: vec![rbitcoin_consensus::TaprootOut {
+                vout: 1,
+                xonly: [0x5f; 32],
+                value: 5410,
+            }],
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(txid, t);
+        let expect = json!({ "850000": height_object(&map) });
+        assert_eq!(v, expect);
     }
 
     #[test]

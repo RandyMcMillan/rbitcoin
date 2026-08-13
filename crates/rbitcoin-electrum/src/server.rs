@@ -539,7 +539,7 @@ where
     let tip = query.tip_height().map(|h| h.0);
     let last = crate::tweaks::last_height(req.start, req.count, tip);
     let t0 = Instant::now();
-    let first = match crate::tweaks::height_map(query, chain, req.start) {
+    let first = match crate::tweaks::height_map_json(query, chain, req.start) {
         Ok(v) => v,
         Err(e) => {
             rbitcoin_log::api_call(
@@ -568,7 +568,7 @@ where
         wall_ms,
         None,
     );
-    write_line(writer, &json!({"jsonrpc":"2.0","id": id, "result": first})).await?;
+    write_rpc_result(writer, &id, &first).await?;
 
     let Some(last) = last else {
         write_line(writer, &crate::tweaks::done_notify()).await?;
@@ -607,17 +607,17 @@ where
             }
             map = {
                 let q = Arc::clone(query);
-                let c = (**chain).clone();
+                let c = Arc::clone(chain);
                 let h = next;
                 async move {
-                    tokio::task::spawn_blocking(move || crate::tweaks::height_map(&q, &c, h))
+                    tokio::task::spawn_blocking(move || crate::tweaks::height_notify_json(&q, &c, h))
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()))
                 }
             } => {
                 match map {
                     Ok(v) => {
-                        write_line(writer, &crate::tweaks::height_notify(v)).await?;
+                        write_raw_line(writer, &v).await?;
                     }
                     Err(e) => {
                         rbitcoin_log::api_call(
@@ -648,6 +648,30 @@ async fn write_line<W: AsyncWrite + Unpin>(
     writer.write_all(s.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn write_raw_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg: &str,
+) -> Result<(), std::io::Error> {
+    writer.write_all(msg.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn write_rpc_result<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    id: &Value,
+    result_json: &str,
+) -> Result<(), std::io::Error> {
+    let mut s = String::with_capacity(result_json.len() + 48);
+    s.push_str("{\"jsonrpc\":\"2.0\",\"id\":");
+    s.push_str(&serde_json::to_string(id).unwrap_or_else(|_| "null".into()));
+    s.push_str(",\"result\":");
+    s.push_str(result_json);
+    s.push('}');
+    write_raw_line(writer, &s).await
 }
 
 fn dispatch(

@@ -208,6 +208,35 @@ impl SpTweaksTable {
         Ok(recs)
     }
 
+    fn decode_eligible(bytes: &[u8], n_tx: u32) -> Result<Vec<(u32, [u8; 33])>, StoreError> {
+        let mut elig = Vec::new();
+        let mut i = 0usize;
+        for tx_i in 0..n_tx {
+            if i >= bytes.len() {
+                return Err(StoreError::Corrupt("sp_tweaks short body"));
+            }
+            let len = bytes[i];
+            i += 1;
+            match len {
+                0 => {}
+                TWEAK_LEN => {
+                    if i + 33 > bytes.len() {
+                        return Err(StoreError::Corrupt("sp_tweaks short tweak"));
+                    }
+                    let mut t = [0u8; 33];
+                    t.copy_from_slice(&bytes[i..i + 33]);
+                    elig.push((tx_i, t));
+                    i += 33;
+                }
+                _ => return Err(StoreError::Corrupt("sp_tweaks bad len (want 0 or 33)")),
+            }
+        }
+        if i != bytes.len() {
+            return Err(StoreError::Corrupt("sp_tweaks n_tx/body mismatch"));
+        }
+        Ok(elig)
+    }
+
     /// Append the next SP-era height. `records.len()` is `header_txs` count.
     pub fn put_block(
         &self,
@@ -282,6 +311,45 @@ impl SpTweaksTable {
             self.body.read_at(start, &mut buf)?;
         }
         Ok(Some(Self::decode_records(&buf, n_tx)?))
+    }
+
+    /// Eligible tweaks only: `(tx_index_in_block, tweak)`. Hole → `None`.
+    pub fn get_eligible(
+        &self,
+        height: Height,
+        block_fk: Fk,
+        n_tx: u32,
+    ) -> Result<Option<Vec<(u32, [u8; 33])>>, StoreError> {
+        if height.0 < self.origin {
+            return Ok(None);
+        }
+        let i = u64::from(height.0 - self.origin);
+        let n = self.slot_count();
+        if i >= n {
+            return Ok(None);
+        }
+        let slot = self.read_slot(i)?;
+        if slot.block_fk != block_fk {
+            return Ok(None);
+        }
+        let start = u64::from(slot.off);
+        let end = if i + 1 < n {
+            u64::from(self.read_slot(i + 1)?.off)
+        } else {
+            self.body.logical_len()
+        };
+        if end < start {
+            return Err(StoreError::Corrupt("sp_tweaks off order"));
+        }
+        let len = (end - start) as usize;
+        if start < FILE_HEADER_LEN as u64 {
+            return Err(StoreError::Corrupt("sp_tweaks off in header"));
+        }
+        let mut buf = vec![0u8; len];
+        if len > 0 {
+            self.body.read_at(start, &mut buf)?;
+        }
+        Ok(Some(Self::decode_eligible(&buf, n_tx)?))
     }
 
     /// Drop heights **above** `new_tip` (inclusive keep `origin..=new_tip`).

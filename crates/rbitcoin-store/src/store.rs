@@ -521,10 +521,10 @@ impl Store {
         )
     }
 
-    /// Sparse denserels/outs by known body ranges (prep; skips `tx.idx`).
+    /// Sparse outs by known `txout` ranges (prep; skips idx).
     ///
     /// See [`TxTable::get_outs_denserels_by_range_batch`].
-    pub fn get_outs_denserels_by_range_batch(
+    pub fn get_outs_by_range_batch(
         &self,
         items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
     ) -> Result<
@@ -538,7 +538,22 @@ impl Store {
         self.txs.get_outs_denserels_by_range_batch(items)
     }
 
-    /// Shape A archive path: Prefix33 select + one denserels per winner.
+    /// Deprecated name for [`Self::get_outs_by_range_batch`].
+    pub fn get_outs_denserels_by_range_batch(
+        &self,
+        items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
+    ) -> Result<
+        (
+            Vec<Option<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>>,
+            u64,
+            u64,
+        ),
+        StoreError,
+    > {
+        self.get_outs_by_range_batch(items)
+    }
+
+    /// Head-resolve: `txid.body` identity + `txout` outs (not Prefix33 body peeks).
     ///
     /// See [`TxTable::get_fk_and_outs_by_txid_batch`].
     pub fn get_fk_and_outs_by_txid_batch(

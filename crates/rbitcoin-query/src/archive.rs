@@ -23,7 +23,7 @@ pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>)>;
 
 /// Approx heap bytes for one [`CreatePin`] payload (for IBD `sizes` metering).
 ///
-/// Counts owned script/denserels vectors + fixed record overhead — not Arc
+/// Counts owned output scripts + fixed record overhead — not Arc
 /// refcount sharing (each strong Arc still "owns" the allocation once).
 #[inline]
 pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
@@ -36,11 +36,10 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     n
 }
 
-/// Sparse external parent denserels for pin (need-vouts only).
+/// Sparse external parent outs for pin (need-vouts only).
 ///
-/// `(tx, live need outs, sparse denserels as (vout, rel))` — **not** a full
-/// `output_count`-sized outs/denserels expand. Transient on the plan until pin;
-/// sparse need then lives in [`crate::BatchParents`].
+/// `(tx, live need outs)` — **not** a full `output_count`-sized expand.
+/// Transient on the plan until pin; sparse need then lives in [`crate::BatchParents`].
 pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>)>;
 
 /// Write-ready plan batch from lookup/load to commit (writer).
@@ -49,7 +48,7 @@ pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>)
 /// appender returns different fks (another writer interleave — must not happen).
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
-    /// Body-append rows: shared [`CreatePin`] (tx + outs + denserels) + inputs.
+    /// Body-append rows: shared [`CreatePin`] (tx + outs) + inputs.
     /// Outs live once in the pin Arc (not duplicated alongside inputs).
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,

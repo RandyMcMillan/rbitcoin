@@ -779,7 +779,7 @@ impl TxTable {
         crate::head_resolve_denserels::resolve_fk_and_range_batch(self, txids)
     }
 
-    /// Sparse denserels/outs by known body ranges (prep pin after plan stamp).
+    /// Sparse outs by known `txout` body ranges (prep pin after plan stamp).
     ///
     /// Each job is `(create_fk, body_range, known_txid, need_vouts)`.
     /// - **Skips `tx.idx`** (range known).

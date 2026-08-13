@@ -858,7 +858,8 @@ impl BatchParents {
             return false;
         };
         let lay = e.load_layout();
-        lay.spent_range.is_some() || !lay.spender_rels.is_empty()
+        // Schema 15: abs is spent_range only. Leftover txout-offset "rels" are not layout.
+        lay.spent_range.is_some()
     }
 
     pub fn fks_missing_layout(&self) -> Vec<Fk> {
@@ -1190,7 +1191,7 @@ mod tests {
             vec![(0, 40)],
         );
         assert!(!bp.has_abs_layout(Fk(3)));
-        assert!(bp.has_spender_rels(Fk(3)));
+        assert!(!bp.has_spender_rels(Fk(3)));
         bp.set_body_range_only(Fk(3), (500, 80));
         assert!(!bp.has_abs_layout(Fk(3)));
         bp.set_spent_range_only(Fk(3), (500, 18));
@@ -1883,7 +1884,7 @@ mod tests {
         assert!(bp.has_parent_out(Fk(1), 0));
         assert_eq!(bp.get_body_range(Fk(1)), Some((200, 50)));
         assert!(!bp.has_abs_layout(Fk(1)));
-        assert!(bp.has_spender_rels(Fk(1)));
+        assert!(!bp.has_spender_rels(Fk(1)));
         bp.set_spent_range_only(Fk(1), (200, 27));
         assert!(bp.has_abs_layout(Fk(1)));
         // No-op when layout already covers same range+rels.

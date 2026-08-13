@@ -1,6 +1,6 @@
-//! **tx.idx → tx.body** pipeline for confirm load and archive head-resolve.
+//! **idx → body** pipeline for confirm load (`txout` / `inwit` / `spent` stems).
 //!
-//! Idx via sorted [`VarTable::record_range_batch`] (`tx.idx` segments are
+//! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
 //! [`crate::file::TableAccess::FdOnly`] pread). Body backend from
 //! [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` / global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
@@ -20,7 +20,7 @@ use rbitcoin_primitives::Fk;
 pub enum BodyMode {
     /// Full record (txout or inwit).
     Full,
-    /// `txout` first page (outs / pin). Alias kept as `OutsDenserels` in re-exports.
+    /// `txout` first page (outs / pin).
     Outs,
     /// Leading ≤32 body bytes (retired; tests only).
     Prefix33,

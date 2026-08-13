@@ -14,7 +14,7 @@ use crate::scripthash_head::{
 };
 use crate::scripthash_layout::{
     payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC,
-    SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_PAGE_SLAB_CLASS,
+    SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
 #[cfg(test)]
 use crate::scripthash_overflow::{ovf_dir, ovf_seg_path};
@@ -22,6 +22,10 @@ use crate::scripthash_overflow::{ovf_segment_slots, ShOverflowStack};
 use crate::scripthash_pages::{
     sh_page_count_for_entries, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk,
     sh_page_pack, sh_page_set_next, sh_page_try_append, SH_PAGE_FK_CAP, SH_PAGE_SIZE,
+};
+use crate::scripthash_slabs::{
+    decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
+    slab_class_for_n_fks_with_slack, SH_MEGAKEY_MIN_FKS,
 };
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
@@ -694,7 +698,15 @@ impl ScriptHashTable {
         match val {
             ShHeadValue::Empty => Ok(Vec::new()),
             ShHeadValue::Inline { .. } => Ok(val.inline_entries().to_vec()),
-            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
+            ShHeadValue::Slab { class, off, used } => {
+                let got = self.read_slab(*class, *off)?;
+                if got.len() != *used as usize {
+                    return Err(StoreError::Corrupt(
+                        "invariant: scripthash slab used != decoded fk count",
+                    ));
+                }
+                Ok(got)
+            }
             ShHeadValue::Paged { first_page, .. } => self.collect_page_chain(*first_page),
         }
     }
@@ -734,7 +746,10 @@ impl ScriptHashTable {
                 let ents = val.inline_entries();
                 Ok(ents.iter().map(|e| e.create_tx_fk).max_by_key(|f| f.0))
             }
-            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
+            ShHeadValue::Slab { class, off, .. } => {
+                let ents = self.read_slab(*class, *off)?;
+                Ok(ents.last().map(|e| e.create_tx_fk))
+            }
             ShHeadValue::Paged { last_page, .. } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
                 self.body.read_at(*last_page, &mut page)?;
@@ -1047,17 +1062,8 @@ impl ScriptHashTable {
                 ));
             }
         }
-        if n <= SH_INLINE_CAP as u32 {
-            self.free_if_paged(alloc, old)?;
-            return Ok(if n == 1 {
-                ShHeadValue::inline_one(live[0])
-            } else {
-                ShHeadValue::inline_two(live[0], live[1])
-            });
-        }
         self.free_if_paged(alloc, old)?;
-        let (first, last) = self.write_new_page_chain(alloc, live)?;
-        Ok(ShHeadValue::paged(first, last))
+        self.pack_entries(alloc, live, false)
     }
 
     /// Append strictly increasing `new_ents` (all already `> durable max`) without
@@ -1082,31 +1088,35 @@ impl ScriptHashTable {
         alloc.live_count = alloc.live_count.saturating_add(new_ents.len() as u64);
 
         match old {
-            ShHeadValue::Empty => {
-                if new_ents.len() <= SH_INLINE_CAP {
-                    return Ok(if new_ents.len() == 1 {
-                        ShHeadValue::inline_one(new_ents[0])
-                    } else {
-                        ShHeadValue::inline_two(new_ents[0], new_ents[1])
-                    });
-                }
-                let (first, last) = self.write_new_page_chain(alloc, new_ents)?;
-                Ok(ShHeadValue::paged(first, last))
-            }
+            ShHeadValue::Empty => self.pack_entries(alloc, new_ents, true),
             ShHeadValue::Inline { .. } => {
                 let mut live = old.inline_entries().to_vec();
                 live.extend_from_slice(new_ents);
-                if live.len() <= SH_INLINE_CAP {
-                    return Ok(if live.len() == 1 {
-                        ShHeadValue::inline_one(live[0])
-                    } else {
-                        ShHeadValue::inline_two(live[0], live[1])
-                    });
-                }
-                let (first, last) = self.write_new_page_chain(alloc, &live)?;
-                Ok(ShHeadValue::paged(first, last))
+                self.pack_entries(alloc, &live, true)
             }
-            ShHeadValue::Slab { .. } => Err(StoreError::Corrupt("scripthash slab body not wired")),
+            ShHeadValue::Slab { class, off, .. } => {
+                let mut live = self.read_slab(*class, *off)?;
+                if let (Some(last), Some(first_new)) = (live.last(), new_ents.first()) {
+                    if first_new.create_tx_fk.0 <= last.create_tx_fk.0 {
+                        return Err(StoreError::Corrupt(
+                            "invariant: scripthash slab append create_fk not strictly increasing",
+                        ));
+                    }
+                }
+                live.extend_from_slice(new_ents);
+                let new_val = self.pack_entries_reuse(alloc, &live, true, Some((*class, *off)))?;
+                if !matches!(
+                    &new_val,
+                    ShHeadValue::Slab {
+                        class: nc,
+                        off: no,
+                        ..
+                    } if *nc == *class && *no == *off
+                ) {
+                    self.free_slab(alloc, *class, *off)?;
+                }
+                Ok(new_val)
+            }
             ShHeadValue::Paged {
                 first_page,
                 last_page,
@@ -1115,6 +1125,93 @@ impl ScriptHashTable {
                 Ok(ShHeadValue::paged(*first_page, last))
             }
         }
+    }
+
+    /// Pack `live` into inline / slab / megakey pages. `slack` picks a class
+    /// with a spare slot on tip grow; cold pack uses exact class.
+    fn pack_entries(
+        &self,
+        alloc: &mut AllocState,
+        live: &[ShEntry],
+        slack: bool,
+    ) -> Result<ShHeadValue, StoreError> {
+        self.pack_entries_reuse(alloc, live, slack, None)
+    }
+
+    fn pack_entries_reuse(
+        &self,
+        alloc: &mut AllocState,
+        live: &[ShEntry],
+        slack: bool,
+        reuse: Option<(u8, u64)>,
+    ) -> Result<ShHeadValue, StoreError> {
+        let n = live.len() as u32;
+        if n == 0 {
+            return Ok(ShHeadValue::Empty);
+        }
+        if n <= SH_INLINE_CAP as u32 {
+            return Ok(if n == 1 {
+                ShHeadValue::inline_one(live[0])
+            } else {
+                ShHeadValue::inline_two(live[0], live[1])
+            });
+        }
+        if n >= SH_MEGAKEY_MIN_FKS {
+            let (first, last) = self.write_new_page_chain(alloc, live)?;
+            return Ok(ShHeadValue::paged(first, last));
+        }
+        let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
+        let payload = encode_slab_payload(&fks)?;
+        let class = match Self::slab_class_fitting(n, payload.len(), slack) {
+            Some(c) => c,
+            None => {
+                let (first, last) = self.write_new_page_chain(alloc, live)?;
+                return Ok(ShHeadValue::paged(first, last));
+            }
+        };
+        let cap = slab_bytes(class) as usize;
+        if payload.len() > cap {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash slab payload exceeds class bytes",
+            ));
+        }
+        let off = if let Some((rc, ro)) = reuse {
+            if rc == class {
+                ro
+            } else {
+                self.alloc_slab(alloc, class)?
+            }
+        } else {
+            self.alloc_slab(alloc, class)?
+        };
+        let mut buf = vec![0u8; cap];
+        buf[..payload.len()].copy_from_slice(&payload);
+        self.body.write_at(off, &buf)?;
+        Ok(ShHeadValue::slab(class, n as u16, off))
+    }
+
+    fn slab_class_fitting(n: u32, packed_len: usize, slack: bool) -> Option<u8> {
+        let start = if slack {
+            slab_class_for_n_fks_with_slack(n)
+        } else {
+            slab_class_for_n_fks(n)
+        }?;
+        for c in start..=SH_MAX_SLAB_CLASS {
+            if slab_bytes(c) as usize >= packed_len {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    fn read_slab(&self, class: u8, off: u64) -> Result<Vec<ShEntry>, StoreError> {
+        if class > SH_MAX_SLAB_CLASS {
+            return Err(StoreError::Corrupt("scripthash slab class overflow"));
+        }
+        let mut buf = vec![0u8; slab_bytes(class) as usize];
+        self.body.read_at(off, &mut buf)?;
+        let fks = decode_slab_payload(&buf)?;
+        Ok(fks.into_iter().map(ShEntry::new).collect())
     }
 
     fn write_new_page_chain(
@@ -1192,14 +1289,15 @@ impl ScriptHashTable {
             return Ok(off);
         }
         let need = slab_bytes(class);
-        debug_assert_eq!(need, SH_PAGE_SIZE as u64);
-        let off = alloc.bump;
-        // Align page allocations to 4 KiB within the body after header.
-        let aligned = (off + 4095) & !4095;
-        if aligned != off {
-            alloc.bump = aligned;
+        let mut off = alloc.bump;
+        // Megakey pages 4 KiB-align. Small slabs pack from bump with no pad.
+        if class >= SH_PAGE_SLAB_CLASS {
+            let aligned = (off + 4095) & !4095;
+            if aligned != off {
+                alloc.bump = aligned;
+                off = aligned;
+            }
         }
-        let off = alloc.bump;
         alloc.bump = alloc.bump.saturating_add(need);
         self.body.ensure_capacity(alloc.bump)?;
         if alloc.bump > self.body.logical_len() {
@@ -1988,6 +2086,56 @@ mod tests {
     }
 
     #[test]
+    fn put_create_uses_slabs_then_pages() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0x15]);
+        for i in 1..=5u64 {
+            t.put_create(&rec(sh, i, 0)).unwrap();
+        }
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Slab { class, used, off } => {
+                assert_eq!(class, 1, "5 fks with slack → class 1 (64 B, cap 8)");
+                assert_eq!(used, 5);
+                assert!(off >= 4096);
+            }
+            other => panic!("expected class-1 slab, got {other:?}"),
+        }
+        assert_eq!(t.entries(&sh).unwrap().len(), 5);
+        for i in 6..=9u64 {
+            t.put_create(&rec(sh, i, 0)).unwrap();
+        }
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Slab { class, used, .. } => {
+                assert_eq!(class, 2, "9th fk grows class 1 → 2");
+                assert_eq!(used, 9);
+            }
+            other => panic!("expected class-2 slab, got {other:?}"),
+        }
+        assert_eq!(
+            t.put_create_batch(&[rec(sh, 9, 0), rec(sh, 5, 0)]).unwrap(),
+            0,
+            "fk ≤ max is a skip"
+        );
+        let rest: Vec<_> = (10..=257u64).map(|i| rec(sh, i, 0)).collect();
+        assert_eq!(t.put_create_batch(&rest).unwrap(), 248);
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
+                assert!(first_page > 0);
+                assert_eq!(first_page, last_page, "257 fks fit one megakey page");
+            }
+            other => panic!("expected page chain at 257, got {other:?}"),
+        }
+        assert_eq!(t.entries(&sh).unwrap().len(), 257);
+        assert!(t.contains_create(&sh, Fk(257)).unwrap());
+        assert!(!t.contains_create(&sh, Fk(258)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn promote_ladder_inline_to_paged() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
@@ -1998,14 +2146,12 @@ mod tests {
         assert_eq!(t.entries(&sh).unwrap().len(), 5);
         let v = t.head_value(&sh).unwrap().unwrap();
         match v {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert!(first_page > 0);
-                assert_eq!(first_page, last_page, "5 fks fit one page");
+            ShHeadValue::Slab { class, used, off } => {
+                assert_eq!(class, 1);
+                assert_eq!(used, 5);
+                assert!(off > 0);
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected slab, got {other:?}"),
         }
         assert_eq!(t.entry_count(), 5);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2021,13 +2167,12 @@ mod tests {
         assert_eq!(n, 100);
         let v = t.head_value(&sh).unwrap().unwrap();
         match v {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert!(first_page > 0 && last_page > 0);
+            ShHeadValue::Slab { class, used, off } => {
+                assert_eq!(class, 5, "100 fks → class 5 (cap 128)");
+                assert_eq!(used, 100);
+                assert!(off > 0);
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected slab, got {other:?}"),
         }
         assert_eq!(t.entries(&sh).unwrap().len(), 100);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2119,27 +2264,23 @@ mod tests {
         let (n, _) = t.put_create_batch_append(&first, &mut heads).unwrap();
         assert_eq!(n, 5);
         let first_off = match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert_eq!(first_page, last_page);
-                first_page
+            ShHeadValue::Slab { class, used, off } => {
+                assert_eq!(class, 1);
+                assert_eq!(used, 5);
+                off
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected slab, got {other:?}"),
         };
         let more: Vec<_> = (6..=7u32).map(|v| rec(sh, u64::from(v), v)).collect();
         let (n2, _) = t.put_create_batch_append(&more, &mut heads).unwrap();
         assert_eq!(n2, 2);
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert_eq!(first_page, first_off, "append must keep first page");
-                assert_eq!(last_page, first_off, "still one page");
+            ShHeadValue::Slab { class, used, off } => {
+                assert_eq!(off, first_off, "in-class append must reuse slab off");
+                assert_eq!(class, 1);
+                assert_eq!(used, 7);
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected slab, got {other:?}"),
         }
         let ents = t.entries(&sh).unwrap();
         assert_eq!(ents.len(), 7);
@@ -2175,7 +2316,7 @@ mod tests {
         }
         assert!(matches!(
             t.head_value(&sh).unwrap().unwrap(),
-            ShHeadValue::Paged { .. }
+            ShHeadValue::Slab { .. }
         ));
         t.unlink_create(&sh, Fk(2), 2).unwrap();
         match t.head_value(&sh).unwrap().unwrap() {
@@ -2710,8 +2851,11 @@ mod tests {
             t.put_create(&rec(sh1, i, i as u32)).unwrap();
         }
         let off1 = match t.head_value(&sh1).unwrap().unwrap() {
-            ShHeadValue::Paged { first_page, .. } => first_page,
-            _ => panic!("paged"),
+            ShHeadValue::Slab { off, class, .. } => {
+                assert_eq!(class, 0);
+                off
+            }
+            other => panic!("expected slab, got {other:?}"),
         };
         for i in 1..=3u64 {
             t.unlink_create(&sh1, Fk(i), i as u32).unwrap();
@@ -2720,10 +2864,13 @@ mod tests {
             t.put_create(&rec(sh2, 10 + i, i as u32)).unwrap();
         }
         let off2 = match t.head_value(&sh2).unwrap().unwrap() {
-            ShHeadValue::Paged { first_page, .. } => first_page,
-            _ => panic!("paged"),
+            ShHeadValue::Slab { off, class, .. } => {
+                assert_eq!(class, 0);
+                off
+            }
+            other => panic!("expected slab, got {other:?}"),
         };
-        assert_eq!(off1, off2, "page freelist should reuse offset");
+        assert_eq!(off1, off2, "slab freelist should reuse offset");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

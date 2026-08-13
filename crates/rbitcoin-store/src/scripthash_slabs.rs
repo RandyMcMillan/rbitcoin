@@ -198,6 +198,7 @@ mod tests {
         assert_eq!(slab_class_for_n_fks_with_slack(4), Some(1));
         assert_eq!(slab_class_for_n_fks_with_slack(256), Some(6));
         assert_eq!(slab_alloc_bytes_for_n_fks(1), 0);
+        assert_eq!(page_alloc_bytes_for_n_fks(1), 0);
         assert_eq!(slab_alloc_bytes_for_n_fks(5), 64);
         assert_eq!(slab_alloc_bytes_for_n_fks(257), 4096);
         assert_eq!(page_alloc_bytes_for_n_fks(5), 4096);
@@ -229,7 +230,14 @@ mod tests {
         }
         assert!(encode_fk_delta_stream(&[Fk(5), Fk(5)]).is_err());
         assert!(encode_fk_delta_stream(&[Fk(0)]).is_err());
+        assert!(encode_fk_delta_stream(&[Fk(SH_FLAG_BIT | 1)]).is_err());
+        assert!(encode_fk_delta_stream(&[Fk(1), Fk(SH_FLAG_BIT | 2)]).is_err());
         assert!(decode_fk_delta_stream(&[0x00], 1).is_err());
+        let mut flagged = Vec::new();
+        crate::compact::write_uleb128(&mut flagged, SH_FLAG_BIT);
+        assert!(decode_fk_delta_stream(&flagged, 1).is_err());
+        assert!(decode_fk_delta_stream(&[0x01, 0x00], 2).is_err());
         assert!(decode_slab_payload(&[0]).is_err());
+        assert!(decode_fk_delta_stream(&[], 0).unwrap().is_empty());
     }
 }

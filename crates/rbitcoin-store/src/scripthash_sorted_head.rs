@@ -361,8 +361,26 @@ mod tests {
 
         let h2 = SortedHead::open(&path).unwrap();
         assert_eq!(h2.get(&key_of(7)).unwrap().unwrap(), new_val);
+
+        let unsorted = vec![(key_of(2), recs[0].1), (key_of(1), recs[0].1)];
+        assert!(SortedHead::write(path.with_extension("bad"), &unsorted).is_err());
+        let junk = path.with_extension("junk");
+        std::fs::write(&junk, b"XXXX").unwrap();
+        assert!(matches!(SortedHead::open(&junk), Err(StoreError::BadMagic)));
+        let mut bad_ver = std::fs::read(&path).unwrap();
+        bad_ver[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let verp = path.with_extension("ver");
+        std::fs::write(&verp, &bad_ver).unwrap();
+        std::fs::copy(idx_path(&path), idx_path(&verp)).unwrap();
+        std::fs::copy(fuse_path(&path), fuse_path(&verp)).unwrap();
+        assert!(SortedHead::open(&verp).is_err());
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(idx_path(&path));
         let _ = std::fs::remove_file(fuse_path(&path));
+        let _ = std::fs::remove_file(&junk);
+        let _ = std::fs::remove_file(&verp);
+        let _ = std::fs::remove_file(idx_path(&verp));
+        let _ = std::fs::remove_file(fuse_path(&verp));
     }
 }

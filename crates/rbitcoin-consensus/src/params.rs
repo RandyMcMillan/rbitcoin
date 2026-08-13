@@ -132,6 +132,35 @@ impl ChainParams {
         height >= self.btc.bip34_height
     }
 
+    /// Core `IsBIP30Repeat`: the two mainnet blocks that overwrite an earlier
+    /// **unspent** coinbase (not the spent-duplicate rule).
+    ///
+    /// `d5d27987…` at 91812 is overwritten by 91842 (30 blocks later — still
+    /// immature). `e3bf3d07…` at 91722 is overwritten by 91880. Core skips
+    /// BIP30 for those two **hashes** so IBD can pass. Every other pre-BIP34
+    /// overwrite of an unspent sibling is still `bad-txns-BIP30`.
+    #[inline]
+    pub fn is_bip30_repeat(&self, height: u32, block_hash: BlockHash) -> bool {
+        if self.network != Network::Bitcoin {
+            return false;
+        }
+        match height {
+            91842 => {
+                block_hash
+                    == block_hash_from_display_hex(
+                        "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+                    )
+            }
+            91880 => {
+                block_hash
+                    == block_hash_from_display_hex(
+                        "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+                    )
+            }
+            _ => false,
+        }
+    }
+
     /// BIP65 CLTV active?
     #[inline]
     pub fn bip65_active_at(&self, height: u32) -> bool {
@@ -208,14 +237,18 @@ impl ChainParams {
 /// (display-order hex). Do **not** invent hashes — a wrong entry rejects the
 /// real chain. Later mainnet safety relies on milestone + most-work, not dense
 /// checkpoints (Core itself stopped extending this list).
+fn block_hash_from_display_hex(hex: &str) -> BlockHash {
+    let bytes = rbitcoin_primitives::hex_decode(hex).expect("block hash hex");
+    let arr: [u8; 32] = bytes.try_into().expect("32 bytes");
+    // Bitcoin displays hashes internal-byte-order reversed in hex.
+    let mut rev = arr;
+    rev.reverse();
+    BlockHash::from_byte_array(rev)
+}
+
 fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
     fn h(hex: &str) -> BlockHash {
-        let bytes = rbitcoin_primitives::hex_decode(hex).expect("checkpoint hex");
-        let arr: [u8; 32] = bytes.try_into().expect("32 bytes");
-        // Bitcoin displays hashes internal-byte-order reversed in hex.
-        let mut rev = arr;
-        rev.reverse();
-        BlockHash::from_byte_array(rev)
+        block_hash_from_display_hex(hex)
     }
     vec![
         Checkpoint {
@@ -343,6 +376,30 @@ mod tests {
         assert_eq!(p.btc.pow_target_timespan, 14 * 24 * 60 * 60);
         assert_eq!(p.difficulty_adjustment_interval(), 20_160);
         assert!(ChainParams::custom_signet(challenge, 0).is_err());
+    }
+
+    /// Core `IsBIP30Repeat` — height+hash, mainnet only.
+    #[test]
+    fn is_bip30_repeat_matches_core() {
+        let main = ChainParams::mainnet();
+        let h91842 = block_hash_from_display_hex(
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+        );
+        let h91880 = block_hash_from_display_hex(
+            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+        );
+        assert!(main.is_bip30_repeat(91842, h91842));
+        assert!(main.is_bip30_repeat(91880, h91880));
+        assert!(
+            !main.is_bip30_repeat(91842, h91880),
+            "wrong hash at 91842 is not grandfathered"
+        );
+        assert!(!main.is_bip30_repeat(91880, h91842));
+        assert!(
+            !main.is_bip30_repeat(91859, h91842),
+            "batch-first height 91859 is not an exception"
+        );
+        assert!(!ChainParams::regtest().is_bip30_repeat(91880, h91880));
     }
 
     /// Mainnet buried heights (Core + Inquisition).

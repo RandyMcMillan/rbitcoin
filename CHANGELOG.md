@@ -38,6 +38,10 @@ before 1.0).
 
 ### Fixed
 
+- **Mainnet BIP30:** skip the two Core `IsBIP30Repeat` overwrites (91842 /
+  91880 hashes). Those coinbases were overwritten while still unspent, not
+  fully spent. IBD `bad-txns-BIP30` at logged `@91859` was the first height
+  of a write batch that contained 91880.
 - **Electrum tweaks subscribe:** stream remaining heights as notifications
   and finish with Cake’s `{"message":"done"}`. A one-shot 8-height result left
   the scan isolate idle after `[restore, remaining, false]`.

@@ -1339,11 +1339,15 @@ pub(crate) fn structural_validate_spends(
     let maturity = ctx.params.coinbase_maturity();
 
     // BIP30: Core skips once BIP34 is active. Before that, a connected
-    // instance with any unspent output may not be overwritten.
+    // instance with any unspent output may not be overwritten — except the
+    // two mainnet `IsBIP30Repeat` hashes (91842 / 91880), which overwrite
+    // unspent coinbases and are grandfathered.
     // One TipOnly batch for the block's create txids — not a per-tx head probe.
     // Just-archived self is unconnected, so it is not a hit; only a real
     // connected sibling comes back.
-    if !ctx.params.bip34_active_at(ctx.height.0) {
+    if !ctx.params.bip34_active_at(ctx.height.0)
+        && !ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
+    {
         let create_txids: Vec<[u8; 32]> = block
             .txdata
             .iter()

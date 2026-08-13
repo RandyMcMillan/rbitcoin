@@ -106,6 +106,83 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
     }
 }
 
+/// Unspent connected sibling + same create txid is BIP30 (not the 91842/91880
+/// mainnet grandfather). Spentness is durable annotate; this pin is the reject.
+#[test]
+fn bip30_rejects_unspent_connected_sibling() {
+    use crate::block::structural_validate_spends;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, FkMap, Query, U32Map, U64Map};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::collections::HashSet;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-bip30-unspent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let first = coinbase(1);
+    let txid = first.compute_txid().to_byte_array();
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let fk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().tx_height.set(fk, Height(1)).unwrap();
+
+    let dup = block_with(vec![first]);
+    let ctx = ctx_h(10);
+    let err = structural_validate_spends(
+        &q,
+        &dup,
+        &ctx,
+        Some(&[Fk(2)]),
+        &[],
+        0,
+        &mut HashSet::new(),
+        &BatchParents::new(),
+        &mut U32Map::default(),
+        &mut U64Map::default(),
+        &FkMap::default(),
+    )
+    .expect_err("unspent sibling must trip BIP30");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad-txns-BIP30"),
+        "expected BIP30 reject, got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn s1_rejects_empty_txdata() {
     let b = block_with(vec![]);

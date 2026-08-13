@@ -1361,6 +1361,74 @@ impl ScriptHashTable {
             PathBuf::from(s)
         });
         *self.ingest.lock().unwrap() = ScriptHashHead::create_with_slots(p, ingest_oa_slots())?;
+        self.maybe_compact_sealed_ovf()?;
+        Ok(())
+    }
+
+    const SEALED_OVF_COMPACT_FILES: usize = 8;
+
+    fn maybe_compact_sealed_ovf(&self) -> Result<(), StoreError> {
+        let n = self.sealed_ovf.lock().unwrap().len();
+        if n >= Self::SEALED_OVF_COMPACT_FILES {
+            self.compact_sealed_ovf()?;
+        }
+        Ok(())
+    }
+
+    /// K-way merge of sealed global ovf heads. Body offs unchanged. Readers
+    /// keep the old `Vec` until this lock is released after rename.
+    pub fn compact_sealed_ovf(&self) -> Result<(), StoreError> {
+        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])> = Vec::new();
+        let old_paths: Vec<PathBuf> = {
+            let g = self.sealed_ovf.lock().unwrap();
+            if g.len() < 2 {
+                return Ok(());
+            }
+            for h in g.iter() {
+                h.for_each_occupied(|k, v| {
+                    recs.push((k, v.encode()));
+                    Ok(())
+                })?;
+            }
+            g.iter().map(|h| h.path().to_path_buf()).collect()
+        };
+        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for w in recs.windows(2) {
+            if w[1].0 == w[0].0 {
+                return Err(StoreError::Corrupt(
+                    "invariant: sealed ovf compact saw a dual-home key",
+                ));
+            }
+        }
+        let id = {
+            let g = self.sealed_ovf.lock().unwrap();
+            g.iter()
+                .filter_map(|h| {
+                    h.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|s| s.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        let path = sealed_ovf_path(&self.store_dir, id);
+        let merged = SortedHead::write(&path, &recs)?;
+        let old = {
+            let mut g = self.sealed_ovf.lock().unwrap();
+            std::mem::replace(&mut *g, vec![merged])
+        };
+        drop(old);
+        for p in old_paths {
+            let _ = std::fs::remove_file(&p);
+            let mut idx = p.as_os_str().to_os_string();
+            idx.push(".idx");
+            let _ = std::fs::remove_file(idx);
+            let mut fuse = p.as_os_str().to_os_string();
+            fuse.push(".fuse8");
+            let _ = std::fs::remove_file(fuse);
+        }
         Ok(())
     }
 
@@ -3316,6 +3384,51 @@ mod tests {
         t.put_create(&rec(sh_new, 11, 0)).unwrap();
         assert_eq!(t.entries(&sh_new).unwrap().len(), 2);
         assert!(matches!(t.key_home(&sh_new).unwrap(), KeyHome::Ingest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_merges_two_sealed_global_ovf_files() {
+        let _g = HEAD_SCALE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh_main = script_hash(&[0x10]);
+        let mut session = t.bulk_session(8).unwrap();
+        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+        session.finish().unwrap();
+
+        let mut first_new = [0u8; 32];
+        let mut second_new = [0u8; 32];
+        for i in 0..210u32 {
+            let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
+            if i == 0 {
+                first_new = sh;
+            }
+            t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
+        }
+        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "first ingest seal");
+        for i in 0..210u32 {
+            let sh = script_hash(&[0xa2, (i & 0xff) as u8, (i >> 8) as u8, 0x02]);
+            if i == 0 {
+                second_new = sh;
+            }
+            t.put_create(&rec(sh, 2000 + u64::from(i), 0)).unwrap();
+        }
+        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 2, "second ingest seal");
+
+        t.compact_sealed_ovf().unwrap();
+        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+        assert_eq!(t.entries(&first_new).unwrap().len(), 1);
+        assert_eq!(t.entries(&second_new).unwrap().len(), 1);
+        assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
+        assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+        if let Some(v) = prev_scale {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", v);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

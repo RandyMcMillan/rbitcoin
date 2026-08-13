@@ -798,8 +798,8 @@ impl AddressHead {
 
     /// Plain slot write of one create_fk (sole writer; no atomic RMW).
     ///
-    /// Bulk insert: **stable sort by probe page**, then original index (preserves
-    /// call order within a page for rare same-batch duplicate txids).
+    /// Bulk insert: **stable sort by probe page** (preserves call order within a
+    /// page for rare same-batch duplicate txids).
     ///
     /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`] in
     /// RAM, then **one page write-back** if dirty (not per-slot pwrite). **SeqCst
@@ -808,25 +808,32 @@ impl AddressHead {
         if entries.is_empty() {
             return Ok(());
         }
+        let mut work = entries.to_vec();
+        self.insert_many_in_place(&mut work)
+    }
+
+    /// Sort `entries` in place by probe page and insert. No extra pair copy.
+    pub(crate) fn insert_many_in_place(
+        &self,
+        entries: &mut [([u8; 32], Fk)],
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let bits = self.layout.bits;
         let es = self.layout.entry_bytes;
         let page_slots = page_slot_count(bits);
         let es_u = es as usize;
 
-        // (page_base, orig_i, txid, fk) — stable by page then plan order.
-        let mut work: Vec<(u64, usize, [u8; 32], Fk)> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, (txid, fk))| (page_base_for_txid(txid, bits), i, *txid, *fk))
-            .collect();
-        work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        // Stable sort: same-page order stays call order (duplicate txids).
+        entries.sort_by(|a, b| page_base_for_txid(&a.0, bits).cmp(&page_base_for_txid(&b.0, bits)));
 
         let mut buf = [0u8; PROBE_REGION_BYTES];
         let mut i = 0;
-        while i < work.len() {
-            let page_base = work[i].0;
+        while i < entries.len() {
+            let page_base = page_base_for_txid(&entries[i].0, bits);
             let mut j = i + 1;
-            while j < work.len() && work[j].0 == page_base {
+            while j < entries.len() && page_base_for_txid(&entries[j].0, bits) == page_base {
                 j += 1;
             }
 
@@ -839,7 +846,7 @@ impl AddressHead {
 
             let mut n_new = 0u64;
             let mut dirty = false;
-            for &(_, _, ref txid, fk) in &work[i..j] {
+            for &(ref txid, fk) in &entries[i..j] {
                 let outcome =
                     insert_fk_into_page_buf(&mut buf[..n], page_base, bits, es, txid, fk)?;
                 if outcome.wrote_new {

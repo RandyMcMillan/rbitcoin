@@ -1030,6 +1030,42 @@ fn head_primary_slot_stable_and_ordered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `head_insert_many` of a tiny-N batch round-trips get + occupied (FdOnly).
+#[test]
+fn head_insert_many_tiny_roundtrip() {
+    let dir = tempfile_dir("head-insert-many-tiny");
+    let t = create_tiny(&dir);
+    let recs: Vec<TxRecord> = (0..64u64)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        })
+        .collect();
+    let items = meta_only_items(&recs);
+    let fks = t.put_full_batch_indexed(&items, false).unwrap();
+    assert_eq!(fks.len(), 64);
+    let heads: Vec<([u8; 32], Fk)> = recs
+        .iter()
+        .zip(fks.iter())
+        .map(|(r, fk)| (r.txid, *fk))
+        .collect();
+    t.head_insert_many(&heads).unwrap();
+    assert_eq!(t.head_occupied(), 64);
+    for (r, fk) in recs.iter().zip(fks.iter()) {
+        assert_eq!(t.get_fk_by_txid(&r.txid).unwrap(), Some(*fk));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Operator recovery: delete `tx.head/` (+ legacy flat files) → open rebuilds.
 #[test]
 fn missing_tx_head_rebuilds_from_bodies_on_open() {

@@ -413,11 +413,14 @@ impl SegmentedTxHead {
 
     /// Insert mixed probe keys → absolute create fks (sole writer).
     ///
+    /// Relativizes `entries` fks in place (absolute → segment-relative) then
+    /// sorts that same buffer in the open HashHead — no extra pair copy.
+    ///
     /// When `force_roll` is true (body soft-span), seal the open segment first
     /// if it has any creates. Also rolls when open count reaches `max_keys`.
     pub fn insert_many(
         &self,
-        entries: &[([u8; 32], Fk)],
+        entries: &mut [([u8; 32], Fk)],
         force_roll: bool,
     ) -> Result<(), StoreError> {
         if entries.is_empty() {
@@ -451,12 +454,11 @@ impl SegmentedTxHead {
             }
             let room = self.max_keys - count;
             let take = (entries.len() - i).min(room as usize);
-            let batch = &entries[i..i + take];
+            let batch = &mut entries[i..i + take];
             let first_fk = last.first_fk;
 
-            let mut rel_entries = Vec::with_capacity(batch.len());
             let mut fuse_keys = Vec::with_capacity(batch.len());
-            for (mixed, fk) in batch {
+            for (mixed, fk) in batch.iter_mut() {
                 if fk.0 < first_fk {
                     return Err(StoreError::Corrupt("tx.head insert fk before segment"));
                 }
@@ -464,11 +466,10 @@ impl SegmentedTxHead {
                 if rel == 0 || rel > u32::MAX as u64 {
                     return Err(StoreError::Corrupt("tx.head relative fk overflow"));
                 }
-                // Within this batch, rel should be dense around count+1 …
-                rel_entries.push((*mixed, Fk(rel)));
+                *fk = Fk(rel);
                 fuse_keys.push(fuse_key_from_mixed(mixed));
             }
-            last.head.insert_many(&rel_entries)?;
+            last.head.insert_many_in_place(batch)?;
             last.open_keys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1117,7 +1118,8 @@ mod tests {
         let dir = tmp();
         let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
         let h = SegmentedTxHead::create(&dir, layout).unwrap();
-        h.insert_many(&[(mixed(1), Fk(1))], false).unwrap();
+        let mut one = [(mixed(1), Fk(1))];
+        h.insert_many(&mut one, false).unwrap();
         let _ = h.probe_candidates(&mixed(1)).unwrap();
         let snap = snapshot_lookup_stats();
         // At least one of the probe counters should be non-zero after probe.
@@ -1146,7 +1148,7 @@ mod tests {
             for i in 0..50u64 {
                 entries.push((mixed(i + 1), Fk(i + 1)));
             }
-            h.insert_many(&entries, false).unwrap();
+            h.insert_many(&mut entries, false).unwrap();
             h.flush().unwrap();
         }
         assert!(dir.join("tx.head").join("meta").is_file());
@@ -1187,7 +1189,7 @@ mod tests {
         for i in 0..n {
             entries.push((mixed(i + 1), Fk(i + 1)));
         }
-        h.insert_many(&entries, false).unwrap();
+        h.insert_many(&mut entries, false).unwrap();
         assert!(h.segment_count() >= 2, "segs={}", h.segment_count());
         assert!(h.sealed_segment_count() >= 1);
 
@@ -1227,8 +1229,8 @@ mod tests {
         let n = 820u64;
         {
             let h = SegmentedTxHead::create(&dir, layout).unwrap();
-            let entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-            h.insert_many(&entries, false).unwrap();
+            let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+            h.insert_many(&mut entries, false).unwrap();
             assert!(h.sealed_segment_count() >= 1);
             let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
             assert!(h
@@ -1279,11 +1281,11 @@ mod tests {
         let dir_roll = tmp();
         let layout_roll = HeadLayout::with_entry_bytes(12, 4).unwrap(); // 4096 slots
         let h_roll = SegmentedTxHead::create(&dir_roll, layout_roll).unwrap();
-        let batch1: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&batch1, false).unwrap();
+        let mut batch1: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h_roll.insert_many(&mut batch1, false).unwrap();
         assert_eq!(h_roll.segment_count(), 1);
-        let batch2: Vec<_> = (100..150u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&batch2, true).unwrap(); // force roll
+        let mut batch2: Vec<_> = (100..150u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h_roll.insert_many(&mut batch2, true).unwrap(); // force roll
         assert!(h_roll.segment_count() >= 2);
         assert!(h_roll.sealed_segment_count() >= 1);
         assert!(h_roll

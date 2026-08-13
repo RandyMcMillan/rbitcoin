@@ -1625,7 +1625,7 @@ impl TxTable {
         if entries.is_empty() {
             return Ok(());
         }
-        let mixed: Vec<([u8; 32], Fk)> = entries
+        let mut mixed: Vec<([u8; 32], Fk)> = entries
             .iter()
             .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
             .collect();
@@ -1655,7 +1655,7 @@ impl TxTable {
             if j == i {
                 j = i + 1; // always make progress (single oversized create)
             }
-            self.head.insert_many(&mixed[i..j], force_roll)?;
+            self.head.insert_many(&mut mixed[i..j], force_roll)?;
             i = j;
         }
         Ok(())

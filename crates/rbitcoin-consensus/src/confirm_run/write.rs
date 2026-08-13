@@ -92,10 +92,10 @@ pub fn confirm_write_phase(
             }
         }
     }
-    // Ensure denserels/abs for every spend edge before structural + annotate:
-    // - load-ahead in-flight parents (no denserels at pin time)
-    // - already-archived Class A (plan=None) same-batch creates never inserted
-    // - partial pin after prior write committed Class A then failed annotate
+    // Ensure abs for residual spend edges before structural + annotate:
+    // - same-batch creates (range after Class A commit + fill_planned)
+    // - load-ahead parents that had no spent.idx stem at pin
+    // - retry after partial write (archived parents are already stamped at load)
     {
         let t_ens = Instant::now();
         ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;

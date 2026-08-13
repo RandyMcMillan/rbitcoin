@@ -1598,6 +1598,205 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Load pin of an already-archived parent stamps `spent_range` (idx only).
+/// Write ensure must be a pin-hit for that fk (no second spent.idx batch).
+#[test]
+fn load_pin_stamps_spent_range_for_archived_parent() {
+    use super::{
+        ensure_external_parent_denserels_from_plan, ensure_spend_abs_layouts, pin_for_wire_batch,
+        ParentPinStamp, Prepared,
+    };
+    use crate::confirm_phase_stats;
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::Query;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::atomic::Ordering;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-load-stamp-spent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let parent_tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
+    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let pfk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(parent_tx.clone(), parent_ins, parent_outs)],
+            /*index=*/ true,
+        )
+        .unwrap()[0];
+    let (spent_off, spent_len) = q.store().tx_spent_range(pfk).unwrap();
+    let expect_abs = rbitcoin_store::spent_abs(spent_off, 0);
+    let _ = spent_len;
+
+    let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
+    let spend_tx = TxRecord {
+        txid: [0x22u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+    plan.packed = vec![(
+        std::sync::Arc::new((spend_tx, spend_outs)),
+        vec![InputRecord {
+            prev_txid: parent_tx.txid,
+            create_fk: pfk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![Fk(2)];
+    ensure_external_parent_denserels_from_plan(&q, Some(&mut plan), None).unwrap();
+
+    let (mut parents, _thin, _warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &ParentPinStamp::from_plan(&plan),
+        &[],
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(parents.has_abs_layout(pfk), "load must stamp spent_range");
+    assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
+
+    let prepared = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(2)],
+        jobs: vec![],
+        spends: vec![([0x11u8; 32], 0, Fk(2), pfk)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [4u8; 32],
+    }];
+    let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
+    ensure_spend_abs_layouts(&q, &mut parents, &prepared).expect("ensure pin-hit");
+    let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
+    assert_eq!(
+        cold, 0,
+        "archived parent must not cold-load at write ensure"
+    );
+    assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Same-batch planned create is not in `spent.idx` yet — load must not invent abs.
+#[test]
+fn load_pin_does_not_stamp_same_batch_create() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::Query;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-load-no-stamp-same-batch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    let q = Query::open_or_create(&path).unwrap();
+
+    let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
+    let parent_tx = TxRecord {
+        txid: [0x22u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let child_tx = TxRecord {
+        txid: [0x33u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    plan.packed = vec![
+        (
+            std::sync::Arc::new((parent_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        ),
+        (
+            std::sync::Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![InputRecord {
+                prev_txid: [0x22u8; 32],
+                create_fk: Fk(2),
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        ),
+    ];
+    plan.planned_fks = vec![Fk(2), Fk(3)];
+
+    let (parents, _thin, _warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &ParentPinStamp::from_plan(&plan),
+        &[],
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(parents.contains(Fk(2)));
+    assert!(
+        !parents.has_abs_layout(Fk(2)),
+        "same-batch create must not get a spent_range before Class A commit"
+    );
+    assert!(parents.get_spender_abs(Fk(2), 0).is_none());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Write-stage ensure must hard-fail when denserels/abs cannot be completed
 /// (no silent leave-for structural cold or post_commit).
 #[test]

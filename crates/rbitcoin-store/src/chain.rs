@@ -70,6 +70,30 @@ impl ConfirmedTable {
         self.arr.set_many(&raw)
     }
 
+    /// Drop a trailing run of null header fks (HWM ahead of last real tip).
+    ///
+    /// Returns how many slots were removed. Mid-array holes are left for
+    /// [`Store::revalidate_tip_window`] to shrink to last good.
+    pub fn trim_trailing_nulls(&self) -> Result<u64, StoreError> {
+        let n = self.arr.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut keep = n;
+        while keep > 0 {
+            let v = self.arr.get(keep - 1)?;
+            if Fk::new(v).is_some() {
+                break;
+            }
+            keep -= 1;
+        }
+        let trimmed = n - keep;
+        if trimmed > 0 {
+            self.arr.truncate(keep)?;
+        }
+        Ok(trimmed)
+    }
+
     /// Disconnect tip: height must be current tip.
     pub fn disconnect_tip(&self, height: Height) -> Result<(), StoreError> {
         match self.tip_height() {

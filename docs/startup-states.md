@@ -7,7 +7,7 @@
 | 1 | `Store::open` + schema gates |
 | 2 | `repair_class_c_above_tip` |
 | 3 | Soft `tip_seal` clamp (if present) |
-| 4 | Tip-window revalidate last **6** heights (structure + merkle); shrink/clear on fail |
+| 4 | Trim trailing null `confirmed[]` slots, then tip-window revalidate last **6** heights (structure + merkle); shrink/clear on fail |
 | 5 | Then node may densify / extend tip |
 
 See [`crash-recovery.md`](./crash-recovery.md).

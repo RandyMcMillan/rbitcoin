@@ -22,7 +22,7 @@ On open (in order):
 
 1. `repair_class_c_above_tip` clears strong/height **above** tip (tip-relative, not a full rebuild).
 2. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
-3. **Tip-window revalidate** (Core `checkblocks=6`): last six confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`. On failure: clear bad Class A association and/or shrink tip to last good height, flush confirmed, repair Class C again.
+3. **Tip-window revalidate** (Core `checkblocks=6`): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last six confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`. On failure: clear bad Class A association and/or shrink tip to last good height, flush confirmed, repair Class C again.
 
 Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 

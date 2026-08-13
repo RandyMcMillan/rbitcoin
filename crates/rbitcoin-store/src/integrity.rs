@@ -188,6 +188,19 @@ impl Store {
     /// Same as [`Self::revalidate_tip_window`] with an explicit window (tests).
     pub fn revalidate_tip_window_n(&self, n: u32) -> Result<TipRevalidateReport, StoreError> {
         let mut report = TipRevalidateReport::default();
+        if let Some(h) = self.confirmed.tip_height() {
+            report.tip_before = Some(h.0);
+        }
+
+        // HWM can include a trailing run of null slots (crash mid-grow). Trim
+        // the whole suffix in one shot so the 6-height window sees a real tip.
+        let trimmed = self.confirmed.trim_trailing_nulls()?;
+        if trimmed > 0 {
+            self.flush_confirmed_only()?;
+            let _ = self.repair_class_c_above_tip()?;
+            report.tip_shrunk = true;
+            eprintln!("rbitcoin: trimmed {trimmed} trailing null confirmed[] slots");
+        }
 
         // Soft seal: clamp confirmed tip that advanced without a complete seal write.
         if let Some(seal) = TipSeal::load(self.path())? {
@@ -575,6 +588,53 @@ mod tests {
         assert!(r.tip_shrunk);
         assert!(s.confirmed.tip_height().is_none());
         assert!(!s.header_txs.has_body(g_fk).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 20 trailing null `confirmed[]` slots must become the last real tip in
+    /// one revalidate (the 6-height window alone only walks the tail).
+    #[test]
+    fn trailing_null_confirmed_slots_trimmed_in_one_open() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        for h in 0u32..4 {
+            let rec = hdr(prev, parent_hash, h as u8);
+            parent_hash = rec.hash;
+            let fk = s.put_header(&rec).unwrap();
+            prev = fk;
+            s.confirmed.set(Height(h), fk).unwrap();
+        }
+        s.headers.flush().unwrap();
+        s.confirmed.flush().unwrap();
+        // No tip seal — seal clamp must not mask the suffix-null case.
+        drop(s);
+
+        let path = dir.join("confirmed.body");
+        let f = crate::file::TableFile::open(&path, rbitcoin_primitives::TableKind::Confirmed)
+            .unwrap();
+        let n = (f.logical_len() - crate::file::FILE_HEADER_LEN as u64) / 8;
+        assert_eq!(n, 4, "four real confirmed heights");
+        let extra = 20u64;
+        let zeros = vec![0u8; (extra * 8) as usize];
+        f.write_at(crate::file::FILE_HEADER_LEN as u64 + n * 8, &zeros)
+            .unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(
+            s.confirmed.tip_height(),
+            Some(Height(23)),
+            "HWM includes 20 trailing nulls"
+        );
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(
+            s.confirmed.tip_height(),
+            Some(Height(3)),
+            "one open must drop the whole null suffix; report={r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -491,6 +491,22 @@ impl TxTable {
         self.body.record_range(fk)
     }
 
+    /// One sequential `tx.body` pread of `[offset, offset+len)`.
+    pub fn with_body_span<R>(
+        &self,
+        offset: u64,
+        len: u64,
+        f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.body.with_bytes_at(offset, len, f)
+    }
+
+    /// Packed outs from a body slice already in RAM (applies script XOR).
+    pub fn packed_outs_from_raw(&self, raw: &[u8]) -> Result<Vec<OutputRecord>, StoreError> {
+        decode_packed_tx_outs_with_spender_rels_secret(raw, Some(&self.secret))
+            .map(|(_, outs, _)| outs)
+    }
+
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
     /// Used by load: discover parents without full parse into RAM.

@@ -972,8 +972,10 @@ mod tests {
             .unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         let thin0 = q.load_thin_tweaks(Height(0)).unwrap().expect("indexed");
-        assert_eq!(thin0.len(), 1);
-        assert!(thin0[0].tweak.is_none(), "coinbase is not eligible");
+        assert!(
+            thin0.is_empty(),
+            "coinbase is not eligible — no Class A join"
+        );
 
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
@@ -1060,6 +1062,13 @@ mod tests {
         assert_eq!(naive.len(), 1);
         let n = backfill_sp_tweaks(&q, &params).unwrap();
         assert_eq!(n, 2);
+        let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
+        assert_eq!(
+            rows.len(),
+            1,
+            "ineligible txs must not be joined from Class A"
+        );
+        assert_eq!(rows[0].txid, spend_txid);
         let indexed = tweaks_at_height(&q, &params, Height(1)).unwrap();
         assert_eq!(
             indexed.get(&spend_txid).unwrap().tweak,

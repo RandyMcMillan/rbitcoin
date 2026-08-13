@@ -11,6 +11,9 @@ before 1.0).
 
 ### Fixed
 
+- **Electrum tweaks subscribe:** stream remaining heights as notifications
+  and finish with Cake’s `{"message":"done"}`. A one-shot 8-height result left
+  the scan isolate idle after `[restore, remaining, false]`.
 - **Electrum `get_balance`:** unconfirmed delta uses the mempool scripthash
   index instead of store-resolving every live chain input. Empty Cake keys were
   ~1.5 s each on a mainnet mempool.

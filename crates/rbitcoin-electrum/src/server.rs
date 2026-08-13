@@ -438,6 +438,21 @@ where
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                 let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let params_v = req.get("params").cloned().unwrap_or(json!([]));
+                if method == "blockchain.tweaks.subscribe" {
+                    serve_tweaks_subscribe(
+                        &mut reader,
+                        &mut writer,
+                        &query,
+                        &params,
+                        &peer,
+                        id,
+                        &params_v,
+                        idle,
+                        max_line,
+                    )
+                    .await?;
+                    continue;
+                }
                 let t0 = Instant::now();
                 let result = dispatch(
                     method,
@@ -481,6 +496,146 @@ where
             }
         }
     }
+    Ok(())
+}
+
+/// Cake scan isolate: JSON-RPC result = first height, then one notify per
+/// following height, then `{"message":"done"}`. Honor `count` through tip
+/// (Cake asks for the remaining chain). Answer `server.ping` while computing.
+async fn serve_tweaks_subscribe<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    peer: &SocketAddr,
+    id: Value,
+    params_v: &Value,
+    idle: Duration,
+    max_line: usize,
+) -> Result<(), std::io::Error>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let req = match crate::tweaks::parse_req(params_v) {
+        Ok(r) => r,
+        Err(e) => {
+            rbitcoin_log::api_call(
+                "electrum",
+                &peer.to_string(),
+                "blockchain.tweaks.subscribe",
+                &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+                0,
+                Some(&e),
+            );
+            write_line(
+                writer,
+                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let tip = query.tip_height().map(|h| h.0);
+    let last = crate::tweaks::last_height(req.start, req.count, tip);
+    let t0 = Instant::now();
+    let first = match crate::tweaks::height_map(query, chain, req.start) {
+        Ok(v) => v,
+        Err(e) => {
+            rbitcoin_log::api_call(
+                "electrum",
+                &peer.to_string(),
+                "blockchain.tweaks.subscribe",
+                &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+                t0.elapsed().as_millis() as u64,
+                Some(&e),
+            );
+            write_line(
+                writer,
+                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    meter_dispatch_wall(t0.elapsed().as_micros() as u64);
+    rbitcoin_log::api_call(
+        "electrum",
+        &peer.to_string(),
+        "blockchain.tweaks.subscribe",
+        &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+        wall_ms,
+        None,
+    );
+    write_line(writer, &json!({"jsonrpc":"2.0","id": id, "result": first})).await?;
+
+    let Some(last) = last else {
+        write_line(writer, &crate::tweaks::done_notify()).await?;
+        return Ok(());
+    };
+    let mut next = req.start.saturating_add(1);
+    while next <= last {
+        tokio::select! {
+            biased;
+            line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
+                match line {
+                    Ok(Ok(Some(l))) => {
+                        if l.trim().is_empty() {
+                            continue;
+                        }
+                        if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                            let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
+                            if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
+                                write_line(
+                                    writer,
+                                    &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => return Ok(()),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "idle timeout",
+                        ));
+                    }
+                }
+            }
+            map = {
+                let q = Arc::clone(query);
+                let c = (**chain).clone();
+                let h = next;
+                async move {
+                    tokio::task::spawn_blocking(move || crate::tweaks::height_map(&q, &c, h))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                }
+            } => {
+                match map {
+                    Ok(v) => {
+                        write_line(writer, &crate::tweaks::height_notify(v)).await?;
+                    }
+                    Err(e) => {
+                        rbitcoin_log::api_call(
+                            "electrum",
+                            &peer.to_string(),
+                            "blockchain.tweaks.subscribe",
+                            &format!("[{next},1]"),
+                            0,
+                            Some(&e),
+                        );
+                        break;
+                    }
+                }
+                next = next.saturating_add(1);
+            }
+        }
+    }
+    write_line(writer, &crate::tweaks::done_notify()).await?;
     Ok(())
 }
 
@@ -2505,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn tweaks_count_clamped_to_eight() {
+    fn tweaks_rpc_result_is_first_height_only() {
         use rbitcoin_primitives::{Fk, Height};
         use rbitcoin_query::TxApply;
         use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
@@ -2570,10 +2725,123 @@ mod tests {
         )
         .unwrap();
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.len(), crate::tweaks::MAX_TWEAK_COUNT as usize);
+        assert_eq!(obj.len(), 1, "RPC result is the first height only");
         assert!(obj.contains_key("0"));
-        assert!(obj.contains_key("7"));
-        assert!(!obj.contains_key("8"));
+        assert!(!obj.contains_key("1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cake scan isolate uses ElectrumProvider.subscribe: JSON-RPC result is the
+    /// first height, then one notification per following height, then
+    /// `{"message":"done"}`. A multi-height result is treated as one event
+    /// (last key only); no `done` leaves the isolate pinging forever.
+    #[tokio::test]
+    async fn tweaks_subscribe_streams_heights_then_done() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..5u32 {
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xec;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(1, &ph, &merkle, h + 1, 0x207fffff, h)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207fffff,
+                nonce: h,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![h as u8], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            parent_hash = Some(hash);
+        }
+
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let req = json!({
+            "jsonrpc":"2.0","id":"scan",
+            "method":"blockchain.tweaks.subscribe",
+            "params":[1, 3, false]
+        });
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+
+        async fn read_json(reader: &mut BufReader<&mut TcpStream>) -> Value {
+            let mut resp = String::new();
+            tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut resp))
+                .await
+                .unwrap_or_else(|_| panic!("tweaks stream: timed out"))
+                .unwrap();
+            serde_json::from_str(&resp)
+                .unwrap_or_else(|e| panic!("tweaks stream parse {e}: {resp}"))
+        }
+
+        let result = read_json(&mut reader).await;
+        assert_eq!(result["id"], "scan");
+        let map = result["result"].as_object().expect("result map");
+        assert_eq!(
+            map.len(),
+            1,
+            "JSON-RPC result must be one height, got {map:?}"
+        );
+        assert!(map.contains_key("1"), "{map:?}");
+
+        let n2 = read_json(&mut reader).await;
+        assert_eq!(n2["method"], "blockchain.tweaks.subscribe");
+        let p2 = n2["params"][0].as_object().expect("notify 2");
+        assert_eq!(p2.len(), 1);
+        assert!(p2.contains_key("2"), "{p2:?}");
+
+        let n3 = read_json(&mut reader).await;
+        assert_eq!(n3["method"], "blockchain.tweaks.subscribe");
+        let p3 = n3["params"][0].as_object().expect("notify 3");
+        assert_eq!(p3.len(), 1);
+        assert!(p3.contains_key("3"), "{p3:?}");
+
+        let done = read_json(&mut reader).await;
+        assert_eq!(done["method"], "blockchain.tweaks.subscribe");
+        assert_eq!(done["params"][0]["message"], "done");
+
+        handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -78,11 +78,22 @@ probe:  [0, 1, false]
 | Param | v1 |
 |-------|----|
 | `height` | Inclusive start. |
-| `count` | Requested heights; **hard cap 8**. |
+| `count` | Requested heights through tip (Cake sends remaining chain). |
 | `historicalMode` | Accepted, ignored. |
 
-**Result:** one JSON-RPC **result** object keyed by height string. Cake’s
-`fromJson` wants that map (not `null`, not a JSON-RPC error).
+**JSON-RPC result:** **one** height map (the start height). Cake’s isolate
+`fromJson` treats a multi-key object as a single event and uses the **last**
+key as `block`.
+
+**Then** (same TCP session) Electrum notifications:
+
+```json
+{"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"<h>": {…}}]}
+{"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message":"done"}]}
+```
+
+Cake waits for `message: done` then resubscribes from `syncHeight+1`. Without
+the stream it sits on `server.ping` after the first window.
 
 ```json
 {
@@ -104,10 +115,9 @@ Locked from live `electrs.cakewallet.com:50001` on 2026-08-12
 - `output_pubkeys[vout][0]` is **64-char x-only** (BIP341), not a 33-byte key.
 - txids are Electrum **display-order** hex.
 
-Cake electrs also **pushes notifications** (data, then `{"message":"done"}`) and
-puts a wrapped `done` in the JSON-RPC result. It **ignores** `server.features`
-(method hangs / empty). v1 still returns the **data map as the result** — that
-is what `fromJson` accepts — and does not stream notifications.
+Cake electrs **pushes notifications** (one height, then `{"message":"done"}`).
+We do the same after the first-height JSON-RPC result. `server.ping` on that
+socket is answered while the next height computes.
 
 Height 0 / empty block: `{"0": {}}`.
 

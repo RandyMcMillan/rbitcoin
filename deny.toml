@@ -1,0 +1,39 @@
+# Supply-chain gate (Q-20). CI: `cargo deny check`.
+# Exceptions need a one-line reason in this file.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",           # rust-bitcoin / hashes
+    "BSL-1.0",
+    "OpenSSL",           # ring / rustls stack
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

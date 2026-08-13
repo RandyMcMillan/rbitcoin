@@ -14,9 +14,20 @@ env:
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
 # Jobs are split so each gate is its own required check on the PR/push UI:
-#   fmt → clippy → test → coverage (coverage waits for the three gates).
-# fmt/clippy/test run in parallel; coverage only starts when all three pass.
+#   fmt + deny + clippy + test in parallel; coverage waits for fmt/clippy/test.
 jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # Prebuilt cargo-deny — do not cargo install. Pin Action commit (CodeQL).
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: cargo-deny@0.18.5
+      - name: cargo deny check
+        run: cargo deny check
+
   fmt:
     runs-on: ubuntu-latest
     steps:

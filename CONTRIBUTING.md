@@ -20,9 +20,9 @@
 ## Workflow
 
 Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
-checks are **separate jobs** on every push/PR (`fmt`, `clippy`, `test`,
-`coverage`) so a red run shows which gate failed without digging into a
-monolithic job log. Locally:
+checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`, `test`,
+`multinode`, `coverage`) so a red run shows which gate failed without digging
+into a monolithic job log. Locally:
 
 ```bash
 nix develop   # or nix-shell — both pin via flake.lock
@@ -30,6 +30,7 @@ cargo fmt --all -- --check
 # rustc warnings are denied via workspace.lints + RUSTFLAGS=-Dwarnings
 cargo build --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check                 # advisories + licenses (deny.toml)
 cargo build -p rbitcoin-node -p rbitcoin-cli
 cargo test --workspace
 ./scripts/coverage.sh

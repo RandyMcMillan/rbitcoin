@@ -322,12 +322,12 @@ mod tests {
             .unwrap();
 
         let fks = q.block_tx_fks(Height(1)).unwrap();
-        let elig_a = q.store().tx_body_range(fks[0]).unwrap();
-        let fat = q.store().tx_body_range(fks[1]).unwrap();
-        let elig_b = q.store().tx_body_range(fks[2]).unwrap();
+        let elig_a = q.store().tx_inwit_range(fks[0]).unwrap();
+        let fat = q.store().tx_inwit_range(fks[1]).unwrap();
+        let elig_b = q.store().tx_inwit_range(fks[2]).unwrap();
         assert!(
             fat.1 > 8_000,
-            "fat ineligible packed row too small: {}",
+            "fat ineligible inwit row too small: {}",
             fat.1
         );
         let elig_sum = elig_a.1.saturating_add(elig_b.1);

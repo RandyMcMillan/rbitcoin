@@ -87,14 +87,14 @@ pub fn ensure_external_parent_denserels_from_plan(
         if plan
             .external_parent_outs
             .get(id)
-            .is_some_and(|pin| !pin.1.is_empty() || !pin.2.is_empty())
+            .is_some_and(|pin| !pin.1.is_empty())
         {
             st.already = st.already.saturating_add(1);
             continue;
         }
         // In-flight offline denserels already available for pin.
         if let Some(ifo) = in_flight {
-            if ifo.get_out(*id).is_some_and(|pin| !pin.2.is_empty()) {
+            if ifo.get_out(*id).is_some_and(|pin| !pin.1.is_empty()) {
                 st.already = st.already.saturating_add(1);
                 continue;
             }
@@ -146,12 +146,12 @@ pub fn ensure_external_parent_denserels_from_plan(
                 let Some(id) = _fk.get() else {
                     continue;
                 };
-                let Some((tx, live, sparse)) = row else {
+                let Some((tx, live, _sparse)) = row else {
                     continue;
                 };
                 let _ = need;
                 plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, live, sparse)));
+                    .insert(id, std::sync::Arc::new((tx, live)));
             }
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
@@ -159,12 +159,9 @@ pub fn ensure_external_parent_denserels_from_plan(
         // Fallback: idx→body denserels (no plan range).
         if !need_idx.is_empty() {
             let t_idx = Instant::now();
-            let loaded = rbitcoin_query::load_creates_once(
-                query.store(),
-                &need_idx,
-                IdxBodyMode::OutsDenserels,
-            )
-            .map_err(ConsensusError::from)?;
+            let loaded =
+                rbitcoin_query::load_creates_once(query.store(), &need_idx, IdxBodyMode::Outs)
+                    .map_err(ConsensusError::from)?;
             let idx_ns = t_idx.elapsed().as_nanos() as u64;
             let n_idx = loaded.len() as u64;
             if idx_ns > 0 {
@@ -206,7 +203,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                         .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
                         .collect()
                 };
-                let sparse = if need.is_empty() {
+                let _sparse = if need.is_empty() {
                     dens.into_iter()
                         .enumerate()
                         .filter(|(_, r)| *r != rbitcoin_query::SPENDER_REL_UNKNOWN)
@@ -216,7 +213,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                     rbitcoin_query::sparse_spender_rels(&dens, &need)
                 };
                 plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, live, sparse)));
+                    .insert(id, std::sync::Arc::new((tx, live)));
             }
         }
         cold_io_ns = t_io.elapsed().as_nanos() as u64;
@@ -230,7 +227,7 @@ pub fn ensure_external_parent_denserels_from_plan(
             if plan
                 .external_parent_outs
                 .get(&id)
-                .is_none_or(|pin| pin.1.is_empty() && pin.2.is_empty())
+                .is_none_or(|pin| pin.1.is_empty())
             {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: lookup stage failed to load external parent denserels",

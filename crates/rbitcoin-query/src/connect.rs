@@ -384,7 +384,7 @@ impl Query {
     ) -> Result<(), QueryError> {
         use std::sync::atomic::Ordering;
         if let Some(pin) = write_pin {
-            let (_tx, outputs, _rels) = pin.as_ref();
+            let (_tx, outputs) = pin.as_ref();
             for o in outputs.iter() {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
             }

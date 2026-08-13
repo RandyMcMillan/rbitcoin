@@ -748,7 +748,7 @@ fn plan_ensure_denserels_then_forbid_skips_cold_io() {
     };
     let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
     plan.packed = vec![(
-        std::sync::Arc::new((spend_tx, spend_outs, Vec::new())),
+        std::sync::Arc::new((spend_tx, spend_outs)),
         vec![InputRecord {
             prev_txid: parent_tx.txid,
             create_fk: pfk,
@@ -769,7 +769,7 @@ fn plan_ensure_denserels_then_forbid_skips_cold_io() {
     assert!(
         plan.external_parent_outs
             .get(&pfk.get().unwrap())
-            .is_some_and(|p| !p.1.is_empty() || !p.2.is_empty()),
+            .is_some_and(|p| !p.1.is_empty()),
         "ensure must put sparse denserels in plan-local external_parent_outs"
     );
     // Sparse only — no full output_count expand (parent has 1 out here; multi-out
@@ -861,10 +861,7 @@ fn pin_for_wire_missing_parent_is_invariant_error() {
     }];
     let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
     let plan = ArchiveWritePlan {
-        packed: vec![(
-            std::sync::Arc::new((spend_tx, spend_outs, Vec::new())),
-            spend_ins,
-        )],
+        packed: vec![(std::sync::Arc::new((spend_tx, spend_outs)), spend_ins)],
         planned_fks: vec![Fk(1)],
         per_header_ranges: vec![],
         spends: vec![],
@@ -945,11 +942,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
     }];
     let plan = ArchiveWritePlan {
         packed: vec![(
-            std::sync::Arc::new((
-                spend_tx,
-                vec![OutputRecord::unspent(1, vec![0x51])],
-                Vec::new(),
-            )),
+            std::sync::Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
             spend_ins,
         )],
         planned_fks: vec![Fk(2)],
@@ -974,7 +967,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         output_start_fk: Fk::NULL,
         output_count: 0,
     };
-    let pin = std::sync::Arc::new((parent_tx, Vec::new(), Vec::new()));
+    let pin = std::sync::Arc::new((parent_tx, Vec::new()));
     let mut log = rbitcoin_query::InFlightLog::new();
     log.note_layer(rbitcoin_query::InFlightLayer::from_plan_pins([(
         Fk(parent_id),
@@ -1045,12 +1038,8 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         &[InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
         &[parent_out.clone()],
     );
-    let sparse_rel = dens.first().copied().unwrap_or(0);
-    let external: SparseExternalPin = Arc::new((
-        parent_tx.clone(),
-        vec![(0, parent_out)],
-        vec![(0, sparse_rel)],
-    ));
+    let _sparse_rel = dens.first().copied().unwrap_or(0);
+    let external: SparseExternalPin = Arc::new((parent_tx.clone(), vec![(0, parent_out)]));
 
     let spend_tx = TxRecord {
         txid: [0x22u8; 32],
@@ -1070,9 +1059,7 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         witness: vec![],
     }];
     let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let spend_dens =
-        rbitcoin_store::denserels_from_packed_records(&spend_tx, &spend_ins, &spend_outs);
-    let spend_pin: CreatePin = Arc::new((spend_tx, spend_outs, spend_dens));
+    let spend_pin: CreatePin = Arc::new((spend_tx, spend_outs));
 
     let mut plan = ArchiveWritePlan {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
@@ -1189,7 +1176,7 @@ fn ensure_external_sparse_need_not_full_output_count() {
     };
     let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
     plan.packed = vec![(
-        std::sync::Arc::new((spend_tx, spend_outs, Vec::new())),
+        std::sync::Arc::new((spend_tx, spend_outs)),
         vec![InputRecord {
             prev_txid: parent_tx.txid,
             create_fk: pfk,
@@ -1215,10 +1202,6 @@ fn ensure_external_sparse_need_not_full_output_count() {
     );
     assert_eq!(pin.1[0].0, 3, "only spent need-vout");
     assert_eq!(pin.1[0].1.value, 1003);
-    assert!(
-        pin.2.iter().all(|(v, _)| *v == 3),
-        "sparse denserels only for need"
-    );
 
     let (parents, _, _) = pin_for_wire_batch(
         &q,
@@ -1562,7 +1545,6 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
     };
     let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
-    let dens = rbitcoin_store::denserels_from_packed_records(&parent_tx, &parent_ins, &parent_outs);
     let fks = q
         .store()
         .put_tx_full_batch_indexed(
@@ -1571,9 +1553,9 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
         )
         .unwrap();
     let parent_fk = fks[0];
-    let (body_off, body_len) = q.store().txs.body_range(parent_fk).unwrap();
+    let (spent_off, spent_len) = q.store().tx_spent_range(parent_fk).unwrap();
 
-    // Pin denserels without body_range (load-ahead shape before commit).
+    // Pin without spent_range (load-ahead shape before commit).
     let mut bp = BatchParents::new();
     bp.insert_owned(
         parent_fk,
@@ -1582,12 +1564,8 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
         vec![0],
         Some(true),
         None,
-        dens.iter()
-            .enumerate()
-            .map(|(i, r)| (i as u32, *r))
-            .collect(),
+        Vec::new(),
     );
-    assert!(bp.has_spender_rels(parent_fk));
     assert!(!bp.has_abs_layout(parent_fk));
 
     let prepared = [Prepared {
@@ -1605,18 +1583,18 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
 
     let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
     let _ = confirm_phase_stats::ENSURE_RES_HIT.swap(0, Ordering::Relaxed);
-    ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("range-only ensure");
+    ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("spent-range ensure");
     let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
     assert_eq!(
         cold, 0,
-        "must not denserels-body cold when pin has denserels"
+        "must not denserels-body cold when spent idx stamps abs"
     );
     assert!(bp.has_abs_layout(parent_fk));
     assert_eq!(
         bp.get_spender_abs(parent_fk, 0),
-        Some(body_off.saturating_add(u64::from(dens[0])))
+        Some(rbitcoin_store::spent_abs(spent_off, 0))
     );
-    let _ = body_len;
+    let _ = spent_len;
     let _ = std::fs::remove_dir_all(&path);
 }
 

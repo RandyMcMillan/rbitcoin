@@ -74,9 +74,19 @@ pub fn load_creates_once(
         .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
         .collect();
     store.idx_body_pipeline(&mut jobs, mode)?;
+    let mut inwit_jobs: Vec<IdxBodyJob> = if mode == IdxBodyMode::Full {
+        fks.iter()
+            .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if mode == IdxBodyMode::Full {
+        store.idx_inwit_pipeline(&mut inwit_jobs, IdxBodyMode::Full)?;
+    }
     let secret: &StoreSecret = store.txs.store_secret();
     let mut out = Vec::with_capacity(jobs.len());
-    for (fk, job) in fks.iter().zip(jobs.into_iter()) {
+    for (i, (fk, job)) in fks.iter().zip(jobs.into_iter()).enumerate() {
         if !job.ok {
             continue;
         }
@@ -88,11 +98,24 @@ pub fn load_creates_once(
         let mut decoded_outs = None;
         match mode {
             IdxBodyMode::Full => {
-                if let Ok((tx, ins, outs, rels)) =
+                if let Ok((tx, _empty_ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    // Schema 13: body has no leading txid. Leave zero; caller
-                    // fills from plan RAM when needed (never body_txid for pin).
+                    let Some(ij) = inwit_jobs.get(i) else {
+                        return Err(StoreError::Corrupt(
+                            "invariant: Full create missing inwit job",
+                        ));
+                    };
+                    if !ij.ok {
+                        return Err(StoreError::Corrupt(
+                            "invariant: Full create inwit body missing after load",
+                        ));
+                    }
+                    let ins =
+                        rbitcoin_store::decode_inwit_secret(&ij.body, tx.input_count, Some(secret))
+                            .map_err(|_| {
+                                StoreError::Corrupt("invariant: packed create inwit decode failed")
+                            })?;
                     decoded_full = Some((tx, ins, outs, rels));
                 } else {
                     return Err(StoreError::Corrupt(
@@ -100,7 +123,7 @@ pub fn load_creates_once(
                     ));
                 }
             }
-            IdxBodyMode::OutsDenserels | IdxBodyMode::Prefix33 => {
+            IdxBodyMode::Outs | IdxBodyMode::Prefix33 => {
                 if let Ok((tx, outs, rels)) =
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
@@ -196,7 +219,7 @@ mod tests {
     fn outs_denserels_loads_parent_decode() {
         let (dir, q) = temp_query();
         let fk = put_tx(&q, 7);
-        let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::OutsDenserels).unwrap();
+        let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::Outs).unwrap();
         assert_eq!(creates.len(), 1);
         assert!(
             creates[0].decoded_outs.is_some(),

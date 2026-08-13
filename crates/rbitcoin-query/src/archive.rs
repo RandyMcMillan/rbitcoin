@@ -15,11 +15,11 @@
 
 use super::*;
 
-/// Shared immutable create pin: tx meta + full outs + layout denserels.
+/// Shared immutable create pin: tx meta + full outs.
 ///
 /// One Arc per create — plan `packed` pin half, `batch_pin`, and prep-ahead
 /// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
-pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>;
+pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>)>;
 
 /// Approx heap bytes for one [`CreatePin`] payload (for IBD `sizes` metering).
 ///
@@ -27,12 +27,11 @@ pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>;
 /// refcount sharing (each strong Arc still "owns" the allocation once).
 #[inline]
 pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
-    let (_tx, outs, dens) = pin.as_ref();
+    let (_tx, outs) = pin.as_ref();
     let mut n = 96usize; // TxRecord + Arc shell overhead (order-of-magnitude)
     for o in outs {
         n = n.saturating_add(24).saturating_add(o.script.len());
     }
-    n = n.saturating_add(dens.len().saturating_mul(4));
     n = n.saturating_add(outs.capacity().saturating_mul(24)); // Vec spare
     n
 }
@@ -42,7 +41,7 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 /// `(tx, live need outs, sparse denserels as (vout, rel))` — **not** a full
 /// `output_count`-sized outs/denserels expand. Transient on the plan until pin;
 /// sparse need then lives in [`crate::BatchParents`].
-pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>;
+pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>)>;
 
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
@@ -560,9 +559,7 @@ impl Query {
                 }
             }
             planned_fks.push(tx_fk);
-            // Layout denserels once; move tx+outs into shared Arc (no second outs clone).
-            let dens = rbitcoin_store::denserels_from_packed_records(&tx, &inputs, &outputs);
-            let pin = std::sync::Arc::new((tx, outputs, dens));
+            let pin = std::sync::Arc::new((tx, outputs));
             batch_pin.push(std::sync::Arc::clone(&pin));
             packed.push((pin, inputs));
         }
@@ -636,7 +633,7 @@ impl Query {
         let body_est: u64 = packed
             .iter()
             .map(|(pin, ins)| {
-                let (_tx, outs, _dens) = pin.as_ref();
+                let (_tx, outs) = pin.as_ref();
                 (1 + TxRecord::ENCODED_LEN) as u64
                     + ins.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
                     + outs.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
@@ -884,14 +881,13 @@ mod tests {
             }
         }
         for ((pin, ins), _) in plan.packed.iter().zip(plan.batch_pin.iter()) {
-            let (tx, outs, dens) = pin.as_ref();
-            let layout = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
-            assert_eq!(*dens, layout);
+            let (tx, outs) = pin.as_ref();
             let mut raw = Vec::new();
             rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
-            let (_, _, decode_rels) =
+            let (meta, dec_outs, _) =
                 rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
-            assert_eq!(*dens, decode_rels);
+            assert_eq!(meta.output_count as usize, dec_outs.len());
+            assert_eq!(outs.len(), dec_outs.len());
         }
         assert_eq!(ifo.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1266,7 +1262,6 @@ mod tests {
             Arc::new((
                 coinbase_apply(99).tx,
                 vec![(0, OutputRecord::unspent(1, vec![0x51]))],
-                vec![(0, 10)],
             )),
         );
         plan_a.external_parent_ranges.insert(99, (0, 1));
@@ -1285,7 +1280,6 @@ mod tests {
             Arc::new((
                 coinbase_apply(88).tx,
                 vec![(0, OutputRecord::unspent(1, vec![0x51]))],
-                vec![(0, 5)],
             )),
         );
         plan_b.freeze_after_pin();
@@ -1377,7 +1371,6 @@ mod tests {
                     output_count: 0,
                 },
                 Vec::new(),
-                Vec::new(),
             ))
         };
         plan.packed = vec![
@@ -1413,7 +1406,6 @@ mod tests {
                     output_start_fk: Fk::NULL,
                     output_count: 0,
                 },
-                Vec::new(),
                 Vec::new(),
             ))
         };

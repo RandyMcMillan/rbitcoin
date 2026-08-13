@@ -205,28 +205,22 @@ pub(super) fn fill_planned_create_layout_after_commit(
         .store()
         .tx_body_range_batch(&need_fks)
         .map_err(ConsensusError::from)?;
-    for ((&fk, range), &pi) in need_fks
+    let spent = query
+        .store()
+        .tx_spent_range_batch(&need_fks)
+        .map_err(ConsensusError::from)?;
+    for (((&fk, range), spent_r), &_pi) in need_fks
         .iter()
         .zip(ranges.into_iter())
+        .zip(spent.into_iter())
         .zip(need_pin_i.iter())
     {
-        let Some((off, len)) = range else {
-            continue;
-        };
-        // Load already attached sparse denserels: only body_range was missing.
-        batch_parents.set_body_range_only(fk, (off, len));
-        if batch_parents.has_abs_layout(fk) {
-            continue;
+        if let Some((off, len)) = range {
+            batch_parents.set_body_range_only(fk, (off, len));
         }
-        // No denserels on pin yet — use shared CreatePin denserels (no packed reclone).
-        let Some(pin) = pins.get(pi) else {
-            continue;
-        };
-        let (_tx, outs, dense_rels) = pin.as_ref();
-        if dense_rels.is_empty() && outs.is_empty() {
-            continue;
+        if let Some(sr) = spent_r {
+            batch_parents.set_spent_range_only(fk, sr);
         }
-        batch_parents.set_layout(fk, (off, len), dense_rels);
     }
     Ok(())
 }

@@ -24,7 +24,6 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
             output_count: 0,
         },
         vec![OutputRecord::unspent(1, vec![0x51])],
-        Vec::new(),
     ))
 }
 

@@ -96,10 +96,11 @@ impl PinOuts {
     }
 }
 
-/// Body range + sparse denserels for abs spender meta (write-filled).
+/// `txout` range + `spent` range. Abs = spent_off + 9×vout (no denserels).
 #[derive(Debug, Clone, Default)]
 struct ParentLayout {
     body_range: Option<(u64, u64)>,
+    spent_range: Option<(u64, u64)>,
     spender_rels: Vec<(u32, u32)>,
 }
 
@@ -107,6 +108,7 @@ impl ParentLayout {
     fn new(body_range: Option<(u64, u64)>, spender_rels: Vec<(u32, u32)>) -> Self {
         Self {
             body_range,
+            spent_range: None,
             spender_rels,
         }
     }
@@ -844,7 +846,7 @@ impl BatchParents {
             return false;
         };
         let lay = e.load_layout();
-        lay.body_range.is_some() && !lay.spender_rels.is_empty()
+        lay.spent_range.is_some()
     }
 
     #[inline]
@@ -855,7 +857,8 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        !e.load_layout().spender_rels.is_empty()
+        let lay = e.load_layout();
+        lay.spent_range.is_some() || !lay.spender_rels.is_empty()
     }
 
     pub fn fks_missing_layout(&self) -> Vec<Fk> {
@@ -863,7 +866,8 @@ impl BatchParents {
             .iter()
             .filter(|(_, e)| {
                 let lay = e.load_layout();
-                lay.body_range.is_none() || lay.spender_rels.is_empty()
+                lay.spent_range.is_none()
+                    && (lay.body_range.is_none() || lay.spender_rels.is_empty())
             })
             .map(|(&id, _)| Fk(id))
             .collect()
@@ -878,16 +882,28 @@ impl BatchParents {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
         let lay = e.load_layout();
-        let (off, _) = lay.body_range?;
-        let i = lay
-            .spender_rels
-            .binary_search_by_key(&vout, |(v, _)| *v)
-            .ok()?;
-        let rel = lay.spender_rels[i].1;
-        if rel == SPENDER_REL_UNKNOWN {
+        let (off, len) = lay.spent_range?;
+        let abs = rbitcoin_store::spent_abs(off, vout);
+        if abs.saturating_add(9) > off.saturating_add(len) {
             return None;
         }
-        Some(off.saturating_add(u64::from(rel)))
+        Some(abs)
+    }
+
+    pub fn set_spent_range_only(&mut self, fk: Fk, spent_range: (u64, u64)) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        if let Some(e) = self.pins.get(&id) {
+            e.publish_layout(|cur| {
+                if cur.spent_range == Some(spent_range) {
+                    return None;
+                }
+                let mut next = cur.clone();
+                next.spent_range = Some(spent_range);
+                Some(next)
+            });
+        }
     }
 
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
@@ -1123,8 +1139,9 @@ mod tests {
         assert!(a.has_parent_out(Fk(1), 0));
         assert!(a.has_parent_out(Fk(1), 1));
         assert!(a.has_parent_out(Fk(2), 0));
-        assert_eq!(a.get_spender_abs(Fk(1), 0), Some(110));
-        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(120));
+        a.set_spent_range_only(Fk(1), (1000, 27));
+        assert_eq!(a.get_spender_abs(Fk(1), 0), Some(1000));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1009));
         assert_eq!(a.get_parent_coinbase(Fk(1)), Some(false));
         assert_eq!(a.get_parent_coinbase(Fk(2)), Some(true));
     }
@@ -1146,7 +1163,8 @@ mod tests {
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
         assert!(!bp.pin_covered(Fk(9), &[0, 3]));
         assert!(!bp.has_parent_out(Fk(9), 1));
-        assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
+        bp.set_spent_range_only(Fk(9), (2000, 27));
+        assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(2018));
         assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
         assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
         assert!(bp.has_abs_layout(Fk(9)));
@@ -1174,8 +1192,10 @@ mod tests {
         assert!(!bp.has_abs_layout(Fk(3)));
         assert!(bp.has_spender_rels(Fk(3)));
         bp.set_body_range_only(Fk(3), (500, 80));
+        assert!(!bp.has_abs_layout(Fk(3)));
+        bp.set_spent_range_only(Fk(3), (500, 18));
         assert!(bp.has_abs_layout(Fk(3)));
-        assert_eq!(bp.get_spender_abs(Fk(3), 0), Some(540));
+        assert_eq!(bp.get_spender_abs(Fk(3), 0), Some(500));
     }
 
     #[test]
@@ -1205,6 +1225,9 @@ mod tests {
             vec![(0, SPENDER_REL_UNKNOWN)],
         );
         assert!(bp.get_spender_abs(Fk(1), 0).is_none());
+        bp.set_spent_range_only(Fk(1), (100, 9));
+        assert_eq!(bp.get_spender_abs(Fk(1), 0), Some(100));
+        assert!(bp.get_spender_abs(Fk(1), 1).is_none());
     }
 
     /// Two batches with the same store share one SharedParentPin after publish/adopt.
@@ -1465,12 +1488,12 @@ mod tests {
             "checked must keep prep-merged vout 1 after write set_layout"
         );
         assert!(writer.has_parent_out(Fk(1), 1));
-        assert_eq!(writer.get_spender_abs(Fk(1), 0), Some(110));
-        // Peer denserels for vout 1 must survive (not full-replaced away).
+        writer.set_spent_range_only(Fk(1), (1000, 27));
+        assert_eq!(writer.get_spender_abs(Fk(1), 0), Some(1000));
         assert_eq!(
             writer.get_spender_abs(Fk(1), 1),
-            Some(120),
-            "spender_rels must merge, not replace, peer denserels"
+            Some(1009),
+            "spent abs covers peer vout after merge"
         );
     }
 
@@ -1584,7 +1607,8 @@ mod tests {
         assert_eq!(a.len(), n_parents);
         assert_eq!(b.len(), n_parents);
         assert!(a.pin_covered(Fk(1), &[0, 1]));
-        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(120));
+        a.set_spent_range_only(Fk(1), (1000, 27));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1009));
         let n = n_parents as f64;
         eprintln!(
             "pin_compose_multi_pack n={n_parents} \
@@ -1809,7 +1833,8 @@ mod tests {
             "layout fill must not clone outs half"
         );
         assert_eq!(lay.body_range, Some((500, 80)));
-        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(520));
+        bp.set_spent_range_only(Fk(1), (800, 27));
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(809));
     }
 
     /// PipelineParentStore size_snapshot / gc + set_layout_sparse / body_range_only edges.
@@ -1857,11 +1882,13 @@ mod tests {
         bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[1]);
         assert!(bp.has_parent_out(Fk(1), 0));
         assert_eq!(bp.get_body_range(Fk(1)), Some((200, 50)));
-        assert!(bp.has_abs_layout(Fk(1)));
+        assert!(!bp.has_abs_layout(Fk(1)));
         assert!(bp.has_spender_rels(Fk(1)));
+        bp.set_spent_range_only(Fk(1), (200, 27));
+        assert!(bp.has_abs_layout(Fk(1)));
         // No-op when layout already covers same range+rels.
         bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[]);
-        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(208));
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(209));
 
         // set_body_range_only updates range; same range is no-op.
         bp.set_body_range_only(Fk(2), (300, 60));

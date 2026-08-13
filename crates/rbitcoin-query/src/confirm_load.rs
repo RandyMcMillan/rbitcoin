@@ -456,7 +456,7 @@ impl Query {
             let loaded = crate::combined_stage::load_creates_once(
                 &self.store,
                 &fks,
-                rbitcoin_store::IdxBodyMode::OutsDenserels,
+                rbitcoin_store::IdxBodyMode::Outs,
             )?;
             let mut by_id: U64Map<crate::combined_stage::CombinedCreate> =
                 U64Map::with_capacity_and_hasher(loaded.len(), Default::default());
@@ -656,18 +656,18 @@ mod load_confirm_invariant_tests {
             .store()
             .put_tx_full_batch_indexed(&[(tx, ins, outs)], true)
             .unwrap();
-        // Overwrite packed body with meta claiming input_count=1 but no input
-        // bytes → Full decode fails short (safe, no OOM) while idx range stays.
+        // Overwrite txout meta to claim more outputs than the idx span holds
+        // → Full decode fails short (safe, no OOM) while idx range stays.
         let (off, len) = q.store().tx_body_range(fks[0]).unwrap();
-        // Schema 13 body meta is 32 B (no leading txid).
         assert!(
             len >= rbitcoin_store::TxRecord::BODY_META_LEN as u64,
             "need full body meta room"
         );
         let mut trash = vec![0u8; len as usize];
-        // Body meta: version[4] locktime[4] in_start[8] in_count[4] …
-        trash[16..20].copy_from_slice(&1u32.to_le_bytes()); // input_count = 1
-        let body_path = q.store().path().join("tx.body");
+        trash[0..4].copy_from_slice(&1i32.to_le_bytes()); // version
+        trash[8..12].copy_from_slice(&1u32.to_le_bytes()); // input_count
+        trash[12..16].copy_from_slice(&50u32.to_le_bytes()); // output_count too high
+        let body_path = q.store().path().join("txout.body");
         {
             use std::io::{Seek, SeekFrom, Write};
             let mut f = std::fs::OpenOptions::new()

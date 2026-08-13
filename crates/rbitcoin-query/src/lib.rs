@@ -2587,7 +2587,8 @@ mod tests {
         let got = bp2.get_parent_outs_needed(Fk(2), &[0, 1]).unwrap();
         assert!(!got.2);
         assert_eq!(got.1.len(), 2);
-        assert_eq!(bp2.get_spender_abs(Fk(2), 1), Some(110));
+        bp2.set_spent_range_only(Fk(2), (100, 27));
+        assert_eq!(bp2.get_spender_abs(Fk(2), 1), Some(109));
         assert!(bp2.get_parent_outs_needed(Fk(2), &[9]).is_none());
     }
 
@@ -2773,7 +2774,12 @@ mod tests {
         assert!(!q.clear_archived_body(&orphan.hash).unwrap());
         let mut trec = coinbase_block(50, Fk::NULL, None).1.tx;
         trec.txid[0] = 0x77;
-        let _tfk = q.put_tx(&trec).unwrap();
+        trec.input_count = 0;
+        trec.output_count = 0;
+        let _tfk = q
+            .store()
+            .put_tx_full_batch_indexed(&[(trec, vec![], vec![])], true)
+            .unwrap()[0];
         // put_spend needs real create - skip if fails
         let _ = q.put_spend(&[1u8; 32], 0, fks0[0], 0);
         let _ = q.spenders(&[1u8; 32], 0);
@@ -3095,7 +3101,6 @@ mod tests {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(42, script)],
-            vec![0],
         ));
 
         let mut recs = Vec::new();

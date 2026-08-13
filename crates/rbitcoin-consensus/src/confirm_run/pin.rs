@@ -33,20 +33,12 @@ pub(super) fn pin_for_wire_batch(
 
     // id → Arc pin (tx, outs, dense denserels). Spent parents only (after thin pass).
     let mut plan_by_id: U64Map<
-        std::sync::Arc<(
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<u32>,
-        )>,
+        std::sync::Arc<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     > = U64Map::default();
     // batch_pin by create id (Arc — preferred same-batch pin source).
     // packed pin half shares the same Arc; no separate outs clone.
     let mut batch_pin_by_id: U64Map<
-        &std::sync::Arc<(
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<u32>,
-        )>,
+        &std::sync::Arc<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     > = U64Map::default();
     if let Some(plan) = plan {
         if plan.batch_pin.len() == plan.planned_fks.len() {
@@ -184,7 +176,7 @@ pub(super) fn pin_for_wire_batch(
         // (skip empty refresh_pin_meta and avoid redundant outs loads).
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
-                let (tx, _outs, denserels) = pin.as_ref();
+                let (tx, _outs) = pin.as_ref();
                 let cb = if tx.input_count != 1 {
                     Some(false)
                 } else {
@@ -195,18 +187,13 @@ pub(super) fn pin_for_wire_batch(
                     .get(id)
                     .copied()
                     .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
-                let sparse = if !denserels.is_empty() {
-                    rbitcoin_query::sparse_spender_rels(denserels, need)
-                } else {
-                    Vec::new()
-                };
-                if cb.is_some() || plan_range.is_some() || !sparse.is_empty() {
-                    batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                if cb.is_some() || plan_range.is_some() {
+                    batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
             } else if let Some(plan) = plan {
                 // Sparse external: layout/coinbase only from plan-local pin.
                 if let Some(ext) = plan.external_parent_outs.get(id) {
-                    let (tx, _live, sparse_all) = ext.as_ref();
+                    let (tx, _live) = ext.as_ref();
                     let cb = if tx.input_count != 1 {
                         Some(false)
                     } else {
@@ -217,13 +204,8 @@ pub(super) fn pin_for_wire_batch(
                         .get(id)
                         .copied()
                         .or_else(|| plan.external_parent_ranges.get(id).copied());
-                    let sparse: Vec<(u32, u32)> = sparse_all
-                        .iter()
-                        .copied()
-                        .filter(|(v, _)| need.binary_search(v).is_ok())
-                        .collect();
-                    if cb.is_some() || plan_range.is_some() || !sparse.is_empty() {
-                        batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                    if cb.is_some() || plan_range.is_some() {
+                        batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                     }
                 }
             }
@@ -233,7 +215,7 @@ pub(super) fn pin_for_wire_batch(
         // Sparse external parent pin (need-vouts only — no dense CreatePin).
         if let Some(plan) = plan {
             if let Some(ext) = plan.external_parent_outs.get(id) {
-                let (tx, live_all, sparse_all) = ext.as_ref();
+                let (tx, live_all) = ext.as_ref();
                 let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
                     .iter()
                     .filter_map(|&v| {
@@ -264,15 +246,6 @@ pub(super) fn pin_for_wire_batch(
                         .get(id)
                         .copied()
                         .or_else(|| plan.external_parent_ranges.get(id).copied());
-                    let sparse: Vec<(u32, u32)> = if need.is_empty() {
-                        sparse_all.clone()
-                    } else {
-                        sparse_all
-                            .iter()
-                            .copied()
-                            .filter(|(v, _)| need.binary_search(v).is_ok())
-                            .collect()
-                    };
                     batch_parents.insert_owned(
                         fk,
                         tx.clone(),
@@ -280,7 +253,7 @@ pub(super) fn pin_for_wire_batch(
                         checked,
                         cb,
                         plan_range,
-                        sparse,
+                        Vec::new(),
                     );
                     n_plan_pin = n_plan_pin.saturating_add(1);
                     continue;
@@ -291,13 +264,12 @@ pub(super) fn pin_for_wire_batch(
             }
         }
         if let Some(pin) = plan_by_id.get(id) {
-            let (tx, outs, denserels) = pin.as_ref();
+            let (tx, outs) = pin.as_ref();
             let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
                 .iter()
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
                 .collect();
             if live.len() != need.len() {
-                // Incomplete plan outs — fall through to range / cold.
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -311,15 +283,15 @@ pub(super) fn pin_for_wire_batch(
                 .get(id)
                 .copied()
                 .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
-            let (body_range, sparse) = if !denserels.is_empty() {
-                (
-                    plan_range,
-                    rbitcoin_query::sparse_spender_rels(denserels, need),
-                )
-            } else {
-                (plan_range, Vec::new())
-            };
-            batch_parents.insert_owned(fk, tx.clone(), live, need.clone(), cb, body_range, sparse);
+            batch_parents.insert_owned(
+                fk,
+                tx.clone(),
+                live,
+                need.clone(),
+                cb,
+                plan_range,
+                Vec::new(),
+            );
             n_plan_pin = n_plan_pin.saturating_add(1);
         } else {
             still_need.insert(*id, need.clone());
@@ -570,6 +542,25 @@ pub(super) fn ensure_spend_abs_layouts(
         vouts.dedup();
     }
 
+    // Stamp spent.body ranges first so abs = spent_off + 9×vout (idx only).
+    {
+        let mut spent_fks: Vec<rbitcoin_primitives::Fk> =
+            need.keys().map(|id| rbitcoin_primitives::Fk(*id)).collect();
+        spent_fks.sort_unstable_by_key(|f| f.0);
+        spent_fks.dedup();
+        if !spent_fks.is_empty() {
+            let spent = query
+                .store()
+                .tx_spent_range_batch(&spent_fks)
+                .map_err(ConsensusError::from)?;
+            for (fk, opt) in spent_fks.iter().zip(spent.into_iter()) {
+                if let Some(sr) = opt {
+                    batch_parents.set_spent_range_only(*fk, sr);
+                }
+            }
+        }
+    }
+
     // 1) Pin denserels + body_range already on BatchParents — no body IO.
     let mut ensure_res = 0u64;
     let mut still: U64Map<Vec<u32>> = U64Map::default();
@@ -612,6 +603,15 @@ pub(super) fn ensure_spend_abs_layouts(
             .store()
             .tx_body_range_batch(&range_only)
             .map_err(ConsensusError::from)?;
+        let spent = query
+            .store()
+            .tx_spent_range_batch(&range_only)
+            .map_err(ConsensusError::from)?;
+        for (fk, sr) in range_only.iter().zip(spent.into_iter()) {
+            if let Some(range) = sr {
+                batch_parents.set_spent_range_only(*fk, range);
+            }
+        }
         for (fk, opt) in range_only.iter().zip(ranges.into_iter()) {
             let Some(range) = opt else {
                 // No idx range yet (e.g. parent not committed) — hard fail at post-condition
@@ -645,9 +645,8 @@ pub(super) fn ensure_spend_abs_layouts(
             .collect();
         confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
         // Structural denserels fill for pin gaps (cold Class A).
-        let loaded =
-            rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::OutsDenserels)
-                .map_err(ConsensusError::from)?;
+        let loaded = rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::Outs)
+            .map_err(ConsensusError::from)?;
         let secret = query.store().txs.store_secret();
         for c in loaded {
             let Some(id) = c.fk.get() else {
@@ -701,6 +700,23 @@ pub(super) fn ensure_spend_abs_layouts(
                 None
             };
             batch_parents.insert_owned(c.fk, tx, live, checked, cb, Some(c.body_range), sparse);
+        }
+        // Cold inserts are new pins — stamp spent ranges onto them too.
+        let mut spent_fks: Vec<rbitcoin_primitives::Fk> = still
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        spent_fks.sort_unstable_by_key(|f| f.0);
+        if !spent_fks.is_empty() {
+            let spent = query
+                .store()
+                .tx_spent_range_batch(&spent_fks)
+                .map_err(ConsensusError::from)?;
+            for (fk, opt) in spent_fks.iter().zip(spent.into_iter()) {
+                if let Some(sr) = opt {
+                    batch_parents.set_spent_range_only(*fk, sr);
+                }
+            }
         }
     }
 

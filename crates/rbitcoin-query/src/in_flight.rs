@@ -255,7 +255,6 @@ mod tests {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
-            vec![0u32],
         ))
     }
 

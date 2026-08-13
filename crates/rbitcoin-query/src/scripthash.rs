@@ -176,12 +176,7 @@ impl Query {
         scripthash: &[u8; 32],
         create_tx_fk: rbitcoin_primitives::Fk,
     ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
-        let create = self.store.get_tx(create_tx_fk)?;
-        let outs = if create.output_count == 0 {
-            Vec::new()
-        } else {
-            self.store.get_tx_meta_and_outputs(create_tx_fk)?.1
-        };
+        let (create, outs) = self.store.get_tx_meta_and_outputs(create_tx_fk)?;
         let height = self.store.tx_height.get(create_tx_fk)?.unwrap_or(0);
         let mut out = Vec::new();
         for (vout, o) in outs.into_iter().enumerate() {

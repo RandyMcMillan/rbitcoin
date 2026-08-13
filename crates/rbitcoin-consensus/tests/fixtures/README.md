@@ -6,6 +6,7 @@
 | `tx_valid.json` | Bitcoin Core `src/test/data/tx_valid.json` | MIT |
 | `tx_invalid.json` | Bitcoin Core `src/test/data/tx_invalid.json` | MIT |
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
+| `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
 
 Core JSON files are vendored for offline CI. Update by re-fetching from
 `https://github.com/bitcoin/bitcoin` `master` (or a pinned tag) when expanding coverage:

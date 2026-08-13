@@ -23,7 +23,10 @@ use tokio::task::JoinHandle;
 
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
-const SERVER_VERSION: &str = concat!("rbitcoin ", env!("CARGO_PKG_VERSION"));
+/// First `server.version` element. Cake Wallet `getNodeIsElectrs()` requires
+/// this string (lowercased) to contain `electrs` before it will probe
+/// `blockchain.tweaks.subscribe [0, 1, false]`.
+const SERVER_VERSION: &str = concat!("rbitcoin-electrs ", env!("CARGO_PKG_VERSION"));
 
 /// Tip-follow 5s DEBUG `tip: perf`: JSON-RPC request count this window.
 static METER_REQ: AtomicU64 = AtomicU64::new(0);
@@ -515,9 +518,10 @@ fn dispatch(
             "server_version": SERVER_VERSION,
             "hash_function": "sha256",
             "pruning": null,
-            // Cake probes the tweaks method, not features. Other clients (and
-            // future Cake) can see SP without a dummy RPC. Cake electrs does
-            // not implement server.features.
+            // Cake gates SP on version[0] containing "electrs", then probes the
+            // tweaks method — not features. Other clients (and future Cake) can
+            // still see SP here without a dummy RPC. Cake electrs does not
+            // implement server.features.
             "silent_payments": [0],
             "tweaks": true,
         })),
@@ -1049,6 +1053,17 @@ mod tests {
         )
         .unwrap();
         assert!(v.as_array().unwrap().len() == 2);
+        // Cake Wallet getNodeIsElectrs(): version[0].toLowerCase().contains('electrs')
+        // before it will call blockchain.tweaks.subscribe [0, 1, false].
+        let cake_server = v[0].as_str().expect("server.version[0] string");
+        assert!(
+            cake_server.to_ascii_lowercase().contains("electrs"),
+            "Cake skips tweaks unless version[0] contains electrs, got {cake_server:?}"
+        );
+        assert!(
+            cake_server.to_ascii_lowercase().contains("rbitcoin"),
+            "version[0] must still identify rbitcoin, got {cake_server:?}"
+        );
 
         assert!(dispatch(
             "server.ping",
@@ -1092,6 +1107,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(features["protocol_min"], PROTOCOL_MIN);
+        assert_eq!(features["server_version"], v[0]);
         assert_eq!(features["silent_payments"], json!([0]));
         assert_eq!(features["tweaks"], json!(true));
 

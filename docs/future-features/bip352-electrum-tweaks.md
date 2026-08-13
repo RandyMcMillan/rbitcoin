@@ -9,10 +9,15 @@ never sees `scan_sk`). Not Frigate’s Remote Scanner.
 ## Product
 
 Cake Wallet asks the selected Electrum node whether it can serve BIP-352 tweaks.
-If the method is missing or errors, it falls back to `electrs.cakewallet.com:50001`.
+`getNodeIsElectrs()` requires `server.version[0]` (lowercased) to contain
+`electrs`; only then does it call `getTweaks(0)` (`blockchain.tweaks.subscribe
+[0, 1, false]`). If that gate fails, or the method is missing / errors, it
+treats the node as non-SP and the scan isolate uses `electrs.cakewallet.com:50001`.
 
-We implement `blockchain.tweaks.subscribe` and advertise SP in `server.features`
-so a wallet pointed at rbitcoin is marked tweak-capable.
+We implement `blockchain.tweaks.subscribe`, advertise `rbitcoin-electrs <ver>`
+in `server.version` / `server.features.server_version`, and set
+`silent_payments` / `tweaks` in features so a wallet pointed at rbitcoin is
+marked tweak-capable.
 
 ## Architecture (this tree)
 
@@ -114,12 +119,17 @@ and the probe only needs a parseable success.
 
 | Cake | rbitcoin |
 |------|----------|
-| Call `blockchain.tweaks.subscribe` `[0, 1, false]` | Method exists; JSON-RPC **success** with a map |
-| Error / timeout / unparseable → no SP | Must not be `unknown method` |
+| `server.version[0].toLowerCase().contains('electrs')` | `"rbitcoin-electrs <ver>"` (also in `server.features.server_version`) |
+| Then call `blockchain.tweaks.subscribe` `[0, 1, false]` | Method exists; JSON-RPC **success** with a map |
+| Error / timeout / unparseable / no `electrs` in version → no SP | Must not be `unknown method` |
 | Features (unused today) | `"silent_payments": [0]`, `"tweaks": true` |
 
-Some Cake builds still hardcode the scan isolate to Cake’s electrs even after a
-successful probe. Advertising is still required; OPERATOR states the caveat.
+Current Cake `_handleScanSilentPayments` still hardcodes
+`tcp://electrs.cakewallet.com:50001` (`shouldSwitchNodes` commented;
+`ScanNode` unused). A passing probe sets `node.supportsSilentPayments` and
+would pass the wallet URI into the isolate, but the isolate does not use it.
+Advertising is still required so Cake even calls `getTweaks`; OPERATOR states
+the isolate caveat.
 
 ## BIP-352 server tweak
 

@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
+  Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
+  Current Cake scan isolate still hardcodes `electrs.cakewallet.com`.
+
 - **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
   `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
   Explicit CLI/conf knobs publish to env; omitting them **preserves** advanced

@@ -24,6 +24,10 @@
 //! - **script** = `SCRIPT_NS`
 //! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tweaks + tip GC
 //!
+//! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
+//! the write thread joins) must add a named token here in the **same commit**.
+//! See `AGENTS.md` “Confirm pipeline timers”. `write=` must equal `write_stage_ms`.
+//!
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
 //! `loadq`/`scriptq` stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
 //! `loadq_hwm=` (OS-thread occupancy + queue high-water). High load_recv_wait

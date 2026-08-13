@@ -119,6 +119,62 @@ land the simplification as a drive-by cleanup.
 | IBD sizes | **`conf_plans=`** + body-queue / pipeline meters (no `residency creates=`) |
 
 
+## Confirm pipeline timers (required visibility)
+
+Anything that runs on the confirm pipeline — **lookup, load, scripts, write**,
+or a sidecar the write thread **joins** — must have a **named** timer on
+`ibd: perf` / `ibd: perf_dbg` **in the same commit** as the work. Write-thread
+`Instant` regions also go on [`LastWritePhases`](crates/rbitcoin-consensus/src/lib.rs)
+and the `confirm write slow` line. See [`crates/rbitcoin-net/src/ibd/perf_log.rs`](crates/rbitcoin-net/src/ibd/perf_log.rs)
+(`write_stage_ms`, `format_info`, `format_debug`).
+
+**Why:** signet IBD 17:47–18:16 (tip 0→263k, `--sptweaks`, no `tweaks=` yet)
+was write-bound from ~180k. `confirm write slow` named phases
+(`class_a+ensure+struct+class_c+spend_ann+tip_gc`) covered only **~35–44%**
+of wall (median hole **~3.2 s**, up to **6.9 s**, **~56–66%** of a 5–10 s
+batch). That work was `index_sp_tweaks_batch` on the only thread that can
+advance tip. After `tweaks=`, the 18:43 run’s window **`write=` equals**
+`class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc` (delta 0); **tweaks
+were 60–80%** of write in the first fat windows. A silent path is how we
+lose the bottleneck.
+
+| Rule | Detail |
+|------|--------|
+| New confirm-path work | Same commit: atomic ns + `ibd: perf` token. Write-thread wall also on `LastWritePhases` + `confirm write slow`. |
+| Completeness | Window `write=` **must** equal the sum of write tokens (`write_stage_ms`). A new large `confirm write slow` named/wall gap is a **missing timer** — add it before more perf work. |
+| Tests | Pin the new token on `format_info` / `write_stage_ms` (or `last_write_phases`) the way `tweaks=` is pinned. |
+| Not OK | Silent index, flush, secp, body walk, memtable lock, or sidecar join on lookup/load/scripts/write. “Meter it later.” |
+
+Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/write busy/wait=` + `loadq_hwm` / `scriptq_hwm` / `writeq_hwm`, not work-sum alone.
+
+### Current inventory (keep this list honest)
+
+| Stage | Tokens | What must stay visible |
+|-------|--------|------------------------|
+| **Lookup** | `lookup=` / `lookup_thr` / `stamp_sub` / `lookup_sub` / `head_rd` | claim, resolve, clone, stamp (`struct/prepare/filter/batch/head_fk/stamp/finish`), head probe/idx/body |
+| **Load** | `load=` / `load_budget` / `pin(` / `assemble=` | pin (`plan` / `cold_range` body+dec / `cold_idx` / adopt / range_fill / contract / publish) + assemble (`prevout` paths, sigop, job) |
+| **Scripts** | `script=` (`SCRIPT_NS`) | rayon verify. Milestone skip is still this stage (near-zero when `check_scripts` is false). |
+| **Write** | `write=` = `write_stage_ms` | table below |
+| **Occupancy** | `loadq` / `scriptq` / `writeq` + `*_hwm`, `thr … busy/wait` | who is the serial pole |
+
+**Write tokens** (must sum to `write=`):
+
+| Token | Work |
+|-------|------|
+| `class_a=` | `archive_commit_plan` (`class_a_sub` body/head/htxs/reserve) |
+| `ensure=` | fill planned layout + ensure spend abs (`pin=` / `cold=`) |
+| `struct=` | spentness / create-height / BIP68 (`spent_sub`) |
+| `class_c=` | strong + tip tables + `flush_class_c_tip` (**not** the SH join wait) |
+| `sh=` | SH filter+collect (Direct enqueue / tip durable append). Parallel with strong. |
+| `spend=` | spend annotate (`ann=` / `pread_skip`) |
+| `tweaks=` | `index_sp_tweaks_batch` (`--sptweaks`; ~0 when off) |
+| `tip_gc=` | `advance_parent_cache_tip` |
+
+Known leftover on `confirm write slow` **Instant** vs named (18:43 run, after `tweaks=`): **~100–300 ms/batch** (~5% of wall). That is SH enqueue / `thread::scope` join, **not** another multi-second silent index. Do not treat it as the 17:47 hole. If a future change makes that leftover large, meter SH enqueue/join explicitly.
+
+Do not add confirm-path work that does not appear in this inventory without extending the table **and** the logs in the same commit.
+
+
 ## GitHub CI must stay green (every commit)
 
 CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to

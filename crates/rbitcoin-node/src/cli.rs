@@ -49,6 +49,7 @@ where
     let mut conf_path: Option<PathBuf> = None;
     // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
     let mut log_level_cli: Option<Option<Level>> = None;
+    let mut api_log: Option<PathBuf> = None;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -62,10 +63,11 @@ where
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
-    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
+    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
 Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
+API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also DEBUG `api:`).\n\
 Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
@@ -384,6 +386,15 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
+            "--api-log" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --api-log requires a path");
+                    return ExitCode::from(2);
+                }
+                api_log = Some(PathBuf::from(&args[i]));
+                i += 1;
+            }
             "--log-level" => {
                 i += 1;
                 if i >= args.len() {
@@ -442,6 +453,17 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 rbitcoin_log::init(Level::Info);
             }
         }
+    }
+
+    if let Some(p) = api_log {
+        config.api_log = Some(p);
+    }
+    if let Some(ref p) = config.api_log {
+        if let Err(e) = rbitcoin_log::init_api_log(p) {
+            eprintln!("error: --api-log {}: {e}", p.display());
+            return ExitCode::from(2);
+        }
+        rbitcoin_log::info!("api-log: {}", p.display());
     }
 
     // 256-way sharded heads need 1k+ FDs; raise soft NOFILE before store open.
@@ -630,6 +652,7 @@ mod tests {
             cli_main(["rbitcoin-node", "--log-level", "wat"]),
             ExitCode::from(2),
         );
+        assert_exit(cli_main(["rbitcoin-node", "--api-log"]), ExitCode::from(2));
         assert_exit(
             cli_main(["rbitcoin-node", "--max-outbound", "0"]),
             ExitCode::from(2),

@@ -156,14 +156,27 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
     if let Some(arr) = parsed.as_array() {
-        let out: Vec<_> = arr
-            .iter()
-            .map(|req| handle_request(&state.ctx, req))
-            .collect();
+        let out: Vec<_> = arr.iter().map(|req| rpc_one(&state.ctx, req)).collect();
         return (StatusCode::OK, axum::Json(out)).into_response();
     }
-    let resp = handle_request(&state.ctx, &parsed);
+    let resp = rpc_one(&state.ctx, &parsed);
     (StatusCode::OK, axum::Json(resp)).into_response()
+}
+
+fn rpc_one(ctx: &RpcContext, req: &serde_json::Value) -> serde_json::Value {
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or(serde_json::json!([]));
+    let params_s = serde_json::to_string(&params).unwrap_or_else(|_| "[]".into());
+    let t0 = Instant::now();
+    let resp = handle_request(ctx, req);
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    let err = resp
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err.as_deref());
+    resp
 }
 
 fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {

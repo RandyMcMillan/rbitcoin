@@ -45,9 +45,16 @@ pub fn sample_reset_perf() -> (u64, u64, u64) {
 }
 
 async fn meter_rest(req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
     let t0 = Instant::now();
     let resp = next.run(req).await;
-    let us = t0.elapsed().as_micros() as u64;
+    let elapsed = t0.elapsed();
+    let us = elapsed.as_micros() as u64;
     METER_REQ.fetch_add(1, Ordering::Relaxed);
     METER_US.fetch_add(us, Ordering::Relaxed);
     let mut cur = METER_MAX_US.load(Ordering::Relaxed);
@@ -57,6 +64,20 @@ async fn meter_rest(req: Request, next: Next) -> Response {
             Err(c) => cur = c,
         }
     }
+    let status = resp.status();
+    let err = if status.is_success() {
+        None
+    } else {
+        Some(status.as_str().to_string())
+    };
+    rbitcoin_log::api_call(
+        "esplora",
+        "-",
+        &format!("{method} {path}"),
+        "",
+        elapsed.as_millis() as u64,
+        err.as_deref(),
+    );
     resp
 }
 

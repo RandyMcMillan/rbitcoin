@@ -236,7 +236,7 @@ pub async fn run_electrum(
                     let stop = shutdown_c.clone();
                     let h = tokio::spawn(async move {
                         let _permit = permit; // held until client task ends
-                        let how = handle_client(stream, q, cfg, p, tip_rx, mp, stop).await;
+                        let how = handle_client(stream, peer, q, cfg, p, tip_rx, mp, stop).await;
                         match how {
                             Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
                             Err(e) => {
@@ -322,6 +322,7 @@ where
 
 async fn handle_client<S>(
     stream: S,
+    peer: SocketAddr,
     query: Arc<Query>,
     config: Arc<ElectrumConfig>,
     params: Arc<ChainParams>,
@@ -445,10 +446,32 @@ where
                     &mut header_sub,
                     &mut sh_subs,
                 );
+                let wall_ms = t0.elapsed().as_millis() as u64;
                 meter_dispatch_wall(t0.elapsed().as_micros() as u64);
+                let params_s = serde_json::to_string(&params_v).unwrap_or_else(|_| "[]".into());
                 let resp = match result {
-                    Ok(v) => json!({"jsonrpc":"2.0","id": id, "result": v}),
-                    Err(e) => json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+                    Ok(v) => {
+                        rbitcoin_log::api_call(
+                            "electrum",
+                            &peer.to_string(),
+                            method,
+                            &params_s,
+                            wall_ms,
+                            None,
+                        );
+                        json!({"jsonrpc":"2.0","id": id, "result": v})
+                    }
+                    Err(e) => {
+                        rbitcoin_log::api_call(
+                            "electrum",
+                            &peer.to_string(),
+                            method,
+                            &params_s,
+                            wall_ms,
+                            Some(&e),
+                        );
+                        json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}})
+                    }
                 };
                 write_line(&mut writer, &resp).await?;
                 let _ = &notify;
@@ -1328,6 +1351,44 @@ mod tests {
         assert_eq!(v["id"], 2);
 
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn api_log_records_electrum_method() {
+        let (dir, q) = tmp_store();
+        let log_path = dir.join("api.jsonl");
+        rbitcoin_log::init_api_log(&log_path).unwrap();
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"server.ping","params":[]});
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
+        handle.shutdown().await;
+        rbitcoin_log::close_api_log();
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            body.contains("\"method\":\"server.ping\""),
+            "api log missing ping: {body}"
+        );
+        assert!(body.contains("\"surface\":\"electrum\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

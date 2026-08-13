@@ -5,6 +5,10 @@
 //!
 //! Format: `2026-07-15T19:21:03.456Z  INFO message…`
 
+mod api_log;
+
+pub use api_log::{api_call, api_log_enabled, close_api_log, compact_params, init_api_log};
+
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};

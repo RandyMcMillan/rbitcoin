@@ -52,6 +52,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--archive-queue-mb N` | | 512 (only publishes env when set; else advanced env kept) |
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | | `info` |
+| `--api-log PATH` | conf `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
 | `--no-seeds` | `--noseeds` | seeds on |
 | `--shindex` | conf `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
 | `--electrum-listen ADDR` | | disabled (**requires** `--shindex`) |
@@ -374,6 +375,18 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
 | Silent Payments tweaks | `blockchain.tweaks.subscribe` — **naive**, computed per request from Class A + parent outs. No tweak index. `count` is **capped at 8**. Cake capability = this method succeeding (probe `[0, 1, false]` → `{"0": {}}`). `server.features` includes `silent_payments` / `tweaks`. On 9p-class IO expect ~1–3 blocks/s; local disk is faster. Some Cake builds still scan `electrs.cakewallet.com` even after a successful probe. |
+
+### API request log
+
+`--api-log PATH` (or conf `api_log=PATH`) appends **one JSON line per Electrum, Esplora, and RPC call**:
+
+```
+{"ts":"…Z","surface":"electrum","peer":"192.168.88.20:51122","method":"blockchain.tweaks.subscribe","params":"[850000,8,false]","wall_ms":2410,"ok":true,"err":null}
+```
+
+`tail -f` that file. The same line is also emitted at **DEBUG** as `api: …` (so `--log-level debug` shows methods in `mainnet.log`). Params are truncated (~384 bytes) so broadcast hex does not fill the disk.
+
+Use this to see whether Cake is hitting tweaks vs only scripthash history, and which calls take seconds.
 
 ### App DoS floor (always on)
 

@@ -80,6 +80,8 @@ pub struct NodeConfig {
     /// Log level from conf (`log_level=…`), if any. CLI `--log-level` overrides.
     /// Values: error|warn|info|debug|trace|off (same as CLI).
     pub conf_log_level: Option<String>,
+    /// Optional JSONL API call log (`--api-log` / `api_log=`). Electrum, Esplora, RPC.
+    pub api_log: Option<PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -112,6 +114,7 @@ impl Default for NodeConfig {
             inhibit_suspend: false,
             conf_path: None,
             conf_log_level: None,
+            api_log: None,
         }
     }
 }
@@ -275,7 +278,7 @@ impl NodeConfig {
     /// Supported keys: `datadir`, `network` / `chain`, `listen`, `connect` (repeatable),
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
-    /// `archive_queue_mb`, `log_level`, `electrum_listen`, `esplora_listen`,
+    /// `archive_queue_mb`, `log_level`, `api_log`, `electrum_listen`, `esplora_listen`,
     /// `shindex`, `rpc_listen`, `rpcuser`, `rpcpassword`,
     /// `noseeds` / `no_seeds`, `signetchallenge`, and `signetblocktime`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
@@ -409,6 +412,12 @@ impl NodeConfig {
                     }
                     self.conf_log_level = Some(val.to_string());
                 }
+                "api_log" | "apilog" => {
+                    if val.is_empty() {
+                        return Err(NodeError::Config("conf api_log requires a path".into()));
+                    }
+                    self.api_log = Some(PathBuf::from(val));
+                }
                 "noseeds" | "no_seeds" => {
                     self.use_seeds = !is_conf_true(val);
                 }
@@ -504,6 +513,7 @@ mod tests {
              mempool_size_mb=50\n\
              milestone=100\n\
              log_level=debug\n\
+             api_log=/tmp/rbitcoin-api.jsonl\n\
              connect=127.0.0.1:38333\n",
         )
         .unwrap();
@@ -518,6 +528,10 @@ mod tests {
         assert_eq!(cfg.mempool_max_weight, 50_000_000);
         assert_eq!(cfg.milestone_height, 100);
         assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
+        assert_eq!(
+            cfg.api_log.as_deref(),
+            Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl"))
+        );
         assert_eq!(cfg.connect.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -16,7 +16,7 @@ use rbitcoin_mempool::{
 };
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -143,6 +143,49 @@ pub struct MempoolAnnounce {
     pub txid: Txid,
     pub replaced: Vec<Txid>,
     pub replaced_scripthashes: Vec<[u8; 32]>,
+    /// Output + spent-input scripthashes of the **new** body (Electrum notify filter).
+    pub scripthashes: Vec<[u8; 32]>,
+}
+
+/// Reverse index: scripthash → live mempool txids (Electrum status / listunspent).
+struct MempoolShIndex {
+    by_sh: HashMap<[u8; 32], HashSet<Txid>>,
+    by_tx: HashMap<Txid, Vec<[u8; 32]>>,
+}
+
+impl MempoolShIndex {
+    fn new() -> Self {
+        Self {
+            by_sh: HashMap::new(),
+            by_tx: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, txid: Txid, shs: Vec<[u8; 32]>) {
+        self.remove(&txid);
+        for sh in &shs {
+            self.by_sh.entry(*sh).or_default().insert(txid);
+        }
+        self.by_tx.insert(txid, shs);
+    }
+
+    fn remove(&mut self, txid: &Txid) {
+        let Some(shs) = self.by_tx.remove(txid) else {
+            return;
+        };
+        for sh in shs {
+            if let Some(set) = self.by_sh.get_mut(&sh) {
+                set.remove(txid);
+                if set.is_empty() {
+                    self.by_sh.remove(&sh);
+                }
+            }
+        }
+    }
+
+    fn txs_for(&self, sh: &[u8; 32]) -> impl Iterator<Item = Txid> + '_ {
+        self.by_sh.get(sh).into_iter().flatten().copied()
+    }
 }
 
 /// Sample-and-reset window of tip-follow mempool/relay meters (`DEBUG tip: perf`).
@@ -200,6 +243,8 @@ pub struct MempoolHub {
     meter_inv_tx: AtomicU64,
     meter_getdata_tx: AtomicU64,
     meter_announce: AtomicU64,
+    /// Live mempool txs by Electrum scripthash (updated on accept/remove).
+    sh_index: Mutex<MempoolShIndex>,
 }
 
 impl MempoolHub {
@@ -216,7 +261,7 @@ impl MempoolHub {
         let mp = ActiveMempool::open_or_create_with_limit(dir.as_ref(), max_weight_wu)
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
-        Ok(Arc::new(Self {
+        let hub = Self {
             inner: RwLock::new(mp),
             query,
             relay_enabled: AtomicBool::new(false),
@@ -240,7 +285,64 @@ impl MempoolHub {
             meter_inv_tx: AtomicU64::new(0),
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
-        }))
+            sh_index: Mutex::new(MempoolShIndex::new()),
+        };
+        hub.reindex_live_scripthashes();
+        Ok(Arc::new(hub))
+    }
+
+    /// Output + spent-input Electrum scripthashes for a live (or just-accepted) tx.
+    fn collect_tx_scripthashes(&self, tx: &Transaction, mp: &ActiveMempool) -> Vec<[u8; 32]> {
+        use rbitcoin_store::script_hash;
+        let mut out = Vec::with_capacity(tx.output.len() + tx.input.len());
+        for o in &tx.output {
+            out.push(script_hash(o.script_pubkey.as_bytes()));
+        }
+        let provider = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        for inp in &tx.input {
+            let op = inp.previous_output;
+            let spk = if let Some(creator) = mp.graph.creator(&op) {
+                mp.get_tx(&creator)
+                    .and_then(|t| t.output.get(op.vout as usize))
+                    .map(|o| o.script_pubkey.as_bytes().to_vec())
+            } else {
+                provider
+                    .get_txout(&op)
+                    .map(|o| o.script_pubkey.as_bytes().to_vec())
+            };
+            if let Some(s) = spk {
+                out.push(script_hash(&s));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn reindex_live_scripthashes(&self) {
+        let g = self.inner.read().unwrap();
+        let mut idx = MempoolShIndex::new();
+        for (txid, _) in g.graph.iter() {
+            let Some(tx) = g.get_tx(txid) else { continue };
+            let shs = self.collect_tx_scripthashes(tx, &g);
+            idx.insert(*txid, shs);
+        }
+        drop(g);
+        *self.sh_index.lock().unwrap() = idx;
+    }
+
+    fn index_txid(&self, txid: Txid, tx: &Transaction) {
+        let shs = {
+            let g = self.inner.read().unwrap();
+            self.collect_tx_scripthashes(tx, &g)
+        };
+        self.sh_index.lock().unwrap().insert(txid, shs);
+    }
+
+    fn unindex_txid(&self, txid: &Txid) {
+        self.sh_index.lock().unwrap().remove(txid);
     }
 
     /// Count peer inv of txs we do not already hold (want → getdata path).
@@ -400,6 +502,12 @@ impl MempoolHub {
             let _ = g.maybe_compact();
             self.mark_fee_dirty();
         }
+        drop(g);
+        if n > 0 {
+            for tid in &to_drop {
+                self.unindex_txid(tid);
+            }
+        }
         n
     }
 
@@ -407,11 +515,12 @@ impl MempoolHub {
         self.announce.subscribe()
     }
 
-    fn publish_announce(&self, r: &AcceptResult) {
+    fn publish_announce(&self, r: &AcceptResult, scripthashes: Vec<[u8; 32]>) {
         let _ = self.announce.send(MempoolAnnounce {
             txid: r.txid,
             replaced: r.replaced.clone(),
             replaced_scripthashes: r.replaced_scripthashes.clone(),
+            scripthashes,
         });
         self.meter_announce.fetch_add(1, Ordering::Relaxed);
     }
@@ -553,7 +662,19 @@ impl MempoolHub {
                 self.meter_accept_wall(us, true);
                 self.note_fee_flow_admit(r.weight, r.fee_sat);
                 self.push_recent(tx, &r);
-                self.publish_announce(&r);
+                for old in &r.replaced {
+                    self.unindex_txid(old);
+                }
+                self.index_txid(r.txid, tx);
+                let shs = self
+                    .sh_index
+                    .lock()
+                    .unwrap()
+                    .by_tx
+                    .get(&r.txid)
+                    .cloned()
+                    .unwrap_or_default();
+                self.publish_announce(&r, shs);
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -710,7 +831,19 @@ impl MempoolHub {
                     self.meter_accept_wall(per, true);
                     self.note_fee_flow_admit(r.weight, r.fee_sat);
                     self.push_recent(tx, r);
-                    self.publish_announce(r);
+                    for old in &r.replaced {
+                        self.unindex_txid(old);
+                    }
+                    self.index_txid(r.txid, tx);
+                    let shs = self
+                        .sh_index
+                        .lock()
+                        .unwrap()
+                        .by_tx
+                        .get(&r.txid)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.publish_announce(r, shs);
                 }
                 Ok(res)
             }
@@ -757,7 +890,14 @@ impl MempoolHub {
                 self.note_fee_flow_confirm(e.weight, e.fee_sat);
             }
         }
-        g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0)
+        let n = g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0);
+        drop(g);
+        if n > 0 {
+            for tid in txids {
+                self.unindex_txid(tid);
+            }
+        }
+        n
     }
 
     /// Unique txs parked waiting on missing parents (Core-class orphanage).
@@ -815,43 +955,17 @@ impl MempoolHub {
 
     /// Electrum `blockchain.scripthash.get_mempool` rows for `scripthash` (internal order).
     pub fn scripthash_mempool(&self, scripthash: &[u8; 32]) -> Vec<ElectrumMempoolItem> {
-        use rbitcoin_store::script_hash;
+        let want: Vec<Txid> = self.sh_index.lock().unwrap().txs_for(scripthash).collect();
+        if want.is_empty() {
+            return Vec::new();
+        }
         let g = self.inner.read().unwrap();
         let mut out = Vec::new();
-        for (txid, e) in g.graph.iter() {
-            let Some(tx) = g.get_tx(txid) else { continue };
-            let mut touches = false;
-            for o in &tx.output {
-                if script_hash(o.script_pubkey.as_bytes()) == *scripthash {
-                    touches = true;
-                    break;
-                }
-            }
-            if !touches {
-                for inp in &tx.input {
-                    let op = inp.previous_output;
-                    let spk = if let Some(creator) = g.graph.creator(&op) {
-                        g.get_tx(&creator)
-                            .and_then(|t| t.output.get(op.vout as usize))
-                            .map(|o| o.script_pubkey.as_bytes().to_vec())
-                    } else {
-                        QueryUtxoProvider {
-                            query: self.query.as_ref(),
-                        }
-                        .get_txout(&op)
-                        .map(|o| o.script_pubkey.as_bytes().to_vec())
-                    };
-                    if let Some(s) = spk {
-                        if script_hash(&s) == *scripthash {
-                            touches = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !touches {
+        for txid in want {
+            let Some(e) = g.graph.get(&txid) else {
                 continue;
-            }
+            };
+            let Some(tx) = g.get_tx(&txid) else { continue };
             let mut height = 0i64;
             for inp in &tx.input {
                 if g.graph.contains(&inp.previous_output.txid) {

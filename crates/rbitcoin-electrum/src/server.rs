@@ -13,8 +13,8 @@ use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -154,15 +154,21 @@ impl ElectrumConfig {
 
 pub struct ElectrumHandle {
     pub local_addr: SocketAddr,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
+    clients: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl ElectrumHandle {
     pub async fn shutdown(mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown.store(true, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        // Client tasks do not observe the accept-loop flag; abort so SIGINT
+        // is not blocked behind a scripthash history / mempool restatus.
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        for t in clients.drain(..) {
             t.abort();
         }
     }
@@ -196,16 +202,18 @@ pub async fn run_electrum(
 ) -> Result<ElectrumHandle, std::io::Error> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_c = shutdown.clone();
     let max_conn = config.max_connections().max(1);
     let conn_sem = Arc::new(Semaphore::new(max_conn));
     let config = Arc::new(config);
     let params = Arc::new(params);
+    let clients: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients_c = clients.clone();
 
     let task = tokio::spawn(async move {
         loop {
-            if shutdown_c.load(std::sync::atomic::Ordering::SeqCst) {
+            if shutdown_c.load(Ordering::SeqCst) {
                 break;
             }
             let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
@@ -225,9 +233,10 @@ pub async fn run_electrum(
                     let p = params.clone();
                     let tip_rx = tip_tx.subscribe();
                     let mp = mempool.clone();
-                    tokio::spawn(async move {
+                    let stop = shutdown_c.clone();
+                    let h = tokio::spawn(async move {
                         let _permit = permit; // held until client task ends
-                        let how = handle_client(stream, q, cfg, p, tip_rx, mp).await;
+                        let how = handle_client(stream, q, cfg, p, tip_rx, mp, stop).await;
                         match how {
                             Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
                             Err(e) => {
@@ -235,6 +244,9 @@ pub async fn run_electrum(
                             }
                         }
                     });
+                    let mut g = clients_c.lock().unwrap_or_else(|e| e.into_inner());
+                    g.retain(|t| !t.is_finished());
+                    g.push(h);
                 }
                 Ok(Err(_)) => break,
                 Err(_) => continue,
@@ -246,6 +258,7 @@ pub async fn run_electrum(
         local_addr,
         shutdown,
         tasks: vec![task],
+        clients,
     })
 }
 
@@ -314,6 +327,7 @@ async fn handle_client<S>(
     params: Arc<ChainParams>,
     mut tip_rx: broadcast::Receiver<TipNotify>,
     mempool: Option<Arc<MempoolHub>>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -328,8 +342,16 @@ where
     let max_line = config.max_line_bytes();
 
     loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         tokio::select! {
             biased;
+            _ = async {
+                while !stop.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => break,
             tip = tip_rx.recv() => {
                 match tip {
                     Ok(t) if header_sub => {
@@ -353,10 +375,17 @@ where
                     None
                 }
             } => {
-                // Mempool change (accept and/or RBF replace): re-status subscribed hashes.
-                if let Some(Ok(_ann)) = ann {
+                // Only restatus hashes this tx (or its RBF victims) actually touch.
+                // Re-walking every subscribe on every mempool accept pegs CPUs
+                // (Cake: tens of gap-limit subs × full history + full-mempool scan).
+                if let Some(Ok(ann)) = ann {
                     if let Some(mp) = &mempool {
                         for sh in sh_subs.iter() {
+                            let hit = ann.scripthashes.iter().any(|s| s == sh)
+                                || ann.replaced_scripthashes.iter().any(|s| s == sh);
+                            if !hit {
+                                continue;
+                            }
                             if let Ok(status) = scripthash_status_full(&query, mp, sh) {
                                 let msg = json!({
                                     "jsonrpc": "2.0",
@@ -561,20 +590,22 @@ fn dispatch(
                 .collect();
             // Mempool outputs matching scripthash that are not spent by another mempool tx.
             if let Some(mp) = mempool {
-                for (txid, _fee, _w, tx) in mp.list_live() {
+                for item in mp.scripthash_mempool(&sh) {
+                    let tid = bitcoin::Txid::from_byte_array(item.txid);
+                    let Some(tx) = mp.get_tx(&tid) else { continue };
                     for (vout, o) in tx.output.iter().enumerate() {
                         if script_hash(o.script_pubkey.as_bytes()) != sh {
                             continue;
                         }
                         let op = bitcoin::OutPoint {
-                            txid,
+                            txid: tid,
                             vout: vout as u32,
                         };
                         if spent.contains(&op) {
                             continue;
                         }
                         arr.push(json!({
-                            "tx_hash": format!("{txid}"),
+                            "tx_hash": format!("{tid}"),
                             "tx_pos": vout,
                             "height": 0,
                             "value": o.value.to_sat() as i64,

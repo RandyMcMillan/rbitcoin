@@ -1,10 +1,12 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 14` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 15` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — most layout changes are reindex-only.  
-**13→14 open:** Class A matches schema 13. A store with `meta` version 13 and
-**no materialized scripthash head** opens and silently rewrites `meta` to 14.
-A schema-13 store with a durable SH index is refused (wipe SH or full datadir).  
+**13/14→15 open:** Class A matches schema 14. A store with `meta` 13 or 14 and
+**no materialized scripthash index** opens and silently rewrites `meta` to 15.
+A store with a durable page-era (or schema-13 slab) SH index is refused:
+wipe `store/scripthash*` (head, body, ovf, runs, include_hwm, cold_progress)
+and rematerialize.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -20,7 +22,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
 | Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
-| Electrum index | Thin **create_tx_fk only** (inline ≤2 or **4 KiB page chains**) | Small index; expand vouts/value/height at query via Class A + Class C |
+| Electrum index | Thin **create_tx_fk only** (inline ≤2 / geometric slabs / megakey pages) | Packed to ~run size; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
 
 ---
@@ -41,8 +43,9 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     tx_height.body               # Class C: tx_fk → create height (u32 slots)
     header_txs_first.body        # header_fk-1 → first_tx_fk
     header_txs_count.body        # header_fk-1 → tx count
-    scripthash.body / *.head     # Class B Electrum SH (thin creates)
-    scripthash.ovf/NNNNNN[.fuse8] # mono ovf segments (1 main-shard slots; seal+roll)
+    scripthash.body / scripthash.head/NN[.fuse8][.idx]  # Class B (slabs + sorted heads)
+    scripthash.ovf/ingest                                # global OA ingest
+    scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     archive_epoch
     scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
@@ -306,65 +309,68 @@ Thin create index: **create_tx_fk only** (no vout in the index). Creates only
 ### Sorted create_fk invariant
 
 For each key, durable create_tx_fks are **strictly increasing** by `create_tx_fk.0`
-(within each page and across pages: last of page *i* < first of page *i+1*).
+(within a slab, within each megakey page, and across pages).
 
 **Insert / batch model (tip + warm residual):**
 
-1. Read **max existing** FK (**last page only** when paged; inline from head).
+1. Read **max existing** FK (slab decode or **last page only** when paged; inline from head).
 2. From the batch (sort+dedup by fk), **skip every `fk ≤ max`** (re-queue / HWM
    replay is safe — not a hard error).
-3. Append remaining higher FKs: fill last page (one write) + new full pages with
-   `next` known (one write each). **No full chain walk** on insert.
+3. Append remaining higher FKs: grow the slab class if needed, or fill last
+   megakey page + new pages. **No full chain walk** on insert.
 
 **Caller contract:** apply SH create batches for a key in **non-decreasing
 block/batch time order**. Skipping lower fks assumes an earlier batch already
 wrote them; inserting a later block before an earlier one can leave permanent holes.
 
-Cold bulk: page-once pack (`next` predicted; no previous-page RMW). Megakeys
-stream page N in RAM → write → page N+1.
+Cold bulk: pick the **exact** geometric class from the run-group length (or emit
+pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
-### Head
+### Head (schema 15)
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
-- Slot = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
+- Record = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
+- Main is a **sealed sorted** file per shard (`scripthash.head/NN`) plus `.fuse8` (BF8R v2)
+  and `.idx` (16 B key + 8 B off per 128 records / 4 KiB page). Record count is
+  immutable after seal. Existing keys update `value16` in place. New keys are
+  **not** punched into main.
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
-  one shard band at a time). Cold load builds one **final-sized** OA image in RAM
-  then sequential-writes the shard file (~0.5–1 GiB peak).
-- **No rehash** after create/materialize size: new keys after ~**0.80** load seal main
-  and go to **overflow segments** under **`scripthash.ovf/`**. Existing main keys still
-  append on main pages. Optional main fuse8 (`scripthash.head.fuse8`, async).
-- **Overflow geometry:** each segment is a **mono** open-address file whose **slot count
-  equals one main shard** (`main_total_slots / n_shards` on multi-shard main — **not**
-  a second 64-way main). Paths: `scripthash.ovf/NNNNNN` + `NNNNNN.fuse8` after seal.
-  Open segment: **no_rehash only**; load ≥ ~0.80 or NeedSlot → **seal** (real BF8R
-  from 16 B head keys, sync) + **roll** next same-size empty segment. Lookups: main →
-  open ovf → sealed ovf (fuse-gated). Updates stay on the key’s home segment (no dual-home).
-  Legacy interim full-size `scripthash.ovf.head` is **wiped on open**.
+  one shard band at a time). Cold load writes packed records (no 2 GiB OA image).
+- **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
+  2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
+  (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
+  disjoint records). **Do not fold ovf into main.** Body offs are not copied.
+- Lookup: shard main fuse → idx → data; then sealed ovf newest→oldest (fuse skip);
+  then ingest OA. A key has **exactly one** home.
 
 | Mode | When | Value (`w0`, `w1`) |
 |------|------|---------------------|
 | Empty | no creates | `0`, `0` |
 | Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` (fk0 < fk1) |
-| **Paged** | ≥3 | bit63=1, **first** page off; bit63=0, **last** page off |
+| **Slab** | 3–256 fks | both bit63=1; `w0` = body off; `w1` = used:u16 \| class<<16 |
+| **Paged** | ≥257 fks (megakey) | bit63=1, **first** page off; bit63=0, **last** page off |
 
-Schema-13 **slab** packing (flag + class/used + slab off) is **rejected** on decode —
-rebuild / rematerialize SH (no dual-read).
+Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
+store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as slabs).
 
-### Body pages (schema 14)
+### Body (schema 15)
 
-- After RBT1 header: 4 KiB alloc page (`SHAL`) + **fixed 4096 B pages**.
-- Page layout: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to **510** create_tx_fks (**strictly increasing**).
-- Chain is singly linked first→last; head stores first+last for O(1) walk start and append target.
-- Append-only growth: RMW **last page only** / link new pages (page freelist reuses class-7 4 KiB slots).
-- Encode/decode refuse unsorted pages; collect refuses cross-page order breaks.
+- Combined prefix: RBT1 at 0–15, SHAL v3 fields at 16–4095, **payload at 4096**.
+  Small slabs pack from bump with **no** 4 KiB align. Megakey pages 4 KiB-align
+  that alloc only.
+- Geometric slabs class 0–6 (`32 B`–`2 KiB`; cap `4 << class`). Payload:
+  `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
+- Megakey **pages**: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to
+  **510** raw `u64` fks. Chain first→last; last-page append only.
+- Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 
 ### Query join
 
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
-IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry (paged layout).
+IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry (slab/page packer).
 
-**Decision:** inline for rare scripts; **page chains** for multi-use scripts so history is
-contiguous page walks, not relocating geometric slabs. Query cost for busy wallets is
+**Decision:** inline for 1–2-use scripts (~95 % of keys); geometric slabs for
+typical multi-use; page chains only for megakeys. Query cost for busy wallets is
 dominated by Class A + spend joins, not SH pointer chasing.
 
 ---

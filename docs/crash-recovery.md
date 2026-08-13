@@ -58,7 +58,9 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ## Thin scripthash (Electrum outpoint pointers)
 
-- Hybrid (current / since v4–v6): head holds ≤2 inline creates or one geometric body slab (`create_tx_fk` only, no `next`). Size-class freelist reuses freed slabs.
+- Schema 15: head holds ≤2 inline creates, a geometric **slab** (3–256 fks, ULEB128
+  deltas), or a megakey **page chain** (≥257). Size-class freelist reuses freed slabs.
+  Main heads are sealed sorted+fuse+idx; new keys go to global ingest OA.
 - **No spend columns** — spentness from points + Class C at query time.
 - Creates written on confirm (before tip advance).
 - **Kill-safe without chain walks:** first confirm after open **sequentially scans**
@@ -87,4 +89,7 @@ Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_sea
   - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
   - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats or sticky FORCE).
   Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: empty/tiny residual runs are normal post-consume; missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); clamp SEAL to HWM only when `0 < hwm < SEAL`. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Legacy 16-way head** + runs: migrate open; no runs ⇒ reindex.
-  **SH head open:** occupancy is **not** full-scanned on multi‑GiB shards. Per-shard `{shard}.occ` sidecar (create / cold install / rehash / inserts); missing sidecar on large files → occupancy unknown (`is_empty=false`, no bulk-fill wipe). Lookups never needed the scan.
+  **SH head open:** sealed sorted shards load `.idx` (one entry per 128 records) and
+  BF8R; occupancy scan is not used on those files. A schema-14 page-era durable
+  index is **refused** (wipe `store/scripthash*` and rematerialize). Ingest OA
+  still uses `{ingest}.occ` like any ScriptHashHead.

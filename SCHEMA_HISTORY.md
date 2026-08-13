@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 14`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 15`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | **Current** |
+| **15** | SH slabs + ULEB128 fks + sealed sorted/fuse/idx heads; global ingest ovf; refuse page-era SH | **Current** |
+| **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
 | **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
 | **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | Prior |
@@ -28,9 +29,17 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v14 (current)
+## v15 (current)
 
-See [`SCHEMA.md`](./SCHEMA.md).
+See [`SCHEMA.md`](./SCHEMA.md). Class B only: geometric slabs + delta fks,
+sealed sorted heads with fuse8+idx, one global ingest OA. Empty 13/14 SH
+upgrades `meta` silently; a materialized page-era index is refused
+(wipe `store/scripthash*` and rematerialize). Class A is unchanged from 14.
+
+## v14
+
+SH head Empty/Inline/Paged (4 KiB page chains). Sealed overflow OA segments
+sized to one main shard. Combined prefix hole at 4112–8191. Replaced by v15.
 
 ### Side product: `sp_tweaks.*` thin BIP-352 index (still schema 14)
 

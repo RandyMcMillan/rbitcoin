@@ -1,8 +1,8 @@
 //! Class B scripthash multimap (Electrum: SHA256(scriptPubKey)).
 //!
-//! Hybrid layout (schema 14): head key = 16 B hash prefix; value = two u64s
-//! (≤2 inline create_tx_fks or first/last **4 KiB page** offsets). Body pages
-//! pack 8 B create_tx_fks; vouts expanded from Class A at query.
+//! Hybrid layout (schema 15): head key = 16 B hash prefix; value = two u64s
+//! (≤2 inline, geometric **slab**, or megakey first/last **4 KiB page** offs).
+//! Body slabs pack ULEB128 fk deltas; vouts expanded from Class A at query.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};

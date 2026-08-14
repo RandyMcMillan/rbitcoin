@@ -129,7 +129,7 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
 /// Start the node: ensure datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
-    let query = Query::open_or_create(config.store_path())?;
+    let query = Query::open_or_create_layout(config.store_layout())?;
     // Mempool is opened in `run_p2p` after ChainHub has `Arc<Query>`.
     Ok(NodeHandle {
         config,
@@ -194,10 +194,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
     let run_started = Instant::now();
     info!(
-        "rbitcoin-node starting version={} network={} datadir={} tip={start_tip} io={}",
+        "rbitcoin-node starting version={} network={} datadir={}{} tip={start_tip} io={}",
         env!("CARGO_PKG_VERSION"),
         config.network.as_str(),
         config.datadir.display(),
+        config
+            .datadir_cold
+            .as_ref()
+            .map(|p| format!(" datadir_cold={}", p.display()))
+            .unwrap_or_default(),
         std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
     );
 

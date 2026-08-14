@@ -13,9 +13,106 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
+/// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
+pub const INWIT_RELOC_NAME: &str = "inwit.reloc";
+
+/// Where a store’s files live.
+///
+/// `dir` is `{datadir}/store`. When `cold_dir` is set and distinct, Class A
+/// `inwit.body` + `inwit.idx/` live there (bulk / HDD). Everything else stays
+/// in `dir`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreLayout {
+    pub dir: PathBuf,
+    pub cold_dir: Option<PathBuf>,
+}
+
+impl StoreLayout {
+    pub fn single(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            cold_dir: None,
+        }
+    }
+
+    pub fn with_cold(dir: impl Into<PathBuf>, cold_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            cold_dir: Some(cold_dir.into()),
+        }
+    }
+
+    /// True when inwit is configured on a different directory than the hot store.
+    pub fn is_split(&self) -> bool {
+        self.cold_dir.as_ref().is_some_and(|c| c != &self.dir)
+    }
+
+    pub fn inwit_dir(&self) -> &Path {
+        self.cold_dir
+            .as_deref()
+            .filter(|c| *c != self.dir)
+            .unwrap_or(&self.dir)
+    }
+}
+
+fn inwit_files_present(dir: &Path) -> bool {
+    dir.join("inwit.body").exists() || dir.join("inwit.idx").exists()
+}
+
+fn inwit_reloc_path(hot: &Path) -> PathBuf {
+    hot.join(INWIT_RELOC_NAME)
+}
+
+/// Decide the inwit VarTable directory. Split stores refuse leftovers in hot
+/// and dual copies; a reloc marker without `--datadir-cold` is a layout error
+/// (not `Corrupt`).
+fn resolve_inwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
+    if !layout.is_split() {
+        if inwit_reloc_path(&layout.dir).exists() {
+            return Err(StoreError::Layout(format!(
+                "inwit is on a cold datadir ({INWIT_RELOC_NAME} present); pass --datadir-cold"
+            )));
+        }
+        return Ok(layout.dir.clone());
+    }
+    let cold = layout.inwit_dir();
+    if !cold.exists() {
+        std::fs::create_dir_all(cold).map_err(|e| StoreError::io(cold, e))?;
+    } else if !cold.is_dir() {
+        return Err(StoreError::NotDirectory(cold.to_path_buf()));
+    }
+    let hot_has = inwit_files_present(&layout.dir);
+    let cold_has = inwit_files_present(cold);
+    match (hot_has, cold_has) {
+        (true, true) => Err(StoreError::Layout(format!(
+            "inwit.body exists in both {} and {}; keep it only under the cold store",
+            layout.dir.display(),
+            cold.display()
+        ))),
+        (true, false) => Err(StoreError::Layout(format!(
+            "inwit is still in {}; move inwit.body and inwit.idx/ to {} \
+             (copy+remove if cross-device)",
+            layout.dir.display(),
+            cold.display()
+        ))),
+        (false, _) => Ok(cold.to_path_buf()),
+    }
+}
+
+fn write_inwit_reloc(hot: &Path) -> Result<(), StoreError> {
+    let p = inwit_reloc_path(hot);
+    if p.exists() {
+        return Ok(());
+    }
+    std::fs::write(&p, b"inwit\n").map_err(|e| StoreError::io(&p, e))
+}
+
 /// Top-level store handle for a datadir `store/` directory.
 pub struct Store {
     path: PathBuf,
+    /// `{datadir-cold}/store` when inwit is split; `None` = inwit in [`Self::path`].
+    cold_path: Option<PathBuf>,
     pub headers: HeaderTable,
     pub txs: TxTable,
     /// Multi-spender list nodes only (sole spends live on create outputs).
@@ -46,9 +143,13 @@ pub enum TxidResolveMode {
 
 impl Store {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::create_layout(StoreLayout::single(path.into()))
+    }
+
+    pub fn create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         // SH open-address shards open many FDs; raise soft nofile before create.
         crate::file::ensure_nofile_budget();
-        let path = path.into();
+        let path = layout.dir.clone();
         if path.exists() {
             if !path.is_dir() {
                 return Err(StoreError::NotDirectory(path));
@@ -59,9 +160,19 @@ impl Store {
         write_meta(&path)?;
         let epoch = ArchiveEpoch::default();
         epoch.store(&path)?;
+        let inwit_dir = resolve_inwit_dir(&layout)?;
+        let txs = TxTable::create_with_head_layout_inwit(
+            &path,
+            &inwit_dir,
+            crate::address_head::default_layout(),
+        )?;
+        if layout.is_split() {
+            write_inwit_reloc(&path)?;
+        }
+        let cold_path = layout.is_split().then(|| inwit_dir);
         Ok(Self {
             headers: HeaderTable::create(&path)?,
-            txs: TxTable::create(&path)?,
+            txs,
             spenders: SpenderTable::create(&path)?,
             scripthash: ScriptHashTable::create(&path)?,
             confirmed: ConfirmedTable::create(&path)?,
@@ -70,12 +181,17 @@ impl Store {
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
             epoch: Mutex::new(epoch),
             path,
+            cold_path,
         })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_layout(StoreLayout::single(path.into()))
+    }
+
+    pub fn open_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         crate::file::ensure_nofile_budget();
-        let path = path.into();
+        let path = layout.dir.clone();
         if !path.is_dir() {
             return Err(StoreError::NotDirectory(path));
         }
@@ -121,9 +237,15 @@ impl Store {
         if meta_ver == 15 && SCHEMA_VERSION == 16 {
             rewrite_meta_current(&path)?;
         }
+        let inwit_dir = resolve_inwit_dir(&layout)?;
+        let txs = TxTable::open_inwit(&path, &inwit_dir)?;
+        if layout.is_split() {
+            write_inwit_reloc(&path)?;
+        }
+        let cold_path = layout.is_split().then(|| inwit_dir);
         Ok(Self {
             headers: HeaderTable::open(&path)?,
-            txs: TxTable::open(&path)?,
+            txs,
             spenders: SpenderTable::open(&path)?,
             scripthash,
             confirmed,
@@ -132,20 +254,29 @@ impl Store {
             height_fence: std::sync::RwLock::new(height_fence),
             epoch: Mutex::new(epoch),
             path,
+            cold_path,
         })
     }
 
     pub fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let path = path.into();
-        if path.join("meta").exists() {
-            Self::open(path)
+        Self::open_or_create_layout(StoreLayout::single(path.into()))
+    }
+
+    pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
+        if layout.dir.join("meta").exists() {
+            Self::open_layout(layout)
         } else {
-            Self::create(path)
+            Self::create_layout(layout)
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Cold store directory when inwit is split (`{datadir-cold}/store`).
+    pub fn cold_path(&self) -> Option<&Path> {
+        self.cold_path.as_deref()
     }
 
     pub fn tip_height(&self) -> Option<Height> {
@@ -2201,5 +2332,103 @@ mod tests {
         assert_eq!(s.tx_height_get(Fk(5)).unwrap(), None);
         assert_eq!(s.tx_height_get(Fk(6)).unwrap(), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_create_puts_inwit_only_on_cold() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let s = Store::create_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
+        assert_eq!(s.path(), hot.as_path());
+        assert_eq!(s.cold_path(), Some(cold.as_path()));
+        assert!(hot.join("txout.body").is_file());
+        assert!(hot.join("spent.body").is_file());
+        assert!(!hot.join("inwit.body").exists());
+        assert!(!hot.join("inwit.idx").exists());
+        assert!(cold.join("inwit.body").is_file());
+        assert!(cold.join("inwit.idx").is_dir());
+        assert!(hot.join(INWIT_RELOC_NAME).is_file());
+        drop(s);
+        let s = Store::open_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
+        assert_eq!(s.cold_path(), Some(cold.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_open_without_cold_flag_refuses_reloc() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        Store::create_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
+        match Store::open(&hot) {
+            Ok(_) => panic!("must refuse when inwit.reloc is present"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("datadir-cold"), "{msg}");
+                assert!(msg.contains(INWIT_RELOC_NAME), "{msg}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_refuses_inwit_left_in_hot() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        Store::create(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+        match Store::open_layout(StoreLayout::with_cold(&hot, &cold)) {
+            Ok(_) => panic!("must refuse leftover inwit in hot"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("move inwit.body"), "{msg}");
+                assert!(msg.contains("inwit.idx"), "{msg}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_refuses_inwit_in_both_dirs() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        Store::create(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+        std::fs::copy(hot.join("inwit.body"), cold.join("inwit.body")).unwrap();
+        match Store::open_layout(StoreLayout::with_cold(&hot, &cold)) {
+            Ok(_) => panic!("must refuse dual inwit copies"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("both"), "{msg}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_roundtrip_create_fk_and_inwit_range() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let s = Store::create_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
+        let item = coinbase_item([9u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+        let fks = s
+            .txs
+            .put_full_batch_indexed(std::slice::from_ref(&item), true)
+            .unwrap();
+        assert_eq!(fks.len(), 1);
+        let range = s.tx_inwit_range(fks[0]).unwrap();
+        assert!(range.1 > 0);
+        s.flush().unwrap();
+        drop(s);
+        let s = Store::open_or_create_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
+        assert_eq!(s.txs.count(), 1);
+        let range = s.tx_inwit_range(fks[0]).unwrap();
+        assert!(range.1 > 0);
+        assert!(!hot.join("inwit.body").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

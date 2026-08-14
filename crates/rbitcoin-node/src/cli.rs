@@ -19,6 +19,8 @@ where
     let mut i = 1usize;
     let mut datadir = PathBuf::from("./datadir");
     let mut datadir_set = false;
+    let mut datadir_cold: Option<PathBuf> = None;
+    let mut datadir_cold_set = false;
     let mut network = Network::Mainnet;
     let mut network_set = false;
     let mut signet_challenge = None;
@@ -57,7 +59,7 @@ where
             "--help" | "-h" => {
                 eprintln!(
                     "rbitcoin-node {} — usage:\n\
-  rbitcoin-node [--conf FILE] [--datadir PATH] [--network NET] \\\n\
+  rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--shindex] [--sptweaks] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
@@ -75,6 +77,8 @@ Peers: --maxoutbound (default 16 live download), --maxinbound/--maxconnections (
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
 Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
 RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
+Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
+  Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
 IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
@@ -116,6 +120,16 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 datadir = PathBuf::from(&args[i]);
                 datadir_set = true;
+                i += 1;
+            }
+            "--datadir-cold" | "--datadir_cold" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --datadir-cold requires a value");
+                    return ExitCode::from(2);
+                }
+                datadir_cold = Some(PathBuf::from(&args[i]));
+                datadir_cold_set = true;
                 i += 1;
             }
             "--network" | "--chain" => {
@@ -459,6 +473,9 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     if datadir_set {
         config.datadir = datadir;
     }
+    if datadir_cold_set {
+        config.datadir_cold = datadir_cold;
+    }
     if network_set {
         config.network = network;
     }
@@ -627,6 +644,10 @@ mod tests {
         );
         assert_exit(cli_main(["rbitcoin-node", "--datadir"]), ExitCode::from(2));
         assert_exit(
+            cli_main(["rbitcoin-node", "--datadir-cold"]),
+            ExitCode::from(2),
+        );
+        assert_exit(
             cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
             ExitCode::from(2),
         );
@@ -716,6 +737,39 @@ mod tests {
         assert!(dir.join("store").is_dir());
         // CLI published operator envs for library readers.
         assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "10");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smoke_datadir_cold_puts_inwit_on_cold_store() {
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_datadir();
+        let hot = dir.join("hot");
+        let cold = dir.join("cold");
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            hot.to_str().unwrap(),
+            "--datadir-cold",
+            cold.to_str().unwrap(),
+            "--no-seeds",
+            "--log-level",
+            "error",
+            "--milestone",
+            "0",
+        ]);
+        assert_exit(code, ExitCode::SUCCESS);
+        assert!(hot.join("store").is_dir());
+        assert!(hot.join("store/txout.body").is_file());
+        assert!(!hot.join("store/inwit.body").exists());
+        assert!(cold.join("store/inwit.body").is_file());
+        assert!(cold.join("store/inwit.idx").is_dir());
+        assert!(hot.join("store").join("inwit.reloc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

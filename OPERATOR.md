@@ -47,6 +47,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | Flag | Core-ish alias | Default |
 |------|----------------|---------|
 | `--datadir PATH` | same | `./datadir` |
+| `--datadir-cold PATH` | conf `datadir-cold=` | unset — Class A `inwit.body` / `inwit.idx/` under `{PATH}/store`; everything else stays in `--datadir` |
 | `--network NET` | `--chain` | `mainnet` |
 | `--signetchallenge HEX` | `--signet-challenge` | default global Signet challenge |
 | `--signetblocktime SECONDS` | `--signet-block-time` | 600; requires a custom challenge |
@@ -74,6 +75,28 @@ Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
 network=signet
 maxinbound=64
 mempool_size_mb=100
+```
+
+`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `.cookie`).
+Omit `--datadir-cold` and cold files live there too. Set it to put the large
+rarely-read Class A **inwit** stem (`inwit.body` + `inwit.idx/`, ~486 GiB + idx
+on mainnet) on another volume. Pin / spend-annotate / Electrum / Cake do not
+read inwit; reconstruct / `getrawtransaction` / block serve do.
+
+```
+--datadir /mnt/nvme/rbtc --datadir-cold /mnt/hdd/rbtc-cold
+# hot:  /mnt/nvme/rbtc/store/txout.body  (and the rest)
+# cold: /mnt/hdd/rbtc-cold/store/inwit.body
+#       /mnt/hdd/rbtc-cold/store/inwit.idx/
+```
+
+A hot-store sidecar `inwit.reloc` records the split. Opening without
+`--datadir-cold` then refuses. Do not leave `inwit.*` in both places. Moving an
+existing datadir is operator `mv` (or copy+remove cross-device):
+
+```
+mkdir -p /mnt/hdd/rbtc-cold/store
+mv /mnt/nvme/rbtc/store/inwit.body /mnt/nvme/rbtc/store/inwit.idx /mnt/hdd/rbtc-cold/store/
 ```
 
 **Advanced** IO/perf tunables may still use `RBITCOIN_*` (see below); they are

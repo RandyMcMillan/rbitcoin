@@ -35,7 +35,7 @@ use bitcoin::{
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
-    SpTweaksTable, Store, StoreError, TxRecord,
+    SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -991,7 +991,11 @@ struct HeightByHashIndex {
 
 impl Query {
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
-        let store = Store::open_or_create(store_path.as_ref())?;
+        Self::open_or_create_layout(StoreLayout::single(store_path.as_ref().to_path_buf()))
+    }
+
+    pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, QueryError> {
+        let store = Store::open_or_create_layout(layout)?;
         // Heal strong bits written above confirmed tip (kill -9 mid Class C).
         // Tip-bound spenders already ignore those rows; this restores is_strong parity.
         let repaired = store.repair_class_c_above_tip()?;

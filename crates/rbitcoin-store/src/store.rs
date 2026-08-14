@@ -242,10 +242,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn put_tx(&self, rec: &TxRecord) -> Result<Fk, StoreError> {
-        self.txs.put(rec)
-    }
-
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         self.txs.get(fk)
     }
@@ -1556,19 +1552,9 @@ mod tests {
     }
 
     #[test]
-    fn put_tx_refused_and_inwit_prevouts_at() {
+    fn put_full_and_inwit_prevouts_at() {
         let dir = tmp();
         let s = Store::create(&dir).unwrap();
-        let rec = TxRecord {
-            txid: [9u8; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-        };
-        assert!(matches!(s.put_tx(&rec), Err(StoreError::Corrupt(_))));
         let item = (
             TxRecord {
                 txid: [8u8; 32],

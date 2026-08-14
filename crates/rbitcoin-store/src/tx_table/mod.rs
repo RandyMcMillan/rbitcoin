@@ -601,22 +601,6 @@ impl TxTable {
         self.body.reserve_append(body_bytes, n_records)
     }
 
-    pub fn put(&self, rec: &TxRecord) -> Result<Fk, StoreError> {
-        let mut fks = self.put_batch(std::slice::from_ref(rec))?;
-        Ok(fks.pop().expect("one tx"))
-    }
-
-    pub fn put_batch(&self, recs: &[TxRecord]) -> Result<Vec<Fk>, StoreError> {
-        self.put_batch_indexed(recs, true)
-    }
-
-    pub fn put_batch_indexed(&self, recs: &[TxRecord], index: bool) -> Result<Vec<Fk>, StoreError> {
-        let _ = (recs, index);
-        Err(StoreError::Corrupt(
-            "bare-meta Class A put is refused; use put_full_batch_indexed",
-        ))
-    }
-
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
         let (mut tx, _, _, _) =
@@ -703,14 +687,6 @@ impl TxTable {
             return Err(StoreError::NotFound);
         }
         Ok(out)
-    }
-
-    /// Read Class A body txid from a known range (no idx). Thin: first 32 bytes.
-    /// Deprecated: body no longer stores leading txid (schema 13).
-    /// Prefer [`body_txid`] by create_fk. Offset-only path cannot resolve identity
-    /// without scanning idx (avoided here) — returns NotFound.
-    pub fn body_txid_at(&self, _offset: u64, _len: u64) -> Result<[u8; 32], StoreError> {
-        Err(StoreError::NotFound)
     }
 
     /// Primary head probe slot for `txid` (sort key for locality-friendly batches).
@@ -1687,11 +1663,6 @@ impl TxTable {
 
     pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         self.head_insert_many(entries)
-    }
-
-    /// Always false — mono-head resize removed (segment roll is synchronous on insert).
-    pub fn head_resize_in_progress(&self) -> bool {
-        false
     }
 
     pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {

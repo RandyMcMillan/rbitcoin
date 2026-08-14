@@ -11,6 +11,11 @@ before 1.0).
 
 ### Removed
 
+- **Dead store APIs / duplicate benches:** refuse-only `TxTable::put` /
+  `Store::put_tx` / `Query::put_tx`, `body_txid_at`, and
+  `head_resize_in_progress`. Deleted `script_parallel{,_ab,_focus}` and
+  `rayon_audit` (they duplicated `script_pool` / `script_hotpath`).
+
 - **Zero meters:** `WRITE_STICKY` / `WRITE_DONTNEED`, `ASM_PREV_RES_*`,
   `pin_spent_ns` / `unpin_spent_parent_outs`, `archive_resolve_stats` alias,
   and mmap-half `sample_spend_*_ab_*` helpers.

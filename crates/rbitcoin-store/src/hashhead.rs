@@ -77,7 +77,6 @@ const REHASH_WARN_MS: u128 = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadRole {
     Header,
-    Tx,
     ScriptHash,
 }
 
@@ -105,12 +104,37 @@ fn running_as_cargo_test_binary() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HEAD_SCALE: std::cell::Cell<Option<HeadScale>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl HeadScale {
+    /// Hold this thread's scale for `f` (does not mutate process env).
+    #[cfg(test)]
+    pub fn test_with<R>(scale: HeadScale, f: impl FnOnce() -> R) -> R {
+        let prev = TEST_HEAD_SCALE.with(|c| c.replace(Some(scale)));
+        struct Restore(Option<HeadScale>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_HEAD_SCALE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+        f()
+    }
+
     /// Resolve from `RBITCOIN_HEAD_SCALE` (`tiny`/`test`/`mainnet`/`full`).
     ///
     /// Default: [`HeadScale::Mainnet`] for normal binaries; [`HeadScale::Tiny`]
     /// when this crate is under `cfg(test)` or the process is a cargo test binary.
+    /// Tests may pin a value with [`Self::test_with`] (thread-local).
     pub fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(s) = TEST_HEAD_SCALE.with(std::cell::Cell::get) {
+            return s;
+        }
         match std::env::var("RBITCOIN_HEAD_SCALE")
             .map(|s| s.to_ascii_lowercase())
             .ok()
@@ -143,7 +167,7 @@ impl HeadScale {
             // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
                 HeadRole::Header => 1 << 20,
-                HeadRole::ScriptHash | HeadRole::Tx => 1 << 22,
+                HeadRole::ScriptHash => 1 << 22,
             },
         }
     }
@@ -151,12 +175,11 @@ impl HeadScale {
 
 /// Effective initial slots for `role` (env scale + optional per-role override).
 ///
-/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_TX`, `_SCRIPTHASH`
+/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_SCRIPTHASH`
 /// (decimal slot count, rounded up to power of two).
 pub fn initial_slots_for(role: HeadRole) -> u64 {
     let env_key = match role {
         HeadRole::Header => "RBITCOIN_HEAD_SLOTS_HEADER",
-        HeadRole::Tx => "RBITCOIN_HEAD_SLOTS_TX",
         HeadRole::ScriptHash => "RBITCOIN_HEAD_SLOTS_SCRIPTHASH",
     };
     if let Ok(s) = std::env::var(env_key) {
@@ -1122,8 +1145,8 @@ mod tests {
 
     #[test]
     fn mainnet_scale_slot_targets() {
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Tx), 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Tx) >= 64);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::ScriptHash), 64);
+        assert!(HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash) >= 64);
         assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
     }
 
@@ -1246,12 +1269,27 @@ mod tests {
     fn head_scale_prefix_and_pack_helpers() {
         // Under unit tests default scale is Tiny.
         assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(HeadScale::from_env(), HeadScale::Mainnet);
+            let other = std::thread::spawn(HeadScale::from_env)
+                .join()
+                .expect("join");
+            assert_eq!(
+                other,
+                HeadScale::Tiny,
+                "sibling thread must keep cargo-test Tiny default"
+            );
+        });
+        assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
         assert_eq!(
             HeadScale::Tiny.initial_slots(HeadRole::Header),
             DEFAULT_SLOTS
         );
         assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 20);
-        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Tx), 1 << 22);
+        assert_eq!(
+            HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash),
+            1 << 22
+        );
         assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
         let full = [0xABu8; 32];
         let p = head_key_prefix(&full);

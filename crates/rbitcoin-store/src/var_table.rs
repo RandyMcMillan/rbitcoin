@@ -314,7 +314,7 @@ impl VarTable {
             offset: start,
             buf: body_blob,
             result: i32::MIN,
-            dontcache: crate::dontcache_policy::body_write(),
+            dontcache: false,
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
@@ -539,12 +539,7 @@ impl VarTable {
         if buf.is_empty() {
             return Ok(());
         }
-        let rc = crate::bulk_io::pread_single(
-            self.body.read_fd(),
-            offset,
-            buf,
-            crate::dontcache_policy::body_read_generic(),
-        );
+        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf, false);
         if rc < 0 {
             return Err(StoreError::io(
                 self.body.path(),
@@ -902,28 +897,26 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Process-local override under lock (not env — parallel remove_var races).
-        let _env = crate::tx_idx::tests_soft_span_env_lock();
-        crate::tx_idx::test_set_soft_span_bytes(128);
-        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        // Each record ~100 B → soft 128 forces new segment often.
-        for i in 0..12u8 {
-            t.put_batch_encode(1, 128, |_j, buf| {
-                buf.extend_from_slice(&vec![i; 100]);
-            })
-            .unwrap();
-        }
-        assert!(t.idx_segment_count() >= 2, "segs={}", t.idx_segment_count());
-        for id in 1..=12u64 {
-            let raw = t.get_raw(Fk(id)).unwrap();
-            assert_eq!(raw[0], (id - 1) as u8);
-            assert!(raw.len() >= 100);
-        }
-        drop(t);
-        let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
-        assert_eq!(t.count(), 12);
-        assert_eq!(t.get_raw(Fk(12)).unwrap()[0], 11);
-        crate::tx_idx::test_set_soft_span_bytes(0);
+        crate::tx_idx::test_with_soft_span_bytes(128, || {
+            let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
+            // Each record ~100 B → soft 128 forces new segment often.
+            for i in 0..12u8 {
+                t.put_batch_encode(1, 128, |_j, buf| {
+                    buf.extend_from_slice(&vec![i; 100]);
+                })
+                .unwrap();
+            }
+            assert!(t.idx_segment_count() >= 2, "segs={}", t.idx_segment_count());
+            for id in 1..=12u64 {
+                let raw = t.get_raw(Fk(id)).unwrap();
+                assert_eq!(raw[0], (id - 1) as u8);
+                assert!(raw.len() >= 100);
+            }
+            drop(t);
+            let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
+            assert_eq!(t.count(), 12);
+            assert_eq!(t.get_raw(Fk(12)).unwrap()[0], 11);
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

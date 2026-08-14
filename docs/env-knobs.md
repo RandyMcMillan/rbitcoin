@@ -11,8 +11,6 @@ below. Do not grow env surface without a damn-good reason.
 | **`RBITCOIN_LOG`** / **`RUST_LOG`** | Bootstrap logging before conf parse; CLI `--log-level` wins when set |
 | **`RBITCOIN_IO`** | Field escape hatch: force `pread` when io_uring is broken (`mmap` demotes to pread). **Single** bulk switch for all paths |
 
-Deprecated alias: `RBITCOIN_IO_URING=0` ≈ `RBITCOIN_IO=pread` (one-time info log).
-
 CLI still sets process env for library readers where needed today:
 
 | CLI / conf | Env bridge (transitional) |
@@ -36,7 +34,6 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
 | `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Idx segment soft rollover (bytes) |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots |
-| `RBITCOIN_HEAD_SLOTS_TX` | scale default | Tx hash-head initial slots |
 | `RBITCOIN_HEAD_SLOTS_SCRIPTHASH` | scale default | SH hash-head initial slots |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
@@ -74,6 +71,8 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_RESIDENCY_BYTES` / create pin FIFO | Feature removed |
 | Per-path bulk IO matrix | Collapsed to `RBITCOIN_IO` |
 | Confirm queue env overrides | Hardcoded depths |
+| `RBITCOIN_IO_URING` | Deleted; use `RBITCOIN_IO=pread` |
+| `RBITCOIN_HEAD_SLOTS_TX` | Deleted; `tx.head` is segmented address head |
 
 ## Related
 

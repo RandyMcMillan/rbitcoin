@@ -125,9 +125,9 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 | `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
 | `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **load / script / write** walls; live confirm `h= n= in=`; **`pin_txid=` / `pin_txid%` / `pin_txid_ms=` / `head_n=`** (create_fk from live pins vs `tx.head`); pin/write detail |
 | `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
-| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit**, contig park |
+| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
 
-At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
+At **info**, progress + perf already expose load/write bottlenecks (schema 16). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
 `pin_txid%` is lookup `txid→create_fk` from live pins vs `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
@@ -163,7 +163,6 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 | Env | Values | Note |
 |-----|--------|------|
 | **`RBITCOIN_IO`** | `uring` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
-| `RBITCOIN_IO_URING=0` | deprecated | Same as `RBITCOIN_IO=pread` |
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 

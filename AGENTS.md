@@ -71,7 +71,8 @@ order + HWM**, not map mutexes (maps removed — phase 6).
 | Not OK | Long-held store locks on IBD/read path, “pause all queries during confirm”, multi appenders |
 
 If a change introduces a new long-held store lock on the IBD/read path, it is the
-wrong design — fix the protocol. See `docs/concurrency.md`.
+wrong design — fix the protocol. Roles: [`docs/concurrency.md`](docs/concurrency.md).
+Which head file: [`docs/heads.md`](docs/heads.md).
 
 ## On-disk format changes: warn, schema, or migrate
 

@@ -157,6 +157,7 @@ Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 | Doc | Audience |
 |-----|----------|
 | [`docs/architecture.md`](./docs/architecture.md) | Design uniqueness (start here) |
+| [`docs/heads.md`](./docs/heads.md) | Which head file (tx / header / scripthash) |
 | [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md) | Lab mainnet runbook |
 | [`OPERATOR.md`](./OPERATOR.md) | Day-to-day ops, env knobs |
 | [`SCHEMA.md`](./SCHEMA.md) | On-disk schema |

@@ -2404,9 +2404,6 @@ fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
 mod tests {
     use super::*;
 
-    /// Serialize `RBITCOIN_HEAD_SCALE` mutations (parallel tests share process env).
-    static HEAD_SCALE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn tmp() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-sh-{}-{}",
@@ -2426,7 +2423,6 @@ mod tests {
 
     /// Create a SH table with **mono 64-slot** main head (suite-speed + env-race safe).
     ///
-    /// Parallel tests may briefly set `RBITCOIN_HEAD_SCALE=mainnet`; hardcoding
     /// 52-key seal assumes tiny geometry. We rewrite the head to a fixed mono
     /// layout after create so ovf stack tests stay ≪2 s and deterministic.
     fn create_tiny_mono_sh(dir: &Path) -> ScriptHashTable {
@@ -3331,96 +3327,84 @@ mod tests {
 
     #[test]
     fn reopen_after_ingest_seal_and_unlink_homes() {
-        let _g = HEAD_SCALE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
-        let dir = tmp();
-        let t = ScriptHashTable::create(&dir).unwrap();
-        let sh_main = script_hash(&[0x10]);
-        let mut session = t.bulk_session(8).unwrap();
-        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
-        session.finish().unwrap();
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let t = ScriptHashTable::create(&dir).unwrap();
+            let sh_main = script_hash(&[0x10]);
+            let mut session = t.bulk_session(8).unwrap();
+            session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+            session.finish().unwrap();
 
-        let mut first_new = [0u8; 32];
-        for i in 0..210u32 {
-            let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
-            if i == 0 {
-                first_new = sh;
+            let mut first_new = [0u8; 32];
+            for i in 0..210u32 {
+                let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
+                if i == 0 {
+                    first_new = sh;
+                }
+                t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
             }
-            t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
-        }
-        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
-        assert!(matches!(
-            t.key_home(&first_new).unwrap(),
-            KeyHome::SealedOvf
-        ));
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            assert!(matches!(
+                t.key_home(&first_new).unwrap(),
+                KeyHome::SealedOvf
+            ));
 
-        t.unlink_create(&sh_main, Fk(1), 0).unwrap();
-        assert!(t.entries(&sh_main).unwrap().is_empty());
-        t.unlink_create(&first_new, Fk(1000), 0).unwrap();
-        assert!(t.entries(&first_new).unwrap().is_empty());
+            t.unlink_create(&sh_main, Fk(1), 0).unwrap();
+            assert!(t.entries(&sh_main).unwrap().is_empty());
+            t.unlink_create(&first_new, Fk(1000), 0).unwrap();
+            assert!(t.entries(&first_new).unwrap().is_empty());
 
-        t.flush().unwrap();
-        drop(t);
-        let t = ScriptHashTable::open(&dir).unwrap();
-        assert!(t.entries(&sh_main).unwrap().is_empty());
-        assert!(t.entries(&first_new).unwrap().is_empty());
-        assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
-        assert!(matches!(
-            t.key_home(&first_new).unwrap(),
-            KeyHome::SealedOvf
-        ));
-        if let Some(v) = prev_scale {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", v);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+            t.flush().unwrap();
+            drop(t);
+            let t = ScriptHashTable::open(&dir).unwrap();
+            assert!(t.entries(&sh_main).unwrap().is_empty());
+            assert!(t.entries(&first_new).unwrap().is_empty());
+            assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+            assert!(matches!(
+                t.key_home(&first_new).unwrap(),
+                KeyHome::SealedOvf
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn compact_merges_two_sealed_global_ovf_files() {
-        let _g = HEAD_SCALE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
-        let dir = tmp();
-        let t = ScriptHashTable::create(&dir).unwrap();
-        let sh_main = script_hash(&[0x10]);
-        let mut session = t.bulk_session(8).unwrap();
-        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
-        session.finish().unwrap();
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let t = ScriptHashTable::create(&dir).unwrap();
+            let sh_main = script_hash(&[0x10]);
+            let mut session = t.bulk_session(8).unwrap();
+            session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+            session.finish().unwrap();
 
-        let mut first_new = [0u8; 32];
-        let mut second_new = [0u8; 32];
-        for i in 0..210u32 {
-            let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
-            if i == 0 {
-                first_new = sh;
+            let mut first_new = [0u8; 32];
+            let mut second_new = [0u8; 32];
+            for i in 0..210u32 {
+                let sh = script_hash(&[0xa1, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
+                if i == 0 {
+                    first_new = sh;
+                }
+                t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
             }
-            t.put_create(&rec(sh, 1000 + u64::from(i), 0)).unwrap();
-        }
-        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "first ingest seal");
-        for i in 0..210u32 {
-            let sh = script_hash(&[0xa2, (i & 0xff) as u8, (i >> 8) as u8, 0x02]);
-            if i == 0 {
-                second_new = sh;
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "first ingest seal");
+            for i in 0..210u32 {
+                let sh = script_hash(&[0xa2, (i & 0xff) as u8, (i >> 8) as u8, 0x02]);
+                if i == 0 {
+                    second_new = sh;
+                }
+                t.put_create(&rec(sh, 2000 + u64::from(i), 0)).unwrap();
             }
-            t.put_create(&rec(sh, 2000 + u64::from(i), 0)).unwrap();
-        }
-        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 2, "second ingest seal");
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 2, "second ingest seal");
 
-        t.compact_sealed_ovf().unwrap();
-        assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
-        assert_eq!(t.entries(&first_new).unwrap().len(), 1);
-        assert_eq!(t.entries(&second_new).unwrap().len(), 1);
-        assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
-        assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
-        if let Some(v) = prev_scale {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", v);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+            t.compact_sealed_ovf().unwrap();
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            assert_eq!(t.entries(&first_new).unwrap().len(), 1);
+            assert_eq!(t.entries(&second_new).unwrap().len(), 1);
+            assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
+            assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3668,82 +3652,74 @@ mod tests {
     #[test]
     fn cold_progress_and_resume_skips_complete_shards() {
         // 4-way head: fill shard 0, abandon, resume from progress, fill rest.
-        // Hold HEAD_SCALE lock and force Tiny so open() does not require 64-way
-        // mainnet layout (parallel tests may set RBITCOIN_HEAD_SCALE=mainnet).
-        let _g = HEAD_SCALE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_scale = std::env::var("RBITCOIN_HEAD_SCALE").ok();
-        std::env::remove_var("RBITCOIN_HEAD_SCALE"); // Tiny default under cfg(test)
-        let dir = tmp();
-        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
-        let payload0 = payload_start(FILE_HEADER_LEN);
-        body.ensure_capacity(payload0).unwrap();
-        body.set_logical_len(payload0).unwrap();
-        let state = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
-        write_alloc_header(&body, &state).unwrap();
-        drop(body);
-        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 4, 256).unwrap();
-        let t = ScriptHashTable::open(&dir).unwrap();
-        assert_eq!(t.head_shard_count(), 4);
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let body =
+                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+            let payload0 = payload_start(FILE_HEADER_LEN);
+            body.ensure_capacity(payload0).unwrap();
+            body.set_logical_len(payload0).unwrap();
+            let state = AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&body, &state).unwrap();
+            drop(body);
+            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 4, 256).unwrap();
+            let t = ScriptHashTable::open(&dir).unwrap();
+            assert_eq!(t.head_shard_count(), 4);
 
-        // Keys: shard = full[0] >> 6 for n=4 (top 2 bits).
-        let key = |shard: u8, i: u8| {
-            let mut k = [0u8; 32];
-            k[0] = shard << 6 | (i & 0x3f);
-            k
-        };
-        let mut session = t.bulk_session(64).unwrap();
-        for i in 0..8u8 {
-            session
-                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
-                .unwrap();
-        }
-        // Cross into shard 1 so shard 0 is installed + checkpointed.
-        session
-            .put_chain(key(1, 0), &[ShEntry::new(Fk(100))])
-            .unwrap();
-        assert!(ColdProgress::load(&dir).unwrap().is_some());
-        let p = ColdProgress::load(&dir).unwrap().unwrap();
-        assert_eq!(p.next_shard, 1);
-        session.abandon_incomplete();
-
-        // Resume: skip shard 0 keys, fill 1..3.
-        let p = ColdProgress::load(&dir).unwrap().unwrap();
-        t.prepare_cold_resume(&p).unwrap();
-        let mut session = t.bulk_session_resume(64, &p).unwrap();
-        // Re-deliver shard 0 keys (must be ignored).
-        for i in 0..8u8 {
-            session
-                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
-                .unwrap();
-        }
-        for shard in 1u8..4 {
-            for i in 0..4u8 {
+            // Keys: shard = full[0] >> 6 for n=4 (top 2 bits).
+            let key = |shard: u8, i: u8| {
+                let mut k = [0u8; 32];
+                k[0] = shard << 6 | (i & 0x3f);
+                k
+            };
+            let mut session = t.bulk_session(64).unwrap();
+            for i in 0..8u8 {
                 session
-                    .put_chain(
-                        key(shard, i),
-                        &[ShEntry::new(Fk(u64::from(shard) * 100 + u64::from(i)))],
-                    )
+                    .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
                     .unwrap();
             }
-        }
-        let (creates, keys, _, _) = session.finish().unwrap();
-        assert!(ColdProgress::load(&dir).unwrap().is_none());
-        // Shard0 kept (8). Resume fills shards 1..3 × 4 keys (the mid-shard1 key was abandoned).
-        assert_eq!(keys, 8 + 12);
-        assert_eq!(creates, 8 + 12);
-        assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
-        assert_eq!(t.entries(&key(3, 3)).unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-        match prev_scale {
-            Some(v) => std::env::set_var("RBITCOIN_HEAD_SCALE", v),
-            None => std::env::remove_var("RBITCOIN_HEAD_SCALE"),
-        }
+            // Cross into shard 1 so shard 0 is installed + checkpointed.
+            session
+                .put_chain(key(1, 0), &[ShEntry::new(Fk(100))])
+                .unwrap();
+            assert!(ColdProgress::load(&dir).unwrap().is_some());
+            let p = ColdProgress::load(&dir).unwrap().unwrap();
+            assert_eq!(p.next_shard, 1);
+            session.abandon_incomplete();
+
+            // Resume: skip shard 0 keys, fill 1..3.
+            let p = ColdProgress::load(&dir).unwrap().unwrap();
+            t.prepare_cold_resume(&p).unwrap();
+            let mut session = t.bulk_session_resume(64, &p).unwrap();
+            // Re-deliver shard 0 keys (must be ignored).
+            for i in 0..8u8 {
+                session
+                    .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
+                    .unwrap();
+            }
+            for shard in 1u8..4 {
+                for i in 0..4u8 {
+                    session
+                        .put_chain(
+                            key(shard, i),
+                            &[ShEntry::new(Fk(u64::from(shard) * 100 + u64::from(i)))],
+                        )
+                        .unwrap();
+                }
+            }
+            let (creates, keys, _, _) = session.finish().unwrap();
+            assert!(ColdProgress::load(&dir).unwrap().is_none());
+            // Shard0 kept (8). Resume fills shards 1..3 × 4 keys (the mid-shard1 key was abandoned).
+            assert_eq!(keys, 8 + 12);
+            assert_eq!(creates, 8 + 12);
+            assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
+            assert_eq!(t.entries(&key(3, 3)).unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3769,89 +3745,85 @@ mod tests {
     #[test]
     fn open_migrates_legacy_head_when_runs_present() {
         // 16-way head + catalog run → open rewrites to current shard count, keeps runs.
-        let _g = HEAD_SCALE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
-        let dir = tmp();
-        // Body only (empty alloc), then force 16-way head.
-        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
-        let payload0 = payload_start(FILE_HEADER_LEN);
-        body.ensure_capacity(payload0).unwrap();
-        body.set_logical_len(payload0).unwrap();
-        let state = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
-        write_alloc_header(&body, &state).unwrap();
-        drop(body);
-        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            let dir = tmp();
+            // Body only (empty alloc), then force 16-way head.
+            let body =
+                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+            let payload0 = payload_start(FILE_HEADER_LEN);
+            body.ensure_capacity(payload0).unwrap();
+            body.set_logical_len(payload0).unwrap();
+            let state = AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&body, &state).unwrap();
+            drop(body);
+            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
 
-        let runs_dir = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs_dir).unwrap();
-        let mut rec = [0u8; 40];
-        rec[0] = 0xab;
-        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
-        let path = crate::sorted_run::next_run_path(&runs_dir, 1);
-        crate::sorted_run::write_sorted_run(&path, 32, 40, &rec).unwrap();
-        assert!(has_sh_run_rebuild_source(&dir));
+            let runs_dir = dir.join("scripthash.runs");
+            std::fs::create_dir_all(&runs_dir).unwrap();
+            let mut rec = [0u8; 40];
+            rec[0] = 0xab;
+            rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+            let path = crate::sorted_run::next_run_path(&runs_dir, 1);
+            crate::sorted_run::write_sorted_run(&path, 32, 40, &rec).unwrap();
+            assert!(has_sh_run_rebuild_source(&dir));
 
-        let t = ScriptHashTable::open(&dir).unwrap();
-        assert_eq!(t.head_shard_count(), 64);
-        assert!(t.head_is_empty());
-        assert_eq!(t.entry_count(), 0);
-        let catalog = list_runs(&runs_dir).unwrap();
-        assert_eq!(catalog.len(), 1, "runs must survive migration");
-        // Cold materialize from the preserved run.
-        let mut session = t.bulk_session(16).unwrap();
-        session
-            .put_chain(
-                {
-                    let mut k = [0u8; 32];
-                    k[0] = 0xab;
-                    k
-                },
-                &[ShEntry::new(Fk(1))],
-            )
-            .unwrap();
-        let (n, _, _, _) = session.finish().unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(t.entries(&[0xab; 32]).unwrap().len(), 0); // key is 0xab then zeros
-        let mut full = [0u8; 32];
-        full[0] = 0xab;
-        assert_eq!(t.entries(&full).unwrap().len(), 1);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
-        let _ = std::fs::remove_dir_all(&dir);
+            let t = ScriptHashTable::open(&dir).unwrap();
+            assert_eq!(t.head_shard_count(), 64);
+            assert!(t.head_is_empty());
+            assert_eq!(t.entry_count(), 0);
+            let catalog = list_runs(&runs_dir).unwrap();
+            assert_eq!(catalog.len(), 1, "runs must survive migration");
+            // Cold materialize from the preserved run.
+            let mut session = t.bulk_session(16).unwrap();
+            session
+                .put_chain(
+                    {
+                        let mut k = [0u8; 32];
+                        k[0] = 0xab;
+                        k
+                    },
+                    &[ShEntry::new(Fk(1))],
+                )
+                .unwrap();
+            let (n, _, _, _) = session.finish().unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(t.entries(&[0xab; 32]).unwrap().len(), 0); // key is 0xab then zeros
+            let mut full = [0u8; 32];
+            full[0] = 0xab;
+            assert_eq!(t.entries(&full).unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn open_refuses_legacy_head_without_runs() {
-        let _g = HEAD_SCALE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
-        let dir = tmp();
-        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
-        let payload0 = payload_start(FILE_HEADER_LEN);
-        body.ensure_capacity(payload0).unwrap();
-        body.set_logical_len(payload0).unwrap();
-        let state = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
-        write_alloc_header(&body, &state).unwrap();
-        drop(body);
-        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
-        assert!(!has_sh_run_rebuild_source(&dir));
-        match ScriptHashTable::open(&dir) {
-            Err(StoreError::Corrupt(m)) if m == SH_HEAD_SHARD_COUNT_MISMATCH => {}
-            Ok(_) => panic!("expected shard mismatch error"),
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
-        let _ = std::fs::remove_dir_all(&dir);
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            let dir = tmp();
+            let body =
+                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+            let payload0 = payload_start(FILE_HEADER_LEN);
+            body.ensure_capacity(payload0).unwrap();
+            body.set_logical_len(payload0).unwrap();
+            let state = AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&body, &state).unwrap();
+            drop(body);
+            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
+            assert!(!has_sh_run_rebuild_source(&dir));
+            match ScriptHashTable::open(&dir) {
+                Err(StoreError::Corrupt(m)) if m == SH_HEAD_SHARD_COUNT_MISMATCH => {}
+                Ok(_) => panic!("expected shard mismatch error"),
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

@@ -1123,7 +1123,7 @@ mod tests {
         let known = plan.external_parent_txid(pid).expect("reverse map");
         let (rows, _body_ns, _dec_ns) = q
             .store
-            .get_outs_denserels_by_range_batch(&[(parent_fk, range, known, vec![0])])
+            .get_outs_by_range_batch(&[(parent_fk, range, known, vec![0])])
             .unwrap();
         let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
         assert_eq!(

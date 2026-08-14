@@ -1,4 +1,4 @@
-//! Memory-mapped relational store (libbitcoin-class tables).
+//! Map-free relational store (libbitcoin-class tables; fd pread/pwrite + uring).
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
@@ -52,16 +52,13 @@ mod var_table;
 pub use crate::compact::output_flags;
 pub use address_head::{
     bits_for_scale, entry_bytes_for_bits, head_table_access_from_env, is_probe_exhausted_error,
-    layout_for_count, load_needs_resize, load_needs_roll, page_index, probe_depth_stats_snapshot,
-    probe_index, sample_probe_depth_stats, AddressHead, HeadLayout, HEAD_LOAD_CEILING,
-    HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS,
-    PAGE_SLOT_BITS, PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
+    layout_for_count, load_needs_roll, page_index, probe_depth_stats_snapshot, probe_index,
+    sample_probe_depth_stats, AddressHead, HeadLayout, HEAD_LOAD_CEILING, HEAD_LOAD_START,
+    HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS,
+    PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
 };
 pub use block_queue::{BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES};
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
-pub use dontcache_policy::{
-    body_always as dontcache_body, head_or_idx_segment, txid_sidefile_entry,
-};
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{

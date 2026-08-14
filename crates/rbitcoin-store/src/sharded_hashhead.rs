@@ -31,13 +31,12 @@ pub fn shard_count_for_scale() -> usize {
 ///
 /// - **Header:** **1** (single file; ~1 M headers ever — no need for 256-way)
 /// - **ScriptHash:** **64** (cold live OA image ~0.5–1 GiB/shard on mainnet)
-/// - **Tx:** unused for address head (kept for any legacy callers)
 pub fn shard_count_for_role(role: HeadRole) -> usize {
     match HeadScale::from_env() {
         HeadScale::Tiny => 1,
         HeadScale::Mainnet => match role {
             HeadRole::Header => 1,
-            HeadRole::Tx | HeadRole::ScriptHash => SHARD_COUNT_TX_SH,
+            HeadRole::ScriptHash => SHARD_COUNT_TX_SH,
         },
     }
 }
@@ -56,7 +55,7 @@ pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
         HeadScale::Mainnet => match role {
             // Single-file: enough for full mainnet headers at 7/8 load.
             HeadRole::Header => 1 << 20,
-            HeadRole::ScriptHash | HeadRole::Tx => 1 << 16,
+            HeadRole::ScriptHash => 1 << 16,
         },
     }
 }
@@ -279,7 +278,7 @@ mod tests {
             h.insert(&[9u8; 32], Fk(42)).unwrap();
             h.flush().unwrap();
         }
-        let h = ShardedHashHead::open_for_role(&path, HeadRole::Tx).unwrap();
+        let h = ShardedHashHead::open_for_role(&path, HeadRole::Header).unwrap();
         assert_eq!(h.shards.len(), 1);
         assert_eq!(h.get(&[9u8; 32]).unwrap(), Some(Fk(42)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -389,20 +388,15 @@ mod tests {
         h.insert_many(&[([2u8; 32], Fk(8))]).unwrap();
         assert!(h.occupied() >= 2);
 
-        // Mainnet scale role branches (restore after).
-        let prev_scale = std::env::var_os("RBITCOIN_HEAD_SCALE");
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "mainnet");
-        assert_eq!(shard_count_for_role(HeadRole::Header), 1);
-        assert_eq!(
-            shard_count_for_role(HeadRole::ScriptHash),
-            SHARD_COUNT_TX_SH
-        );
-        assert_eq!(initial_slots_per_shard(HeadRole::Header), 1 << 20);
-        assert_eq!(initial_slots_per_shard(HeadRole::ScriptHash), 1 << 16);
-        match prev_scale {
-            Some(v) => std::env::set_var("RBITCOIN_HEAD_SCALE", v),
-            None => std::env::remove_var("RBITCOIN_HEAD_SCALE"),
-        }
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(shard_count_for_role(HeadRole::Header), 1);
+            assert_eq!(
+                shard_count_for_role(HeadRole::ScriptHash),
+                SHARD_COUNT_TX_SH
+            );
+            assert_eq!(initial_slots_per_shard(HeadRole::Header), 1 << 20);
+            assert_eq!(initial_slots_per_shard(HeadRole::ScriptHash), 1 << 16);
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

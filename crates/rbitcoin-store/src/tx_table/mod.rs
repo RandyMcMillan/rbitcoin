@@ -267,12 +267,6 @@ pub fn spend_meta_backend() -> SpendMetaBackend {
     }
 }
 
-/// Deprecated alias — use [`spend_meta_backend`].
-#[inline]
-pub fn spend_meta_backend_next() -> SpendMetaBackend {
-    spend_meta_backend()
-}
-
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Self::create_with_head_layout(dir, crate::address_head::default_layout())
@@ -789,7 +783,7 @@ impl TxTable {
     ///
     /// Returns `(rows, body_ns, decode_ns)` where each row is
     /// `Some((tx, live (vout,out), sparse denserels (vout,rel)))` (N2.0 timers).
-    pub fn get_outs_denserels_by_range_batch(
+    pub fn get_outs_by_range_batch(
         &self,
         items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
     ) -> Result<
@@ -867,7 +861,7 @@ impl TxTable {
         crate::head_resolve_denserels::resolve_fk_and_denserels_batch(self, txids)
     }
 
-    /// Bulk `body_range` for many fks (archive sticky + confirm load).
+    /// Bulk `body_range` for many fks (confirm load / reconstruct).
     ///
     /// **Sorted** walk of `tx.idx` via [`VarTable::record_range_batch`] (FdOnly
     /// pread segments) —
@@ -1059,7 +1053,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
-        self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend_next())
+        self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend())
     }
 
     /// Like [`Self::get_spender_meta_at_abs_batch`] with an explicit backend.
@@ -1136,7 +1130,7 @@ impl TxTable {
                 buf: slice,
                 result: i32::MIN,
                 // Confirm write-stage meta: same pages as load pin — do not DONTCACHE.
-                dontcache: crate::dontcache_policy::body_read_confirm(),
+                dontcache: false,
             });
         }
         bulk_io::pread_batch_backend(&mut ops, backend);

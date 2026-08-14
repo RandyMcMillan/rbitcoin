@@ -570,7 +570,7 @@ impl Store {
 
     /// Sparse outs by known `txout` ranges (prep; skips idx).
     ///
-    /// See [`TxTable::get_outs_denserels_by_range_batch`].
+    /// See [`TxTable::get_outs_by_range_batch`].
     pub fn get_outs_by_range_batch(
         &self,
         items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
@@ -582,22 +582,7 @@ impl Store {
         ),
         StoreError,
     > {
-        self.txs.get_outs_denserels_by_range_batch(items)
-    }
-
-    /// Deprecated name for [`Self::get_outs_by_range_batch`].
-    pub fn get_outs_denserels_by_range_batch(
-        &self,
-        items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
-    ) -> Result<
-        (
-            Vec<Option<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>>,
-            u64,
-            u64,
-        ),
-        StoreError,
-    > {
-        self.get_outs_by_range_batch(items)
+        self.txs.get_outs_by_range_batch(items)
     }
 
     /// Head-resolve: `txid.body` identity + `txout` outs (not Prefix33 body peeks).
@@ -619,7 +604,7 @@ impl Store {
         self.txs.get_fk_and_outs_by_txid_batch(txids)
     }
 
-    /// Bulk Class A body ranges (archive sticky + confirm load).
+    /// Bulk Class A body ranges (confirm load / reconstruct).
     ///
     /// Sorted walk of `tx.idx` (FdOnly pread; contiguous runs coalesced). Prefer
     /// [`Self::idx_body_pipeline`] when the caller also needs body bytes.

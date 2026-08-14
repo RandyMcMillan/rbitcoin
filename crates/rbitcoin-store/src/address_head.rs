@@ -512,12 +512,6 @@ pub fn load_needs_roll(tx_count: u64, slots: u64) -> bool {
     tx_count >= threshold
 }
 
-/// Deprecated name for [`load_needs_roll`] (segment capacity, not bits-widen).
-#[inline]
-pub fn load_needs_resize(tx_count: u64, slots: u64) -> bool {
-    load_needs_roll(tx_count, slots)
-}
-
 /// Legacy sidecar path (`tx.head.meta`) — only for best-effort cleanup of old datadirs.
 fn meta_path(head_path: &Path) -> PathBuf {
     let mut p = head_path.as_os_str().to_os_string();
@@ -728,17 +722,14 @@ impl AddressHead {
     /// slots). Caps to the slot data region (excludes trailing footer). Acquire
     /// fence so concurrent probes observe prior sole-writer Release stores.
     ///
-    /// `dontcache` sets [`crate::bulk_io::ReadOp::dontcache`] (schema 13+ head
-    /// segments older than open + past 3 sealed).
-    ///
     /// Returns bytes filled (multiple of entry size). Callers must pass the
     /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
+    /// Head probe pages are never RWF_DONTCACHE (spend-pwrite only).
     fn load_page_slots(
         &self,
         page_base: u64,
         n_slots: u64,
         buf: &mut [u8],
-        dontcache: bool,
     ) -> Result<usize, StoreError> {
         let es = self.layout.entry_bytes as usize;
         if es != 4 && es != 8 {
@@ -758,7 +749,6 @@ impl AddressHead {
         if need == 0 {
             return Ok(0);
         }
-        // Production path: bulk_io so RWF_DONTCACHE can ride the SQE when set.
         {
             use crate::bulk_io::{self, ReadOp};
             let fd = self.file.read_fd();
@@ -768,7 +758,7 @@ impl AddressHead {
                 offset: off,
                 buf: slice,
                 result: i32::MIN,
-                dontcache,
+                dontcache: false,
             }];
             bulk_io::pread_batch(&mut ops);
             if ops[0].result < 0 {
@@ -838,7 +828,7 @@ impl AddressHead {
             }
 
             // Open-segment insert: never DONTCACHE (hot write path).
-            let n = self.load_page_slots(page_base, page_slots, &mut buf, false)?;
+            let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
             if n < es_u {
                 note_probe_exhausted();
                 return Err(StoreError::Corrupt("address head probe page empty"));
@@ -889,43 +879,27 @@ impl AddressHead {
     /// Batch probe: group keys by probe page, **one page load per distinct page**,
     /// hop each key in RAM. Same results as N× [`Self::probe_fks`] (order preserved).
     ///
-    /// Standalone (non-segmented) head: tip window → no DONTCACHE. Segmented
-    /// callers use [`Self::probe_fks_batch_dontcache`].
     pub fn probe_fks_batch(&self, txids: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_fks_batch_dontcache(txids, false)
+        self.probe_fks_batch_inner(txids, None)
     }
 
-    /// Like [`Self::probe_fks_batch`] with explicit DONTCACHE for this segment.
-    ///
-    /// Used by [`crate::segmented_head::SegmentedTxHead`] with sealed-age policy.
-    /// Page loads use TLS bulk_io one page at a time (single buffer).
-    pub fn probe_fks_batch_dontcache(
-        &self,
-        txids: &[[u8; 32]],
-        dontcache: bool,
-    ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_fks_batch_dontcache_inner(txids, dontcache, None)
-    }
-
-    /// Same as [`Self::probe_fks_batch_dontcache`] but page preads use the
+    /// Same as [`Self::probe_fks_batch`] but page preads use the
     /// **already-held** plan TLS session (no nested `with_thread_local`).
     ///
     /// Streams at most [`PROBE_PAGES_IN_FLIGHT`] OS-page SQEs (matches ring
     /// depth): hop all keys for a page on CQE, reuse the buffer, arm the next
     /// page. Never allocates one buffer per unique page in the stamp.
-    pub fn probe_fks_batch_dontcache_on_session(
+    pub fn probe_fks_batch_on_session(
         &self,
         txids: &[[u8; 32]],
-        dontcache: bool,
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_fks_batch_dontcache_inner(txids, dontcache, Some(session))
+        self.probe_fks_batch_inner(txids, Some(session))
     }
 
-    fn probe_fks_batch_dontcache_inner(
+    fn probe_fks_batch_inner(
         &self,
         txids: &[[u8; 32]],
-        dontcache: bool,
         session: Option<&mut crate::uring_session::UringSession>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n_keys = txids.len();
@@ -969,7 +943,6 @@ impl AddressHead {
                 es,
                 es_u,
                 page_slots,
-                dontcache,
                 &order,
                 &page_bases,
                 &page_ranges,
@@ -979,7 +952,7 @@ impl AddressHead {
                 // Standalone: one reusable page buffer, serial load (cheap).
                 let mut buf = [0u8; PROBE_REGION_BYTES];
                 for (pi, &page_base) in page_bases.iter().enumerate() {
-                    let n = self.load_page_slots(page_base, page_slots, &mut buf, dontcache)?;
+                    let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
                     if n < es_u {
                         continue;
                     }
@@ -1008,7 +981,6 @@ impl AddressHead {
         es: u8,
         es_u: usize,
         page_slots: u64,
-        dontcache: bool,
         order: &[(u64, usize)],
         page_bases: &[u64],
         page_ranges: &[(usize, usize)],
@@ -1021,11 +993,7 @@ impl AddressHead {
 
         let fd = self.file.read_fd();
         let path = self.file.path();
-        let rw_flags = if dontcache && crate::bulk_io::rwf_dontcache_ok() {
-            crate::uring_session::RWF_DONTCACHE
-        } else {
-            0
-        };
+        let rw_flags = 0i32;
 
         // Fixed pool — never one buffer per unique page in the stamp.
         let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
@@ -1552,7 +1520,28 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
-    /// Bulk page load must match per-slot reads (regression: load_page_slots
+    /// Head probe pages never request RWF_DONTCACHE (spend-pwrite only).
+    #[test]
+    fn probe_fks_batch_never_sets_dontcache() {
+        let path = tmp("probe-no-dc");
+        let h = AddressHead::create_with_bits(&path, 10).unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x11;
+        h.insert_many(&[(txid, Fk(1))]).unwrap();
+        let _ = crate::bulk_io::test_take_last_read_dontcache();
+        let got = h.probe_fks_batch(&[txid]).unwrap();
+        assert!(got[0].contains(&Fk(1)));
+        let flags = crate::bulk_io::test_take_last_read_dontcache();
+        assert!(!flags.is_empty(), "probe must issue a page load");
+        assert!(
+            flags.iter().all(|&d| !d),
+            "head probe must not DONTCACHE; got {flags:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    /// Bulk page load must match per-slot reads (regression: load_page_slots)
     /// used to call load_u32 once per slot — ~1024× cost on every insert/probe).
     #[test]
     fn load_page_slots_matches_per_slot_reads() {
@@ -1574,9 +1563,7 @@ mod tests {
         // Page 0 for bits=14 is the whole table when bits<=10; for 14 use page 0.
         let page_base = 0u64;
         let mut bulk = [0u8; PROBE_REGION_BYTES];
-        let n = h
-            .load_page_slots(page_base, page_slots, &mut bulk, false)
-            .unwrap();
+        let n = h.load_page_slots(page_base, page_slots, &mut bulk).unwrap();
         let nslots = (n / es as usize) as u64;
         assert!(nslots > 0);
         assert_eq!(n, (nslots as usize) * es as usize);
@@ -1846,7 +1833,7 @@ mod tests {
             }
         };
         assert_eq!(load_ratio(10, 0), 0.0);
-        assert!(!load_needs_resize(0, 100));
+        assert!(!load_needs_roll(0, 100));
         // bits_for_scale env out of range falls back
         let prev = std::env::var_os("RBITCOIN_TX_HEAD_BITS");
         std::env::set_var("RBITCOIN_TX_HEAD_BITS", "999");
@@ -1910,7 +1897,6 @@ mod tests {
         assert!(!load_needs_roll(0, 100));
         // Just above HEAD_LOAD_START (0.80) of 100 slots → roll.
         assert!(load_needs_roll(81, 100));
-        assert!(!load_needs_resize(0, 100));
         let ext = encode_layout_ext(layout, 7);
         let (dec, gen) = decode_layout_ext(&ext).unwrap();
         assert_eq!(dec.bits, layout.bits);

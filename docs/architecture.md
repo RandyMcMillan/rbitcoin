@@ -60,7 +60,7 @@ for unknown-height bodies (mark missing → re-getdata).
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
 | Primary store | **Map-free** Class A/B/C tables (fd pread/pwrite + heads; page cache L0) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
-| Historical block serve | **Reconstruct** from `txout`+`inwit`; tip soft zone keeps a **wire ring** | Serve raw blk files / undo |
+| Historical block serve | **Reconstruct** from `txout`+`inwit`; tip uses body queue + peer wire | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
 | Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |
 | Transport | **BIP324 v2 only** | v1 + v2 |
@@ -99,12 +99,12 @@ recorded as annotations (and rare multi-spender lists), with best-chain
 visibility defined by confirmation / strong flags — not by deleting coins from
 a LevelDB bag.
 
-### Reconstruct + tip wire ring
+### Reconstruct (no live wire ring)
 
-- **Historical blocks** are rebuilt from Class A (zip `txout` + `inwit`) rather than
-  kept forever as raw wire `blk` files.
-- After IBD, a **wire-format ring** covers the soft tip window for serve,
-  reorg, and recovery ([crash recovery](./crash-recovery.md)).
+- **Historical blocks** are rebuilt from Class A (zip `txout` + `inwit`) rather
+  than kept forever as raw wire `blk` files.
+- Tip serve / reorg uses the **in-RAM body queue** and **peer wire**.
+  `{datadir}/wire` is unused (opened, never filled).
 - **Epoch finalize** fsyncs buried archive prefixes in steady state; IBD itself
   does not promise Core-class durability mid-catch-up.
 
@@ -135,11 +135,10 @@ sibling tip; that is replaced by the design above.)
 
 ### Identity without fat keys
 
-`tx.head/` is a **segmented keyless address table** of dense create foreign
-keys (txid identity verified against **`txid.body`**): fixed **25-bit** open-address heads
-with **4 B relative** ids, roll at 80% load / body soft span, and **binary fuse8**
-built only on seal. Open segments always probe; sealed segments are fuse-gated.
-See SCHEMA.
+`tx.head/` is a **segmented keyless address table** (mixed txid → relative
+create_fk; verify on **`txid.body`**). Header hashes use `header.head`
+(`HashHead`). Scripthash uses a third shape. Which module/file:
+[`docs/heads.md`](./heads.md). Bytes: SCHEMA.
 
 ---
 
@@ -207,13 +206,10 @@ Test matrix for rules we own: [`docs/consensus-tests.md`](./consensus-tests.md).
 
 ## Pipeline summary (IBD)
 
-1. **Peer IO** downloads headers/blocks (v2 transport).
-2. **Archive prep/write** encodes and appends Class A (single writer thread).
-3. **Confirm load** pins parent bodies / builds work for a height batch.
-4. **Confirm scripts** verifies scripts in parallel (`rbtc-scripts` steal) with **no store I/O**.
-5. **Confirm write** structural checks + Class C + spend annotations + SH runs.
-6. At tip: bulk materialize durable scripthash; enable tip-follow, mempool
-   relay, Electrum.
+Peer → body queue → **lookup** (stamp) → **load** (pin) → **scripts** → **write**
+(sole Class A appender). Roles, pack size, pins:
+[`concurrency.md`](./concurrency.md). Heads used on lookup:
+[`heads.md`](./heads.md).
 
 Tip follow adds compact blocks (BIP152 v2), wtxid relay (BIP339), and
 libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
@@ -227,6 +223,7 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
+| [`docs/heads.md`](./heads.md) | Which head file / module (tx / header / SH) |
 | [`docs/design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md) | Most-work reorg design (selector, apply, invalid-heavy, resume) |
 | [`docs/experimental-mainnet.md`](./experimental-mainnet.md) | Lab mainnet ops |
 | [`OPERATOR.md`](../OPERATOR.md) | Knobs, logging, memory budgets |

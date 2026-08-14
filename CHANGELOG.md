@@ -9,6 +9,25 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
+  Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
+  link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).
+
+### Fixed
+
+- **Tests:** head and `tx.idx` share one thread-local soft-span override.
+  `HeadScale::test_with` pins tiny/mainnet without process-global `set_var`.
+
+### Removed
+
+- **Dead DONTCACHE / IO aliases:** head/idx probe no longer threads an always-false
+  DONTCACHE flag. `sealed_age_from_index` lives with winner-age stats.
+  Dropped `get_outs_denserels_by_range_batch`, `spend_meta_backend_next`,
+  `load_needs_resize`, `HeadRole::Tx` / `RBITCOIN_HEAD_SLOTS_TX`, and
+  `RBITCOIN_IO_URING` (`RBITCOIN_IO=pread` is the only pread hatch).
+
 ### Added
 
 - **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow

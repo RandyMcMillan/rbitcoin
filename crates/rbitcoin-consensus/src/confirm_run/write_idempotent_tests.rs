@@ -1636,7 +1636,7 @@ fn store_start_states_lookup_load_confirm() {
         .and_then(|s| s.split("pub fn confirm_wire_load_from_plan").next())
         .expect("stamp fn slice");
     assert!(
-        !stamp_fn.contains("get_outs_denserels_by_range_batch"),
+        !stamp_fn.contains("get_outs_by_range_batch"),
         "lookup stamp must never body denserels-decode"
     );
     assert!(
@@ -1663,7 +1663,7 @@ fn store_start_states_lookup_load_confirm() {
         "load pin must not idx denserels via load_creates_once"
     );
     assert!(
-        load_pin.contains("get_outs_denserels_by_range_batch"),
+        load_pin.contains("get_outs_by_range_batch"),
         "load pin must denserels by known body range"
     );
 

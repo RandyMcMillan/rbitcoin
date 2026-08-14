@@ -978,7 +978,7 @@ fn get_outs_denserels_by_range_sparse_need() {
     let range = t.body.record_range(fk).unwrap();
     // Only need vout 1 — skip allocating big scripts on 0 and 2.
     let (rows, body_ns, dec_ns) = t
-        .get_outs_denserels_by_range_batch(&[(fk, range, want_txid, vec![1])])
+        .get_outs_by_range_batch(&[(fk, range, want_txid, vec![1])])
         .unwrap();
     assert!(body_ns > 0 || dec_ns > 0 || true); // timers fire or tiny fixture
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
@@ -1063,7 +1063,6 @@ fn head_insert_many_tiny_roundtrip() {
 #[test]
 fn missing_tx_head_rebuilds_from_bodies_on_open() {
     with_env_lock(|| {
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-tx-head-rebuild-{}",
             std::time::SystemTime::now()
@@ -1127,14 +1126,12 @@ fn missing_tx_head_rebuilds_from_bodies_on_open() {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     });
 }
 
 #[test]
 fn missing_tx_head_with_no_bodies_creates_empty() {
     with_env_lock(|| {
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-tx-head-empty-{}",
             std::time::SystemTime::now()
@@ -1153,7 +1150,6 @@ fn missing_tx_head_with_no_bodies_creates_empty() {
         assert_eq!(t.count(), 0);
         assert!(crate::segmented_head::head_meta_exists(&dir));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     });
 }
 

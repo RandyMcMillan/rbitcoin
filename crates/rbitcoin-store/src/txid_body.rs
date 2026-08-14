@@ -320,8 +320,7 @@ impl TxidBody {
                         offset: off,
                         buf: slice,
                         result: i32::MIN,
-                        // Policy: sidefile peeks never DONTCACHE (flags always 0).
-                        dontcache: crate::dontcache_policy::sidefile_sqe_rw_flags(0, 0) != 0,
+                        dontcache: false,
                     });
                 }
                 used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);

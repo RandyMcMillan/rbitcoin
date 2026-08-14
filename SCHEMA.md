@@ -40,7 +40,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     spent.body / spent.idx/                         # sole-spender 9 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
-    tx.head.meta / tx.head.NNNNNN [/ .fuse8]        # segmented 25-bit heads + sealed fuse8
+    tx.head/                     # meta + NNNNNN + .fuse8 (segmented 25-bit)
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -53,7 +53,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     archive_epoch
     scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
-  wire/                          # tip wire ring (soft zone)
+  wire/                          # unused (opened, never filled)
 ```
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
@@ -281,15 +281,15 @@ Reorg: truncate slots above the new tip (same era as SH HWM).
 
 ---
 
-## Tx address head (segmented `tx.head.*`)
+## Tx address head (segmented `tx.head/`)
 
 Keyless open-address tables: **txid → dense create_fk**, one **fixed-bits** head
 per segment. There is **no** monolithic growing single `tx.head` file and **no**
-bits-widen / shadow-resize path.
+bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head.meta` + `tx.head.NNNNNN` (+ `tx.head.NNNNNN.fuse8` when sealed) |
+| Files | `tx.head/meta` + `tx.head/NNNNNN` (+ `tx.head/NNNNNN.fuse8` when sealed) |
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
@@ -298,7 +298,7 @@ bits-widen / shadow-resize path.
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
 | Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B); max depth 1024 |
 | Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
-| Lookup | **Open always** → sealed **newest→oldest** (fuse gate) → body-verify candidates (deepest match wins, BIP30-shaped) |
+| Lookup | Pin by txid → **hot** (open + ages ≤3) → ID/idx → **cold** (ages ≥4) if needed; fuse-gate sealed; body-verify ([`docs/heads.md`](./docs/heads.md)) |
 | Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |
 
 **Publish order on seal:** write fuse8 file durable → mark segment sealed in
@@ -315,6 +315,7 @@ segment/meta and rebuild from Class A, or reindex.
 ## Hash heads (`header.head`, generic)
 
 Used where the key is a 32 B hash and the value is a single fk (or multi-list).
+Not `tx.head` — see [`docs/heads.md`](./docs/heads.md).
 
 - Slot = **16 B key prefix** + **8 B packed value** (24 B); power-of-two slots; linear probe.
 - Packed value: sole fk (high bit clear), or `MULTI_BIT | list_fk` → sibling `.mlt` (`create_fk:u64 | next:u64`, newest first).

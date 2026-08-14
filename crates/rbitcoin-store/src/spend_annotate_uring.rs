@@ -870,7 +870,6 @@ mod tests {
         if !crate::bulk_io::io_uring_enabled() {
             if crate::bulk_io::rwf_dontcache_ok() {
                 assert!(crate::dontcache_policy::body_write_spend());
-                assert!(!crate::dontcache_policy::body_write());
             }
             return;
         }

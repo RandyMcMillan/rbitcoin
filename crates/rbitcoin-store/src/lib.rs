@@ -117,7 +117,7 @@ pub use sorted_run::{
 };
 pub use sp_tweaks::{SpTweaksSlot, SpTweaksTable, TWEAK_LEN};
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
-pub use store::{Store, TxidResolveMode};
+pub use store::{Store, StoreLayout, TxidResolveMode, INWIT_RELOC_NAME};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{

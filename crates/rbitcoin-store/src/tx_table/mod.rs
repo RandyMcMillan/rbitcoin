@@ -278,11 +278,23 @@ impl TxTable {
 
     /// Create with an explicit head geometry (tests / recovery).
     pub fn create_with_head_layout(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
+        Self::create_with_head_layout_inwit(dir, dir, layout)
+    }
+
+    /// Create Class A stems; `inwit` may live in a different directory.
+    pub(crate) fn create_with_head_layout_inwit(
+        dir: &Path,
+        inwit_dir: &Path,
+        layout: HeadLayout,
+    ) -> Result<Self, StoreError> {
+        if inwit_dir != dir {
+            std::fs::create_dir_all(inwit_dir).map_err(|e| StoreError::io(inwit_dir, e))?;
+        }
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let layout = HeadLayout::with_entry_bytes(layout.bits, 4)?;
         Ok(Self {
             body: VarTable::create(dir, "txout", TableKind::TxOut)?,
-            inwit: VarTable::create(dir, "inwit", TableKind::Inwit)?,
+            inwit: VarTable::create(inwit_dir, "inwit", TableKind::Inwit)?,
             spent: VarTable::create(dir, "spent", TableKind::Spent)?,
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
@@ -292,6 +304,11 @@ impl TxTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Self::open_inwit(dir, dir)
+    }
+
+    /// Open Class A stems; `inwit` may live in a different directory.
+    pub(crate) fn open_inwit(dir: &Path, inwit_dir: &Path) -> Result<Self, StoreError> {
         if dir.join("tx.body").exists() && !dir.join("txout.body").exists() {
             let legacy = VarTable::open(dir, "tx", TableKind::TxOut)?;
             if legacy.count() > 0 {
@@ -301,7 +318,7 @@ impl TxTable {
             }
         }
         let had_txout = dir.join("txout.body").exists();
-        let had_inwit = dir.join("inwit.body").exists();
+        let had_inwit = inwit_dir.join("inwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
         let body = if had_txout {
             VarTable::open(dir, "txout", TableKind::TxOut)?
@@ -310,13 +327,17 @@ impl TxTable {
         };
         if had_txout && body.count() > 0 && (!had_inwit || !had_spent) {
             return Err(StoreError::Corrupt(
-                "schema 15 Class A missing inwit/spent for existing txout creates; wipe + IBD",
+                "schema 15 Class A missing inwit/spent for existing txout creates; wipe + IBD \
+                 (or --datadir-cold if inwit is on a cold volume)",
             ));
         }
+        if inwit_dir != dir {
+            std::fs::create_dir_all(inwit_dir).map_err(|e| StoreError::io(inwit_dir, e))?;
+        }
         let inwit = if had_inwit {
-            VarTable::open(dir, "inwit", TableKind::Inwit)?
+            VarTable::open(inwit_dir, "inwit", TableKind::Inwit)?
         } else {
-            VarTable::create(dir, "inwit", TableKind::Inwit)?
+            VarTable::create(inwit_dir, "inwit", TableKind::Inwit)?
         };
         let spent = if had_spent {
             VarTable::open(dir, "spent", TableKind::Spent)?

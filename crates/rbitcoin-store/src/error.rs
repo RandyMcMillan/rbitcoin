@@ -23,6 +23,8 @@ pub enum StoreError {
     BudgetFull(&'static str),
     /// Cooperative abort (SIGINT / IBD stop) — not data corruption.
     Cancelled(&'static str),
+    /// Operator layout / open-option error (not on-disk corruption).
+    Layout(String),
 }
 
 impl StoreError {
@@ -53,6 +55,7 @@ impl fmt::Display for StoreError {
             StoreError::Corrupt(m) => write!(f, "corrupt record: {m}"),
             StoreError::BudgetFull(m) => write!(f, "budget full: {m}"),
             StoreError::Cancelled(m) => write!(f, "cancelled: {m}"),
+            StoreError::Layout(m) => write!(f, "{m}"),
         }
     }
 }
@@ -92,6 +95,7 @@ mod tests {
             StoreError::Corrupt("broken"),
             StoreError::BudgetFull("block_queue"),
             StoreError::Cancelled("stop"),
+            StoreError::Layout("inwit is on a cold datadir".into()),
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
         assert_eq!(texts[0], "invalid store magic");
@@ -104,6 +108,7 @@ mod tests {
         assert!(texts[6].contains("corrupt record: broken"));
         assert!(texts[7].contains("budget full: block_queue"));
         assert!(texts[8].contains("cancelled: stop"));
+        assert_eq!(texts[9], "inwit is on a cold datadir");
         for e in &arms {
             assert!(e.source().is_none());
         }

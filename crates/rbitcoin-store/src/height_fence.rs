@@ -138,6 +138,14 @@ impl HeightFence {
         fks.iter().map(|&fk| self.height_of(fk)).collect()
     }
 
+    /// Highest confirmed height present on any run (`None` if empty).
+    ///
+    /// In-flight prune HWM. Distinct from `confirmed[]` length (`tip_height`):
+    /// `set_many` can publish tip before [`Self::extend`].
+    pub fn max_height(&self) -> Option<u32> {
+        self.runs.iter().map(|r| r.height).max()
+    }
+
     /// Highest create_fk in any connected run (`0` if empty).
     ///
     /// Not `last_tip_fk` as a connectedness test — holes after reorg sit
@@ -229,5 +237,13 @@ mod tests {
         assert_eq!(f.height_of(Fk(10)), Some(4));
         assert_eq!(f.height_of(Fk(12)), None);
         assert_eq!(HeightFence::empty().height_of(Fk(1)), None);
+    }
+
+    #[test]
+    fn height_fence_max_height_is_highest_run_not_last_fk() {
+        assert_eq!(HeightFence::empty().max_height(), None);
+        let f = HeightFence::from_runs(vec![run(1, 2, 0), run(10, 3, 2)]);
+        assert_eq!(f.max_height(), Some(2));
+        assert_eq!(f.max_connected_fk(), 12);
     }
 }

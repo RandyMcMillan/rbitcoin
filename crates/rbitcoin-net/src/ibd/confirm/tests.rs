@@ -27,9 +27,9 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     ))
 }
 
-/// Unconfirmed pack stays after head drain; drop only once tip covers it.
+/// Unconfirmed pack stays after head drain; drop only once the fence covers it.
 ///
-/// Occupied/fence_max prune dropped tip-ahead parents (931147 / 933474).
+/// Occupied/confirmed-HWM prune dropped tip-ahead parents (931147 / 945952).
 #[test]
 fn prune_inflight_keeps_until_tip_covers_height() {
     let mut log = InFlightLog::new();
@@ -41,6 +41,29 @@ fn prune_inflight_keeps_until_tip_covers_height() {
     assert_eq!(log.entry_count(), 16, "tip < max_height keeps the pack");
     log.prune_through_tip(Some(10));
     assert_eq!(log.layer_count(), 0);
+}
+
+/// Production prune_committed must drop on fence coverage, not confirmed HWM.
+/// `set_many` then leftover `get_fk_by_txid_batch` holding the fence lock made
+/// tip lead fence (mainnet 945952).
+#[test]
+fn prune_committed_uses_fence_tip_not_confirmed_hwm() {
+    let src = include_str!("mod.rs");
+    let prune = src
+        .split("fn prune_committed")
+        .nth(1)
+        .and_then(|s| s.split("fn publish_mem_stats").next())
+        .expect("prune_committed");
+    assert!(
+        prune.contains("fence_tip_height"),
+        "in-flight prune must use fence coverage, not confirmed[] HWM: {prune}"
+    );
+    assert!(
+        prune.contains("prune_through_tip(hub.query.fence_tip_height())")
+            || prune.contains("prune_through_tip(self.fence")
+            || prune.contains("prune_through_tip(hub.query.store().fence_tip_height())"),
+        "prune_through_tip must take fence_tip_height: {prune}"
+    );
 }
 
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.

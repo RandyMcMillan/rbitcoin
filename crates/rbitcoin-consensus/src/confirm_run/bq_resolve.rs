@@ -441,6 +441,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Write `set_many` publishes `tip_height` before `height_fence_extend`.
+    /// Prune on confirmed tip drops the parent layer; leftover TipOnly then
+    /// wipes the open-head hit (mainnet 945952 leftover_n=3546 hit=2811).
+    #[test]
+    fn stamp_uses_inflight_when_confirmed_tip_leads_fence() {
+        use rbitcoin_query::{InFlightLayer, InFlightLog};
+        use rbitcoin_store::{OutputRecord, TxRecord};
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+
+        q.store()
+            .confirmed
+            .set(Height(1), rbitcoin_primitives::Fk(2))
+            .unwrap();
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert_eq!(
+            q.fence_tip_height(),
+            Some(0),
+            "production torn publish: tip leads fence"
+        );
+
+        let parent_txid = [0x33u8; 32];
+        let parent_fk = rbitcoin_primitives::Fk(99);
+        let pin = std::sync::Arc::new((
+            TxRecord {
+                txid: parent_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: rbitcoin_primitives::Fk::NULL,
+                input_count: 1,
+                output_start_fk: rbitcoin_primitives::Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ));
+        let mut log = InFlightLog::new();
+        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        let mut dropped = log.clone();
+        dropped.prune_through_tip(q.tip_height().map(|h| h.0));
+        assert!(
+            dropped.snapshot().get_create_fk(&parent_txid).is_none(),
+            "prune-on-confirmed-HWM is the 945952 race"
+        );
+        // Same cutoff production prune_committed must use.
+        log.prune_through_tip(q.fence_tip_height());
+        assert!(
+            log.snapshot().get_create_fk(&parent_txid).is_some(),
+            "in-flight stays until the fence covers the pack, not confirmed HWM"
+        );
+        // Dummy height-1 confirmed row was only to tear tip vs fence; stamp
+        // still connects at tip+1 from genesis.
+        q.store().confirmed.disconnect_tip(Height(1)).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(
+                Txid::from_byte_array(parent_txid),
+                0,
+                Amount::from_sat(49_0000_0000),
+            )],
+        );
+        let pipe = crate::WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: log.snapshot(),
+            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+        };
+        let empty = rbitcoin_store::BqParentHits::default();
+        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
+            &q,
+            &params,
+            Milestone::NONE,
+            &items,
+            Some(&pipe),
+            Some(&empty),
+        )
+        .expect("in-flight parent must stamp while confirmed tip leads the fence");
+        let plan = stamped.plan.expect("plan");
+        let spend = plan
+            .packed
+            .iter()
+            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+            .expect("spend");
+        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
+        assert_eq!(inp.create_fk, parent_fk);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// Wave may miss a parent that is already connected in `tx.head`.
     /// Load stamp must TipOnly-head the leftover — not Corrupt-as-invariant.
     #[test]

@@ -296,6 +296,15 @@ impl Store {
         self.fence().max_connected_fk()
     }
 
+    /// Highest height whose Class A run is on the RAM fence (`None` if empty).
+    ///
+    /// Leftover TipOnly accepts a create iff [`HeightFence::height_of`] is
+    /// `Some`. In-flight may drop a pack only when this covers `max_height`.
+    /// `tip_height` (`confirmed[]` HWM) can lead this by one `set_many`.
+    pub fn fence_tip_height(&self) -> Option<u32> {
+        self.fence().max_height()
+    }
+
     /// Connected create height from the RAM fence (`None` = unconnected / hole).
     pub fn tx_height_get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
         if tx_fk.is_null() {
@@ -681,7 +690,10 @@ impl Store {
         txids: &[[u8; 32]],
         mode: TxidResolveMode,
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
-        let fence = self.fence();
+        // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
+        // `height_fence_extend` for that whole machine (write `set_many` still
+        // publishes tip). Clone is O(blocks).
+        let fence = self.fence().clone();
         crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
             &self.txs,
             &fence,
@@ -1883,6 +1895,54 @@ mod tests {
         assert_eq!(s.txs.head_drain_pending().unwrap(), 1);
         assert_eq!(s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(), Some(fks[0]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `confirmed.set` publishes tip HWM; fence stays at the last extend.
+    /// In-flight prune must use [`Store::fence_tip_height`], not tip HWM
+    /// (mainnet 945952: leftover TipOnly wiped open-head parents).
+    #[test]
+    fn fence_tip_height_lags_unextended_confirmed() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+        s.rebuild_height_fence().unwrap();
+        assert_eq!(s.tip_height(), Some(Height(0)));
+        assert_eq!(s.fence_tip_height(), Some(0));
+
+        s.confirmed.set(Height(1), Fk(2)).unwrap();
+        s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
+        assert_eq!(
+            s.tip_height(),
+            Some(Height(1)),
+            "set_many/set publishes tip"
+        );
+        assert_eq!(
+            s.fence_tip_height(),
+            Some(0),
+            "fence stays at last extend until height_fence_extend"
+        );
+        assert_eq!(s.tx_height_get(Fk(2)).unwrap(), None);
+
+        s.height_fence_extend(Height(1), Fk(2)).unwrap();
+        assert_eq!(s.fence_tip_height(), Some(1));
+        assert_eq!(s.tx_height_get(Fk(2)).unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leftover TipOnly must not hold the fence lock across head IO — clone.
+    #[test]
+    fn leftover_batch_clones_fence_before_resolve() {
+        let src = include_str!("store.rs");
+        let batch = src
+            .split("pub fn get_fk_by_txid_batch_mode")
+            .nth(1)
+            .and_then(|s| s.split("pub fn get_outs_by_range_batch").next())
+            .expect("get_fk_by_txid_batch_mode");
+        assert!(
+            batch.contains("self.fence().clone()"),
+            "hold a fence snapshot, not the RwLock, across leftover IO: {batch}"
+        );
     }
 
     /// Documented hazard if tip flushed without strong: tip advanced, missing strong.

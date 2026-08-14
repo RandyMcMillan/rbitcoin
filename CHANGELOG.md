@@ -34,6 +34,16 @@ before 1.0).
 
 ### Fixed
 
+- **In-flight prune is fence coverage, not confirmed tip HWM:** leftover
+  TipOnly accepts a create iff `fence.height_of` is `Some`. `confirmed.set_many`
+  publishes tip before `height_fence_extend`, and leftover held the fence lock
+  across head IO — prune-on-tip dropped just-committed layers while TipOnly
+  still saw the old fence. Open-head hits wiped; valid tip+1 blacklisted
+  (mainnet **945952**, `leftover_n=3546 hit=2811`, age0=100, pend=0). Prune
+  now uses `fence_tip_height`; leftover clones the fence before resolve.
+  Occupied-HWM form of the same implication was **929462** / **931147** /
+  **933474**.
+
 - **In-flight prune is confirmed tip, not head occupied:** planned creates stay
   until `tip >= pack max_height`. Occupied/fence_max prune dropped tip-ahead
   parents after drain while leftover TipOnly still required `height_of` — valid

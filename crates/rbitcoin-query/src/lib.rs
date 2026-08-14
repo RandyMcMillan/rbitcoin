@@ -131,7 +131,7 @@ pub use catchup::IndexMode;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::ConfirmPrepared;
-pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
+pub use in_flight::{inflight_prune_cutoff, InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashChainStats,
     ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -1544,6 +1544,11 @@ impl Query {
     /// Durable `tx.head` occupied slots (for backfill heuristics / logs).
     pub fn tx_head_occupied(&self) -> u64 {
         self.store.txs.head_occupied()
+    }
+
+    /// Highest fence-connected create_fk (`0` if no confirmed run).
+    pub fn tx_fence_max_connected_fk(&self) -> u64 {
+        self.store.fence_max_connected_fk()
     }
 
     /// Thin scripthash create row count (diagnostic / tip-mode logs).

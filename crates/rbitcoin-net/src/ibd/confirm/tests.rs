@@ -53,6 +53,19 @@ fn prune_inflight_keeps_body_ahead_of_head() {
     }
 }
 
+/// Head occupied raced ahead of the fence: prune must not drop the layer.
+#[test]
+fn prune_inflight_keeps_when_fence_lags_occupied() {
+    let mut log = InFlightLog::new();
+    let p = test_pin(42);
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]));
+    log.prune(rbitcoin_query::inflight_prune_cutoff(42, 0));
+    assert!(
+        log.snapshot().get_create_fk(&p.0.txid).is_some(),
+        "929462 class: drain-before-fence must keep in-flight"
+    );
+}
+
 /// Lookup may note new packs while load holds a prior snapshot — prior Arc
 /// layers must stay frozen (no whole-map make_mut).
 #[test]

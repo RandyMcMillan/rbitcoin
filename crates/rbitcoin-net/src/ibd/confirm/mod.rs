@@ -38,8 +38,7 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop creates that are already **head-findable** (and thus resolvable
-    /// without the pipeline map).
+    /// Drop creates that leftover TipOnly would accept (head + fence).
     ///
     /// **Must not use body count alone.** Class A commit is body → head →
     /// head; during `tx.head` seal/roll the body count jumps while head
@@ -47,13 +46,18 @@ impl LoadAheadState {
     /// parents that head cannot resolve yet → `parent create_fk unresolved`
     /// and a permanent tip blacklist (mainnet ~269050 first segment seal).
     ///
+    /// **Must not use `tx.head` occupied alone.** Write drains head in
+    /// parallel with Class C; occupied can jump before `height_fence_extend`.
+    /// TipOnly leftover then wipes the head hit (`connected=false`) and
+    /// blacklists tip+1 (mainnet 929462).
+    ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        // Head-occupied ≈ highest create_fk published into the segmented head
-        // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
         let head_n = hub.query.tx_head_occupied();
-        self.in_flight.prune(head_n);
+        let fence_n = hub.query.tx_fence_max_connected_fk();
+        self.in_flight
+            .prune(rbitcoin_query::inflight_prune_cutoff(head_n, fence_n));
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);

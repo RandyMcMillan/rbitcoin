@@ -137,6 +137,23 @@ impl HeightFence {
     pub fn get_batch(&self, fks: &[Fk]) -> Vec<Option<u32>> {
         fks.iter().map(|&fk| self.height_of(fk)).collect()
     }
+
+    /// Highest create_fk in any connected run (`0` if empty).
+    ///
+    /// Not `last_tip_fk` as a connectedness test — holes after reorg sit
+    /// numerically between runs. Use [`Self::height_of`] per fk; this is
+    /// only a prune HWM (min with `tx.head` occupied).
+    pub fn max_connected_fk(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|r| {
+                r.first_fk
+                    .saturating_add(u64::from(r.count))
+                    .saturating_sub(1)
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +210,16 @@ mod tests {
         assert_eq!(f.height_of(Fk(1)), Some(0));
         f.pop_height(0);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn height_fence_max_connected_fk_is_last_run_end() {
+        assert_eq!(HeightFence::empty().max_connected_fk(), 0);
+        let f = HeightFence::from_runs(vec![run(1, 2, 0), run(10, 3, 2)]);
+        // last connected run is 10..=12, not 2 — holes must not use last_tip_fk.
+        assert_eq!(f.max_connected_fk(), 12);
+        assert_eq!(f.height_of(Fk(12)), Some(2));
+        assert_eq!(f.height_of(Fk(3)), None);
     }
 
     #[test]

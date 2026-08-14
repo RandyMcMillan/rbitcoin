@@ -243,8 +243,6 @@ impl Query {
     /// Crash and `plan=None` tests. Not a production IBD API — confirm write
     /// uses [`Self::archive_plan_batch_from_store`] + [`Self::archive_commit_plan`].
     ///
-    /// Remaining public `archive_block` wrappers (tests until later slices):
-    /// [`Self::archive_block`], `accept_and_archive_block`, `ChainHub::archive_block`.
     pub fn commit_class_a_only(
         &self,
         header: &HeaderRecord,
@@ -255,20 +253,8 @@ impl Query {
         Ok(out.pop().expect("one archive result"))
     }
 
-    pub fn archive_block(&self, header: &HeaderRecord, txs: &[TxApply]) -> Result<Fk, QueryError> {
-        self.commit_class_a_only(header, txs)
-    }
-
-    /// Archive many prepared blocks, **moving** `TxApply` payloads (no re-clone).
-    ///
-    /// Libbitcoin-style: plan FKs, contiguous put of txs/ins/outs, bulk hash
-    /// heads. Prefer this from the IBD writer over N×[`archive_block`].
-    ///
-    /// Caller should pass a **height-contiguous** run so create_fk parents are
-    /// already committed or in this batch (IBD writer enforces this).
-    ///
-    /// `items[i].1` is drained (empty on success). Returns header fk per item.
-    pub fn archive_prepared_owned(
+    /// Plan + commit Class A for prepared blocks (no tip / Class C).
+    pub(crate) fn archive_prepared_owned(
         &self,
         items: &mut [(HeaderRecord, Vec<TxApply>)],
     ) -> Result<Vec<Fk>, QueryError> {
@@ -287,13 +273,8 @@ impl Query {
         self.archive_prepared_with_fks(&mut with_fk)
     }
 
-    /// Hot IBD path: header fk already known (from ensure_header).
-    ///
-    /// **Idempotent**: if a body is already stored for `header_fk`, skips the
-    /// write and warms the process txid→fk cache. Multi-peer block delivery
-    /// must not re-append Class A txs — that would orphan `header_txs`/`strong`
-    /// on the previous fks (signet tip stuck at 2148: coinbase missing height).
-    pub fn archive_prepared_with_fks(
+    /// **Idempotent** Class A commit when `header_fk` is already known.
+    pub(crate) fn archive_prepared_with_fks(
         &self,
         items: &mut [(Fk, HeaderRecord, Vec<TxApply>)],
     ) -> Result<Vec<Fk>, QueryError> {
@@ -371,7 +352,6 @@ impl Query {
             &crate::InFlightView::empty(),
             None,
             None,
-            false,
         )
     }
 
@@ -391,13 +371,13 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, false)
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None)
     }
 
     /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
     /// (`txid → create_fk` + range) and optional BQ-ahead hits before `tx.head`.
-    /// Remaining externals after those caches take a TipOnly (`tip_only`) or
-    /// TipThenAny batch — they are not an invariant miss.
+    /// Remaining externals after those caches take a TipOnly batch — they are
+    /// not an invariant miss.
     pub fn archive_plan_batch_from_store(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
@@ -405,8 +385,6 @@ impl Query {
         in_flight: &crate::InFlightView,
         parent_store: Option<&crate::PipelineParentStore>,
         pre_resolved: Option<&rbitcoin_store::BqParentHits>,
-        // Confirm: true (connected only). archive_block: false.
-        tip_only: bool,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -569,20 +547,12 @@ impl Query {
             external_parent_ranges.insert(id, range);
         }
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
-        // Confirm: cheap TipOnly (open head + ages ≤3 sealed). archive_block
-        // may take unconnected rows. Never treat a leftover as Corrupt.
+        // Cheap TipOnly (open head + ages ≤3 sealed). Never treat a leftover as Corrupt.
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = if tip_only {
-                self.store.get_fk_by_txid_batch(&need_head)?
-            } else {
-                self.store.get_fk_by_txid_batch_mode(
-                    &need_head,
-                    rbitcoin_store::TxidResolveMode::TipThenAny,
-                )?
-            };
+            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
             for (txid, row) in hits {
                 if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);
@@ -980,8 +950,8 @@ mod tests {
         let src = include_str!("archive.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
-            prod.contains("if tip_only"),
-            "confirm vs archive_block must pick resolve mode"
+            !prod.contains("get_fk_by_txid_batch_mode"),
+            "plan stamp must not last-chance-fill leftovers"
         );
         assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
@@ -1460,7 +1430,6 @@ mod tests {
                     &crate::InFlightView::empty(),
                     Some(store.as_ref()),
                     None,
-                    false,
                 )
                 .expect("pin-txid stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));

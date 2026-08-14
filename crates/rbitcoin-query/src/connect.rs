@@ -454,16 +454,16 @@ impl Query {
         Ok(outs)
     }
 
-    /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.
+    /// Connect a block at `height` (genesis or tip+1): Class A then confirm Class C.
     ///
-    /// Back-compat wrapper around [`archive_block`] + [`confirm_block`].
+    /// Cheap store fixture (HeaderRecord + TxApply). Not `confirm_wire_run`.
     pub fn connect_block(
         &self,
         height: Height,
         header: &HeaderRecord,
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
-        self.archive_block(header, txs)?;
+        self.commit_class_a_only(header, txs)?;
         self.confirm_block(height, &header.hash)
     }
 

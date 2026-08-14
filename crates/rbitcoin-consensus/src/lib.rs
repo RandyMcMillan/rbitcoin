@@ -670,17 +670,6 @@ pub fn accept_and_connect_block_preverified(
         )))
 }
 
-/// Archive a block body (Class A) without confirming.
-pub fn accept_and_archive_block(
-    query: &Query,
-    params: &ChainParams,
-    height: Height,
-    block: &Block,
-    milestone: Milestone,
-) -> Result<(), ConsensusError> {
-    commit_class_a_block(query, params, height, block, milestone)
-}
-
 /// Class A only (no tip / Class C). Crash and `plan=None` tests.
 ///
 /// Not a production IBD API — confirm write uses `archive_plan_batch` + commit.

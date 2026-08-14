@@ -370,7 +370,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
                     None,
-                    true,
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -380,7 +379,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     &rbitcoin_query::InFlightView::empty(),
                     None,
                     None,
-                    true,
                 )
                 .map_err(ConsensusError::from)?,
         };

@@ -693,6 +693,17 @@ pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
     false
 }
 
+/// Operator line for load stamp reject. Stamp-stage `missing prevout` is the
+/// leftover TipOnly miss remapped from `parent create_fk unresolved` — name
+/// that so a race is not logged as a bare invalid-block.
+pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
+    if err == "missing prevout" {
+        format!("{err} (leftover parent create_fk unresolved)")
+    } else {
+        err.to_string()
+    }
+}
+
 /// Drain scripts→write after `first` is already dequeued (and accounted):
 /// non-blocking `try_recv` until empty, merge contiguous into one batch.
 ///
@@ -1467,13 +1478,14 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
+                        let log_msg = stamp_reject_operator_msg(&msg);
                         warn!(
-                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {e}"
+                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {log_msg}"
                         );
                         let _ = event_tx_load.send(ConfirmEvent::Reject {
                             height: expect_h,
                             hash: first_hash,
-                            err: msg,
+                            err: log_msg,
                         });
                         std::thread::sleep(Duration::from_millis(50));
                         continue;

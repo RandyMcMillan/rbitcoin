@@ -1,7 +1,8 @@
 //! tests (peeled from ibd/confirm.rs).
 
 use super::{
-    format_conf_q, format_queue_depth, is_confirm_load_retryable, ConfirmFeed, ConfirmQueueDepths,
+    format_conf_q, format_queue_depth, is_confirm_load_retryable, stamp_reject_operator_msg,
+    ConfirmFeed, ConfirmQueueDepths,
 };
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -332,6 +333,22 @@ fn thr_stats_sample_and_reset() {
     assert_eq!(busy, s.lookup_resolve_ns + s.lookup_clone_ns);
     let z = confirm_thr_stats::sample_and_reset();
     assert_eq!(z.lookup_resolve_ns, 0);
+}
+
+#[test]
+fn stamp_reject_names_leftover_unresolved() {
+    let msg = stamp_reject_operator_msg("missing prevout");
+    assert!(msg.contains("missing prevout"), "{msg}");
+    assert!(msg.contains("unresolved"), "{msg}");
+    assert!(
+        !msg.contains("corrupt"),
+        "must not look like store wipe: {msg}"
+    );
+    assert_eq!(
+        stamp_reject_operator_msg("unexpected previous header"),
+        "unexpected previous header"
+    );
+    assert!(!is_confirm_load_retryable(&msg));
 }
 
 #[test]

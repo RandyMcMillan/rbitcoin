@@ -360,19 +360,15 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default lookup→load depth (`loadq`): enough ahead for pin/IO while scripts run.
-pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
 
-/// Resolved load / script / write queue capacities.
+/// Resolved script / write queue capacities. Load claims BQ; no lookup→load channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
-    /// lookup→load (`loadq`)
-    pub load: usize,
     /// load→scripts (`scriptq`)
     pub script: usize,
     /// scripts→write (`writeq`)
@@ -383,7 +379,6 @@ pub(crate) struct ConfirmQueueCaps {
 ///
 /// | Queue | Default |
 /// |-------|---------|
-/// | lookup→load (`loadq`) | **8** |
 /// | load→scripts (`scriptq`) | **4** |
 /// | scripts→write (`writeq`) | **20** |
 ///
@@ -391,16 +386,11 @@ pub(crate) struct ConfirmQueueCaps {
 #[inline]
 pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     ConfirmQueueCaps {
-        load: LOAD_QUEUE_CAP_DEFAULT,
         script: SCRIPT_QUEUE_CAP_DEFAULT,
         write: WRITE_QUEUE_CAP_DEFAULT,
     }
 }
 
-/// Lookup→load (`loadq`) `SyncSender` capacity.
-pub(crate) fn load_queue_cap() -> usize {
-    confirm_queue_caps().load
-}
 /// Load→scripts (`scriptq`) capacity.
 pub(crate) fn script_queue_cap() -> usize {
     confirm_queue_caps().script
@@ -417,8 +407,25 @@ pub(crate) fn write_queue_cap() -> usize {
 /// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
-    let q = c.load.saturating_add(c.script).saturating_add(c.write);
+    let q = c.script.saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
+}
+
+/// BQ heights ≥ `path_lo` with resolve-complete and not load-inflight.
+pub(crate) fn confirm_ready_count(
+    query: &rbitcoin_query::Query,
+    path_lo: u32,
+    inflight: &std::collections::HashSet<u32>,
+) -> usize {
+    query
+        .block_queue_list_meta()
+        .into_iter()
+        .filter(|m| {
+            m.height >= path_lo
+                && !inflight.contains(&m.height)
+                && query.block_queue_is_resolve_complete(m.height)
+        })
+        .count()
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -431,20 +438,14 @@ fn max_claim_ahead() -> u32 {
 /// samples alone almost always show 0 under a lookup-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
-    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
-    lookup_to_load: AtomicUsize,
     /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
     load_to_scripts: AtomicUsize,
     /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
     scripts_to_write: AtomicUsize,
-    /// Max lookup→load depth since last HWM sample.
-    load_hwm: AtomicUsize,
     /// Max load→scripts depth since last HWM sample.
     script_hwm: AtomicUsize,
     /// Max scripts→write depth since last HWM sample.
     write_hwm: AtomicUsize,
-    /// Sum of `batch.len()` sitting in lookup→load.
-    load_blocks: AtomicUsize,
     /// Sum of `batch.len()` sitting in load→scripts.
     script_blocks: AtomicUsize,
     /// Sum of approx wire bytes of load→scripts batches.
@@ -461,8 +462,8 @@ pub(crate) struct ConfirmQueueDepths {
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConfirmPipelineSizes {
-    pub load_batches: usize,
-    pub load_blocks: usize,
+    /// BQ resolve-complete heights load can claim (not a queue).
+    pub ready: usize,
     pub script_batches: usize,
     pub script_blocks: usize,
     pub script_wire_bytes: usize,
@@ -496,22 +497,20 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline queue depths for progress/perf: `loadq… scriptq… writeq…`.
+/// Confirm pipeline: `ready=` (BQ resolve-complete) + real `scriptq` / `writeq`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
-/// `loadq` = lookup→load; `scriptq` = load→scripts; `writeq` = scripts→write.
 #[inline]
 pub(crate) fn format_conf_q(
-    load: usize,
+    ready: usize,
     script: usize,
     write: usize,
-    load_cap: usize,
     script_cap: usize,
     write_cap: usize,
 ) -> String {
     format!(
-        "{} {} {}",
-        format_queue_depth("loadq", load, load_cap),
+        "ready={} {} {}",
+        ready,
         format_queue_depth("scriptq", script, script_cap),
         format_queue_depth("writeq", write, write_cap),
     )
@@ -522,19 +521,17 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
-    /// `(lookup→load, load→scripts, scripts→write)`.
-    pub(crate) fn snap(&self) -> (usize, usize, usize) {
+    /// `(load→scripts, scripts→write)`.
+    pub(crate) fn snap(&self) -> (usize, usize) {
         (
-            self.lookup_to_load.load(Ordering::Relaxed),
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
     }
 
     /// Max queue depths since last call; resets HWMs to 0.
-    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
+    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize) {
         (
-            self.load_hwm.swap(0, Ordering::Relaxed),
             self.script_hwm.swap(0, Ordering::Relaxed),
             self.write_hwm.swap(0, Ordering::Relaxed),
         )
@@ -543,8 +540,7 @@ impl ConfirmQueueDepths {
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
-            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
-            load_blocks: self.load_blocks.load(Ordering::Relaxed),
+            ready: 0,
             script_batches: self.load_to_scripts.load(Ordering::Relaxed),
             script_blocks: self.script_blocks.load(Ordering::Relaxed),
             script_wire_bytes: self.script_wire_bytes.load(Ordering::Relaxed),
@@ -581,23 +577,6 @@ impl ConfirmQueueDepths {
         let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_sub(1))
         });
-    }
-
-    fn note_lookup_send(&self, blocks: usize) {
-        Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
-        self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
-            .ok();
-    }
-    fn note_lookup_recv(&self, blocks: usize) {
-        Self::note_batch_depth_recv(&self.lookup_to_load);
-        self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
-            .ok();
     }
 
     fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
@@ -1512,8 +1491,6 @@ pub(crate) fn spawn_confirm_engine(
                     .iter()
                     .map(|(h, ha, _)| (*h, *ha))
                     .collect();
-                let n = heights_hashes.len();
-                queues_load.note_lookup_recv(n);
                 let first_hash = heights_hashes[0].1;
                 let _ = wire_batch;
 
@@ -1690,7 +1667,6 @@ pub(crate) fn spawn_confirm_engine(
                     ) {
                         Ok(st) if st.heights > 0 => {
                             did = true;
-                            queues_lookup.note_lookup_send(st.heights as usize);
                             feed.notify();
                         }
                         Ok(_) => {}

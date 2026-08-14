@@ -280,17 +280,16 @@ fn requeue_clears_inflight_so_tip_can_retry() {
 #[test]
 fn queue_hwm_tracks_max_depth() {
     let q = ConfirmQueueDepths::new();
-    q.note_lookup_send(32);
-    q.note_lookup_send(32);
+    q.note_script_send(32, 1, 0);
+    q.note_script_send(32, 1, 0);
     assert_eq!(q.snap().0, 2);
-    q.note_lookup_recv(32);
+    q.note_script_recv(32, 1, 0);
     assert_eq!(q.snap().0, 1);
-    let (ph, lh, wh) = q.sample_hwm_and_reset();
-    assert_eq!(ph, 2, "hwm keeps max even after recv");
-    assert_eq!(lh, 0);
+    let (sh, wh) = q.sample_hwm_and_reset();
+    assert_eq!(sh, 2, "hwm keeps max even after recv");
     assert_eq!(wh, 0);
-    let (ph2, _, _) = q.sample_hwm_and_reset();
-    assert_eq!(ph2, 0, "hwm resets each sample window");
+    let (sh2, _) = q.sample_hwm_and_reset();
+    assert_eq!(sh2, 0, "hwm resets each sample window");
 }
 
 /// Debug overflow on script_wire_bytes / parents used to abort IBD confirm
@@ -420,56 +419,48 @@ fn feed_note_requeue_finish_surface() {
     assert!(!g.inflight.contains(&11));
 }
 
-/// Log tokens + live caps (OPERATOR.md loadq/scriptq/writeq defaults 8/4/20).
+/// Log tokens + live caps (scriptq/writeq; ready= is not capped).
 #[test]
 fn queue_depth_log_and_caps_surface() {
-    assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");
     assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
     assert_eq!(format_queue_depth("script", 1, 2), "script=1/2");
     assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
     assert_eq!(
-        format_conf_q(0, 0, 1, 2, 2, 2),
-        "loadq<0/2 scriptq<0/2 writeq=1/2"
+        format_conf_q(0, 0, 1, 2, 2),
+        "ready=0 scriptq<0/2 writeq=1/2"
     );
     assert_eq!(
-        format_conf_q(1, 1, 0, 2, 2, 2),
-        "loadq=1/2 scriptq=1/2 writeq<0/2"
+        format_conf_q(3, 1, 0, 2, 2),
+        "ready=3 scriptq=1/2 writeq<0/2"
     );
     assert_eq!(
-        format_conf_q(0, 0, 0, 2, 2, 2),
-        "loadq<0/2 scriptq<0/2 writeq<0/2"
+        format_conf_q(0, 0, 0, 2, 2),
+        "ready=0 scriptq<0/2 writeq<0/2"
     );
 
-    // Hardcoded production queue caps (env overrides removed).
     let caps = super::confirm_queue_caps();
-    assert_eq!(caps.load, super::LOAD_QUEUE_CAP_DEFAULT);
     assert_eq!(caps.script, super::SCRIPT_QUEUE_CAP_DEFAULT);
     assert_eq!(caps.write, super::WRITE_QUEUE_CAP_DEFAULT);
-    assert_eq!(super::load_queue_cap(), caps.load);
     assert_eq!(super::script_queue_cap(), caps.script);
     assert_eq!(super::write_queue_cap(), caps.write);
-    for c in [caps.load, caps.script, caps.write] {
+    for c in [caps.script, caps.write] {
         assert!(c >= 1, "queue cap must be positive: {c}");
     }
     assert_eq!(
-        format_conf_q(0, 0, 0, caps.load, caps.script, caps.write),
-        format!(
-            "loadq<0/{} scriptq<0/{} writeq<0/{}",
-            caps.load, caps.script, caps.write
-        )
+        format_conf_q(0, 0, 0, caps.script, caps.write),
+        format!("ready=0 scriptq<0/{} writeq<0/{}", caps.script, caps.write)
     );
     assert_eq!(
         format_conf_q(
-            caps.load,
+            caps.script,
             caps.script,
             caps.write,
-            caps.load,
             caps.script,
             caps.write
         ),
         format!(
-            "loadq={0}/{0} scriptq={1}/{1} writeq={2}/{2}",
-            caps.load, caps.script, caps.write
+            "ready={0} scriptq={1}/{1} writeq={2}/{2}",
+            caps.script, caps.script, caps.write
         )
     );
 }
@@ -505,7 +496,7 @@ fn claim_feed_stops_at_gap() {
 fn confirm_queue_depths_content_snap_and_notes() {
     use super::ConfirmQueueDepths;
     let q = ConfirmQueueDepths::new();
-    assert_eq!(q.snap(), (0, 0, 0));
+    assert_eq!(q.snap(), (0, 0));
     let c0 = q.content_snap();
     assert_eq!(c0.script_batches, 0);
     assert_eq!(c0.write_batches, 0);
@@ -524,7 +515,7 @@ fn confirm_queue_depths_content_snap_and_notes() {
     assert_eq!(c1.write_wire_bytes, 500);
     assert_eq!(c1.write_parents, 7);
     assert_eq!(c1.parents_total(), 9);
-    assert_eq!(q.snap(), (0, 1, 1));
+    assert_eq!(q.snap(), (1, 1));
 
     q.note_script_recv(3, 1000, 2);
     q.note_write_recv(2, 500, 7);

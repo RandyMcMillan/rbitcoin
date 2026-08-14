@@ -232,14 +232,11 @@ pub(crate) struct IbdPerfSample {
     pub load_ready_through: u32,
     pub cache_bodies: usize,
     pub cache_plans: usize,
-    pub conf_load_q: usize,
+    pub conf_ready: usize,
     pub conf_script_q: usize,
     pub conf_write_q: usize,
-    pub conf_load_q_cap: usize,
     pub conf_script_q_cap: usize,
     pub conf_write_q_cap: usize,
-    /// Max loadq depth since last 5s sample (not instantaneous).
-    pub conf_load_q_hwm: usize,
     /// Max scriptq depth since last 5s sample.
     pub conf_script_q_hwm: usize,
     pub conf_write_q_hwm: usize,
@@ -496,13 +493,11 @@ impl Default for IbdPerfSample {
             load_ready_through: 0,
             cache_bodies: 0,
             cache_plans: 0,
-            conf_load_q: 0,
+            conf_ready: 0,
             conf_script_q: 0,
             conf_write_q: 0,
-            conf_load_q_cap: super::confirm::load_queue_cap(),
             conf_script_q_cap: super::confirm::script_queue_cap(),
             conf_write_q_cap: super::confirm::write_queue_cap(),
-            conf_load_q_hwm: 0,
             conf_script_q_hwm: 0,
             conf_write_q_hwm: 0,
             thr_lookup_claim_ms: 0,
@@ -706,10 +701,10 @@ pub(crate) fn sample(
     headers_done: bool,
     // (ready_through, ahead, parents, bodies, plans).
     load: (u32, u32, usize, usize, usize),
-    conf_load_q: usize,
+    conf_ready: usize,
     conf_script_q: usize,
     conf_write_q: usize,
-    conf_q_hwm: (usize, usize, usize),
+    conf_q_hwm: (usize, usize),
     sh_runs: usize,
     work: WorkStructureSizes,
     owned: ProcessOwnedSizes,
@@ -916,15 +911,13 @@ pub(crate) fn sample(
         load_ready_through,
         cache_bodies,
         cache_plans,
-        conf_load_q,
+        conf_ready,
         conf_script_q,
         conf_write_q,
-        conf_load_q_cap: super::confirm::load_queue_cap(),
         conf_script_q_cap: super::confirm::script_queue_cap(),
         conf_write_q_cap: super::confirm::write_queue_cap(),
-        conf_load_q_hwm: conf_q_hwm.0,
-        conf_script_q_hwm: conf_q_hwm.1,
-        conf_write_q_hwm: conf_q_hwm.2,
+        conf_script_q_hwm: conf_q_hwm.0,
+        conf_write_q_hwm: conf_q_hwm.1,
         thr_lookup_claim_ms: ns_ms(thr.lookup_claim_ns),
         thr_lookup_resolve_ms: ns_ms(thr.lookup_resolve_ns),
         thr_lookup_clone_ms: ns_ms(thr.lookup_clone_ns),
@@ -1124,7 +1117,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         " | conf blks={} lookup={}ms load={}ms script={}ms write={}ms \
          lookup_thr busy={}ms(claim={}ms resolve={}ms clone={}ms stamp={}ms other={}ms send_w={}ms) \
          thr load=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
-         loadq_hwm={}/{} scriptq_hwm={}/{} writeq_hwm={}/{}",
+         ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
         s.plan_ms,
         load_wall_ms,
@@ -1143,8 +1136,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         thr_script_wait,
         s.thr_write_work_ms,
         s.thr_write_recv_wait_ms,
-        s.conf_load_q_hwm,
-        s.conf_load_q_cap,
+        s.conf_ready,
         s.conf_script_q_hwm,
         s.conf_script_q_cap,
         s.conf_write_q_hwm,
@@ -1384,10 +1376,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_load_q,
+        s.conf_ready,
         s.conf_script_q,
         s.conf_write_q,
-        s.conf_load_q_cap,
         s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
@@ -1483,10 +1474,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_load_q,
+        s.conf_ready,
         s.conf_script_q,
         s.conf_write_q,
-        s.conf_load_q_cap,
         s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
@@ -1716,7 +1706,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body known={} pend={} miss={} rej={} \
          | bq soft={}/{} RAM={}MiB \
          | conf_plans={} \
-         | conf loadq={}/{} blks={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
            wire={}MiB fuse8={}MiB open_keys={}MiB class_c_l2={}MiB \
@@ -1746,9 +1736,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_soft_stop,
         bq_mib,
         o.conf_plans,
-        cp.load_batches,
-        s.conf_load_q_cap,
-        cp.load_blocks,
+        cp.ready,
         cp.script_batches,
         s.conf_script_q_cap,
         cp.script_blocks,
@@ -1905,10 +1893,9 @@ mod tests {
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 in=8000 1500ms"), "{line}");
-        s.conf_load_q = 0;
+        s.conf_ready = 0;
         s.conf_script_q = 1;
         s.conf_write_q = 2;
-        s.conf_load_q_cap = 2;
         s.conf_script_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
@@ -1932,7 +1919,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("loadq<0/2 scriptq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("ready=0 scriptq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         // pin_residency slot always 0 (process pin FIFO removed); pin_plan_cache label retired.
         assert!(!line.contains("pin_res="), "{line}");
@@ -2183,10 +2170,9 @@ mod tests {
         s.wf_body_store = 3;
         s.wf_store_body_ms = 50;
         // (no cache/lock fields — pruned)
-        s.conf_load_q = 0;
+        s.conf_ready = 0;
         s.conf_script_q = 0;
         s.conf_write_q = 1;
-        s.conf_load_q_cap = 2;
         s.conf_script_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
@@ -2228,7 +2214,7 @@ mod tests {
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
-        assert!(line.contains("loadq"), "{line}");
+        assert!(line.contains("ready=0"), "{line}");
         assert!(
             line.contains("scriptq<0/2 writeq=1/2") || line.contains("scriptq="),
             "{line}"
@@ -2308,8 +2294,7 @@ mod tests {
         s.owned.head.segment_count = 3;
         s.owned.head.sealed_segments = 2;
         s.owned.head.class_a_n = 2_000_000;
-        s.conf_pipe.load_batches = 2;
-        s.conf_pipe.load_blocks = 40;
+        s.conf_pipe.ready = 40;
         s.conf_pipe.script_batches = 2;
         s.conf_pipe.script_blocks = 16;
         s.conf_pipe.script_wire_bytes = 12 * 1024 * 1024;
@@ -2319,7 +2304,7 @@ mod tests {
         s.conf_pipe.write_wire_bytes = 4 * 1024 * 1024;
         s.conf_pipe.feed_ready = 8;
         s.conf_pipe.feed_inflight = 32;
-        s.conf_load_q_cap = 5;
+        s.conf_ready = 40;
         s.conf_script_q_cap = 5;
         s.conf_write_q_cap = 5;
         let line = format_sizes(&s);
@@ -2341,7 +2326,7 @@ mod tests {
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
         // parents= is pipeline total (scriptq + writeq entry counts).
-        assert!(line.contains("loadq=2/5 blks=40"), "{line}");
+        assert!(line.contains("ready=40"), "{line}");
         assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
         assert!(
             line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"),
@@ -2427,11 +2412,11 @@ mod tests {
             8,           // peers
             true,        // headers_done
             (50, 10, 0, 0, 0),
-            0,         // loadq
-            0,         // load_q
-            0,         // write_q
-            (0, 0, 0), // q hwm
-            1,         // sh_runs
+            0,      // ready
+            0,      // script_q
+            0,      // write_q
+            (0, 0), // q hwm
+            1,      // sh_runs
             work,
             owned,
             conf_pipe,
@@ -2444,10 +2429,10 @@ mod tests {
         assert_eq!(s.confirm_blocks, 1);
         assert_eq!(s.sh_runs, 1);
         // thr / hwm fields present (zero when idle).
-        assert_eq!(s.conf_load_q_hwm, 0);
+        assert_eq!(s.conf_ready, 0);
         let line = format_info(&s);
         assert!(line.contains("lookup_thr busy="), "{line}");
-        assert!(line.contains("loadq_hwm="), "{line}");
+        assert!(line.contains("ready=0"), "{line}");
 
         // Edge format arms: spend_mix, miss_p, headers_done, zero pin_hit.
         let mut edge = s.clone();

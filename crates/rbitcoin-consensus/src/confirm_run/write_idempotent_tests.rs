@@ -192,6 +192,21 @@ fn scripts_feed_ahead_single_batch() {
     assert!(outs[0].batch.is_empty());
 }
 
+/// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
+#[test]
+fn scripts_phase_does_not_run_on_steal_worker() {
+    use super::{confirm_scripts_phase_async, scripts_feed_test_sync};
+    scripts_feed_test_sync::reset();
+    confirm_scripts_phase_async(empty_loaded_batch())
+        .join()
+        .expect("empty phase");
+    let name = scripts_feed_test_sync::phase_thread_name().expect("phase entered");
+    assert!(
+        !name.starts_with("rbtc-scripts-"),
+        "scripts phase ran on steal worker {name:?}"
+    );
+}
+
 /// Two ready batches: both verify on the real async path; write order preserved.
 ///
 /// Uses [`confirm_scripts_feed_ahead`] (same submit/join helper production
@@ -223,8 +238,8 @@ fn scripts_feed_ahead_zero_batches() {
     assert!(outs.is_empty());
 }
 
-/// **Production claim timing under depth-1:** batch B is submitted to rayon
-/// while A’s wave is still open (not only after A’s join returns).
+/// **Production claim timing under depth-1:** batch B is submitted to a
+/// coordinator while A’s wave is still open (not only after A’s join returns).
 ///
 /// Drives [`scripts_stage_from_load_channel`] (same `try_recv` +
 /// [`join_scripts_polling`] pattern as the IBD scripts OS thread) on a
@@ -266,7 +281,10 @@ fn scripts_stage_depth1_submits_second_before_first_finishes() {
     mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
     let deadline = Instant::now() + Duration::from_secs(3);
     while scripts_feed_test_sync::submit_count() < 1 {
-        assert!(Instant::now() < deadline, "A never submitted to rayon");
+        assert!(
+            Instant::now() < deadline,
+            "A never submitted to coordinator"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     // Enqueue B while A is held mid-wave; feed-ahead must try_recv+submit B.

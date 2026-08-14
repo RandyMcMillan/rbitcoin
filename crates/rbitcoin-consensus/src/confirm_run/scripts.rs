@@ -26,11 +26,11 @@ pub fn confirm_scripts_phase(
     })
 }
 
-/// Handle for a scripts stage running on the rayon global pool (non-blocking start).
+/// Handle for a scripts stage running on a coordinator (non-blocking start).
 ///
 /// IBD scripts OS thread starts the next batch with [`confirm_scripts_phase_async`]
-/// **while** joining the prior (poll claim + short timeouts), so rayon stays fed
-/// even when load→scripts depth is 1.
+/// **while** joining the prior (poll claim + short timeouts), so the script
+/// workers stay fed even when load→scripts depth is 1.
 pub struct ScriptsPhaseHandle {
     rx: std::sync::mpsc::Receiver<Result<ConfirmScriptOutcome, ConsensusError>>,
 }
@@ -64,7 +64,7 @@ impl ScriptsPhaseHandle {
 pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     scripts_feed_test_sync::on_async_submit();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    crate::script_pool::spawn_detached(move || {
+    crate::script_pool::spawn_coordinator(move || {
         let r = confirm_scripts_phase(batch);
         let _ = tx.send(r);
     });
@@ -72,7 +72,7 @@ pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
 }
 
 /// Join `handle`, repeatedly invoking `on_poll` (e.g. load `try_recv` + async
-/// submit) so a second ready batch reaches rayon **before** this join returns.
+/// submit) so a second ready batch reaches a coordinator **before** this join returns.
 ///
 /// This is the production feed-ahead primitive used under depth-1 channels.
 pub fn join_scripts_polling<F>(
@@ -99,8 +99,8 @@ where
 
 /// Run script verify for a sequence of loaded batches with **one-batch feed-ahead**.
 ///
-/// While batch *i* is verifying on rayon, batch *i+1* (if present) is already
-/// submitted so the pool is not idle solely between sequential claim walls.
+/// While batch *i* is verifying on a coordinator, batch *i+1* (if present) is
+/// already submitted so the pool is not idle solely between sequential claim walls.
 /// Results are returned **in input order** (height-ordered write handoff).
 ///
 /// Single-batch input is fine (no second submit).
@@ -236,17 +236,28 @@ impl ScriptsBatchMeta {
 /// Test-only sync so unit tests can prove N+1 was submitted while N’s wave is still open.
 pub mod scripts_feed_test_sync {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
     static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
     static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
+    static PHASE_THREAD: Mutex<Option<String>> = Mutex::new(None);
 
     /// Reset counters (call at start of each feed-ahead timing test).
     pub fn reset() {
         SUBMIT_COUNT.store(0, Ordering::SeqCst);
         HOLD_FIRST.store(false, Ordering::SeqCst);
         FIRST_ENTERED.store(false, Ordering::SeqCst);
+        *PHASE_THREAD.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Thread name recorded by [`on_phase_enter`] (empty string if unnamed).
+    pub fn phase_thread_name() -> Option<String> {
+        PHASE_THREAD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// When true, the first [`super::confirm_scripts_phase`] waits until
@@ -265,6 +276,8 @@ pub mod scripts_feed_test_sync {
     }
 
     pub(super) fn on_phase_enter() {
+        *PHASE_THREAD.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(std::thread::current().name().unwrap_or("").to_string());
         if !HOLD_FIRST.load(Ordering::SeqCst) {
             return;
         }

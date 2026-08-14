@@ -6,7 +6,7 @@
 //!   wire Block → structure → stamp create_fk (Class A planned only)
 //! LOAD STAGE (ibd-confirm-load OS thread):
 //!   pin denserels once → assemble (uses intake wire; **no Class-A wire rebuild**)
-//! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
+//! SCRIPTS STAGE (ibd-confirm OS thread + script coordinators):
 //!   pure CPU verify — no Query, no disk
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC
@@ -19,7 +19,7 @@
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD uses
 //! [`confirm_scripts_phase_async`] / [`confirm_scripts_feed_ahead`] so the
-//! rayon pool stays fed across batch boundaries (one-batch lookahead).
+//! script coordinators stay fed across batch boundaries (one-batch lookahead).
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,

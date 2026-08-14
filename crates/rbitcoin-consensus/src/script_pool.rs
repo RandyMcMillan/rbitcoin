@@ -82,17 +82,22 @@ static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
-fn recv_job(pool: &ScriptWorkers) -> Job {
-    let mut g = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+fn recv_job(jobs: &Mutex<VecDeque<Job>>, cv: &Condvar, count_idle: bool) -> Job {
+    let _ = count_idle;
+    let mut g = jobs.lock().unwrap_or_else(|p| p.into_inner());
     loop {
         if let Some(job) = g.pop_front() {
             return job;
         }
         #[cfg(test)]
-        IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
-        g = pool.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+        if count_idle {
+            IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
+        }
+        g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
         #[cfg(test)]
-        IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        if count_idle {
+            IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -111,7 +116,7 @@ fn workers() -> &'static ScriptWorkers {
             let _ = thread::Builder::new()
                 .name(format!("rbtc-scripts-{i}"))
                 .spawn(move || loop {
-                    let f = recv_job(pool);
+                    let f = recv_job(&pool.jobs, &pool.cv, true);
                     f();
                 });
             WORKER_SPAWNS.fetch_add(1, Ordering::Relaxed);
@@ -139,6 +144,48 @@ where
     F: FnOnce() + Send + 'static,
 {
     let pool = workers();
+    {
+        let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        q.push_back(Box::new(work));
+    }
+    pool.cv.notify_one();
+}
+
+/// Two coordinators for IBD feed-ahead phases. Must not share the steal
+/// worker set: a phase that waits on `try_for_each_parallel` would deadlock
+/// if it occupied an `rbtc-scripts-*` thread.
+struct CoordWorkers {
+    jobs: Mutex<VecDeque<Job>>,
+    cv: Condvar,
+}
+
+static COORD: OnceLock<CoordWorkers> = OnceLock::new();
+
+fn coord_workers() -> &'static CoordWorkers {
+    static SPAWN: OnceLock<()> = OnceLock::new();
+    let pool = COORD.get_or_init(|| CoordWorkers {
+        jobs: Mutex::new(VecDeque::new()),
+        cv: Condvar::new(),
+    });
+    SPAWN.get_or_init(|| {
+        for i in 0..2 {
+            let _ = thread::Builder::new()
+                .name(format!("rbtc-script-coord-{i}"))
+                .spawn(move || loop {
+                    let f = recv_job(&pool.jobs, &pool.cv, false);
+                    f();
+                });
+        }
+    });
+    pool
+}
+
+/// Submit `work` on a scripts-phase coordinator (not a steal worker).
+pub(crate) fn spawn_coordinator<F>(work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let pool = coord_workers();
     {
         let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
         q.push_back(Box::new(work));

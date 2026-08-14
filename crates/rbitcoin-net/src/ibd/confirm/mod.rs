@@ -1051,9 +1051,9 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-write");
 
-    // Scripts: loaded batch → script verify (rayon) → write queue.
+    // Scripts: loaded batch → script verify (coordinators + rbtc-scripts) → write queue.
     // **Feed-ahead (depth-1 safe):** while joining batch N, poll load `try_recv`
-    // and submit N+1 to rayon *during* the wait — not only once before a blocking
+    // and submit N+1 to a coordinator *during* the wait — not only once before a blocking
     // join (that left the pool idle under a tight scriptq cap).
     // Write handoff stays height-ordered (join N then N+1).
     let hub_sc = Arc::clone(&hub);
@@ -1065,9 +1065,9 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm".into())
         .spawn(move || {
             info!(
-                "ibd: confirm scripts on dedicated OS thread (pure CPU; rayon feed-ahead)"
+                "ibd: confirm scripts on dedicated OS thread (pure CPU; coordinator feed-ahead)"
             );
-            /// One scripts wave started on rayon (not yet joined / written).
+            /// One scripts wave started on a coordinator (not yet joined / written).
             struct Inflight {
                 handle: rbitcoin_consensus::ScriptsPhaseHandle,
                 meta: rbitcoin_consensus::ScriptsBatchMeta,
@@ -1083,7 +1083,7 @@ pub(crate) fn spawn_confirm_engine(
                 q_sc.note_script_recv(n, load_wire, script_parents);
                 let meta =
                     rbitcoin_consensus::ScriptsBatchMeta::from_batch(&mat_batch, mat_ns);
-                // Non-blocking submit onto rayon global pool.
+                // Non-blocking submit onto a scripts coordinator.
                 let handle = rbitcoin_consensus::confirm_scripts_phase_async(mat_batch);
                 Inflight { handle, meta }
             }

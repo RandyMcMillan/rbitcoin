@@ -1129,7 +1129,7 @@ impl Query {
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
-            confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
+            confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             block_queue_pressure: AtomicBool::new(false),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),

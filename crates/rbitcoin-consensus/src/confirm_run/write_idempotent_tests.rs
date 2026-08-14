@@ -1090,12 +1090,6 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         output_count: 1,
     };
     let parent_out = OutputRecord::unspent(50_0000_0000, vec![0x51]);
-    let dens = rbitcoin_store::denserels_from_packed_records(
-        &parent_tx,
-        &[InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-        &[parent_out.clone()],
-    );
-    let _sparse_rel = dens.first().copied().unwrap_or(0);
     let external: SparseExternalPin = Arc::new((parent_tx.clone(), vec![(0, parent_out)]));
 
     let spend_tx = TxRecord {

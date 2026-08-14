@@ -487,17 +487,6 @@ pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     out.resize(out.len().saturating_add(n), 0);
 }
 
-/// Removed: spender abs is `spent_abs(spent_off, vout)`. Kept so leftover tests compile out.
-#[allow(dead_code)]
-pub fn denserels_from_packed_records(
-    _tx: &TxRecord,
-    _inputs: &[InputRecord],
-    outputs: &[OutputRecord],
-) -> Vec<u32> {
-    let _ = outputs;
-    Vec::new()
-}
-
 /// Spent abs for `vout` given the create's `spent.body` range start.
 #[inline]
 pub fn spent_abs(spent_off: u64, vout: u32) -> u64 {

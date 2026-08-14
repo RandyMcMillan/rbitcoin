@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **Agent delivery:** plans land on a worktree topic branch as many small
+  commits and **one PR**. Full workspace test/coverage is GitHub Actions, not
+  a local plan-end ritual; poll the PR to green. Musl install stays
+  post-merge on `master`. See `AGENTS.md` and `docs/how-we-plan.md`.
 - **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
   Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
   link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).

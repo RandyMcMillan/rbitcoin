@@ -176,83 +176,103 @@ Known leftover on `confirm write slow` **Instant** vs named (18:43 run, after `t
 Do not add confirm-path work that does not appear in this inventory without extending the table **and** the logs in the same commit.
 
 
-## GitHub CI must stay green (every commit)
+## Ship via worktree + pull request (default)
 
-CI is [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (push/PR to
-`master`/`main`). Required checks are separate jobs so the push/PR UI shows
-which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`**.
-**Do not push or leave a commit that would fail any of them.** A red CI on
-`master` is incomplete work.
+Agent work is **not** committed onto local `master` and is **not** proven by a
+full local workspace suite. Default delivery:
 
-Workflow [`musl.yml`](.github/workflows/musl.yml) is **not** required. After
-`ci` succeeds on a **push** to `master`/`main`, it builds
-`nix build .#rbitcoin-musl` and uploads node/cli + `SHA256SUMS`. A red `musl`
-run does not fail the required `ci` jobs; fix or re-run that workflow. Do not
-add `musl` as a required PR status.
-
-### Required before a code commit
-
-From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets
-`CARGO_TARGET_DIR=target/dev` so host test/clippy objects stay out of the
-coverage tree (`target/cov` via `./scripts/coverage.sh`). Musl ship binaries
-come only from `nix build .#rbitcoin-musl` → install into `target/release/`
-(operator path; not the cargo debug target) — and **only on `master` after
-commit** (see below).
-
-What you must run **before that commit** depends on whether this is a
-single-shot change or one slice of a multi-step plan on local `master`:
-
-| Work | Before commit | After the last commit |
-|------|---------------|------------------------|
-| **Single-shot** (one bugfix / one docs rule) | Full local gates below | Musl if on `master` (recipe below) |
-| **Multi-step plan on local `master`** | **New/targeted tests only** for that slice, then commit | After the **last** slice: full gates, then **one** musl |
-
-Do **not** run workspace test / coverage / musl after every intermediate
-slice. Prefer finishing the plan on `master`, then one full gate + musl.
-
-```bash
-cargo fmt --all -- --check          # if dirty: cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+```text
+worktree branch → many small commits → one PR → poll GitHub Actions → green PR
 ```
 
-| CI job | Local command | Expectation |
-|--------|---------------|-------------|
-| **fmt** | `cargo fmt --all -- --check` | Clean (default rustfmt; no project `rustfmt.toml`) |
-| **clippy** | `clippy … -D warnings` | Clean under `[workspace.lints.clippy]` allows in root `Cargo.toml` |
-| **test** | `cargo test --workspace` (+ CI also builds node/cli bins) | All non-ignored tests pass |
-| **coverage** | `./scripts/coverage.sh` | ≥90% first-party LCOV; job waits on fmt+clippy+test |
+A plan is **not complete** until that PR’s **required** checks are green.
+Typical shape: **many commits, one PR**.
 
-**Toolchain:** CI pins **rustc 1.95.0** (same class as `nix-shell` / crane via
-`nixos-26.05` in `flake.lock`). Do not rely on host “latest stable” alone.
-Expand clippy allows only for real noise after a toolchain bump — prefer
-fixing the code.
+### Worktrees
 
-### Multi-step plan execution (local master: tests per step, gates at end)
+Implement on a **linked worktree**, not the primary checkout (that tree may be
+another agent’s dirty branch, and sharing `target/` fights cargo locks).
 
-When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs/how-we-plan.md)),
-including work that lives entirely on **local `master`**:
+```bash
+git fetch origin master   # or HTTPS if SSH is not the App remote
+git worktree add -b <area>/<short-name> /tmp/rbtc-<short> origin/master
+export CARGO_TARGET_DIR=/tmp/rbtc-<short>/target/dev
+```
+
+| Rule | Detail |
+|------|--------|
+| Base | Current `origin/master` (or `main`) |
+| Branch | Topic name (`store/…`, `perf/…`, `docs/…`) — **never** commit the plan onto `master` |
+| `CARGO_TARGET_DIR` | Inside the worktree (`…/target/dev`) so objects stay off the other agent’s tree |
+| Identity | Worktree-only `git config --worktree user.name` / `user.email` when committing as a bot; do not change the primary checkout’s `user.*` |
+| After merge | `git worktree remove` the dir; delete the local branch |
+
+### Local tests (thin on purpose)
+
+From `nix-shell` (CI pins **rustc 1.95.0**, same class as `nixos-26.05` in
+`flake.lock`). The shell’s `CARGO_TARGET_DIR=target/dev` keeps host objects
+out of `target/cov`.
+
+| When | Run |
+|------|-----|
+| **Each plan step / single-shot** | Targeted `cargo test -p <crate> …` (or slim scenario) for what you touched. `cargo fmt --all` if rustfmt is dirty. |
+| **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, workspace `clippy … -D warnings`, `nix build .#rbitcoin-musl` |
+| **Exception** | User asked for a local full suite, or you cannot push and must prove gates offline |
+
+Do **not** wait out a host IBD or a 90% coverage run in the agent VM. GitHub
+Actions is the workspace/coverage/clippy gate.
+
+Targeted tests still follow TDD (Red → Green → Refactor). A step that would
+fail its **own** new test is not ready to commit.
+
+### Push, PR, poll CI
+
+Required PR/push jobs (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+**`fmt`**, **`deny`**, **`clippy`**, **`test`**, **`multinode`**, **`coverage`**.
+The UI shows which gate failed. **`musl.yml`** is **not** required (runs after
+green `master` `ci` and uploads node/cli + `SHA256SUMS`).
+
+```bash
+git push -u origin HEAD
+gh pr create --title "…" --body "…"
+gh pr checks --watch          # or: gh run watch
+```
+
+| Rule | Detail |
+|------|--------|
+| **One PR per plan** | Do not open a PR per step. Push more commits to the same branch. |
+| **Poll until green** | After opening (and after each fixup push), watch required checks. Do not walk away and call the plan done. |
+| **Red PR** | Fix on the worktree, commit, push, poll again. Same TDD: targeted test first when the fail is behavioral. |
+| **Done** | Required checks green **and** the PR is up for review. Do not merge unless the user asked. |
+| **Do not** | Force-push `master`, merge a red PR, or skip polling because “tests passed locally.” |
+
+A red required check on the PR is incomplete work. A red `ci` on **`master`**
+after merge is also incomplete — fix forward or revert.
+
+**Toolchain:** do not rely on host “latest stable” alone. Expand clippy allows
+only for real noise after a toolchain bump — prefer fixing the code.
+
+### Coverage job (CI, not local default)
+
+`./scripts/coverage.sh` enforces **≥90% first-party line coverage** (LCOV
+`LH`/`LF`; see `COVERAGE.md`). It is a **required** CI job (slow). Prefer not
+to grow uncovered production regions; the 90% bar applies to new and existing
+code. If CI `coverage` fails, add a pin and push — do not start a local
+coverage run unless you cannot use Actions.
+
+### Multi-step plan execution
+
+When executing an **approved multi-step plan** (see [`docs/how-we-plan.md`](docs/how-we-plan.md)):
 
 | Phase | Expectation |
 |-------|-------------|
-| **Each intermediate step** | Red → green targeted tests for crates/modules touched; **one logical commit** with public hygiene. Do **not** require full workspace suite, full coverage, or musl after every slice. |
-| **Plan complete / before calling the plan done** | Full local gates: fmt, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%). **Then** musl if that last commit is on **`master`** (merge/rebase first if the plan lived on a feature branch). |
-| **Push to master** | Still must keep CI green — do not push intermediate commits that fail required jobs (`fmt` / `clippy` / `test` / `multinode` / `coverage`) if you push them at all; prefer finishing the plan then push, or ensure each pushed commit at least passes what CI runs. |
+| **Each intermediate step** | Red → green targeted tests; **one logical commit**. No workspace suite, coverage, or musl. |
+| **Plan coded** | Push the branch and open **one** PR. |
+| **Plan complete** | Required GitHub Actions checks on that PR are **green**. |
+| **After merge to master** | Musl install on the operator host if the node/cli binary changed (recipe below). |
 
-Single-shot turns (one bugfix, no multi-step plan) follow the full gate list
-above before commit; musl only when that commit lands on **`master`**.
-
-### Coverage job
-
-`./scripts/coverage.sh` enforces **≥90% first-party line coverage** (LCOV
-`LH`/`LF`; see `COVERAGE.md`). It runs as a **required** CI job (slow). Prefer
-running it when touching store/query/consensus hot paths. Prefer not to grow
-uncovered production regions; the 90% bar applies to new and existing code.
-During multi-step plans, run coverage at **plan end** (not every step) unless
-the step’s contract is the coverage gate itself.
-
-If a change cannot pass required gates, **do not commit it as done** — fix, split,
-or get explicit user approval for a temporary exception (prefer none).
+Single-shot turns (one bugfix, one docs rule) use the same path: worktree
+branch, targeted tests, one or few commits, one PR, poll to green.
 
 ## Commit + static musl release after code changes
 
@@ -271,27 +291,25 @@ Green-then-refactor is fine as **two** commits when each stands alone (tests sti
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
-1. **Pass tests for what you touched** (targeted during multi-step plans; full
-   workspace suite when finishing a plan or for single-shot turns). A commit that
-   would fail GitHub Actions `test` is incomplete work if pushed.
-2. **Commit** following the public hygiene table above. Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-3. **Musl install (strict):** build and install the portable static musl release
-   **only when both** hold:
-   - current branch is **`master`** (or `main` if that is the default); and
-   - the tree is **clean after a successful commit** of the change (or the
-     commit that finished a multi-step plan on master).
+1. **Pass targeted tests** for what you touched (`cargo test -p <crate> …`).
+   Do **not** run the workspace suite or coverage unless the user asked.
+2. **Commit** following the public hygiene table above. Prefer one commit per
+   logical checkpoint — especially before starting a risky follow-on experiment,
+   so we can roll back. Do **not** leave multi-hour IBD perf/refactor work
+   uncommitted. A plan is **many commits, one PR**.
+3. **Push the worktree branch and open or update the plan PR.** Poll required
+   GitHub Actions checks to green before calling the work done.
+4. **Musl install (strict):** only after the change is **on `master`/`main`**
+   (merged PR) and the tree is clean. Never on a plan branch, never from
+   uncommitted work.
 
    | Situation | Musl? |
    |-----------|--------|
-   | Feature / plan branch (`rpc/…`, `feat/…`, …) | **No** — even at plan end on that branch |
-   | On `master`, after commit of code that ships in the node/cli | **Yes** — one `nix build .#rbitcoin-musl` + install (recipe below) |
-   | Uncommitted dirty tree | **No** — commit first; never install from uncommitted work |
-   | Cannot commit (hooks, secrets, user said not to) | **No** musl; say the tree was not committed and ship binary was **not** refreshed |
-   | Pure docs/discussion, no compile-affecting edits | Skip commit and musl |
-
-   Multi-step plans: no musl on intermediate slices; at plan end, full suite +
-   coverage on the plan branch as usual, then **merge/rebase to master, commit
-   if needed, then one musl** so `./target/release/rbitcoin-node` matches master.
+   | Plan / PR branch | **No** |
+   | On `master`, after merge of code that ships in the node/cli | **Yes** — one `nix build .#rbitcoin-musl` + install (recipe below) |
+   | Uncommitted dirty tree | **No** |
+   | Cannot push (hooks, secrets, user said not to) | No musl; say the tree was not pushed |
+   | Pure discussion, no compile-affecting edits | Skip commit, PR, and musl |
 
 ### Required recipe (only this — single `nix build`; **master + post-commit only**)
 
@@ -391,7 +409,7 @@ it stays small; otherwise green commit then refactor commit — both must stay g
 | 2. Red | Add or extend a test that **fails without the change** and would pass only if that contract holds. Run it; capture the fail. |
 | 3. Green | Implement the **smallest** production change that makes that test pass. Do not expand scope mid-fix. |
 | 4. Refactor | Still green: integrate the fix into shared structure / the correct stage; delete one-offs and dual paths introduced only to get green. Re-run the new and related tests. |
-| 5. Before commit | `cargo test -p <crate> …` (or scenario) for everything touched; do not land known red. |
+| 5. Before commit | `cargo test -p <crate> …` (or scenario) for everything touched; do not land known red. Workspace suite / coverage wait for GitHub Actions on the PR. |
 
 For **performance**, prefer a before/after benchmark or metered scenario that
 shows the win; do not land “perf” rewrites with only correctness tests. Same

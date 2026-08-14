@@ -124,8 +124,11 @@ Requires Rust **1.95** (workspace `rust-version`, matching Nix/CI). Prefer the
 nix develop   # or: nix-shell  (both use flake.lock, not floating <nixpkgs>)
 cargo build --workspace
 cargo test --workspace
-./scripts/coverage.sh   # PR bar: see CONTRIBUTING.md
+./scripts/coverage.sh   # PR bar (Actions); see CONTRIBUTING.md / AGENTS.md
 ```
+
+Agents implement on a worktree branch and let GitHub Actions run the
+workspace/coverage gates — see [`AGENTS.md`](./AGENTS.md).
 
 Operator binary: always the static install under `./target/release/` (or
 `./result/bin/`). After green `master` CI, the **musl** workflow uploads the

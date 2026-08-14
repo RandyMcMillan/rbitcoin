@@ -449,7 +449,7 @@ mod tests {
             inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
             outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
-        let hfk0 = q.archive_block(&h0, &[ta0]).unwrap();
+        let hfk0 = q.ensure_header(&h0).unwrap();
 
         // h1: coinbase + spend of parent vout 0 (hash commits to h0 via write gate).
         let version = 1;
@@ -506,7 +506,9 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
         };
-        q.archive_block(&h1, &[cb1, child]).unwrap();
+        q.archive_prepared_owned(&mut [(h0, vec![ta0]), (h1, vec![cb1, child])])
+            .unwrap();
+        let _ = hfk0;
 
         reset_body_ok_reads();
         let (st0, parents0, _thin0, bodies0) =

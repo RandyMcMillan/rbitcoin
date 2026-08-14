@@ -67,6 +67,12 @@ before 1.0).
   always-zero `HeadResizeSizeSnapshot` shadow fields. Printed `ibd: sizes` /
   `ASM_PREV_*` unchanged.
 
+- **Public archive-without-confirm:** `Query::archive_block`,
+  `accept_and_archive_block`, and `ChainHub::archive_block`. Confirm is sole
+  Class A (`archive_plan_batch_*` + `archive_commit_plan`). Crash / `plan=None`
+  tests use `commit_class_a_only`. `Query::connect_block` stays as the cheap
+  store fixture. Plan stamp is TipOnly; store `TipThenAny` remains for RPC.
+
 ### Changed
 
 - **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty

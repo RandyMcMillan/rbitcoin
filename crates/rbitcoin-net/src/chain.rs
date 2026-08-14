@@ -6,7 +6,7 @@ use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction, Work};
 use rbitcoin_consensus::{
-    accept_and_archive_block, accept_and_connect_block_preverified, confirm_scripts_phase,
+    accept_and_connect_block_preverified, confirm_scripts_phase,
     confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
     confirm_wire_lookup_stamp, confirm_write_phase, genesis_block, header_to_record, ChainParams,
     Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
@@ -212,23 +212,6 @@ impl ChainHub {
         self.query
             .ensure_header(&rec)
             .map_err(|e| NetError::Consensus(e.to_string()))
-    }
-
-    /// Archive Class A body without requiring tip order (IBD path).
-    pub fn archive_block(&self, height: u32, block: Block) -> Result<(), NetError> {
-        let hash = block.block_hash();
-        if self.is_archived(&hash) {
-            return Ok(());
-        }
-        accept_and_archive_block(
-            &self.query,
-            &self.params,
-            Height(height),
-            &block,
-            self.milestone,
-        )
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
-        Ok(())
     }
 
     /// Contiguous tip-extension slice for plan (Arc wire; skip already confirmed).
@@ -1289,19 +1272,14 @@ mod tests {
         let b1 = mine(gen, 1_300_000_100, 1);
         let h1 = b1.block_hash();
 
-        // Header-only then archive body out-of-order style.
+        // Header then accept (confirm is sole Class A).
         hub.ensure_header(&b1.header).unwrap();
         let fk = hub.ensure_header_fk(&b1.header).unwrap();
         assert!(fk.0 > 0 || fk.0 == 0); // Fk may be 0 on some layouts
-        hub.archive_block(1, b1.clone()).unwrap();
-        // Idempotent archive.
-        hub.archive_block(1, b1.clone()).unwrap();
-        assert!(hub.is_archived(&h1));
-
-        // Confirm via wire (already archived Class A).
         assert!(hub.confirm_wire_load_phase(&[]).unwrap().is_none());
         let acc = hub.accept_block(b1.clone()).unwrap();
         assert!(matches!(acc, AcceptOutcome::Accepted { height: 1 }));
+        assert!(hub.is_archived(&h1));
         assert_eq!(hub.tip_height(), Some(1));
         // Already confirmed → AlreadyHave.
         assert!(matches!(

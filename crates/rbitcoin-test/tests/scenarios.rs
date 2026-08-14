@@ -557,16 +557,13 @@ fn chain_connect_reorg_and_growth() {
         .is_err());
 }
 
-// ─── IBD Class A: out-of-order archive, idempotent re-archive, head-off ─────
+// ─── Resume: Class A remains after connect+disconnect (not archive-ahead) ─────
 
-/// After archive-ahead of tip, `resume_work_path_after_tip` must rebuild the
-/// ordered path with Class A flags so restart does not re-getdata those bodies.
+/// After connect then disconnect, `resume_work_path_after_tip` still sees
+/// Class A bodies (production leaves archive on disconnect).
 #[test]
 fn resume_work_path_sees_archived_bodies_after_reopen() {
-    use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, header_to_record, ChainParams,
-        Milestone,
-    };
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 
     let td = TestDatadir::new().unwrap();
@@ -577,27 +574,20 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
     let hashes = {
         let q = Query::open_or_create(td.store_path()).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-        let g_fk = q
-            .get_header_by_hash(&genesis.block_hash().to_byte_array())
-            .unwrap()
-            .unwrap()
-            .0;
         let mut tip = genesis.block_hash();
         let mut tip_time = genesis.header.time;
-        let mut prev_fk = g_fk;
         let mut out = Vec::new();
-        // Confirm stays at 0; archive heights 1..4 ahead (IBD shape).
         for h in 1u32..=4 {
             let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-            let fk = q
-                .ensure_header(&header_to_record(prev_fk, &b.header))
-                .unwrap();
-            accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
             out.push(b.block_hash().to_byte_array());
             tip = b.block_hash();
             tip_time = b.header.time;
-            prev_fk = fk;
         }
+        for _ in 1u32..=4 {
+            q.disconnect_tip().unwrap();
+        }
+        assert_eq!(q.tip_height().map(|h| h.0), Some(0));
         q.flush().unwrap();
         out
     };
@@ -620,198 +610,13 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
     }
 }
 
-/// Single scenario covering the signet @2148 failure class and IBD:
-/// - archive bodies out of height order (ahead of tip)
-/// - re-archive / mega-batch duplicate is idempotent (fk + create height stable)
-/// - Direct: live `tx.head` + durable spend annotations on confirm
-/// - coinbase maturity then spend still connects
-#[test]
-fn ibd_parallel_archive_idempotent_confirm_direct() {
-    use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, header_to_record,
-        prepare_block_for_archive, ChainParams, Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let ms = Milestone { height: 1_000_000 };
-    let params = ChainParams::regtest();
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let g_fk = q
-        .get_header_by_hash(&genesis.block_hash().to_byte_array())
-        .unwrap()
-        .unwrap()
-        .0;
-
-    // Mine a short pad, then archive **out of order** (2 before 1) like IBD.
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-    let b2 = mine_regtest_block(tip, tip_time + 600, 2, vec![]);
-    tip = b2.block_hash();
-    tip_time = b2.header.time;
-
-    // Headers first (body order independent), then bodies 2 then 1.
-    let h1_fk = q
-        .ensure_header(&header_to_record(g_fk, &b1.header))
-        .unwrap();
-    let _h2_fk = q
-        .ensure_header(&header_to_record(h1_fk, &b2.header))
-        .unwrap();
-    accept_and_archive_block(&q, &params, Height(2), &b2, ms).unwrap();
-    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
-    // Mega-batch duplicate of the same header (two prep deliveries).
-    let (h1_rec, h1_txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
-    let fks_before = q.store().header_txs.get_list(h1_fk).unwrap().unwrap();
-    let mut dup = vec![
-        (h1_fk, h1_rec.clone(), h1_txs.clone()),
-        (h1_fk, h1_rec, h1_txs),
-    ];
-    q.archive_prepared_with_fks(&mut dup).unwrap();
-    assert_eq!(
-        q.store().header_txs.get_list(h1_fk).unwrap().unwrap(),
-        fks_before,
-        "duplicate mega-batch must not reassign tx fks"
-    );
-
-    confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
-    // Second peer delivery after confirm: still idempotent.
-    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
-    assert_eq!(
-        q.store().tx_height_get(fks_before[0]).unwrap(),
-        Some(1),
-        "create height must remain on first-archive fks"
-    );
-    confirm_wire_run(&q, &params, ms, &[(Height(2), b2.clone())]).unwrap();
-
-    let last_pad = maturity + 1;
-    for h in 3..=last_pad {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
-        confirm_wire_run(&q, &params, ms, &[(Height(h), b.clone())]).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
-
-    let spend_h = last_pad + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    confirm_wire_run(&q, &params, ms, &[(Height(spend_h), b_spend)])
-        .expect("mature coinbase spend with Direct head + double-archive");
-    assert_eq!(q.tip_height(), Some(Height(spend_h)));
-    // Direct: confirm batch-writes durable spend annotations.
-    assert!(
-        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "durable strong spend must mark coinbase spent"
-    );
-    assert_eq!(
-        q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
-        1,
-        "confirm spend batch writes durable edges for Electrum/spenders"
-    );
-    let fks = q.block_tx_fks(Height(spend_h)).unwrap();
-    assert!(fks.len() >= 2);
-    let rec = q.get_tx(fks[1]).unwrap();
-    let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
-    // v10: create_fk stamped at archive; soft prev_txid zero until wire rebuild.
-    assert!(!inp.create_fk.is_null());
-    assert_eq!(q.resolve_prev_txid(&inp).unwrap(), *cb1.as_byte_array());
-    assert_eq!(inp.prev_index, 0);
-}
-
-/// Milestone 0 / `spend_index` on: archive writes point edges before Class C.
-/// Confirm must use **strong** spenders only — `spenders_raw` would see the
-/// archived (non-strong) edge and reject a valid tip (signet height 2148).
-#[test]
-fn confirm_with_spend_index_ignores_archive_only_point_edges() {
-    use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    // Full-verify / tip-mode indexing: durable points written on archive + confirm.
-    q.set_spend_index(true);
-    q.set_tx_index(true);
-    let ms = Milestone::NONE; // scripts on; same spend path as milestone 0
-    let params = ChainParams::regtest();
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-
-    let last_pad = maturity + 1;
-    let mut pad_blocks = Vec::new();
-    for h in 2..=last_pad {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        // Archive ahead of confirm (IBD shape).
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-        pad_blocks.push((h, b));
-    }
-    let spend_h = last_pad + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    // Archive spend **before** confirming the pad — writes point row while
-    // spending tx is not yet strong.
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    assert!(
-        !q.spenders_raw(cb1.as_byte_array(), 0).unwrap().is_empty(),
-        "archive must have written a raw point edge"
-    );
-    assert!(
-        q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
-        "spending tx not strong yet — strong spenders empty"
-    );
-    assert!(
-        !q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "is_outpoint_spent must not treat archive-only edges as best-chain spent"
-    );
-
-    // Confirm pad then spend; must not false-positive PrevoutSpent.
-    for (h, b) in &pad_blocks {
-        confirm_wire_run(&q, &params, ms, &[(Height(*h), b.clone())]).unwrap();
-    }
-    confirm_wire_run(&q, &params, ms, &[(Height(spend_h), b_spend)])
-        .expect("confirm spend with archive-ahead point edges (signet @2148 class)");
-    assert_eq!(q.tip_height(), Some(Height(spend_h)));
-    assert_eq!(
-        q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
-        1,
-        "after Class C the spend is strong"
-    );
-}
-
 /// Simulate kill -9 mid Class C: strong_tx + point edges written for
 /// tip+1 but `confirmed[]` not advanced. Re-confirm must not false-positive
 /// PrevoutSpent (tip is the Class C commit point).
 #[test]
 fn confirm_survives_partial_class_c_without_tip_advance() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
+        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -847,7 +652,7 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
 
     let hash = b_spend.block_hash().to_byte_array();
     let (header_fk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
@@ -899,7 +704,7 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
         spend_h + 1,
         vec![],
     );
-    accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_next, ms).unwrap();
+    commit_class_a_block(&q, &params, Height(spend_h + 1), &b_next, ms).unwrap();
     let hash2 = b_next.block_hash().to_byte_array();
     let (hfk2, _) = q.get_header_by_hash(&hash2).unwrap().unwrap();
     let fks2 = q.store().header_txs.get_list(hfk2).unwrap().unwrap();
@@ -920,82 +725,11 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
-/// Schema v10: Class A archive requires parent create on disk (or same mega-batch).
-/// IBD parks out-of-order bodies until height-contiguous; direct archive of a
-/// spend without its parent must fail cleanly, then succeed after the parent.
-#[test]
-fn archive_spend_requires_parent_then_ok() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, header_to_record, prepare_block_for_archive_ibd, ChainParams,
-        Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let ms = Milestone { height: 1_000_000 };
-    let params = ChainParams::regtest();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let g_fk = q
-        .get_header_by_hash(genesis.block_hash().as_byte_array())
-        .unwrap()
-        .unwrap()
-        .0;
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    // Parent create at height 1 — headers only first (no Class A body yet).
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-    let h1 = header_to_record(g_fk, &b1.header);
-    let h1_fk = q.store().put_header(&h1).unwrap();
-
-    // Spend of b1 coinbase (IBD prep: no store prev check).
-    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, 2, vec![spend]);
-    let (mut hs, txs) = prepare_block_for_archive_ibd(&params, &b_spend).unwrap();
-    hs.prev_fk = h1_fk;
-    let hs_fk = q.store().put_header(&hs).unwrap();
-
-    let err = q
-        .archive_prepared_with_fks(&mut [(hs_fk, hs.clone(), txs.clone())])
-        .expect_err("spend without parent create must fail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("parent create_fk unresolved") || msg.contains("contiguous"),
-        "expected create_fk parent error, got: {msg}"
-    );
-    assert!(
-        !q.store().header_txs.has_body(hs_fk).unwrap(),
-        "failed spend must not leave a Class A body"
-    );
-
-    // Parent body lands, then spend retries (sticky/head resolve).
-    let (_h1b, txs1) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
-    q.archive_prepared_with_fks(&mut [(h1_fk, h1, txs1)])
-        .unwrap();
-    q.archive_prepared_with_fks(&mut [(hs_fk, hs, txs)])
-        .expect("spend archives after parent");
-    assert!(q.store().header_txs.has_body(hs_fk).unwrap());
-    let fks = q.store().header_txs.get_list(hs_fk).unwrap().unwrap();
-    let rec = q.get_tx(fks[1]).unwrap();
-    let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
-    assert!(!inp.create_fk.is_null());
-    assert_eq!(q.resolve_prev_txid(&inp).unwrap(), *cb1.as_byte_array());
-    let _ = ms;
-}
-
 /// Resume: spend archived with create_fk (archive sticky/head); confirm spends.
 #[test]
 fn resume_tx_head_resolves_external_prev() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
+        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -1040,7 +774,7 @@ fn resume_tx_head_resolves_external_prev() {
             q.tx_fk_by_txid(cb1.as_byte_array()).unwrap().is_some(),
             "tx.head must retain mature coinbase create_fk across reopen"
         );
-        accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+        commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
         let fks = q
             .store()
             .header_txs
@@ -1084,7 +818,7 @@ fn resume_tx_head_resolves_external_prev() {
 #[test]
 fn confirm_structural_rejects_already_spent_prevout() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, ChainParams, Milestone,
+        accept_and_connect_block, commit_class_a_block, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -1117,7 +851,7 @@ fn confirm_structural_rejects_already_spent_prevout() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
     let (_st, batch_parents, _thin, _bodies) =
         q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
@@ -1140,7 +874,7 @@ fn confirm_structural_rejects_already_spent_prevout() {
         spend_h + 1,
         vec![spend2],
     );
-    accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
+    commit_class_a_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
     let err = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms)
         .expect_err("double-spend must fail structural");
     let msg = err.to_string();
@@ -1157,8 +891,7 @@ fn confirm_structural_rejects_already_spent_prevout() {
 #[test]
 fn confirm_batch_create_and_spend_parent_same_run() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
+        accept_and_connect_block, commit_class_a_run, confirm_wire_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -1176,7 +909,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
 
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
     let cb1 = b1.txdata[0].compute_txid();
-    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
     tip = b1.block_hash();
     tip_time = b1.header.time;
 
@@ -1184,7 +916,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let mut run: Vec<(Height, bitcoin::Block)> = vec![(Height(1), b1)];
     for h in 2..=last_pad {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         run.push((Height(h), b));
@@ -1195,7 +926,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let mk_parent = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let b_create = mine_regtest_block(tip, tip_time + 600, create_h, vec![mk_parent]);
     let parent_txid = b_create.txdata[1].compute_txid();
-    accept_and_archive_block(&q, &params, Height(create_h), &b_create, ms).unwrap();
     tip = b_create.block_hash();
     tip_time = b_create.header.time;
     run.push((Height(create_h), b_create));
@@ -1204,8 +934,8 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let spend_h = create_h + 1;
     let spend_parent = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &run, ms).unwrap();
 
     // Runway the run: parent pin + prevout scan; same-batch create must not
     // leave the spend height unready.
@@ -1239,8 +969,8 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
+        accept_and_connect_block, commit_class_a_block, commit_class_a_run, confirm_wire_run,
+        ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{
         mine_regtest_block, regtest_genesis, spend_many_anyone_can_spend, split_anyone_can_spend,
@@ -1284,7 +1014,6 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     );
     let b_split = mine_regtest_block(tip, tip_time + 600, split_h, vec![split]);
     let parent_txid = b_split.txdata[1].compute_txid();
-    accept_and_archive_block(&q, &params, Height(split_h), &b_split, ms).unwrap();
     tip = b_split.block_hash();
     tip_time = b_split.header.time;
 
@@ -1332,7 +1061,16 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     let t2_txid = t2.compute_txid();
     let t3 = spend_many_anyone_can_spend(&[(t2_txid, 0)], Amount::from_sat(46_0000_0000));
     let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![t1, t2, t3]);
-    accept_and_archive_block(&q, &params, Height(merge_h), &b_merge, ms).unwrap();
+    commit_class_a_run(
+        &q,
+        &params,
+        &[
+            (Height(split_h), b_split.clone()),
+            (Height(merge_h), b_merge.clone()),
+        ],
+        ms,
+    )
+    .unwrap();
 
     confirm_wire_run(
         &q,
@@ -1355,7 +1093,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     let next_h = merge_h + 1;
     let spend = spend_many_anyone_can_spend(&[(t3_txid, 0)], Amount::from_sat(45_0000_0000));
     let b_next = mine_regtest_block(tip, tip_time + 600, next_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(next_h), &b_next, ms).unwrap();
+    commit_class_a_block(&q, &params, Height(next_h), &b_next, ms).unwrap();
     confirm_wire_run(&q, &params, ms, &[(Height(next_h), b_next)])
         .expect("cross-batch tx.head create_fk resolve must work");
     assert_eq!(q.tip_height(), Some(Height(next_h)));
@@ -1365,8 +1103,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, ChainParams,
-        Milestone,
+        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 
@@ -1383,7 +1120,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
     let mut blocks = Vec::new();
     for h in 1u32..=4 {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         blocks.push(b);
@@ -1829,7 +1566,7 @@ fn consensus_reject_bad_structure_and_milestone() {
 #[test]
 fn three_stage_confirm_and_parent_pin_surface() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
@@ -1849,7 +1586,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
 
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
     let cb1 = b1.txdata[0].compute_txid();
-    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
     tip = b1.block_hash();
     tip_time = b1.header.time;
 
@@ -1857,7 +1593,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let mut run: Vec<(Height, bitcoin::Block)> = vec![(Height(1), b1)];
     for h in 2..=last_pad {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         run.push((Height(h), b));
@@ -1866,8 +1601,8 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &run, ms).unwrap();
 
     // Inline confirm load (parent pin).
     let items: Vec<(u32, [u8; 32])> = run
@@ -1918,7 +1653,7 @@ fn three_stage_confirm_and_parent_pin_surface() {
 #[test]
 fn confirm_multi_block_spend_uses_header_plan_mtp() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
@@ -1945,7 +1680,6 @@ fn confirm_multi_block_spend_uses_header_plan_mtp() {
         if h == 1 {
             cb1 = Some(b.txdata[0].compute_txid());
         }
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         all.push((Height(h), b));
@@ -1954,8 +1688,8 @@ fn confirm_multi_block_spend_uses_header_plan_mtp() {
     let spend = spend_anyone_can_spend(cb1.unwrap(), 0, Amount::from_sat(49_0000_0000));
     // Second spend height in the *same* load batch (mid-batch BIP68 MTP).
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     all.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &all, ms).unwrap();
     assert_eq!(q.tip_height(), Some(Height::GENESIS));
 
     // One multi-block load of the whole run while tip is still genesis.
@@ -1980,7 +1714,7 @@ fn confirm_multi_block_spend_uses_header_plan_mtp() {
 #[test]
 fn confirm_load_ahead_of_write_does_not_badprev() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_wire_load_phase_pipelined, confirm_write_phase,
         ChainParams, Milestone, ScriptPreverified, WireLoadPipeline,
     };
@@ -2002,7 +1736,7 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
     let mut all: Vec<(Height, bitcoin::Block)> = Vec::with_capacity(20);
     for h in 1u32..=20 {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         all.push((Height(h), b));
@@ -2054,7 +1788,7 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
 #[test]
 fn confirm_assemble_after_tip_gc_uses_store_for_mtp() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
@@ -2074,7 +1808,7 @@ fn confirm_assemble_after_tip_gc_uses_store_for_mtp() {
     let mut all: Vec<(Height, bitcoin::Block)> = Vec::with_capacity(24);
     for h in 1u32..=24 {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         all.push((Height(h), b));
@@ -2372,7 +2106,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
 #[test]
 fn wire_prep_already_archived_bodies_spend_annotate() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
 
@@ -2401,14 +2135,19 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
     let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a]);
     let a_out = ba.txdata[1].compute_txid();
-    accept_and_archive_block(&q, &params, Height(ha), &ba, ms).unwrap();
     tip = ba.block_hash();
     tip_time = ba.header.time;
 
     let hb = maturity + 2;
     let spend_b = spend_anyone_can_spend(a_out, 0, Amount::from_sat(48_0000_0000));
     let bb = mine_regtest_block(tip, tip_time + 600, hb, vec![spend_b]);
-    accept_and_archive_block(&q, &params, Height(hb), &bb, ms).unwrap();
+    commit_class_a_run(
+        &q,
+        &params,
+        &[(Height(ha), ba.clone()), (Height(hb), bb.clone())],
+        ms,
+    )
+    .unwrap();
     assert_eq!(q.tip_height(), Some(Height(maturity)));
 
     // Wire prep both heights: need empty → plan None; must still annotate.

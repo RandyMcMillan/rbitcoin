@@ -1401,7 +1401,7 @@ fn store_start_states_lookup_load_confirm() {
     };
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
-    use crate::{accept_and_archive_block, accept_and_connect_block};
+    use crate::{accept_and_connect_block, prepare_block_for_archive};
     use bitcoin::block::{Header, Version};
     use bitcoin::blockdata::transaction::{
         OutPoint, Transaction, TxIn, TxOut, Version as TxVersion,
@@ -1566,7 +1566,8 @@ fn store_start_states_lookup_load_confirm() {
     // S1: already-archived (plan=None) — lookup stamps parent pin; load by range.
     let h_s1 = h_s0 + 1;
     let b_s1 = mine_cb(tip, tip_time + 600, h_s1);
-    accept_and_archive_block(&q, &params, Height(h_s1), &b_s1, ms).unwrap();
+    let (header_s1, txs_s1) = prepare_block_for_archive(&q, &params, &b_s1).unwrap();
+    q.commit_class_a_only(&header_s1, &txs_s1).unwrap();
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
     {
         let arcs = [(Height(h_s1), Arc::new(b_s1.clone()))];

@@ -382,11 +382,13 @@ mod class_a_rehydrate_tests {
         let time = 1_300_000_000u32;
         let mut tip = gen;
         let mut hashes = Vec::new();
-        // Tip stays at genesis; archive heights 1..3 ahead (restart Class A shape).
+        // Tip stays at genesis; Class A via commit_class_a_only (not public archive_block).
         for h in 1u32..=3 {
             let b = mine(tip, time + h * 600, h);
             hub.ensure_header(&b.header).unwrap();
-            hub.archive_block(h, b.clone()).unwrap();
+            let (rec, txs) =
+                rbitcoin_consensus::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
+            hub.query.commit_class_a_only(&rec, &txs).unwrap();
             hashes.push(b.block_hash());
             tip = b.block_hash();
         }

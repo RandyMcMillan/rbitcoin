@@ -249,7 +249,7 @@ mod tests {
             Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
             Witness,
         };
-        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_consensus::{prepare_block_for_archive, ChainParams, Milestone};
         use rbitcoin_query::Query;
 
         if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
@@ -318,13 +318,15 @@ mod tests {
             block
         }
 
-        // Tip stays at genesis; archive heights 1..=2, header-only height 3 (gap).
+        // Tip stays at genesis; Class A at 1..=2 via the crash helper (not public
+        // archive_block). Header-only height 3 breaks the contiguous-prefix.
         let mut tip = gen;
         let time = 1_300_000_000u32;
         for h in 1u32..=2 {
             let b = mine(tip, time + h * 600, h);
             hub.ensure_header(&b.header).unwrap();
-            hub.archive_block(h, b.clone()).unwrap();
+            let (rec, txs) = prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
+            hub.query.commit_class_a_only(&rec, &txs).unwrap();
             tip = b.block_hash();
         }
         let b3 = mine(tip, time + 3 * 600, 3);

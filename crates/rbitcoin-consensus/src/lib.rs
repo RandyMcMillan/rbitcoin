@@ -670,8 +670,10 @@ pub fn accept_and_connect_block_preverified(
         )))
 }
 
-/// Archive a block body (Class A) without confirming.
-pub fn accept_and_archive_block(
+/// Class A only (no tip / Class C). Crash and `plan=None` tests.
+///
+/// Not a production IBD API — confirm write uses `archive_plan_batch` + commit.
+pub fn commit_class_a_block(
     query: &Query,
     params: &ChainParams,
     height: Height,
@@ -681,7 +683,31 @@ pub fn accept_and_archive_block(
     let _ = (height, milestone);
     let (header_rec, txs) = prepare_block_for_archive(query, params, block)?;
     query
-        .archive_block(&header_rec, &txs)
+        .commit_class_a_only(&header_rec, &txs)
+        .map_err(ConsensusError::from)?;
+    Ok(())
+}
+
+/// Class A for a contiguous run in one plan (same-batch parent stamp).
+///
+/// Use this instead of N×[`commit_class_a_block`] when later blocks spend
+/// earlier unconfirmed creates.
+pub fn commit_class_a_run(
+    query: &Query,
+    params: &ChainParams,
+    blocks: &[(Height, Block)],
+    milestone: Milestone,
+) -> Result<(), ConsensusError> {
+    let _ = milestone;
+    let mut items = Vec::with_capacity(blocks.len());
+    for (_, block) in blocks {
+        let (header, txs) = prepare_block_for_archive(query, params, block)?;
+        // Later headers resolve prev_fk from this header.
+        query.ensure_header(&header).map_err(ConsensusError::from)?;
+        items.push((header, txs));
+    }
+    query
+        .commit_class_a_batch(&mut items)
         .map_err(ConsensusError::from)?;
     Ok(())
 }
@@ -1010,14 +1036,13 @@ mod coverage_tests {
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 
         let b1 = mine_regtest(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
-        // prepare + archive paths
+        // prepare helpers stay (CPU-side); confirm is sole Class A.
         let (_hr, _txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
         let (_hr2, _txs2) = prepare_block_for_archive_new(&q, &params, &b1).unwrap();
         let (_hr3, _txs3) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
-        accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
-        // already archived branch
+        accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+        // already-have prepare after connect
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-        confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
 
         // Bad pow limit on prepare_ibd
         let mut bad = b1.clone();

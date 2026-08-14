@@ -19,9 +19,17 @@ before 1.0).
   TipOnly `tx.head` for parents not in live caches (almost all open head; the
   rest ages ≤3 sealed). No `TipThenAny` last-chance on the confirm path.
   One-shot `accept_branch` / `confirm_wire_run` still stamp in-process with
-  TipOnly.
+  TipOnly. Progress/sizes print **`ready=`** (BQ resolve-complete count), not
+  a fake `loadq=n/8`. Load leftover head is `leftover_n/hit/ms/pend/cdf`;
+  lookup wave wall is `lookup_thr wave=`.
 
 ### Fixed
+
+- **In-flight prune waits for the height fence:** write drains `tx.head` in
+  parallel with Class C, so occupied can jump before `height_fence_extend`.
+  Pruning on occupied alone dropped parents TipOnly leftover then wiped
+  (`connected=false`) and blacklisted tip+1 (mainnet 929462 `missing prevout`).
+  Cutoff is `min(occupied, fence max connected fk)`.
 
 - **Load leftover parents are TipOnly `tx.head`, not an invariant:** after the
   BQ wave, some externals remain (same-batch / in-flight / not yet in the

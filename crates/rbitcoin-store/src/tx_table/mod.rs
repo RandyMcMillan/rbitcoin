@@ -1595,6 +1595,11 @@ impl TxTable {
         self.head.occupied()
     }
 
+    /// Per-segment first create_fk (winner-age stats).
+    pub fn head_first_fks_snapshot(&self) -> Vec<u64> {
+        self.head.first_fks_snapshot()
+    }
+
     pub fn head_bits(&self) -> u32 {
         self.head.bits()
     }

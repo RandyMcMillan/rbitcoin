@@ -555,8 +555,16 @@ impl Query {
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
+            let leftover_pend = need_head
+                .iter()
+                .filter(|t| self.store.txs.pending_fk(t).is_some())
+                .count() as u64;
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            let first_fks = self.store.txs.head_first_fks_snapshot();
+            let mut age0 = 0u64;
+            let mut age3 = 0u64;
+            let mut age_n = 0u64;
             for (txid, row) in hits {
                 if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);
@@ -564,9 +572,21 @@ impl Query {
                     if let Some(id) = fk.get() {
                         external_parent_ranges.insert(id, range);
                         external_parent_txids.insert(id, txid);
+                        if let Some(age) =
+                            rbitcoin_store::head_resolve_stats::sealed_age_for_fk(&first_fks, id)
+                        {
+                            age_n = age_n.saturating_add(1);
+                            if age == 0 {
+                                age0 = age0.saturating_add(1);
+                            }
+                            if age <= 3 {
+                                age3 = age3.saturating_add(1);
+                            }
+                        }
                     }
                 }
             }
+            crate::archive_phase_stats::note_leftover_mix(leftover_pend, age0, age3, age_n);
         }
         let head_total_ns = t_head.elapsed().as_nanos() as u64;
         let head_fk_ns = head_total_ns; // denserels not on plan stamp path

@@ -38,8 +38,7 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop creates that are already **head-findable** (and thus resolvable
-    /// without the pipeline map).
+    /// Drop creates that leftover TipOnly would accept (head + fence).
     ///
     /// **Must not use body count alone.** Class A commit is body → head →
     /// head; during `tx.head` seal/roll the body count jumps while head
@@ -47,13 +46,18 @@ impl LoadAheadState {
     /// parents that head cannot resolve yet → `parent create_fk unresolved`
     /// and a permanent tip blacklist (mainnet ~269050 first segment seal).
     ///
+    /// **Must not use `tx.head` occupied alone.** Write drains head in
+    /// parallel with Class C; occupied can jump before `height_fence_extend`.
+    /// TipOnly leftover then wipes the head hit (`connected=false`) and
+    /// blacklists tip+1 (mainnet 929462).
+    ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        // Head-occupied ≈ highest create_fk published into the segmented head
-        // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
         let head_n = hub.query.tx_head_occupied();
-        self.in_flight.prune(head_n);
+        let fence_n = hub.query.tx_fence_max_connected_fk();
+        self.in_flight
+            .prune(rbitcoin_query::inflight_prune_cutoff(head_n, fence_n));
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
@@ -356,19 +360,15 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default lookup→load depth (`loadq`): enough ahead for pin/IO while scripts run.
-pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
 
-/// Resolved load / script / write queue capacities.
+/// Resolved script / write queue capacities. Load claims BQ; no lookup→load channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
-    /// lookup→load (`loadq`)
-    pub load: usize,
     /// load→scripts (`scriptq`)
     pub script: usize,
     /// scripts→write (`writeq`)
@@ -379,7 +379,6 @@ pub(crate) struct ConfirmQueueCaps {
 ///
 /// | Queue | Default |
 /// |-------|---------|
-/// | lookup→load (`loadq`) | **8** |
 /// | load→scripts (`scriptq`) | **4** |
 /// | scripts→write (`writeq`) | **20** |
 ///
@@ -387,16 +386,11 @@ pub(crate) struct ConfirmQueueCaps {
 #[inline]
 pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     ConfirmQueueCaps {
-        load: LOAD_QUEUE_CAP_DEFAULT,
         script: SCRIPT_QUEUE_CAP_DEFAULT,
         write: WRITE_QUEUE_CAP_DEFAULT,
     }
 }
 
-/// Lookup→load (`loadq`) `SyncSender` capacity.
-pub(crate) fn load_queue_cap() -> usize {
-    confirm_queue_caps().load
-}
 /// Load→scripts (`scriptq`) capacity.
 pub(crate) fn script_queue_cap() -> usize {
     confirm_queue_caps().script
@@ -413,8 +407,25 @@ pub(crate) fn write_queue_cap() -> usize {
 /// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
-    let q = c.load.saturating_add(c.script).saturating_add(c.write);
+    let q = c.script.saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
+}
+
+/// BQ heights ≥ `path_lo` with resolve-complete and not load-inflight.
+pub(crate) fn confirm_ready_count(
+    query: &rbitcoin_query::Query,
+    path_lo: u32,
+    inflight: &std::collections::HashSet<u32>,
+) -> usize {
+    query
+        .block_queue_list_meta()
+        .into_iter()
+        .filter(|m| {
+            m.height >= path_lo
+                && !inflight.contains(&m.height)
+                && query.block_queue_is_resolve_complete(m.height)
+        })
+        .count()
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -427,20 +438,14 @@ fn max_claim_ahead() -> u32 {
 /// samples alone almost always show 0 under a lookup-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
-    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
-    lookup_to_load: AtomicUsize,
     /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
     load_to_scripts: AtomicUsize,
     /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
     scripts_to_write: AtomicUsize,
-    /// Max lookup→load depth since last HWM sample.
-    load_hwm: AtomicUsize,
     /// Max load→scripts depth since last HWM sample.
     script_hwm: AtomicUsize,
     /// Max scripts→write depth since last HWM sample.
     write_hwm: AtomicUsize,
-    /// Sum of `batch.len()` sitting in lookup→load.
-    load_blocks: AtomicUsize,
     /// Sum of `batch.len()` sitting in load→scripts.
     script_blocks: AtomicUsize,
     /// Sum of approx wire bytes of load→scripts batches.
@@ -457,8 +462,8 @@ pub(crate) struct ConfirmQueueDepths {
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConfirmPipelineSizes {
-    pub load_batches: usize,
-    pub load_blocks: usize,
+    /// BQ resolve-complete heights load can claim (not a queue).
+    pub ready: usize,
     pub script_batches: usize,
     pub script_blocks: usize,
     pub script_wire_bytes: usize,
@@ -492,22 +497,20 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline queue depths for progress/perf: `loadq… scriptq… writeq…`.
+/// Confirm pipeline: `ready=` (BQ resolve-complete) + real `scriptq` / `writeq`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
-/// `loadq` = lookup→load; `scriptq` = load→scripts; `writeq` = scripts→write.
 #[inline]
 pub(crate) fn format_conf_q(
-    load: usize,
+    ready: usize,
     script: usize,
     write: usize,
-    load_cap: usize,
     script_cap: usize,
     write_cap: usize,
 ) -> String {
     format!(
-        "{} {} {}",
-        format_queue_depth("loadq", load, load_cap),
+        "ready={} {} {}",
+        ready,
         format_queue_depth("scriptq", script, script_cap),
         format_queue_depth("writeq", write, write_cap),
     )
@@ -518,19 +521,17 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
-    /// `(lookup→load, load→scripts, scripts→write)`.
-    pub(crate) fn snap(&self) -> (usize, usize, usize) {
+    /// `(load→scripts, scripts→write)`.
+    pub(crate) fn snap(&self) -> (usize, usize) {
         (
-            self.lookup_to_load.load(Ordering::Relaxed),
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
     }
 
     /// Max queue depths since last call; resets HWMs to 0.
-    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
+    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize) {
         (
-            self.load_hwm.swap(0, Ordering::Relaxed),
             self.script_hwm.swap(0, Ordering::Relaxed),
             self.write_hwm.swap(0, Ordering::Relaxed),
         )
@@ -539,8 +540,7 @@ impl ConfirmQueueDepths {
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
-            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
-            load_blocks: self.load_blocks.load(Ordering::Relaxed),
+            ready: 0,
             script_batches: self.load_to_scripts.load(Ordering::Relaxed),
             script_blocks: self.script_blocks.load(Ordering::Relaxed),
             script_wire_bytes: self.script_wire_bytes.load(Ordering::Relaxed),
@@ -577,23 +577,6 @@ impl ConfirmQueueDepths {
         let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_sub(1))
         });
-    }
-
-    fn note_lookup_send(&self, blocks: usize) {
-        Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
-        self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
-            .ok();
-    }
-    fn note_lookup_recv(&self, blocks: usize) {
-        Self::note_batch_depth_recv(&self.lookup_to_load);
-        self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
-            .ok();
     }
 
     fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
@@ -689,6 +672,17 @@ pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
     false
 }
 
+/// Operator line for load stamp reject. Stamp-stage `missing prevout` is the
+/// leftover TipOnly miss remapped from `parent create_fk unresolved` — name
+/// that so a race is not logged as a bare invalid-block.
+pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
+    if err == "missing prevout" {
+        format!("{err} (leftover parent create_fk unresolved)")
+    } else {
+        err.to_string()
+    }
+}
+
 /// Drain scripts→write after `first` is already dequeued (and accounted):
 /// non-blocking `try_recv` until empty, merge contiguous into one batch.
 ///
@@ -734,7 +728,7 @@ fn drain_script_ok_write_queue(
 /// OS-thread occupancy for the confirm pipeline (lookup / load / scripts / write).
 ///
 /// Stage `plan_ms` / `script_ms` / … are **work** sums and mis-rank the long
-/// pole when loadq is empty. These timers include **wait** (claim, recv, send
+/// pole when scriptq is empty. These timers include **wait** (claim, recv, send
 /// block) so a 5s window can show who is busy vs idle.
 pub(crate) mod confirm_thr_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -770,6 +764,9 @@ pub(crate) mod confirm_thr_stats {
     pub fn add_lookup_claim(d: Duration) {
         add(&LOOKUP_CLAIM_NS, d);
     }
+    /// Pack BQ decode used to land here; it is load work now. Tests still
+    /// drive the atomic.
+    #[cfg(test)]
     #[inline]
     pub fn add_lookup_resolve(d: Duration) {
         add(&LOOKUP_RESOLVE_NS, d);
@@ -1337,7 +1334,7 @@ pub(crate) fn spawn_confirm_engine(
                                     break;
                                 }
                             }
-                            confirm_thr_stats::add_lookup_resolve(t_pack_io.elapsed());
+                            confirm_thr_stats::add_load_work(t_pack_io.elapsed());
                             if !body_missing.is_empty() {
                                 for (mh, mhash) in &body_missing {
                                     let _ = event_tx_load.send(ConfirmEvent::BodyMissing {
@@ -1463,13 +1460,14 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
+                        let log_msg = stamp_reject_operator_msg(&msg);
                         warn!(
-                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {e}"
+                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {log_msg}"
                         );
                         let _ = event_tx_load.send(ConfirmEvent::Reject {
                             height: expect_h,
                             hash: first_hash,
-                            err: msg,
+                            err: log_msg,
                         });
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
@@ -1496,8 +1494,6 @@ pub(crate) fn spawn_confirm_engine(
                     .iter()
                     .map(|(h, ha, _)| (*h, *ha))
                     .collect();
-                let n = heights_hashes.len();
-                queues_load.note_lookup_recv(n);
                 let first_hash = heights_hashes[0].1;
                 let _ = wire_batch;
 
@@ -1674,7 +1670,6 @@ pub(crate) fn spawn_confirm_engine(
                     ) {
                         Ok(st) if st.heights > 0 => {
                             did = true;
-                            queues_lookup.note_lookup_send(st.heights as usize);
                             feed.notify();
                         }
                         Ok(_) => {}

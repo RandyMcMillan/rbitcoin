@@ -859,7 +859,13 @@ pub async fn ibd_cancellable(
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
             let tip_rate = tip_delta as f64 / window_secs;
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            let (load_q, script_q, write_q) = confirm_queues.snap();
+            let (script_q, write_q) = confirm_queues.snap();
+            let path_lo = hub.tip_height().map(|t| t.saturating_add(1)).unwrap_or(0);
+            let inflight_h = {
+                let g = confirm_feed.inner.lock().unwrap();
+                g.inflight.clone()
+            };
+            let ready_n = confirm::confirm_ready_count(&hub.query, path_lo, &inflight_h);
             // Class A fks published in tx.idx (dense create_fk high-water).
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
@@ -872,13 +878,12 @@ pub async fn ibd_cancellable(
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // loadq/scriptq/writeq; `name<0/cap` = empty.
+            // ready= BQ resolve-complete; scriptq/writeq `name<0/cap` = empty.
             // bq soft=n/win RAM=: in-RAM body queue; win = 1-min confirm window at rate.
             let conf_q = confirm::format_conf_q(
-                load_q,
+                ready_n,
                 script_q,
                 write_q,
-                confirm::load_queue_cap(),
                 confirm::script_queue_cap(),
                 confirm::write_queue_cap(),
             );
@@ -909,10 +914,10 @@ pub async fn ibd_cancellable(
                 .saturating_add(st.inflight.len() as u32);
             // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
-            let (load_q, script_q, write_q) = confirm_queues.snap();
             let conf_q_hwm = confirm_queues.sample_hwm_and_reset();
             let mut conf_pipe = confirm_queues.content_snap();
             let (feed_ready, feed_inflight) = confirm_feed.size_snap();
+            conf_pipe.ready = ready_n;
             conf_pipe.feed_ready = feed_ready;
             conf_pipe.feed_inflight = feed_inflight;
             let work_sizes = st.structure_sizes();
@@ -928,7 +933,7 @@ pub async fn ibd_cancellable(
                 peers_n,
                 st.headers_done,
                 parent_cache_snap,
-                load_q,
+                ready_n,
                 script_q,
                 write_q,
                 conf_q_hwm,
@@ -947,8 +952,9 @@ pub async fn ibd_cancellable(
             // Do **not** WARN while feed has claims or lookup/load/scripts/write
             // queues hold work (post-rehydrate cold start used to spam tip stall with
             // ready=false even though load was live on tip+1).
+            // ready_n is inventory (BQ painted), not occupancy — a blacklist
+            // stall can sit with ready>0 and an idle pipeline.
             let conf_busy = feed_inflight > 0
-                || load_q > 0
                 || script_q > 0
                 || write_q > 0
                 || loop_stats.confirm_live_snap().is_some();

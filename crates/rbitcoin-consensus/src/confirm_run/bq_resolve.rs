@@ -248,7 +248,7 @@ mod tests {
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
             prod.contains("get_fk_by_txid_batch(&keys)"),
-            "wave must use TipOnly batch API"
+            "wave must use TipOnly 2-wave batch API (not a separate full-depth probe)"
         );
         assert!(
             !prod.contains("TxidResolveMode::TipThenAny"),
@@ -361,6 +361,78 @@ mod tests {
             "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
         );
         assert!(q.block_queue_is_resolve_complete(2));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Head occupied raced ahead of the fence: prune must keep in-flight so
+    /// stamp does not MissingPrevout (mainnet 929462).
+    #[test]
+    fn stamp_uses_inflight_when_fence_lags_occupied() {
+        use rbitcoin_query::{inflight_prune_cutoff, InFlightLayer, InFlightLog};
+        use rbitcoin_store::{OutputRecord, TxRecord};
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let parent_txid = [0x22u8; 32];
+        let parent_fk = rbitcoin_primitives::Fk(99);
+        let pin = std::sync::Arc::new((
+            TxRecord {
+                txid: parent_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: rbitcoin_primitives::Fk::NULL,
+                input_count: 1,
+                output_start_fk: rbitcoin_primitives::Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ));
+        let mut log = InFlightLog::new();
+        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]));
+        // Production prune_committed: occupied=99, fence empty (Class C not yet).
+        log.prune(inflight_prune_cutoff(99, 0));
+        let view = log.snapshot();
+        assert!(
+            view.get_create_fk(&parent_txid).is_some(),
+            "in-flight must survive occupied-ahead-of-fence prune"
+        );
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(
+                Txid::from_byte_array(parent_txid),
+                0,
+                Amount::from_sat(49_0000_0000),
+            )],
+        );
+        let pipe = crate::WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: view,
+            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+        };
+        let empty = rbitcoin_store::BqParentHits::default();
+        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
+            &q,
+            &params,
+            Milestone::NONE,
+            &items,
+            Some(&pipe),
+            Some(&empty),
+        )
+        .expect("in-flight parent must stamp when leftover TipOnly cannot see fence");
+        let plan = stamped.plan.expect("plan");
+        let spend = plan
+            .packed
+            .iter()
+            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+            .expect("spend");
+        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
+        assert_eq!(inp.create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&path);
     }
 

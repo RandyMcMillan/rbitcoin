@@ -6,8 +6,10 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop whole layers with `max_fk ≤ head_occupied`; rebuild only a
+//! **Prune:** drop whole layers with `max_fk ≤ cutoff`; rebuild only a
 //! straddling layer as a **new** Arc (body-ahead-of-head seal window).
+//! Cutoff is [`inflight_prune_cutoff`]: min(head occupied, fence-connected
+//! max fk). Occupied alone races head drain ahead of `height_fence_extend`.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -17,6 +19,15 @@ use crate::U64Map;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// In-flight prune HWM: both durable `tx.head` occupied **and** the height
+/// fence must accept the fk before TipOnly leftover will keep a hit.
+///
+/// `fence_max_connected_fk == 0` (empty fence) keeps every layer.
+#[inline]
+pub fn inflight_prune_cutoff(head_occupied: u64, fence_max_connected_fk: u64) -> u64 {
+    head_occupied.min(fence_max_connected_fk)
+}
 
 /// One planned pack's published creates (immutable after construction).
 #[derive(Debug, Clone)]
@@ -333,6 +344,30 @@ mod tests {
             assert!(v.get_out(id).is_none(), "drop {id}");
         }
         assert_eq!(log.entry_count(), 10);
+    }
+
+    /// Occupied can race ahead of the height fence (head drain ∥ Class C).
+    /// Cutoff must wait for both — occupied alone drops parents TipOnly
+    /// will not accept yet (mainnet 929462 leftover miss → blacklist).
+    #[test]
+    fn inflight_prune_cutoff_waits_for_fence() {
+        assert_eq!(inflight_prune_cutoff(100, 50), 50);
+        assert_eq!(inflight_prune_cutoff(100, 200), 100);
+        assert_eq!(
+            inflight_prune_cutoff(100, 0),
+            0,
+            "empty fence: keep all in-flight"
+        );
+        let mut log = InFlightLog::new();
+        let p = pin(42);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]));
+        log.prune(inflight_prune_cutoff(42, 0));
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "occupied-only prune would drop fk=42 before fence knows it"
+        );
+        log.prune(inflight_prune_cutoff(42, 42));
+        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
     }
 
     #[test]

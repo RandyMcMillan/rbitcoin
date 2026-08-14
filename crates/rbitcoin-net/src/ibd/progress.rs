@@ -38,7 +38,7 @@ pub(crate) struct ProgressLineInput {
     pub tip_rate: f64,
     pub tip_hole: usize,
     pub peers: usize,
-    /// Confirm pipeline depths already formatted (`loadq… scriptq… writeq…`).
+    /// Confirm pipeline depths already formatted (`ready=… scriptq… writeq…`).
     pub conf_q: String,
     pub txs: u64,
     pub horizon: u32,
@@ -317,7 +317,7 @@ mod tests {
             tip_rate: 12.5,
             tip_hole: 3,
             peers: 8,
-            conf_q: "loadq=1/2 scriptq=1/2 writeq=0/2".into(),
+            conf_q: "ready=1 scriptq=1/2 writeq=0/2".into(),
             txs: 50_000_000,
             horizon: 900_000,
             eta: "eta=18h".into(),
@@ -327,7 +327,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 loadq=1/2 scriptq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 ready=1 scriptq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
         );
         // Current schema tokens present.
         assert!(line.contains(" hole="), "{line}");
@@ -342,7 +342,7 @@ mod tests {
             !line.contains("pending_ram="),
             "no RAM overflow meter: {line}"
         );
-        assert!(line.contains("loadq"), "{line}");
+        assert!(line.contains("ready="), "{line}");
         assert!(line.contains("scriptq"), "{line}");
         // Retired dual-track progress tokens forbidden.
         assert!(
@@ -368,7 +368,7 @@ mod tests {
             tip_rate: 2.4,
             tip_hole: 0,
             peers: 1,
-            conf_q: "loadq<0/2 scriptq<0/2 writeq<0/2".into(),
+            conf_q: "ready=0 scriptq<0/2 writeq<0/2".into(),
             txs: 1,
             horizon: 1000,
             eta: "eta=?".into(),

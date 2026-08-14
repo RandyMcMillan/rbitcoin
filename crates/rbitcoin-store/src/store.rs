@@ -160,6 +160,11 @@ impl Store {
         self.height_fence.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Highest create_fk in a connected fence run (`0` if empty).
+    pub fn fence_max_connected_fk(&self) -> u64 {
+        self.fence().max_connected_fk()
+    }
+
     /// Connected create height from the RAM fence (`None` = unconnected / hole).
     pub fn tx_height_get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
         if tx_fk.is_null() {

@@ -37,12 +37,16 @@ jobs:
     name: musl
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # workflow_run is privileged (default-branch workflow + GITHUB_TOKEN).
+    # CodeQL actions/untrusted-checkout/critical requires an explicit same-repo
+    # check before checkout+run of head_sha (branch filter alone is not enough).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
-        contains(fromJSON('["master", "main"]'), github.event.workflow_run.head_branch)
+        contains(fromJSON('["master", "main"]'), github.event.workflow_run.head_branch) &&
+        github.event.workflow_run.head_repository.full_name == github.repository
       )
     env:
       # workflow_run.head_sha is the green commit. dispatch: input or tip.
@@ -52,6 +56,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.BUILD_REF }}
+          # Do not write GITHUB_TOKEN into .git — later steps run tree scripts.
+          persist-credentials: false
 
       # workflow_run's github.sha is the default-branch tip, not the green
       # commit. Name artifacts from the tree we actually built.

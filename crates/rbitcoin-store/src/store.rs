@@ -1,7 +1,8 @@
-use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable, TxHeightTable};
+use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
+use crate::height_fence::HeightFence;
 use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
@@ -22,21 +23,21 @@ pub struct Store {
     pub scripthash: ScriptHashTable,
     pub confirmed: ConfirmedTable,
     pub strong_tx: StrongTxTable,
-    /// Class C: tx_fk → create height (maturity; not a UTXO set).
-    pub tx_height: TxHeightTable,
     /// Class A: header_fk → tx list (archive before tip confirm).
     /// Confirmed heights resolve txs via `confirmed[h]` → this list.
     pub header_txs: HeaderTxsTable,
+    /// Resident create-height fence (confirmed[] + header_txs). No `tx_height.body`.
+    height_fence: std::sync::RwLock<HeightFence>,
     epoch: Mutex<ArchiveEpoch>,
 }
 
 /// How txid → Class A fk picks among rows with the same txid.
 ///
 /// Head probe is newest-first. A later **unconnected** row (rejected block)
-/// must not hide an older **connected** instance (`tx_height` Some).
+/// must not hide an older **connected** instance (height fence hit).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TxidResolveMode {
-    /// Connected instance only (`tx_height` set). Else `None`.
+    /// Connected instance only (fence height Some). Else `None`.
     /// Confirm stamp, structural spends, mempool "confirmed?", annotate.
     TipOnly,
     /// Connected if any, else newest unconnected Class A row (RPC / reconstruct).
@@ -65,8 +66,8 @@ impl Store {
             scripthash: ScriptHashTable::create(&path)?,
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
-            tx_height: TxHeightTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
+            height_fence: std::sync::RwLock::new(HeightFence::empty()),
             epoch: Mutex::new(epoch),
             path,
         })
@@ -86,9 +87,9 @@ impl Store {
         } else {
             ScriptHashTable::create(&path)?
         };
-        // Schema 13/14→15: empty Class A + empty SH may rewrite meta. Packed
+        // Schema 13/14→current: empty Class A + empty SH may rewrite meta. Packed
         // tx.body with creates, or a materialized SH index, is refused.
-        if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION == 15 {
+        if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION >= 15 {
             if scripthash.has_durable_index() {
                 return Err(StoreError::Corrupt(
                     "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
@@ -96,7 +97,7 @@ impl Store {
             }
             if class_a_has_creates(&path) {
                 return Err(StoreError::Corrupt(
-                    "schema 15 refuses packed Class A with creates; wipe datadir and redo IBD",
+                    "schema 16 refuses packed Class A with creates; wipe datadir and redo IBD",
                 ));
             }
             rewrite_meta_current(&path)?;
@@ -107,20 +108,28 @@ impl Store {
         } else {
             HeaderTxsTable::create(&path)?
         };
-        let tx_height = if path.join("tx_height.body").exists() {
-            TxHeightTable::open(&path)?
-        } else {
-            TxHeightTable::create(&path)?
-        };
+        let confirmed = ConfirmedTable::open(&path)?;
+        let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
+        // Schema 15 leftover: height is O(blocks) in the fence. Drop the 4 B/tx file.
+        let leftover_h = path.join("tx_height.body");
+        if leftover_h.exists() {
+            eprintln!(
+                "store: dropping leftover tx_height.body (schema 16 uses a RAM fence from header_txs)"
+            );
+            let _ = std::fs::remove_file(&leftover_h);
+        }
+        if meta_ver == 15 && SCHEMA_VERSION == 16 {
+            rewrite_meta_current(&path)?;
+        }
         Ok(Self {
             headers: HeaderTable::open(&path)?,
             txs: TxTable::open(&path)?,
             spenders: SpenderTable::open(&path)?,
             scripthash,
-            confirmed: ConfirmedTable::open(&path)?,
+            confirmed,
             strong_tx: StrongTxTable::open(&path)?,
-            tx_height,
             header_txs,
+            height_fence: std::sync::RwLock::new(height_fence),
             epoch: Mutex::new(epoch),
             path,
         })
@@ -141,6 +150,43 @@ impl Store {
 
     pub fn tip_height(&self) -> Option<Height> {
         self.confirmed.tip_height()
+    }
+
+    fn fence(&self) -> std::sync::RwLockReadGuard<'_, HeightFence> {
+        self.height_fence.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn fence_write(&self) -> std::sync::RwLockWriteGuard<'_, HeightFence> {
+        self.height_fence.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Connected create height from the RAM fence (`None` = unconnected / hole).
+    pub fn tx_height_get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
+        if tx_fk.is_null() {
+            return Err(StoreError::InvalidFk);
+        }
+        Ok(self.fence().height_of(tx_fk))
+    }
+
+    /// Rebuild the fence from `confirmed[]` + `header_txs` (open / tests).
+    pub fn rebuild_height_fence(&self) -> Result<(), StoreError> {
+        let f = HeightFence::from_confirmed(&self.confirmed, &self.header_txs)?;
+        *self.fence_write() = f;
+        Ok(())
+    }
+
+    /// After `confirmed[]` advanced: append this height’s Class A run.
+    pub fn height_fence_extend(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
+        let Some((first, n)) = self.header_txs.get_range(header_fk)? else {
+            return Ok(());
+        };
+        self.fence_write().extend(height.0, first, n);
+        Ok(())
+    }
+
+    /// After tip shrink: drop the disconnected height’s run.
+    pub fn height_fence_pop_tip(&self, height: Height) {
+        self.fence_write().pop_height(height.0);
     }
 
     /// Header write gate: unique by full hash; reject false `prev_fk` edges.
@@ -377,12 +423,12 @@ impl Store {
         Ok(())
     }
 
-    /// Bulk Class C create heights (confirm write). io_uring 4 B slot preads.
+    /// Bulk create heights from the RAM fence (confirm write / BIP68).
     pub fn tx_height_get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
-        self.tx_height.get_batch(fks)
+        Ok(self.fence().get_batch(fks))
     }
 
-    /// Among Class A rows for `txid`, prefer a connected fk (`tx_height` Some).
+    /// Among Class A rows for `txid`, prefer a connected fk (fence height Some).
     pub fn resolve_txid(
         &self,
         txid: &[u8; 32],
@@ -393,7 +439,7 @@ impl Store {
             return Ok(None);
         }
         let fks: Vec<Fk> = all.iter().map(|(fk, _)| *fk).collect();
-        let heights = self.tx_height.get_batch(&fks)?;
+        let heights = self.tx_height_get_batch(&fks)?;
         for (fk, h) in fks.iter().zip(heights.iter()) {
             if h.is_some() {
                 return Ok(Some(*fk));
@@ -513,9 +559,10 @@ impl Store {
         txids: &[[u8; 32]],
         mode: TxidResolveMode,
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+        let fence = self.fence();
         crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
             &self.txs,
-            &self.tx_height,
+            &fence,
             txids,
             matches!(mode, TxidResolveMode::TipOnly),
         )
@@ -756,15 +803,10 @@ impl Store {
 
     /// True if `tx_fk` is strong **and** sits on the confirmed tip chain.
     ///
-    /// Class C writes set `strong_tx` / `tx_height` before advancing `confirmed[]`
-    /// (tip is the commit point). After a hard kill mid-batch, strong bits may sit
-    /// above tip; those must not count as best-chain spent (else re-confirm of
-    /// tip+1 fails with PrevoutSpent).
-    ///
-    /// Height ≤ tip alone is insufficient: the tx must appear in `header_txs` of
-    /// `confirmed[height]`. A concurrent tip accept can leave a second Class A+C
-    /// copy with the same height but not linked from `confirmed[]` — those
-    /// orphans must not poison spentness.
+    /// Class C writes set `strong_tx` before advancing `confirmed[]` (tip is the
+    /// commit point). The height fence is rebuilt/extended only from confirmed
+    /// header_txs, so leftover strong bits above tip have no fence height and
+    /// do not count as best-chain spent.
     pub fn is_confirmed_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         self.is_confirmed_strong_at(tx_fk, tip)
@@ -776,18 +818,14 @@ impl Store {
         if !self.strong_tx.is_strong(tx_fk)? {
             return Ok(false);
         }
-        let Some(h) = self.tx_height.get(tx_fk)? else {
-            // Strong without height: partial Class C write; not tip-committed.
+        let Some(h) = self.fence().height_of(tx_fk) else {
+            // Strong without a confirmed run: partial Class C write or orphan.
             return Ok(false);
         };
         match tip {
-            Some(t) if h <= t => {}
-            _ => return Ok(false),
+            Some(t) if h <= t => Ok(true),
+            _ => Ok(false),
         }
-        let Some(header_fk) = self.confirmed.get(Height(h))? else {
-            return Ok(false);
-        };
-        self.header_body_contains(header_fk, tx_fk)
     }
 
     /// True if `tx_fk` is in the Class A body association for `header_fk`.
@@ -868,110 +906,33 @@ impl Store {
         Ok(out)
     }
 
-    /// Clear `strong_tx` + `tx_height` for txs whose height is above the confirmed tip.
+    /// Unstrong every fk that is strong but not on the confirmed fence.
     ///
-    /// Heals partial Class C from a hard kill (`kill -9` / power loss) between
-    /// marking spends strong and advancing `confirmed[]`. Point multimap rows are
-    /// left in place (archive-shaped); they stay invisible to [`Self::spenders`]
-    /// until the spending tx is re-confirmed. Returns the number of txs cleared.
+    /// Covers leftover strong above tip (kill mid-confirm) and orphan second
+    /// Class A+C copies (not in `confirmed[h]` header_txs). Point rows stay;
+    /// they remain invisible to [`Self::spenders`] until re-confirm.
     pub fn repair_class_c_above_tip(&self) -> Result<u64, StoreError> {
-        let tip_max = self.confirmed.tip_height().map(|t| t.0);
-        // Collect runs first so we do not hold tx_height scan state while clearing.
-        let mut runs: Vec<(u64, u64)> = Vec::new(); // (start_id inclusive, end_id exclusive)
-        let mut run_start: Option<u64> = None;
-        let mut run_end: u64 = 0;
-        self.tx_height.for_each_set(|tx_fk, h| {
-            let above = match tip_max {
-                Some(tip) => h > tip,
-                None => true, // no tip: any height is uncommitted Class C
-            };
-            let id = match tx_fk.get() {
-                Some(i) => i,
-                None => return Ok(()),
-            };
-            if !above {
-                if let Some(s) = run_start.take() {
-                    runs.push((s, run_end));
-                }
-                return Ok(());
-            }
-            match run_start {
-                Some(_) if id == run_end => {
-                    run_end = id + 1;
-                }
-                Some(s) => {
-                    runs.push((s, run_end));
-                    run_start = Some(id);
-                    run_end = id + 1;
-                }
-                None => {
-                    run_start = Some(id);
-                    run_end = id + 1;
-                }
-            }
-            Ok(())
-        })?;
-        if let Some(s) = run_start {
-            runs.push((s, run_end));
-        }
-        let mut cleared = 0u64;
-        for (start, end) in runs {
-            if end <= start {
-                continue;
-            }
-            let count = end - start;
-            cleared += count;
-            if count <= u64::from(u32::MAX) {
-                let n = count as u32;
-                self.strong_tx.set_unstrong_range(Fk(start), n)?;
-                self.tx_height.clear_range(Fk(start), n)?;
-            } else {
-                for id in start..end {
-                    self.strong_tx.set_unstrong(Fk(id))?;
-                    self.tx_height.clear(Fk(id))?;
-                }
-            }
-        }
-        Ok(cleared)
+        self.repair_strong_not_on_fence()
     }
 
-    /// Clear `strong_tx` + `tx_height` for Class C at `h ≤ tip` not in
-    /// `header_txs` of `confirmed[h]` (orphan second Class A+C copy).
-    ///
-    /// Complements [`Self::repair_class_c_above_tip`] (`h > tip` only).
+    /// Same as [`Self::repair_class_c_above_tip`] (fence is the only height oracle).
     pub fn repair_orphan_class_c(&self) -> Result<u64, StoreError> {
-        let Some(tip) = self.confirmed.tip_height().map(|t| t.0) else {
-            return Ok(0);
-        };
-        // Precompute contiguous body ranges for 0..=tip (O(tip) once; membership O(1)).
-        let mut ranges: Vec<Option<(u64, u64)>> = Vec::with_capacity(tip as usize + 1);
-        for h in 0..=tip {
-            let r = match self.confirmed.get(Height(h))? {
-                Some(hfk) => self
-                    .header_txs
-                    .get_range(hfk)?
-                    .and_then(|(f, n)| f.get().map(|lo| (lo, lo.saturating_add(u64::from(n))))),
-                None => None,
-            };
-            ranges.push(r);
-        }
+        self.repair_strong_not_on_fence()
+    }
+
+    fn repair_strong_not_on_fence(&self) -> Result<u64, StoreError> {
         let mut to_clear: Vec<u64> = Vec::new();
-        self.tx_height.for_each_set(|tx_fk, h| {
-            if h > tip {
-                return Ok(());
-            }
-            let Some(id) = tx_fk.get() else {
-                return Ok(());
-            };
-            let in_body = match ranges.get(h as usize).and_then(|o| o.as_ref()) {
-                Some(&(lo, hi)) => id >= lo && id < hi,
-                None => false,
-            };
-            if !in_body {
-                to_clear.push(id);
-            }
-            Ok(())
-        })?;
+        {
+            let fence = self.fence();
+            self.strong_tx.for_each_strong(|fk| {
+                if fence.height_of(fk).is_none() {
+                    if let Some(id) = fk.get() {
+                        to_clear.push(id);
+                    }
+                }
+                Ok(())
+            })?;
+        }
         if to_clear.is_empty() {
             return Ok(0);
         }
@@ -998,13 +959,10 @@ impl Store {
         }
         let count = end - start;
         if count <= u64::from(u32::MAX) {
-            let n = count as u32;
-            self.strong_tx.set_unstrong_range(Fk(start), n)?;
-            self.tx_height.clear_range(Fk(start), n)?;
+            self.strong_tx.set_unstrong_range(Fk(start), count as u32)?;
         } else {
             for id in start..end {
                 self.strong_tx.set_unstrong(Fk(id))?;
-                self.tx_height.clear(Fk(id))?;
             }
         }
         Ok(count)
@@ -1012,16 +970,14 @@ impl Store {
 
     /// Flush Class C **except** `confirmed[]` (pre-tip half of the barrier).
     ///
-    /// Order: `strong_tx` → `tx_height` → `header_txs`. Used so a mid-barrier
-    /// kill can leave strong/height durable **above** tip (repairable) without
-    /// advancing tip. Prefer [`Self::flush_class_c_tip`] for the full barrier.
+    /// Order: `strong_tx` → `header_txs`. Used so a mid-barrier kill can leave
+    /// strong durable **above** tip (repairable) without advancing tip. Prefer
+    /// [`Self::flush_class_c_tip`] for the full barrier.
     pub fn flush_class_c_pre_tip(&self) -> Result<(), StoreError> {
         // Tip-as-commit: never flush confirmed here.
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
         self.strong_tx.flush()?;
-        // tx_height is L0 write-through; still fsync HWM/payload.
-        self.tx_height.flush()?;
         self.header_txs.flush()?;
         Ok(())
     }
@@ -1031,16 +987,16 @@ impl Store {
     /// Complete-or-fail per table. Call **before** body-queue dequeue so a kill
     /// mid-commit can re-drive from BQ when the barrier had not finished.
     ///
-    /// **Tip last on connect:** if `confirmed` were durable before `strong_tx` /
-    /// `tx_height`, a mid-barrier kill advances tip with missing strong bits;
-    /// re-confirm skips those heights and `repair_class_c_above_tip` only clears
-    /// **above** tip — permanent unstrong tip txs.
+    /// **Tip last on connect:** if `confirmed` were durable before `strong_tx`,
+    /// a mid-barrier kill advances tip with missing strong bits; re-confirm
+    /// skips those heights and `repair_class_c_above_tip` only clears leftover
+    /// strong not on the fence — permanent unstrong tip txs.
     ///
     /// After confirmed is durable, publish soft [`crate::TIP_SEAL_NAME`] so open
     /// can clamp an incomplete extension that never finished this barrier.
     pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
         self.flush_class_c_pre_tip()?;
-        // Commit point on disk: tip advance only after strong/height/header_txs.
+        // Commit point on disk: tip advance only after strong/header_txs.
         self.confirmed.flush()?;
         self.publish_tip_seal()?;
         Ok(())
@@ -1049,18 +1005,17 @@ impl Store {
     /// Flush only `confirmed[]` (tip length / tip header map).
     ///
     /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
-    /// unstrong / `tx_height` clears. Do not use for connect (would tip-first).
+    /// unstrong. Do not use for connect (would tip-first).
     pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
         self.confirmed.flush()?;
         self.publish_tip_seal()?;
         Ok(())
     }
 
-    /// Class C **disconnect** post-clear barrier: strong + height after tip already
+    /// Class C **disconnect** post-clear barrier: strong after tip already
     /// shrunk and flushed via [`Self::flush_confirmed_only`].
     pub fn flush_class_c_after_disconnect_tip(&self) -> Result<(), StoreError> {
         self.strong_tx.flush()?;
-        self.tx_height.flush()?;
         // header_txs unchanged on disconnect (archive association remains).
         Ok(())
     }
@@ -1302,8 +1257,7 @@ mod tests {
         assert_eq!(fks.len(), 2);
         s.header_txs.put_range(hfk, fks[0], 2).unwrap();
         s.confirmed.set(Height(0), hfk).unwrap();
-        s.tx_height.set(fks[0], Height(0)).unwrap();
-        s.tx_height.set(fks[1], Height(0)).unwrap();
+        s.rebuild_height_fence().unwrap();
 
         let map = s.coinbase_fk_at_heights(&[0, 1, 99]).unwrap();
         assert_eq!(map.get(&0).copied(), Some(fks[0]));
@@ -1475,7 +1429,7 @@ mod tests {
             .put_range(hfk, Fk(body_first), (body_last - body_first + 1) as u32)
             .unwrap();
         s.strong_tx.set_strong(spend_fk, hfk).unwrap();
-        s.tx_height.set(spend_fk, Height(0)).unwrap();
+        s.rebuild_height_fence().unwrap();
         assert!(s.is_confirmed_strong(spend_fk).unwrap());
         assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
         assert!(s
@@ -1510,9 +1464,8 @@ mod tests {
         s.finalize_through(0).unwrap();
         assert_eq!(s.epoch().finalized_height, Some(0));
 
-        // repair: strong above tip
+        // repair: strong not on the fence
         s.strong_tx.set_strong(spend2_fk, hfk).unwrap();
-        s.tx_height.set(spend2_fk, Height(99)).unwrap();
         let cleared = s.repair_class_c_above_tip().unwrap();
         assert!(cleared >= 1);
         assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
@@ -1707,7 +1660,7 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert!(!s.scripthash.has_durable_index());
         drop(s);
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
 
         let s = Store::open(&dir).unwrap();
@@ -1787,13 +1740,13 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
             assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
 
             // In-RAM tip extension (height 1) + strong for new txs — no full barrier.
             s.strong_tx.set_strong_range(Fk(2), 3, Fk(2)).unwrap();
-            s.tx_height.set_range(Fk(2), 3, Height(1)).unwrap();
+            s.header_txs.put_range(Fk(2), Fk(2), 3).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             // Mid-barrier: strong/height durable, confirmed still unflushed.
             s.flush_class_c_pre_tip().unwrap();
@@ -1831,13 +1784,13 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
 
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
-            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
         }
         let s = Store::open(&dir).unwrap();
@@ -1863,10 +1816,10 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
 
-            // New tip height only — intentionally skip strong/height (hazard).
+            // New tip height only — intentionally skip strong (hazard).
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             s.confirmed.flush().unwrap(); // tip durable without strong
         }
@@ -1891,18 +1844,17 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
-            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
             assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
 
             // Disconnect tip-first: shrink tip + flush confirmed only (kill before unstrong).
             s.confirmed.disconnect_tip(Height(1)).unwrap();
             s.flush_confirmed_only().unwrap();
-            // Do not unstrong / clear height — simulate kill mid-disconnect.
+            // Do not unstrong — simulate kill mid-disconnect.
         }
         let s = Store::open(&dir).unwrap();
         assert_eq!(
@@ -1910,10 +1862,8 @@ mod tests {
             Some(Height(0)),
             "tip shrink must be durable after flush_confirmed_only"
         );
-        // Strong may still mark height-1 txs; they are above tip.
-        assert!(
-            s.strong_tx.is_strong(Fk(2)).unwrap() || s.tx_height.get(Fk(2)).unwrap() == Some(1)
-        );
+        // Strong may still mark height-1 txs; they are not on the new fence.
+        assert!(s.strong_tx.is_strong(Fk(2)).unwrap());
         let cleared = s.repair_class_c_above_tip().unwrap();
         assert!(
             cleared >= 1,
@@ -1933,25 +1883,24 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
             s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
-            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
 
             // Production disconnect order (store half).
             s.confirmed.disconnect_tip(Height(1)).unwrap();
             s.flush_confirmed_only().unwrap();
             s.strong_tx.set_unstrong_range(Fk(2), 2).unwrap();
-            s.tx_height.clear_range(Fk(2), 2).unwrap();
+            s.height_fence_pop_tip(Height(1));
             s.flush_class_c_after_disconnect_tip().unwrap();
         }
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
         assert!(s.is_confirmed_strong(Fk(1)).unwrap());
         assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
-        assert_eq!(s.tx_height.get(Fk(2)).unwrap(), None);
+        assert_eq!(s.tx_height_get(Fk(2)).unwrap(), None);
         assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1965,16 +1914,13 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
             s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-            s.tx_height.set(Fk(1), Height(0)).unwrap();
             s.confirmed.set(Height(1), Fk(2)).unwrap();
             s.header_txs.put_range(Fk(2), Fk(2), 1).unwrap();
             s.strong_tx.set_strong(Fk(2), Fk(2)).unwrap();
-            s.tx_height.set(Fk(2), Height(1)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.flush_class_c_tip().unwrap();
 
-            // Bad order: clear height (L0 write-through) while tip still 1.
-            s.tx_height.clear(Fk(2)).unwrap();
-            s.tx_height.flush().unwrap();
+            // Bad order: unstrong while tip still 1.
             s.strong_tx.set_unstrong(Fk(2)).unwrap();
             s.strong_tx.flush().unwrap();
             // Tip still 1 on disk — kill before confirmed.truncate.
@@ -1998,10 +1944,9 @@ mod tests {
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
         s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
-        s.tx_height.set_range(Fk(1), 2, Height(0)).unwrap();
-        // Orphan second copy: txs 3..=4 strong at same height, not in header_txs.
+        s.rebuild_height_fence().unwrap();
+        // Orphan second copy: txs 3..=4 strong, not in header_txs.
         s.strong_tx.set_strong_range(Fk(3), 2, Fk(99)).unwrap();
-        s.tx_height.set_range(Fk(3), 2, Height(0)).unwrap();
         s.flush_class_c_tip().unwrap();
 
         assert!(s.is_confirmed_strong(Fk(1)).unwrap());
@@ -2015,7 +1960,7 @@ mod tests {
         let n = s.repair_orphan_class_c().unwrap();
         assert!(n >= 2, "cleared={n}");
         assert!(!s.strong_tx.is_strong(Fk(3)).unwrap());
-        assert_eq!(s.tx_height.get(Fk(3)).unwrap(), None);
+        assert_eq!(s.tx_height_get(Fk(3)).unwrap(), None);
         assert!(s.is_confirmed_strong(Fk(1)).unwrap());
         assert_eq!(s.repair_orphan_class_c().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2032,22 +1977,19 @@ mod tests {
             s.confirmed.set(Height(0), Fk(1)).unwrap();
             s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
             s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
-            s.tx_height.set_range(Fk(1), 2, Height(0)).unwrap();
+            s.rebuild_height_fence().unwrap();
             s.strong_tx.set_strong(Fk(5), Fk(99)).unwrap();
-            s.tx_height.set(Fk(5), Height(0)).unwrap();
             s.strong_tx.set_strong(Fk(10), Fk(99)).unwrap();
-            s.tx_height.set(Fk(10), Height(0)).unwrap();
             s.flush_class_c_tip().unwrap();
             let n = s.repair_orphan_class_c().unwrap();
             assert_eq!(n, 2, "cleared gapped orphans");
             assert!(!s.strong_tx.is_strong(Fk(5)).unwrap());
             assert!(!s.strong_tx.is_strong(Fk(10)).unwrap());
             assert!(s.is_confirmed_strong(Fk(1)).unwrap());
-            // Height above tip is left for repair_class_c_above_tip.
+            // Strong not on the fence (same repair as above-tip leftovers).
             s.strong_tx.set_strong(Fk(20), Fk(1)).unwrap();
-            s.tx_height.set(Fk(20), Height(9)).unwrap();
-            assert_eq!(s.repair_orphan_class_c().unwrap(), 0);
-            assert!(s.strong_tx.is_strong(Fk(20)).unwrap());
+            assert_eq!(s.repair_class_c_above_tip().unwrap(), 1);
+            assert!(!s.strong_tx.is_strong(Fk(20)).unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2117,7 +2059,9 @@ mod tests {
             s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
             None
         );
-        s.tx_height.set(old, Height(5)).unwrap();
+        s.header_txs.put_range(Fk(1), old, 1).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.rebuild_height_fence().unwrap();
         assert_eq!(
             s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
             Some(old),
@@ -2135,6 +2079,37 @@ mod tests {
             .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
             .unwrap();
         assert_eq!(batch_any[0].1.map(|(f, _)| f), Some(old));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema16_create_does_not_write_tx_height_and_fence_has_reorg_holes() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        assert!(
+            !dir.join("tx_height.body").exists(),
+            "schema 16 must not create tx_height.body"
+        );
+        s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        // Discarded block used fks 3..=5 under header 2 (not confirmed).
+        s.header_txs.put_range(Fk(2), Fk(3), 3).unwrap();
+        s.header_txs.put_range(Fk(3), Fk(6), 2).unwrap();
+        s.confirmed.set(Height(1), Fk(3)).unwrap();
+        s.rebuild_height_fence().unwrap();
+        assert_eq!(s.tx_height_get(Fk(1)).unwrap(), Some(0));
+        assert_eq!(s.tx_height_get(Fk(3)).unwrap(), None);
+        assert_eq!(s.tx_height_get(Fk(5)).unwrap(), None);
+        assert_eq!(s.tx_height_get(Fk(6)).unwrap(), Some(1));
+        s.flush().unwrap();
+        drop(s);
+        assert!(!dir.join("tx_height.body").exists());
+        // Leftover 15 file is unlinked on open.
+        std::fs::write(dir.join("tx_height.body"), b"junk").unwrap();
+        let s = Store::open(&dir).unwrap();
+        assert!(!dir.join("tx_height.body").exists());
+        assert_eq!(s.tx_height_get(Fk(5)).unwrap(), None);
+        assert_eq!(s.tx_height_get(Fk(6)).unwrap(), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

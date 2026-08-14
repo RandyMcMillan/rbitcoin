@@ -96,8 +96,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         let create_height = self
             .query
             .store()
-            .tx_height
-            .get(fk)
+            .tx_height_get(fk)
             .ok()
             .flatten()
             .unwrap_or(0);

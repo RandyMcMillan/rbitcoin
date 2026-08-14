@@ -1025,7 +1025,7 @@ struct HeightByHashIndex {
 impl Query {
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
         let store = Store::open_or_create(store_path.as_ref())?;
-        // Heal strong_tx / tx_height written above confirmed tip (kill -9 mid Class C).
+        // Heal strong bits written above confirmed tip (kill -9 mid Class C).
         // Tip-bound spenders already ignore those rows; this restores is_strong parity.
         let repaired = store.repair_class_c_above_tip()?;
         if repaired > 0 {
@@ -1039,10 +1039,9 @@ impl Query {
         let orphan = store.repair_orphan_class_c()?;
         if orphan > 0 {
             eprintln!(
-                "rbitcoin: repaired {orphan} orphan Class C tx rows (strong/height not on confirmed header_txs)"
+                "rbitcoin: repaired {orphan} orphan Class C tx rows (strong not on confirmed header_txs)"
             );
             let _ = store.strong_tx.flush();
-            let _ = store.tx_height.flush();
         }
         // Core checkblocks-style tip window (structure + Class A merkle) before
         // any P2P tip extension. Shrinks tip / clears bad bodies on failure.
@@ -1167,7 +1166,7 @@ impl Query {
         self.lookup_tx_fk(txid)
     }
 
-    /// Confirm / spentness: connected instance only (`tx_height` Some).
+    /// Confirm / spentness: connected instance only (height fence Some).
     pub fn tx_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if self.tx_index_enabled() {
             return Ok(self.store.get_fk_by_txid_tip(txid)?);

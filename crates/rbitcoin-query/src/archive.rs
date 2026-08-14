@@ -276,8 +276,8 @@ impl Query {
     ///
     /// **Idempotent**: if a body is already stored for `header_fk`, skips the
     /// write and warms the process txid→fk cache. Multi-peer block delivery
-    /// must not re-append Class A txs — that would orphan `tx_height`/`strong`
-    /// on the previous fks (signet tip stuck at 2148: coinbase missing tx_height).
+    /// must not re-append Class A txs — that would orphan `header_txs`/`strong`
+    /// on the previous fks (signet tip stuck at 2148: coinbase missing height).
     pub fn archive_prepared_with_fks(
         &self,
         items: &mut [(Fk, HeaderRecord, Vec<TxApply>)],
@@ -296,7 +296,7 @@ impl Query {
                 continue;
             }
             if self.store.header_txs.has_body(*fk)? {
-                // Keep existing first_tx_fk / tx_height / strong alignment.
+                // Keep existing first_tx_fk / fence / strong alignment.
                 let _ = std::mem::take(txs);
                 continue;
             }

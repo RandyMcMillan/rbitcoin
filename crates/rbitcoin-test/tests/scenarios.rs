@@ -632,7 +632,7 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
 
 /// Single scenario covering the signet @2148 failure class and IBD:
 /// - archive bodies out of height order (ahead of tip)
-/// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
+/// - re-archive / mega-batch duplicate is idempotent (fk + create height stable)
 /// - Direct: live `tx.head` + durable spend annotations on confirm
 /// - coinbase maturity then spend still connects
 #[test]
@@ -696,9 +696,9 @@ fn ibd_parallel_archive_idempotent_confirm_direct() {
     // Second peer delivery after confirm: still idempotent.
     accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
     assert_eq!(
-        q.store().tx_height.get(fks_before[0]).unwrap(),
+        q.store().tx_height_get(fks_before[0]).unwrap(),
         Some(1),
-        "tx_height must remain on first-archive fks"
+        "create height must remain on first-archive fks"
     );
     confirm_archived_at(&q, &params, Height(2), &b2.block_hash().to_byte_array(), ms).unwrap();
 
@@ -826,7 +826,7 @@ fn confirm_with_spend_index_ignores_archive_only_point_edges() {
     );
 }
 
-/// Simulate kill -9 mid Class C: strong_tx + tx_height + point edges written for
+/// Simulate kill -9 mid Class C: strong_tx + point edges written for
 /// tip+1 but `confirmed[]` not advanced. Re-confirm must not false-positive
 /// PrevoutSpent (tip is the Class C commit point).
 #[test]
@@ -876,7 +876,7 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     let tx_fks = q.store().header_txs.get_list(header_fk).unwrap().unwrap();
     assert!(tx_fks.len() >= 2, "coinbase + spend");
 
-    // --- Partial Class C (confirm_blocks_run writes strong/tx_height before tip) ---
+    // --- Partial Class C (confirm_blocks_run writes strong before tip) ---
     // Archive already wrote point edges (spend_index on); the kill-9 window is
     // strong bits without confirmed[] advance — old spenders() treated that as spent.
     let first = tx_fks[0];
@@ -884,11 +884,7 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
         .strong_tx
         .set_strong_range(first, tx_fks.len() as u32, header_fk)
         .unwrap();
-    q.store()
-        .tx_height
-        .set_range(first, tx_fks.len() as u32, Height(spend_h))
-        .unwrap();
-    // Tip intentionally NOT advanced.
+    // Tip intentionally NOT advanced (fence still at old tip).
     assert_eq!(q.tip_height(), Some(tip_before));
     assert!(
         q.store().strong_tx.is_strong(tx_fks[1]).unwrap(),
@@ -932,10 +928,6 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     q.store()
         .strong_tx
         .set_strong_range(fks2[0], fks2.len() as u32, hfk2)
-        .unwrap();
-    q.store()
-        .tx_height
-        .set_range(fks2[0], fks2.len() as u32, Height(spend_h + 1))
         .unwrap();
     q.flush().unwrap();
     drop(q);

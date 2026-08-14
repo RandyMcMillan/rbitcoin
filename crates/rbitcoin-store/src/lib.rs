@@ -20,6 +20,7 @@ mod hashhead;
 mod head_resolve_denserels;
 pub mod head_resolve_stats;
 mod header_table;
+mod height_fence;
 mod ibd_io_policy;
 mod idx_body_pipeline;
 mod int_map;
@@ -69,6 +70,7 @@ pub use file::{
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
+pub use height_fence::{FenceRun, HeightFence};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};

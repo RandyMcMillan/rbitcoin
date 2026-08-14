@@ -858,7 +858,7 @@ impl ScriptCheckJob {
 ///
 /// [`AssembleMode::Optimistic`] (confirm IBD path): no durable spentness / maturity /
 /// BIP68 create-height resolution — those run in [`structural_validate_spends`] after
-/// scripts (load must not walk `tx_height` per parent). Absolute nLockTime finality
+/// scripts (load must not walk create height per parent). Absolute nLockTime finality
 /// (BIP113 MTP of prev block) still runs here — it only needs header MTP.
 /// [`AssembleMode::Full`]: spentness + maturity + BIP68 during the walk (legacy).
 ///
@@ -1159,7 +1159,7 @@ fn assemble_block_prevouts_mode(
             if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
                 return Err(ConsensusError::BadTx("not final"));
             }
-            // BIP68 relative locks need per-input create heights (`tx_height`).
+            // BIP68 relative locks need per-input create heights (fence).
             // Optimistic/confirm defers that IO to structural write; Full does it here.
             // Reuse the same prev-block MTP as BIP113 when CSV is active (already
             // computed once as lock_time_cutoff for height > 0).
@@ -1301,7 +1301,7 @@ pub(crate) struct StructuralPhaseNs {
 /// write-local across a multi-height run.
 ///
 /// **BIP68** create-height lives here (not optimistic load assemble) so confirm
-/// load does not walk `tx_height` for every parent. Heights: bulk `tx_height`.
+/// load does not walk create height for every parent. Heights: bulk fence.
 /// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
 /// **Spentness:** pin denserels → abs + bulk 9-byte meta. Sparse durable-**spent**
@@ -1365,8 +1365,7 @@ pub(crate) fn structural_validate_spends(
             // already-confirmed fixture). BIP30 is an earlier unspent sibling.
             if query
                 .store()
-                .tx_height
-                .get(old_fk)
+                .tx_height_get(old_fk)
                 .map_err(ConsensusError::from)?
                 == Some(ctx.height.0)
             {
@@ -1499,13 +1498,11 @@ pub(crate) fn structural_validate_spends(
             // corruption), do not soft-recover via wire re-check.
             let create_h = query
                 .store()
-                .tx_height
-                .get(rbitcoin_primitives::Fk(id))
+                .tx_height_get(rbitcoin_primitives::Fk(id))
                 .map_err(ConsensusError::from)?;
             let spend_h = query
                 .store()
-                .tx_height
-                .get(field)
+                .tx_height_get(field)
                 .map_err(ConsensusError::from)?;
             if let (Some(ch), Some(sh)) = (create_h, spend_h) {
                 if sh < ch {
@@ -1558,7 +1555,7 @@ pub(crate) fn structural_validate_spends(
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
     // ── Create height + coinbase maturity (durable Class C only) ──────────
-    // Heights: bulk `tx_height`. Coinbase: create_fk == first_tx_fk of block at
+    // Heights: bulk fence. Coinbase: create_fk == first_tx_fk of block at
     // that height — **never** `tx.body`. Pin may short-circuit non-coinbase.
     let t_create = Instant::now();
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
@@ -1888,7 +1885,7 @@ fn resolve_prevout(
     // Height of the block being validated (same-block BIP68 coin height).
     spend_height: u32,
     // When false (optimistic confirm load): only prevout value/script — no
-    // `tx_height` / coinbase body walks. BIP68 + maturity run in structural.
+    // height fence / coinbase body walks. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
@@ -2101,8 +2098,7 @@ fn create_height_for_fk(
     }
     Ok(query
         .store()
-        .tx_height
-        .get(prev_fk)
+        .tx_height_get(prev_fk)
         .map_err(ConsensusError::from)?
         .unwrap_or(0))
 }
@@ -2131,11 +2127,10 @@ fn coinbase_height_for_maturity(
     if cb_h.is_some() {
         return Ok(cb_h);
     }
-    // Last resort: durable tx_height.
+    // Last resort: height fence.
     Ok(query
         .store()
-        .tx_height
-        .get(prev_fk)
+        .tx_height_get(prev_fk)
         .map_err(ConsensusError::from)?)
 }
 
@@ -2164,8 +2159,7 @@ fn coinbase_info(
         }
         let h = query
             .store()
-            .tx_height
-            .get(prev_fk)
+            .tx_height_get(prev_fk)
             .map_err(ConsensusError::from)?;
         if h.is_some() {
             cache.insert(prev_fk, h);
@@ -2180,8 +2174,7 @@ fn coinbase_info(
     let h = if is_cb {
         query
             .store()
-            .tx_height
-            .get(prev_fk)
+            .tx_height_get(prev_fk)
             .map_err(ConsensusError::from)?
     } else {
         None

@@ -664,7 +664,7 @@ impl TableFile {
     ///
     /// Skips entirely when no payload write has occurred since the last
     /// successful sync (Class C tip barrier: avoid fsyncing multi‑GiB tables
-    /// that were not dirtied this batch — e.g. `tx_height` ~1.8 GiB).
+    /// that were not dirtied this batch).
     pub fn flush(&self) -> Result<(), StoreError> {
         if !self.needs_sync.load(Ordering::Acquire) {
             return Ok(());

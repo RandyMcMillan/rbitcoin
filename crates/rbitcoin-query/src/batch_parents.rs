@@ -29,7 +29,7 @@
 //! **Sparse:** only spent need-vouts + layout fields write/assemble need (not
 //! full parent output sets). Vout merge when a later batch spends more outs.
 //!
-//! Create heights are not stashed — write re-reads Class C `tx_height`.
+//! Create heights are not stashed — write re-reads the height fence.
 
 use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;

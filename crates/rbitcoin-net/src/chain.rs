@@ -1284,21 +1284,14 @@ mod tests {
             .unwrap();
         let tip_set: std::collections::HashSet<u64> =
             tip_fks.iter().filter_map(|f| f.get()).collect();
-        hub.query
-            .store()
-            .tx_height
-            .for_each_set(|fk, h| {
-                if h == 1 {
-                    let id = fk.get().unwrap();
-                    assert!(
-                        tip_set.contains(&id),
-                        "orphan Class C fk={id} at tip height not in header_txs"
-                    );
-                    assert!(hub.query.store().is_confirmed_strong(fk).unwrap());
-                }
-                Ok(())
-            })
-            .unwrap();
+        for &fk in &tip_fks {
+            let id = fk.get().unwrap();
+            assert!(
+                tip_set.contains(&id),
+                "orphan Class C fk={id} at tip height not in header_txs"
+            );
+            assert!(hub.query.store().is_confirmed_strong(fk).unwrap());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -92,7 +92,7 @@ Deep layout: [`SCHEMA.md`](../SCHEMA.md). Crash / tip commit:
 |-------|------|----------------|
 | **A** | Canonical archive: headers, split txs (`txout` / `inwit` / `spent` + `txid.body` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
 | **B** | Forever-open indexes (e.g. Electrum scripthash) | Append + head updates; may grow forever per key |
-| **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, `tx_height` | Tip advance is the **commit**; may lead/lag slightly across crash |
+| **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, height fence | Tip advance is the **commit**; may lead/lag slightly across crash |
 
 Spend model: **do not rewrite old output rows** as a UTXO set. Spends are
 recorded as annotations (and rare multi-spender lists), with best-chain

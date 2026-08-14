@@ -177,7 +177,7 @@ impl Query {
         create_tx_fk: rbitcoin_primitives::Fk,
     ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
         let (create, outs) = self.store.get_tx_meta_and_outputs(create_tx_fk)?;
-        let height = self.store.tx_height.get(create_tx_fk)?.unwrap_or(0);
+        let height = self.store.tx_height_get(create_tx_fk)?.unwrap_or(0);
         let mut out = Vec::new();
         for (vout, o) in outs.into_iter().enumerate() {
             if script_hash(&o.script) != *scripthash {
@@ -255,7 +255,7 @@ impl Query {
                         continue;
                     }
                     let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
-                    let spend_h = self.store.tx_height.get(p.spending_tx_fk)?.unwrap_or(0);
+                    let spend_h = self.store.tx_height_get(p.spending_tx_fk)?.unwrap_or(0);
                     if let Some(to) = to_excl {
                         if i64::from(spend_h) >= to {
                             continue;

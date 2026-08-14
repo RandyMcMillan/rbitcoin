@@ -15,7 +15,7 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
     if !confirmed {
         return Ok(json!({ "confirmed": false }));
     }
-    let height = query.store().tx_height.get(tx_fk)?.unwrap_or(0);
+    let height = query.store().tx_height_get(tx_fk)?.unwrap_or(0);
     let mut out = json!({
         "confirmed": true,
         "block_height": height,

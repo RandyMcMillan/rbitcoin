@@ -65,7 +65,7 @@ fn main() {
                         vout
                     );
                     for p in &strong {
-                        let th = q.store().tx_height.get(p.spending_tx_fk).unwrap();
+                        let th = q.store().tx_height_get(p.spending_tx_fk).unwrap();
                         let is = q.store().strong_tx.is_strong(p.spending_tx_fk).unwrap();
                         let cs = q.store().is_confirmed_strong(p.spending_tx_fk).unwrap();
                         let stx = q.store().get_tx(p.spending_tx_fk).ok();
@@ -89,7 +89,7 @@ fn main() {
                         raw.len()
                     );
                     for p in raw.iter().take(4) {
-                        let th = q.store().tx_height.get(p.spending_tx_fk).unwrap();
+                        let th = q.store().tx_height_get(p.spending_tx_fk).unwrap();
                         let is = q.store().strong_tx.is_strong(p.spending_tx_fk).unwrap();
                         let cs = q.store().is_confirmed_strong(p.spending_tx_fk).unwrap();
                         eprintln!(
@@ -107,19 +107,19 @@ fn main() {
     let tip_h = tip.0;
     let mut above = 0u64;
     q.store()
-        .tx_height
-        .for_each_set(|fk, h| {
-            if h > tip_h {
+        .strong_tx
+        .for_each_strong(|fk| {
+            let h = q.store().tx_height_get(fk).unwrap();
+            if h.map(|hh| hh > tip_h).unwrap_or(true) {
                 above += 1;
                 if above <= 5 {
-                    let is = q.store().strong_tx.is_strong(fk).unwrap();
-                    eprintln!("  above-tip fk={} h={h} is_strong={is}", fk.0);
+                    eprintln!("  not-on-fence-or-above fk={} h={h:?}", fk.0);
                 }
             }
             Ok(())
         })
         .unwrap();
-    eprintln!("tx_height entries with h > tip: {above}");
+    eprintln!("strong fks with no fence height or h > tip: {above}");
 
     let params = ChainParams::signet();
     let ms = Milestone::NONE;

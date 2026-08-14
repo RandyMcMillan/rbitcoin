@@ -258,7 +258,8 @@ double-hash within the page (one 4 KiB IO @ 4 B). Capacity ends at
 (~9 bits/key) then opens a new segment (no mono-file bits-widen, no shadow
 resize thread). Open segment has **no** filter (always probed); sealed segments
 are fuse-gated newest→oldest. Legacy monolithic `tx.head` / `.new` / `.resize` /
-`.overflow` are **refused** — reindex. **tx_height** uses 4 B height slots.
+`.overflow` are **refused** — reindex. Create height is a RAM fence (no
+`tx_height` file; schema 16).
 Dense Class A fk + segmented **`txout.idx` / `inwit.idx` / `spent.idx`**.
 Class A is **split** (outs / ins+wit / sole-spender). Spends are schema-v5
 annotations on **`spent.body`** (no `point.head`). Inputs store **`create_fk` +

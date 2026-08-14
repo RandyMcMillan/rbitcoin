@@ -115,245 +115,6 @@ impl ConfirmedTable {
     }
 }
 
-/// Class C: per-tx create height for coinbase maturity (not a UTXO set).
-///
-/// Index = `tx_fk - 1`; stored value = `height + 1` as **u32** (0 = unset so
-/// height 0 is representable). Schema v9: 4 B slots (was u64).
-pub struct TxHeightTable {
-    file: crate::file::TableFile,
-    len: std::sync::atomic::AtomicU64,
-}
-
-const TX_HEIGHT_ELEM: u64 = 4;
-
-impl TxHeightTable {
-    pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        let file = crate::file::TableFile::create(dir.join("tx_height.body"), TableKind::TxHeight)?;
-        Ok(Self {
-            file,
-            len: std::sync::atomic::AtomicU64::new(0),
-        })
-    }
-
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let file = crate::file::TableFile::open(dir.join("tx_height.body"), TableKind::TxHeight)?;
-        let body = file
-            .logical_len()
-            .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
-        if body % TX_HEIGHT_ELEM != 0 {
-            return Err(StoreError::Corrupt("tx_height size (expect 4 B slots)"));
-        }
-        Ok(Self {
-            file,
-            len: std::sync::atomic::AtomicU64::new(body / TX_HEIGHT_ELEM),
-        })
-    }
-
-    fn offset(index: u64) -> u64 {
-        crate::file::FILE_HEADER_LEN as u64 + index * TX_HEIGHT_ELEM
-    }
-
-    fn get_slot(&self, index: u64) -> Result<u32, StoreError> {
-        use std::sync::atomic::Ordering;
-        let len = self.len.load(Ordering::Acquire);
-        if index >= len {
-            return Ok(0);
-        }
-        let mut buf = [0u8; 4];
-        self.file.read_at(Self::offset(index), &mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    }
-
-    fn set_slot(&self, index: u64, value: u32) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        let len = self.len.load(Ordering::Acquire);
-        if index >= len {
-            let need = index + 1;
-            let start = len;
-            if need > start {
-                let zeros = vec![0u8; ((need - start) as usize) * 4];
-                self.file.write_at(Self::offset(start), &zeros)?;
-                self.len.store(need, Ordering::Release);
-            }
-        }
-        self.file
-            .write_at(Self::offset(index), &value.to_le_bytes())?;
-        Ok(())
-    }
-
-    fn fill_range(&self, start: u64, count: u64, value: u32) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        if count == 0 {
-            return Ok(());
-        }
-        let end = start.saturating_add(count);
-        let len = self.len.load(Ordering::Acquire);
-        if end > len {
-            let zeros = vec![0u8; ((end - len) as usize) * 4];
-            self.file.write_at(Self::offset(len), &zeros)?;
-            self.len.store(end, Ordering::Release);
-        }
-        let word = value.to_le_bytes();
-        // Chunked fill.
-        const CHUNK: usize = 4096;
-        let mut blob = vec![0u8; CHUNK * 4];
-        for c in blob.chunks_exact_mut(4) {
-            c.copy_from_slice(&word);
-        }
-        let mut left = count;
-        let mut at = start;
-        while left > 0 {
-            let n = (left as usize).min(CHUNK);
-            self.file.write_at(Self::offset(at), &blob[..n * 4])?;
-            at += n as u64;
-            left -= n as u64;
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
-        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        let v = self.get_slot(id - 1)?;
-        if v == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(v - 1))
-        }
-    }
-
-    /// Bulk `get` for many tx fks (confirm write create-height).
-    ///
-    /// Backend: global `RBITCOIN_IO` (`uring` \| `pread`).
-    /// Returns one `Option<height>` per input fk (invalid/null fk → `None`).
-    pub fn get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
-        use crate::bulk_io::{self, ReadOp};
-        use crate::io_backend;
-        use std::sync::atomic::Ordering;
-        if fks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let nslots = self.len.load(Ordering::Acquire);
-        let mut out: Vec<Option<u32>> = vec![None; fks.len()];
-        let mut submitted: Vec<(usize, u64)> = Vec::with_capacity(fks.len());
-        for (i, fk) in fks.iter().enumerate() {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            let index = id - 1;
-            if index >= nslots {
-                continue;
-            }
-            submitted.push((i, index));
-        }
-        if submitted.is_empty() {
-            return Ok(out);
-        }
-
-        let backend = io_backend::class_c_io_backend();
-        let fd = self.file.read_fd();
-        let mut bufs: Vec<[u8; 4]> = vec![[0u8; 4]; fks.len()];
-        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-        for &(i, index) in &submitted {
-            let ptr = bufs[i].as_mut_ptr();
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 4) };
-            read_ops.push(ReadOp {
-                fd,
-                offset: Self::offset(index),
-                buf: slice,
-                result: i32::MIN,
-                dontcache: false,
-            });
-        }
-        bulk_io::pread_batch_backend(&mut read_ops, backend);
-        for (ro, &(i, _)) in read_ops.iter().zip(submitted.iter()) {
-            if ro.result != 4 {
-                continue;
-            }
-            let v = u32::from_le_bytes(bufs[i]);
-            if v != 0 {
-                out[i] = Some(v - 1);
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn set(&self, tx_fk: Fk, height: Height) -> Result<(), StoreError> {
-        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.set_slot(id - 1, height.0.saturating_add(1))
-    }
-
-    /// Set the same height for a contiguous tx_fk range.
-    pub fn set_range(&self, first_tx_fk: Fk, count: u32, height: Height) -> Result<(), StoreError> {
-        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if count == 0 {
-            return Ok(());
-        }
-        self.fill_range(id - 1, u64::from(count), height.0.saturating_add(1))
-    }
-
-    pub fn clear(&self, tx_fk: Fk) -> Result<(), StoreError> {
-        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if id > self.len() {
-            return Ok(());
-        }
-        self.set_slot(id - 1, 0)
-    }
-
-    /// Number of allocated slots (covers tx fks `1..=len`).
-    pub fn len(&self) -> u64 {
-        self.len.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Zero `count` consecutive height slots starting at `first_tx_fk` (disconnect/repair).
-    pub fn clear_range(&self, first_tx_fk: Fk, count: u32) -> Result<(), StoreError> {
-        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if count == 0 {
-            return Ok(());
-        }
-        let start = id - 1;
-        let n = self.len();
-        if start >= n {
-            return Ok(());
-        }
-        let take = u64::from(count).min(n - start);
-        self.fill_range(start, take, 0)
-    }
-
-    /// Bulk-scan set heights; `visit(tx_fk, height)` for each allocated non-zero slot.
-    pub fn for_each_set<F>(&self, mut visit: F) -> Result<(), StoreError>
-    where
-        F: FnMut(Fk, u32) -> Result<(), StoreError>,
-    {
-        let n = self.len();
-        const CHUNK: u64 = 8192;
-        let mut buf = vec![0u8; (CHUNK as usize) * 4];
-        let mut i = 0u64;
-        while i < n {
-            let take = (n - i).min(CHUNK);
-            let bytes = (take as usize) * 4;
-            self.file.read_at(Self::offset(i), &mut buf[..bytes])?;
-            for j in 0..take as usize {
-                let off = j * 4;
-                let v = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                if v != 0 {
-                    let tx_fk = Fk(i + j as u64 + 1);
-                    visit(tx_fk, v - 1)?;
-                }
-            }
-            i += take;
-        }
-        Ok(())
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.file.flush()
-    }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.file.flush_async()
-    }
-}
-
 /// Per-tx strong bit (schema v3): bit `(tx_fk - 1)` set ⇒ strong on best chain.
 ///
 /// ~64× smaller than u64-per-tx; call sites only need `is_strong`. Header fk is
@@ -631,6 +392,65 @@ impl StrongTxTable {
         self.get_bit(id - 1)
     }
 
+    /// Visit every fk whose strong bit is set (open repair / tests).
+    pub fn for_each_strong<F>(&self, mut visit: F) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk) -> Result<(), StoreError>,
+    {
+        use std::sync::atomic::Ordering;
+        let n = self.n_bits.load(Ordering::Acquire);
+        if n == 0 {
+            return Ok(());
+        }
+        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref v) = *guard {
+            for (bi, &byte) in v.iter().enumerate() {
+                if byte == 0 {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if byte & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let idx = (bi as u64).saturating_mul(8).saturating_add(u64::from(bit));
+                    if idx < n {
+                        visit(Fk(idx + 1))?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        drop(guard);
+        const CHUNK: usize = 8192;
+        let mut buf = vec![0u8; CHUNK];
+        let nbytes = n.div_ceil(8);
+        let mut off = 0u64;
+        while off < nbytes {
+            let take = ((nbytes - off) as usize).min(CHUNK);
+            self.bits
+                .read_at(crate::file::FILE_HEADER_LEN as u64 + off, &mut buf[..take])?;
+            for (bi, &byte) in buf[..take].iter().enumerate() {
+                if byte == 0 {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if byte & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let idx = off
+                        .saturating_add(bi as u64)
+                        .saturating_mul(8)
+                        .saturating_add(u64::from(bit));
+                    if idx < n {
+                        visit(Fk(idx + 1))?;
+                    }
+                }
+            }
+            off += take as u64;
+        }
+        Ok(())
+    }
+
     /// Persist dirty L2 bit image. Prefers append-only byte suffix writes.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
@@ -895,44 +715,6 @@ mod chain_table_tests {
         ));
         c.flush().unwrap();
         c.flush_async().unwrap();
-
-        // TxHeight
-        let th = TxHeightTable::create(&dir).unwrap();
-        assert_eq!(th.len(), 0);
-        th.set(Fk(1), Height(0)).unwrap();
-        th.set(Fk(5), Height(10)).unwrap();
-        assert_eq!(th.get(Fk(1)).unwrap(), Some(0));
-        assert_eq!(th.get(Fk(5)).unwrap(), Some(10));
-        assert_eq!(th.get(Fk(2)).unwrap(), None);
-        assert!(matches!(th.get(Fk::NULL), Err(StoreError::InvalidFk)));
-        th.set_range(Fk(10), 0, Height(1)).unwrap();
-        th.set_range(Fk(10), 5, Height(7)).unwrap();
-        for i in 10..15 {
-            assert_eq!(th.get(Fk(i)).unwrap(), Some(7));
-        }
-        let batch = th.get_batch(&[Fk::NULL, Fk(1), Fk(5), Fk(9999)]).unwrap();
-        assert_eq!(batch, vec![None, Some(0), Some(10), None]);
-        assert!(th.get_batch(&[]).unwrap().is_empty());
-        th.clear(Fk(1)).unwrap();
-        assert_eq!(th.get(Fk(1)).unwrap(), None);
-        th.clear(Fk(9999)).unwrap(); // past end
-        th.clear_range(Fk(10), 0).unwrap();
-        th.clear_range(Fk(10), 3).unwrap();
-        assert_eq!(th.get(Fk(10)).unwrap(), None);
-        assert_eq!(th.get(Fk(13)).unwrap(), Some(7));
-        th.clear_range(Fk(9000), 5).unwrap();
-        let mut seen = Vec::new();
-        th.for_each_set(|fk, h| {
-            seen.push((fk.0, h));
-            Ok(())
-        })
-        .unwrap();
-        assert!(seen.contains(&(5, 10)));
-        th.flush().unwrap();
-        th.flush_async().unwrap();
-        drop(th);
-        let th = TxHeightTable::open(&dir).unwrap();
-        assert_eq!(th.get(Fk(5)).unwrap(), Some(10));
 
         // HeaderTxs
         let ht = HeaderTxsTable::create(&dir).unwrap();

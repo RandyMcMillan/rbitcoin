@@ -18,20 +18,23 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **16:** Drop `tx_height.body`; create height is a RAM fence from `confirmed[]` +
+///         `header_txs_*`. Soft-open schema 15 (unlink leftover file). Class A unchanged.
 /// **15:** Class A split (`txout` / `inwit` / `spent`) + Class B SH slabs / sorted heads.
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 15;
+pub const SCHEMA_VERSION: u16 = 16;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
+/// Schema **15** soft-opens (Class A unchanged; leftover `tx_height.body` dropped).
 /// Schema **13**/**14** may open only when Class A is empty and SH is empty/missing
 /// (silent meta rewrite). A **materialized** page-era SH index, or a packed
 /// `tx.body` with creates, is refused (wipe + IBD).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 15 && (ver == 14 || ver == 13))
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 16 && matches!(ver, 13..=15))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -257,8 +260,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(16));
         assert!(schema_file_openable(15));
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));

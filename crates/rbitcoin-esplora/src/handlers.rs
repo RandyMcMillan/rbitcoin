@@ -344,7 +344,7 @@ pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<St
     let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) else {
         return not_found();
     };
-    let height = match st.query.store().tx_height.get(fk) {
+    let height = match st.query.store().tx_height_get(fk) {
         Ok(Some(h)) => h,
         Ok(None) => return not_found(),
         Err(e) => return store_err(e),
@@ -397,7 +397,7 @@ pub async fn tx_merkleblock_proof(
     let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) else {
         return not_found();
     };
-    let height = match st.query.store().tx_height.get(fk) {
+    let height = match st.query.store().tx_height_get(fk) {
         Ok(Some(h)) => h,
         Ok(None) => return not_found(),
         Err(e) => return store_err(e),

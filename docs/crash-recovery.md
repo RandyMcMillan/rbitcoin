@@ -9,18 +9,18 @@ Best-chain views ignore uncommitted Class C state:
 | Write order (confirm **write** thread) | Role |
 |-------------------------------------------|------|
 | 0. Structural spentness / maturity / subsidy | No durable tip write yet |
-| 1. `strong_tx` + `tx_height` (L2 RAM / L0 file) | May lead tip after kill **before** barrier |
+| 1. `strong_tx` (L2 RAM) | May lead tip after kill **before** barrier |
 | 2. Thin scripthash **creates** (batched) | May lead tip after kill |
-| 3. `confirmed[]` tip advance (L2 RAM) | In-process commit |
-| 3b. **`flush_class_c_tip`** (complete-or-fail L2 images + `tx_height` sync) | **Durability barrier** |
+| 3. `confirmed[]` tip advance (L2 RAM) + height-fence extend | In-process commit |
+| 3b. **`flush_class_c_tip`** (complete-or-fail L2 images) | **Durability barrier** |
 | 4. Body-queue dequeue for those heights | Only after confirm-write returns Ok |
-| 5. Spend annotations (Direct) | After tip; spentness filters use strong+height |
+| 5. Spend annotations (Direct) | After tip; spentness filters use strong+fence |
 
-`is_confirmed_strong(tx)` ⇔ strong ∧ `tx_height ≤ tip`. Queries that mean “on best chain” use this (or equivalent).
+`is_confirmed_strong(tx)` ⇔ strong ∧ height fence contains the fk. Queries that mean “on best chain” use this (or equivalent).
 
 On open (in order):
 
-1. `repair_class_c_above_tip` clears strong/height **above** tip (tip-relative, not a full rebuild).
+1. `repair_class_c_above_tip` unstrongs bits **not on the fence** (leftover strong above tip / orphans).
 2. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
 3. **Tip-window revalidate** (Core `checkblocks=6`): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last six confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`. On failure: clear bad Class A association and/or shrink tip to last good height, flush confirmed, repair Class C again.
 
@@ -28,16 +28,16 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ### L2 write-behind + body queue (phase 6)
 
-- Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch (`tx_height` stays L0 write-through).
-- **Connect** barrier order on disk (**tip last**): `strong_tx` → `tx_height` → `header_txs` → **`confirmed[]` last**.
-  - Mid-barrier kill after pre-tip tables: tip stays old; strong/height above tip repaired by `repair_class_c_above_tip`.
-  - Never flush `confirmed` before strong/height on connect — tip with permanent unstrong txs (repair only clears **above** tip).
+- Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch. The height fence is RAM-only (derived from those tables).
+- **Connect** barrier order on disk (**tip last**): `strong_tx` → `header_txs` → **`confirmed[]` last**.
+  - Mid-barrier kill after pre-tip tables: tip stays old; leftover strong not on the fence is repaired by `repair_class_c_above_tip`.
+  - Never flush `confirmed` before strong on connect — tip with permanent unstrong txs (repair only clears leftover strong).
 - **Disconnect** barrier order (**tip first** — opposite of connect):
-  1. SH unlink only (do not clear strong/height yet).
-  2. `confirmed` truncate → `flush_confirmed_only` (durable tip shrink).
-  3. Then `set_unstrong` / `tx_height.clear` → flush strong/height.
-  - Mid-kill after tip shrink: leftover strong/height are **above** new tip → repairable.
-  - Never clear `tx_height` (L0 write-through) or unstrong while tip is still high — permanent unstrong-at-tip.
+  1. SH unlink only (do not unstrong yet).
+  2. `confirmed` truncate + fence pop → `flush_confirmed_only` (durable tip shrink).
+  3. Then `set_unstrong` → flush strong.
+  - Mid-kill after tip shrink: leftover strong is **not on the new fence** → repairable.
+  - Never unstrong while tip is still high — permanent unstrong-at-tip.
 - Append-only tip extension writes **suffix only**. In-prefix full rewrites residual; tip-last connect + tip-first disconnect + BQ re-drive mitigate.
 - Prefer **loss of uncommitted tip progress** over **tip-ahead-of-strong** or **tip-high-with-unstrong**.
 

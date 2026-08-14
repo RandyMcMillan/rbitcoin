@@ -17,8 +17,8 @@
 //!
 //! Backend: global `RBITCOIN_IO` (`uring` \| `pread`).
 
-use crate::chain::TxHeightTable;
 use crate::error::StoreError;
+use crate::height_fence::HeightFence;
 use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
 use crate::io_backend::{self, ReadIoBackend};
 use crate::tx_table::{
@@ -41,13 +41,13 @@ pub fn resolve_fk_and_range_batch(
 }
 
 /// Like [`resolve_fk_and_range_batch`], but prefer a **connected** Class A row
-/// (`tx_height` Some). Unconnected hot hits do **not** skip the cold wave.
+/// (height fence hit). Unconnected hot hits do **not** skip the cold wave.
 ///
 /// `tip_only`: result is connected-or-None (confirm). Otherwise connected else
 /// newest unconnected (RPC).
 pub fn resolve_fk_and_range_batch_with_tip(
     table: &TxTable,
-    heights: &TxHeightTable,
+    heights: &HeightFence,
     txids: &[[u8; 32]],
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
@@ -57,7 +57,7 @@ pub fn resolve_fk_and_range_batch_with_tip(
 fn resolve_fk_and_range_batch_opts(
     table: &TxTable,
     txids: &[[u8; 32]],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     if txids.is_empty() {
@@ -106,7 +106,7 @@ pub fn resolve_fk_and_denserels_batch(
 fn resolve_fk_and_range_pread(
     table: &TxTable,
     txids: &[[u8; 32]],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
@@ -354,7 +354,7 @@ fn key_done(
     skip_if_won: bool,
     winner: &[Option<(Fk, (u64, u64))>],
     connected: &[bool],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
 ) -> bool {
     if heights.is_some() {
         connected[ki]
@@ -370,7 +370,7 @@ fn id_idx_wave(
     side: &TxidBody,
     winner: &mut [Option<(Fk, (u64, u64))>],
     connected: &mut [bool],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
     skip_if_won: bool,
     body_lookups: &mut u64,
     miss_peeks: &mut u64,
@@ -430,7 +430,7 @@ fn id_idx_wave(
             // held resolve ring (AGENTS.md: do not nest TLS io_uring).
             let mut picked = None;
             for &fk in &matches {
-                if ht.get(fk)?.is_some() {
+                if ht.height_of(fk).is_some() {
                     picked = Some(fk);
                     break;
                 }
@@ -521,7 +521,7 @@ fn resolve_denserels_pread(
 fn resolve_fk_and_range_uring(
     table: &TxTable,
     txids: &[[u8; 32]],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
@@ -536,7 +536,7 @@ fn resolve_fk_and_range_uring_on(
     session: &mut UringSession,
     table: &TxTable,
     txids: &[[u8; 32]],
-    heights: Option<&TxHeightTable>,
+    heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();

@@ -157,7 +157,9 @@ fn bip30_rejects_unspent_connected_sibling() {
             true,
         )
         .unwrap()[0];
-    q.store().tx_height.set(fk, Height(1)).unwrap();
+    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
 
     let dup = block_with(vec![first]);
     let ctx = ctx_h(10);

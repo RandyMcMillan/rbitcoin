@@ -47,13 +47,14 @@ impl Query {
     ///
     /// # Class C write order (crash atomicity)
     ///
-    /// Per block we write `strong_tx` + `tx_height` (and optional scripthash
-    /// marks), then **last** advance `confirmed[]` for the whole run. The confirmed
-    /// tip is the commit point: [`rbitcoin_store::Store::spenders`] /
+    /// Per block we write `strong_tx` (and optional scripthash marks), then
+    /// **last** advance `confirmed[]` for the whole run. The confirmed tip is
+    /// the commit point: [`rbitcoin_store::Store::spenders`] /
     /// [`rbitcoin_store::Store::is_confirmed_strong`] only treat a spend as
-    /// best-chain once `tx_height ≤ tip`. A hard kill after strong bits but
-    /// before tip advance leaves recoverable state — open repairs strong above
-    /// tip, and re-confirm of tip+1 does not see false PrevoutSpent.
+    /// best-chain once the height fence (confirmed + header_txs) contains the
+    /// spender. A hard kill after strong bits but before tip advance leaves
+    /// recoverable state — open repairs strong not on the fence, and re-confirm
+    /// of tip+1 does not see false PrevoutSpent.
     ///
     /// # Spend annotations
     ///
@@ -141,16 +142,10 @@ impl Query {
                                     item.tx_fks.len() as u32,
                                     item.header_fk,
                                 )?;
-                                self.store.tx_height.set_range(
-                                    first,
-                                    item.tx_fks.len() as u32,
-                                    item.height,
-                                )?;
                             }
                         } else {
                             for &tx_fk in &item.tx_fks {
                                 self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
-                                self.store.tx_height.set(tx_fk, item.height)?;
                             }
                         }
                         pairs.push((item.height, item.header_fk));
@@ -283,6 +278,10 @@ impl Query {
         // Tip is the commit point (after strong + SH both finished).
         let t_tip = std::time::Instant::now();
         self.store.confirmed.set_many(&confirmed_pairs)?;
+        for item in items {
+            self.store
+                .height_fence_extend(item.height, item.header_fk)?;
+        }
         // L2 write-behind barrier: complete-or-fail Class C image to disk **before**
         // callers dequeue the body queue. Kill after this returns → tip durable;
         // kill before → BQ still holds blocks for re-drive.
@@ -476,19 +475,18 @@ impl Query {
     ///
     /// 1. SH unlink (index only; filtered by strong+tip at query time).
     /// 2. `confirmed` truncate in RAM → **`flush_confirmed_only`** (durable tip shrink).
-    /// 3. Then `set_unstrong` / `tx_height.clear` for disconnected txs → flush those.
+    /// 3. Then `set_unstrong` for disconnected txs → flush strong.
     ///
-    /// `tx_height` is L0 write-through: clearing it **before** tip shrink would make
-    /// tip txs fail `is_confirmed_strong` while tip is still high (permanent if kill).
-    /// Unstrong-before-tip has the same hazard. Mid-kill after tip shrink leaves
-    /// strong/height **above** new tip → `repair_class_c_above_tip` heals.
+    /// Unstrong-before-tip would make tip txs fail `is_confirmed_strong` while
+    /// tip is still high (permanent if kill). Mid-kill after tip shrink leaves
+    /// strong **not on the new fence** → `repair_class_c_above_tip` heals.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.block_tx_fks(height)?;
 
-        // 1. Scripthash unlink only — do **not** clear strong / tx_height yet.
+        // 1. Scripthash unlink only — do **not** clear strong yet.
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
@@ -517,6 +515,7 @@ impl Query {
 
         // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
+        self.store.height_fence_pop_tip(height);
         self.store.flush_confirmed_only()?;
         // Height index: tip−1 remove when map was current; else rebuild on next ensure.
         if let Some(new_tip) = self.tip_height() {
@@ -525,10 +524,9 @@ impl Query {
             self.invalidate_height_by_hash_index();
         }
 
-        // 3. Only after tip is durable lower: clear strong + height for disconnected txs.
+        // 3. Only after tip is durable lower: clear strong for disconnected txs.
         for &tx_fk in &tx_fks {
             self.store.strong_tx.set_unstrong(tx_fk)?;
-            self.store.tx_height.clear(tx_fk)?;
         }
         self.store.flush_class_c_after_disconnect_tip()?;
 

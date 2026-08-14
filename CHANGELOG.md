@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Schema 16:** drop `tx_height.body` (~5 GiB). Create height is a resident
+  fence from `confirmed[]` + `header_txs_*` (O(blocks), RAM bsearch). Reorg
+  holes return unconnected. Schema 15 stores soft-open (unlink leftover file).
+  Old binaries refuse 16 (they still write `tx_height`).
+
 - **Script pool:** `try_for_each_parallel` steals on process-wide
   `rbtc-scripts-*` workers (no per-batch `thread::scope`). Confirm phases run
   on two `rbtc-script-coord-*` threads so a steal worker is not blocked inside

@@ -1,11 +1,13 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 15` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 16` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — most layout changes are reindex-only.  
-**13/14→15 open:** Empty Class A (no creates) + empty/missing SH may silently
-rewrite `meta` to 15. A packed `tx.body` **with creates**, or a durable page-era
+**13/14→16 open:** Empty Class A (no creates) + empty/missing SH may silently
+rewrite `meta` to 16. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
 `txout` + `inwit` + `spent` (not a single packed `tx.body`).  
+**15→16 open:** Soft migrate — Class A unchanged; leftover `tx_height.body` is
+unlinked; create height is the RAM fence.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -42,7 +44,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
-    tx_height.body               # Class C: tx_fk → create height (u32 slots)
+    # tx_height.body retired in 16 (RAM fence from confirmed + header_txs)
     header_txs_first.body        # header_fk-1 → first_tx_fk
     header_txs_count.body        # header_fk-1 → tx count
     scripthash.body / scripthash.head/NN[.idx]        # Class B (slabs + sorted heads; no fuse)
@@ -66,7 +68,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **15** |
+| 4 | 2 | Schema version (u16) — **16** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -409,19 +411,24 @@ Dense u64 array: index = height → header_fk. Length = tip_height + 1 when non-
 
 Bitset: bit `(tx_fk − 1)` set ⇒ tx is strong on the best chain.
 
-### `tx_height.body`
+### Create height (schema 16: RAM fence, no `tx_height.body`)
 
-Index = `tx_fk − 1`; value = **height + 1** as **u32** (0 = unset).  
-Used for maturity and `is_confirmed_strong` (height ≤ tip).
+`tx_height.body` (4 B/tx) is **gone**. Create height is O(blocks): a resident
+fence of `confirmed[h]` → `header_txs` `(first_fk, count)`. Point query is a
+binary search over confirmed runs. Reorg holes (orphaned Class A fks between
+two confirmed runs) return unconnected (`None`), not the neighbor height.
+
+Schema 15 leftover `tx_height.body` is unlinked on open (logged).
 
 ### Commit order (confirm)
 
-1. `strong_tx` + `tx_height` (may lead tip after kill)
+1. `strong_tx` (may lead tip after kill)
 2. Thin scripthash creates (may lead tip)
-3. **`confirmed[]` tip advance** ← **commit**
+3. **`confirmed[]` tip advance** ← **commit**, then fence extend
 
-`is_confirmed_strong(tx)` ⇔ strong ∧ `tx_height ≤ tip`.  
-On open: `repair_class_c_above_tip` clears strong/height above tip.
+`is_confirmed_strong(tx)` ⇔ strong ∧ fence contains the fk (implies height ≤ tip
+and membership in `confirmed[h]` header_txs).  
+On open: `repair_class_c_above_tip` unstrongs bits not on the fence.
 
 ---
 

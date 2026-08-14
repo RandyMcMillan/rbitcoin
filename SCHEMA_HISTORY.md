@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 15`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 16`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | **Current** |
+| **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | **Current** |
+| **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
 | **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
@@ -29,7 +30,15 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v15 (current)
+## v16 (current)
+
+Create height is no longer a 4 B/tx L0 file. A resident fence is built from
+`confirmed[]` + `header_txs_first/count` (O(blocks), ~16 B/height). Point
+query is an in-RAM binary search; reorg holes return unconnected. Schema 15
+stores soft-open: leftover `tx_height.body` is unlinked and `meta` rewritten
+to 16. Class A / Class B layout unchanged.
+
+## v15
 
 See [`SCHEMA.md`](./SCHEMA.md). Class B: geometric slabs + delta fks,
 sealed sorted heads with idx (main has no fuse8; sealed ovf keeps fuse8),

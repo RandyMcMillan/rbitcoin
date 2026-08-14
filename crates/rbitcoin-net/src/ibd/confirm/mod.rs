@@ -653,22 +653,6 @@ impl ConfirmQueueDepths {
     }
 }
 
-/// True when a lookup/load error should re-queue the batch (not permanent reject).
-///
-/// **Policy:** internal confirm invariants are permanent failures — fix the
-/// root cause (in-flight prune, denserels pin, claim readiness). Soft-looping
-/// hid pipeline bugs and either livelocked tip (requeue forever) or froze it
-/// after a hard blacklist. Wire recovery uses soft re-getdata in
-/// [`super::events::apply_confirm_reject`] (`unexpected previous header` only)
-/// or [`ConfirmEvent::BodyMissing`] — not this path.
-///
-/// Kept as a named hook so multi-block / load error handling stays uniform;
-/// always returns false.
-#[inline]
-pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
-    false
-}
-
 /// Operator line for load stamp reject. Stamp-stage `missing prevout` is the
 /// leftover TipOnly miss remapped from `parent create_fk unresolved` — name
 /// that so a race is not logged as a bare invalid-block.
@@ -736,7 +720,6 @@ pub(crate) mod confirm_thr_stats {
     use std::time::Duration;
 
     static LOOKUP_CLAIM_NS: AtomicU64 = AtomicU64::new(0);
-    static LOOKUP_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_CLONE_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_OTHER_NS: AtomicU64 = AtomicU64::new(0);
@@ -764,13 +747,6 @@ pub(crate) mod confirm_thr_stats {
     #[inline]
     pub fn add_lookup_claim(d: Duration) {
         add(&LOOKUP_CLAIM_NS, d);
-    }
-    /// Pack BQ decode used to land here; it is load work now. Tests still
-    /// drive the atomic.
-    #[cfg(test)]
-    #[inline]
-    pub fn add_lookup_resolve(d: Duration) {
-        add(&LOOKUP_RESOLVE_NS, d);
     }
     #[inline]
     pub fn add_lookup_clone(d: Duration) {
@@ -827,7 +803,6 @@ pub(crate) mod confirm_thr_stats {
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub lookup_claim_ns: u64,
-        pub lookup_resolve_ns: u64,
         pub lookup_clone_ns: u64,
         pub lookup_stamp_ns: u64,
         pub lookup_other_ns: u64,
@@ -845,7 +820,6 @@ pub(crate) mod confirm_thr_stats {
     pub fn sample_and_reset() -> Sample {
         Sample {
             lookup_claim_ns: LOOKUP_CLAIM_NS.swap(0, Ordering::Relaxed),
-            lookup_resolve_ns: LOOKUP_RESOLVE_NS.swap(0, Ordering::Relaxed),
             lookup_clone_ns: LOOKUP_CLONE_NS.swap(0, Ordering::Relaxed),
             lookup_stamp_ns: LOOKUP_STAMP_NS.swap(0, Ordering::Relaxed),
             lookup_other_ns: LOOKUP_OTHER_NS.swap(0, Ordering::Relaxed),
@@ -1435,16 +1409,6 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = scripts.join();
                             return;
                         }
-                        if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
-                                wire_batch
-                                    .iter()
-                                    .filter(|(_, ha, _)| !hub_load.has_block(ha))
-                                    .map(|(h, ha, _)| (*h, *ha, None))
-                                    .collect();
-                            feed_load.requeue_wire(&retry);
-                            continue;
-                        }
                         let first_hash = wire_batch[0].1;
                         if wire_batch.len() > 1 {
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
@@ -1568,24 +1532,6 @@ pub(crate) fn spawn_confirm_engine(
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
-                        }
-                        if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
-                                heights_hashes
-                                    .iter()
-                                    .filter(|(_, ha)| !hub_load.has_block(ha))
-                                    .map(|(h, ha)| (*h, *ha, None))
-                                    .collect();
-                            feed_load.requeue_wire(&retry);
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n.is_multiple_of(200) {
-                                warn!(
-                                    "ibd: confirm load incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                            continue;
                         }
                         if heights_hashes.len() > 1 {
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =

@@ -6,10 +6,9 @@ use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction, Work};
 use rbitcoin_consensus::{
-    accept_and_connect_block_preverified, confirm_scripts_phase,
-    confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
-    confirm_wire_lookup_stamp, confirm_write_phase, genesis_block, header_to_record, ChainParams,
-    Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
+    accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
+    confirm_wire_load_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
+    ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -169,16 +168,6 @@ impl ChainHub {
             .is_some()
     }
 
-    /// True if the full block body is in Class A (may not be confirmed yet).
-    pub fn is_archived(&self, hash: &BlockHash) -> bool {
-        if self.has_block(hash) {
-            return true;
-        }
-        self.query
-            .is_block_archived(&hash.to_byte_array())
-            .unwrap_or(false)
-    }
-
     /// Persist a header row only (for header-sync → out-of-order body archive).
     pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
         let _ = self.ensure_header_fk(header)?;
@@ -212,42 +201,6 @@ impl ChainHub {
         self.query
             .ensure_header(&rec)
             .map_err(|e| NetError::Consensus(e.to_string()))
-    }
-
-    /// Contiguous tip-extension slice for plan (Arc wire; skip already confirmed).
-    fn confirm_wire_contig_arc(
-        &self,
-        blocks: &[(Height, std::sync::Arc<Block>)],
-        pipeline: Option<&WireLoadPipeline>,
-    ) -> Option<Vec<(Height, std::sync::Arc<Block>)>> {
-        if blocks.is_empty() {
-            return None;
-        }
-        let store_path_lo = match self.tip_height() {
-            None => 0u32,
-            Some(t) => t.saturating_add(1),
-        };
-        let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
-        let need: Vec<(Height, std::sync::Arc<Block>)> = blocks
-            .iter()
-            .filter(|(h, b)| {
-                let hash = b.block_hash();
-                !self.has_block(&hash) && h.0 >= path_lo
-            })
-            .map(|(h, b)| (*h, std::sync::Arc::clone(b)))
-            .collect();
-        let mut contig = Vec::new();
-        for (h, b) in need {
-            if h.0 != path_lo.saturating_add(contig.len() as u32) {
-                break;
-            }
-            contig.push((h, b));
-        }
-        if contig.is_empty() {
-            None
-        } else {
-            Some(contig)
-        }
     }
 
     /// Contiguous tip-extension slice for one-shot load (owned Block).
@@ -286,24 +239,7 @@ impl ChainHub {
         }
     }
 
-    /// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
-    ///
-    /// Wire is `Arc<Block>` so body-queue decode is not re-cloned into stamp.
-    pub fn confirm_wire_lookup_phase(
-        &self,
-        blocks: &[(Height, std::sync::Arc<Block>)],
-        pipeline: Option<&WireLoadPipeline>,
-    ) -> Result<Option<PlanStampOutcome>, NetError> {
-        let Some(contig) = self.confirm_wire_contig_arc(blocks, pipeline) else {
-            return Ok(None);
-        };
-        let out =
-            confirm_wire_lookup_stamp(&self.query, &self.params, self.milestone, &contig, pipeline)
-                .map_err(|e| NetError::Consensus(e.to_string()))?;
-        Ok(Some(out))
-    }
-
-    /// IBD **load** after lookup denserels ensure: pin + assemble (does not re-lookup).
+    /// IBD **load** after lookup stamp: pin + assemble (does not re-lookup).
     ///
     /// Single path: denserels by body range from lookup stamp (plan-local or plan=None
     /// `ParentPinStamp`). No cold denserels dual path.
@@ -330,9 +266,8 @@ impl ChainHub {
     /// When `Some`, first height is `pipeline.path_lo` so lookup(N+1) can run
     /// while write(N) has not advanced tip.
     ///
-    /// One-shot path (tests / tip-follow): stamp+pin+assemble with cold denserels
-    /// allowed. IBD uses [`Self::confirm_wire_lookup_phase`] then
-    /// [`Self::confirm_wire_load_from_plan`].
+    /// One-shot path (tests / tip-follow): stamp + pin denserels by range + assemble.
+    /// IBD load uses [`Self::confirm_wire_load_from_plan`] after BQ TipOnly stamp.
     pub fn confirm_wire_load_phase(
         &self,
         blocks: &[(Height, Block)],
@@ -344,15 +279,6 @@ impl ChainHub {
     ///
     /// One-shot or pipelined load: lookup stamps then pin denserels by range.
     pub fn confirm_wire_load_phase_pipelined(
-        &self,
-        blocks: &[(Height, Block)],
-        pipeline: Option<&WireLoadPipeline>,
-    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
-        self.confirm_wire_load_phase_pipelined_cold(blocks, pipeline)
-    }
-
-    /// One-shot load (stamp + pin denserels by range + assemble).
-    pub fn confirm_wire_load_phase_pipelined_cold(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WireLoadPipeline>,
@@ -370,16 +296,6 @@ impl ChainHub {
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))
-    }
-
-    /// SCRIPT stage only: pure verify of jobs on a loaded batch (no store access).
-    pub fn confirm_scripts(
-        &self,
-        batch: rbitcoin_consensus::LoadedBatch,
-    ) -> Result<rbitcoin_consensus::ConfirmScriptOutcome, NetError> {
-        // Scripts never touch Query/store — receiver kept for call-site symmetry.
-        let _hub = self;
-        confirm_scripts_phase(batch).map_err(|e| NetError::Consensus(e.to_string()))
     }
 
     /// WRITE stage: structural + Class C + spend annotate (ordered).
@@ -926,7 +842,7 @@ mod tests {
     use bitcoin::{
         Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
     };
-    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_consensus::{confirm_scripts_phase, ChainParams, Milestone};
     use rbitcoin_query::Query;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1095,7 +1011,7 @@ mod tests {
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         assert!(hub.has_block(&gen));
-        assert!(hub.is_archived(&gen));
+        assert!(hub.query.is_block_archived(&gen.to_byte_array()).unwrap());
 
         let b1 = mine(gen, 1_300_000_000, 1);
         assert!(matches!(
@@ -1279,7 +1195,7 @@ mod tests {
         assert!(hub.confirm_wire_load_phase(&[]).unwrap().is_none());
         let acc = hub.accept_block(b1.clone()).unwrap();
         assert!(matches!(acc, AcceptOutcome::Accepted { height: 1 }));
-        assert!(hub.is_archived(&h1));
+        assert!(hub.has_block(&h1));
         assert_eq!(hub.tip_height(), Some(1));
         // Already confirmed → AlreadyHave.
         assert!(matches!(
@@ -1463,7 +1379,7 @@ mod tests {
         let loaded = hub.confirm_wire_load_phase(&[(Height(1), b1)]).unwrap();
         assert!(loaded.is_some());
         let batch = loaded.unwrap();
-        let script_out = hub.confirm_scripts(batch.batch).unwrap();
+        let script_out = confirm_scripts_phase(batch.batch).unwrap();
         let write_out = hub.confirm_write(script_out.batch).unwrap();
         assert_eq!(write_out.len(), 1);
         assert!(matches!(

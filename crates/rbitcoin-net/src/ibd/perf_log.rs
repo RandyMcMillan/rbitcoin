@@ -242,7 +242,6 @@ pub(crate) struct IbdPerfSample {
     pub conf_write_q_hwm: usize,
     // OS-thread occupancy (ms) — wait vs busy; explains idle load vs work sums.
     pub thr_lookup_claim_ms: u64,
-    pub thr_lookup_resolve_ms: u64,
     pub thr_lookup_clone_ms: u64,
     pub thr_lookup_stamp_ms: u64,
     pub thr_lookup_other_ms: u64,
@@ -259,8 +258,6 @@ pub(crate) struct IbdPerfSample {
     pub stamp_batch_head_ms: u64,
     /// Pure get_fk_by_txid_batch wall.
     pub stamp_batch_head_fk_ms: u64,
-    /// Plan-time external-parent denserels load.
-    pub stamp_batch_head_dens_ms: u64,
     pub stamp_batch_stamp_ms: u64,
     pub stamp_batch_finish_ms: u64,
     pub thr_load_recv_wait_ms: u64,
@@ -309,7 +306,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
     pub arch_prep_head_fk_ms: u64,
-    pub arch_prep_head_dens_ms: u64,
     pub arch_prep_probe_ms: u64,
     pub arch_prep_idx_ms: u64,
     pub arch_prep_body_txid_ms: u64,
@@ -330,9 +326,6 @@ pub(crate) struct IbdPerfSample {
     /// Winner age hist compact `h0:h1:…:h7+tail`.
     pub arch_prep_age_hit_compact: String,
     pub arch_prep_age_hit_n: u64,
-    /// Plan denserels wave: fks + packed body bytes (approx).
-    pub arch_head_dens_fks: u64,
-    pub arch_head_dens_bytes: u64,
     pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
     pub arch_prep_finish_ms: u64,
@@ -505,7 +498,6 @@ impl Default for IbdPerfSample {
             conf_script_q_hwm: 0,
             conf_write_q_hwm: 0,
             thr_lookup_claim_ms: 0,
-            thr_lookup_resolve_ms: 0,
             thr_lookup_clone_ms: 0,
             thr_lookup_stamp_ms: 0,
             thr_lookup_other_ms: 0,
@@ -518,7 +510,6 @@ impl Default for IbdPerfSample {
             stamp_batch_collect_ms: 0,
             stamp_batch_head_ms: 0,
             stamp_batch_head_fk_ms: 0,
-            stamp_batch_head_dens_ms: 0,
             stamp_batch_stamp_ms: 0,
             stamp_batch_finish_ms: 0,
             thr_load_recv_wait_ms: 0,
@@ -563,7 +554,6 @@ impl Default for IbdPerfSample {
             arch_prep_inflight_ms: 0,
             arch_prep_head_ms: 0,
             arch_prep_head_fk_ms: 0,
-            arch_prep_head_dens_ms: 0,
             arch_prep_probe_ms: 0,
             arch_prep_idx_ms: 0,
             arch_prep_body_txid_ms: 0,
@@ -580,8 +570,6 @@ impl Default for IbdPerfSample {
             arch_prep_age_cdf31_pct: 0,
             arch_prep_age_hit_compact: String::new(),
             arch_prep_age_hit_n: 0,
-            arch_head_dens_fks: 0,
-            arch_head_dens_bytes: 0,
             arch_prep_body_lookups: 0,
             arch_prep_stamp_ms: 0,
             arch_prep_finish_ms: 0,
@@ -927,7 +915,6 @@ pub(crate) fn sample(
         conf_script_q_hwm: conf_q_hwm.0,
         conf_write_q_hwm: conf_q_hwm.1,
         thr_lookup_claim_ms: ns_ms(thr.lookup_claim_ns),
-        thr_lookup_resolve_ms: ns_ms(thr.lookup_resolve_ns),
         thr_lookup_clone_ms: ns_ms(thr.lookup_clone_ns),
         thr_lookup_stamp_ms: ns_ms(thr.lookup_stamp_ns),
         thr_lookup_other_ms: ns_ms(thr.lookup_other_ns),
@@ -940,7 +927,6 @@ pub(crate) fn sample(
         stamp_batch_collect_ms: ns_ms(arch_res.prep_collect_ns),
         stamp_batch_head_ms: ns_ms(arch_res.prep_head_ns),
         stamp_batch_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
-        stamp_batch_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
         stamp_batch_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         stamp_batch_finish_ms: ns_ms(arch_res.prep_finish_ns),
         thr_load_recv_wait_ms: ns_ms(thr.load_recv_wait_ns),
@@ -985,7 +971,6 @@ pub(crate) fn sample(
         arch_prep_inflight_ms: ns_ms(arch_res.prep_inflight_ns),
         arch_prep_head_ms: ns_ms(arch_res.prep_head_ns),
         arch_prep_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
-        arch_prep_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
         arch_prep_probe_ms: ns_ms(head_res.probe_ns),
         arch_prep_idx_ms: ns_ms(head_res.idx_ns),
         arch_prep_body_txid_ms: ns_ms(head_res.body_ns),
@@ -1002,8 +987,6 @@ pub(crate) fn sample(
         arch_prep_age_cdf31_pct: head_res.age_cdf_pct(31),
         arch_prep_age_hit_compact: head_res.age_hit_compact(),
         arch_prep_age_hit_n: head_res.age_hit_n(),
-        arch_head_dens_fks: arch_res.head_dens_fks,
-        arch_head_dens_bytes: arch_res.head_dens_bytes,
         arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
@@ -1112,8 +1095,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     // Prefer thr busy/wait + ready= / scriptq_hwm for long-pole diagnosis.
     let load_wall_ms = load_stage_wall_ms(s);
     let thr_lookup_busy = s
-        .thr_lookup_resolve_ms
-        .saturating_add(s.thr_lookup_clone_ms)
+        .thr_lookup_clone_ms
         .saturating_add(s.thr_lookup_stamp_ms)
         .saturating_add(s.thr_lookup_other_ms);
     let thr_lookup_wait = s
@@ -1127,7 +1109,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms write={}ms \
-         lookup_thr busy={}ms(claim={}ms resolve={}ms clone={}ms wave={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms clone={}ms wave={}ms other={}ms send_w={}ms) \
          thr load=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
@@ -1137,7 +1119,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         write_ms,
         thr_lookup_busy,
         s.thr_lookup_claim_ms,
-        s.thr_lookup_resolve_ms,
         s.thr_lookup_clone_ms,
         s.thr_lookup_stamp_ms,
         s.thr_lookup_other_ms,
@@ -1164,7 +1145,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
              batch_assign={}ms collect={}ms pin_txid={} pin_txid%={} pin_txid_ms={} \
              leftover_n={} leftover_hit={} leftover_ms={} leftover_pend={} leftover_cdf0={} leftover_cdf3={} leftover_age_n={} \
-             head_dens={}ms head={}ms stamp={}ms finish={}ms)",
+             head={}ms stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
             s.stamp_filter_ms,
@@ -1181,7 +1162,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.leftover_cdf0_pct,
             s.leftover_cdf3_pct,
             s.leftover_age_n,
-            s.stamp_batch_head_dens_ms,
             s.stamp_batch_head_ms,
             s.stamp_batch_stamp_ms,
             s.stamp_batch_finish_ms,
@@ -1542,7 +1522,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         };
         out.push_str(&format!(
             " | plan_batch assign={} collect={} inflight={} pin_txid={}/{} pin_txid_ms={} \
-             us/pin_txid={} head_fk={} head_dens={} head={} \
+             us/pin_txid={} head_fk={} head={} \
              stamp={} finish={} resolve_us/blk={} ext={} head_hit={}/{} \
              stamp_n batch={}",
             s.arch_prep_assign_ms,
@@ -1553,7 +1533,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_pin_txid_ms,
             us_pin_txid(s),
             s.arch_prep_head_fk_ms,
-            s.arch_prep_head_dens_ms,
             s.arch_prep_head_ms,
             s.arch_prep_stamp_ms,
             s.arch_prep_finish_ms,
@@ -1627,13 +1606,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                     s.arch_prep_age_hit_compact.as_str()
                 },
                 s.arch_prep_age_hit_n,
-            ));
-        }
-        if s.arch_head_dens_fks > 0 || s.arch_prep_head_dens_ms > 0 {
-            let dens_mib = s.arch_head_dens_bytes / (1024 * 1024);
-            out.push_str(&format!(
-                " dens_wave(fks={} bytes={}MiB dens_ms={})",
-                s.arch_head_dens_fks, dens_mib, s.arch_prep_head_dens_ms,
             ));
         }
     }
@@ -2089,7 +2061,6 @@ mod tests {
         s.stamp_batch_assign_ms = 1;
         s.stamp_batch_collect_ms = 1;
         s.stamp_batch_head_fk_ms = 1;
-        s.stamp_batch_head_dens_ms = 1;
         s.stamp_batch_head_ms = 2;
         s.stamp_batch_stamp_ms = 1;
         s.stamp_batch_finish_ms = 1;
@@ -2104,7 +2075,6 @@ mod tests {
         s.arch_prep_collect_ms = 2;
         s.arch_prep_inflight_ms = 1;
         s.arch_prep_head_fk_ms = 1;
-        s.arch_prep_head_dens_ms = 2;
         s.arch_prep_head_ms = 3;
         s.arch_prep_stamp_ms = 1;
         s.arch_prep_finish_ms = 1;
@@ -2126,8 +2096,6 @@ mod tests {
         s.arch_prep_miss_peeks = 5;
         s.arch_prep_pending_hits = 3;
         s.arch_prep_age_hit_compact = "1:2:3:0:0:0:0:0:0".into();
-        s.arch_head_dens_fks = 12;
-        s.arch_head_dens_bytes = 3 * 1024 * 1024;
         s.sh_collect_pin = 7;
         s.sh_collect_cold = 3;
         s.sh_collect_ms = 9;

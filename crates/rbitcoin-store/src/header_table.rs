@@ -115,22 +115,6 @@ impl HeaderTable {
         })
     }
 
-    /// Append-only insert **without** uniqueness. Prefer [`Self::ensure`].
-    ///
-    /// Used by offline rebuild tools that rewrite a clean table from scratch.
-    pub fn put_raw(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.put_unlocked(rec)
-    }
-
-    /// Append header and publish into the hash head. Returns new FK.
-    ///
-    /// **Deprecated for hot paths:** use [`Self::ensure`] so the same full hash
-    /// cannot get a second body row with a divergent `prev_fk`.
-    pub fn put(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        self.ensure(rec)
-    }
-
     /// Write gate: at most one body row per full block hash (I1).
     ///
     /// - If `hash` already exists → return that fk (ignore caller's `prev_fk`).
@@ -214,19 +198,6 @@ impl HeaderTable {
         self.count.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Overwrite one header row in place (offline repair / rebuild tools).
-    pub fn rewrite(&self, fk: Fk, rec: &HeaderRecord) -> Result<(), StoreError> {
-        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = self.count.load(std::sync::atomic::Ordering::Acquire);
-        if id == 0 || id > count {
-            return Err(StoreError::NotFound);
-        }
-        let offset = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64;
-        self.body.write_at(offset, &rec.encode())?;
-        Ok(())
-    }
-
     /// Occupied open-address slots in the header hash head.
     pub fn head_occupied(&self) -> u64 {
         self.head.occupied()
@@ -281,8 +252,8 @@ mod tests {
         let t = HeaderTable::create(&dir).unwrap();
         let h1 = [1u8; 32];
         let h2 = [2u8; 32];
-        let fk1 = t.put(&sample(h1)).unwrap();
-        let fk2 = t.put(&sample(h2)).unwrap();
+        let fk1 = t.ensure(&sample(h1)).unwrap();
+        let fk2 = t.ensure(&sample(h2)).unwrap();
         assert_eq!(t.count(), 2);
         assert_eq!(t.get(fk1).unwrap().hash, h1);
         assert_eq!(t.get(fk2).unwrap().hash, h2);

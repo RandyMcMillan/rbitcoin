@@ -3,8 +3,8 @@
 What is strong, what still blocks “industry-leading,” and what is already
 closed. Replaces the 2026-08-06 point-in-time audit.
 
-**Last reaudit:** 2026-08-12 (second pass: fold shipped tip-hole / page-group
-work into Completed; add **Q-39–Q-40**).
+**Last reaudit:** 2026-08-14 (close **Q-23** musl workflow; leftover
+hash-load confirm twin gone).
 
 **Two lists only**
 
@@ -75,18 +75,17 @@ same leverage rule. Do not recreate a second R-table or P0/P1/P2 split.
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | Nightly/weekly script + BIP324 + header/block wire (fuzzamoto-class or in-tree); crashes → `docs/external_findings/` + regression |
 | 2 | **Q-37** | Warm default suite **≤3 min** (stretch **&lt;2 min**) on a CI-class host | test-speed | Re-measure `cargo test --workspace` after R-03; record wall in TESTING.md. If still over budget, cut more; if inside, close. No new default remine-100 / &gt;2 s tests without justification |
-| 3 | **Q-23** | Optional musl CI | ci | Weekly or release-branch `nix build .#rbitcoin-musl` (proves crane; not every PR) |
-| 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
-| 5 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
-| 6 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
-| 7 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
-| 8 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
-| 9 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
-| 10 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
-| 11 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
-| 12 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
-| 13 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
-| 14 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
+| 3 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
+| 4 | **Q-15** | RPC + CLI destiny | product | `rbitcoin-cli` talks to the documented subset (or both are demoted from the product narrative); `getpeerinfo` is real or honestly absent; dummy `getblockchaininfo` fields (`chainwork`, `size_on_disk`, `verificationprogress`) filled or documented as never |
+| 5 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters |
+| 6 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
+| 7 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist; optional public tip-height badge |
+| 8 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
+| 9 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
+| 10 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
+| 11 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
+| 12 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
+| 13 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam (`query/lib`, `scripthash.rs`, `interpreter.rs`, `electrum/server.rs`). No new 2k-line modules |
 
 **P0 trust/correctness (Q-01–Q-05) stays empty.** Do not reopen without new
 evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
@@ -107,7 +106,7 @@ R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed id is in
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 15 |
+| R-10 | **R-10** | Open rank 13 |
 
 ---
 
@@ -118,6 +117,7 @@ audit closures. Do not reopen without new evidence.
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-23** | Optional musl CI | `.github/workflows/musl.yml` after green master `ci` (`nix build .#rbitcoin-musl`, artifact upload; not a required PR check) |
 | **Q-14** | Head-module glossary | [`docs/heads.md`](./heads.md): which file/module; lookup 2-wave; DONTCACHE ≠ wave split; confirm stages point at concurrency |
 | **Q-40** | Host `rust-toolchain` pin | Root `rust-toolchain.toml` channel **1.95.0** |
 | **Q-21** | SBOM for musl release | `scripts/sbom.sh` / `scripts/sbom.py` emit CycloneDX 1.5 from `Cargo.lock` |

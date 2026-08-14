@@ -7,8 +7,6 @@
 //! 3. If any key still unmatched **or** (fence on and hot hit unconnected):
 //!    **cold probe** (sealed ages ≥4) for those keys → ID/IDX again
 //!    (`TipThenAny` can still take a connected sibling in cold)
-//! 4. **denserels** (optional) — packed body when outs are needed
-//!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
 //! idx, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
@@ -20,11 +18,8 @@
 
 use crate::error::StoreError;
 use crate::height_fence::HeightFence;
-use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
 use crate::io_backend::{self, ReadIoBackend};
-use crate::tx_table::{
-    decode_packed_tx_outs_with_spender_rels_secret, OutputRecord, TxRecord, TxTable,
-};
+use crate::tx_table::TxTable;
 use crate::txid_body::TxidBody;
 use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
@@ -71,34 +66,6 @@ fn resolve_fk_and_range_batch_opts(
             Err(_) => resolve_fk_and_range_pread(table, txids, heights, tip_only),
         },
         ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
-    }
-}
-
-/// Resolve many parent txids to create fk + denserels (plan Shape A full).
-///
-/// Returns rows in **input order** and denserels-wave wall ns (archive `head_dens`).
-pub fn resolve_fk_and_denserels_batch(
-    table: &TxTable,
-    txids: &[[u8; 32]],
-) -> Result<
-    (
-        Vec<(
-            [u8; 32],
-            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
-        )>,
-        u64,
-    ),
-    StoreError,
-> {
-    if txids.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-    match io_backend::head_resolve_io_backend() {
-        ReadIoBackend::Uring => match resolve_denserels_uring(table, txids) {
-            Ok(v) => Ok(v),
-            Err(_) => resolve_denserels_pread(table, txids),
-        },
-        ReadIoBackend::Pread => resolve_denserels_pread(table, txids),
     }
 }
 
@@ -574,66 +541,6 @@ fn id_idx_wave(
     Ok(())
 }
 
-fn resolve_denserels_pread(
-    table: &TxTable,
-    txids: &[[u8; 32]],
-) -> Result<
-    (
-        Vec<(
-            [u8; 32],
-            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
-        )>,
-        u64,
-    ),
-    StoreError,
-> {
-    // Identity + range first (depth-first), then one denserels wave for winners.
-    let ranges = resolve_fk_and_range_pread(table, txids, None, false)?;
-    let mut dens_ns = 0u64;
-    let mut dens_decoded: std::collections::HashMap<
-        usize,
-        (TxRecord, Vec<OutputRecord>, Vec<u32>),
-    > = std::collections::HashMap::new();
-
-    let mut need: Vec<(usize, Fk, (u64, u64))> = Vec::new();
-    for (i, (_tid, row)) in ranges.iter().enumerate() {
-        if let Some((fk, range)) = row {
-            need.push((i, *fk, *range));
-        }
-    }
-    if !need.is_empty() {
-        let t_dens = Instant::now();
-        let mut jobs: Vec<IdxBodyJob> = need
-            .iter()
-            .map(|(_, fk, range)| IdxBodyJob::new(fk.0, Some(*range)))
-            .collect();
-        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::Outs)?;
-        dens_ns = t_dens.elapsed().as_nanos() as u64;
-        for ((ki, fk, _), job) in need.into_iter().zip(jobs.into_iter()) {
-            if !job.ok || job.body.is_empty() {
-                continue;
-            }
-            match decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(&table.secret)) {
-                Ok(mut decoded) => {
-                    if let Ok(tid) = table.txid_sidefile().get(fk) {
-                        decoded.0.txid = tid;
-                    }
-                    dens_decoded.insert(ki, decoded);
-                }
-                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    let mut out = Vec::with_capacity(txids.len());
-    for (i, (txid, row)) in ranges.into_iter().enumerate() {
-        let mapped = row.map(|(fk, _range)| (fk, dens_decoded.remove(&i)));
-        out.push((txid, mapped));
-    }
-    Ok((out, dens_ns))
-}
-
 // ── uring probe path (ID stage is page-grouped bulk, shared with pread) ─────
 
 fn resolve_fk_and_range_uring(
@@ -791,67 +698,6 @@ fn resolve_fk_and_range_uring_on(
         .enumerate()
         .map(|(i, t)| (*t, winner[i]))
         .collect())
-}
-
-fn resolve_denserels_uring(
-    table: &TxTable,
-    txids: &[[u8; 32]],
-) -> Result<
-    (
-        Vec<(
-            [u8; 32],
-            Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
-        )>,
-        u64,
-    ),
-    StoreError,
-> {
-    // fk+range via the fused TLS machine, then denserels body for winners
-    // (separate bulk pipeline — range already known, no re-idx).
-    let ranges = resolve_fk_and_range_uring(table, txids, None, false)?;
-    let mut dens_ns = 0u64;
-    let mut dens_decoded: std::collections::HashMap<
-        usize,
-        (TxRecord, Vec<OutputRecord>, Vec<u32>),
-    > = std::collections::HashMap::new();
-
-    let mut need: Vec<(usize, Fk, (u64, u64))> = Vec::new();
-    for (i, (_tid, row)) in ranges.iter().enumerate() {
-        if let Some((fk, range)) = row {
-            need.push((i, *fk, *range));
-        }
-    }
-    if !need.is_empty() {
-        let t_dens = Instant::now();
-        let mut jobs: Vec<IdxBodyJob> = need
-            .iter()
-            .map(|(_, fk, range)| IdxBodyJob::new(fk.0, Some(*range)))
-            .collect();
-        run_idx_body_pipeline(&table.body, &mut jobs, BodyMode::Outs)?;
-        dens_ns = t_dens.elapsed().as_nanos() as u64;
-        for ((ki, fk, _), job) in need.into_iter().zip(jobs.into_iter()) {
-            if !job.ok || job.body.is_empty() {
-                continue;
-            }
-            match decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(&table.secret)) {
-                Ok(mut decoded) => {
-                    if let Ok(tid) = table.txid_sidefile().get(fk) {
-                        decoded.0.txid = tid;
-                    }
-                    dens_decoded.insert(ki, decoded);
-                }
-                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    let mut out = Vec::with_capacity(txids.len());
-    for (i, (txid, row)) in ranges.into_iter().enumerate() {
-        let mapped = row.map(|(fk, _range)| (fk, dens_decoded.remove(&i)));
-        out.push((txid, mapped));
-    }
-    Ok((out, dens_ns))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
-//! Archive epochs: durable-archive soft/hard zones (`archive_epoch.wire_depth` unread).
+//! Archive epochs: on-disk leftover (`archive_mode` / `finalized_height` / `wire_depth` unread).
 
 mod address_head;
 mod array_table;
@@ -129,7 +129,7 @@ pub use tx_table::{
     scan_inwit_prevouts, scan_packed_meta_and_prevouts, spend_meta_backend, spent_abs, InputRecord,
     OutputRecord, SpendMetaBackend, TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
-pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_DONTCACHE_FROM_TAIL, TXID_ENTRY_LEN};
+pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_ENTRY_LEN};
 pub use uring_session::RWF_DONTCACHE;
 
 /// Crate identity for diagnostics and coverage scenarios.

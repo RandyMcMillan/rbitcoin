@@ -50,8 +50,7 @@ pub use bq_resolve::{confirm_bq_resolve_wave, BqResolveWaveStats, BQ_RESOLVE_WAV
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
-    confirm_wire_load_from_plan, confirm_wire_lookup_and_ensure_denserels,
-    confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
+    confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
     ensure_external_parent_denserels_from_plan, DenserelsWarmStats, ParentPinStamp,
     PlanStampOutcome,
 };

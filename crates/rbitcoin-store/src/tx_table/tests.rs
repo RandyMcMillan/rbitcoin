@@ -747,7 +747,7 @@ fn bulk_body_range_and_full_match_sequential() {
 /// Two creates of the same txid (foreigner + real); deepest wins; denserels
 /// decode returns outs for pin without a second denserels wave on wrong cands.
 #[test]
-fn get_fk_and_outs_shape_a_multi_cand_one_denserels() {
+fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-shape-a-multi-{}",
         std::time::SystemTime::now()
@@ -809,26 +809,30 @@ fn get_fk_and_outs_shape_a_multi_cand_one_denserels() {
         .put_full_batch_indexed(&[(solo_rec, solo_in, solo_out)], true)
         .unwrap()[0];
 
-    let (batch, _dens_ns) = t
-        .get_fk_and_outs_by_txid_batch(&[txid, solo, [0xff; 32]])
-        .unwrap();
+    let batch = t.get_fk_by_txid_batch(&[txid, solo, [0xff; 32]]).unwrap();
     assert_eq!(batch.len(), 3);
 
     let multi = batch.iter().find(|(id, _)| *id == txid).unwrap();
-    let (fk, outs_opt) = multi.1.as_ref().expect("multi-cand hit");
-    assert_eq!(*fk, fk_new);
-    let (tx, outs, dens) = outs_opt.as_ref().expect("denserels for winner");
+    let (fk, range) = multi.1.expect("multi-cand hit");
+    assert_eq!(fk, fk_new);
+    let (outs_rows, _, _) = t
+        .get_outs_by_range_batch(&[(fk, range, txid, vec![0])])
+        .unwrap();
+    let (tx, outs, dens) = outs_rows[0].as_ref().expect("outs for winner");
     assert_eq!(tx.txid, txid);
     assert_eq!(outs.len(), 1);
-    assert_eq!(outs[0].value, 22);
+    assert_eq!(outs[0].1.value, 22);
     assert_eq!(dens.len(), outs.len());
 
     let single = batch.iter().find(|(id, _)| *id == solo).unwrap();
-    let (fk_s, outs_s) = single.1.as_ref().expect("single-cand hit");
-    assert_eq!(*fk_s, fk_solo);
-    let (tx_s, outs_s, _) = outs_s.as_ref().expect("single denserels-only");
+    let (fk_s, range_s) = single.1.expect("single-cand hit");
+    assert_eq!(fk_s, fk_solo);
+    let (solo_rows, _, _) = t
+        .get_outs_by_range_batch(&[(fk_s, range_s, solo, vec![0])])
+        .unwrap();
+    let (tx_s, outs_s, _) = solo_rows[0].as_ref().expect("single outs");
     assert_eq!(tx_s.txid, solo);
-    assert_eq!(outs_s[0].value, 33);
+    assert_eq!(outs_s[0].1.value, 33);
 
     assert!(batch.iter().any(|(id, r)| *id == [0xff; 32] && r.is_none()));
     let _ = std::fs::remove_dir_all(&dir);

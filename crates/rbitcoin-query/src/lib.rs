@@ -1,7 +1,6 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
 mod archive;
-mod batch_full_bodies;
 mod batch_parents;
 mod catchup;
 mod chain_view;
@@ -122,7 +121,6 @@ pub mod process_mem_stats {
 }
 
 pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
-pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
@@ -140,12 +138,12 @@ pub use wave_prevout::ThinInput;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///
-/// Accrued by `load_confirm_parents` (now called inline from confirm load).
-/// Pair with [`Query::parent_cache_perf_snapshot`] for cache watermarks.
+/// Accrued by wire pin (`pin_for_wire_batch`).
+/// Pair with [`Query::parent_cache_perf_snapshot`] for header-plan occupancy.
 pub mod confirm_load_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Pin/load wall: full `load_confirm_parents` on hash path; pin wall on wire path.
+    /// Pin/load wall (wire pin).
     pub static NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +333,7 @@ pub mod confirm_load_stats {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn note(st: &crate::confirm_load::ConfirmLoadStats, ns: u64) {
         if ns > 0 {
@@ -419,7 +418,6 @@ pub mod archive_phase_stats {
     /// Headers (blocks) planned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
-    pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
     /// Unique prev_txids resolved from live [`crate::PipelineParentStore`].
@@ -432,10 +430,6 @@ pub mod archive_phase_stats {
     pub static LEFTOVER_AGE0: AtomicU64 = AtomicU64::new(0);
     pub static LEFTOVER_AGE3: AtomicU64 = AtomicU64::new(0);
     pub static LEFTOVER_AGE_N: AtomicU64 = AtomicU64::new(0);
-    /// Fks that received plan denserels in Shape A fused head resolve.
-    pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
-    /// Sum of packed body lengths read in denserels wave (when ranges known).
-    pub static HEAD_DENS_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -446,14 +440,11 @@ pub mod archive_phase_stats {
     pub static PREP_FILTER_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PREP_STICKY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Combined head wall (fk resolve + plan denserels); = head_fk + head_dens.
+    /// Leftover TipOnly head wall (= PREP_HEAD_FK_NS).
     pub static PREP_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// Shape A Prefix33 select wall (head total − denserels).
+    /// Leftover TipOnly `get_fk_by_txid_batch`.
     pub static PREP_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
-    /// Shape A denserels wave (single-cand denserels-only + multi-cand dens).
-    pub static PREP_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_FINISH_NS: AtomicU64 = AtomicU64::new(0);
     /// Reserved HWM + inflight create map publish after plan.
@@ -477,7 +468,6 @@ pub mod archive_phase_stats {
     pub struct Sample {
         pub blocks: u64,
         pub ext_need: u64,
-        pub sticky_hit: u64,
         pub head_need: u64,
         pub head_hit: u64,
         pub pin_txid_n: u64,
@@ -486,25 +476,20 @@ pub mod archive_phase_stats {
         pub leftover_cdf0_pct: u64,
         pub leftover_cdf3_pct: u64,
         pub leftover_age_n: u64,
-        pub head_dens_fks: u64,
-        pub head_dens_bytes: u64,
         pub batch_stamp: u64,
         pub resolved_stamp: u64,
-        /// Sticky+inflight+head_fk only (not plan denserels load).
+        /// inflight + leftover head_fk.
         pub resolve_ns: u64,
         pub prep_total_ns: u64,
         pub prep_struct_ns: u64,
         pub prep_filter_ns: u64,
         pub prep_assign_ns: u64,
         pub prep_collect_ns: u64,
-        pub prep_sticky_ns: u64,
         pub prep_inflight_ns: u64,
-        /// head_fk + head_dens (legacy total).
+        /// Leftover TipOnly `get_fk_by_txid_batch` (= prep_head_fk_ns).
         pub prep_head_ns: u64,
-        /// Pure tx.head resolve (`get_fk_by_txid_batch`).
+        /// Pure leftover tx.head resolve (`get_fk_by_txid_batch`).
         pub prep_head_fk_ns: u64,
-        /// Plan-time denserels for external parents (Shape A fused head resolve).
-        pub prep_head_dens_ns: u64,
         pub prep_stamp_ns: u64,
         pub prep_finish_ns: u64,
         pub prep_publish_ns: u64,
@@ -527,7 +512,6 @@ pub mod archive_phase_stats {
                 .saturating_add(self.prep_filter_ns)
                 .saturating_add(self.prep_assign_ns)
                 .saturating_add(self.prep_collect_ns)
-                .saturating_add(self.prep_sticky_ns)
                 .saturating_add(self.prep_inflight_ns)
                 .saturating_add(self.prep_head_ns)
                 .saturating_add(self.prep_stamp_ns)
@@ -552,17 +536,12 @@ pub mod archive_phase_stats {
     }
 
     fn sample_and_reset_inner() -> Sample {
-        let prep_sticky = PREP_STICKY_NS.swap(0, Ordering::Relaxed);
         let prep_inflight = PREP_INFLIGHT_NS.swap(0, Ordering::Relaxed);
         let prep_head_fk = PREP_HEAD_FK_NS.swap(0, Ordering::Relaxed);
-        let prep_head_dens = PREP_HEAD_DENS_NS.swap(0, Ordering::Relaxed);
-        let prep_head = PREP_HEAD_NS
-            .swap(0, Ordering::Relaxed)
-            .max(prep_head_fk.saturating_add(prep_head_dens));
+        let prep_head = PREP_HEAD_NS.swap(0, Ordering::Relaxed).max(prep_head_fk);
         Sample {
             blocks: BLOCKS.swap(0, Ordering::Relaxed),
             ext_need: EXT_NEED.swap(0, Ordering::Relaxed),
-            sticky_hit: STICKY_HIT.swap(0, Ordering::Relaxed),
             head_need: HEAD_NEED.swap(0, Ordering::Relaxed),
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
             pin_txid_n: PIN_TXID_N.swap(0, Ordering::Relaxed),
@@ -587,23 +566,17 @@ pub mod archive_phase_stats {
                 }
             },
             leftover_age_n: LEFTOVER_AGE_N.swap(0, Ordering::Relaxed),
-            head_dens_fks: HEAD_DENS_FKS.swap(0, Ordering::Relaxed),
-            head_dens_bytes: HEAD_DENS_BYTES.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
             resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
-            resolve_ns: prep_sticky
-                .saturating_add(prep_inflight)
-                .saturating_add(prep_head_fk),
+            resolve_ns: prep_inflight.saturating_add(prep_head_fk),
             prep_total_ns: PREP_TOTAL_NS.swap(0, Ordering::Relaxed),
             prep_struct_ns: PREP_STRUCT_NS.swap(0, Ordering::Relaxed),
             prep_filter_ns: PREP_FILTER_NS.swap(0, Ordering::Relaxed),
             prep_assign_ns: PREP_ASSIGN_NS.swap(0, Ordering::Relaxed),
             prep_collect_ns: PREP_COLLECT_NS.swap(0, Ordering::Relaxed),
-            prep_sticky_ns: prep_sticky,
             prep_inflight_ns: prep_inflight,
             prep_head_ns: prep_head,
             prep_head_fk_ns: prep_head_fk,
-            prep_head_dens_ns: prep_head_dens,
             prep_stamp_ns: PREP_STAMP_NS.swap(0, Ordering::Relaxed),
             prep_finish_ns: PREP_FINISH_NS.swap(0, Ordering::Relaxed),
             prep_publish_ns: PREP_PUBLISH_NS.swap(0, Ordering::Relaxed),
@@ -632,7 +605,6 @@ pub mod archive_phase_stats {
     pub fn note_resolve_counts(
         blocks: u64,
         ext_need: u64,
-        sticky_hit: u64,
         head_need: u64,
         head_hit: u64,
         batch_stamp: u64,
@@ -641,17 +613,12 @@ pub mod archive_phase_stats {
         exclusive::with(|| {
             add(&BLOCKS, blocks);
             add(&EXT_NEED, ext_need);
-            add(&STICKY_HIT, sticky_hit);
             add(&HEAD_NEED, head_need);
             add(&HEAD_HIT, head_hit);
             add(&BATCH_STAMP, batch_stamp);
             add(&RESOLVED_STAMP, resolved_stamp);
-            LAST_BLOCKS.store(blocks, Ordering::Relaxed);
-            LAST_EXT_NEED.store(ext_need, Ordering::Relaxed);
             LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
             LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
-            LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
-            LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
         });
     }
 
@@ -675,114 +642,46 @@ pub mod archive_phase_stats {
         });
     }
 
-    /// Plan denserels wave size (fks + optional body bytes read).
-    #[inline]
-    pub fn note_head_dens_wave(dens_fks: u64, dens_bytes: u64) {
-        exclusive::with(|| {
-            add(&HEAD_DENS_FKS, dens_fks);
-            add(&HEAD_DENS_BYTES, dens_bytes);
-        });
-    }
-
     /// Lookup sub-phases for one plan batch (`archive_plan_batch_from`).
     ///
-    /// `head_fk_ns`: pure `get_fk_by_txid_batch`.  
-    /// `head_dens_ns`: plan-time external-parent denserels load.  
-    /// `head` total = head_fk + head_dens (also stored on `PREP_HEAD_NS`).
-    ///
-    /// Also overwrites **last-batch** plan snapshot for slow-lookup logs (not
-    /// window-summed; see [`last_plan_batch`]).
+    /// `head_fk_ns`: leftover TipOnly `get_fk_by_txid_batch` after BQ / pins.
     #[inline]
     pub fn note_prep_plan(
         assign_ns: u64,
         collect_ns: u64,
-        sticky_ns: u64,
         inflight_ns: u64,
         head_fk_ns: u64,
-        head_dens_ns: u64,
         stamp_ns: u64,
         finish_ns: u64,
     ) {
         exclusive::with(|| {
             add(&PREP_ASSIGN_NS, assign_ns);
             add(&PREP_COLLECT_NS, collect_ns);
-            add(&PREP_STICKY_NS, sticky_ns);
             add(&PREP_INFLIGHT_NS, inflight_ns);
             add(&PREP_HEAD_FK_NS, head_fk_ns);
-            add(&PREP_HEAD_DENS_NS, head_dens_ns);
-            add(&PREP_HEAD_NS, head_fk_ns.saturating_add(head_dens_ns));
+            add(&PREP_HEAD_NS, head_fk_ns);
             add(&PREP_STAMP_NS, stamp_ns);
             add(&PREP_FINISH_NS, finish_ns);
-            // Last-batch (overwrite; for slow-plan diagnosis).
-            LAST_ASSIGN_NS.store(assign_ns, Ordering::Relaxed);
-            LAST_COLLECT_NS.store(collect_ns, Ordering::Relaxed);
-            LAST_STICKY_NS.store(sticky_ns, Ordering::Relaxed);
-            LAST_INFLIGHT_NS.store(inflight_ns, Ordering::Relaxed);
-            LAST_HEAD_FK_NS.store(head_fk_ns, Ordering::Relaxed);
-            LAST_HEAD_DENS_NS.store(head_dens_ns, Ordering::Relaxed);
-            LAST_STAMP_NS.store(stamp_ns, Ordering::Relaxed);
-            LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
         });
     }
 
-    // ── Last completed plan_batch (slow-plan logs; not window-summed) ────────
-    static LAST_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_STICKY_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_STAMP_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_FINISH_NS: AtomicU64 = AtomicU64::new(0);
+    // Last leftover mix (overwrite). Stamp-reject leftover_n/hit and the
+    // fail-pack test read this — note_resolve_counts stores it *before* stamp
+    // so a leftover miss still meters. last_stamp timing snapshots stay gone.
     static LAST_HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     static LAST_HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    static LAST_EXT_NEED: AtomicU64 = AtomicU64::new(0);
-    static LAST_BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
-    static LAST_RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
-    static LAST_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
-    /// Snapshot of the most recent [`note_prep_plan`] + resolve mix (one plan batch).
+    /// Snapshot of the most recent leftover head resolve (one plan batch).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct LastPlanBatch {
-        pub blocks: u64,
-        pub ext_need: u64,
         pub head_need: u64,
         pub head_hit: u64,
-        pub batch_stamp: u64,
-        pub resolved_stamp: u64,
-        pub assign_ns: u64,
-        pub collect_ns: u64,
-        pub sticky_ns: u64,
-        pub inflight_ns: u64,
-        pub head_fk_ns: u64,
-        pub head_dens_ns: u64,
-        pub stamp_ns: u64,
-        pub finish_ns: u64,
-    }
-
-    impl LastPlanBatch {
-        #[inline]
-        pub fn ms(ns: u64) -> u64 {
-            ns / 1_000_000
-        }
     }
 
     pub fn last_plan_batch() -> LastPlanBatch {
         LastPlanBatch {
-            blocks: LAST_BLOCKS.load(Ordering::Relaxed),
-            ext_need: LAST_EXT_NEED.load(Ordering::Relaxed),
             head_need: LAST_HEAD_NEED.load(Ordering::Relaxed),
             head_hit: LAST_HEAD_HIT.load(Ordering::Relaxed),
-            batch_stamp: LAST_BATCH_STAMP.load(Ordering::Relaxed),
-            resolved_stamp: LAST_RESOLVED_STAMP.load(Ordering::Relaxed),
-            assign_ns: LAST_ASSIGN_NS.load(Ordering::Relaxed),
-            collect_ns: LAST_COLLECT_NS.load(Ordering::Relaxed),
-            sticky_ns: LAST_STICKY_NS.load(Ordering::Relaxed),
-            inflight_ns: LAST_INFLIGHT_NS.load(Ordering::Relaxed),
-            head_fk_ns: LAST_HEAD_FK_NS.load(Ordering::Relaxed),
-            head_dens_ns: LAST_HEAD_DENS_NS.load(Ordering::Relaxed),
-            stamp_ns: LAST_STAMP_NS.load(Ordering::Relaxed),
-            finish_ns: LAST_FINISH_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -1237,11 +1136,6 @@ impl Query {
         Ok(None)
     }
 
-    /// Durable head probe with **body txid only** (no full packed decode).
-    pub fn tx_fk_by_txid_store(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        Ok(self.store.get_fk_by_txid(txid)?)
-    }
-
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -1270,18 +1164,6 @@ impl Query {
 
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {
         &self.confirm_parents
-    }
-
-    /// No-op compatibility: SH dedupe is a height watermark (`sh_indexed_through`),
-    /// not a HashSet warm from durable body.
-    pub fn warm_scripthash_create_index(&self) -> Result<(), QueryError> {
-        // Align watermark with tip if durable SH exists (tip mode resume).
-        if let Some(tip) = self.tip_height() {
-            if self.sh_indexed_through_height().is_none() {
-                self.set_sh_indexed_through_height(Some(tip.0));
-            }
-        }
-        Ok(())
     }
 
     /// Enable/disable durable spend-annotation writes on archive **and** confirm
@@ -2234,21 +2116,16 @@ mod tests {
         assert!(s.edge_coinbase >= 21);
 
         let _ = archive_phase_stats::sample_and_reset();
-        archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
-        archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
+        archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6);
         let last = archive_phase_stats::last_plan_batch();
         // last_plan_batch is last-writer; re-note immediately before read if raced.
-        if last.head_fk_ns != 10 {
-            archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7);
+        if last.head_need != 3 {
+            archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6);
         }
         let last = archive_phase_stats::last_plan_batch();
-        assert_eq!(last.head_fk_ns, 10);
-        assert_eq!(last.head_dens_ns, 20);
-        assert_eq!(last.head_need, 4);
-        assert_eq!(last.head_hit, 5);
-        assert_eq!(last.assign_ns, 1);
-        assert_eq!(archive_phase_stats::LastPlanBatch::ms(10_000_000), 10);
-        archive_phase_stats::note_head_dens_wave(9, 1024);
+        assert_eq!(last.head_need, 3);
+        assert_eq!(last.head_hit, 4);
+        archive_phase_stats::note_prep_plan(1, 2, 3, 10, 6, 7);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 1);
         archive_phase_stats::note_write_flush(8);
@@ -2257,10 +2134,7 @@ mod tests {
         assert!(a.write_phases_sum_ns() > 0);
         assert!(a.blocks >= 1);
         assert!(a.prep_head_fk_ns >= 10);
-        assert!(a.prep_head_dens_ns >= 20);
-        assert!(a.prep_head_ns >= 30);
-        assert!(a.head_dens_fks >= 9);
-        assert!(a.head_dens_bytes >= 1024);
+        assert!(a.prep_head_ns >= 10);
 
         confirm_load_stats::note_last_pin(11, 22, 33, 44, 55, 100, 9);
         let lp = confirm_load_stats::last_pin_phases();
@@ -2370,7 +2244,6 @@ mod tests {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.
         assert!(q.index_mode().is_tip());
-        assert!(q.index_mode().uses_durable_spends());
 
         let mut prev = Fk::NULL;
         let mut parent_hash: Option<[u8; 32]> = None;
@@ -2420,7 +2293,6 @@ mod tests {
         assert_eq!(fks.len(), 1);
         let tx = q.get_tx(fks[0]).unwrap();
         assert!(q.tx_fk_by_txid(&tx.txid).unwrap().is_some());
-        assert!(q.tx_fk_by_txid_store(&tx.txid).unwrap().is_some());
         let inp = q.tx_input_at_fk(fks[0], &tx, 0).unwrap();
         assert!(inp.is_coinbase());
         let out = q.tx_output_at_fk(fks[0], &tx, 0).unwrap();
@@ -2457,7 +2329,6 @@ mod tests {
         let _ = std::fs::write(q.store().path().join("ibd_utxo.map"), b"x");
         let _ = std::fs::create_dir_all(q.store().path().join("point.runs"));
         q.enter_direct_index_mode().unwrap();
-        q.warm_scripthash_create_index().unwrap();
         let _ = q.finalize_sh_runs();
         let _ = q.scripthash_run_count();
         q.enter_tip_index_mode();
@@ -2482,23 +2353,7 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.tip_height(), Some(Height(2)));
 
-        // load_confirm_parents empty / already-confirmed heights.
-        let (st, _, _, _) = q.load_confirm_parents(&[]).unwrap();
-        let _ = st.blocks;
-        let (st2, _, _, _) = q
-            .load_confirm_parents(&[(0, hashes[0]), (1, hashes[1])])
-            .unwrap();
-        let _ = st2;
-
-        // Cancelled load path.
-        q.request_confirm_cancel();
-        let cancelled = q.load_confirm_parents(&[(10, [9u8; 32])]);
-        assert!(cancelled.is_err());
-        q.clear_confirm_cancel();
-
         q.advance_parent_cache_tip(2);
-        q.seed_parent_cache(&[(3, hashes[3])]);
-        assert!(q.is_confirm_load_ready(&[]));
 
         // resume_work_path: max 0 → empty.
         assert!(q
@@ -2552,29 +2407,6 @@ mod tests {
         assert!(IndexMode::Direct.is_direct());
         assert!(!IndexMode::Direct.is_tip());
         assert!(IndexMode::Tip.is_tip());
-        assert!(IndexMode::Direct.uses_durable_spends());
-        assert!(IndexMode::Tip.uses_durable_spends());
-
-        let mut b = BatchFullBodies::with_capacity(2);
-        assert!(b.is_empty());
-        b.insert(
-            Fk::NULL,
-            1,
-            TxRecord {
-                txid: [0; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            },
-            vec![],
-            vec![],
-            None,
-            vec![],
-        );
-        assert!(b.is_empty()); // null fk ignored
 
         let mut bp = BatchParents::new();
         assert!(bp.is_empty());
@@ -2683,19 +2515,7 @@ mod tests {
         assert_eq!(arch.txdata.len(), 3);
         // archived path does not require header.hash == wire block_hash.
         assert_eq!(arch.txdata[0].input.len(), 1);
-        // Batch-local body path.
-        let mut batch = BatchFullBodies::new();
-        let full = q.store().get_tx_full(fks0[0]).unwrap();
-        batch.insert(
-            fks0[0],
-            0,
-            full.0.clone(),
-            full.1.clone(),
-            full.2.clone(),
-            None,
-            vec![],
-        );
-        let tx2 = q.reconstruct_tx_with_batch(fks0[0], Some(&batch)).unwrap();
+        let tx2 = q.reconstruct_tx(fks0[0]).unwrap();
         assert_eq!(tx2.output.len(), 1);
         // Empty tx list → corrupt.
         let (_hfk, hrec) = q.get_header_by_hash(&hashes[0]).unwrap().unwrap();
@@ -2748,14 +2568,8 @@ mod tests {
                 .txs
                 .put_full_batch_indexed(&[(spend_tx, spend_ins, spend_outs)], true)
                 .unwrap()[0];
-            // Batch entry for parent with **zero** packed identity (pre-stamp).
-            let mut batch_z = BatchFullBodies::new();
-            let (mut ptx, pins, pouts) = q.store().get_tx_full(parent_fk).unwrap();
-            ptx.txid = [0u8; 32];
-            batch_z.insert(parent_fk, 0, ptx, pins, pouts, None, vec![]);
-            assert_eq!(batch_z.txid(parent_fk), None);
             let rebuilt = q
-                .reconstruct_tx_with_batch(spend_fk, Some(&batch_z))
+                .reconstruct_tx(spend_fk)
                 .expect("wire rebuild must resolve create id via txid.body");
             assert_eq!(rebuilt.input.len(), 2);
             for inp in &rebuilt.input {
@@ -2848,22 +2662,8 @@ mod tests {
         let path = q.resume_work_path_after_tip(hashes[2], 2, 5).unwrap();
         let _ = path;
 
-        // confirm_load of height above tip with archived body (archive-only ahead).
-        // Archive header+body at height 3 without confirm.
         let (h3, ta3) = coinbase_block(3, prev, Some(hashes[2]));
-        let h3hash = h3.hash;
         q.commit_class_a_only(&h3, &[ta3]).unwrap();
-        let (st, parents, thin, bodies) = q.load_confirm_parents(&[(3, h3hash)]).unwrap();
-        assert!(st.blocks >= 1 || bodies.len() >= 1 || !parents.is_empty() || thin.is_empty());
-        let _ = thin;
-        // Missing header / no body paths.
-        let (st2, _, _, _) = q.load_confirm_parents(&[(9, [0xbb; 32])]).unwrap();
-        let _ = st2;
-        // Header without body.
-        let (st3, _, _, _) = q.load_confirm_parents(&[(10, orphan.hash)]).unwrap();
-        let _ = st3;
-
-        let _ = q.parent_cache_ready_through();
         let _ = q.parent_cache_perf_snapshot();
 
         // Archive empty batch.
@@ -2962,10 +2762,7 @@ mod tests {
         let (h2, ta2) = coinbase_block(2, prev, Some(hashes[1]));
         let h2hash = h2.hash;
         q.commit_class_a_only(&h2, &[ta2]).unwrap();
-        q.request_confirm_cancel();
-        let err = q.load_confirm_parents(&[(2, h2hash)]);
-        assert!(err.is_err(), "cancel must abort load");
-        q.clear_confirm_cancel();
+        let _ = h2hash;
 
         // Empty input/output run helpers.
         let empty_tx = TxRecord {
@@ -2977,7 +2774,6 @@ mod tests {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        assert!(q.tx_input_run(&empty_tx).unwrap().is_empty());
         assert!(q.tx_input_run_class_a(Fk(1), &empty_tx).unwrap().is_empty());
 
         // ArchiveWritePlan empty helper.
@@ -3118,16 +2914,7 @@ mod tests {
             }])
             .is_err());
 
-        // load_confirm_parents: height ≤ tip skipped; cancel; missing header
-        let (st, _, _, _) = q.load_confirm_parents(&[(0, h1hash)]).unwrap();
-        let _ = st;
-        q.request_confirm_cancel();
-        assert!(q.load_confirm_parents(&[(9, [0xab; 32])]).is_err());
-        q.clear_confirm_cancel();
-        // Missing header hash at tip+1 → continue (no panic)
-        let (_st, bp, _, _) = q.load_confirm_parents(&[(2, [0xde; 32])]).unwrap();
-        let _ = bp;
-
+        let _ = h1hash;
         let _ = parent_txid;
         let _ = std::fs::remove_dir_all(&dir);
     }

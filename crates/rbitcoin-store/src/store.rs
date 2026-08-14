@@ -200,16 +200,6 @@ impl Store {
         self.headers.ensure(rec)
     }
 
-    /// Append without uniqueness (offline rebuild only).
-    pub fn put_header_raw(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        self.headers.put_raw(rec)
-    }
-
-    /// In-place rewrite of one header row (offline repair).
-    pub fn rewrite_header(&self, fk: Fk, rec: &HeaderRecord) -> Result<(), StoreError> {
-        self.headers.rewrite(fk, rec)
-    }
-
     pub fn get_header(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
         self.headers.get(fk)
     }
@@ -584,25 +574,6 @@ impl Store {
         StoreError,
     > {
         self.txs.get_outs_by_range_batch(items)
-    }
-
-    /// Head-resolve: `txid.body` identity + `txout` outs (not Prefix33 body peeks).
-    ///
-    /// See [`TxTable::get_fk_and_outs_by_txid_batch`].
-    pub fn get_fk_and_outs_by_txid_batch(
-        &self,
-        txids: &[[u8; 32]],
-    ) -> Result<
-        (
-            Vec<(
-                [u8; 32],
-                Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
-            )>,
-            u64,
-        ),
-        StoreError,
-    > {
-        self.txs.get_fk_and_outs_by_txid_batch(txids)
     }
 
     /// Bulk Class A body ranges (confirm load / reconstruct).
@@ -1058,24 +1029,6 @@ impl Store {
     pub fn epoch(&self) -> ArchiveEpoch {
         self.epoch.lock().unwrap().clone()
     }
-
-    pub fn set_archive_mode(&self, enabled: bool) -> Result<(), StoreError> {
-        let mut ep = self.epoch.lock().unwrap();
-        ep.archive_mode = enabled;
-        ep.store(&self.path)
-    }
-
-    /// Finalize (seal) archive through `height` (inclusive). Soft zone is above this height.
-    ///
-    /// Flushes all tables and persists the epoch. Caller should drop wire entries ≤ height.
-    pub fn finalize_through(&self, height: u32) -> Result<(), StoreError> {
-        self.flush()?;
-        // Best-effort fsync of store directory files is via table flush; epoch syncs itself.
-        let mut ep = self.epoch.lock().unwrap();
-        ep.archive_mode = true;
-        ep.finalized_height = Some(height);
-        ep.store(&self.path)
-    }
 }
 
 fn class_a_has_creates(dir: &Path) -> bool {
@@ -1284,9 +1237,6 @@ mod tests {
         assert_eq!(s.header_count(), 0);
         assert_eq!(s.archived_block_count().unwrap(), 0);
         assert_eq!(s.spender_list_count(), 0);
-        assert!(!s.epoch().archive_mode);
-        s.set_archive_mode(true).unwrap();
-        assert!(s.epoch().archive_mode);
 
         let hdr = HeaderRecord {
             prev_fk: Fk::NULL,
@@ -1454,8 +1404,6 @@ mod tests {
         s.flush_header_archive().unwrap();
         s.flush_index_tables().unwrap();
         s.flush_for_shutdown().unwrap();
-        s.finalize_through(0).unwrap();
-        assert_eq!(s.epoch().finalized_height, Some(0));
 
         // repair: strong not on the fence
         s.strong_tx.set_strong(spend2_fk, hfk).unwrap();

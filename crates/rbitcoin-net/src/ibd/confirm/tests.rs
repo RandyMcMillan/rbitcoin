@@ -1,8 +1,7 @@
 //! tests (peeled from ibd/confirm.rs).
 
 use super::{
-    format_conf_q, format_queue_depth, is_confirm_load_retryable, stamp_reject_operator_msg,
-    ConfirmFeed, ConfirmQueueDepths,
+    format_conf_q, format_queue_depth, stamp_reject_operator_msg, ConfirmFeed, ConfirmQueueDepths,
 };
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -307,21 +306,18 @@ fn thr_stats_sample_and_reset() {
     use super::confirm_thr_stats;
     use std::time::Duration;
     let _ = confirm_thr_stats::sample_and_reset(); // clear
-    confirm_thr_stats::add_lookup_resolve(Duration::from_millis(10));
     confirm_thr_stats::add_lookup_clone(Duration::from_millis(5));
     confirm_thr_stats::add_load_recv_wait(Duration::from_millis(20));
     let s = confirm_thr_stats::sample_and_reset();
-    assert!(s.lookup_resolve_ns >= 10_000_000);
     assert!(s.lookup_clone_ns >= 5_000_000);
     assert!(s.load_recv_wait_ns >= 20_000_000);
     let busy = s
-        .lookup_resolve_ns
-        .saturating_add(s.lookup_clone_ns)
+        .lookup_clone_ns
         .saturating_add(s.lookup_stamp_ns)
         .saturating_add(s.lookup_other_ns);
-    assert_eq!(busy, s.lookup_resolve_ns + s.lookup_clone_ns);
+    assert_eq!(busy, s.lookup_clone_ns);
     let z = confirm_thr_stats::sample_and_reset();
-    assert_eq!(z.lookup_resolve_ns, 0);
+    assert_eq!(z.lookup_clone_ns, 0);
 }
 
 #[test]
@@ -339,29 +335,23 @@ fn stamp_reject_names_leftover_unresolved() {
         stamp_reject_operator_msg("unexpected previous header"),
         "unexpected previous header"
     );
-    assert!(!is_confirm_load_retryable(&msg));
 }
 
 #[test]
-fn is_confirm_load_retryable_always_false() {
+fn confirm_load_has_no_soft_requeue_hook() {
     // Policy: no lookup/load soft-requeue. Internal errors permanent; wire
-    // recovery is soft re-getdata / BodyMissing only.
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (parent package not ready, timeout)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (wave body missing from cache)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (parent header plan missing above tip)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "archive: parent create_fk unresolved (contiguous batch required)"
-    ));
-    assert!(!is_confirm_load_retryable("script failed: false"));
-    assert!(!is_confirm_load_retryable("prevout already spent"));
-    assert!(!is_confirm_load_retryable("unexpected previous header"));
-    assert!(!is_confirm_load_retryable("invariant: lookup stage miss"));
+    // recovery is soft re-getdata / BodyMissing only. The always-false hook
+    // hid that — production confirm must not name it.
+    let src = include_str!("mod.rs");
+    let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+    assert!(
+        !prod.contains("is_confirm_load_retryable"),
+        "always-false retry hook must stay gone"
+    );
+    assert!(
+        !prod.contains("re-queue (n="),
+        "soft-requeue warn path must stay gone"
+    );
 }
 
 /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).
@@ -638,7 +628,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
 
     let d = Duration::from_nanos(1_000);
     confirm_thr_stats::add_lookup_claim(d);
-    confirm_thr_stats::add_lookup_resolve(d);
     confirm_thr_stats::add_lookup_clone(d);
     confirm_thr_stats::add_lookup_stamp(d);
     confirm_thr_stats::add_lookup_other(d);
@@ -653,7 +642,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     confirm_thr_stats::add_write_work(d);
     let s = confirm_thr_stats::sample_and_reset();
     assert!(s.lookup_claim_ns >= 1_000);
-    assert!(s.lookup_resolve_ns >= 1_000);
     assert!(s.lookup_clone_ns >= 1_000);
     assert!(s.lookup_stamp_ns >= 1_000);
     assert!(s.lookup_other_ns >= 1_000);

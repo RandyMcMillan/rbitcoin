@@ -95,5 +95,3 @@ structural cold spentness).
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load; structural IO split asserts |
 | `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
 | `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 soft requeue |
-| `pin_new_missing_parent_body_is_invariant_error` | `load_confirm_parents` pin_new ghost create_fk |
-| `pin_new_incomplete_need_vouts_is_invariant_error` | `load_confirm_parents` pin_new OOB need_vouts |

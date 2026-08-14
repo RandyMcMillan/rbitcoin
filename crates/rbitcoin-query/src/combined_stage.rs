@@ -60,7 +60,7 @@ pub struct CombinedCreate {
 /// body `TxRecord.txid` from plan RAM maps when needed — this path never seeds
 /// a process pin map and does not fill txid from `txid.body` for that purpose.
 ///
-/// **Shipped entry used by** [`crate::Query::load_confirm_parents`] and wire pin.
+/// **Shipped entry used by** wire pin and SH.
 pub fn load_creates_once(
     store: &Store,
     fks: &[Fk],
@@ -188,9 +188,9 @@ mod tests {
             .unwrap()[0]
     }
 
-    /// Drive shipped `load_creates_once` as used by `load_confirm_parents`.
+    /// Drive shipped `load_creates_once` (wire pin + SH).
     #[test]
-    fn load_confirm_parents_uses_combined_body_path() {
+    fn load_creates_once_combined_body_path() {
         let (dir, q) = temp_query();
         let fks: Vec<Fk> = (0..4u8).map(|i| put_tx(&q, i + 20)).collect();
         reset_body_ok_reads();
@@ -410,143 +410,6 @@ mod tests {
         assert_eq!(q.block_queue_dequeue_height(3).unwrap(), 1);
         assert!(!q.block_queue_is_resolve_complete(3));
         assert!(q.block_queue_parent_hits(3).is_none());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents
-    /// on h0; load of h1 pins parent from batch_bodies same-batch or cold Class A
-    /// once (full_tx_reads for external parent).
-    #[test]
-    fn multi_block_load_confirm_parents_single_parent_body() {
-        use crate::TxApply;
-        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
-
-        let (dir, q) = temp_query();
-        // h0 coinbase
-        let mut h0hash = [0u8; 32];
-        h0hash[0] = 0xa0;
-        let h0 = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 0x207fffff,
-            nonce: 0,
-            merkle_root: h0hash,
-            hash: h0hash,
-        };
-        let mut parent_txid = [0u8; 32];
-        parent_txid[0] = 0xcb;
-        let ta0 = TxApply {
-            tx: TxRecord {
-                txid: parent_txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
-        };
-        let hfk0 = q.ensure_header(&h0).unwrap();
-
-        // h1: coinbase + spend of parent vout 0 (hash commits to h0 via write gate).
-        let version = 1;
-        let timestamp = 2;
-        let bits = 0x207fffff;
-        let nonce = 1;
-        let mut merkle = [0u8; 32];
-        merkle[0] = 0xa1;
-        let h1hash =
-            rbitcoin_store::block_header_hash(version, &h0.hash, &merkle, timestamp, bits, nonce);
-        let h1 = HeaderRecord {
-            prev_fk: hfk0,
-            version,
-            timestamp,
-            bits,
-            nonce,
-            merkle_root: merkle,
-            hash: h1hash,
-        };
-        let mut cb_txid = [0u8; 32];
-        cb_txid[0] = 0xcc;
-        let cb1 = TxApply {
-            tx: TxRecord {
-                txid: cb_txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
-        };
-        let mut child_txid = [0u8; 32];
-        child_txid[0] = 0x5e;
-        let child = TxApply {
-            tx: TxRecord {
-                txid: child_txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord {
-                prev_txid: parent_txid,
-                create_fk: Fk::NULL, // archive stamps
-                prev_index: 0,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }],
-            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
-        };
-        q.archive_prepared_owned(&mut [(h0, vec![ta0]), (h1, vec![cb1, child])])
-            .unwrap();
-        let _ = hfk0;
-
-        reset_body_ok_reads();
-        let (st0, parents0, _thin0, bodies0) =
-            q.load_confirm_parents(&[(0, h0hash)]).expect("load h0");
-        assert!(st0.blocks >= 1, "h0 load blocks={}", st0.blocks);
-        assert!(bodies0.len() >= 1, "h0 bodies");
-        let body_reads_after_h0 = body_ok_reads();
-        assert!(
-            body_reads_after_h0 >= 1,
-            "h0 must body-read creates, got {body_reads_after_h0}"
-        );
-        let parent_fk = q
-            .store()
-            .txs
-            .get_fk_by_txid(&parent_txid)
-            .unwrap()
-            .expect("parent head");
-        let _ = parents0;
-        let _ = parent_fk;
-
-        // Load h1: child spends parent → pin via same-batch (if multi-height) or cold.
-        // Separate load of h1 only: parent is external → one denserels cold load.
-        let (st1, parents1, _thin1, bodies1) =
-            q.load_confirm_parents(&[(1, h1hash)]).expect("load h1");
-        assert!(st1.blocks >= 1);
-        assert!(bodies1.len() >= 1);
-        // Parent pin from cold denserels (or batch if multi-block load).
-        assert!(
-            st1.full_tx_reads >= 1 || parents1.has_parent_out(parent_fk, 0),
-            "parent must pin: full_tx_reads={} has_parent_out={}",
-            st1.full_tx_reads,
-            parents1.has_parent_out(parent_fk, 0)
-        );
-        assert!(
-            parents1.has_parent_out(parent_fk, 0),
-            "parent out must be in BatchParents"
-        );
-
         let _ = std::fs::remove_dir_all(dir);
     }
 

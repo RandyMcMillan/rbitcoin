@@ -18,10 +18,17 @@ before 1.0).
 
 ### Fixed
 
+- **Head resolve 2-wave:** wave 1 is open + sealed ages ≤3 again. The spend-only
+  DONTCACHE change had made `head_or_idx_segment_index` always false, so hot
+  probed every segment and cold was empty. Unconnected hot hits still run
+  wave 2 so `TipThenAny` / `TipOnly` can take a connected sibling in age ≥4.
+
 - **Tests:** scripts-phase steal-worker pin records the coordinator thread on
   the handle (not a process-global name). Archive plan/commit wall stats sample
   under an exclusive lock so parallel `sample_and_reset` cannot steal the
-  window.
+  window. Head soft-span override is thread-local so a sibling
+  `test_set_soft_span_bytes(0)` cannot reset another test's 48-byte roll
+  window (`tip_then_any_connected_in_cold_beats_unconnected_hot`).
 
 ### Changed
 

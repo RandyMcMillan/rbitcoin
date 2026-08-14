@@ -1,11 +1,12 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
 //! Schema **13+** two waves on probe (uring when available):
-//! 1. **Hot probe** — page-coalesced loads for non-DONTCACHE segs (ages ≤3) → cands
+//! 1. **Hot probe** — open + sealed ages ≤3 → cands
 //! 2. **ID / IDX** — page-grouped `txid.body` identity fill, then depth-first BIP30
 //!    match in RAM + **one** page-grouped `txout.idx` fill for chosen fks
-//! 3. If any key still unmatched: **cold probe** (DONTCACHE segs ages ≥4) for
-//!    survivors only → full cand list → ID/IDX again
+//! 3. If any key still unmatched **or** (fence on and hot hit unconnected):
+//!    **cold probe** (sealed ages ≥4) for those keys → ID/IDX again
+//!    (`TipThenAny` can still take a connected sibling in cold)
 //! 4. **denserels** (optional) — packed body when outs are needed
 //!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
@@ -869,39 +870,40 @@ mod tests {
     /// via `first_fks` and only require the process counters moved for age 0.
     #[test]
     fn resolve_records_winner_age_open_segment() {
-        crate::segmented_head::SegmentedTxHead::test_set_soft_span_bytes(0);
-        let _ = crate::head_resolve_stats::sample_and_reset();
-        let (dir, t, txids) = seed_table(16);
-        assert_eq!(
-            t.head.segment_count(),
-            1,
-            "unexpected segs={}",
-            t.head.segment_count()
-        );
-        let first = t.head.first_fks_snapshot();
-        assert_eq!(first, vec![1]);
-        let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
-        let hits = got.iter().filter(|(_, r)| r.is_some()).count() as u64;
-        assert_eq!(hits, txids.len() as u64);
-        for (_tid, row) in &got {
-            if let Some((fk, _)) = row {
-                assert_eq!(
-                    crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0),
-                    Some(0),
-                    "fk={}",
-                    fk.0
-                );
+        crate::segmented_head::SegmentedTxHead::test_with_soft_span_bytes(0, || {
+            let _ = crate::head_resolve_stats::sample_and_reset();
+            let (dir, t, txids) = seed_table(16);
+            assert_eq!(
+                t.head.segment_count(),
+                1,
+                "unexpected segs={}",
+                t.head.segment_count()
+            );
+            let first = t.head.first_fks_snapshot();
+            assert_eq!(first, vec![1]);
+            let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
+            let hits = got.iter().filter(|(_, r)| r.is_some()).count() as u64;
+            assert_eq!(hits, txids.len() as u64);
+            for (_tid, row) in &got {
+                if let Some((fk, _)) = row {
+                    assert_eq!(
+                        crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0),
+                        Some(0),
+                        "fk={}",
+                        fk.0
+                    );
+                }
             }
-        }
-        let s = crate::head_resolve_stats::sample_and_reset();
-        // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
-        assert!(
-            s.age_hit[0] >= hits,
-            "age0={} hits={hits} age_hit={:?}",
-            s.age_hit[0],
-            &s.age_hit[..8]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+            let s = crate::head_resolve_stats::sample_and_reset();
+            // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
+            assert!(
+                s.age_hit[0] >= hits,
+                "age0={} hits={hits} age_hit={:?}",
+                s.age_hit[0],
+                &s.age_hit[..8]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// On a small (no cold segs) store, hot∪cold cands equal full probe.
@@ -921,6 +923,87 @@ mod tests {
         }
         // Tiny store: everything is hot; cold must be empty.
         assert!(cold.iter().all(|c| c.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wave 1 is open + sealed ages ≤3; ages ≥4 are cold only. hot∪cold = full.
+    #[test]
+    fn hot_wave_is_open_plus_three_sealed() {
+        use crate::address_head::HeadLayout;
+        use crate::segmented_head::HEAD_PROBE_HOT_MAX_AGE;
+        let dir = tmp("hot-open-plus-3");
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        // bits=8 → 256 slots, seal ~204 keys. Six segments ⇒ oldest age ≥4.
+        let n = 204u32.saturating_mul(6);
+        let mut items = Vec::new();
+        let mut txids = Vec::new();
+        for i in 0..n {
+            let mut tid = [0u8; 32];
+            tid[0..4].copy_from_slice(&i.to_le_bytes());
+            tid[8] = 0xa5;
+            txids.push(tid);
+            items.push((
+                TxRecord {
+                    txid: tid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ));
+        }
+        t.put_full_batch_indexed(&items, true).unwrap();
+        assert!(
+            t.head.sealed_segment_count() >= 4,
+            "need a cold sealed age, segs={} sealed={}",
+            t.head.segment_count(),
+            t.head.sealed_segment_count()
+        );
+        let first = t.head.first_fks_snapshot();
+        let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
+        let hot = t.head.probe_candidates_batch_hot(&mixed).unwrap();
+        let active = vec![true; mixed.len()];
+        let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
+        let full = t.head.probe_candidates_batch(&mixed).unwrap();
+        let mut saw_cold = false;
+        for i in 0..txids.len() {
+            let mut merged = hot[i].clone();
+            merged.extend(cold[i].iter().copied());
+            assert_eq!(merged, full[i], "hot∪cold must equal full probe i={i}");
+            for &fk in &hot[i] {
+                let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
+                assert!(
+                    age <= HEAD_PROBE_HOT_MAX_AGE,
+                    "hot cand fk={} age={age}",
+                    fk.0
+                );
+            }
+            for &fk in &cold[i] {
+                let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
+                assert!(
+                    age > HEAD_PROBE_HOT_MAX_AGE,
+                    "cold cand fk={} age={age}",
+                    fk.0
+                );
+                saw_cold = true;
+            }
+        }
+        assert!(saw_cold, "expected some keys to have cold-only cands");
+        let oldest = crate::head_resolve_stats::sealed_age_for_fk(&first, 1).unwrap();
+        assert!(oldest > HEAD_PROBE_HOT_MAX_AGE, "oldest age={oldest}");
+        assert!(
+            !hot[0].iter().any(|f| f.0 == 1),
+            "oldest create must not be in hot"
+        );
+        assert!(
+            cold[0].iter().any(|f| f.0 == 1),
+            "oldest create must be in cold"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

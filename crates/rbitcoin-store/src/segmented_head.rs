@@ -58,10 +58,13 @@ static LOOKUP_SEALED_PROBE: AtomicU64 = AtomicU64::new(0);
 static ROLLS: AtomicU64 = AtomicU64::new(0);
 static SEALS: AtomicU64 = AtomicU64::new(0);
 
-/// Test-only soft-span override (bytes). Non-zero wins over env so parallel
-/// `RBITCOIN_TX_IDX_SOFT_SPAN` mutators in other modules cannot desync this path.
+// Test-only soft-span override (bytes). Thread-local: a sibling test that
+// `test_set_soft_span_bytes(0)` must not reset this thread's roll window.
+// Non-zero wins over env.
 #[cfg(test)]
-static TEST_SOFT_SPAN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static TEST_SOFT_SPAN_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 pub fn sample_lookup_stats() -> HeadLookupStats {
     HeadLookupStats {
@@ -378,14 +381,12 @@ impl SegmentedTxHead {
     /// Body soft-span roll threshold (bytes). Same default as `tx.idx`.
     ///
     /// Production: env `RBITCOIN_TX_IDX_SOFT_SPAN` (min 8). Under test,
-    /// [`test_set_soft_span_bytes`] overrides env when non-zero so parallel
-    /// modules that also poke the env cannot race this path.
+    /// [`test_with_soft_span_bytes`] overrides env when non-zero (thread-local
+    /// so parallel store tests cannot steal each other's roll window).
     pub fn soft_span_bytes() -> u64 {
-        // Process-local override wins in tests so parallel env mutators cannot
-        // desync this path. Env is next; then the production default.
         #[cfg(test)]
         {
-            let o = TEST_SOFT_SPAN_OVERRIDE.load(Ordering::Relaxed);
+            let o = TEST_SOFT_SPAN_OVERRIDE.with(std::cell::Cell::get);
             if o > 0 {
                 return o;
             }
@@ -400,11 +401,25 @@ impl SegmentedTxHead {
         DEFAULT_SOFT_SPAN
     }
 
-    /// Test-only soft-span override (`0` = use env/default). Process-local;
-    /// preferred over env for concurrent store unit tests.
+    /// Test-only soft-span override (`0` = use env/default). Thread-local.
+    /// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
     #[cfg(test)]
     pub fn test_set_soft_span_bytes(bytes: u64) {
-        TEST_SOFT_SPAN_OVERRIDE.store(bytes, Ordering::Relaxed);
+        TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(bytes));
+    }
+
+    /// Hold this thread's soft-span override for `f`, then restore.
+    #[cfg(test)]
+    pub fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+        let prev = TEST_SOFT_SPAN_OVERRIDE.with(|c| c.replace(bytes));
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+        f()
     }
 
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
@@ -486,14 +501,20 @@ impl SegmentedTxHead {
     }
 }
 
+/// Wave-1 sealed-age cap: open (age 0) + sealed ages `1..=` this.
+///
+/// Independent of [`crate::dontcache_policy::head_or_idx_segment_index`]
+/// (that flag is spend-annotate pwrite only and is always false for head).
+pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
+
 /// Which head segments to probe (two-wave resolve vs full baseline).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadProbeWave {
     /// Open + all sealed (legacy full probe).
     All,
-    /// Non-DONTCACHE only (ages ≤3): open + up to 3 sealed.
+    /// Open + sealed ages ≤ [`HEAD_PROBE_HOT_MAX_AGE`].
     Hot,
-    /// DONTCACHE sealed only (ages ≥4).
+    /// Sealed ages > [`HEAD_PROBE_HOT_MAX_AGE`].
     Cold,
 }
 
@@ -503,13 +524,13 @@ impl HeadProbeWave {
         matches!(self, HeadProbeWave::All | HeadProbeWave::Hot)
     }
 
-    /// `dc` = [`crate::dontcache_policy::head_or_idx_segment_index`] for the seg.
+    /// `age` = [`crate::dontcache_policy::sealed_age_from_index`] for the seg.
     #[inline]
-    fn includes_seg(self, dontcache: bool) -> bool {
+    fn includes_sealed_age(self, age: u32) -> bool {
         match self {
             HeadProbeWave::All => true,
-            HeadProbeWave::Hot => !dontcache,
-            HeadProbeWave::Cold => dontcache,
+            HeadProbeWave::Hot => age <= HEAD_PROBE_HOT_MAX_AGE,
+            HeadProbeWave::Cold => age > HEAD_PROBE_HOT_MAX_AGE,
         }
     }
 }
@@ -544,7 +565,7 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::All, None)
     }
 
-    /// Two-wave resolve: probe only **hot** (non-DONTCACHE) segments for all keys.
+    /// Two-wave resolve: probe only **hot** (open + sealed ages ≤3) for all keys.
     pub(crate) fn probe_candidates_batch_hot(
         &self,
         mixed: &[[u8; 32]],
@@ -561,8 +582,9 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Hot, None)
     }
 
-    /// Two-wave resolve: probe only **cold** (DONTCACHE) segments for keys where
-    /// `active[i]` is true (wave-1 misses). Inactive keys get empty cand lists.
+    /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where
+    /// `active[i]` is true (wave-1 misses / unconnected hot). Inactive keys
+    /// get empty cand lists.
     pub(crate) fn probe_candidates_batch_cold(
         &self,
         mixed: &[[u8; 32]],
@@ -607,7 +629,7 @@ impl SegmentedTxHead {
 
         let n_segs = segs.len();
         let last = segs.last().unwrap();
-        // Open is always age 0 → never DONTCACHE → hot only (not cold).
+        // Open is always age 0 → wave 1 only (not cold).
         if !last.sealed && wave.includes_hot() {
             let mut pass_i: Vec<usize> = Vec::new();
             let mut pass_keys: Vec<[u8; 32]> = Vec::new();
@@ -649,10 +671,12 @@ impl SegmentedTxHead {
             if !seg.sealed {
                 continue;
             }
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
-            if !wave.includes_seg(dc) {
+            let age = crate::dontcache_policy::sealed_age_from_index(si, n_segs);
+            if !wave.includes_sealed_age(age) {
                 continue;
             }
+            // Page-cache flag only (always false under spend-pwrite DONTCACHE).
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };
@@ -1099,6 +1123,28 @@ mod tests {
         m[0..8].copy_from_slice(&i.to_le_bytes());
         m[8] = 0xA5;
         m
+    }
+
+    /// Sibling tests used to `test_set_soft_span_bytes(0)` on a process-global
+    /// Atomic and steal the 48-byte roll window from
+    /// `tip_then_any_connected_in_cold_beats_unconnected_hot` (stuck at age=2).
+    #[test]
+    fn soft_span_override_is_thread_local() {
+        SegmentedTxHead::test_with_soft_span_bytes(48, || {
+            assert_eq!(SegmentedTxHead::soft_span_bytes(), 48);
+            let other = std::thread::spawn(SegmentedTxHead::soft_span_bytes)
+                .join()
+                .expect("join");
+            assert_eq!(
+                SegmentedTxHead::soft_span_bytes(),
+                48,
+                "holding thread keeps its override"
+            );
+            assert_ne!(
+                other, 48,
+                "sibling thread must not inherit this test's override (got {other})"
+            );
+        });
     }
 
     #[test]

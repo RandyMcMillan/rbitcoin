@@ -193,14 +193,21 @@ fn scripts_feed_ahead_single_batch() {
 }
 
 /// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
+///
+/// Thread name is recorded on the handle (not process-global
+/// [`scripts_feed_test_sync`]) so a parallel `reset()` / `on_phase_enter`
+/// cannot steal or overwrite it under `cargo llvm-cov`.
 #[test]
 fn scripts_phase_does_not_run_on_steal_worker() {
-    use super::{confirm_scripts_phase_async, scripts_feed_test_sync};
-    scripts_feed_test_sync::reset();
-    confirm_scripts_phase_async(empty_loaded_batch())
-        .join()
+    use super::confirm_scripts_phase_async;
+    let (ok, name) = confirm_scripts_phase_async(empty_loaded_batch())
+        .join_with_phase_thread()
         .expect("empty phase");
-    let name = scripts_feed_test_sync::phase_thread_name().expect("phase entered");
+    assert!(ok.batch.is_empty());
+    assert!(
+        name.starts_with("rbtc-script-coord-"),
+        "scripts phase must run on a coordinator, got {name:?}"
+    );
     assert!(
         !name.starts_with("rbtc-scripts-"),
         "scripts phase ran on steal worker {name:?}"

@@ -33,6 +33,9 @@ pub fn confirm_scripts_phase(
 /// workers stay fed even when load→scripts depth is 1.
 pub struct ScriptsPhaseHandle {
     rx: std::sync::mpsc::Receiver<Result<ConfirmScriptOutcome, ConsensusError>>,
+    /// Per-submit thread name (test). Not the process-global last-writer slot.
+    #[cfg(test)]
+    phase_thread: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ScriptsPhaseHandle {
@@ -43,6 +46,19 @@ impl ScriptsPhaseHandle {
                 "scripts phase: worker disconnected before result",
             ))
         })
+    }
+
+    /// Join and return the coordinator thread name recorded for **this** handle.
+    #[cfg(test)]
+    pub fn join_with_phase_thread(self) -> Result<(ConfirmScriptOutcome, String), ConsensusError> {
+        let slot = std::sync::Arc::clone(&self.phase_thread);
+        let out = self.join()?;
+        let name = slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_default();
+        Ok((out, name))
     }
 
     /// Wait up to `timeout` for the wave result (production feed-ahead polls
@@ -64,11 +80,24 @@ impl ScriptsPhaseHandle {
 pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     scripts_feed_test_sync::on_async_submit();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    #[cfg(test)]
+    let phase_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+    #[cfg(test)]
+    let slot = std::sync::Arc::clone(&phase_thread);
     crate::script_pool::spawn_coordinator(move || {
+        #[cfg(test)]
+        {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(std::thread::current().name().unwrap_or("").to_string());
+        }
         let r = confirm_scripts_phase(batch);
         let _ = tx.send(r);
     });
-    ScriptsPhaseHandle { rx }
+    ScriptsPhaseHandle {
+        rx,
+        #[cfg(test)]
+        phase_thread,
+    }
 }
 
 /// Join `handle`, repeatedly invoking `on_poll` (e.g. load `try_recv` + async
@@ -236,28 +265,17 @@ impl ScriptsBatchMeta {
 /// Test-only sync so unit tests can prove N+1 was submitted while N’s wave is still open.
 pub mod scripts_feed_test_sync {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
     static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
     static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
-    static PHASE_THREAD: Mutex<Option<String>> = Mutex::new(None);
 
     /// Reset counters (call at start of each feed-ahead timing test).
     pub fn reset() {
         SUBMIT_COUNT.store(0, Ordering::SeqCst);
         HOLD_FIRST.store(false, Ordering::SeqCst);
         FIRST_ENTERED.store(false, Ordering::SeqCst);
-        *PHASE_THREAD.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    }
-
-    /// Thread name recorded by [`on_phase_enter`] (empty string if unnamed).
-    pub fn phase_thread_name() -> Option<String> {
-        PHASE_THREAD
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
     }
 
     /// When true, the first [`super::confirm_scripts_phase`] waits until
@@ -276,8 +294,6 @@ pub mod scripts_feed_test_sync {
     }
 
     pub(super) fn on_phase_enter() {
-        *PHASE_THREAD.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(std::thread::current().name().unwrap_or("").to_string());
         if !HOLD_FIRST.load(Ordering::SeqCst) {
             return;
         }

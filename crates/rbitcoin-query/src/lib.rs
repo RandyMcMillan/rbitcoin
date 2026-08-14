@@ -383,6 +383,42 @@ pub mod confirm_load_stats {
 pub mod archive_phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Test builds: serialize note_* + [`sample_and_reset`] so a coverage
+    /// worker cannot steal this thread's window. Re-entrant on the same thread
+    /// so [`with_exclusive`] can wrap a plan+commit+sample.
+    #[cfg(test)]
+    mod exclusive {
+        use std::cell::Cell;
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        thread_local! {
+            static HELD: Cell<bool> = const { Cell::new(false) };
+        }
+        pub fn with<R>(f: impl FnOnce() -> R) -> R {
+            if HELD.with(Cell::get) {
+                return f();
+            }
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            HELD.with(|h| h.set(true));
+            let r = f();
+            HELD.with(|h| h.set(false));
+            r
+        }
+    }
+    #[cfg(not(test))]
+    mod exclusive {
+        #[inline]
+        pub fn with<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+    }
+
+    /// Hold the test stats lock across drain → work → sample (integration pins).
+    #[cfg(test)]
+    pub fn with_exclusive<R>(f: impl FnOnce() -> R) -> R {
+        exclusive::with(f)
+    }
+
     // ── counts (resolve mix) ─────────────────────────────────────────────
     /// Headers (blocks) planned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -512,6 +548,10 @@ pub mod archive_phase_stats {
     }
 
     pub fn sample_and_reset() -> Sample {
+        exclusive::with(sample_and_reset_inner)
+    }
+
+    fn sample_and_reset_inner() -> Sample {
         let prep_sticky = PREP_STICKY_NS.swap(0, Ordering::Relaxed);
         let prep_inflight = PREP_INFLIGHT_NS.swap(0, Ordering::Relaxed);
         let prep_head_fk = PREP_HEAD_FK_NS.swap(0, Ordering::Relaxed);
@@ -580,33 +620,39 @@ pub mod archive_phase_stats {
         batch_stamp: u64,
         resolved_stamp: u64,
     ) {
-        add(&BLOCKS, blocks);
-        add(&EXT_NEED, ext_need);
-        add(&STICKY_HIT, sticky_hit);
-        add(&HEAD_NEED, head_need);
-        add(&HEAD_HIT, head_hit);
-        add(&BATCH_STAMP, batch_stamp);
-        add(&RESOLVED_STAMP, resolved_stamp);
-        LAST_BLOCKS.store(blocks, Ordering::Relaxed);
-        LAST_EXT_NEED.store(ext_need, Ordering::Relaxed);
-        LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
-        LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
-        LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
-        LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
+        exclusive::with(|| {
+            add(&BLOCKS, blocks);
+            add(&EXT_NEED, ext_need);
+            add(&STICKY_HIT, sticky_hit);
+            add(&HEAD_NEED, head_need);
+            add(&HEAD_HIT, head_hit);
+            add(&BATCH_STAMP, batch_stamp);
+            add(&RESOLVED_STAMP, resolved_stamp);
+            LAST_BLOCKS.store(blocks, Ordering::Relaxed);
+            LAST_EXT_NEED.store(ext_need, Ordering::Relaxed);
+            LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
+            LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
+            LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
+            LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
+        });
     }
 
     /// Live-pin `txid → (fk, range)` hits this plan batch.
     #[inline]
     pub fn note_pin_txid(n: u64, ns: u64) {
-        add(&PIN_TXID_N, n);
-        add(&PIN_TXID_NS, ns);
+        exclusive::with(|| {
+            add(&PIN_TXID_N, n);
+            add(&PIN_TXID_NS, ns);
+        });
     }
 
     /// Plan denserels wave size (fks + optional body bytes read).
     #[inline]
     pub fn note_head_dens_wave(dens_fks: u64, dens_bytes: u64) {
-        add(&HEAD_DENS_FKS, dens_fks);
-        add(&HEAD_DENS_BYTES, dens_bytes);
+        exclusive::with(|| {
+            add(&HEAD_DENS_FKS, dens_fks);
+            add(&HEAD_DENS_BYTES, dens_bytes);
+        });
     }
 
     /// Lookup sub-phases for one plan batch (`archive_plan_batch_from`).
@@ -628,24 +674,26 @@ pub mod archive_phase_stats {
         stamp_ns: u64,
         finish_ns: u64,
     ) {
-        add(&PREP_ASSIGN_NS, assign_ns);
-        add(&PREP_COLLECT_NS, collect_ns);
-        add(&PREP_STICKY_NS, sticky_ns);
-        add(&PREP_INFLIGHT_NS, inflight_ns);
-        add(&PREP_HEAD_FK_NS, head_fk_ns);
-        add(&PREP_HEAD_DENS_NS, head_dens_ns);
-        add(&PREP_HEAD_NS, head_fk_ns.saturating_add(head_dens_ns));
-        add(&PREP_STAMP_NS, stamp_ns);
-        add(&PREP_FINISH_NS, finish_ns);
-        // Last-batch (overwrite; for slow-plan diagnosis).
-        LAST_ASSIGN_NS.store(assign_ns, Ordering::Relaxed);
-        LAST_COLLECT_NS.store(collect_ns, Ordering::Relaxed);
-        LAST_STICKY_NS.store(sticky_ns, Ordering::Relaxed);
-        LAST_INFLIGHT_NS.store(inflight_ns, Ordering::Relaxed);
-        LAST_HEAD_FK_NS.store(head_fk_ns, Ordering::Relaxed);
-        LAST_HEAD_DENS_NS.store(head_dens_ns, Ordering::Relaxed);
-        LAST_STAMP_NS.store(stamp_ns, Ordering::Relaxed);
-        LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
+        exclusive::with(|| {
+            add(&PREP_ASSIGN_NS, assign_ns);
+            add(&PREP_COLLECT_NS, collect_ns);
+            add(&PREP_STICKY_NS, sticky_ns);
+            add(&PREP_INFLIGHT_NS, inflight_ns);
+            add(&PREP_HEAD_FK_NS, head_fk_ns);
+            add(&PREP_HEAD_DENS_NS, head_dens_ns);
+            add(&PREP_HEAD_NS, head_fk_ns.saturating_add(head_dens_ns));
+            add(&PREP_STAMP_NS, stamp_ns);
+            add(&PREP_FINISH_NS, finish_ns);
+            // Last-batch (overwrite; for slow-plan diagnosis).
+            LAST_ASSIGN_NS.store(assign_ns, Ordering::Relaxed);
+            LAST_COLLECT_NS.store(collect_ns, Ordering::Relaxed);
+            LAST_STICKY_NS.store(sticky_ns, Ordering::Relaxed);
+            LAST_INFLIGHT_NS.store(inflight_ns, Ordering::Relaxed);
+            LAST_HEAD_FK_NS.store(head_fk_ns, Ordering::Relaxed);
+            LAST_HEAD_DENS_NS.store(head_dens_ns, Ordering::Relaxed);
+            LAST_STAMP_NS.store(stamp_ns, Ordering::Relaxed);
+            LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
+        });
     }
 
     // ── Last completed plan_batch (slow-plan logs; not window-summed) ────────
@@ -720,12 +768,14 @@ pub mod archive_phase_stats {
         qwait_ns: u64,
         blocks: u64,
     ) {
-        add(&PREP_TOTAL_NS, total_ns);
-        add(&PREP_STRUCT_NS, struct_ns);
-        add(&PREP_FILTER_NS, filter_ns);
-        add(&PREP_PUBLISH_NS, publish_ns);
-        add(&PREP_QWAIT_NS, qwait_ns);
-        add(&PREP_BLOCKS, blocks);
+        exclusive::with(|| {
+            add(&PREP_TOTAL_NS, total_ns);
+            add(&PREP_STRUCT_NS, struct_ns);
+            add(&PREP_FILTER_NS, filter_ns);
+            add(&PREP_PUBLISH_NS, publish_ns);
+            add(&PREP_QWAIT_NS, qwait_ns);
+            add(&PREP_BLOCKS, blocks);
+        });
     }
 
     /// Commit path sub-phases (`archive_commit_plan`).
@@ -741,22 +791,26 @@ pub mod archive_phase_stats {
         dontneed_ns: u64,
         blocks: u64,
     ) {
-        add(&WRITE_TOTAL_NS, total_ns);
-        add(&WRITE_RESERVE_NS, reserve_ns);
-        add(&WRITE_BODY_NS, body_ns);
-        add(&WRITE_HEAD_NS, head_ns);
-        add(&WRITE_SPEND_NS, spend_ns);
-        add(&WRITE_HTXS_NS, htxs_ns);
-        add(&WRITE_STICKY_NS, sticky_ns);
-        add(&WRITE_DONTNEED_NS, dontneed_ns);
-        add(&WRITE_BLOCKS, blocks);
+        exclusive::with(|| {
+            add(&WRITE_TOTAL_NS, total_ns);
+            add(&WRITE_RESERVE_NS, reserve_ns);
+            add(&WRITE_BODY_NS, body_ns);
+            add(&WRITE_HEAD_NS, head_ns);
+            add(&WRITE_SPEND_NS, spend_ns);
+            add(&WRITE_HTXS_NS, htxs_ns);
+            add(&WRITE_STICKY_NS, sticky_ns);
+            add(&WRITE_DONTNEED_NS, dontneed_ns);
+            add(&WRITE_BLOCKS, blocks);
+        });
     }
 
     #[inline]
     pub fn note_write_flush(ns: u64) {
-        add(&WRITE_FLUSH_NS, ns);
-        // Include flush in write total so phases_sum ≈ total.
-        add(&WRITE_TOTAL_NS, ns);
+        exclusive::with(|| {
+            add(&WRITE_FLUSH_NS, ns);
+            // Include flush in write total so phases_sum ≈ total.
+            add(&WRITE_TOTAL_NS, ns);
+        });
     }
 }
 

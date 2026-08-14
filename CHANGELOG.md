@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tests:** scripts-phase steal-worker pin records the coordinator thread on
+  the handle (not a process-global name). Archive plan/commit wall stats sample
+  under an exclusive lock so parallel `sample_and_reset` cannot steal the
+  window.
+
 ### Changed
 
 - **Lookup stamp:** consult live `PipelineParentStore` by prev_txid before

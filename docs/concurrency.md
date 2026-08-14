@@ -28,8 +28,10 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 **tx.head (segmented):** fixed **25-bit** open-address head per segment with
 **4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,
 build **binary fuse8** (~9 bits/key). Open segment has no filter (always probed).
-Lookup: live pipeline pin by txid (same Weak as outs) → open → sealed
-newest→oldest (fuse gate) → body verify. No mono-head resize / overflow sidecar.
+Lookup: live pipeline pin by txid (same Weak as outs) → **hot** (open +
+sealed ages ≤3) → ID/idx; unfinished or unconnected-hot keys then **cold**
+(sealed ages ≥4). Fuse-gates sealed segs. No mono-head resize / overflow
+sidecar. RWF_DONTCACHE is not this split (spend-annotate pwrites only).
 
 **Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 

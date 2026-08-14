@@ -69,6 +69,8 @@ pub fn sealed_age_from_index(si: usize, n_segs: usize) -> u32 {
     n_segs.saturating_sub(1).saturating_sub(si) as u32
 }
 
+/// Page-cache flag only. **Not** the two-wave probe split (that is
+/// [`sealed_age_from_index`] vs [`crate::segmented_head::HEAD_PROBE_HOT_MAX_AGE`]).
 #[inline]
 pub fn head_or_idx_segment_index(_si: usize, _n_segs: usize) -> bool {
     false

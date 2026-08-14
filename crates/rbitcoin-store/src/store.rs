@@ -2082,6 +2082,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Connected sibling in a **cold** sealed age must beat a newer unconnected
+    /// hot hit (`TipThenAny` and `TipOnly`). Wave 1 is only open+3; skipping
+    /// wave 2 after an unconnected hot cand would regress to the newer row.
+    #[test]
+    fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
+        use crate::head_resolve_stats::sealed_age_for_fk;
+        use crate::segmented_head::{SegmentedTxHead, HEAD_PROBE_HOT_MAX_AGE};
+        use crate::tx_table::OutputRecord;
+
+        fn put_one(s: &Store, txid: [u8; 32], lock: u32) -> Fk {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: lock,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let out = vec![OutputRecord::unspent(1, vec![0x51; 96])];
+            s.put_tx_full_batch_indexed(&[(rec, vec![], out)], true)
+                .unwrap()[0]
+        }
+
+        SegmentedTxHead::test_with_soft_span_bytes(48, || {
+            let dir = tmp();
+            let s = Store::create(&dir).unwrap();
+            let txid = [0xCDu8; 32];
+            let old = put_one(&s, txid, 1);
+            let mut n = 10u64;
+            let mut guard = 0u32;
+            loop {
+                let first = s.txs.head.first_fks_snapshot();
+                let age = sealed_age_for_fk(&first, old.0).unwrap_or(0);
+                if age > HEAD_PROBE_HOT_MAX_AGE && s.txs.head.sealed_segment_count() >= 4 {
+                    break;
+                }
+                let mut dummy = [0u8; 32];
+                dummy[0..8].copy_from_slice(&n.to_le_bytes());
+                dummy[15] = 0xee;
+                let _ = put_one(&s, dummy, n as u32);
+                n += 1;
+                guard += 1;
+                assert!(
+                    guard < 80,
+                    "could not roll oldest create into cold age (age={age} segs={})",
+                    s.txs.head.segment_count()
+                );
+            }
+            let new = put_one(&s, txid, 2);
+            assert_ne!(old, new);
+            let first = s.txs.head.first_fks_snapshot();
+            let age_old = sealed_age_for_fk(&first, old.0).unwrap();
+            let age_new = sealed_age_for_fk(&first, new.0).unwrap();
+            assert!(
+                age_old > HEAD_PROBE_HOT_MAX_AGE,
+                "old fk must sit in cold age={age_old}"
+            );
+            assert!(
+                age_new <= HEAD_PROBE_HOT_MAX_AGE,
+                "new fk must sit in hot age={age_new}"
+            );
+
+            let mixed = [s.txs.secret.mix_txid(&txid)];
+            let hot = s.txs.head.probe_candidates_batch_hot(&mixed).unwrap();
+            let cold = s
+                .txs
+                .head
+                .probe_candidates_batch_cold(&mixed, &[true])
+                .unwrap();
+            assert!(
+                hot[0].iter().any(|f| *f == new) && !hot[0].iter().any(|f| *f == old),
+                "hot={:?} new={new:?} old={old:?}",
+                hot[0]
+            );
+            assert!(
+                cold[0].iter().any(|f| *f == old) && !cold[0].iter().any(|f| *f == new),
+                "cold={:?} old={old:?} new={new:?}",
+                cold[0]
+            );
+
+            // Neither connected yet: newest unconnected (hot) for TipThenAny.
+            assert_eq!(
+                s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+                Some(new)
+            );
+            assert_eq!(
+                s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
+                    .unwrap()[0]
+                    .1
+                    .map(|(f, _)| f),
+                Some(new),
+                "batch TipThenAny must keep newer unconnected when cold has no connected"
+            );
+            assert_eq!(
+                s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
+                    .unwrap()[0]
+                    .1,
+                None
+            );
+
+            s.header_txs.put_range(Fk(1), old, 1).unwrap();
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.rebuild_height_fence().unwrap();
+
+            assert_eq!(
+                s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
+                Some(old)
+            );
+            assert_eq!(
+                s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+                Some(old)
+            );
+            let batch_tip = s
+                .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
+                .unwrap();
+            assert_eq!(
+                batch_tip[0].1.map(|(f, _)| f),
+                Some(old),
+                "TipOnly must take connected cold sibling, not unconnected hot"
+            );
+            let batch_any = s
+                .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
+                .unwrap();
+            assert_eq!(
+                batch_any[0].1.map(|(f, _)| f),
+                Some(old),
+                "TipThenAny must take connected cold sibling over newer unconnected hot"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn schema16_create_does_not_write_tx_height_and_fence_has_reorg_holes() {
         let dir = tmp();

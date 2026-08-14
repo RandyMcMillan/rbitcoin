@@ -407,6 +407,22 @@ impl SegmentedTxHead {
         TEST_SOFT_SPAN_OVERRIDE.store(bytes, Ordering::Relaxed);
     }
 
+    /// Hold the process-local soft-span override for `f`, then restore.
+    #[cfg(test)]
+    pub fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = TEST_SOFT_SPAN_OVERRIDE.swap(bytes, Ordering::Relaxed);
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_SOFT_SPAN_OVERRIDE.store(self.0, Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
+        f()
+    }
+
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
         Arc::clone(&self.segments.read().unwrap_or_else(|e| e.into_inner()))
     }
@@ -486,14 +502,20 @@ impl SegmentedTxHead {
     }
 }
 
+/// Wave-1 sealed-age cap: open (age 0) + sealed ages `1..=` this.
+///
+/// Independent of [`crate::dontcache_policy::head_or_idx_segment_index`]
+/// (that flag is spend-annotate pwrite only and is always false for head).
+pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
+
 /// Which head segments to probe (two-wave resolve vs full baseline).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadProbeWave {
     /// Open + all sealed (legacy full probe).
     All,
-    /// Non-DONTCACHE only (ages ≤3): open + up to 3 sealed.
+    /// Open + sealed ages ≤ [`HEAD_PROBE_HOT_MAX_AGE`].
     Hot,
-    /// DONTCACHE sealed only (ages ≥4).
+    /// Sealed ages > [`HEAD_PROBE_HOT_MAX_AGE`].
     Cold,
 }
 
@@ -503,13 +525,13 @@ impl HeadProbeWave {
         matches!(self, HeadProbeWave::All | HeadProbeWave::Hot)
     }
 
-    /// `dc` = [`crate::dontcache_policy::head_or_idx_segment_index`] for the seg.
+    /// `age` = [`crate::dontcache_policy::sealed_age_from_index`] for the seg.
     #[inline]
-    fn includes_seg(self, dontcache: bool) -> bool {
+    fn includes_sealed_age(self, age: u32) -> bool {
         match self {
             HeadProbeWave::All => true,
-            HeadProbeWave::Hot => !dontcache,
-            HeadProbeWave::Cold => dontcache,
+            HeadProbeWave::Hot => age <= HEAD_PROBE_HOT_MAX_AGE,
+            HeadProbeWave::Cold => age > HEAD_PROBE_HOT_MAX_AGE,
         }
     }
 }
@@ -544,7 +566,7 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::All, None)
     }
 
-    /// Two-wave resolve: probe only **hot** (non-DONTCACHE) segments for all keys.
+    /// Two-wave resolve: probe only **hot** (open + sealed ages ≤3) for all keys.
     pub(crate) fn probe_candidates_batch_hot(
         &self,
         mixed: &[[u8; 32]],
@@ -561,8 +583,9 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Hot, None)
     }
 
-    /// Two-wave resolve: probe only **cold** (DONTCACHE) segments for keys where
-    /// `active[i]` is true (wave-1 misses). Inactive keys get empty cand lists.
+    /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where
+    /// `active[i]` is true (wave-1 misses / unconnected hot). Inactive keys
+    /// get empty cand lists.
     pub(crate) fn probe_candidates_batch_cold(
         &self,
         mixed: &[[u8; 32]],
@@ -607,7 +630,7 @@ impl SegmentedTxHead {
 
         let n_segs = segs.len();
         let last = segs.last().unwrap();
-        // Open is always age 0 → never DONTCACHE → hot only (not cold).
+        // Open is always age 0 → wave 1 only (not cold).
         if !last.sealed && wave.includes_hot() {
             let mut pass_i: Vec<usize> = Vec::new();
             let mut pass_keys: Vec<[u8; 32]> = Vec::new();
@@ -649,10 +672,12 @@ impl SegmentedTxHead {
             if !seg.sealed {
                 continue;
             }
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
-            if !wave.includes_seg(dc) {
+            let age = crate::dontcache_policy::sealed_age_from_index(si, n_segs);
+            if !wave.includes_sealed_age(age) {
                 continue;
             }
+            // Page-cache flag only (always false under spend-pwrite DONTCACHE).
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };

@@ -678,10 +678,23 @@ pub fn accept_and_archive_block(
     block: &Block,
     milestone: Milestone,
 ) -> Result<(), ConsensusError> {
+    commit_class_a_block(query, params, height, block, milestone)
+}
+
+/// Class A only (no tip / Class C). Crash and `plan=None` tests.
+///
+/// Not a production IBD API — confirm write uses `archive_plan_batch` + commit.
+pub fn commit_class_a_block(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    block: &Block,
+    milestone: Milestone,
+) -> Result<(), ConsensusError> {
     let _ = (height, milestone);
     let (header_rec, txs) = prepare_block_for_archive(query, params, block)?;
     query
-        .archive_block(&header_rec, &txs)
+        .commit_class_a_only(&header_rec, &txs)
         .map_err(ConsensusError::from)?;
     Ok(())
 }

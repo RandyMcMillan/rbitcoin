@@ -650,7 +650,7 @@ fn reorg_same_height_then_multi_block_branch() {
 #[test]
 fn confirm_wire_idempotent_when_class_a_already_present() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_wire_run, header_to_record,
+        accept_and_connect_block, commit_class_a_block, confirm_wire_run, header_to_record,
         ChainParams, Milestone,
     };
     use rbitcoin_primitives::Height as H;
@@ -671,7 +671,7 @@ fn confirm_wire_idempotent_when_class_a_already_present() {
     let hfk = q
         .ensure_header(&header_to_record(g_fk, &b1.header))
         .unwrap();
-    accept_and_archive_block(&q, &params, H(1), &b1, ms).unwrap();
+    commit_class_a_block(&q, &params, H(1), &b1, ms).unwrap();
     assert!(q
         .is_block_archived(&b1.block_hash().to_byte_array())
         .unwrap());

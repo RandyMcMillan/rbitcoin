@@ -2806,7 +2806,7 @@ mod tests {
         // Archive header+body at height 3 without confirm.
         let (h3, ta3) = coinbase_block(3, prev, Some(hashes[2]));
         let h3hash = h3.hash;
-        q.archive_block(&h3, &[ta3]).unwrap();
+        q.commit_class_a_only(&h3, &[ta3]).unwrap();
         let (st, parents, thin, bodies) = q.load_confirm_parents(&[(3, h3hash)]).unwrap();
         assert!(st.blocks >= 1 || bodies.len() >= 1 || !parents.is_empty() || thin.is_empty());
         let _ = thin;
@@ -2915,7 +2915,7 @@ mod tests {
         // Cancel before load of archived-ahead body.
         let (h2, ta2) = coinbase_block(2, prev, Some(hashes[1]));
         let h2hash = h2.hash;
-        q.archive_block(&h2, &[ta2]).unwrap();
+        q.commit_class_a_only(&h2, &[ta2]).unwrap();
         q.request_confirm_cancel();
         let err = q.load_confirm_parents(&[(2, h2hash)]);
         assert!(err.is_err(), "cancel must abort load");
@@ -3140,11 +3140,11 @@ mod tests {
         let (dir, q) = temp_query("resume-most-work");
         let (g, tg) = coinbase_block(0, Fk::NULL, None);
         let gfk = q.put_header(&g).unwrap();
-        let _ = q.archive_block(&g, &[tg]).unwrap();
+        let _ = q.commit_class_a_only(&g, &[tg]).unwrap();
         // Loser: single child with body.
         let (lose, tl) = coinbase_block(1, gfk, Some(g.hash));
         let _ = q.put_header(&lose).unwrap();
-        let _ = q.archive_block(&lose, &[tl]).unwrap();
+        let _ = q.commit_class_a_only(&lose, &[tl]).unwrap();
         // Winner: two-header chain, no Class A bodies.
         let mut w1 = coinbase_block(11, gfk, Some(g.hash)).0;
         if w1.hash == lose.hash {
@@ -3292,7 +3292,7 @@ mod tests {
         let (dir, q) = temp_query("resume-deep");
         let (g, tg) = coinbase_block(0, Fk::NULL, None);
         let mut prev_fk = q.put_header(&g).unwrap();
-        let _ = q.archive_block(&g, &[tg]).unwrap();
+        let _ = q.commit_class_a_only(&g, &[tg]).unwrap();
         let mut prev_hash = g.hash;
         // Tall enough that recursive DFS would blow a default ~2–8 MiB stack
         // when scoring the child under tip.

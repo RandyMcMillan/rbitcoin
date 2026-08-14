@@ -435,7 +435,7 @@ On open: `repair_class_c_above_tip` unstrongs bits not on the fence.
 
 ## Archive epoch (`archive_epoch`)
 
-Small control file (~32 B): magic, schema version, archive_mode flag, optional finalized_height, wire_depth. Coordinates durable-archive soft/hard zones with the tip wire ring.
+Small control file (~32 B): magic, schema version, archive_mode flag, optional finalized_height, `wire_depth`. Bytes stay on disk; **`wire_depth` is unread** (leftover from a removed tip wire ring). Epoch finalize still fsyncs buried archive prefixes — it does not coordinate a live ring.
 
 ---
 

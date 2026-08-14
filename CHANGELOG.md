@@ -15,6 +15,11 @@ before 1.0).
   commits and **one PR**. Full workspace test/coverage is GitHub Actions, not
   a local plan-end ritual; poll the PR to green. Musl install stays
   post-merge on `master`. See `AGENTS.md` and `docs/how-we-plan.md`.
+
+- **Docs honesty:** root `/api.jsonl` is gitignored. SCHEMA `archive_epoch.wire_depth`
+  is an unread leftover field (no tip wire ring). `page_rmw_pipelined` is
+  documented as test-only.
+
 - **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
   Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
   link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).

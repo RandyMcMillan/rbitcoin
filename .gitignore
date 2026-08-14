@@ -22,3 +22,5 @@ lcov.info
 *-ibd.log
 mainnet*.log
 signet*.log
+# Live Electrum dump if a node is started in the repo root
+/api.jsonl

@@ -174,7 +174,7 @@ pub fn validate_block_structure_hashed(
 
     // BIP325 signet solution is **not** checked here — structure/archive must stay
     // cheap for IBD. Full challenge verify runs on tip confirm only
-    // (`confirm_archived_run` / connect). Invalid signet blocks never become tip.
+    // (`confirm_wire_run` / connect). Invalid signet blocks never become tip.
 
     Ok(txids)
 }
@@ -498,7 +498,7 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 /// archived bodies (thin create_fk / Class A rows in parent cache).
 ///
 /// **Production tip / IBD:** use [`crate::accept_and_connect_block`] or
-/// [`crate::confirm_archived_run`] (load pin denserels → scripts → write). This
+/// [`crate::confirm_wire_run`] (lookup → load pin denserels → scripts → write). This
 /// helper is a **no-write** unit-test surface (empty pin → store cold spentness).
 /// It does not populate denserels and must not be the tip hot path.
 pub fn validate_block_connect(
@@ -518,7 +518,7 @@ pub fn validate_block_connect(
     // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    // Unit-test path: no load pin stage (production uses confirm_archived_run).
+    // Unit-test path: no load pin stage (production uses confirm_wire_run).
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::default();
     // Sole hash for this unit-test connect surface.

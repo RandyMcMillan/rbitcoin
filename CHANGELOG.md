@@ -9,6 +9,29 @@ before 1.0).
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead store APIs / duplicate benches:** refuse-only `TxTable::put` /
+  `Store::put_tx` / `Query::put_tx`, `body_txid_at`, and
+  `head_resize_in_progress`. Deleted `script_parallel{,_ab,_focus}` and
+  `rayon_audit` (they duplicated `script_pool` / `script_hotpath`).
+
+- **Zero meters:** `WRITE_STICKY` / `WRITE_DONTNEED`, `ASM_PREV_RES_*`,
+  `pin_spent_ns` / `unpin_spent_parent_outs`, `archive_resolve_stats` alias,
+  and mmap-half `sample_spend_*_ab_*` helpers.
+
+- **Hash-only confirm:** `confirm_archived_*`, hash `confirm_load_phase` /
+  `confirm_script_phase`, `wire_rebuild`, and `ChainHub::confirm_hash` /
+  `confirm_run`. Confirm is wire-only (`confirm_wire_*`). Store fixtures
+  `Query::connect_block` / `confirm_blocks_run` stay.
+
+- **Archive queue budget:** uncharged `ArchiveQueueBudget` / `--archive-queue-mb` /
+  `RBITCOIN_ARCHIVE_QUEUE_MB`. Densify is gated by body-queue soft depth only.
+
+- **`rbitcoin-wire-cache`:** unused tip wire-format ring crate. Node no longer
+  opens `{datadir}/wire`. Reconstruct + body queue + peer wire serve tip/reorg.
+  On-disk `archive_epoch.wire_depth` bytes stay unread.
+
 ### Changed
 
 - **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
@@ -23,6 +46,11 @@ before 1.0).
   commits and **one PR**. Full workspace test/coverage is GitHub Actions, not
   a local plan-end ritual; poll the PR to green. Musl install stays
   post-merge on `master`. See `AGENTS.md` and `docs/how-we-plan.md`.
+
+- **Docs honesty:** root `/api.jsonl` is gitignored. SCHEMA `archive_epoch.wire_depth`
+  is an unread leftover field (no tip wire ring). `page_rmw_pipelined` is
+  documented as test-only.
+
 - **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
   Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
   link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).

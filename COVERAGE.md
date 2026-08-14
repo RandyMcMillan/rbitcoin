@@ -40,7 +40,7 @@ each other. Musl release stays on `nix build .#rbitcoin-musl` (crane), not host
 
 All workspace members that contain production code:
 
-- `rbitcoin-primitives`, `rbitcoin-store`, `rbitcoin-query`, `rbitcoin-wire-cache`
+- `rbitcoin-primitives`, `rbitcoin-store`, `rbitcoin-query`
 - `rbitcoin-consensus`, `rbitcoin-mempool`, `rbitcoin-net`
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`

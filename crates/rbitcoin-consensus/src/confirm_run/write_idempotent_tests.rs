@@ -151,11 +151,10 @@ fn three_stage_write_filter_and_scripts_surface() {
     assert!(write_height_needed(None, 1));
 
     // Load / scripts / write are separate public surfaces for IBD.
-    let _m = super::confirm_load_phase;
+    let _m = super::confirm_wire_load_phase;
     let _s = super::confirm_scripts_phase;
     let _w = super::confirm_write_phase;
-    let _combined = super::confirm_script_phase;
-    let _sync = super::confirm_archived_run;
+    let _sync = super::confirm_wire_run;
 
     use super::{confirm_scripts_phase, LoadedBatch, ScriptPreverified};
     let batch = LoadedBatch {
@@ -374,9 +373,10 @@ fn check_bip34_helper_and_expected_bits_no_retarget() {
 
 #[test]
 fn empty_confirm_batch_rejected() {
-    // confirm_load_phase empty → BadBlock without store open
+    // confirm_wire_load_phase empty → BadBlock without store open
     // We only have Query API; use a throwaway path under /tmp when available.
-    use super::confirm_load_phase;
+    use super::confirm_wire_load_phase;
+    use super::ScriptPreverified;
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use rbitcoin_primitives::Height;
@@ -400,66 +400,25 @@ fn empty_confirm_batch_rejected() {
     std::fs::create_dir_all(&path).unwrap();
     let q = Query::open_or_create(&path).unwrap();
     let params = ChainParams::regtest();
-    let err = match confirm_load_phase(&q, &params, Milestone::NONE, &[]) {
+    let none = ScriptPreverified::new();
+    let err = match confirm_wire_load_phase(&q, &params, Milestone::NONE, &[], &none) {
         Ok(_) => panic!("expected empty batch error"),
         Err(e) => e,
     };
     assert!(matches!(err, crate::error::ConsensusError::BadBlock(_)));
     // Non-contiguous
-    let err2 = match confirm_load_phase(
+    let g = crate::params::genesis_block(&params);
+    let err2 = match confirm_wire_load_phase(
         &q,
         &params,
         Milestone::NONE,
-        &[(Height(1), [1u8; 32]), (Height(3), [2u8; 32])],
+        &[(Height(1), g.clone()), (Height(3), g)],
+        &none,
     ) {
         Ok(_) => panic!("expected non-contiguous error"),
         Err(e) => e,
     };
     assert!(matches!(err2, crate::error::ConsensusError::BadBlock(_)));
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// load_confirm_batch empty + resolve_body_metas store fallback (no plan).
-#[test]
-fn load_batch_empty_and_resolve_metas_fallback() {
-    use super::{load_confirm_batch, resolve_body_metas};
-    use crate::accept_and_connect_block;
-    use crate::milestone::Milestone;
-    use crate::params::ChainParams;
-    use rbitcoin_primitives::Height;
-    use rbitcoin_query::Query;
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-confirm-loadbatch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    let (bp, bt, bb) = load_confirm_batch(&q, &[], &[], 0).unwrap();
-    let _ = (bp, bt, bb);
-
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    use bitcoin::hashes::Hash;
-    let hash = genesis.block_hash().to_byte_array();
-    // No header plan in cache → store fallback in resolve_body_metas
-    let metas = resolve_body_metas(&q, &[(Height::GENESIS, hash)]).unwrap();
-    assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].hash, hash);
-    // Missing hash → NotFound
-    assert!(resolve_body_metas(&q, &[(Height(9), [0xee; 32])]).is_err());
     let _ = std::fs::remove_dir_all(&path);
 }
 

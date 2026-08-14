@@ -9,11 +9,11 @@ use std::path::Path;
 /// On-disk epoch record under `store/archive_epoch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveEpoch {
-    /// When true, tip wire ring + incremental finalize are active.
+    /// When true, incremental finalize is active.
     pub archive_mode: bool,
     /// Last height fully fsynced / sealed (None = nothing finalized yet).
     pub finalized_height: Option<u32>,
-    /// Soft-zone depth (wire ring window).
+    /// Leftover on-disk field (was a tip wire-ring window). Serialized; unread.
     pub wire_depth: u32,
 }
 

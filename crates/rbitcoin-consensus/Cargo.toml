@@ -32,27 +32,11 @@ harness = false
 name = "script_hotpath"
 harness = false
 
-[[bench]]
-name = "script_parallel"
-harness = false
-
-[[bench]]
-name = "script_parallel_ab"
-harness = false
-
 [dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "script_parallel_focus"
-harness = false
-
-[[bench]]
-name = "rayon_audit"
-harness = false
 
 [[bench]]
 name = "confirm_stage_cpu"

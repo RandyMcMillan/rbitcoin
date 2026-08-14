@@ -14,7 +14,6 @@
 //! IBD pipelines lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2). One Class A appender.
 //!
 //! [`confirm_wire_run`] is the unified entry (tests / tip / IBD).
-//! [`confirm_archived_run`] remains for already-archived Class A only.
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD uses
@@ -57,13 +56,12 @@ use lookup::{known_create_txid_lookup, stamp_parent_pin_archived};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
 pub use scripts::scripts_feed_test_sync;
 pub use scripts::{
-    confirm_script_phase, confirm_scripts_feed_ahead, confirm_scripts_phase,
-    confirm_scripts_phase_async, join_scripts_polling, scripts_stage_from_load_channel,
-    ScriptsBatchMeta, ScriptsPhaseHandle,
+    confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
+    join_scripts_polling, scripts_stage_from_load_channel, ScriptsBatchMeta, ScriptsPhaseHandle,
 };
 pub use write::confirm_write_phase;
 // Production helpers used by orchestration in this module and write stage.
-use phases::{assemble_run, load_confirm_batch, resolve_body_metas, script_wave, wire_rebuild};
+use phases::{assemble_run, script_wave};
 // Test modules reach these via super::
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
@@ -166,33 +164,6 @@ pub struct ScriptOkBatch {
     pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
 }
 
-/// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
-///
-/// Prefer the split phases in IBD for pipeline overlap.
-/// Script preverified set is empty (full verify).
-pub fn confirm_archived_run(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, [u8; 32])],
-) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    confirm_archived_run_preverified(query, params, milestone, blocks, &ScriptPreverified::new())
-}
-
-/// Like [`confirm_archived_run`], skipping script verify for `preverified` txids
-/// (tip follow: live mempool txs already checked at accept).
-pub fn confirm_archived_run_preverified(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, [u8; 32])],
-    preverified: &ScriptPreverified,
-) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let mat = confirm_load_phase_preverified(query, params, milestone, blocks, preverified)?;
-    let ok = confirm_scripts_phase(mat.batch)?;
-    confirm_write_phase(query, params, milestone, ok.batch)
-}
-
 /// Outcome of load: batch ready for scripts + pure work wall.
 pub struct ConfirmLoadOutcome {
     pub batch: LoadedBatch,
@@ -204,103 +175,7 @@ pub struct ConfirmLoadOutcome {
 pub struct ConfirmScriptOutcome {
     pub batch: ScriptOkBatch,
     /// Script verify only (when produced by [`confirm_scripts_phase`]).
-    /// When produced by [`confirm_script_phase`], includes load work too.
     pub work_ns: u64,
-}
-
-/// LOAD STAGE: load batch Class A + pin parents →
-/// resolve → wire → assemble.
-///
-/// Does **not** run scripts, advance tip, or probe durable spentness (except
-/// provisional same-run doubles during assemble).
-///
-/// Inline Class A load is included in [`ConfirmLoadOutcome::work_ns`]
-/// and also accrued into [`confirm_phase_stats::LOAD_NS`] (historical
-/// counter name) for IBD log continuity.
-pub fn confirm_load_phase(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, [u8; 32])],
-) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    confirm_load_phase_preverified(query, params, milestone, blocks, &ScriptPreverified::new())
-}
-
-/// Load with optional mempool script-preverified txids (tip follow).
-pub fn confirm_load_phase_preverified(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, [u8; 32])],
-    preverified: &ScriptPreverified,
-) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    if blocks.is_empty() {
-        return Err(ConsensusError::BadBlock("empty confirm batch"));
-    }
-    for w in blocks.windows(2) {
-        if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
-            return Err(ConsensusError::BadBlock("confirm run not contiguous"));
-        }
-    }
-
-    let heights: Vec<u32> = blocks.iter().map(|(h, _)| h.0).collect();
-    let items: Vec<(u32, [u8; 32])> = blocks.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    let batch_end = heights.last().copied().unwrap_or(0);
-
-    let t_work = Instant::now();
-
-    // Decode bodies once, pin parents + thin edges (batch-local).
-    //   • BatchParents holds need-vouts only (rides load→scripts→write queues)
-    //   • BatchFullBodies (creates) is used for wire then dropped — not queued
-    let t_load = Instant::now();
-    let (batch_parents, batch_thin, batch_bodies) =
-        load_confirm_batch(query, &heights, &items, batch_end)?;
-    let load_ns = t_load.elapsed().as_nanos() as u64;
-    confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
-
-    let t_resolve = Instant::now();
-    let metas = resolve_body_metas(query, blocks)?;
-    confirm_phase_stats::RESOLVE_NS
-        .fetch_add(t_resolve.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-    // Wire rebuild needs full create Class A; free it before assemble so the
-    // queued LoadedBatch does not retain create full-bodies (only wire blocks).
-    let wire_blocks = wire_rebuild(query, &metas, &batch_bodies)?;
-    drop(batch_bodies);
-
-    // Sole compute_txid pass for archived confirm (no plan structure stage).
-    let mut metas = metas;
-    for (m, w) in metas.iter_mut().zip(wire_blocks.iter()) {
-        m.txids = w
-            .txdata
-            .iter()
-            .map(|t| t.compute_txid().to_byte_array())
-            .collect();
-    }
-
-    let prepared = assemble_run(
-        query,
-        params,
-        milestone,
-        metas,
-        &wire_blocks,
-        &batch_parents,
-        &batch_thin,
-    )?;
-    // batch_thin only needed for assemble; drop before queue handoff.
-    drop(batch_thin);
-
-    let work_ns = t_work.elapsed().as_nanos() as u64;
-    Ok(ConfirmLoadOutcome {
-        batch: LoadedBatch {
-            prepared,
-            wire_blocks,
-            batch_parents,
-            script_preverified: preverified.clone(),
-            archive_plan: None,
-        },
-        work_ns,
-    })
 }
 
 /// LOAD STAGE from **raw wire blocks** (unified height-ordered pipeline).

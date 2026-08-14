@@ -46,14 +46,12 @@ proxy TLS for Electrum; do not expose plain Electrum to the internet.
 
 ```bash
 # Prefer a dedicated disk; large Class A archive.
-# Optional advanced env (preserved if you omit CLI): export RBITCOIN_ARCHIVE_QUEUE_MB=256
 
 ./target/release/rbitcoin-node \
   --datadir /path/to/datadir-mainnet \
   --network mainnet \
   --listen 0.0.0.0:8333 \
   --max-outbound 16 \
-  --archive-queue-mb 256 \
   --mempool-size-mb 300 \
   --inhibit-suspend \
   --log-level info

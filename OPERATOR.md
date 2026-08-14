@@ -56,7 +56,6 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--max-outbound N` | `--maxoutbound` | 16 live download peers |
 | `--maxinbound N` | `--maxconnections` | 125 inbound sessions |
 | `--mempool-size-mb N` | `--maxmempool` | ~300 MiB weight |
-| `--archive-queue-mb N` | | 512 (only publishes env when set; else advanced env kept) |
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | | `info` |
 | `--api-log PATH` | conf `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
@@ -74,7 +73,6 @@ Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
 ```
 network=signet
 maxinbound=64
-archive_queue_mb=256
 mempool_size_mb=100
 ```
 
@@ -181,7 +179,6 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 | Live IBD peers | **16** | `--max-outbound` |
 | Inbound P2P sessions | **125** | `--maxinbound` / `--maxconnections` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` / `--assumevalid-height` (`0` = full scripts) |
-| Archive queue RAM | **512 MiB** | `--archive-queue-mb` **or** advanced `RBITCOIN_ARCHIVE_QUEUE_MB` (CLI only overwrites when flag/conf set) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
@@ -611,7 +608,6 @@ export RAYON_NUM_THREADS=4
 # Prefer --milestone 840000 for catch-up, then reindex/full validate later if needed
 nice -n 10 ionice -c 3 ./target/release/rbitcoin-node \
   --datadir /mnt/dedicated/datadir-mainnet \
-  --archive-queue-mb 128 \
   --network mainnet \
   --max-outbound 12 \
   --mempool-size-mb 200 \

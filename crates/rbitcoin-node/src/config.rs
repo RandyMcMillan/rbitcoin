@@ -6,8 +6,6 @@ use rbitcoin_primitives::Network;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-/// Default soft densify / archive meter (MiB). Matches historical env default.
-pub const DEFAULT_ARCHIVE_QUEUE_MB: u64 = 512;
 /// Default max concurrent inbound P2P sessions (Core-ish).
 pub const DEFAULT_MAX_INBOUND: u32 = 125;
 
@@ -29,8 +27,6 @@ pub struct NodeConfig {
     pub signet_challenge: Option<ScriptBuf>,
     /// Custom Signet PoW target spacing in seconds.
     pub signet_block_time: Option<u64>,
-    pub archive_durability: bool,
-    pub wire_depth_blocks: u32,
     /// Bind address for P2P listen (`None` = do not listen / default bind later).
     pub p2p_listen: Option<SocketAddr>,
     /// Explicit outbound peers (`--connect`).
@@ -70,10 +66,6 @@ pub struct NodeConfig {
     pub max_inbound: u32,
     /// True when max_inbound came from CLI or conf (publish to env on apply).
     pub max_inbound_explicit: bool,
-    /// Soft densify / archive meter budget (MiB).
-    pub archive_queue_mb: u64,
-    /// True when archive_queue_mb came from CLI or conf.
-    pub archive_queue_mb_explicit: bool,
     /// Mempool weight budget in **WU** (default ~300M WU ≈ plan 300 MiB class).
     pub mempool_max_weight: u64,
     /// When true, ask systemd (if available) to block automatic suspend/idle.
@@ -94,8 +86,6 @@ impl Default for NodeConfig {
             network: Network::Mainnet,
             signet_challenge: None,
             signet_block_time: None,
-            archive_durability: true,
-            wire_depth_blocks: 100,
             p2p_listen: None,
             connect: Vec::new(),
             use_seeds: true,
@@ -112,8 +102,6 @@ impl Default for NodeConfig {
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,
             max_inbound_explicit: false,
-            archive_queue_mb: DEFAULT_ARCHIVE_QUEUE_MB,
-            archive_queue_mb_explicit: false,
             mempool_max_weight: 300_000_000,
             inhibit_suspend: false,
             conf_path: None,
@@ -228,7 +216,6 @@ impl NodeConfig {
                 ));
             }
         }
-        let _ = (self.wire_depth_blocks, self.archive_durability);
         Ok(())
     }
 
@@ -237,7 +224,7 @@ impl NodeConfig {
         self.datadir.join(".cookie")
     }
 
-    /// Create `{datadir}` and standard subdirs (`store`, `mempool`, `wire`) if missing.
+    /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
         let created_root = !self.datadir.exists();
@@ -251,7 +238,7 @@ impl NodeConfig {
                 self.datadir.display()
             )));
         }
-        for sub in ["store", "mempool", "wire"] {
+        for sub in ["store", "mempool"] {
             let p = self.datadir.join(sub);
             std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir { path: p, source })?;
         }
@@ -269,12 +256,6 @@ impl NodeConfig {
         if self.max_inbound_explicit {
             std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", self.max_inbound.to_string());
         }
-        if self.archive_queue_mb_explicit {
-            std::env::set_var(
-                "RBITCOIN_ARCHIVE_QUEUE_MB",
-                self.archive_queue_mb.to_string(),
-            );
-        }
     }
 
     /// Load a simple `key=value` conf (Core-style lines; `#` comments).
@@ -282,7 +263,7 @@ impl NodeConfig {
     /// Supported keys: `datadir`, `network` / `chain`, `listen`, `connect` (repeatable),
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
-    /// `archive_queue_mb`, `log_level`, `api_log`, `electrum_listen`, `esplora_listen`,
+    /// `log_level`, `api_log`, `electrum_listen`, `esplora_listen`,
     /// `shindex`, `rpc_listen`, `rpcuser`, `rpcpassword`,
     /// `noseeds` / `no_seeds`, `signetchallenge`, and `signetblocktime`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
@@ -408,12 +389,6 @@ impl NodeConfig {
                     }
                     self.mempool_max_weight = mb.saturating_mul(1_000_000);
                 }
-                "archive_queue_mb" => {
-                    self.archive_queue_mb = val
-                        .parse()
-                        .map_err(|e| NodeError::Config(format!("conf archive_queue_mb: {e}")))?;
-                    self.archive_queue_mb_explicit = true;
-                }
                 "log_level" => {
                     if val.is_empty() {
                         return Err(NodeError::Config("conf log_level requires a value".into()));
@@ -496,9 +471,7 @@ mod tests {
         assert_eq!(cfg.store_path(), dir.join("store"));
         assert_eq!(cfg.mempool_path(), dir.join("mempool"));
         assert_eq!(cfg.max_inbound, DEFAULT_MAX_INBOUND);
-        assert_eq!(cfg.archive_queue_mb, DEFAULT_ARCHIVE_QUEUE_MB);
         assert!(!cfg.max_inbound_explicit);
-        assert!(!cfg.archive_queue_mb_explicit);
         cfg.ensure_datadir().unwrap();
         assert!(dir.join("store").is_dir());
         assert!(dir.join("mempool").is_dir());
@@ -517,7 +490,6 @@ mod tests {
              network=signet\n\
              maxinbound=40\n\
              maxoutbound=8\n\
-             archive_queue_mb=128\n\
              mempool_size_mb=50\n\
              milestone=100\n\
              log_level=debug\n\
@@ -531,8 +503,6 @@ mod tests {
         assert_eq!(cfg.max_inbound, 40);
         assert!(cfg.max_inbound_explicit);
         assert_eq!(cfg.max_outbound, 8);
-        assert_eq!(cfg.archive_queue_mb, 128);
-        assert!(cfg.archive_queue_mb_explicit);
         assert_eq!(cfg.mempool_max_weight, 50_000_000);
         assert_eq!(cfg.milestone_height, 100);
         assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
@@ -552,46 +522,28 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_in = std::env::var_os("RBITCOIN_P2P_MAX_INBOUND");
-        let prev_ar = std::env::var_os("RBITCOIN_ARCHIVE_QUEUE_MB");
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "99");
-        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "55");
         let cfg = NodeConfig::default(); // no explicit flags
         assert!(!cfg.max_inbound_explicit);
-        assert!(!cfg.archive_queue_mb_explicit);
         cfg.apply_operator_env();
         assert_eq!(
             std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
             Ok("99"),
             "must not overwrite advanced inbound env when CLI/conf omitted knob"
         );
-        assert_eq!(
-            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
-            Ok("55"),
-            "must not overwrite advanced archive env when CLI/conf omitted knob"
-        );
         // Explicit knobs do publish.
         let mut explicit = NodeConfig::default();
         explicit.max_inbound = 12;
         explicit.max_inbound_explicit = true;
-        explicit.archive_queue_mb = 88;
-        explicit.archive_queue_mb_explicit = true;
         explicit.apply_operator_env();
         assert_eq!(
             std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
             Ok("12")
         );
-        assert_eq!(
-            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
-            Ok("88")
-        );
         // Restore prior process env (do not leave blank for parallel CLI tests).
         match prev_in {
             Some(v) => std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", v),
             None => std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND"),
-        }
-        match prev_ar {
-            Some(v) => std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", v),
-            None => std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB"),
         }
     }
 
@@ -600,17 +552,10 @@ mod tests {
         let cfg = NodeConfig {
             max_inbound: 42,
             max_inbound_explicit: true,
-            archive_queue_mb: 64,
-            archive_queue_mb_explicit: true,
             ..NodeConfig::default()
         };
         assert_eq!(cfg.max_inbound, 42);
-        assert_eq!(cfg.archive_queue_mb, 64);
         assert_eq!(NodeConfig::default().max_inbound, DEFAULT_MAX_INBOUND);
-        assert_eq!(
-            NodeConfig::default().archive_queue_mb,
-            DEFAULT_ARCHIVE_QUEUE_MB
-        );
     }
 
     #[test]
@@ -804,7 +749,6 @@ mod tests {
              maxoutbound=8\n\
              maxinbound=32\n\
              mempool_size_mb=50\n\
-             archive_queue_mb=64\n\
              log_level=info\n\
              noseeds=0\n\
              unknown_key=1\n\
@@ -826,8 +770,6 @@ mod tests {
         assert_eq!(cfg.max_inbound, 32);
         assert!(cfg.max_inbound_explicit);
         assert_eq!(cfg.mempool_max_weight, 50_000_000);
-        assert_eq!(cfg.archive_queue_mb, 64);
-        assert!(cfg.archive_queue_mb_explicit);
         assert_eq!(cfg.conf_log_level.as_deref(), Some("info"));
         assert!(cfg.use_seeds); // noseeds=0 → seeds on
 

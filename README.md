@@ -41,7 +41,7 @@ Operator-order facts (mainnet tip moves; treat as ballpark, not a warranty):
 1. **On-disk archive** — **map-free** Class A/B/C tables (pread/pwrite + fallocate
    grow; kernel page cache as L0): split Class A (`txout` / `inwit` / `spent`),
    keyless `tx.head`, spend annotations, native scripthash. Historical blocks are **reconstructed** from
-   the archive; tip keeps a **wire ring** and Class C tip durability after catch-up.
+   the archive; tip serve / reorg uses the in-RAM body queue and peer wire.
    Confirm/mempool prevouts use the archive (and in-mempool parents), not a
    separate UTXO hash table. Layout: [`SCHEMA.md`](./SCHEMA.md); IO:
    [`docs/io-modality.md`](./docs/io-modality.md); concurrency:
@@ -143,7 +143,6 @@ Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 | `rbitcoin-primitives` | Shared types / newtypes |
 | `rbitcoin-store` | Map-free Class A/B/C tables (fd pread/pwrite), scripthash, bulk IO |
 | `rbitcoin-query` | Domain API (archive, confirm, reconstruct, Electrum joins) |
-| `rbitcoin-wire-cache` | Tip wire-format block ring |
 | `rbitcoin-consensus` | Validation / confirm; pure-Rust scripts; milestone = scripts only |
 | `rbitcoin-net` | P2P + IBD (modular `ibd/`), tip follow, relay |
 | `rbitcoin-mempool` | Cluster graph + libre admission |

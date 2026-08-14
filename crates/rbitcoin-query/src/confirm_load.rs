@@ -27,9 +27,7 @@ pub struct ConfirmLoadStats {
     pub pin_cache_body: u32,
     /// Of `parent_unique`: missed same-batch (cold denserels).
     pub pin_new: u32,
-    /// Historical: spent-filter during pin (now always 0 — structural owns spentness).
-    pub pin_spent_ns: u64,
-    /// FIFO hit path resolve (excludes spent timer).
+    /// FIFO hit path resolve.
     pub pin_body_ns: u64,
     /// pin_new meta/outs resolve (excludes spent timer).
     pub pin_new_meta_ns: u64,
@@ -529,11 +527,6 @@ impl Query {
 
         crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok((st, batch_parents, batch_thin, batch_bodies))
-    }
-
-    /// No-op: sparse parents are batch-local and drop with the confirm batch.
-    pub fn unpin_spent_parent_outs(&self, _spends: &[(Fk, u32)]) -> Result<(), QueryError> {
-        Ok(())
     }
 }
 

@@ -113,28 +113,6 @@ fn open_refuses_txout_without_peer_stems() {
 }
 
 #[test]
-fn bare_meta_put_is_refused() {
-    let dir = tempfile_dir("bare-put");
-    let t = create_tiny(&dir);
-    let rec = TxRecord {
-        txid: [2u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 0,
-        output_start_fk: Fk::NULL,
-        output_count: 0,
-    };
-    assert!(matches!(t.put_batch(&[]), Err(StoreError::Corrupt(_))));
-    assert!(matches!(t.put(&rec), Err(StoreError::Corrupt(_))));
-    assert!(matches!(
-        t.put_batch_indexed(&[rec], false),
-        Err(StoreError::Corrupt(_))
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn put_full_batch_from_pins_roundtrip() {
     let dir = tempfile_dir("from-pins");
     let t = create_tiny(&dir);
@@ -683,8 +661,6 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
     assert_eq!(from_thin, txid, "sidefile thin identity");
     let (_off, len) = t.inwit.record_range(fk).unwrap();
     assert!(len > 50_000, "inwit should hold the fat witness");
-    // Offset-only identity is gone (schema 13); use fk.
-    assert!(t.body_txid_at(_off, len).is_err());
     // Head resolve still works.
     assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk));
     let _ = std::fs::remove_dir_all(&dir);

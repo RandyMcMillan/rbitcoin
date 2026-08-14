@@ -205,7 +205,6 @@ pub(crate) struct IbdPerfSample {
     /// Wire plan / in-flight parent pins (not denserels hits).
     pub load_pin_plan: u64,
     pub load_pin_new: u64,
-    pub load_pin_spent_ms: u64,
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
     pub load_plan_pin_ms: u64,
@@ -342,7 +341,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_write_head_ms: u64,
     pub arch_write_spend_ms: u64,
     pub arch_write_htxs_ms: u64,
-    pub arch_write_dontneed_ms: u64,
     pub arch_write_flush_ms: u64,
     pub arch_write_blocks: u64,
 
@@ -477,7 +475,6 @@ impl Default for IbdPerfSample {
             load_pin_cache_body: 0,
             load_pin_plan: 0,
             load_pin_new: 0,
-            load_pin_spent_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
             load_plan_pin_ms: 0,
@@ -591,7 +588,6 @@ impl Default for IbdPerfSample {
             arch_write_head_ms: 0,
             arch_write_spend_ms: 0,
             arch_write_htxs_ms: 0,
-            arch_write_dontneed_ms: 0,
             arch_write_flush_ms: 0,
             arch_write_blocks: 0,
             rss_kb: 0,
@@ -763,8 +759,6 @@ pub(crate) fn sample(
         asm_in_n,
         asm_prev_batch_ns,
         asm_prev_batch_n,
-        _asm_prev_res_ns,
-        _asm_prev_res_n,
         asm_prev_same_ns,
         asm_prev_same_n,
         asm_prev_cold_ns,
@@ -903,7 +897,6 @@ pub(crate) fn sample(
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_plan: pw.pin_plan,
         load_pin_new: pw.pin_new,
-        load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
         load_plan_pin_ms: ns_ms(pw.plan_pin_ns),
@@ -1018,7 +1011,6 @@ pub(crate) fn sample(
         arch_write_head_ms: ns_ms(arch_res.write_head_ns),
         arch_write_spend_ms: ns_ms(arch_res.write_spend_ns),
         arch_write_htxs_ms: ns_ms(arch_res.write_htxs_ns),
-        arch_write_dontneed_ms: ns_ms(arch_res.write_dontneed_ns),
         arch_write_flush_ms: ns_ms(arch_res.write_flush_ns),
         arch_write_blocks: arch_res.write_blocks,
         rss_kb: rss.rss_kb,
@@ -1521,13 +1513,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     append_nz(&mut out, "miss_p", s.load_missing_parents);
     out.push_str(&format!(
-        " phases hdr={} dec={} thin={} pin={} put={} spent={}ms pin_sub body={} new={}",
+        " phases hdr={} dec={} thin={} pin={} put={} pin_sub body={} new={}",
         s.load_hdr_ms,
         s.load_decode_ms,
         s.load_thin_ms,
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
-        s.load_pin_spent_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
     ));
@@ -1655,7 +1646,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | class_a_commit total={} body={} head={} htxs={} reserve={} spend={} dontneed={} flush={} blks={} \
+            " | class_a_commit total={} body={} head={} htxs={} reserve={} spend={} flush={} blks={} \
              ca_head_us/blk={} ca_body_us/blk={}",
             s.arch_write_total_ms,
             s.arch_write_body_ms,
@@ -1663,7 +1654,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_write_htxs_ms,
             s.arch_write_reserve_ms,
             s.arch_write_spend_ms,
-            s.arch_write_dontneed_ms,
             s.arch_write_flush_ms,
             s.arch_write_blocks,
             ca_head_us_blk,

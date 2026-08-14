@@ -16,7 +16,6 @@ rbitcoin-primitives = { workspace = true }
 rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
-rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-mempool = { workspace = true }
 rbitcoin-net = { workspace = true }

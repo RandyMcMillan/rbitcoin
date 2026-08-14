@@ -985,17 +985,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     // only densify further past the hole.
     let stats = LoopStats::default();
     let cfg = IbdConfig::for_test();
-    assign_work_ordered(
-        &mut st,
-        &hub,
-        &cfg,
-        &stats,
-        1.0,
-        3,
-        AssignDepth::Full,
-        true,
-        None,
-    );
+    assign_work_ordered(&mut st, &hub, &cfg, &stats, 3, AssignDepth::Full, None);
     assert!(
         st.inflight.contains_key(&w1.block_hash()) && st.inflight.contains_key(&w2.block_hash()),
         "assign reorg need (1b) must getdata both mids at confirmed heights; inflight={:?}",
@@ -1257,17 +1247,7 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
 
     let stats = LoopStats::default();
     let cfg = IbdConfig::for_test();
-    assign_work_ordered(
-        &mut st,
-        &hub,
-        &cfg,
-        &stats,
-        1.0,
-        3,
-        AssignDepth::Full,
-        true,
-        None,
-    );
+    assign_work_ordered(&mut st, &hub, &cfg, &stats, 3, AssignDepth::Full, None);
 
     // Desired contract: demote zombie mid and re-getdata (same as tip-hole
     // cover does for tip+1 zombies). Today assign 1b skip_download's the mid

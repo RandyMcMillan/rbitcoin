@@ -80,7 +80,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | `0ee28c0` / `77cb2ab` | io_uring bulk / page-grouped RMW for `tx.head` insert |
 | **`259b766`** (2026-07-23) | **Reverted to mmap-only head insert.** Host A/B: **io_uring head inserts ~5× slower on head ms/blk** than mmap Release. Bulk uring kept for **reads** only |
 | `788936e` | Page-coalesce insert still via **plain map** `write_at` |
-| `bulk_io::page_rmw_pipelined` | Still in tree, **`#[allow(dead_code)]`** — not production head path |
+| `bulk_io::page_rmw_pipelined` | Still in tree, **test-only** (`#[allow(dead_code)]` on the prod symbol) — not the head path |
 | `3a0c220` | **Body** FdOnly success (different pattern: linear append + bulk batch read) |
 | `f829090` / `11134cb` | Segmented idx/head landed **after** the 5× failure |
 

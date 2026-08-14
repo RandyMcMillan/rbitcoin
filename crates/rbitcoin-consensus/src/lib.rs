@@ -200,8 +200,6 @@ pub mod confirm_phase_stats {
     /// Prevout path splits (ns + counts; sum of path ns ≈ ASM_PREVOUT_NS).
     pub static ASM_PREV_BATCH_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_BATCH_N: AtomicU64 = AtomicU64::new(0);
-    pub static ASM_PREV_RES_NS: AtomicU64 = AtomicU64::new(0);
-    pub static ASM_PREV_RES_N: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_SAME_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_SAME_N: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_COLD_NS: AtomicU64 = AtomicU64::new(0);
@@ -385,18 +383,15 @@ pub mod confirm_phase_stats {
         )
     }
 
-    /// Prevout path detail: `(in_n, batch_ns, batch_n, res_ns, res_n, same_ns, same_n,
+    /// Prevout path detail: `(in_n, batch_ns, batch_n, same_ns, same_n,
     /// cold_ns, cold_n, fk_ns)`.
     #[inline]
     #[allow(clippy::type_complexity)]
-    pub fn sample_assemble_prevout_detail_and_reset(
-    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn sample_assemble_prevout_detail_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             ASM_IN_N.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_NS.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_N.swap(0, Ordering::Relaxed),
-            ASM_PREV_RES_NS.swap(0, Ordering::Relaxed),
-            ASM_PREV_RES_N.swap(0, Ordering::Relaxed),
             ASM_PREV_SAME_NS.swap(0, Ordering::Relaxed),
             ASM_PREV_SAME_N.swap(0, Ordering::Relaxed),
             ASM_PREV_COLD_NS.swap(0, Ordering::Relaxed),
@@ -583,43 +578,15 @@ pub mod confirm_phase_stats {
             SPEND_META_N.swap(0, Ordering::Relaxed),
         )
     }
-
-    /// Backward-compat alias — returns zeros for removed mmap half of the tuple.
-    #[inline]
-    pub fn sample_spend_ann_ab_and_reset() -> (u64, u64, u64, u64, u64, u64) {
-        let (ns, n, skip, pread) = sample_spend_ann_and_reset();
-        (0, 0, ns, n, skip, pread)
-    }
-
-    /// Backward-compat alias — mmap half is always zero.
-    #[inline]
-    pub fn sample_spend_meta_ab_and_reset() -> (u64, u64, u64, u64) {
-        let (ns, n) = sample_spend_meta_and_reset();
-        (0, 0, ns, n)
-    }
 }
 
-/// Confirm one archived tip+1 block (see [`confirm_archived_run`]).
-pub fn confirm_archived_at(
-    query: &Query,
-    params: &ChainParams,
-    height: Height,
-    block_hash: &[u8; 32],
-    milestone: Milestone,
-) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
-    let fks = confirm_archived_run(query, params, milestone, &[(height, *block_hash)])?;
-    Ok(fks[0])
-}
-
-/// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
+/// Confirm a contiguous tip-extension run of wire blocks (sync all stages).
 ///
-/// See [`confirm_run`]: load → scripts → write. IBD uses the split
-/// phases for 3-stage pipeline overlap.
+/// See [`confirm_wire_run`]: lookup → load → scripts → write. IBD uses the split
+/// phases for pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
-    confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_feed_ahead,
-    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_load_from_plan,
-    confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
+    confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
+    confirm_wire_load_from_plan, confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
     confirm_wire_lookup_and_ensure_denserels, confirm_wire_lookup_stamp, confirm_wire_run,
     confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
     join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
@@ -631,7 +598,7 @@ pub use confirm_run::{
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).
 ///
 /// **Same path as IBD confirm:** structure + header checks, then Class A
-/// archive, then [`confirm_archived_run`] (load pin denserels → scripts →
+/// archive, then [`confirm_wire_run`] (lookup → load pin denserels → scripts →
 /// structural → Class C → abs spend annotate). No empty-pin
 /// [`validate_block_connect`] and no separate `put_spend_batch_by_create`.
 ///
@@ -968,8 +935,6 @@ mod coverage_tests {
         ASM_IN_N.store(100, Ordering::Relaxed);
         ASM_PREV_BATCH_NS.store(1000, Ordering::Relaxed);
         ASM_PREV_BATCH_N.store(80, Ordering::Relaxed);
-        ASM_PREV_RES_NS.store(200, Ordering::Relaxed);
-        ASM_PREV_RES_N.store(10, Ordering::Relaxed);
         ASM_PREV_SAME_NS.store(50, Ordering::Relaxed);
         ASM_PREV_SAME_N.store(5, Ordering::Relaxed);
         ASM_PREV_COLD_NS.store(300, Ordering::Relaxed);
@@ -977,7 +942,7 @@ mod coverage_tests {
         ASM_PREV_FK_NS.store(40, Ordering::Relaxed);
         assert_eq!(
             sample_assemble_prevout_detail_and_reset(),
-            (100, 1000, 80, 200, 10, 50, 5, 300, 5, 40)
+            (100, 1000, 80, 50, 5, 300, 5, 40)
         );
         let _ = sample_assemble_cold_why_and_reset();
         ASM_PREV_COLD_NULL_FK_N.store(1, Ordering::Relaxed);
@@ -999,12 +964,6 @@ mod coverage_tests {
         let _ = sample_ensure_mix_and_reset();
         let _ = sample_spend_ann_and_reset();
         let _ = sample_spend_meta_and_reset();
-        let ab = sample_spend_ann_ab_and_reset();
-        assert_eq!(ab.0, 0);
-        assert_eq!(ab.1, 0);
-        let mb = sample_spend_meta_ab_and_reset();
-        assert_eq!(mb.0, 0);
-        assert_eq!(mb.1, 0);
     }
 
     #[test]
@@ -1057,7 +1016,7 @@ mod coverage_tests {
         accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
         // already archived branch
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-        confirm_archived_at(&q, &params, Height(1), &b1.block_hash().to_byte_array(), ms).unwrap();
+        confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
 
         // Bad pow limit on prepare_ibd
         let mut bad = b1.clone();

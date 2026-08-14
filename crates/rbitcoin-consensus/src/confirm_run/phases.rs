@@ -3,111 +3,6 @@
 use super::*;
 use rbitcoin_query::FkMap;
 
-/// Load Class A + pin parents + thin edges for the claimed batch.
-pub(super) fn load_confirm_batch(
-    query: &Query,
-    heights: &[u32],
-    items: &[(u32, [u8; 32])],
-    _batch_end: u32,
-) -> Result<
-    (
-        rbitcoin_query::BatchParents,
-        rbitcoin_query::BatchThin,
-        rbitcoin_query::BatchFullBodies,
-    ),
-    ConsensusError,
-> {
-    if heights.is_empty() {
-        return Ok((
-            rbitcoin_query::BatchParents::new(),
-            rbitcoin_query::BatchThin::default(),
-            rbitcoin_query::BatchFullBodies::new(),
-        ));
-    }
-    let (_st, batch_parents, batch_thin, batch_bodies) = query
-        .load_confirm_parents(items)
-        .map_err(ConsensusError::from)?;
-    Ok((batch_parents, batch_thin, batch_bodies))
-}
-
-pub(super) fn resolve_body_metas(
-    query: &Query,
-    blocks: &[(Height, [u8; 32])],
-) -> Result<Vec<BodyMeta>, ConsensusError> {
-    let mut metas = Vec::with_capacity(blocks.len());
-    for &(height, hash) in blocks {
-        // Prefer load-stage header plan (no store page faults after load).
-        if let Some(plan) = query.confirm_parent_cache().get_header_plan(height.0) {
-            if plan.header_rec.hash == hash {
-                metas.push(BodyMeta {
-                    height,
-                    hash,
-                    header_fk: plan.header_fk,
-                    header_rec: plan.header_rec,
-                    tx_fks: plan.tx_fks,
-                    // Filled after wire rebuild (sole hash for archived path).
-                    txids: Vec::new(),
-                });
-                continue;
-            }
-        }
-        // ConfirmParentCache miss or hash mismatch: load header meta from store
-        // (cold query path — not a soft recovery for a promised plan hit).
-        let (header_fk, header_rec) = query
-            .get_header_by_hash(&hash)
-            .map_err(ConsensusError::from)?
-            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
-        let tx_fks = query
-            .header_tx_fks(header_fk, Some(&hash))
-            .map_err(ConsensusError::from)?
-            .ok_or(ConsensusError::Store(StoreError::Corrupt(
-                "confirm without archived body",
-            )))?;
-        metas.push(BodyMeta {
-            height,
-            hash,
-            header_fk,
-            header_rec,
-            tx_fks,
-            txids: Vec::new(),
-        });
-    }
-    Ok(metas)
-}
-
-pub(super) fn wire_rebuild(
-    query: &Query,
-    metas: &[BodyMeta],
-    batch_bodies: &rbitcoin_query::BatchFullBodies,
-) -> Result<Vec<Arc<Block>>, ConsensusError> {
-    // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
-    // *slower* than sequential for 1–128 blocks. Load decoded Class A once into
-    // `batch_bodies` — wire builds `bitcoin::Transaction` from that map (store
-    // only if a create is missing from the batch, which should not happen).
-    let t0 = Instant::now();
-    let mut blks = Vec::with_capacity(metas.len());
-    for m in metas {
-        let prev_hash = query
-            .confirm_parent_cache()
-            .get_header_plan(m.height.0)
-            .map(|p| p.prev_hash);
-        blks.push(Arc::new(
-            query
-                .reconstruct_archived_block_from_parts_cached(
-                    m.header_rec.clone(),
-                    m.tx_fks.clone(),
-                    prev_hash,
-                    Some(batch_bodies),
-                )
-                .map_err(ConsensusError::from)?,
-        ));
-    }
-    let ns = t0.elapsed().as_nanos() as u64;
-    confirm_phase_stats::RECONSTRUCT_WIRE_NS.fetch_add(ns, Ordering::Relaxed);
-    confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
-    Ok(blks)
-}
-
 pub(super) fn assemble_run(
     query: &Query,
     params: &ChainParams,
@@ -446,7 +341,7 @@ pub(super) fn post_commit(
     batch_parents: &rbitcoin_query::BatchParents,
     meta_by_abs: &rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<(u64, u64), ConsensusError> {
-    // Confirm write (IBD + tip via accept_and_connect → confirm_archived_run):
+    // Confirm write (IBD + tip via accept_and_connect → confirm_wire_run):
     // batch durable spend annotations after Class C. Load pin must supply
     // denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
@@ -500,26 +395,6 @@ pub(super) fn post_commit(
     }
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);
-
-    // IBD (Direct): skip per-spend unpin — tip GC drops the same parent outs.
-    // Tip mode: still retire spent sparse parents so long-lived cache stays lean.
-    let t_unpin = Instant::now();
-    if query.index_mode() != rbitcoin_query::IndexMode::Direct {
-        let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
-            .iter()
-            .flat_map(|p| {
-                p.spends.iter().filter_map(|(_txid, vout, _sfk, cfk)| {
-                    if cfk.is_null() {
-                        None
-                    } else {
-                        Some((*cfk, *vout))
-                    }
-                })
-            })
-            .collect();
-        let _ = query.unpin_spent_parent_outs(&all_spends);
-    }
-    confirm_phase_stats::UNPIN_NS.fetch_add(t_unpin.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Prune confirm-parent cache for heights at/below new tip.
     let mut tip_gc_ns = 0u64;

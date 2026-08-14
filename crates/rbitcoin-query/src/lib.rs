@@ -157,7 +157,6 @@ pub mod confirm_load_stats {
     pub static PIN_PLAN: AtomicU64 = AtomicU64::new(0);
     /// Pin candidates that missed same-batch / plan-local (cold denserels).
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
     /// Wire pin sub-walls (ns).
@@ -209,7 +208,6 @@ pub mod confirm_load_stats {
         pub pin_cache_body: u64,
         pub pin_plan: u64,
         pub pin_new: u64,
-        pub pin_spent_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
         pub plan_pin_ns: u64,
@@ -307,7 +305,6 @@ pub mod confirm_load_stats {
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_plan: PIN_PLAN.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
-            pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
             plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
@@ -356,7 +353,6 @@ pub mod confirm_load_stats {
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_cache_body, PIN_CACHE_BODY);
         add!(pin_new, PIN_NEW);
-        add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_body_ns, PIN_BODY_NS);
         add!(pin_new_meta_ns, PIN_NEW_META_NS);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
@@ -379,7 +375,7 @@ pub mod confirm_load_stats {
 /// **Accounting:** `prep_total_ns` / `write_total_ns` are end-to-end walls for
 /// each batch; sub-phase ns should sum to ≈ total (gap = unaccounted). Prep
 /// includes structure decode, plan/resolve, and write-queue wait. Write includes
-/// reserve, body, head, spends, header_txs, sticky, dontneed, and periodic flush.
+/// reserve, body, head, spends, header_txs, and periodic flush.
 pub mod archive_phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -467,8 +463,6 @@ pub mod archive_phase_stats {
     pub static WRITE_HEAD_NS: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_SPEND_NS: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_HTXS_NS: AtomicU64 = AtomicU64::new(0);
-    pub static WRITE_STICKY_NS: AtomicU64 = AtomicU64::new(0);
-    pub static WRITE_DONTNEED_NS: AtomicU64 = AtomicU64::new(0);
     /// Periodic `flush_header_archive` on the writer thread.
     pub static WRITE_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -512,8 +506,6 @@ pub mod archive_phase_stats {
         pub write_head_ns: u64,
         pub write_spend_ns: u64,
         pub write_htxs_ns: u64,
-        pub write_sticky_ns: u64,
-        pub write_dontneed_ns: u64,
         pub write_flush_ns: u64,
         pub write_blocks: u64,
     }
@@ -541,8 +533,6 @@ pub mod archive_phase_stats {
                 .saturating_add(self.write_head_ns)
                 .saturating_add(self.write_spend_ns)
                 .saturating_add(self.write_htxs_ns)
-                .saturating_add(self.write_sticky_ns)
-                .saturating_add(self.write_dontneed_ns)
                 .saturating_add(self.write_flush_ns)
         }
     }
@@ -595,8 +585,6 @@ pub mod archive_phase_stats {
             write_head_ns: WRITE_HEAD_NS.swap(0, Ordering::Relaxed),
             write_spend_ns: WRITE_SPEND_NS.swap(0, Ordering::Relaxed),
             write_htxs_ns: WRITE_HTXS_NS.swap(0, Ordering::Relaxed),
-            write_sticky_ns: WRITE_STICKY_NS.swap(0, Ordering::Relaxed),
-            write_dontneed_ns: WRITE_DONTNEED_NS.swap(0, Ordering::Relaxed),
             write_flush_ns: WRITE_FLUSH_NS.swap(0, Ordering::Relaxed),
             write_blocks: WRITE_BLOCKS.swap(0, Ordering::Relaxed),
         }
@@ -787,8 +775,6 @@ pub mod archive_phase_stats {
         head_ns: u64,
         spend_ns: u64,
         htxs_ns: u64,
-        sticky_ns: u64,
-        dontneed_ns: u64,
         blocks: u64,
     ) {
         exclusive::with(|| {
@@ -798,8 +784,6 @@ pub mod archive_phase_stats {
             add(&WRITE_HEAD_NS, head_ns);
             add(&WRITE_SPEND_NS, spend_ns);
             add(&WRITE_HTXS_NS, htxs_ns);
-            add(&WRITE_STICKY_NS, sticky_ns);
-            add(&WRITE_DONTNEED_NS, dontneed_ns);
             add(&WRITE_BLOCKS, blocks);
         });
     }
@@ -812,11 +796,6 @@ pub mod archive_phase_stats {
             add(&WRITE_TOTAL_NS, ns);
         });
     }
-}
-
-/// Backward-compatible name for archive resolve/phase sampler.
-pub mod archive_resolve_stats {
-    pub use super::archive_phase_stats::*;
 }
 
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
@@ -1192,11 +1171,6 @@ impl Query {
     pub fn confirm_cancelled(&self) -> bool {
         self.confirm_cancel
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// True while store runs a **blocking RAM** `tx.head` resize (confirm should pause).
-    pub fn tx_head_resize_in_progress(&self) -> bool {
-        self.store.txs.head_resize_in_progress()
     }
 
     /// Last height with SH creates committed (after tip). `None` if empty chain.
@@ -1692,10 +1666,6 @@ impl Query {
             }
         }
         Ok(self.store.header_txs.get_list(header_fk)?)
-    }
-
-    pub fn put_tx(&self, rec: &TxRecord) -> Result<Fk, QueryError> {
-        self.store.put_tx(rec)
     }
 
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
@@ -2220,7 +2190,6 @@ mod tests {
                 parent_unique: 4,
                 pin_cache_body: 5,
                 pin_new: 6,
-                pin_spent_ns: 7,
                 pin_body_ns: 8,
                 pin_new_meta_ns: 9,
                 parent_cache_hits: 10,
@@ -2261,7 +2230,7 @@ mod tests {
         assert_eq!(archive_phase_stats::LastPlanBatch::ms(10_000_000), 10);
         archive_phase_stats::note_head_dens_wave(9, 1024);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
-        archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);
+        archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 1);
         archive_phase_stats::note_write_flush(8);
         let a = archive_phase_stats::sample_and_reset();
         assert!(a.prep_phases_sum_ns() > 0);

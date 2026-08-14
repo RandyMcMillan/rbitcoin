@@ -43,8 +43,6 @@ where
     let mut max_outbound_set = false;
     let mut max_inbound = crate::config::DEFAULT_MAX_INBOUND;
     let mut max_inbound_set = false;
-    let mut archive_queue_mb = crate::config::DEFAULT_ARCHIVE_QUEUE_MB;
-    let mut archive_queue_set = false;
     let mut max_run_secs: Option<u64> = None;
     let mut mempool_size_mb: Option<u64> = None;
     let mut inhibit_suspend = false;
@@ -64,7 +62,7 @@ where
     [--shindex] [--sptweaks] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
-    [--mempool-size-mb|--maxmempool N] [--archive-queue-mb N] \\\n\
+    [--mempool-size-mb|--maxmempool N] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
 Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
@@ -74,7 +72,6 @@ Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound/--maxconnections (default 125).\n\
-Memory: --archive-queue-mb (default 512 soft densify meter).\n\
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
 Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
 RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
@@ -357,28 +354,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
-            "--archive-queue-mb" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --archive-queue-mb requires a number");
-                    return ExitCode::from(2);
-                }
-                match args[i].to_string_lossy().parse::<u64>() {
-                    Ok(n) if n > 0 => {
-                        archive_queue_mb = n;
-                        archive_queue_set = true;
-                    }
-                    Ok(_) => {
-                        eprintln!("error: --archive-queue-mb must be >= 1");
-                        return ExitCode::from(2);
-                    }
-                    Err(e) => {
-                        eprintln!("error: bad --archive-queue-mb: {e}");
-                        return ExitCode::from(2);
-                    }
-                }
-                i += 1;
-            }
             "--max-run-secs" => {
                 i += 1;
                 if i >= args.len() {
@@ -537,10 +512,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.max_inbound = max_inbound;
         config.max_inbound_explicit = true;
     }
-    if archive_queue_set {
-        config.archive_queue_mb = archive_queue_mb;
-        config.archive_queue_mb_explicit = true;
-    }
     config.inhibit_suspend = inhibit_suspend;
     // Map MiB → weight units (1 MiB ≈ 1e6 WU for budget purposes).
     if let Some(mb) = mempool_size_mb {
@@ -568,7 +539,7 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.max_run_secs = max_run_secs;
     }
 
-    // Create --datadir (and store/mempool/wire) before opening the store.
+    // Create --datadir (and store/mempool) before opening the store.
     if let Err(e) = config.ensure_datadir() {
         error!("{e}");
         return ExitCode::FAILURE;
@@ -686,18 +657,6 @@ mod tests {
             cli_main(["rbitcoin-node", "--maxinbound", "nope"]),
             ExitCode::from(2),
         );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--archive-queue-mb"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--archive-queue-mb", "0"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--archive-queue-mb", "x"]),
-            ExitCode::from(2),
-        );
         // Bad conf path / invalid conf log_level.
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -752,14 +711,11 @@ mod tests {
             "10",
             "--mempool-size-mb",
             "10",
-            "--archive-queue-mb",
-            "64",
         ]);
         assert_exit(code, ExitCode::SUCCESS);
         assert!(dir.join("store").is_dir());
         // CLI published operator envs for library readers.
         assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "10");
-        assert_eq!(std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").unwrap(), "64");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -824,11 +780,7 @@ mod tests {
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("node.conf");
-        std::fs::write(
-            &conf,
-            "network=signet\nmaxinbound=33\narchive_queue_mb=77\n",
-        )
-        .unwrap();
+        std::fs::write(&conf, "network=signet\nmaxinbound=33\n").unwrap();
         let data = dir.join("data");
         let code = cli_main([
             "rbitcoin-node",
@@ -848,18 +800,16 @@ mod tests {
         assert_exit(code, ExitCode::SUCCESS);
         // conf maxinbound applied (CLI did not override inbound)
         assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "33");
-        assert_eq!(std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").unwrap(), "77");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// CLI omit of inbound/archive must not clobber pre-set advanced envs.
+    /// CLI omit of inbound must not clobber pre-set advanced envs.
     #[test]
     fn cli_omit_preserves_advanced_env() {
         let _g = OPERATOR_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "91");
-        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "44");
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -873,19 +823,14 @@ mod tests {
             "--no-seeds",
             "--milestone",
             "0",
-            // no --maxinbound / --archive-queue-mb
+            // no --maxinbound
         ]);
         assert_exit(code, ExitCode::SUCCESS);
         assert_eq!(
             std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
             Ok("91")
         );
-        assert_eq!(
-            std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB").as_deref(),
-            Ok("44")
-        );
         std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND");
-        std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

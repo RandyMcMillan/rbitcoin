@@ -41,10 +41,10 @@ pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32) -> bool {
     should_log_empty_headers_lag(streak)
 }
 
-/// Work path idle: no ordered hashes, no inflight getdata, archive queue empty.
+/// Work path idle: no ordered hashes, no inflight getdata.
 #[inline]
-pub fn path_drained(st: &IbdWorkState, archive_q_count: usize) -> bool {
-    st.ordered.is_empty() && st.inflight.is_empty() && archive_q_count == 0
+pub fn path_drained(st: &IbdWorkState) -> bool {
+    st.ordered.is_empty() && st.inflight.is_empty()
 }
 
 /// True when tip is within 2 of peer horizon and archive is not ahead of tip.
@@ -56,8 +56,8 @@ pub fn peer_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
 
 /// Success exit after path drain: headers_done or tip near max_peer_height.
 #[inline]
-pub fn catchup_complete_after_drain(st: &IbdWorkState, tip_h: u32, archive_q_count: usize) -> bool {
-    if !path_drained(st, archive_q_count) {
+pub fn catchup_complete_after_drain(st: &IbdWorkState, tip_h: u32) -> bool {
+    if !path_drained(st) {
         return false;
     }
     let lag = header_lag_behind_peers(st, tip_h);
@@ -82,12 +82,11 @@ pub enum AllPeersDead {
 pub fn all_peers_dead_action(
     st: &IbdWorkState,
     tip_h: u32,
-    archive_q_count: usize,
     redial_in_flight: bool,
     dark_redial_empty: u32,
 ) -> AllPeersDead {
     let lag = header_lag_behind_peers(st, tip_h);
-    let path_ok = path_drained(st, archive_q_count);
+    let path_ok = path_drained(st);
     let caught_up = path_ok
         && tip_h > 0
         && lag <= 2
@@ -113,11 +112,11 @@ mod tests {
         mid.max_peer_height = 958_820;
         mid.max_ready_height = 161_000;
         assert_eq!(
-            all_peers_dead_action(&mid, 161_249, 0, false, 0),
+            all_peers_dead_action(&mid, 161_249, false, 0),
             AllPeersDead::GiveUpMidCatchup
         );
         assert_eq!(
-            all_peers_dead_action(&mid, 161_249, 0, true, 0),
+            all_peers_dead_action(&mid, 161_249, true, 0),
             AllPeersDead::WaitRedial
         );
 
@@ -127,7 +126,7 @@ mod tests {
         done.max_ready_height = 100;
         done.headers_done = true;
         assert_eq!(
-            all_peers_dead_action(&done, 100, 0, false, 0),
+            all_peers_dead_action(&done, 100, false, 0),
             AllPeersDead::CatchupComplete
         );
 
@@ -136,40 +135,40 @@ mod tests {
         path.max_peer_height = 313_000;
         path.max_ready_height = 2000;
         path.headers_done = true;
-        assert!(!catchup_complete_after_drain(&path, 2000, 0));
+        assert!(!catchup_complete_after_drain(&path, 2000));
         path.max_peer_height = 2001;
-        assert!(catchup_complete_after_drain(&path, 2000, 0));
+        assert!(catchup_complete_after_drain(&path, 2000));
 
         // Regression: tip=0 + peer horizon must not look complete (false tip mode).
         let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
         zero.max_peer_height = 958_900;
         zero.max_ready_height = 0;
         zero.headers_done = false;
-        assert!(!catchup_complete_after_drain(&zero, 0, 0));
+        assert!(!catchup_complete_after_drain(&zero, 0));
         assert!(!peer_caught_up(&zero, 0));
         assert_eq!(
-            all_peers_dead_action(&zero, 0, 0, false, 0),
+            all_peers_dead_action(&zero, 0, false, 0),
             AllPeersDead::GiveUpMidCatchup
         );
 
         // Dark redial budget exhausted while redial still marked in-flight.
         assert_eq!(
-            all_peers_dead_action(&mid, 161_249, 0, true, MAX_DARK_EMPTY_REDIALS),
+            all_peers_dead_action(&mid, 161_249, true, MAX_DARK_EMPTY_REDIALS),
             AllPeersDead::GiveUpMidCatchup
         );
 
-        // path_drained false when archive queue non-empty or ordered non-empty.
+        // path_drained false when ordered is non-empty.
         let mut busy = IbdWorkState::new(Vec::new(), None, Some(10));
         busy.max_peer_height = 10;
         busy.max_ready_height = 10;
         busy.headers_done = true;
-        assert!(!path_drained(&busy, 1));
-        assert!(!catchup_complete_after_drain(&busy, 10, 1));
+        assert!(path_drained(&busy));
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
         busy.ordered
             .push_back(BlockHash::from_byte_array([1u8; 32]));
-        assert!(!path_drained(&busy, 0));
+        assert!(!path_drained(&busy));
+        assert!(!catchup_complete_after_drain(&busy, 10));
 
         // peer_caught_up: tip near horizon and not behind archive.
         let mut near = IbdWorkState::new(Vec::new(), None, Some(100));

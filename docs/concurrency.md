@@ -17,7 +17,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Lookup pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do not assume large multi-dozen block waves.
 
-**Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** (when implemented) also calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. See [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
+**Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. See [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 
 **Wire retained on the pipeline batch only:** lookup/load pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Split Class A (`txout` / `inwit` / `spent`) is planned once and committed in the write stage.
 
@@ -25,13 +25,9 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Pipeline pins:** plan `batch_pin` / `BatchParents` / plan-local **sparse** `external_parent_outs` only (no process create FIFO). External staging maps are **frozen/cleared after pin** (`ArchiveWritePlan::freeze_after_pin`) so write batch only concatenates commit halves. `SharedParentPin` publishes immutable outs/layout halves via `arc_swap::ArcSwap` (compose + RCU; no in-place mutation). `BatchParents` sticky-caches the last outs Arc for multi-input assemble. IBD `pin(... adopt= range_fill= contract= publish=)` names residual pin wall. ConfirmParentCache holds tip-ahead **Arc** header plans only (insert/replace/drop under tip GC).
 
-**tx.head (segmented):** fixed **25-bit** open-address head per segment with
-**4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,
-build **binary fuse8** (~9 bits/key). Open segment has no filter (always probed).
-Lookup: live pipeline pin by txid (same Weak as outs) → **hot** (open +
-sealed ages ≤3) → ID/idx; unfinished or unconnected-hot keys then **cold**
-(sealed ages ≥4). Fuse-gates sealed segs. No mono-head resize / overflow
-sidecar. RWF_DONTCACHE is not this split (spend-annotate pwrites only).
+**tx.head (segmented):** see [`heads.md`](./heads.md). Lookup: live pin by
+txid → hot (open + ages ≤3) → ID/idx → cold (ages ≥4) if needed.
+RWF_DONTCACHE is spend-annotate pwrite only, not the wave split.
 
 **Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 

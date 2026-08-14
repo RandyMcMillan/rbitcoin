@@ -9,6 +9,12 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
+  Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
+  link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).
+
 ### Fixed
 
 - **Tests:** head and `tx.idx` share one thread-local soft-span override.

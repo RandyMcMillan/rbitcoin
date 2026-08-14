@@ -319,6 +319,8 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_hit_rank_avg_x100: u64,
     pub arch_prep_hit_rank_n: u64,
     pub arch_prep_miss_peeks: u64,
+    /// Write-behind pending txid→fk hits.
+    pub arch_prep_pending_hits: u64,
     /// Winner sealed-age CDF % (0/3/7/15/31); `cdf3` ≈ wave1 hit % under ages≤3 policy.
     pub arch_prep_age_cdf0_pct: u64,
     pub arch_prep_age_cdf3_pct: u64,
@@ -570,6 +572,7 @@ impl Default for IbdPerfSample {
             arch_prep_hit_rank_avg_x100: 0,
             arch_prep_hit_rank_n: 0,
             arch_prep_miss_peeks: 0,
+            arch_prep_pending_hits: 0,
             arch_prep_age_cdf0_pct: 0,
             arch_prep_age_cdf3_pct: 0,
             arch_prep_age_cdf7_pct: 0,
@@ -995,6 +998,7 @@ pub(crate) fn sample(
         arch_prep_hit_rank_avg_x100: (head_res.hit_rank_avg() * 100.0).round() as u64,
         arch_prep_hit_rank_n: head_res.hit_rank_n,
         arch_prep_miss_peeks: head_res.miss_peeks,
+        arch_prep_pending_hits: head_res.pending_hits,
         arch_prep_age_cdf0_pct: head_res.age_cdf_pct(0),
         arch_prep_age_cdf3_pct: head_res.age_cdf_pct(3),
         arch_prep_age_cdf7_pct: head_res.age_cdf_pct(7),
@@ -1599,6 +1603,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             out.push_str(&format!(
                 " head_rd(probe={} idx={} body={} keys={} cands={} lookups={} \
                  avg_cands={} avg_lookups={} hit_rank_avg={hit_rank_avg:.2} hit_n={} miss_peeks={} \
+                 pend={} \
                  probe_us/key={} idx_us/key={} body_us/key={} \
                  age_cdf(0={} 3={} 7={} 15={} 31={}) age_hit={} age_n={})",
                 s.arch_prep_probe_ms,
@@ -1611,6 +1616,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                 avg_lookups,
                 s.arch_prep_hit_rank_n,
                 s.arch_prep_miss_peeks,
+                s.arch_prep_pending_hits,
                 probe_us_key,
                 idx_us_key,
                 body_us_key,
@@ -1703,11 +1709,17 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
     let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
     let conf_wire_mib = (script_wire_mib.saturating_add(write_wire_mib)) as u64;
+    let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
+    let open_keys_mib = h.open_keys_bytes / (1024 * 1024);
+    let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
         .saturating_add(ps_mib)
         .saturating_add(sh_mt_mib)
-        .saturating_add(conf_wire_mib);
+        .saturating_add(conf_wire_mib)
+        .saturating_add(fuse8_mib)
+        .saturating_add(open_keys_mib)
+        .saturating_add(class_c_l2_mib);
     let anon_mib = kb_mib(s.rss_anon_kb);
     let residual_mib = anon_mib.saturating_sub(accounted_mib);
     format!(
@@ -1719,7 +1731,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf loadq={}/{} blks={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
-           wire={}MiB accounted≈{}MiB residual≈{}MiB \
+           wire={}MiB fuse8={}MiB open_keys={}MiB class_c_l2={}MiB \
+           accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} memtable={} heads={}",
         kb_mib(s.rss_kb),
@@ -1769,6 +1782,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         ps_mib,
         sh_mt_mib,
         conf_wire_mib,
+        fuse8_mib,
+        open_keys_mib,
+        class_c_l2_mib,
         accounted_mib,
         residual_mib,
         h.primary_bits,
@@ -2116,6 +2132,7 @@ mod tests {
         s.arch_prep_hit_rank_avg_x100 = 150;
         s.arch_prep_hit_rank_n = 20;
         s.arch_prep_miss_peeks = 5;
+        s.arch_prep_pending_hits = 3;
         s.arch_prep_age_hit_compact = "1:2:3:0:0:0:0:0:0".into();
         s.arch_head_dens_fks = 12;
         s.arch_head_dens_bytes = 3 * 1024 * 1024;
@@ -2144,6 +2161,7 @@ mod tests {
         assert!(dbg.contains("pin_txid=15/25"), "{dbg}");
         assert!(dbg.contains("us/pin_txid=133"), "{dbg}");
         assert!(dbg.contains("head_rd("), "{dbg}");
+        assert!(dbg.contains("pend=3"), "{dbg}");
         assert!(dbg.contains("probe_us/key="), "{dbg}");
         assert!(
             dbg.contains("sh_src pin=7 cold=3") || dbg.contains("sh collect=9"),
@@ -2352,6 +2370,9 @@ mod tests {
         assert!(line.contains("pstore weak=20000/live=8000≈16MiB"), "{line}");
         assert!(line.contains("accounted≈"), "{line}");
         assert!(line.contains("residual≈"), "{line}");
+        assert!(line.contains("fuse8="), "{line}");
+        assert!(line.contains("class_c_l2="), "{line}");
+        assert!(line.contains("open_keys="), "{line}");
         assert!(!line.contains("shadow"), "{line}");
         assert!(!line.contains("contig parked="), "{line}");
     }

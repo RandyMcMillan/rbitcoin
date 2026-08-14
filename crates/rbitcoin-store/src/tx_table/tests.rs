@@ -158,6 +158,150 @@ fn put_full_batch_from_pins_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Class A append submits txout+inwit+spent bodies as one pwrite wave (not 3 serial).
+#[test]
+fn put_full_batch_one_body_write_wave() {
+    let dir = tempfile_dir("one-wave");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [4u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    let pin = std::sync::Arc::new((tx, outs));
+    let _ = crate::bulk_io::test_take_pwrite_waves();
+    let fks = t.put_full_batch_from_pins(&[(pin, ins)], true).unwrap();
+    assert_eq!(fks.len(), 1);
+    let waves = crate::bulk_io::test_take_pwrite_waves();
+    assert!(
+        waves.iter().any(|&n| n >= 3),
+        "expected one ≥3-op body wave, got {waves:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pending_head_resolve_before_drain() {
+    let dir = tempfile_dir("pending-hit");
+    let t = create_tiny(&dir);
+    let mut txid = [0u8; 32];
+    txid[0] = 0x51;
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 0,
+        output_start_fk: Fk::NULL,
+        output_count: 0,
+    };
+    let fks = t
+        .put_full_batch_indexed(&meta_only_items(&[rec]), /*index=*/ false)
+        .unwrap();
+    assert!(
+        t.get_fk_by_txid(&txid).unwrap().is_none(),
+        "durable head must miss before note"
+    );
+    t.head_note_pending(&[(txid, fks[0])]);
+    assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fks[0]));
+    assert_eq!(t.head_drain_pending().unwrap(), 1);
+    assert_eq!(t.pending_head_len(), 0);
+    assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fks[0]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pending_head_same_page_drains_one_write() {
+    let dir = tempfile_dir("pending-page");
+    let t = create_tiny(&dir);
+    let bits = t.head_bits();
+    let mut items = Vec::new();
+    let mut i = 1u64;
+    while items.len() < 8 {
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&i.to_le_bytes());
+        let mixed = t.mix_txid_for_head(&txid);
+        if items.is_empty() {
+            items.push((txid, i));
+        } else {
+            let want =
+                crate::address_head::page_base_for_txid(&t.mix_txid_for_head(&items[0].0), bits);
+            if crate::address_head::page_base_for_txid(&mixed, bits) == want {
+                items.push((txid, i));
+            }
+        }
+        i += 1;
+        if i > 50_000 {
+            panic!("could not find 8 keys on one head page");
+        }
+    }
+    let recs: Vec<TxRecord> = items
+        .iter()
+        .map(|(txid, _)| TxRecord {
+            txid: *txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        })
+        .collect();
+    let fks = t
+        .put_full_batch_indexed(&meta_only_items(&recs), false)
+        .unwrap();
+    let pending: Vec<([u8; 32], Fk)> = recs
+        .iter()
+        .zip(fks.iter())
+        .map(|(r, fk)| (r.txid, *fk))
+        .collect();
+    t.head_note_pending(&pending);
+    let _ = crate::address_head::test_take_head_page_writes();
+    assert_eq!(t.head_drain_pending().unwrap(), 8);
+    let writes = crate::address_head::test_take_head_page_writes();
+    assert_eq!(
+        writes, 1,
+        "same-page drain must be one page write, got {writes}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pending_head_reopen_backfills_lagging_head() {
+    let dir = tempfile_dir("pending-reopen");
+    let txid = {
+        let t = create_tiny(&dir);
+        let mut txid = [0u8; 32];
+        txid[0] = 0x77;
+        let rec = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        t.put_full_batch_indexed(&meta_only_items(&[rec]), false)
+            .unwrap();
+        // No head insert, no pending (process kill).
+        txid
+    };
+    let t = TxTable::open(&dir).unwrap();
+    assert_eq!(
+        t.get_fk_by_txid(&txid).unwrap(),
+        Some(Fk(1)),
+        "open must backfill head from Class A"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Simulate crash after body/idx publish, before `txid.body` catch-up:
 /// body leads identity → open truncates body/idx to the common prefix.
 #[test]

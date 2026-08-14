@@ -19,8 +19,18 @@ use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::tx_idx::TxIdx;
 use rbitcoin_primitives::{Fk, TableKind};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Encoded Class A append waiting for body write + idx + HWM publish.
+pub(crate) struct PreparedAppend {
+    pub start: u64,
+    pub body_blob: Vec<u8>,
+    pub starts: Vec<u64>,
+    pub fks: Vec<Fk>,
+    pub base_count: u64,
+}
 
 /// Next 8-byte-aligned body start (schema 13+: no body-txid page rule).
 #[inline]
@@ -301,7 +311,11 @@ impl VarTable {
 
     /// Class A body payload write via bulk `WriteOp` (no RWF_DONTCACHE — permanent
     /// spend-only policy). Falls back to plain pwrite when uring is unavailable.
-    fn write_body_blob_bulk(&self, start: u64, body_blob: &[u8]) -> Result<(), StoreError> {
+    pub(crate) fn write_body_blob_bulk(
+        &self,
+        start: u64,
+        body_blob: &[u8],
+    ) -> Result<(), StoreError> {
         if body_blob.is_empty() {
             return Ok(());
         }
@@ -330,7 +344,61 @@ impl VarTable {
             .set_logical_len(end.max(self.body.logical_len()))?;
         Ok(())
     }
+}
 
+/// Submit several prepared Class A body blobs as **one** `pwrite_batch` wave.
+///
+/// Publish order is still body → idx → HWM: callers must [`VarTable::finish_prepared`]
+/// after this returns. Falls back to per-stem [`VarTable::write_body_blob_bulk`]
+/// if the batched submit is short or fails.
+pub(crate) fn write_prepared_bodies_one_wave(
+    jobs: &[(&VarTable, &PreparedAppend)],
+) -> Result<(), StoreError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    for (table, prep) in jobs {
+        if prep.body_blob.is_empty() {
+            continue;
+        }
+        let end = prep.start.saturating_add(prep.body_blob.len() as u64);
+        table.ensure_body_end(end)?;
+    }
+    use crate::bulk_io::{self, WriteOp};
+    let mut ops: Vec<WriteOp<'_>> = Vec::with_capacity(jobs.len());
+    for (table, prep) in jobs {
+        if prep.body_blob.is_empty() {
+            continue;
+        }
+        ops.push(WriteOp {
+            fd: table.body_write_fd(),
+            offset: prep.start,
+            buf: prep.body_blob.as_slice(),
+            result: i32::MIN,
+            dontcache: false,
+        });
+    }
+    if !ops.is_empty() {
+        bulk_io::pwrite_batch(&mut ops);
+        let all_ok = ops
+            .iter()
+            .zip(jobs.iter().filter(|(_, p)| !p.body_blob.is_empty()))
+            .all(|(op, (_, prep))| op.result >= 0 && (op.result as usize) == prep.body_blob.len());
+        if !all_ok {
+            for (table, prep) in jobs {
+                table.write_body_blob_bulk(prep.start, &prep.body_blob)?;
+            }
+            return Ok(());
+        }
+    }
+    for (table, prep) in jobs {
+        let end = prep.start.saturating_add(prep.body_blob.len() as u64);
+        table.publish_body_hwm(end)?;
+    }
+    Ok(())
+}
+
+impl VarTable {
     /// Next 8-aligned body start for a following append.
     pub fn next_aligned_start(&self) -> u64 {
         let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
@@ -384,10 +452,24 @@ impl VarTable {
         &self,
         n: usize,
         estimate_bytes: usize,
-        mut encode: impl FnMut(usize, &mut Vec<u8>),
+        encode: impl FnMut(usize, &mut Vec<u8>),
     ) -> Result<Vec<Fk>, StoreError> {
-        if n == 0 {
+        let Some(prep) = self.prepare_batch_encode(n, estimate_bytes, encode)? else {
             return Ok(Vec::new());
+        };
+        self.write_body_blob_bulk(prep.start, &prep.body_blob)?;
+        self.finish_prepared(prep)
+    }
+
+    /// Encode records and validate starts. Does **not** write or publish.
+    pub(crate) fn prepare_batch_encode(
+        &self,
+        n: usize,
+        estimate_bytes: usize,
+        mut encode: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<Option<PreparedAppend>, StoreError> {
+        if n == 0 {
+            return Ok(None);
         }
         let base_count = self.count.load(Ordering::Acquire);
         let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
@@ -429,17 +511,37 @@ impl VarTable {
                 ));
             }
         }
-        // Class A body append (bulk pwrite; no RWF_DONTCACHE).
-        self.write_body_blob_bulk(start, &body_blob)?;
-        // Idx after body (publish order).
-        self.idx.append_starts(base_count, &starts)?;
-        let new_end = start.saturating_add(body_blob.len() as u64);
-        let new_count = base_count + n as u64;
+        Ok(Some(PreparedAppend {
+            start,
+            body_blob,
+            starts,
+            fks,
+            base_count,
+        }))
+    }
+
+    pub(crate) fn body_write_fd(&self) -> RawFd {
+        self.body.read_fd()
+    }
+
+    pub(crate) fn ensure_body_end(&self, end: u64) -> Result<(), StoreError> {
+        self.body.ensure_capacity(end)
+    }
+
+    pub(crate) fn publish_body_hwm(&self, end: u64) -> Result<(), StoreError> {
+        self.body.set_logical_len(end.max(self.body.logical_len()))
+    }
+
+    /// Idx + count publish after the body blob is already on disk (and HWM set).
+    pub(crate) fn finish_prepared(&self, prep: PreparedAppend) -> Result<Vec<Fk>, StoreError> {
+        self.idx.append_starts(prep.base_count, &prep.starts)?;
+        let new_end = prep.start.saturating_add(prep.body_blob.len() as u64);
+        let new_count = prep.base_count + prep.fks.len() as u64;
         self.publish_begin();
         self.published_body_end.store(new_end, Ordering::Relaxed);
         self.count.store(new_count, Ordering::Relaxed);
         self.publish_end();
-        Ok(fks)
+        Ok(prep.fks)
     }
 
     /// Absolute start offset of record `fk` in body (for length-from-idx).

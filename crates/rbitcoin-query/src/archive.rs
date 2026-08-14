@@ -732,7 +732,22 @@ impl Query {
     /// body append / fk mismatch. Returns `Ok(true)` when body was appended.
     ///
     /// Phase walls go to [`crate::archive_phase_stats`] (body vs head split).
-    pub fn archive_commit_plan(&self, mut plan: ArchiveWritePlan) -> Result<bool, QueryError> {
+    ///
+    /// Drains write-behind `tx.head` before return. Confirm write uses
+    /// [`Self::archive_commit_plan_defer_head`] to overlap drain with Class C.
+    pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<bool, QueryError> {
+        let committed = self.archive_commit_plan_defer_head(plan)?;
+        if committed {
+            let _ = self.drain_pending_tx_head()?;
+        }
+        Ok(committed)
+    }
+
+    /// Like [`Self::archive_commit_plan`] but leaves `tx.head` in the pending map.
+    pub fn archive_commit_plan_defer_head(
+        &self,
+        mut plan: ArchiveWritePlan,
+    ) -> Result<bool, QueryError> {
         use std::time::Instant;
         if plan.packed.is_empty() {
             return Ok(false);
@@ -766,7 +781,7 @@ impl Query {
             ));
         }
 
-        // Head sole-writer insert (plain store + fence inside head_insert_many).
+        // Head write-behind: publish pending txid→fk so resolve can hit before drain.
         let t = Instant::now();
         if plan.index_tx {
             let heads: Vec<([u8; 32], Fk)> = plan
@@ -775,7 +790,8 @@ impl Query {
                 .zip(got_tx_fks.iter())
                 .map(|((pin, _), fk)| (pin.0.txid, *fk))
                 .collect();
-            self.store.txs.head_insert_many(&heads)?;
+            self.store.txs.head_drain_pending_if_full()?;
+            self.store.txs.head_note_pending(&heads);
         }
         let head_ns = t.elapsed().as_nanos() as u64;
 
@@ -812,6 +828,11 @@ impl Query {
             n_blocks.max(1),
         );
         Ok(true)
+    }
+
+    /// Drain write-behind `tx.head` inserts (page-grouped).
+    pub fn drain_pending_tx_head(&self) -> Result<u64, QueryError> {
+        Ok(self.store.txs.head_drain_pending()?)
     }
 
     /// Resolve prev outpoint txid for an input.

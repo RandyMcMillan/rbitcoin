@@ -125,6 +125,8 @@ fn resolve_fk_and_range_pread(
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
 
+    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
+
     // Wave 1: hot (cacheable) head segments.
     let t_probe = Instant::now();
     let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
@@ -422,11 +424,45 @@ fn key_done(
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
+    // Pending / prior-wave winner: do not ID older cands.
+    if winner[ki].is_some() && (heights.is_none() || connected[ki]) {
+        return true;
+    }
     if heights.is_some() {
         connected[ki]
     } else {
         skip_if_won && winner[ki].is_some()
     }
+}
+
+/// Write-behind map: txid.body is published, tx.head may still be draining.
+fn apply_pending_hits(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    heights: Option<&HeightFence>,
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    connected: &mut [bool],
+) -> Result<usize, StoreError> {
+    let mut hits = 0usize;
+    for (i, txid) in txids.iter().enumerate() {
+        let Some(fk) = table.pending_fk(txid) else {
+            continue;
+        };
+        if let Some(h) = heights {
+            if h.height_of(fk).is_none() {
+                continue;
+            }
+        }
+        let range = table.body.record_range(fk)?;
+        winner[i] = Some((fk, range));
+        if heights.is_some() {
+            connected[i] = true;
+        }
+        hits += 1;
+        crate::head_resolve_stats::add_pending_hit(1);
+        crate::head_resolve_stats::add_hit_rank(1);
+    }
+    Ok(hits)
 }
 
 fn id_idx_wave(
@@ -631,6 +667,8 @@ fn resolve_fk_and_range_uring_on(
     let mut idx_ns = 0u64;
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
+
+    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
 
     // ── Wave 1: hot head pages (uring) + page-grouped ID/IDX ──────────────
     let t_probe = Instant::now();

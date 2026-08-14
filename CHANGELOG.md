@@ -11,6 +11,14 @@ before 1.0).
 
 ### Changed
 
+- **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
+  suffix — now pinned. Class A `txout`/`inwit`/`spent` bodies submit as one
+  `pwrite_batch` wave. `tx.head` insert is write-behind (page-grouped drain
+  overlaps structural/Class C); resolve hits a pending txid→fk map until drain.
+  Crash-open backfills a lagging head from Class A.
+- **`ibd: sizes` residual:** `fuse8=` / `open_keys=` / `class_c_l2=` enter
+  accounted. Sealed fuse fingerprints (~9 bits/create) were the ~1.6 GiB gap
+  at 1.42 B creates — see [`docs/ibd-memory.md`](docs/ibd-memory.md).
 - **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
   Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
   link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).

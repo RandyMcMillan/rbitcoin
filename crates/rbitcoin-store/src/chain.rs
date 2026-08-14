@@ -23,6 +23,10 @@ impl ConfirmedTable {
         })
     }
 
+    pub fn l2_resident_bytes(&self) -> u64 {
+        self.arr.l2_resident_bytes()
+    }
+
     pub fn tip_height(&self) -> Option<Height> {
         let n = self.arr.len();
         if n == 0 {
@@ -132,6 +136,8 @@ pub struct StrongTxTable {
     dirty_lo_bit: std::sync::atomic::AtomicU64,
     /// Body byte length last flushed to disk (L2).
     disk_bytes: std::sync::atomic::AtomicU64,
+    /// Payload bytes written by the last [`Self::flush_dirty`].
+    last_flush_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl StrongTxTable {
@@ -143,6 +149,7 @@ impl StrongTxTable {
             dirty: std::sync::atomic::AtomicBool::new(false),
             dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
             disk_bytes: std::sync::atomic::AtomicU64::new(0),
+            last_flush_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -168,6 +175,7 @@ impl StrongTxTable {
             dirty: std::sync::atomic::AtomicBool::new(false),
             dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
             disk_bytes: std::sync::atomic::AtomicU64::new(body),
+            last_flush_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -267,6 +275,12 @@ impl StrongTxTable {
         } else {
             Ok(None)
         }
+    }
+
+    /// In-RAM L2 bit-image bytes (0 when FdOnly).
+    pub fn l2_resident_bytes(&self) -> u64 {
+        let g = self.data.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|v| v.len() as u64).unwrap_or(0)
     }
 
     pub fn set_strong(&self, tx_fk: Fk, header_fk: Fk) -> Result<(), StoreError> {
@@ -451,6 +465,13 @@ impl StrongTxTable {
         Ok(())
     }
 
+    /// Bytes written by the last [`Self::flush_dirty`].
+    #[cfg(test)]
+    pub(crate) fn last_flush_write_bytes(&self) -> u64 {
+        self.last_flush_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Persist dirty L2 bit image. Prefers append-only byte suffix writes.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
@@ -475,6 +496,7 @@ impl StrongTxTable {
             // Pure growth into new bytes: write only the new suffix.
             let suffix = v[disk as usize..].to_vec();
             drop(guard);
+            let n = suffix.len() as u64;
             if !suffix.is_empty() {
                 self.bits
                     .write_at(crate::file::FILE_HEADER_LEN as u64 + disk, &suffix)?;
@@ -482,6 +504,7 @@ impl StrongTxTable {
             self.disk_bytes.store(body_len, Ordering::Release);
             self.dirty.store(false, Ordering::Release);
             self.dirty_lo_bit.store(u64::MAX, Ordering::Release);
+            self.last_flush_bytes.store(n, Ordering::Release);
             return Ok(());
         }
 
@@ -493,6 +516,7 @@ impl StrongTxTable {
         let from = dirty_byte.min(body_len);
         let suffix = v[from as usize..].to_vec();
         drop(guard);
+        let n = suffix.len() as u64;
         if !suffix.is_empty() {
             self.bits
                 .write_at(crate::file::FILE_HEADER_LEN as u64 + from, &suffix)?;
@@ -504,6 +528,7 @@ impl StrongTxTable {
         self.disk_bytes.store(body_len, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         self.dirty_lo_bit.store(u64::MAX, Ordering::Release);
+        self.last_flush_bytes.store(n, Ordering::Release);
         Ok(())
     }
 
@@ -573,6 +598,33 @@ mod strong_tests {
             !t.is_strong(Fk(9)).unwrap(),
             "unflushed strong must not survive"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// High-fk-only dirties must write a suffix, not the full L2 image.
+    #[test]
+    fn strong_high_fk_flush_writes_suffix_not_full_image() {
+        let dir = tmp();
+        let t = StrongTxTable::create(&dir).unwrap();
+        // 80_000 bits = 10_000 payload bytes.
+        t.set_strong_range(Fk(1), 80_000, Fk(1)).unwrap();
+        t.flush_dirty().unwrap();
+        let first = t.last_flush_write_bytes();
+        assert!(
+            first >= 10_000,
+            "first flush should persist the full image, got {first}"
+        );
+
+        // Flip only the last allocated bit — dirty_lo is near the end.
+        t.set_unstrong(Fk(80_000)).unwrap();
+        t.flush_dirty().unwrap();
+        let second = t.last_flush_write_bytes();
+        assert!(
+            second > 0 && second < first / 4,
+            "high-bit dirty must write a suffix, not the full image (first={first} second={second})"
+        );
+        assert!(t.is_strong(Fk(1)).unwrap());
+        assert!(!t.is_strong(Fk(80_000)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -830,6 +882,12 @@ impl HeaderTxsTable {
             first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
             count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
         })
+    }
+
+    pub fn l2_resident_bytes(&self) -> u64 {
+        self.first
+            .l2_resident_bytes()
+            .saturating_add(self.count.l2_resident_bytes())
     }
 
     /// Store a contiguous range. `tx_fks` must be non-empty and contiguous.

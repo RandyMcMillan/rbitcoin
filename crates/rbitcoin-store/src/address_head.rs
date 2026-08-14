@@ -69,6 +69,26 @@ pub const MAX_PROBE: u32 = 1024;
 /// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
 pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
 
+#[cfg(test)]
+thread_local! {
+    static HEAD_PAGE_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_note_head_page_write() {
+    HEAD_PAGE_WRITES.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Drain counted dirty-page write-backs from [`AddressHead::insert_many`].
+#[cfg(test)]
+pub fn test_take_head_page_writes() -> u64 {
+    HEAD_PAGE_WRITES.with(|c| {
+        let n = c.get();
+        c.set(0);
+        n
+    })
+}
+
 /// Concurrent probe page preads on a held plan TLS session (matches ring depth).
 /// One buffer per in-flight slot — hop keys on CQE, then reuse.
 const PROBE_PAGES_IN_FLIGHT: usize = crate::uring_session::DEFAULT_ENTRIES as usize;
@@ -850,6 +870,8 @@ impl AddressHead {
                 let off = self.entry_off(page_base);
                 self.file.write_at(off, &buf[..n])?;
                 self.occupied.fetch_add(n_new, Ordering::Relaxed);
+                #[cfg(test)]
+                test_note_head_page_write();
             }
             i = j;
         }

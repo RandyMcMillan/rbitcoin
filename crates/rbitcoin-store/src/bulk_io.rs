@@ -211,6 +211,8 @@ pub fn pwrite_batch(ops: &mut [WriteOp<'_>]) {
     }
     #[cfg(test)]
     test_note_write_dontcache(ops);
+    #[cfg(test)]
+    test_note_pwrite_wave(ops.len());
     if io_uring_enabled() && pwrite_batch_uring(ops) {
         return;
     }
@@ -224,6 +226,8 @@ thread_local! {
         std::cell::RefCell::new(Vec::new());
     static LAST_WRITE_DONTCACHE: std::cell::RefCell<Vec<bool>> =
         std::cell::RefCell::new(Vec::new());
+    /// Ops-per-call for each [`pwrite_batch`] (Class A append wave grouping).
+    static PWRITE_WAVES: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
 }
 
 #[cfg(test)]
@@ -250,6 +254,17 @@ pub fn test_take_last_read_dontcache() -> Vec<bool> {
 #[cfg(test)]
 pub fn test_take_last_write_dontcache() -> Vec<bool> {
     LAST_WRITE_DONTCACHE.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+#[cfg(test)]
+fn test_note_pwrite_wave(n: usize) {
+    PWRITE_WAVES.with(|c| c.borrow_mut().push(n));
+}
+
+/// Drain recorded `pwrite_batch` sizes (ops per submit). Tests only.
+#[cfg(test)]
+pub fn test_take_pwrite_waves() -> Vec<usize> {
+    PWRITE_WAVES.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Pipelined page RMW on the thread-local ring:

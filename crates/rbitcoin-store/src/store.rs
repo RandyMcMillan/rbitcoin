@@ -953,6 +953,14 @@ impl Store {
         Ok(count)
     }
 
+    /// In-RAM Class C L2 images (strong_tx bits + confirmed + header_txs).
+    pub fn class_c_l2_resident_bytes(&self) -> u64 {
+        self.strong_tx
+            .l2_resident_bytes()
+            .saturating_add(self.confirmed.l2_resident_bytes())
+            .saturating_add(self.header_txs.l2_resident_bytes())
+    }
+
     /// Flush Class C **except** `confirmed[]` (pre-tip half of the barrier).
     ///
     /// Order: `strong_tx` → `header_txs`. Used so a mid-barrier kill can leave
@@ -1785,6 +1793,26 @@ mod tests {
         assert!(s.is_confirmed_strong(Fk(2)).unwrap());
         assert!(s.is_confirmed_strong(Fk(3)).unwrap());
         assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write-behind: TipOnly resolve hits the pending map before `tx.head` drain.
+    #[test]
+    fn get_fk_by_txid_tip_hits_pending_before_head_drain() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+        s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+        let item = coinbase_item([0x51; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+        let fks = s
+            .put_tx_full_batch_indexed(&[item], /*index=*/ false)
+            .unwrap();
+        s.txs.head_note_pending(&[([0x51; 32], fks[0])]);
+        s.rebuild_height_fence().unwrap();
+        assert_eq!(s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(), Some(fks[0]));
+        assert_eq!(s.txs.head_drain_pending().unwrap(), 1);
+        assert_eq!(s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(), Some(fks[0]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

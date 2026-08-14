@@ -22,6 +22,9 @@ pub const DEFAULT_MAX_INBOUND: u32 = 125;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub datadir: PathBuf,
+    /// When set, Class A `inwit.body` / `inwit.idx/` live under `{datadir-cold}/store`.
+    /// All other files stay in [`Self::datadir`]. `None` = both hot and cold in datadir.
+    pub datadir_cold: Option<PathBuf>,
     pub network: Network,
     /// Custom BIP325 challenge. `None` selects the default global Signet.
     pub signet_challenge: Option<ScriptBuf>,
@@ -83,6 +86,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             datadir: PathBuf::from("./datadir"),
+            datadir_cold: None,
             network: Network::Mainnet,
             signet_challenge: None,
             signet_block_time: None,
@@ -117,6 +121,11 @@ impl NodeConfig {
         self
     }
 
+    pub fn with_datadir_cold(mut self, datadir_cold: impl Into<PathBuf>) -> Self {
+        self.datadir_cold = Some(datadir_cold.into());
+        self
+    }
+
     pub fn with_network(mut self, network: Network) -> Self {
         self.network = network;
         self
@@ -129,6 +138,18 @@ impl NodeConfig {
 
     pub fn store_path(&self) -> PathBuf {
         self.datadir.join("store")
+    }
+
+    /// Cold store directory (`{datadir-cold}/store`) when `--datadir-cold` is set.
+    pub fn store_cold_path(&self) -> Option<PathBuf> {
+        self.datadir_cold.as_ref().map(|p| p.join("store"))
+    }
+
+    pub fn store_layout(&self) -> rbitcoin_store::StoreLayout {
+        match self.store_cold_path() {
+            Some(cold) => rbitcoin_store::StoreLayout::with_cold(self.store_path(), cold),
+            None => rbitcoin_store::StoreLayout::single(self.store_path()),
+        }
     }
 
     /// Durable mempool directory (`{datadir}/mempool/`).
@@ -160,6 +181,16 @@ impl NodeConfig {
     pub fn validate(&self) -> Result<(), NodeError> {
         if self.datadir.as_os_str().is_empty() {
             return Err(NodeError::Config("datadir must not be empty".into()));
+        }
+        if let Some(cold) = &self.datadir_cold {
+            if cold.as_os_str().is_empty() {
+                return Err(NodeError::Config("datadir-cold must not be empty".into()));
+            }
+            if cold == &self.datadir {
+                return Err(NodeError::Config(
+                    "datadir-cold must differ from datadir".into(),
+                ));
+            }
         }
         if self.max_outbound == 0 {
             return Err(NodeError::Config("max_outbound must be >= 1".into()));
@@ -242,6 +273,27 @@ impl NodeConfig {
             let p = self.datadir.join(sub);
             std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir { path: p, source })?;
         }
+        if let Some(cold) = &self.datadir_cold {
+            if cold.exists() && !cold.is_dir() {
+                return Err(NodeError::Config(format!(
+                    "datadir-cold is not a directory: {}",
+                    cold.display()
+                )));
+            }
+            let created_cold = !cold.exists();
+            std::fs::create_dir_all(cold).map_err(|source| NodeError::Datadir {
+                path: cold.clone(),
+                source,
+            })?;
+            let store = cold.join("store");
+            std::fs::create_dir_all(&store).map_err(|source| NodeError::Datadir {
+                path: store,
+                source,
+            })?;
+            if created_cold {
+                rbitcoin_log::info!("node: created datadir-cold {}", cold.display());
+            }
+        }
         if created_root {
             rbitcoin_log::info!("node: created datadir {}", self.datadir.display());
         }
@@ -260,7 +312,7 @@ impl NodeConfig {
 
     /// Load a simple `key=value` conf (Core-style lines; `#` comments).
     ///
-    /// Supported keys: `datadir`, `network` / `chain`, `listen`, `connect` (repeatable),
+    /// Supported keys: `datadir`, `datadir-cold` / `datadir_cold`, `network` / `chain`, `listen`, `connect` (repeatable),
     /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
     /// `maxinbound` / `max_inbound` / `maxconnections`, `mempool_size_mb` / `maxmempool`,
     /// `log_level`, `api_log`, `electrum_listen`, `esplora_listen`,
@@ -302,6 +354,14 @@ impl NodeConfig {
             let key_l = key.to_ascii_lowercase();
             match key_l.as_str() {
                 "datadir" => self.datadir = PathBuf::from(val),
+                "datadir-cold" | "datadir_cold" | "datadircold" => {
+                    if val.is_empty() {
+                        return Err(NodeError::Config(
+                            "conf datadir-cold requires a path".into(),
+                        ));
+                    }
+                    self.datadir_cold = Some(PathBuf::from(val));
+                }
                 "network" | "chain" => {
                     self.network = Network::parse(val)
                         .map_err(|e| NodeError::Config(format!("conf network: {e}")))?;
@@ -469,6 +529,7 @@ mod tests {
             .with_p2p_listen("127.0.0.1:0".parse().unwrap());
         assert_eq!(cfg.network, Network::Regtest);
         assert_eq!(cfg.store_path(), dir.join("store"));
+        assert_eq!(cfg.store_cold_path(), None);
         assert_eq!(cfg.mempool_path(), dir.join("mempool"));
         assert_eq!(cfg.max_inbound, DEFAULT_MAX_INBOUND);
         assert!(!cfg.max_inbound_explicit);
@@ -476,6 +537,19 @@ mod tests {
         assert!(dir.join("store").is_dir());
         assert!(dir.join("mempool").is_dir());
         cfg.ensure_datadir().unwrap();
+        let cold = dir.join("cold");
+        let split = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_datadir_cold(&cold);
+        assert_eq!(
+            split.store_cold_path().as_deref(),
+            Some(cold.join("store").as_path())
+        );
+        split.ensure_datadir().unwrap();
+        assert!(cold.join("store").is_dir());
+        let mut same = NodeConfig::default().with_datadir(&dir);
+        same.datadir_cold = Some(dir.clone());
+        assert!(same.validate().unwrap_err().to_string().contains("differ"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -494,7 +568,8 @@ mod tests {
              milestone=100\n\
              log_level=debug\n\
              api_log=/tmp/rbitcoin-api.jsonl\n\
-             connect=127.0.0.1:38333\n",
+             connect=127.0.0.1:38333\n\
+             datadir-cold=/mnt/hdd/rbtc-cold\n",
         )
         .unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("data"));
@@ -511,6 +586,10 @@ mod tests {
             Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl"))
         );
         assert_eq!(cfg.connect.len(), 1);
+        assert_eq!(
+            cfg.datadir_cold.as_deref(),
+            Some(std::path::Path::new("/mnt/hdd/rbtc-cold"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

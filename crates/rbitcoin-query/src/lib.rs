@@ -617,8 +617,12 @@ pub mod archive_phase_stats {
             add(&HEAD_HIT, head_hit);
             add(&BATCH_STAMP, batch_stamp);
             add(&RESOLVED_STAMP, resolved_stamp);
-            LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
-            LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
+            // Finish-path stamp-only notes pass zeros for leftover mix.
+            // last_plan_batch is the last leftover resolve (fail-pack leftover_n).
+            if head_need > 0 {
+                LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
+                LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
+            }
         });
     }
 
@@ -665,9 +669,10 @@ pub mod archive_phase_stats {
         });
     }
 
-    // Last leftover mix (overwrite). Stamp-reject leftover_n/hit and the
-    // fail-pack test read this — note_resolve_counts stores it *before* stamp
-    // so a leftover miss still meters. last_stamp timing snapshots stay gone.
+    // Last leftover mix (overwrite when head_need > 0). Stamp-reject leftover_n
+    // and the fail-pack test read this — leftover note_resolve_counts stores it
+    // *before* stamp so a miss still meters. Stamp-only follow-up notes (zeros)
+    // must not wipe it (parallel cargo test / finish path).
     static LAST_HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     static LAST_HEAD_HIT: AtomicU64 = AtomicU64::new(0);
 
@@ -2192,6 +2197,21 @@ mod tests {
         confirm_load_stats::COLD_IDX_NS.store(2_000_000, AtomicOrdering::Relaxed);
         confirm_load_stats::COLD_IDX_N.store(5, AtomicOrdering::Relaxed);
         let _ = confirm_load_stats::sample_and_reset();
+    }
+
+    /// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.
+    #[test]
+    fn leftover_last_plan_batch_survives_stamp_only_note() {
+        archive_phase_stats::with_exclusive(|| {
+            archive_phase_stats::note_resolve_counts(1, 1, 7, 3, 0, 0);
+            archive_phase_stats::note_resolve_counts(0, 0, 0, 0, 5, 6);
+            let last = archive_phase_stats::last_plan_batch();
+            assert_eq!(
+                last.head_need, 7,
+                "stamp-only note_resolve_counts must not clobber leftover LAST"
+            );
+            assert_eq!(last.head_hit, 3);
+        });
     }
 
     #[test]

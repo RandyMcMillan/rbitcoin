@@ -1,8 +1,8 @@
 //! Tip-window revalidation on store open (Bitcoin Core `checkblocks`-style).
 //!
 //! Default window is [`VERIFY_TIP_BLOCKS`] (6) for both structural checks and
-//! Class A merkle content. Runs after `repair_class_c_above_tip` so tip is the
-//! source of truth before P2P extends it.
+//! Class A merkle content. Runs **before** the one complement Class C repair
+//! so the fence matches the post-revalidate tip.
 //!
 //! Soft sidecar [`TIP_SEAL_NAME`]: written after a successful connect/disconnect
 //! Class C barrier so a kill that advanced `confirmed` without a complete seal
@@ -197,6 +197,7 @@ impl Store {
         let trimmed = self.confirmed.trim_trailing_nulls()?;
         if trimmed > 0 {
             self.flush_confirmed_only()?;
+            self.rebuild_height_fence()?;
             let _ = self.repair_class_c_above_tip()?;
             report.tip_shrunk = true;
             eprintln!("rbitcoin: trimmed {trimmed} trailing null confirmed[] slots");
@@ -364,7 +365,11 @@ impl Store {
                     report.bodies_cleared = report.bodies_cleared.saturating_add(1);
                     return Err("merkle root mismatch");
                 }
-                Ok(())
+                match self.strong_tx.all_strong_range(first, count) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err("strong bits missing in tip window"),
+                    Err(_) => Err("strong_tx read"),
+                }
             }
             Err(_) => Err("header_txs read"),
         }
@@ -413,6 +418,7 @@ impl Store {
         }
 
         self.flush_confirmed_only()?;
+        self.rebuild_height_fence()?;
         let _ = self.repair_class_c_above_tip()?;
         report.tip_shrunk = true;
         report.tip_after = self.confirmed.tip_height().map(|h| h.0);
@@ -441,12 +447,16 @@ mod tests {
     }
 
     fn hdr(prev: Fk, parent_hash: [u8; 32], salt: u8) -> HeaderRecord {
+        let mut merkle = [0u8; 32];
+        merkle[0] = salt;
+        hdr_merkle(prev, parent_hash, salt, merkle)
+    }
+
+    fn hdr_merkle(prev: Fk, parent_hash: [u8; 32], salt: u8, merkle: [u8; 32]) -> HeaderRecord {
         let version = 1i32;
         let timestamp = u32::from(salt) + 1;
         let bits = 0x207fffff;
         let nonce = u32::from(salt);
-        let mut merkle = [0u8; 32];
-        merkle[0] = salt;
         let hash = if prev.is_null() {
             block_header_hash(version, &[0u8; 32], &merkle, timestamp, bits, nonce)
         } else {
@@ -588,6 +598,48 @@ mod tests {
         assert!(r.tip_shrunk);
         assert!(s.confirmed.tip_height().is_none());
         assert!(!s.header_txs.has_body(g_fk).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tip_window_missing_strong_shrinks() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        let mut tip_tx = Fk::NULL;
+        for h in 0u32..3 {
+            let tx_fk = put_coinbase(&s, h as u8 + 1);
+            let txid = s.txs.body_txid(tx_fk).unwrap();
+            let rec = hdr_merkle(prev, parent_hash, h as u8, txid);
+            parent_hash = rec.hash;
+            let hfk = s.put_header(&rec).unwrap();
+            s.header_txs.put_range(hfk, tx_fk, 1).unwrap();
+            s.strong_tx.set_strong(tx_fk, hfk).unwrap();
+            s.confirmed.set(Height(h), hfk).unwrap();
+            prev = hfk;
+            tip_tx = tx_fk;
+        }
+        s.rebuild_height_fence().unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        s.txs.flush().unwrap();
+        s.header_txs.flush().unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(2)));
+        s.strong_tx.set_unstrong(tip_tx).unwrap();
+
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(
+            r.first_bad_reason,
+            Some("strong bits missing in tip window")
+        );
+        assert!(r.tip_shrunk, "must shrink: {r:?}");
+        assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+        assert_eq!(
+            s.tx_height_get(tip_tx).unwrap(),
+            None,
+            "fence must drop the disconnected height"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -325,16 +325,17 @@ Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block c
 |---------|--------|-----|
 | `known≈982k` while peers ~961k, absurd resume walk | False `prev_fk` / duplicate header edges | Prefer a **fresh datadir**; header rows are hash-unique on write |
 | `tip=H` but tip **hash** is a short orphan sibling; peers ahead | Stale confirmed tip; most-work **explore + reorg** | Restart; expect reorg once bodies densify |
-| Stuck on tip+1: `prevout already spent` / many re-rejects of same block | Orphan Class C (second Class A+C copy at tip height) | Fixed on open: `repair_orphan_class_c` + confirmed-strong **membership** |
+| Stuck on tip+1: `prevout already spent` / many re-rejects of same block | Orphan Class C (second Class A+C copy at tip height) | Fixed on open: complement `repair_class_c_above_tip` + confirmed-strong **membership** |
 
-**Every open:** the node (1) repairs Class C **above** tip, (2) repairs **orphan**
-Class C at `h ≤ tip` not linked from `confirmed[h]`’s `header_txs`, (3) revalidates
-the last **six** confirmed heights (header `prev_fk`/hash chain, Class A range
-bounds, merkle from `txid.body`) and may **shrink tip** or clear a bad body if
-something fails. Look for `rbitcoin: repaired … orphan Class C` and
-`rbitcoin: tip revalidate …` on stderr. That is intentional Core-style
-`checkblocks=6` + crash/race healing — not a full reindex. Widespread mid-chain
-header graph poison still means a clean datadir.
+**Every open:** the node (1) revalidates the last **six** confirmed heights
+(header `prev_fk`/hash chain, Class A range bounds, merkle from `txid.body`,
+those six runs all-strong) and may **shrink tip** or clear a bad body, then
+(2) one Class C complement repair (unstrong leftover 1s in fence holes / a
+short suffix — not a minute-long walk of every create). Look for
+`rbitcoin: class_c repair cleared=…` and `rbitcoin: tip revalidate …` on
+stderr. That is intentional Core-style `checkblocks=6` + crash/race healing —
+not a full reindex. Widespread mid-chain header graph poison still means a
+clean datadir.
 
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
 is damaged or an old 4k-slot table was left wedged, stop the node and delete that

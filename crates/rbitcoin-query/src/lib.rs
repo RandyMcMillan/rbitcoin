@@ -996,26 +996,7 @@ impl Query {
 
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, QueryError> {
         let store = Store::open_or_create_layout(layout)?;
-        // Heal strong bits written above confirmed tip (kill -9 mid Class C).
-        // Tip-bound spenders already ignore those rows; this restores is_strong parity.
-        let repaired = store.repair_class_c_above_tip()?;
-        if repaired > 0 {
-            // Use eprintln so node logs still see it before rbitcoin_log is configured.
-            eprintln!(
-                "rbitcoin: repaired {repaired} Class C tx rows above confirmed tip (partial confirm / kill -9)"
-            );
-        }
-        // Orphan Class C at h≤tip not linked from confirmed[h] header_txs
-        // (concurrent tip accept double Class A+C). Poison spentness otherwise.
-        let orphan = store.repair_orphan_class_c()?;
-        if orphan > 0 {
-            eprintln!(
-                "rbitcoin: repaired {orphan} orphan Class C tx rows (strong not on confirmed header_txs)"
-            );
-            let _ = store.strong_tx.flush();
-        }
-        // Core checkblocks-style tip window (structure + Class A merkle) before
-        // any P2P tip extension. Shrinks tip / clears bad bodies on failure.
+        // Core checkblocks-style tip window first so repair sees the final fence.
         let reval = store.revalidate_tip_window()?;
         if !reval.is_clean() {
             eprintln!(
@@ -1028,6 +1009,11 @@ impl Query {
                 reval.bodies_cleared,
                 reval.tip_shrunk
             );
+        }
+        // One complement repair (holes + short suffix). Do not walk every strong bit.
+        let repaired = store.repair_class_c_above_tip()?;
+        if repaired > 0 {
+            let _ = store.strong_tx.flush();
         }
         let store_path = store.path().to_path_buf();
         let (sp_tweaks, sptweaks_origin) = if SpTweaksTable::files_present(&store_path) {
@@ -2022,6 +2008,32 @@ mod tests {
     use super::*;
     use rbitcoin_store::{InputRecord, OutputRecord};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn query_open_repairs_class_c_once_after_revalidate() {
+        let src = include_str!("lib.rs");
+        let open = src
+            .split("pub fn open_or_create_layout")
+            .nth(1)
+            .and_then(|s| s.split("let store_path = store.path()").next())
+            .expect("open_or_create_layout");
+        assert!(
+            open.contains("revalidate_tip_window"),
+            "revalidate before repair: {open}"
+        );
+        let repair_pos = open.find("repair_class_c_above_tip").expect("one repair");
+        let reval_pos = open.find("revalidate_tip_window").expect("revalidate");
+        assert!(reval_pos < repair_pos, "revalidate must run first");
+        assert_eq!(
+            open.matches("repair_class_c_above_tip").count(),
+            1,
+            "one complement repair"
+        );
+        assert!(
+            !open.contains("repair_orphan_class_c"),
+            "orphan alias is the same walk — do not call twice: {open}"
+        );
+    }
 
     fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
         let n = SystemTime::now()

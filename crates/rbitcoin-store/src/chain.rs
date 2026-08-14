@@ -406,6 +406,110 @@ impl StrongTxTable {
         self.get_bit(id - 1)
     }
 
+    /// Allocated bit count (covers create fks `1..=n`).
+    pub fn allocated_bits(&self) -> u64 {
+        self.n_bits.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Count set bits for create fks in half-open `[start_fk, end_fk)`.
+    pub fn count_strong_in_fk_range(&self, start_fk: u64, end_fk: u64) -> Result<u64, StoreError> {
+        if start_fk == 0 || end_fk <= start_fk {
+            return Ok(0);
+        }
+        let n = self.allocated_bits();
+        if start_fk - 1 >= n {
+            return Ok(0);
+        }
+        let start_bit = start_fk - 1;
+        let end_bit = (end_fk - 1).min(n);
+        self.count_ones_bits(start_bit, end_bit)
+    }
+
+    fn count_ones_bits(&self, start_bit: u64, end_bit: u64) -> Result<u64, StoreError> {
+        if end_bit <= start_bit {
+            return Ok(0);
+        }
+        let mut ones = 0u64;
+        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref v) = *guard {
+            let mut bit = start_bit;
+            while bit < end_bit {
+                let bi = (bit / 8) as usize;
+                let b = v[bi];
+                if b == 0 {
+                    bit = (bit + 8) & !7;
+                    continue;
+                }
+                let off = (bit % 8) as u32;
+                if (b >> off) & 1 != 0 {
+                    ones += 1;
+                }
+                bit += 1;
+            }
+            return Ok(ones);
+        }
+        drop(guard);
+        const CHUNK: usize = 8192;
+        let mut buf = vec![0u8; CHUNK];
+        let mut bit = start_bit;
+        while bit < end_bit {
+            let byte_off = bit / 8;
+            let nbytes = end_bit.div_ceil(8).saturating_sub(byte_off);
+            let take = (nbytes as usize).min(CHUNK);
+            self.bits.read_at(
+                crate::file::FILE_HEADER_LEN as u64 + byte_off,
+                &mut buf[..take],
+            )?;
+            let base_bit = byte_off * 8;
+            for (i, &b) in buf[..take].iter().enumerate() {
+                if b == 0 {
+                    continue;
+                }
+                for k in 0..8u32 {
+                    let idx = base_bit + (i as u64) * 8 + u64::from(k);
+                    if idx >= start_bit && idx < end_bit && (b >> k) & 1 != 0 {
+                        ones += 1;
+                    }
+                }
+            }
+            bit = base_bit + (take as u64) * 8;
+        }
+        Ok(ones)
+    }
+
+    /// Read `dst.len()` bit-image bytes starting at payload byte `byte_off`.
+    pub(crate) fn read_bit_bytes(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), StoreError> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref v) = *guard {
+            let start = byte_off as usize;
+            let end = start.saturating_add(dst.len()).min(v.len());
+            if start >= v.len() {
+                dst.fill(0);
+                return Ok(());
+            }
+            let n = end - start;
+            dst[..n].copy_from_slice(&v[start..end]);
+            dst[n..].fill(0);
+            return Ok(());
+        }
+        drop(guard);
+        self.bits
+            .read_at(crate::file::FILE_HEADER_LEN as u64 + byte_off, dst)
+    }
+
+    /// True when every fk in `[first, first+count)` is strong.
+    pub fn all_strong_range(&self, first_tx_fk: Fk, count: u32) -> Result<bool, StoreError> {
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        let ones = self.count_strong_in_fk_range(id, id.saturating_add(u64::from(count)))?;
+        Ok(ones == u64::from(count))
+    }
+
     /// Visit every fk whose strong bit is set (open repair / tests).
     pub fn for_each_strong<F>(&self, mut visit: F) -> Result<(), StoreError>
     where

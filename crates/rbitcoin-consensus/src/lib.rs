@@ -1010,14 +1010,13 @@ mod coverage_tests {
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 
         let b1 = mine_regtest(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
-        // prepare + archive paths
+        // prepare helpers stay (CPU-side); confirm is sole Class A.
         let (_hr, _txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
         let (_hr2, _txs2) = prepare_block_for_archive_new(&q, &params, &b1).unwrap();
         let (_hr3, _txs3) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
-        accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
-        // already archived branch
+        accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+        // already-have prepare after connect
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-        confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
 
         // Bad pow limit on prepare_ibd
         let mut bad = b1.clone();

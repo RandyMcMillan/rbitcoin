@@ -1392,6 +1392,48 @@ pub(crate) fn spawn_confirm_engine(
                 if feed.stopped() {
                     break;
                 }
+                // BQ-ahead TipOnly wave: attach hits on unclaimed ready heights
+                // before this thread claims a pack. Load will consume the hits
+                // (Step 3); until then stamp still runs and stays green.
+                {
+                    let t_wave = Instant::now();
+                    let skip: std::collections::HashSet<u32> = {
+                        let g = feed.inner.lock().unwrap();
+                        g.inflight.iter().copied().collect()
+                    };
+                    let tip = hub.tip_height();
+                    let path_lo = if tip.is_none() {
+                        0u32
+                    } else {
+                        tip.unwrap_or(0).saturating_add(1)
+                    };
+                    let mut wave_h: Vec<u32> = hub
+                        .query
+                        .block_queue_list_meta()
+                        .into_iter()
+                        .map(|m| m.height)
+                        .filter(|h| {
+                            *h >= path_lo
+                                && !skip.contains(h)
+                                && !hub.query.block_queue_is_resolve_complete(*h)
+                        })
+                        .collect();
+                    wave_h.sort_unstable();
+                    wave_h.dedup();
+                    if wave_h.len() > rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS {
+                        wave_h.truncate(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
+                    }
+                    if !wave_h.is_empty() {
+                        if let Err(e) = rbitcoin_consensus::confirm_bq_resolve_wave(
+                            &hub.query,
+                            &hub.params,
+                            &wave_h,
+                        ) {
+                            warn!("ibd: bq resolve wave: {e}");
+                        }
+                    }
+                    confirm_thr_stats::add_lookup_other(t_wave.elapsed());
+                }
                 let t_claim = Instant::now();
                 // Packed run: fully decoded wire + total input count (confirm-side).
                 let batch: (Vec<(u32, BlockHash, bitcoin::Block)>, u32) = {

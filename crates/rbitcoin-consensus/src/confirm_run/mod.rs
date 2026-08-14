@@ -39,12 +39,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod bq_resolve;
 mod lookup;
 mod phases;
 mod pin;
 mod scripts;
 mod write;
 
+pub use bq_resolve::{confirm_bq_resolve_wave, BqResolveWaveStats, BQ_RESOLVE_WAVE_MAX_BLOCKS};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{

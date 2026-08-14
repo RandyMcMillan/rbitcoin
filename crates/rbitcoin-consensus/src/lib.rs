@@ -585,14 +585,15 @@ pub mod confirm_phase_stats {
 /// See [`confirm_wire_run`]: lookup → load → scripts → write. IBD uses the split
 /// phases for pipeline overlap.
 pub use confirm_run::{
-    confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
-    confirm_wire_load_from_plan, confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
-    confirm_wire_lookup_and_ensure_denserels, confirm_wire_lookup_stamp, confirm_wire_run,
-    confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
-    join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
-    scripts_stage_from_load_channel, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats,
-    LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta,
-    ScriptsPhaseHandle, WireLoadPipeline,
+    confirm_bq_resolve_wave, confirm_scripts_feed_ahead, confirm_scripts_phase,
+    confirm_scripts_phase_async, confirm_wire_load_from_plan, confirm_wire_load_phase,
+    confirm_wire_load_phase_pipelined, confirm_wire_lookup_and_ensure_denserels,
+    confirm_wire_lookup_stamp, confirm_wire_run, confirm_wire_run_preverified, confirm_write_phase,
+    ensure_external_parent_denserels_from_plan, join_scripts_polling, lookup_stage_stats,
+    plan_stamp_sub_stats, scripts_feed_test_sync, scripts_stage_from_load_channel,
+    BqResolveWaveStats, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
+    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
+    WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

@@ -392,6 +392,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn block_queue_parent_hits_via_query_die_with_dequeue() {
+        let (dir, q) = temp_query();
+        q.block_queue_enqueue(3, [3u8; 32], 1, b"wire").unwrap();
+        q.block_queue_attach_parent_hits(3, [([0xAAu8; 32], Fk(9), (8, 16))])
+            .unwrap();
+        q.block_queue_mark_resolve_complete(3).unwrap();
+        assert!(q.block_queue_is_resolve_complete(3));
+        assert_eq!(
+            q.block_queue_parent_hits(3)
+                .unwrap()
+                .get(&[0xAAu8; 32])
+                .copied(),
+            Some((Fk(9), (8, 16)))
+        );
+        assert_eq!(q.block_queue_dequeue_height(3).unwrap(), 1);
+        assert!(!q.block_queue_is_resolve_complete(3));
+        assert!(q.block_queue_parent_hits(3).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents
     /// on h0; load of h1 pins parent from batch_bodies same-batch or cold Class A
     /// once (full_tx_reads for external parent).

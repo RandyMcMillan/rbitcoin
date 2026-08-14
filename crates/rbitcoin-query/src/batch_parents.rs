@@ -35,6 +35,7 @@ use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -151,6 +152,7 @@ impl ParentLayout {
 /// that changes), published via ArcSwap (lock-free load).
 #[derive(Debug)]
 pub struct SharedParentPin {
+    fk: Fk,
     tx: TxRecord,
     /// 0 unknown, 1 not coinbase, 2 coinbase.
     coinbase: AtomicU8,
@@ -162,6 +164,7 @@ pub struct SharedParentPin {
 
 impl SharedParentPin {
     fn new(
+        fk: Fk,
         tx: TxRecord,
         live: Vec<(u32, OutputRecord)>,
         checked: Vec<u32>,
@@ -175,6 +178,7 @@ impl SharedParentPin {
             None => CB_UNKNOWN,
         };
         Self {
+            fk,
             tx,
             coinbase: AtomicU8::new(cb),
             outs: ArcSwap::from_pointee(PinOuts::new(live, checked)),
@@ -312,30 +316,63 @@ impl SharedParentPin {
 /// assemble walks inputs or write fills layout data, and **not** on the
 /// per-parent insert hot path.
 #[derive(Debug, Default)]
+struct PinIndex {
+    by_fk: U64Map<Weak<SharedParentPin>>,
+    by_txid: HashMap<[u8; 32], Weak<SharedParentPin>>,
+}
+
+/// Prep-time registry: Weak map so dead pins free when last batch Arc drops.
+///
+/// Mutex is only for bulk adopt / publish / [`Self::lookup_txid`] — never held
+/// while assemble walks inputs or write fills layout, and **not** on the
+/// per-parent insert hot path.
+#[derive(Debug, Default)]
 pub struct PipelineParentStore {
-    by_fk: Mutex<U64Map<Weak<SharedParentPin>>>,
+    maps: Mutex<PinIndex>,
 }
 
 impl PipelineParentStore {
     pub fn new() -> Self {
         Self {
-            by_fk: Mutex::new(U64Map::default()),
+            maps: Mutex::new(PinIndex::default()),
+        }
+    }
+
+    /// Live pin with non-zero txid and a stamped `txout` body range.
+    ///
+    /// Same Weak lifetime as outs share: last batch `Arc` drop → `None`.
+    /// Zero txid is never indexed. Live pin without `body_range` is a miss
+    /// (do not half-skip head).
+    pub fn lookup_txid(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
+        if *txid == [0u8; 32] {
+            return None;
+        }
+        let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = g.by_txid.get(txid) else {
+            return None;
+        };
+        match w.upgrade() {
+            Some(p) => p.load_layout().body_range.map(|r| (p.fk, r)),
+            None => {
+                g.by_txid.remove(txid);
+                None
+            }
         }
     }
 
     /// Live strong pins still reachable via Weak (diagnostics / tests).
     pub fn live_count(&self) -> usize {
-        let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-        g.values().filter(|w| w.strong_count() > 0).count()
+        let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        g.by_fk.values().filter(|w| w.strong_count() > 0).count()
     }
 
     /// Occupancy: weak map slots, live strong pins, approx bytes of live pin outs.
     pub fn size_snapshot(&self) -> (usize, usize, u64) {
-        let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-        let weak_slots = g.len();
+        let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        let weak_slots = g.by_fk.len();
         let mut live = 0usize;
         let mut bytes = 0u64;
-        for w in g.values() {
+        for w in g.by_fk.values() {
             if let Some(p) = w.upgrade() {
                 live = live.saturating_add(1);
                 let outs = p.load_outs();
@@ -358,9 +395,11 @@ impl PipelineParentStore {
 
     /// Drop dead Weaks now (keeps map from retaining empty slots after pin drop).
     pub fn gc_dead_weaks(&self) {
-        let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
-        g.retain(|_, w| w.strong_count() > 0);
-        g.shrink_to_fit();
+        let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        g.by_fk.retain(|_, w| w.strong_count() > 0);
+        g.by_txid.retain(|_, w| w.strong_count() > 0);
+        g.by_fk.shrink_to_fit();
+        g.by_txid.shrink_to_fit();
     }
 
     /// One lock: upgrade live pins for `ids` into a map (prep batch start).
@@ -368,10 +407,10 @@ impl PipelineParentStore {
         &self,
         ids: impl IntoIterator<Item = u64>,
     ) -> U64Map<Arc<SharedParentPin>> {
-        let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = U64Map::default();
         for id in ids {
-            if let Some(p) = g.get(&id).and_then(|w| w.upgrade()) {
+            if let Some(p) = g.by_fk.get(&id).and_then(|w| w.upgrade()) {
                 out.insert(id, p);
             }
         }
@@ -398,26 +437,31 @@ impl PipelineParentStore {
         // Phase 1 under lock: insert vacant Weaks; collect conflicts to merge outside.
         let mut conflicts: Vec<(u64, Arc<SharedParentPin>, Arc<SharedParentPin>)> = Vec::new();
         {
-            let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
             for &id in publish_ids {
                 let Some(pin) = pins.get(&id) else {
                     continue;
                 };
-                match g.get(&id).and_then(|w| w.upgrade()) {
+                match g.by_fk.get(&id).and_then(|w| w.upgrade()) {
                     Some(existing) if !Arc::ptr_eq(&existing, pin) => {
                         conflicts.push((id, existing, Arc::clone(pin)));
                     }
                     Some(_) => {}
                     None => {
-                        g.insert(id, Arc::downgrade(pin));
+                        let w = Arc::downgrade(pin);
+                        g.by_fk.insert(id, w.clone());
+                        if pin.tx.txid != [0u8; 32] {
+                            g.by_txid.insert(pin.tx.txid, w);
+                        }
                     }
                 }
             }
             // Soft GC: drop dead Weaks periodically so the Weak map cannot retain
             // empty slots for the whole IBD. Threshold keeps some share hits
             // without unbounded weak growth (was 4k→65k; 16k is a middle ground).
-            if g.len() > 16_384 {
-                g.retain(|_, w| w.strong_count() > 0);
+            if g.by_fk.len() > 16_384 {
+                g.by_fk.retain(|_, w| w.strong_count() > 0);
+                g.by_txid.retain(|_, w| w.strong_count() > 0);
             }
         }
         // Phase 2 outside lock: compose local → existing halves, swap batch handle.
@@ -609,6 +653,7 @@ impl BatchParents {
             }
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Arc::new(SharedParentPin::new(
+                    fk,
                     tx,
                     live,
                     checked,
@@ -1742,6 +1787,7 @@ mod tests {
     #[test]
     fn pin_body_compose_does_not_mutate_source() {
         let pin = SharedParentPin::new(
+            Fk(1),
             tx(1),
             vec![(0, out(10))],
             vec![0],
@@ -1921,5 +1967,51 @@ mod tests {
         assert!(bp.get_parent_tx(Fk::NULL).is_none());
         assert!(bp.get_parent_coinbase(Fk::NULL).is_none());
         assert!(bp.get_body_range(Fk::NULL).is_none());
+    }
+
+    #[test]
+    fn pipeline_parent_store_lookup_txid() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 1);
+        let tid = tx(7).txid;
+        bp.insert_owned(
+            Fk(42),
+            tx(7),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((1000, 80)),
+            Vec::new(),
+        );
+        bp.publish_to_store();
+        assert_eq!(
+            store.lookup_txid(&tid),
+            Some((Fk(42), (1000, 80))),
+            "live pin with range must resolve by txid"
+        );
+        let mut zero = tx(8);
+        zero.txid = [0u8; 32];
+        let mut bp0 = BatchParents::with_store(Arc::clone(&store), 1);
+        bp0.insert_owned(
+            Fk(43),
+            zero,
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((2000, 10)),
+            Vec::new(),
+        );
+        bp0.publish_to_store();
+        assert!(
+            store.lookup_txid(&[0u8; 32]).is_none(),
+            "zero txid is never indexed"
+        );
+        drop(bp);
+        drop(bp0);
+        store.gc_dead_weaks();
+        assert!(
+            store.lookup_txid(&tid).is_none(),
+            "txid index must die with the last pin Arc"
+        );
     }
 }

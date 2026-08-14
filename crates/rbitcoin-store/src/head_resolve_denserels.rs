@@ -3,7 +3,7 @@
 //! Schema **13+** two waves on probe (uring when available):
 //! 1. **Hot probe** — page-coalesced loads for non-DONTCACHE segs (ages ≤3) → cands
 //! 2. **ID / IDX** — page-grouped `txid.body` identity fill, then depth-first BIP30
-//!    match in RAM + `record_range` idx
+//!    match in RAM + **one** page-grouped `txout.idx` fill for chosen fks
 //! 3. If any key still unmatched: **cold probe** (DONTCACHE segs ages ≥4) for
 //!    survivors only → full cand list → ID/IDX again
 //! 4. **denserels** (optional) — packed body when outs are needed
@@ -288,67 +288,114 @@ fn fill_idx_pages(
     false
 }
 
-/// Body range for `fk` without nested TLS bulk when a plan session is held.
-///
-/// - `session == None`: [`VarTable::record_range`] (may use process bulk_io TLS).
-/// - `session == Some`: plan idx pages + preads on the **held** session (or libc
-///   fallback), then [`BodyRangeIdxPlan::decode_range`].
-fn body_range_no_nested_tls(
-    table: &TxTable,
-    fk: Fk,
-    session: Option<&mut UringSession>,
-) -> Result<Option<(u64, u64)>, StoreError> {
-    let Some(sess) = session else {
-        return match table.body.record_range(fk) {
-            Ok((off, len)) if len > 0 => Ok(Some((off, len))),
-            Ok(_) | Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => Ok(None),
-            Err(e) => Err(e),
-        };
-    };
-    let plan = match table.body.plan_body_range_idx(fk) {
-        Ok(p) => p,
-        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) | Err(StoreError::InvalidFk) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if plan.pages.is_empty() {
-        return Ok(None);
-    }
-    let mut bufs: Vec<Vec<u8>> = plan.pages.iter().map(|p| vec![0u8; p.want]).collect();
-    let filled = fill_idx_pages(sess, &plan.pages, &mut bufs);
-    if !filled {
-        for (i, page) in plan.pages.iter().enumerate() {
-            let rc = unsafe {
-                libc::pread(
-                    page.fd,
-                    bufs[i].as_mut_ptr() as *mut libc::c_void,
-                    page.want,
-                    page.page_off as libc::off_t,
-                )
-            };
-            if rc < 0 || (rc as usize) < page.want {
-                return Ok(None);
-            }
+/// Dedup idx OS pages by `(fd, page_off)` so a wave fills each page once.
+fn unique_idx_pages<'a, I>(pages: I) -> Vec<crate::tx_idx::IdxPagePlan>
+where
+    I: IntoIterator<Item = &'a crate::tx_idx::IdxPagePlan>,
+{
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in pages {
+        if seen.insert((p.fd, p.page_off)) {
+            out.push(p.clone());
         }
     }
-    let page_refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-    match plan.decode_range(&page_refs) {
-        Ok((off, len)) if len > 0 => Ok(Some((off, len))),
-        Ok(_) | Err(StoreError::Corrupt(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
+    out
 }
 
-/// Sidefile ID (page-grouped bulk) then depth-first BIP30 match + idx.
+fn fill_idx_pages_libc(pages: &[crate::tx_idx::IdxPagePlan], bufs: &mut [Vec<u8>]) -> bool {
+    for (i, page) in pages.iter().enumerate() {
+        let rc = unsafe {
+            libc::pread(
+                page.fd,
+                bufs[i].as_mut_ptr() as *mut libc::c_void,
+                page.want,
+                page.page_off as libc::off_t,
+            )
+        };
+        if rc < 0 || (rc as usize) < page.want {
+            return false;
+        }
+    }
+    true
+}
+
+/// Body ranges for chosen fks: plan each, fill **unique** idx pages once
+/// (held session or libc), decode. No nested TLS uring.
+fn body_ranges_batched(
+    table: &TxTable,
+    fks: &[Fk],
+    session: Option<&mut UringSession>,
+) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+    if fks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut plans: Vec<Option<crate::tx_idx::BodyRangeIdxPlan>> = Vec::with_capacity(fks.len());
+    for &fk in fks {
+        match table.body.plan_body_range_idx(fk) {
+            Ok(p) if !p.pages.is_empty() => plans.push(Some(p)),
+            Ok(_) => plans.push(None),
+            Err(StoreError::NotFound)
+            | Err(StoreError::Corrupt(_))
+            | Err(StoreError::InvalidFk) => plans.push(None),
+            Err(e) => return Err(e),
+        }
+    }
+    let uniq = unique_idx_pages(plans.iter().flatten().flat_map(|p| p.pages.iter()));
+    if uniq.is_empty() {
+        return Ok(vec![None; fks.len()]);
+    }
+    let mut bufs: Vec<Vec<u8>> = uniq.iter().map(|p| vec![0u8; p.want]).collect();
+    let filled = match session {
+        Some(sess) => fill_idx_pages(sess, &uniq, &mut bufs),
+        None => false,
+    };
+    if !filled && !fill_idx_pages_libc(&uniq, &mut bufs) {
+        return Ok(vec![None; fks.len()]);
+    }
+    let mut page_ix = std::collections::HashMap::with_capacity(uniq.len());
+    for (i, p) in uniq.iter().enumerate() {
+        page_ix.insert((p.fd, p.page_off), i);
+    }
+    let mut out = Vec::with_capacity(fks.len());
+    for plan in &plans {
+        let Some(plan) = plan else {
+            out.push(None);
+            continue;
+        };
+        let mut page_refs: Vec<&[u8]> = Vec::with_capacity(plan.pages.len());
+        let mut ok = true;
+        for p in &plan.pages {
+            match page_ix.get(&(p.fd, p.page_off)) {
+                Some(&i) => page_refs.push(bufs[i].as_slice()),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            out.push(None);
+            continue;
+        }
+        match plan.decode_range(&page_refs) {
+            Ok((off, len)) if len > 0 => out.push(Some((off, len))),
+            Ok(_) | Err(StoreError::Corrupt(_)) => out.push(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Sidefile ID (page-grouped bulk) then depth-first BIP30 match + batched idx.
 ///
 /// Collects every still-active key's cand create_fks, fills identities with
 /// **one bulk pread per OS page** of `txid.body`, then walks each key's cand
-/// list in original order in RAM. Idx uses held session when provided (no
-/// nested TLS bulk from `record_range`).
+/// list in original order in RAM. Chosen fks share **one** idx-page fill
+/// (held session or libc). No nested TLS bulk from `record_range`.
 ///
 /// When `session` is `Some`, ID + IDX page preads ride that **already-held**
-/// plan ring. When `None`, libc pread for ID and normal `record_range` for IDX.
+/// plan ring. When `None`, libc pread for ID and unique idx pages.
 fn key_done(
     ki: usize,
     skip_if_won: bool,
@@ -396,10 +443,13 @@ fn id_idx_wave(
     *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
     *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
 
-    // ── RAM match + IDX ──────────────────────────────────────────────────
+    // ── RAM match then one IDX page-grouped fill ──────────────────────────
     // With a height table: collect every body_txid match in this wave, then
     // pick the newest connected (`tx_height` Some). First-match-and-stop would
     // hide an older connected sibling behind a just-archived unconnected row.
+    // BIP30 / height-fence pick is **before** idx (only the chosen fk is ranged).
+    let mut chosen_kis: Vec<usize> = Vec::new();
+    let mut chosen_fks: Vec<Fk> = Vec::new();
     for (ki, cands) in cands_by_key.iter().enumerate() {
         if key_done(ki, skip_if_won, winner, connected, heights) {
             continue;
@@ -446,13 +496,18 @@ fn id_idx_wave(
         } else {
             matches[0]
         };
-        let t_idx = Instant::now();
-        if let Some(range) = body_range_no_nested_tls(table, chosen, session.as_deref_mut())? {
-            winner[ki] = Some((chosen, range));
-            crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, chosen.0);
-        }
-        *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+        chosen_kis.push(ki);
+        chosen_fks.push(chosen);
     }
+    let t_idx = Instant::now();
+    let ranges = body_ranges_batched(table, &chosen_fks, session)?;
+    for ((&ki, &fk), range) in chosen_kis.iter().zip(chosen_fks.iter()).zip(ranges) {
+        if let Some(range) = range {
+            winner[ki] = Some((fk, range));
+            crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
+        }
+    }
+    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
     Ok(())
 }
 
@@ -752,6 +807,40 @@ mod tests {
         (dir, t, txids)
     }
 
+    /// `n` creates (1-based fks). 4 B idx slots + 16 B file header → ~1020
+    /// slots on page 0, so `n ≥ 1100` spans two OS pages.
+    fn seed_table_n(n: u32) -> (PathBuf, TxTable, Vec<[u8; 32]>) {
+        let dir = tmp("seed-n");
+        let t = TxTable::create(&dir).unwrap();
+        let mut items = Vec::new();
+        let mut txids = Vec::new();
+        for i in 0..n {
+            let mut tid = [0u8; 32];
+            tid[0] = (i & 0xff) as u8;
+            tid[1] = ((i >> 8) & 0xff) as u8;
+            tid[2] = 0xa5;
+            tid[3] = 0x5a;
+            txids.push(tid);
+            let tx = TxRecord {
+                txid: tid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let script: Vec<u8> = (0..((i as usize % 17) + 1)).map(|b| b as u8).collect();
+            items.push((
+                tx,
+                vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                vec![OutputRecord::unspent(1000 + i as i64, script)],
+            ));
+        }
+        let _fks = t.put_full_batch_indexed(&items, true).unwrap();
+        (dir, t, txids)
+    }
+
     /// Uring machine returns same (fk, body_range) as sequential pread path.
     #[test]
     fn uring_fk_and_range_matches_pread() {
@@ -900,6 +989,51 @@ mod tests {
             let got = plan.decode_range(&refs).unwrap();
             assert_eq!(got, expected, "fk={fk:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batched idx fill: unique pages, decode equals serial `record_range`.
+    ///
+    /// Distant fks sit on distinct OS pages; adjacent fks share a page so the
+    /// helper's unique set is smaller than the per-fk page sum.
+    #[test]
+    fn id_idx_wave_batches_idx_pages() {
+        let (dir, t, txids) = seed_table_n(1100);
+        let first = Fk(1);
+        let near = Fk(2);
+        let far = Fk(1100);
+        let p0 = t.body.plan_body_range_idx(first).unwrap();
+        let p_near = t.body.plan_body_range_idx(near).unwrap();
+        let p_far = t.body.plan_body_range_idx(far).unwrap();
+        assert!(!p0.pages.is_empty() && !p_far.pages.is_empty());
+
+        let uniq_far = unique_idx_pages(p0.pages.iter().chain(p_far.pages.iter()));
+        let far_offs: std::collections::HashSet<u64> =
+            uniq_far.iter().map(|p| p.page_off).collect();
+        assert!(
+            far_offs.len() >= 2,
+            "fk 1 and 1100 must span distinct idx pages, offs={far_offs:?}"
+        );
+
+        let sum_near = p0.pages.len() + p_near.pages.len();
+        let uniq_near = unique_idx_pages(p0.pages.iter().chain(p_near.pages.iter()));
+        assert!(
+            uniq_near.len() < sum_near,
+            "adjacent fks must share an idx page: uniq={} sum={sum_near}",
+            uniq_near.len()
+        );
+
+        let batch = body_ranges_batched(&t, &[first, near, far], None).unwrap();
+        for (fk, got) in [first, near, far].iter().zip(batch.iter()) {
+            let exp = t.body.record_range(*fk).unwrap();
+            assert_eq!(*got, Some(exp), "fk={}", fk.0);
+        }
+
+        let got = resolve_fk_and_range_pread(&t, &[txids[0], txids[1], txids[1099]], None, false)
+            .unwrap();
+        assert_eq!(got[0].1, Some((first, batch[0].unwrap())));
+        assert_eq!(got[1].1, Some((near, batch[1].unwrap())));
+        assert_eq!(got[2].1, Some((far, batch[2].unwrap())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

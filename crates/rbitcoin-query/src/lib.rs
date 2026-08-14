@@ -390,6 +390,10 @@ pub mod archive_phase_stats {
     pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
+    /// Unique prev_txids resolved from live [`crate::PipelineParentStore`].
+    pub static PIN_TXID_N: AtomicU64 = AtomicU64::new(0);
+    /// Wall of that consult (RAM).
+    pub static PIN_TXID_NS: AtomicU64 = AtomicU64::new(0);
     /// Fks that received plan denserels in Shape A fused head resolve.
     pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
     /// Sum of packed body lengths read in denserels wave (when ranges known).
@@ -440,6 +444,8 @@ pub mod archive_phase_stats {
         pub sticky_hit: u64,
         pub head_need: u64,
         pub head_hit: u64,
+        pub pin_txid_n: u64,
+        pub pin_txid_ns: u64,
         pub head_dens_fks: u64,
         pub head_dens_bytes: u64,
         pub batch_stamp: u64,
@@ -519,6 +525,8 @@ pub mod archive_phase_stats {
             sticky_hit: STICKY_HIT.swap(0, Ordering::Relaxed),
             head_need: HEAD_NEED.swap(0, Ordering::Relaxed),
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
+            pin_txid_n: PIN_TXID_N.swap(0, Ordering::Relaxed),
+            pin_txid_ns: PIN_TXID_NS.swap(0, Ordering::Relaxed),
             head_dens_fks: HEAD_DENS_FKS.swap(0, Ordering::Relaxed),
             head_dens_bytes: HEAD_DENS_BYTES.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
@@ -585,6 +593,13 @@ pub mod archive_phase_stats {
         LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
         LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
         LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
+    }
+
+    /// Live-pin `txid → (fk, range)` hits this plan batch.
+    #[inline]
+    pub fn note_pin_txid(n: u64, ns: u64) {
+        add(&PIN_TXID_N, n);
+        add(&PIN_TXID_NS, ns);
     }
 
     /// Plan denserels wave size (fks + optional body bytes read).

@@ -381,7 +381,8 @@ pub(super) fn pin_for_wire_batch(
                 };
                 batch_parents.insert_owned(fk, tx, live, need, cb, Some(range), sparse);
                 still_need.remove(&id);
-                n_plan_pin = n_plan_pin.saturating_add(1);
+                // Cold range-fill: PIN_NEW only. Do not bump n_plan_pin /
+                // PIN_CACHE_BODY — that would inflate pin_hit%.
             }
             let range_fill_ns = t_range_fill.elapsed().as_nanos() as u64;
             if range_fill_ns > 0 {

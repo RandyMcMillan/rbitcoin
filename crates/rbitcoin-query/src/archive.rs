@@ -253,6 +253,16 @@ impl Query {
         Ok(out.pop().expect("one archive result"))
     }
 
+    /// Class A for a **contiguous** prepared run (same-batch parent resolve).
+    ///
+    /// Crash / `plan=None` tests. Not a production IBD API.
+    pub fn commit_class_a_batch(
+        &self,
+        items: &mut [(HeaderRecord, Vec<TxApply>)],
+    ) -> Result<Vec<Fk>, QueryError> {
+        self.archive_prepared_owned(items)
+    }
+
     /// Plan + commit Class A for prepared blocks (no tip / Class C).
     pub(crate) fn archive_prepared_owned(
         &self,

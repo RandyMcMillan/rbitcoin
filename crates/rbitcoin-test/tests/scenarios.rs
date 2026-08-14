@@ -891,7 +891,7 @@ fn confirm_structural_rejects_already_spent_prevout() {
 #[test]
 fn confirm_batch_create_and_spend_parent_same_run() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
+        accept_and_connect_block, commit_class_a_run, confirm_wire_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -909,7 +909,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
 
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
     let cb1 = b1.txdata[0].compute_txid();
-    commit_class_a_block(&q, &params, Height(1), &b1, ms).unwrap();
     tip = b1.block_hash();
     tip_time = b1.header.time;
 
@@ -917,7 +916,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let mut run: Vec<(Height, bitcoin::Block)> = vec![(Height(1), b1)];
     for h in 2..=last_pad {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         run.push((Height(h), b));
@@ -928,7 +926,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let mk_parent = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let b_create = mine_regtest_block(tip, tip_time + 600, create_h, vec![mk_parent]);
     let parent_txid = b_create.txdata[1].compute_txid();
-    commit_class_a_block(&q, &params, Height(create_h), &b_create, ms).unwrap();
     tip = b_create.block_hash();
     tip_time = b_create.header.time;
     run.push((Height(create_h), b_create));
@@ -937,8 +934,8 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let spend_h = create_h + 1;
     let spend_parent = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
-    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &run, ms).unwrap();
 
     // Runway the run: parent pin + prevout scan; same-batch create must not
     // leave the spend height unready.
@@ -972,7 +969,8 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
+        accept_and_connect_block, commit_class_a_block, commit_class_a_run, confirm_wire_run,
+        ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{
         mine_regtest_block, regtest_genesis, spend_many_anyone_can_spend, split_anyone_can_spend,
@@ -1016,7 +1014,6 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     );
     let b_split = mine_regtest_block(tip, tip_time + 600, split_h, vec![split]);
     let parent_txid = b_split.txdata[1].compute_txid();
-    commit_class_a_block(&q, &params, Height(split_h), &b_split, ms).unwrap();
     tip = b_split.block_hash();
     tip_time = b_split.header.time;
 
@@ -1064,7 +1061,16 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     let t2_txid = t2.compute_txid();
     let t3 = spend_many_anyone_can_spend(&[(t2_txid, 0)], Amount::from_sat(46_0000_0000));
     let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![t1, t2, t3]);
-    commit_class_a_block(&q, &params, Height(merge_h), &b_merge, ms).unwrap();
+    commit_class_a_run(
+        &q,
+        &params,
+        &[
+            (Height(split_h), b_split.clone()),
+            (Height(merge_h), b_merge.clone()),
+        ],
+        ms,
+    )
+    .unwrap();
 
     confirm_wire_run(
         &q,
@@ -1560,7 +1566,7 @@ fn consensus_reject_bad_structure_and_milestone() {
 #[test]
 fn three_stage_confirm_and_parent_pin_surface() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
@@ -1580,7 +1586,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
 
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
     let cb1 = b1.txdata[0].compute_txid();
-    commit_class_a_block(&q, &params, Height(1), &b1, ms).unwrap();
     tip = b1.block_hash();
     tip_time = b1.header.time;
 
@@ -1588,7 +1593,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let mut run: Vec<(Height, bitcoin::Block)> = vec![(Height(1), b1)];
     for h in 2..=last_pad {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         run.push((Height(h), b));
@@ -1597,8 +1601,8 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &run, ms).unwrap();
 
     // Inline confirm load (parent pin).
     let items: Vec<(u32, [u8; 32])> = run
@@ -1649,7 +1653,7 @@ fn three_stage_confirm_and_parent_pin_surface() {
 #[test]
 fn confirm_multi_block_spend_uses_header_plan_mtp() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
@@ -1676,7 +1680,6 @@ fn confirm_multi_block_spend_uses_header_plan_mtp() {
         if h == 1 {
             cb1 = Some(b.txdata[0].compute_txid());
         }
-        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         all.push((Height(h), b));
@@ -1685,8 +1688,8 @@ fn confirm_multi_block_spend_uses_header_plan_mtp() {
     let spend = spend_anyone_can_spend(cb1.unwrap(), 0, Amount::from_sat(49_0000_0000));
     // Second spend height in the *same* load batch (mid-batch BIP68 MTP).
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     all.push((Height(spend_h), b_spend));
+    commit_class_a_run(&q, &params, &all, ms).unwrap();
     assert_eq!(q.tip_height(), Some(Height::GENESIS));
 
     // One multi-block load of the whole run while tip is still genesis.
@@ -2103,7 +2106,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
 #[test]
 fn wire_prep_already_archived_bodies_spend_annotate() {
     use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
+        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
         confirm_wire_load_phase, confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
 
@@ -2132,14 +2135,19 @@ fn wire_prep_already_archived_bodies_spend_annotate() {
     let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a]);
     let a_out = ba.txdata[1].compute_txid();
-    commit_class_a_block(&q, &params, Height(ha), &ba, ms).unwrap();
     tip = ba.block_hash();
     tip_time = ba.header.time;
 
     let hb = maturity + 2;
     let spend_b = spend_anyone_can_spend(a_out, 0, Amount::from_sat(48_0000_0000));
     let bb = mine_regtest_block(tip, tip_time + 600, hb, vec![spend_b]);
-    commit_class_a_block(&q, &params, Height(hb), &bb, ms).unwrap();
+    commit_class_a_run(
+        &q,
+        &params,
+        &[(Height(ha), ba.clone()), (Height(hb), bb.clone())],
+        ms,
+    )
+    .unwrap();
     assert_eq!(q.tip_height(), Some(Height(maturity)));
 
     // Wire prep both heights: need empty → plan None; must still annotate.

@@ -688,6 +688,30 @@ pub fn commit_class_a_block(
     Ok(())
 }
 
+/// Class A for a contiguous run in one plan (same-batch parent stamp).
+///
+/// Use this instead of N×[`commit_class_a_block`] when later blocks spend
+/// earlier unconfirmed creates.
+pub fn commit_class_a_run(
+    query: &Query,
+    params: &ChainParams,
+    blocks: &[(Height, Block)],
+    milestone: Milestone,
+) -> Result<(), ConsensusError> {
+    let _ = milestone;
+    let mut items = Vec::with_capacity(blocks.len());
+    for (_, block) in blocks {
+        let (header, txs) = prepare_block_for_archive(query, params, block)?;
+        // Later headers resolve prev_fk from this header.
+        query.ensure_header(&header).map_err(ConsensusError::from)?;
+        items.push((header, txs));
+    }
+    query
+        .commit_class_a_batch(&mut items)
+        .map_err(ConsensusError::from)?;
+    Ok(())
+}
+
 /// CPU-side prep for Class A archive.
 pub fn prepare_block_for_archive(
     query: &Query,

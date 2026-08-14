@@ -138,6 +138,35 @@ impl HeightFence {
         fks.iter().map(|&fk| self.height_of(fk)).collect()
     }
 
+    /// Half-open `[lo, hi)` create-fk spans not in any run, covering `1..=last_fk`.
+    ///
+    /// Adjacent runs emit nothing between them. Empty fence → `[1, last_fk+1)`
+    /// when `last_fk > 0`. Used by Class C open repair (complement of the fence).
+    pub fn unconnected_ranges(&self, last_fk: u64) -> Vec<(u64, u64)> {
+        if last_fk == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut prev_end = 1u64;
+        let cap = last_fk.saturating_add(1);
+        for r in &self.runs {
+            if r.first_fk >= cap {
+                break;
+            }
+            if r.first_fk > prev_end {
+                out.push((prev_end, r.first_fk.min(cap)));
+            }
+            let run_end = r.first_fk.saturating_add(u64::from(r.count));
+            if run_end > prev_end {
+                prev_end = run_end;
+            }
+        }
+        if prev_end < cap {
+            out.push((prev_end, cap));
+        }
+        out
+    }
+
     /// Highest confirmed height present on any run (`None` if empty).
     ///
     /// In-flight prune HWM. Distinct from `confirmed[]` length (`tip_height`):
@@ -245,5 +274,27 @@ mod tests {
         let f = HeightFence::from_runs(vec![run(1, 2, 0), run(10, 3, 2)]);
         assert_eq!(f.max_height(), Some(2));
         assert_eq!(f.max_connected_fk(), 12);
+    }
+
+    #[test]
+    fn height_fence_unconnected_ranges() {
+        assert_eq!(
+            HeightFence::empty().unconnected_ranges(0),
+            Vec::<(u64, u64)>::new()
+        );
+        assert_eq!(
+            HeightFence::empty().unconnected_ranges(10),
+            vec![(1, 11)],
+            "empty fence: the whole 1..=last_fk span is leftover"
+        );
+        let abut = HeightFence::from_runs(vec![run(1, 2, 0), run(3, 3, 1)]);
+        assert_eq!(abut.unconnected_ranges(5), Vec::<(u64, u64)>::new());
+        assert_eq!(abut.unconnected_ranges(8), vec![(6, 9)]);
+        let hole = HeightFence::from_runs(vec![run(1, 2, 0), run(6, 3, 1)]);
+        assert_eq!(hole.unconnected_ranges(8), vec![(3, 6)]);
+        assert_eq!(hole.unconnected_ranges(10), vec![(3, 6), (9, 11)]);
+        let late = HeightFence::from_runs(vec![run(10, 2, 4)]);
+        assert_eq!(late.unconnected_ranges(12), vec![(1, 10), (12, 13)]);
+        assert_eq!(late.unconnected_ranges(9), vec![(1, 10)]);
     }
 }

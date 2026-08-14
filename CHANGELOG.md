@@ -34,6 +34,15 @@ before 1.0).
 
 ### Fixed
 
+- **Class C open repair is a fence complement, not a full-bit walk:**
+  `Query::open` revalidates the tip window first (last six heights now also
+  require those `header_txs` runs to be all-strong), rebuilds the fence on
+  shrink, then runs **one** `repair_class_c_above_tip`. Repair unstrongs holes
+  between fence runs plus a short suffix (stop at a 64 KiB zero page) instead
+  of `for_each_strong` + `height_of` on every set bit (~1.4 B visits × 2 on
+  mainnet, ~1 minute pegged CPU even after a clean shutdown). Logs
+  `class_c repair cleared= ranges= ms=` even when nothing is cleared.
+
 - **In-flight prune is fence coverage, not confirmed tip HWM:** leftover
   TipOnly accepts a create iff `fence.height_of` is `Some`. `confirmed.set_many`
   publishes tip before `height_fence_extend`, and leftover held the fence lock

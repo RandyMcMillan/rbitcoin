@@ -438,7 +438,7 @@ Schema 15 leftover `tx_height.body` is unlinked on open (logged).
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ fence contains the fk (implies height ≤ tip
 and membership in `confirmed[h]` header_txs).  
-On open: `repair_class_c_above_tip` unstrongs bits not on the fence.
+On open: after tip-window revalidate, one `repair_class_c_above_tip` unstrongs bits not on the fence (complement of fence runs — not a full-bit walk).
 
 ---
 

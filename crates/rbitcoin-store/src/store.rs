@@ -1021,36 +1021,56 @@ impl Store {
     }
 
     fn repair_strong_not_on_fence(&self) -> Result<u64, StoreError> {
-        let mut to_clear: Vec<u64> = Vec::new();
-        {
-            let fence = self.fence();
-            self.strong_tx.for_each_strong(|fk| {
-                if fence.height_of(fk).is_none() {
-                    if let Some(id) = fk.get() {
-                        to_clear.push(id);
-                    }
-                }
-                Ok(())
-            })?;
+        let t0 = std::time::Instant::now();
+        let after = self.fence().max_connected_fk();
+        let holes = self.fence().unconnected_ranges(after);
+        let n_bits = self.strong_tx.allocated_bits();
+        let suffix_lo = after.saturating_add(1);
+        let suffix_hi = self.strong_suffix_end_fk(suffix_lo, n_bits)?;
+        let mut ranges = holes;
+        if suffix_hi > suffix_lo {
+            ranges.push((suffix_lo, suffix_hi));
         }
-        if to_clear.is_empty() {
-            return Ok(0);
-        }
-        to_clear.sort_unstable();
+        let n_ranges = ranges.len();
         let mut cleared = 0u64;
-        let mut run_start = to_clear[0];
-        let mut run_end = to_clear[0] + 1;
-        for &id in to_clear.iter().skip(1) {
-            if id == run_end {
-                run_end = id + 1;
+        for (lo, hi) in ranges {
+            let ones = self.strong_tx.count_strong_in_fk_range(lo, hi)?;
+            if ones == 0 {
                 continue;
             }
-            cleared += self.clear_class_c_run(run_start, run_end)?;
-            run_start = id;
-            run_end = id + 1;
+            self.clear_class_c_run(lo, hi)?;
+            cleared = cleared.saturating_add(ones);
         }
-        cleared += self.clear_class_c_run(run_start, run_end)?;
+        let ms = t0.elapsed().as_millis();
+        eprintln!("rbitcoin: class_c repair cleared={cleared} ranges={n_ranges} ms={ms}");
         Ok(cleared)
+    }
+
+    /// Exclusive end fk of leftover 1s after `start_fk`, stopping at a 64 KiB
+    /// all-zero bit page so slab padding is not rewritten.
+    fn strong_suffix_end_fk(&self, start_fk: u64, n_bits: u64) -> Result<u64, StoreError> {
+        if start_fk == 0 || start_fk.saturating_sub(1) >= n_bits {
+            return Ok(start_fk);
+        }
+        const ZERO_PAGE: usize = 65536;
+        let mut bit = start_fk - 1;
+        let mut last_one_end = start_fk;
+        let mut buf = vec![0u8; ZERO_PAGE];
+        while bit < n_bits {
+            let byte_off = bit / 8;
+            let remain = n_bits.div_ceil(8).saturating_sub(byte_off);
+            let take = (remain as usize).min(ZERO_PAGE);
+            self.strong_tx.read_bit_bytes(byte_off, &mut buf[..take])?;
+            if buf[..take].iter().all(|&b| b == 0) {
+                break;
+            }
+            last_one_end = (byte_off + take as u64)
+                .saturating_mul(8)
+                .saturating_add(1)
+                .min(n_bits.saturating_add(1));
+            bit = byte_off.saturating_add(take as u64).saturating_mul(8);
+        }
+        Ok(last_one_end.max(start_fk))
     }
 
     fn clear_class_c_run(&self, start: u64, end: u64) -> Result<u64, StoreError> {
@@ -2134,6 +2154,24 @@ mod tests {
             assert!(!s.strong_tx.is_strong(Fk(20)).unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_uses_fence_complement_not_for_each_strong() {
+        let src = include_str!("store.rs");
+        let repair = src
+            .split("fn repair_strong_not_on_fence")
+            .nth(1)
+            .and_then(|s| s.split("fn strong_suffix_end_fk").next())
+            .expect("repair_strong_not_on_fence");
+        assert!(
+            repair.contains("unconnected_ranges"),
+            "repair must invert the fence: {repair}"
+        );
+        assert!(
+            !repair.contains("for_each_strong"),
+            "do not walk every strong bit: {repair}"
+        );
     }
 
     /// Upgrade open paths: missing optional tables recreated; unspent without range.

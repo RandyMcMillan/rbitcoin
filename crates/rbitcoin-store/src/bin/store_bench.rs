@@ -10,11 +10,10 @@
 //! Run:
 //! ```text
 //! ./target/release/rbitcoin-store-bench --n 200000 --bits 16
-//! ./target/release/rbitcoin-store-bench --n 200000 --bits 16 --access fd
 //! ```
 
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{AddressHead, HeadLayout, TableAccess};
+use rbitcoin_store::{AddressHead, HeadLayout};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -25,15 +24,14 @@ use std::time::Instant;
 
 fn usage() {
     eprintln!(
-        "usage: rbitcoin-store-bench [--n KEYS] [--bits BITS] [--access fd] [--dir DIR]\n\
-         defaults: n=100000 bits=16 access=fd dir=$TMPDIR/rbitcoin-store-bench-$$"
+        "usage: rbitcoin-store-bench [--n KEYS] [--bits BITS] [--dir DIR]\n\
+         defaults: n=100000 bits=16 dir=$TMPDIR/rbitcoin-store-bench-$$"
     );
 }
 
-fn parse_args() -> (usize, u32, String, PathBuf) {
+fn parse_args() -> (usize, u32, PathBuf) {
     let mut n = 100_000usize;
     let mut bits = 16u32;
-    let mut access = "fd".to_string();
     let mut dir = env::temp_dir().join(format!("rbitcoin-store-bench-{}", std::process::id()));
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
@@ -54,9 +52,6 @@ fn parse_args() -> (usize, u32, String, PathBuf) {
                     .and_then(|s| s.parse().ok())
                     .expect("--bits needs integer");
             }
-            "--access" => {
-                access = args.next().expect("--access needs fd");
-            }
             "--dir" => {
                 dir = PathBuf::from(args.next().expect("--dir needs path"));
             }
@@ -67,7 +62,7 @@ fn parse_args() -> (usize, u32, String, PathBuf) {
             }
         }
     }
-    (n, bits, access, dir)
+    (n, bits, dir)
 }
 
 fn mixed_key(i: u64) -> [u8; 32] {
@@ -83,9 +78,8 @@ fn run_mode(n: usize, bits: u32, base: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let path = base.join("head");
     let layout = HeadLayout::with_entry_bytes(bits, 4).map_err(|e| format!("{e}"))?;
-    let head = AddressHead::create_with_table_access(&path, layout, TableAccess::FdOnly)
-        .map_err(|e| format!("create: {e}"))?;
-    assert_eq!(head.table_access(), TableAccess::FdOnly);
+    let head =
+        AddressHead::create_with_layout(&path, layout).map_err(|e| format!("create: {e}"))?;
 
     let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(n);
     for i in 0..n as u64 {
@@ -112,7 +106,7 @@ fn run_mode(n: usize, bits: u32, base: &std::path::Path) -> Result<(), String> {
     let probe_ns = t1.elapsed().as_nanos() / n.max(1) as u128;
 
     println!(
-        "access=FdOnly bits={bits} n={n} occupied={} insert_ms={insert_ms:.2} insert_ns/key={insert_ns} \
+        "bits={bits} n={n} occupied={} insert_ms={insert_ms:.2} insert_ns/key={insert_ns} \
          probe_ms={probe_ms:.2} probe_ns/key={probe_ns} hits={hits}/{n}",
         head.occupied()
     );
@@ -124,30 +118,17 @@ fn run_mode(n: usize, bits: u32, base: &std::path::Path) -> Result<(), String> {
 }
 
 fn main() {
-    let (n, bits, access, dir) = parse_args();
+    let (n, bits, dir) = parse_args();
     println!(
-        "rbitcoin-store-bench n={n} bits={bits} access={access} dir={}",
+        "rbitcoin-store-bench n={n} bits={bits} dir={}",
         dir.display()
     );
     if bits < 12 || bits > 28 {
         eprintln!("bits should be 12..=28 for a useful microbench (got {bits})");
     }
 
-    match access.to_ascii_lowercase().as_str() {
-        "fd" | "fdonly" | "pread" | "both" | "ab" | "a/b" => {}
-        "map" | "mmap" | "mapfull" => {
-            eprintln!("MapFull removed (phase 6); running FdOnly only");
-        }
-        other => {
-            eprintln!("unknown --access {other}");
-            usage();
-            std::process::exit(2);
-        }
-    }
-
-    let sub = dir.join("FdOnly");
-    if let Err(e) = run_mode(n, bits, &sub) {
-        eprintln!("FAIL access=FdOnly: {e}");
+    if let Err(e) = run_mode(n, bits, &dir) {
+        eprintln!("FAIL: {e}");
         std::process::exit(1);
     }
 }

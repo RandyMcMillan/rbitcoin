@@ -55,7 +55,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 9 B×n_out sole-spender; annotate RMW |
 | **`txout.idx` / `inwit.idx` / `spent.idx`** | L0 | Append pwrite; reads pread; **grow-tight** (~1 MiB) |
-| **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (`RBITCOIN_TX_HEAD_ACCESS=map` ignored) |
+| **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (fd pread/pwrite) |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
 | **`scripthash.head` / body** | L0+L1 / idx in process | Sealed main: page idx in RAM, data FdOnly, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf: idx+fuse8. Body slabs L0 |
@@ -80,7 +80,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | `0ee28c0` / `77cb2ab` | io_uring bulk / page-grouped RMW for `tx.head` insert |
 | **`259b766`** (2026-07-23) | **Reverted to mmap-only head insert.** Host A/B: **io_uring head inserts ~5× slower on head ms/blk** than mmap Release. Bulk uring kept for **reads** only |
 | `788936e` | Page-coalesce insert still via **plain map** `write_at` |
-| `bulk_io::page_rmw_pipelined` | Still in tree, **test-only** (`#[allow(dead_code)]` on the prod symbol) — not the head path |
+| `bulk_io::page_rmw_pipelined` | **Test-only** (`#[cfg(test)]`) — not the head path |
 | `3a0c220` | **Body** FdOnly success (different pattern: linear append + bulk batch read) |
 | `f829090` / `11134cb` | Segmented idx/head landed **after** the 5× failure |
 
@@ -144,103 +144,20 @@ Binary: **`rbitcoin-store-bench`** (`crates/rbitcoin-store`).
 ```bash
 # Dev / agent (glibc nix-shell) — correctness + rough order of magnitude only:
 cargo build -p rbitcoin-store --release --bin rbitcoin-store-bench
-./target/release/rbitcoin-store-bench --n 200000 --bits 18 --access both --dir /var/tmp/head-ab
+./target/release/rbitcoin-store-bench --n 200000 --bits 18 --dir /var/tmp/head-ab
 
 # Operator preferred: build via musl package (ships when -p rbitcoin-store is built):
 nix build .#rbitcoin-musl --out-link result
 # After install from result, or:
 find result -name 'rbitcoin-store-bench' 2>/dev/null
 # Run on local NVMe, not 9p:
-./target/release/rbitcoin-store-bench --n 500000 --bits 20 --access both --dir /var/tmp/head-ab
+./target/release/rbitcoin-store-bench --n 500000 --bits 20 --dir /var/tmp/head-ab
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `--access map` | Historical. `MapFull` is **removed**; the bench flag is ignored. |
-| `--access fd` | [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs) (only live mode) |
-| `--access both` | Historical A/B; map arm is gone |
+Maps are gone (`memmap2` not in the workspace). There is no `RBITCOIN_TX_HEAD_ACCESS`
+hatch and no `--access` bench flag. Tables are fd pread/pwrite + fallocate.
+Class C is L2 write-behind (`flush_class_c_tip` before BQ dequeue).
 
-`RBITCOIN_TX_HEAD_ACCESS=map` is ignored (one-time warn). Heads are FdOnly.
-
----
-
-## Phase results (append here)
-
-### Phase 0 — Truth layer (landed with `TableAccess`)
-
-- [`TableAccess::FdOnly` \| `MapFull`](../crates/rbitcoin-store/src/file.rs);
-  originally only leading `TableKind::Tx` was FdOnly by default.
-- Bulk comments/OPERATOR no longer claim bulk `mmap` as a live mode.
-- No host A/B required (behavior unchanged).
-
-### Phase 1 — `tx.idx` FdOnly (landed)
-
-- Segment create/open via `TableFile::create_with_access` / `open_with_access`
-  with **`TableAccess::FdOnly`** (kind remains `ArrayLink` for on-disk identity).
-- Reads: `read_at` → pread; appends: pwrite; grow: fallocate only.
-- Correctness: store unit tests (multi-segment soft-span, reopen, range batch).
-- Host A/B: **optional** for tip-rate; not a hard gate (lower risk than heads).
-
-### Phase 2 — Head FdOnly path + bench harness (landed)
-
-- Trailing-header [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs):
-  tiny map window, pread/pwrite payload, pwrite trailer/HWM, fallocate grow.
-- Env **`RBITCOIN_TX_HEAD_ACCESS`** (initially default **map**; phase 3 flips).
-- Binary **`rbitcoin-store-bench`**.
-
-### Phase 2b — Page coalesce + resolve state machine (landed)
-
-| Path | Behavior |
-|------|----------|
-| **Head insert** | One **page read** + multi in-buffer hop; **one page write-back** if dirty (not per-slot pwrite). 4 KiB-aligned on trailing heads. |
-| **Idx reads** | **OS-page-aligned** preads (4096 B). Contiguous runs expand to page spans. Sparse `record_range_batch` → **one uring/pread SQE per distinct OS page**. Same-page interior range → single page pread. |
-| **Head resolve (uring)** | Per key: CPU **probe** → **STAGE_IDX** (idx OS-page pread) → **STAGE_BODY** (≤32 B body). Many keys mixed in flight — **not** “all idx then all body”. |
-
-- **Agent-side sample** after page write-back (bits=16 n=50k /tmp; not a ship gate):
-
-  | access | insert_ns/key | probe_ns/key |
-  |--------|---------------|--------------|
-  | MapFull | ~111 | ~489 |
-  | FdOnly | ~100 | ~500 |
-
-  Operator: numbers look good on host → phase 3 cutover.
-
-### Phase 3 — `tx.head` default FdOnly + header head (landed)
-
-- **`RBITCOIN_TX_HEAD_ACCESS`** default **FdOnly**; opt-out `map` / `mmap`.
-- [`TableAccess::for_kind`](../crates/rbitcoin-store/src/file.rs): `HashHead` (leading + trailing) → FdOnly.
-- Header `HashHead` + multi-list (`.mlt`) FdOnly; insert/probe via 128-slot chunk cache.
-- Segmented `tx.head` create/open follows env (default FdOnly).
-
-### Phase 4 — scripthash + spenders FdOnly (landed)
-
-- `ScriptHash` body + `ScriptHashHead` shards: default FdOnly via `for_kind`.
-- SH probe/get/clear use the same 4 KiB chunk cache as insert (not per-slot pread).
-- `Spender` multi-list body: FdOnly via `for_kind`.
-- Class C / mempool remain MapFull (phase 5 InRam).
-
-### Phase 5a — Class C FdOnly + resolve page-batch (landed)
-
-- [`TableAccess::for_kind`](../crates/rbitcoin-store/src/file.rs): Class C
-  (`ArrayLink`, Confirmed, Header, TxHeight, StrongTx, …) default **FdOnly**.
-- Head resolve: **`probe_candidates_batch` / `probe_fks_batch`** — one page
-  pread per distinct probe page across the whole key wave (uring + pread paths).
-- Logging: `access=` on address-head **open** + segment open; node start logs
-  `version=` + `tx_head_access=`; `perf_dbg` adds `probe_us/key=` `idx_us/key=`
-  `body_us/key=` and `ca_head_us/blk=` `ca_body_us/blk=`.
-
-### Phase 5b — Mempool InRam + sidecar (landed)
-
-- `rbitcoin-mempool` uses process buffers + normal file IO under
-  `{datadir}/mempool/` (`meta` / `slots` / `tx.body`).
-- **Not** Class A: confirmed archive is `{datadir}/store/txout.body` (+ `inwit` /
-  `spent`) with confirm as sole writer.
-- Tip script skip for live mempool txs unchanged (`script_preverified_txids`).
-- No `memmap2` in the mempool crate.
-
-### Phase 6 — map-free + Class C L2 (landed)
-
-- `TableFile`: no `memmap2` / map epochs; always pread/pwrite + fallocate.
-- `MapFull` / `RBITCOIN_TX_HEAD_ACCESS=map` removed (env ignored with warn).
-- Compact Class C L2 write-behind; `flush_class_c_tip` before BQ dequeue.
-- Workspace `memmap2` dependency removed.
+Live head insert is page-coalesced pread → mutate → pwrite (not per-slot uring).
+Head resolve batches one pread per distinct probe page. Node start logs `io=`,
+not `tx_head_access=`.

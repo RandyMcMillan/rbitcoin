@@ -451,22 +451,14 @@ fn packed_output_spender_rels_multi_vout_one_walk() {
     ];
     let mut raw = Vec::new();
     encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
-    let single0 = TxTable::packed_output_spender_rel(&raw, 0).unwrap();
-    let single3 = TxTable::packed_output_spender_rel(&raw, 3).unwrap();
-    let multi = TxTable::packed_output_spender_rels(&raw, &[3, 0, 3]).unwrap();
-    assert_eq!(multi.len(), 2);
-    assert_eq!(multi[0], (0, single0));
-    assert_eq!(multi[1], (3, single3));
-    // Schema 15: denserels are retired; decode rels are txout output starts.
-    let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
+    // Schema 15: decode rels are txout output starts (not spent denserels).
     let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
-    assert!(layout.is_empty());
-    assert_eq!(decode_rels[0] as u64, single0);
-    assert_eq!(decode_rels[3] as u64, single3);
-    for (_, rel) in multi {
-        let fo = rel as usize;
-        assert!(fo >= TxRecord::BODY_META_LEN);
-        assert!(fo < raw.len());
+    assert_eq!(decode_rels.len(), 4);
+    let mut off = TxRecord::BODY_META_LEN;
+    for (i, _) in outputs.iter().enumerate() {
+        assert_eq!(decode_rels[i] as usize, off);
+        assert!(off < raw.len());
+        off += OutputRecord::skip_at(&raw[off..]).unwrap();
     }
 }
 
@@ -545,14 +537,9 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
                 "output exact len vs encode"
             );
         }
-        let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
         let mut raw = Vec::new();
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
         let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
-        assert!(
-            layout.is_empty(),
-            "R3 abs is spent_off+9*vout, not denserels"
-        );
         assert_eq!(decode_rels.len(), outputs.len());
         let mut off = TxRecord::BODY_META_LEN;
         for (i, _) in outputs.iter().enumerate() {

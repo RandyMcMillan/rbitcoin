@@ -50,7 +50,6 @@ for signet/mainnet sync. **Not** CLI.
 | Confirm `loadq` / `scriptq` / `writeq` | 8 / 4 / 20 |
 | `RBITCOIN_CONFIRM_BATCH_INPUTS` | 8000 soft inputs/pack |
 | Per-path IO (`PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`, `SPEND_ANN`, `CLASS_C_IO`) | Follow **`RBITCOIN_IO` only** (strings deleted) |
-| `RBITCOIN_TX_HEAD_ACCESS=map` | Ignored (FdOnly); warn once if exported |
 | `RBITCOIN_FD_APPEND` | Never read (deleted) |
 | `RBITCOIN_BLOCK_QUEUE_MB` | Never read (deleted; use `_BYTES` / `_GB`) |
 
@@ -71,6 +70,7 @@ for signet/mainnet sync. **Not** CLI.
 | Per-path bulk IO matrix | Collapsed to `RBITCOIN_IO` |
 | Confirm queue env overrides | Hardcoded depths |
 | `RBITCOIN_IO_URING` | Deleted; use `RBITCOIN_IO=pread` |
+| `RBITCOIN_TX_HEAD_ACCESS` | Deleted; tables are always fd pread/pwrite |
 | `RBITCOIN_HEAD_SLOTS_TX` | Deleted; `tx.head` is segmented address head |
 
 ## Related

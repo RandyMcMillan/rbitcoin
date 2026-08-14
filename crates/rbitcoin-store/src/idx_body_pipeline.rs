@@ -1,7 +1,7 @@
 //! **idx → body** pipeline for confirm load (`txout` / `inwit` / `spent` stems).
 //!
 //! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
-//! [`crate::file::TableAccess::FdOnly`] pread). Body backend from
+//! fd pread). Body backend from
 //! [`crate::io_backend::pin_io_backend`] (global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!

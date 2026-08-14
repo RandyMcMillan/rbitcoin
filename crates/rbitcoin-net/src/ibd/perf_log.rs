@@ -775,8 +775,6 @@ pub(crate) fn sample(
         rbitcoin_query::class_c_phase_stats::sample_sh_collect_src_and_reset();
     let (wf_body_store, wf_store_body_ns) =
         rbitcoin_query::wave_fill_stats::sample_store_and_reset();
-    // Drain connect prevout counters (not displayed; avoid unbounded growth).
-    let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let dens = rbitcoin_consensus::lookup_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();

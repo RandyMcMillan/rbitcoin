@@ -649,62 +649,6 @@ impl TxTable {
         &self.txids
     }
 
-    #[allow(dead_code)]
-    /// Relative byte offset of output `vout`'s start inside a `txout` payload.
-    ///
-    /// Input walk uses [`InputRecord::decode_prevout_at`] (no script/witness alloc).
-    fn packed_output_spender_rel(raw: &[u8], vout: u32) -> Result<u64, StoreError> {
-        let found = Self::packed_output_spender_rels(raw, &[vout])?;
-        found
-            .into_iter()
-            .next()
-            .map(|(_, rel)| rel)
-            .ok_or(StoreError::NotFound)
-    }
-
-    #[allow(dead_code)]
-    /// One packed walk: for each requested `vout`, relative offset of its `txout` start.
-    ///
-    /// `vouts` need not be sorted; results are returned in ascending vout order.
-    /// Missing vouts are omitted (caller treats as NotFound).
-    fn packed_output_spender_rels(
-        raw: &[u8],
-        vouts: &[u32],
-    ) -> Result<Vec<(u32, u64)>, StoreError> {
-        if raw.len() < TxRecord::BODY_META_LEN {
-            return Err(StoreError::Corrupt("short packed tx"));
-        }
-        if vouts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-        let mut want: Vec<u32> = vouts.to_vec();
-        want.sort_unstable();
-        want.dedup();
-        let max_v = *want.last().unwrap();
-        if max_v >= meta.output_count {
-            return Err(StoreError::NotFound);
-        }
-        let mut off = TxRecord::BODY_META_LEN;
-        let mut out = Vec::with_capacity(want.len());
-        let mut wi = 0usize;
-        for i in 0..=max_v {
-            if off >= raw.len() {
-                return Err(StoreError::Corrupt("packed outputs short"));
-            }
-            if wi < want.len() && want[wi] == i {
-                out.push((i, off as u64));
-                wi += 1;
-            }
-            let (_, used) = OutputRecord::decode_at(&raw[off..])?;
-            off += used;
-        }
-        if out.len() != want.len() {
-            return Err(StoreError::NotFound);
-        }
-        Ok(out)
-    }
-
     /// Primary head probe slot for `txid` (sort key for locality-friendly batches).
     #[inline]
     pub fn head_primary_slot(&self, txid: &[u8; 32]) -> u64 {
@@ -1779,10 +1723,6 @@ impl TxTable {
             .max(span(&self.spent)?))
     }
 
-    pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        self.head_insert_many(entries)
-    }
-
     pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {
         let n = self.count();
         let bits = self.head.bits();
@@ -1790,19 +1730,12 @@ impl TxTable {
         let occ = self.head.occupied();
         let body_bytes = slots.saturating_mul(u64::from(self.head.entry_bytes()));
         HeadResizeSizeSnapshot {
-            active: false,
-            cursor: 0,
             class_a_n: n,
             primary_bits: bits,
             primary_slots: slots,
             primary_entry_b: self.head.entry_bytes(),
             primary_occupied: occ,
             primary_body_bytes: body_bytes,
-            shadow_bits: 0,
-            shadow_slots: 0,
-            shadow_entry_b: 0,
-            shadow_occupied: 0,
-            shadow_body_bytes: 0,
             segment_count: self.head.segment_count() as u64,
             sealed_segments: self.head.sealed_segment_count() as u64,
             fuse8_bytes: self.head.sealed_fuse_resident_bytes(),

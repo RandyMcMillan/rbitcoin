@@ -22,7 +22,6 @@ mod head_resolve_pick;
 pub mod head_resolve_stats;
 mod header_table;
 mod height_fence;
-mod ibd_io_policy;
 mod idx_body_pipeline;
 mod int_map;
 mod integrity;
@@ -52,24 +51,21 @@ mod var_table;
 
 pub use crate::compact::output_flags;
 pub use address_head::{
-    bits_for_scale, entry_bytes_for_bits, head_table_access_from_env, is_probe_exhausted_error,
-    layout_for_count, load_needs_roll, page_index, probe_depth_stats_snapshot, probe_index,
-    sample_probe_depth_stats, AddressHead, HeadLayout, HEAD_LOAD_CEILING, HEAD_LOAD_START,
-    HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS,
-    PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
+    bits_for_scale, entry_bytes_for_bits, is_probe_exhausted_error, layout_for_count,
+    load_needs_roll, page_index, probe_depth_stats_snapshot, probe_index, sample_probe_depth_stats,
+    AddressHead, HeadLayout, HEAD_LOAD_CEILING, HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS,
+    MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS, PROBE_DEPTH_WARN,
+    PROBE_REGION_BYTES, TINY_BITS,
 };
 pub use block_queue::{BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES};
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
-pub use file::{
-    ensure_nofile_budget, ensure_nofile_budget_at_least, TableAccess, NOFILE_SOFT_TARGET,
-};
+pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use height_fence::{FenceRun, HeightFence};
-pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{
@@ -126,11 +122,10 @@ pub use tx_table::{
     clear_output_spender_fields, decode_inwit_secret, decode_packed_tx,
     decode_packed_tx_need_outs_with_spender_rels_secret, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
-    decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records,
-    encode_inwit_with_secret, encode_packed_tx, encode_packed_tx_with_secret, encode_spent_zeros,
-    is_packed_tx_payload, next_tx_body_start, scan_inwit_prevouts, scan_packed_meta_and_prevouts,
-    spend_meta_backend, spent_abs, InputRecord, OutputRecord, SpendMetaBackend, TxRecord,
-    BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
+    decode_packed_tx_with_spender_rels_secret, encode_inwit_with_secret, encode_packed_tx,
+    encode_packed_tx_with_secret, encode_spent_zeros, is_packed_tx_payload, next_tx_body_start,
+    scan_inwit_prevouts, scan_packed_meta_and_prevouts, spend_meta_backend, spent_abs, InputRecord,
+    OutputRecord, SpendMetaBackend, TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
 pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_DONTCACHE_FROM_TAIL, TXID_ENTRY_LEN};
 pub use uring_session::RWF_DONTCACHE;

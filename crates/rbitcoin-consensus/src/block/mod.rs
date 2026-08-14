@@ -1888,7 +1888,6 @@ fn resolve_prevout(
     // height fence / coinbase body walks. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
 ) -> Result<ResolvedPrevout, ConsensusError> {
-    use rbitcoin_query::connect_prevout_stats;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -1949,7 +1948,6 @@ fn resolve_prevout(
         cold_why = ColdWhy::NotPin;
         match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
             Some((value, script, parent_txid)) if parent_txid == prev_txid => {
-                connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
                 let (cb_h, create_height) = if resolve_create_heights {
                     // Need TxRecord only for coinbase/maturity path (Full mode).
                     let prev_rec = batch_parents
@@ -2211,7 +2209,7 @@ fn find_output(
     }
     // Cold path: always use create fk (packed body + head-off catch-up).
     query
-        .tx_output_at_fk_attributed(prev_fk, prev_rec, vout, true)
+        .tx_output_at_fk(prev_fk, prev_rec, vout)
         .map_err(ConsensusError::from)
 }
 

@@ -1024,7 +1024,6 @@ impl Store {
 
     /// Flush durable index tables (spenders / tx head / scripthash).
     pub fn flush_index_tables(&self) -> Result<(), StoreError> {
-        crate::ibd_io_policy::set_defer_durable_flush(false);
         self.spenders.flush()?;
         self.txs.flush()?;
         self.scripthash.flush()?;

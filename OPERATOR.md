@@ -147,7 +147,7 @@ tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 **FdOnly** `txout.idx` + **`txid.body`** identity via **io_uring or pread**
 (deepest-cand-first).
 **Class A `txout` / `inwit` / `spent` + their `*.idx`, `tx.head`, header head,
-SH head/body, and spenders are FdOnly** ([`TableAccess::FdOnly`](docs/io-modality.md)).
+SH head/body, and spenders are fd pread/pwrite**.
 Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
@@ -274,8 +274,9 @@ vout** (soft `prev_txid` in RAM only).
 annotations on confirm. Pin/SH/Cake read **`txout` only**; annotate dirties
 **`spent`**. Parent resolve uses parent cache + `tx.head` (open + fuse-gated
 sealed). SH create dedupe is an **O(1) height watermark**; durable SH tables
-bulk-load at tip as sorted files (ingest OA is the only large SH heap). Do not
-raise archive queues without watching RSS vs page cache. Working-set sizes:
+bulk-load at tip as sorted files (ingest OA is the only large SH heap). Densify
+is gated by body-queue soft depth — do not raise that depth without watching
+RSS vs page cache. Working-set sizes:
 [`SCHEMA.md`](./SCHEMA.md) (mainnet census) and [`docs/ibd-memory.md`](docs/ibd-memory.md).
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)

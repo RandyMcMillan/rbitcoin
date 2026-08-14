@@ -10,11 +10,11 @@
 //! `create_fk:u64 | next:u64`.
 //!
 //! **IBD write path:** chunk-coalesced insert_many (128 slots ≈ 3 KiB RMW) under
-//! [`TableAccess::FdOnly`] by default. Probe walks reuse the same chunk cache so
-//! FdOnly is not one pread per open-address hop.
+//! fd pread/pwrite. Probe walks reuse the same chunk cache so
+//! a hop is not one pread per open-address step.
 
 use crate::error::StoreError;
-use crate::file::{TableAccess, TableFile, FILE_HEADER_LEN};
+use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -207,7 +207,7 @@ impl MultiList {
         let path = Self::path_for(head_path);
         // ArrayLink kind is shared with Class C; multi-list is
         // linear append like idx — always FdOnly.
-        let file = TableFile::create_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        let file = TableFile::create(path, TableKind::ArrayLink)?;
         Ok(Self {
             file,
             count: Mutex::new(0),
@@ -219,7 +219,7 @@ impl MultiList {
         if !path.exists() {
             return Self::create(head_path);
         }
-        let file = TableFile::open_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        let file = TableFile::open(path, TableKind::ArrayLink)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % MULTI_REC_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("hash head multi-list size"));
@@ -433,13 +433,6 @@ impl HashHead {
             slot = (slot + 1) & (slots - 1);
         }
         Ok(Vec::new())
-    }
-
-    /// Payload transport for this head file (unit tests).
-    #[cfg(test)]
-    #[inline]
-    fn table_access(&self) -> TableAccess {
-        self.file.access()
     }
 
     /// Number of occupied hash slots (open-address load observer).
@@ -1003,7 +996,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(MultiList::path_for(&path));
         let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-        assert_eq!(h.table_access(), TableAccess::FdOnly);
         drop(h);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(MultiList::path_for(&path));

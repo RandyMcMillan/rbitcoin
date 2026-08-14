@@ -41,6 +41,14 @@ before 1.0).
   opens `{datadir}/wire`. Reconstruct + body queue + peer wire serve tip/reorg.
   On-disk `archive_epoch.wire_depth` bytes stay unread.
 
+- **FdOnly ceremony / leftover ghost surface:** `TableAccess` / ignored
+  `RBITCOIN_TX_HEAD_ACCESS` / bench `--access`. `ibd_io_policy` (always-false
+  defer). Always-empty `denserels_from_packed_records`, test-only packed
+  spender-rel helpers, unused `head_insert_many_sole`, no-op
+  `ConfirmParentCache::from_env`. Unprinted `connect_prevout_stats` and
+  always-zero `HeadResizeSizeSnapshot` shadow fields. Printed `ibd: sizes` /
+  `ASM_PREV_*` unchanged.
+
 ### Changed
 
 - **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
@@ -58,7 +66,9 @@ before 1.0).
 
 - **Docs honesty:** root `/api.jsonl` is gitignored. SCHEMA `archive_epoch.wire_depth`
   is an unread leftover field (no tip wire ring). `page_rmw_pipelined` is
-  documented as test-only.
+  documented as test-only. io-modality no longer describes a map hatch;
+  OPERATOR densify is body-queue soft depth (no archive-queue cap).
+- **Table flush:** `TableFile::flush` always `sync_data` after a dirty persist.
 
 - **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
   Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS

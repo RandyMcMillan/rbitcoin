@@ -81,10 +81,6 @@ impl ConfirmParentCache {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self::new()
-    }
-
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
     pub fn ready_through(&self) -> u32 {
         self.ready_through.load(Ordering::Relaxed)

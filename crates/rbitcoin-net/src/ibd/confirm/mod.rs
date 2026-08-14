@@ -1273,6 +1273,8 @@ pub(crate) fn spawn_confirm_engine(
                             let soft_inputs = confirm_batch_max_inputs();
                             let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
                             drop(g);
+                            // 32 is Vec prealloc only — pack size is 8000 inputs
+                            // (typically 1–3 dense blocks), not 32 heights.
                             let mut run: Vec<(u32, BlockHash, bitcoin::Block)> =
                                 Vec::with_capacity(hard_blocks.min(32));
                             let mut sum_inputs = 0u32;

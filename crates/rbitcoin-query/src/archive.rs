@@ -357,6 +357,7 @@ impl Query {
             None,
             None,
             true,
+            false,
         )
     }
 
@@ -376,7 +377,7 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, true)
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, true, false)
     }
 
     /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
@@ -389,6 +390,8 @@ impl Query {
         parent_store: Option<&crate::PipelineParentStore>,
         pre_resolved: Option<&rbitcoin_store::BqParentHits>,
         allow_head: bool,
+        // Confirm one-shot: true (connected only). archive_block: false.
+        tip_only: bool,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -558,9 +561,16 @@ impl Query {
                     "invariant: external parent missing BQ TipOnly hit",
                 ));
             }
-            // Confirm: connected-only. RPC/reconstruct keep get_fk_by_txid (TipThenAny).
+            // Confirm: TipOnly. Standalone archive_block may take unconnected rows.
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            let hits = if tip_only {
+                self.store.get_fk_by_txid_batch(&need_head)?
+            } else {
+                self.store.get_fk_by_txid_batch_mode(
+                    &need_head,
+                    rbitcoin_store::TxidResolveMode::TipThenAny,
+                )?
+            };
             for (txid, row) in hits {
                 if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);
@@ -921,16 +931,16 @@ mod tests {
         let src = include_str!("archive.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
+            prod.contains("if tip_only"),
+            "confirm vs archive_block must pick resolve mode"
+        );
+        assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
             "confirm plan must TipOnly-batch leftovers"
         );
         assert!(
-            !prod.contains("TxidResolveMode::TipThenAny"),
-            "TipThenAny leak must be gone from archive plan"
-        );
-        assert!(
             !prod.contains("get_fk_by_txid(&inp.prev_txid)"),
-            "last-chance TipThenAny probe must be gone"
+            "last-chance single probe must stay gone"
         );
     }
 
@@ -1398,6 +1408,7 @@ mod tests {
                     Some(store.as_ref()),
                     None,
                     true,
+                    false,
                 )
                 .expect("pin-txid stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));

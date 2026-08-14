@@ -371,10 +371,19 @@ pub fn confirm_wire_load_phase_pipelined(
                     Some(p.parent_store.as_ref()),
                     None,
                     true,
+                    true,
                 )
                 .map_err(ConsensusError::from)?,
             None => query
-                .archive_plan_batch_owned(&mut need)
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    query.tx_body_count().saturating_add(1).max(1),
+                    &rbitcoin_query::InFlightView::empty(),
+                    None,
+                    None,
+                    true,
+                    true,
+                )
                 .map_err(ConsensusError::from)?,
         };
         // Expand each header body range to ordered create fks.

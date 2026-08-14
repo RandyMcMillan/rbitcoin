@@ -762,6 +762,7 @@ pub(super) fn wire_lookup_phase(
                     Some(p.parent_store.as_ref()),
                     pre_resolved,
                     allow_head,
+                    true,
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -772,6 +773,7 @@ pub(super) fn wire_lookup_phase(
                     None,
                     pre_resolved,
                     allow_head,
+                    true,
                 )
                 .map_err(ConsensusError::from)?,
         };

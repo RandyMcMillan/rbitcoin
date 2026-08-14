@@ -1,7 +1,7 @@
 //! BQ-ahead TipOnly parent resolve (lookup wave).
 //!
-//! One [`Store::get_fk_by_txid_batch`] (TipOnly) across many ready heights.
-//! Hits live on the BQ record. Does not claim, structure, or stamp.
+//! One [`Store::get_fk_by_txid_batch`] (TipOnly) across a short ready-height
+//! wave. Hits live on the BQ record. Does not claim, structure, or stamp.
 
 use super::*;
 use bitcoin::consensus::Decodable;
@@ -9,10 +9,16 @@ use rbitcoin_store::BqParentHits;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
-/// Soft cap: ~BQ soft depth, much larger than one confirm pack.
-pub const BQ_RESOLVE_WAVE_MAX_BLOCKS: usize = 256;
-/// Soft cap so one wave cannot stall forever on a megablock run.
-pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 400_000;
+/// Heights per TipOnly wave. Start conservative so load sees complete BQ
+/// slices often instead of waiting out one huge machine.
+///
+/// Claim pack is **not** ~32 blocks. Claim stops at Σ `tx.input` **8000**
+/// (typically **1–3** dense mainnet blocks) or hard 144 thin early blocks.
+/// `32` was 8000/250 (mid-chain average) and must not be reused as pack size.
+/// Eight heights is a few claim packs at fat-era density, not a `bq soft` dump.
+pub const BQ_RESOLVE_WAVE_MAX_BLOCKS: usize = 8;
+/// Safety cap so one megablock run cannot stall the wave (~8 × 8000 inputs).
+pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 64_000;
 
 /// Outcome of one TipOnly wave over BQ-ready heights.
 #[derive(Debug, Default, Clone, Copy)]
@@ -400,6 +406,7 @@ mod tests {
                 None,
                 Some(&rbitcoin_store::BqParentHits::default()),
                 false,
+                true,
             )
             .expect_err("missing BQ hit must not TipThenAny-fill");
         let msg = err.to_string();

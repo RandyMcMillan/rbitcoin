@@ -15,7 +15,9 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Height-ordered unified pipeline (current):** peer → **body queue** → **lookup** (structure + stamp create_fk) → **load** (pin `txout` + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Load must **not** re-run lookup head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → no cold idx on load). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
-**Lookup pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do not assume large multi-dozen block waves.
+**Load claim pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do **not** treat ~32 as pack size (that was 8000/250 mid-chain, not fat-era).
+
+**IBD lookup resolve wave:** TipOnly `head_fk` over at most **8** BQ-ready heights (or 64 k keys), then mark those complete for load to claim. Small on purpose so complete slices arrive steadily; raise only after host A/B.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. See [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
 

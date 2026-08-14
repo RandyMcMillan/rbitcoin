@@ -764,6 +764,9 @@ pub(crate) mod confirm_thr_stats {
     pub fn add_lookup_claim(d: Duration) {
         add(&LOOKUP_CLAIM_NS, d);
     }
+    /// Pack BQ decode used to land here; it is load work now. Tests still
+    /// drive the atomic.
+    #[cfg(test)]
     #[inline]
     pub fn add_lookup_resolve(d: Duration) {
         add(&LOOKUP_RESOLVE_NS, d);

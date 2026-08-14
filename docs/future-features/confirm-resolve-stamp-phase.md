@@ -1,6 +1,6 @@
-# Confirm: split lookup into resolve + stamp (active)
+# Confirm: split lookup into resolve + stamp (shipped)
 
-Active on the four-stage pipeline (no fifth OS thread). IBD **lookup** is the
+Shipped on the four-stage pipeline (no fifth OS thread). IBD **lookup** is the
 BQ-ahead TipOnly `head_fk` wave; **load** claims resolve-complete heights and
 stamps from BQ hits plus leftover TipOnly `tx.head` (open head / ages ≤3
 sealed). Remaining externals after the wave are expected. One-shot

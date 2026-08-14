@@ -1,4 +1,4 @@
-//! Archive mode and finalization epoch (durable-archive soft/hard zones).
+//! On-disk `archive_epoch` leftover (bytes unread: mode / finalized / wire_depth).
 
 use crate::error::StoreError;
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
@@ -9,9 +9,9 @@ use std::path::Path;
 /// On-disk epoch record under `store/archive_epoch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveEpoch {
-    /// When true, incremental finalize is active.
+    /// Leftover on-disk flag (was incremental finalize). Serialized; unread.
     pub archive_mode: bool,
-    /// Last height fully fsynced / sealed (None = nothing finalized yet).
+    /// Leftover on-disk height (was last sealed prefix). Serialized; unread.
     pub finalized_height: Option<u32>,
     /// Leftover on-disk field (was a tip wire-ring window). Serialized; unread.
     pub wire_depth: u32,

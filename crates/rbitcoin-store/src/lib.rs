@@ -2,7 +2,7 @@
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
-//! Archive epochs: durable-archive soft/hard zones (`archive_epoch.wire_depth` unread).
+//! Archive epochs: on-disk leftover (`archive_mode` / `finalized_height` / `wire_depth` unread).
 
 mod address_head;
 mod array_table;

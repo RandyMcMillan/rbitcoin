@@ -76,6 +76,24 @@ before 1.0).
   always-zero `HeadResizeSizeSnapshot` shadow fields. Printed `ibd: sizes` /
   `ASM_PREV_*` unchanged.
 
+- **Hash-load confirm twin:** `Query::load_confirm_parents`, ConfirmParentCache
+  scan watermark, and `BatchFullBodies`. Confirm load is wire-only
+  (`pin_for_wire_batch` + `load_creates_once`). Reconstruct always reads
+  Class A from the store. Header plans stay for MTP.
+
+- **Dead wrappers after archive-ahead / hash-confirm:**
+  `confirm_wire_lookup_and_ensure_denserels`, `ChainHub::confirm_wire_lookup_phase`
+  / `_pipelined_cold` / `confirm_scripts` / `is_archived`,
+  `prepare_block_for_archive_ibd`, header `put_raw`/`rewrite`, unread
+  `archive_epoch` mutators, fused `get_fk_and_outs_by_txid_batch`, always-false
+  `txid.body` DONTCACHE and confirm load-retry hook, no-op
+  `warm_scripthash_create_index`, always-true `IndexMode::uses_durable_spends`.
+
+- **Ghost meters those paths fed:** plan `sticky_ns` / `head_dens`, unused
+  `last_stamp`, `lookup_thr resolve=` (always 0). `last_plan_batch`
+  leftover_n/hit stays for stamp-reject. Live leftover `head_fk` /
+  `pin_txid` / leftover CDF stay.
+
 - **Public archive-without-confirm:** `Query::archive_block`,
   `accept_and_archive_block`, and `ChainHub::archive_block`. Confirm is sole
   Class A (`archive_plan_batch_*` + `archive_commit_plan`). Crash / `plan=None`
@@ -182,8 +200,8 @@ before 1.0).
   thin `--sptweaks` serve is idx→body uring, not a packed span.
 - **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
   Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
-- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--archive-queue-mb`,
-  `--conf`, Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
+- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--conf`,
+  Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
 - **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`.
 - **Fee snapshot / mempool APIs:** published fee table and mining chunks so
   Electrum/Esplora estimates do not block accepts (R-01–R-04).

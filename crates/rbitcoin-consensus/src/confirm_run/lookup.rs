@@ -778,24 +778,15 @@ pub(super) fn wire_lookup_phase(
     let batch_ns = t_batch.elapsed().as_nanos() as u64;
     // plan_ns for HEAD_NS: filter + batch (legacy “lookup wall” without struct/prepare).
     let plan_ns = filter_ns.saturating_add(batch_ns);
-    plan_stamp_sub_stats::note_last(
-        blocks.len() as u64,
-        struct_ns,
-        prepare_ns,
-        filter_ns,
-        batch_ns,
-    );
+    plan_stamp_sub_stats::note(struct_ns, prepare_ns, filter_ns, batch_ns);
     Ok((plan, metas, wire_blocks, plan_ns))
 }
 
 /// Stamp-phase sub-walls for lookup_thr diagnosis (structure / prepare / filter / batch).
 ///
-/// Batch is the archive plan_batch wall (assign+collect+res+head_fk+head_dens+stamp+finish
-/// already timed in `archive_phase_stats`). `head_fk` = get_fk_by_txid_batch;
-/// `head_dens` = plan-time external-parent denserels load; `head` = sum.
-///
-/// Last-batch fields (overwrite) power slow-plan logs; window sum is still
-/// [`sample_and_reset`].
+/// Batch is the archive plan_batch wall (assign+collect+inflight+head_fk+stamp+finish
+/// already timed in `archive_phase_stats`). `head_fk` = leftover TipOnly
+/// `get_fk_by_txid_batch`. Window sum is [`sample_and_reset`].
 pub mod plan_stamp_sub_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -803,11 +794,6 @@ pub mod plan_stamp_sub_stats {
     static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
     static FILTER_NS: AtomicU64 = AtomicU64::new(0);
     static BATCH_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_FILTER_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_BATCH_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_N_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
         if struct_ns > 0 {
@@ -824,22 +810,6 @@ pub mod plan_stamp_sub_stats {
         }
     }
 
-    /// Record last stamp sub-walls for one plan batch (slow-plan logs).
-    pub fn note_last(
-        n_blocks: u64,
-        struct_ns: u64,
-        prepare_ns: u64,
-        filter_ns: u64,
-        batch_ns: u64,
-    ) {
-        note(struct_ns, prepare_ns, filter_ns, batch_ns);
-        LAST_N_BLOCKS.store(n_blocks, Ordering::Relaxed);
-        LAST_STRUCT_NS.store(struct_ns, Ordering::Relaxed);
-        LAST_PREPARE_NS.store(prepare_ns, Ordering::Relaxed);
-        LAST_FILTER_NS.store(filter_ns, Ordering::Relaxed);
-        LAST_BATCH_NS.store(batch_ns, Ordering::Relaxed);
-    }
-
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub struct_ns: u64,
@@ -854,33 +824,6 @@ pub mod plan_stamp_sub_stats {
             prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
             filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
             batch_ns: BATCH_NS.swap(0, Ordering::Relaxed),
-        }
-    }
-
-    /// Last stamp batch (not consumed by sample_and_reset).
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LastStamp {
-        pub n_blocks: u32,
-        pub struct_ns: u64,
-        pub prepare_ns: u64,
-        pub filter_ns: u64,
-        pub batch_ns: u64,
-    }
-
-    impl LastStamp {
-        #[inline]
-        pub fn ms(ns: u64) -> u64 {
-            ns / 1_000_000
-        }
-    }
-
-    pub fn last_stamp() -> LastStamp {
-        LastStamp {
-            n_blocks: LAST_N_BLOCKS.load(Ordering::Relaxed) as u32,
-            struct_ns: LAST_STRUCT_NS.load(Ordering::Relaxed),
-            prepare_ns: LAST_PREPARE_NS.load(Ordering::Relaxed),
-            filter_ns: LAST_FILTER_NS.load(Ordering::Relaxed),
-            batch_ns: LAST_BATCH_NS.load(Ordering::Relaxed),
         }
     }
 }

@@ -720,7 +720,6 @@ pub(crate) mod confirm_thr_stats {
     use std::time::Duration;
 
     static LOOKUP_CLAIM_NS: AtomicU64 = AtomicU64::new(0);
-    static LOOKUP_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_CLONE_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_OTHER_NS: AtomicU64 = AtomicU64::new(0);
@@ -748,13 +747,6 @@ pub(crate) mod confirm_thr_stats {
     #[inline]
     pub fn add_lookup_claim(d: Duration) {
         add(&LOOKUP_CLAIM_NS, d);
-    }
-    /// Pack BQ decode used to land here; it is load work now. Tests still
-    /// drive the atomic.
-    #[cfg(test)]
-    #[inline]
-    pub fn add_lookup_resolve(d: Duration) {
-        add(&LOOKUP_RESOLVE_NS, d);
     }
     #[inline]
     pub fn add_lookup_clone(d: Duration) {
@@ -811,7 +803,6 @@ pub(crate) mod confirm_thr_stats {
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub lookup_claim_ns: u64,
-        pub lookup_resolve_ns: u64,
         pub lookup_clone_ns: u64,
         pub lookup_stamp_ns: u64,
         pub lookup_other_ns: u64,
@@ -829,7 +820,6 @@ pub(crate) mod confirm_thr_stats {
     pub fn sample_and_reset() -> Sample {
         Sample {
             lookup_claim_ns: LOOKUP_CLAIM_NS.swap(0, Ordering::Relaxed),
-            lookup_resolve_ns: LOOKUP_RESOLVE_NS.swap(0, Ordering::Relaxed),
             lookup_clone_ns: LOOKUP_CLONE_NS.swap(0, Ordering::Relaxed),
             lookup_stamp_ns: LOOKUP_STAMP_NS.swap(0, Ordering::Relaxed),
             lookup_other_ns: LOOKUP_OTHER_NS.swap(0, Ordering::Relaxed),

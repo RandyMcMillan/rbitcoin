@@ -418,7 +418,6 @@ pub mod archive_phase_stats {
     /// Headers (blocks) planned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
-    pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
     /// Unique prev_txids resolved from live [`crate::PipelineParentStore`].
@@ -431,10 +430,6 @@ pub mod archive_phase_stats {
     pub static LEFTOVER_AGE0: AtomicU64 = AtomicU64::new(0);
     pub static LEFTOVER_AGE3: AtomicU64 = AtomicU64::new(0);
     pub static LEFTOVER_AGE_N: AtomicU64 = AtomicU64::new(0);
-    /// Fks that received plan denserels in Shape A fused head resolve.
-    pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
-    /// Sum of packed body lengths read in denserels wave (when ranges known).
-    pub static HEAD_DENS_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -445,14 +440,11 @@ pub mod archive_phase_stats {
     pub static PREP_FILTER_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PREP_STICKY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Combined head wall (fk resolve + plan denserels); = head_fk + head_dens.
+    /// Leftover TipOnly head wall (= PREP_HEAD_FK_NS).
     pub static PREP_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// Shape A Prefix33 select wall (head total − denserels).
+    /// Leftover TipOnly `get_fk_by_txid_batch`.
     pub static PREP_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
-    /// Shape A denserels wave (single-cand denserels-only + multi-cand dens).
-    pub static PREP_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_FINISH_NS: AtomicU64 = AtomicU64::new(0);
     /// Reserved HWM + inflight create map publish after plan.
@@ -476,7 +468,6 @@ pub mod archive_phase_stats {
     pub struct Sample {
         pub blocks: u64,
         pub ext_need: u64,
-        pub sticky_hit: u64,
         pub head_need: u64,
         pub head_hit: u64,
         pub pin_txid_n: u64,
@@ -485,25 +476,20 @@ pub mod archive_phase_stats {
         pub leftover_cdf0_pct: u64,
         pub leftover_cdf3_pct: u64,
         pub leftover_age_n: u64,
-        pub head_dens_fks: u64,
-        pub head_dens_bytes: u64,
         pub batch_stamp: u64,
         pub resolved_stamp: u64,
-        /// Sticky+inflight+head_fk only (not plan denserels load).
+        /// inflight + leftover head_fk.
         pub resolve_ns: u64,
         pub prep_total_ns: u64,
         pub prep_struct_ns: u64,
         pub prep_filter_ns: u64,
         pub prep_assign_ns: u64,
         pub prep_collect_ns: u64,
-        pub prep_sticky_ns: u64,
         pub prep_inflight_ns: u64,
-        /// head_fk + head_dens (legacy total).
+        /// Leftover TipOnly `get_fk_by_txid_batch` (= prep_head_fk_ns).
         pub prep_head_ns: u64,
-        /// Pure tx.head resolve (`get_fk_by_txid_batch`).
+        /// Pure leftover tx.head resolve (`get_fk_by_txid_batch`).
         pub prep_head_fk_ns: u64,
-        /// Plan-time denserels for external parents (Shape A fused head resolve).
-        pub prep_head_dens_ns: u64,
         pub prep_stamp_ns: u64,
         pub prep_finish_ns: u64,
         pub prep_publish_ns: u64,
@@ -526,7 +512,6 @@ pub mod archive_phase_stats {
                 .saturating_add(self.prep_filter_ns)
                 .saturating_add(self.prep_assign_ns)
                 .saturating_add(self.prep_collect_ns)
-                .saturating_add(self.prep_sticky_ns)
                 .saturating_add(self.prep_inflight_ns)
                 .saturating_add(self.prep_head_ns)
                 .saturating_add(self.prep_stamp_ns)
@@ -551,17 +536,12 @@ pub mod archive_phase_stats {
     }
 
     fn sample_and_reset_inner() -> Sample {
-        let prep_sticky = PREP_STICKY_NS.swap(0, Ordering::Relaxed);
         let prep_inflight = PREP_INFLIGHT_NS.swap(0, Ordering::Relaxed);
         let prep_head_fk = PREP_HEAD_FK_NS.swap(0, Ordering::Relaxed);
-        let prep_head_dens = PREP_HEAD_DENS_NS.swap(0, Ordering::Relaxed);
-        let prep_head = PREP_HEAD_NS
-            .swap(0, Ordering::Relaxed)
-            .max(prep_head_fk.saturating_add(prep_head_dens));
+        let prep_head = PREP_HEAD_NS.swap(0, Ordering::Relaxed).max(prep_head_fk);
         Sample {
             blocks: BLOCKS.swap(0, Ordering::Relaxed),
             ext_need: EXT_NEED.swap(0, Ordering::Relaxed),
-            sticky_hit: STICKY_HIT.swap(0, Ordering::Relaxed),
             head_need: HEAD_NEED.swap(0, Ordering::Relaxed),
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
             pin_txid_n: PIN_TXID_N.swap(0, Ordering::Relaxed),
@@ -586,23 +566,17 @@ pub mod archive_phase_stats {
                 }
             },
             leftover_age_n: LEFTOVER_AGE_N.swap(0, Ordering::Relaxed),
-            head_dens_fks: HEAD_DENS_FKS.swap(0, Ordering::Relaxed),
-            head_dens_bytes: HEAD_DENS_BYTES.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
             resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
-            resolve_ns: prep_sticky
-                .saturating_add(prep_inflight)
-                .saturating_add(prep_head_fk),
+            resolve_ns: prep_inflight.saturating_add(prep_head_fk),
             prep_total_ns: PREP_TOTAL_NS.swap(0, Ordering::Relaxed),
             prep_struct_ns: PREP_STRUCT_NS.swap(0, Ordering::Relaxed),
             prep_filter_ns: PREP_FILTER_NS.swap(0, Ordering::Relaxed),
             prep_assign_ns: PREP_ASSIGN_NS.swap(0, Ordering::Relaxed),
             prep_collect_ns: PREP_COLLECT_NS.swap(0, Ordering::Relaxed),
-            prep_sticky_ns: prep_sticky,
             prep_inflight_ns: prep_inflight,
             prep_head_ns: prep_head,
             prep_head_fk_ns: prep_head_fk,
-            prep_head_dens_ns: prep_head_dens,
             prep_stamp_ns: PREP_STAMP_NS.swap(0, Ordering::Relaxed),
             prep_finish_ns: PREP_FINISH_NS.swap(0, Ordering::Relaxed),
             prep_publish_ns: PREP_PUBLISH_NS.swap(0, Ordering::Relaxed),
@@ -631,7 +605,6 @@ pub mod archive_phase_stats {
     pub fn note_resolve_counts(
         blocks: u64,
         ext_need: u64,
-        sticky_hit: u64,
         head_need: u64,
         head_hit: u64,
         batch_stamp: u64,
@@ -640,17 +613,12 @@ pub mod archive_phase_stats {
         exclusive::with(|| {
             add(&BLOCKS, blocks);
             add(&EXT_NEED, ext_need);
-            add(&STICKY_HIT, sticky_hit);
             add(&HEAD_NEED, head_need);
             add(&HEAD_HIT, head_hit);
             add(&BATCH_STAMP, batch_stamp);
             add(&RESOLVED_STAMP, resolved_stamp);
-            LAST_BLOCKS.store(blocks, Ordering::Relaxed);
-            LAST_EXT_NEED.store(ext_need, Ordering::Relaxed);
             LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
             LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
-            LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
-            LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
         });
     }
 
@@ -674,114 +642,46 @@ pub mod archive_phase_stats {
         });
     }
 
-    /// Plan denserels wave size (fks + optional body bytes read).
-    #[inline]
-    pub fn note_head_dens_wave(dens_fks: u64, dens_bytes: u64) {
-        exclusive::with(|| {
-            add(&HEAD_DENS_FKS, dens_fks);
-            add(&HEAD_DENS_BYTES, dens_bytes);
-        });
-    }
-
     /// Lookup sub-phases for one plan batch (`archive_plan_batch_from`).
     ///
-    /// `head_fk_ns`: pure `get_fk_by_txid_batch`.  
-    /// `head_dens_ns`: plan-time external-parent denserels load.  
-    /// `head` total = head_fk + head_dens (also stored on `PREP_HEAD_NS`).
-    ///
-    /// Also overwrites **last-batch** plan snapshot for slow-lookup logs (not
-    /// window-summed; see [`last_plan_batch`]).
+    /// `head_fk_ns`: leftover TipOnly `get_fk_by_txid_batch` after BQ / pins.
     #[inline]
     pub fn note_prep_plan(
         assign_ns: u64,
         collect_ns: u64,
-        sticky_ns: u64,
         inflight_ns: u64,
         head_fk_ns: u64,
-        head_dens_ns: u64,
         stamp_ns: u64,
         finish_ns: u64,
     ) {
         exclusive::with(|| {
             add(&PREP_ASSIGN_NS, assign_ns);
             add(&PREP_COLLECT_NS, collect_ns);
-            add(&PREP_STICKY_NS, sticky_ns);
             add(&PREP_INFLIGHT_NS, inflight_ns);
             add(&PREP_HEAD_FK_NS, head_fk_ns);
-            add(&PREP_HEAD_DENS_NS, head_dens_ns);
-            add(&PREP_HEAD_NS, head_fk_ns.saturating_add(head_dens_ns));
+            add(&PREP_HEAD_NS, head_fk_ns);
             add(&PREP_STAMP_NS, stamp_ns);
             add(&PREP_FINISH_NS, finish_ns);
-            // Last-batch (overwrite; for slow-plan diagnosis).
-            LAST_ASSIGN_NS.store(assign_ns, Ordering::Relaxed);
-            LAST_COLLECT_NS.store(collect_ns, Ordering::Relaxed);
-            LAST_STICKY_NS.store(sticky_ns, Ordering::Relaxed);
-            LAST_INFLIGHT_NS.store(inflight_ns, Ordering::Relaxed);
-            LAST_HEAD_FK_NS.store(head_fk_ns, Ordering::Relaxed);
-            LAST_HEAD_DENS_NS.store(head_dens_ns, Ordering::Relaxed);
-            LAST_STAMP_NS.store(stamp_ns, Ordering::Relaxed);
-            LAST_FINISH_NS.store(finish_ns, Ordering::Relaxed);
         });
     }
 
-    // ── Last completed plan_batch (slow-plan logs; not window-summed) ────────
-    static LAST_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_STICKY_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_STAMP_NS: AtomicU64 = AtomicU64::new(0);
-    static LAST_FINISH_NS: AtomicU64 = AtomicU64::new(0);
+    // Last leftover mix (overwrite). Stamp-reject leftover_n/hit and the
+    // fail-pack test read this — note_resolve_counts stores it *before* stamp
+    // so a leftover miss still meters. last_stamp timing snapshots stay gone.
     static LAST_HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     static LAST_HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    static LAST_EXT_NEED: AtomicU64 = AtomicU64::new(0);
-    static LAST_BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
-    static LAST_RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
-    static LAST_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
-    /// Snapshot of the most recent [`note_prep_plan`] + resolve mix (one plan batch).
+    /// Snapshot of the most recent leftover head resolve (one plan batch).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct LastPlanBatch {
-        pub blocks: u64,
-        pub ext_need: u64,
         pub head_need: u64,
         pub head_hit: u64,
-        pub batch_stamp: u64,
-        pub resolved_stamp: u64,
-        pub assign_ns: u64,
-        pub collect_ns: u64,
-        pub sticky_ns: u64,
-        pub inflight_ns: u64,
-        pub head_fk_ns: u64,
-        pub head_dens_ns: u64,
-        pub stamp_ns: u64,
-        pub finish_ns: u64,
-    }
-
-    impl LastPlanBatch {
-        #[inline]
-        pub fn ms(ns: u64) -> u64 {
-            ns / 1_000_000
-        }
     }
 
     pub fn last_plan_batch() -> LastPlanBatch {
         LastPlanBatch {
-            blocks: LAST_BLOCKS.load(Ordering::Relaxed),
-            ext_need: LAST_EXT_NEED.load(Ordering::Relaxed),
             head_need: LAST_HEAD_NEED.load(Ordering::Relaxed),
             head_hit: LAST_HEAD_HIT.load(Ordering::Relaxed),
-            batch_stamp: LAST_BATCH_STAMP.load(Ordering::Relaxed),
-            resolved_stamp: LAST_RESOLVED_STAMP.load(Ordering::Relaxed),
-            assign_ns: LAST_ASSIGN_NS.load(Ordering::Relaxed),
-            collect_ns: LAST_COLLECT_NS.load(Ordering::Relaxed),
-            sticky_ns: LAST_STICKY_NS.load(Ordering::Relaxed),
-            inflight_ns: LAST_INFLIGHT_NS.load(Ordering::Relaxed),
-            head_fk_ns: LAST_HEAD_FK_NS.load(Ordering::Relaxed),
-            head_dens_ns: LAST_HEAD_DENS_NS.load(Ordering::Relaxed),
-            stamp_ns: LAST_STAMP_NS.load(Ordering::Relaxed),
-            finish_ns: LAST_FINISH_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -2216,21 +2116,16 @@ mod tests {
         assert!(s.edge_coinbase >= 21);
 
         let _ = archive_phase_stats::sample_and_reset();
-        archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
-        archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
+        archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6);
         let last = archive_phase_stats::last_plan_batch();
         // last_plan_batch is last-writer; re-note immediately before read if raced.
-        if last.head_fk_ns != 10 {
-            archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7);
+        if last.head_need != 3 {
+            archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6);
         }
         let last = archive_phase_stats::last_plan_batch();
-        assert_eq!(last.head_fk_ns, 10);
-        assert_eq!(last.head_dens_ns, 20);
-        assert_eq!(last.head_need, 4);
-        assert_eq!(last.head_hit, 5);
-        assert_eq!(last.assign_ns, 1);
-        assert_eq!(archive_phase_stats::LastPlanBatch::ms(10_000_000), 10);
-        archive_phase_stats::note_head_dens_wave(9, 1024);
+        assert_eq!(last.head_need, 3);
+        assert_eq!(last.head_hit, 4);
+        archive_phase_stats::note_prep_plan(1, 2, 3, 10, 6, 7);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 1);
         archive_phase_stats::note_write_flush(8);
@@ -2239,10 +2134,7 @@ mod tests {
         assert!(a.write_phases_sum_ns() > 0);
         assert!(a.blocks >= 1);
         assert!(a.prep_head_fk_ns >= 10);
-        assert!(a.prep_head_dens_ns >= 20);
-        assert!(a.prep_head_ns >= 30);
-        assert!(a.head_dens_fks >= 9);
-        assert!(a.head_dens_bytes >= 1024);
+        assert!(a.prep_head_ns >= 10);
 
         confirm_load_stats::note_last_pin(11, 22, 33, 44, 55, 100, 9);
         let lp = confirm_load_stats::last_pin_phases();

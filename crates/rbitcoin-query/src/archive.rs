@@ -466,10 +466,6 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        // sticky_* slots kept at 0 (process pin FIFO removed). Live pins are
-        // consulted via PipelineParentStore::lookup_txid (same Weak lifecycle).
-        let sticky_ns = 0u64;
-        let sticky_hit_n = 0u64;
         let mut resolved: HashMap<[u8; 32], Fk> = HashMap::with_capacity(need_vec.len() / 2);
 
         // Prior plan batch(es) still in the write queue: not head yet.
@@ -553,7 +549,6 @@ impl Query {
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
         // Cheap TipOnly (open head + ages ≤3 sealed). Never treat a leftover as Corrupt.
         let t_head = Instant::now();
-        let head_dens_ns = 0u64;
         if !need_head.is_empty() {
             let leftover_pend = need_head
                 .iter()
@@ -588,14 +583,11 @@ impl Query {
             }
             crate::archive_phase_stats::note_leftover_mix(leftover_pend, age0, age3, age_n);
         }
-        let head_total_ns = t_head.elapsed().as_nanos() as u64;
-        let head_fk_ns = head_total_ns; // denserels not on plan stamp path
-        crate::archive_phase_stats::note_head_dens_wave(0, 0);
+        let head_fk_ns = t_head.elapsed().as_nanos() as u64;
         // Need/hit before stamp so a leftover miss still meters the fail pack.
         crate::archive_phase_stats::note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
-            sticky_hit_n,
             head_need_n,
             head_hit_n,
             0,
@@ -729,14 +721,12 @@ impl Query {
         // heuristics were dead work that cost O(headers) RwLock gets per plan.
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
-        crate::archive_phase_stats::note_resolve_counts(0, 0, 0, 0, 0, batch_stamp, resolved_stamp);
+        crate::archive_phase_stats::note_resolve_counts(0, 0, 0, 0, batch_stamp, resolved_stamp);
         crate::archive_phase_stats::note_prep_plan(
             assign_ns,
             collect_ns,
-            sticky_ns,
             inflight_ns,
             head_fk_ns,
-            head_dens_ns,
             stamp_ns,
             finish_ns,
         );

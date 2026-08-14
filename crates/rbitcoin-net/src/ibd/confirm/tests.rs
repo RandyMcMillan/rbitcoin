@@ -306,21 +306,18 @@ fn thr_stats_sample_and_reset() {
     use super::confirm_thr_stats;
     use std::time::Duration;
     let _ = confirm_thr_stats::sample_and_reset(); // clear
-    confirm_thr_stats::add_lookup_resolve(Duration::from_millis(10));
     confirm_thr_stats::add_lookup_clone(Duration::from_millis(5));
     confirm_thr_stats::add_load_recv_wait(Duration::from_millis(20));
     let s = confirm_thr_stats::sample_and_reset();
-    assert!(s.lookup_resolve_ns >= 10_000_000);
     assert!(s.lookup_clone_ns >= 5_000_000);
     assert!(s.load_recv_wait_ns >= 20_000_000);
     let busy = s
-        .lookup_resolve_ns
-        .saturating_add(s.lookup_clone_ns)
+        .lookup_clone_ns
         .saturating_add(s.lookup_stamp_ns)
         .saturating_add(s.lookup_other_ns);
-    assert_eq!(busy, s.lookup_resolve_ns + s.lookup_clone_ns);
+    assert_eq!(busy, s.lookup_clone_ns);
     let z = confirm_thr_stats::sample_and_reset();
-    assert_eq!(z.lookup_resolve_ns, 0);
+    assert_eq!(z.lookup_clone_ns, 0);
 }
 
 #[test]
@@ -631,7 +628,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
 
     let d = Duration::from_nanos(1_000);
     confirm_thr_stats::add_lookup_claim(d);
-    confirm_thr_stats::add_lookup_resolve(d);
     confirm_thr_stats::add_lookup_clone(d);
     confirm_thr_stats::add_lookup_stamp(d);
     confirm_thr_stats::add_lookup_other(d);
@@ -646,7 +642,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     confirm_thr_stats::add_write_work(d);
     let s = confirm_thr_stats::sample_and_reset();
     assert!(s.lookup_claim_ns >= 1_000);
-    assert!(s.lookup_resolve_ns >= 1_000);
     assert!(s.lookup_clone_ns >= 1_000);
     assert!(s.lookup_stamp_ns >= 1_000);
     assert!(s.lookup_other_ns >= 1_000);

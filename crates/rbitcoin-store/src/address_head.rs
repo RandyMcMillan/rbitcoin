@@ -36,27 +36,11 @@
 //! global bits-widen.
 
 use crate::error::StoreError;
-use crate::file::{TableAccess, TableFile, TRAILING_FOOTER_LEN};
+use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Table transport for address-head files (`tx.head` segments).
-///
-/// Always [`TableAccess::FdOnly`] (phase 6 — maps removed). Env
-/// `RBITCOIN_TX_HEAD_ACCESS=map|mmap` is ignored with a one-time warn.
-pub fn head_table_access_from_env() -> TableAccess {
-    if let Ok(s) = std::env::var("RBITCOIN_TX_HEAD_ACCESS") {
-        let t = s.trim().to_ascii_lowercase();
-        if t == "map" || t == "mmap" || t == "mapfull" {
-            rbitcoin_log::warn!(
-                "store: RBITCOIN_TX_HEAD_ACCESS={t} ignored — MapFull removed (phase 6); using FdOnly"
-            );
-        }
-    }
-    TableAccess::FdOnly
-}
 
 /// In-page slot index width (1024 slots / page @ any entry width).
 pub const PAGE_SLOT_BITS: u32 = 10;
@@ -600,16 +584,6 @@ impl AddressHead {
     ) -> Result<Self, StoreError> {
         // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
         // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
-        Self::create_with_table_access(path, layout, head_table_access_from_env())
-    }
-
-    /// Create with explicit table access (always FdOnly after phase 6).
-    pub fn create_with_table_access(
-        path: impl Into<PathBuf>,
-        layout: HeadLayout,
-        access: crate::file::TableAccess,
-    ) -> Result<Self, StoreError> {
-        let _ = access;
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -637,15 +611,6 @@ impl AddressHead {
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Self::open_with_table_access(path, head_table_access_from_env())
-    }
-
-    /// Open with explicit table access (always FdOnly after phase 6).
-    pub fn open_with_table_access(
-        path: impl Into<PathBuf>,
-        access: crate::file::TableAccess,
-    ) -> Result<Self, StoreError> {
-        let _ = access;
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -698,11 +663,6 @@ impl AddressHead {
 
     pub fn occupied(&self) -> u64 {
         self.occupied.load(Ordering::Relaxed)
-    }
-
-    /// Table transport for this head file (always FdOnly after phase 6).
-    pub fn table_access(&self) -> TableAccess {
-        self.file.access()
     }
 
     pub fn generation(&self) -> u64 {
@@ -1308,8 +1268,7 @@ mod tests {
     fn fd_only_insert_many_probe_and_reopen() {
         let path = tmp("fd_only_head");
         let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
-        let h = AddressHead::create_with_table_access(&path, layout, TableAccess::FdOnly).unwrap();
-        assert_eq!(h.table_access(), TableAccess::FdOnly);
+        let h = AddressHead::create_with_layout(&path, layout).unwrap();
         let mut batch = Vec::new();
         for i in 1..=500u64 {
             let mut txid = [0u8; 32];
@@ -1325,8 +1284,7 @@ mod tests {
             assert!(cands.contains(&Fk(i)), "fk={i} cands={cands:?}");
         }
         drop(h);
-        let h2 = AddressHead::open_with_table_access(&path, TableAccess::FdOnly).unwrap();
-        assert_eq!(h2.table_access(), TableAccess::FdOnly);
+        let h2 = AddressHead::open(&path).unwrap();
         assert_eq!(h2.occupied(), 500);
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&42u64.to_le_bytes());
@@ -1868,20 +1826,6 @@ mod tests {
 
     #[test]
     fn head_access_env_probe_stats_and_layout_helpers() {
-        let prev = std::env::var_os("RBITCOIN_TX_HEAD_ACCESS");
-        for val in ["map", "mmap", "mapfull", "fd", ""] {
-            if val.is_empty() {
-                std::env::remove_var("RBITCOIN_TX_HEAD_ACCESS");
-            } else {
-                std::env::set_var("RBITCOIN_TX_HEAD_ACCESS", val);
-            }
-            assert!(matches!(head_table_access_from_env(), TableAccess::FdOnly));
-        }
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_TX_HEAD_ACCESS", v),
-            None => std::env::remove_var("RBITCOIN_TX_HEAD_ACCESS"),
-        }
-
         let _ = sample_probe_depth_stats(); // reset
         let (w0, e0) = probe_depth_stats_snapshot();
         assert_eq!(w0, 0);

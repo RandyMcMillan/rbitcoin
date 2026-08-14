@@ -147,7 +147,7 @@ tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 **FdOnly** `txout.idx` + **`txid.body`** identity via **io_uring or pread**
 (deepest-cand-first).
 **Class A `txout` / `inwit` / `spent` + their `*.idx`, `tx.head`, header head,
-SH head/body, and spenders are FdOnly** ([`TableAccess::FdOnly`](docs/io-modality.md)).
+SH head/body, and spenders are fd pread/pwrite**.
 Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends

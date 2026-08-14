@@ -12,8 +12,6 @@
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 
 use crate::error::StoreError;
-#[cfg(test)]
-use crate::file::TableAccess;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
 use crate::scripthash_layout::{
@@ -297,13 +295,6 @@ impl ScriptHashHead {
         }
         self.set_occupied_known(0);
         Ok(())
-    }
-
-    /// Payload transport for this head file (unit tests).
-    #[cfg(test)]
-    #[inline]
-    fn table_access(&self) -> TableAccess {
-        self.file.access()
     }
 
     pub fn get(&self, full: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
@@ -1540,7 +1531,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
         let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
-        assert_eq!(h.table_access(), TableAccess::FdOnly);
         let mut key = [0u8; 32];
         key[0] = 7;
         let val = ShHeadValue::inline_one(ShEntry::new(Fk(42)));

@@ -52,19 +52,17 @@ mod var_table;
 
 pub use crate::compact::output_flags;
 pub use address_head::{
-    bits_for_scale, entry_bytes_for_bits, head_table_access_from_env, is_probe_exhausted_error,
-    layout_for_count, load_needs_roll, page_index, probe_depth_stats_snapshot, probe_index,
-    sample_probe_depth_stats, AddressHead, HeadLayout, HEAD_LOAD_CEILING, HEAD_LOAD_START,
-    HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS,
-    PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
+    bits_for_scale, entry_bytes_for_bits, is_probe_exhausted_error, layout_for_count,
+    load_needs_roll, page_index, probe_depth_stats_snapshot, probe_index, sample_probe_depth_stats,
+    AddressHead, HeadLayout, HEAD_LOAD_CEILING, HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS,
+    MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS, PROBE_DEPTH_WARN,
+    PROBE_REGION_BYTES, TINY_BITS,
 };
 pub use block_queue::{BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES};
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
-pub use file::{
-    ensure_nofile_budget, ensure_nofile_budget_at_least, TableAccess, NOFILE_SOFT_TARGET,
-};
+pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};

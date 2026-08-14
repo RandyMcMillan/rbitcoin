@@ -44,27 +44,6 @@ pub const FILE_HEADER_LEN: usize = 16;
 /// so probe pages stay OS-page-aligned.
 pub const TRAILING_FOOTER_LEN: usize = 32;
 
-/// Historical table-access token (phase 0–5 demap). **Always fd-only** after
-/// phase 6 — maps are gone. Kept so call sites / bench CLI compile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TableAccess {
-    /// Payload via pread/pwrite (only remaining mode).
-    FdOnly,
-}
-
-impl TableAccess {
-    /// Default access for any table kind — always [`Self::FdOnly`].
-    #[inline]
-    pub fn for_kind(_kind: TableKind, _trailing_header: bool) -> Self {
-        Self::FdOnly
-    }
-
-    #[inline]
-    pub fn is_fd_only(self) -> bool {
-        true
-    }
-}
-
 pub struct TableFile {
     path: PathBuf,
     /// Grow / fsync / fadvise only — not on the pread/pwrite hot path.
@@ -88,22 +67,7 @@ pub struct TableFile {
 }
 
 impl TableFile {
-    /// Payload access mode (always [`TableAccess::FdOnly`]).
-    #[inline]
-    pub fn access(&self) -> TableAccess {
-        TableAccess::FdOnly
-    }
-
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
-        Self::create_with_access(path, kind, TableAccess::FdOnly)
-    }
-
-    /// Create with explicit access (ignored — always fd-only; kept for API stability).
-    pub fn create_with_access(
-        path: impl Into<PathBuf>,
-        kind: TableKind,
-        _access: TableAccess,
-    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -306,14 +270,6 @@ impl TableFile {
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
-        Self::open_with_access(path, kind, TableAccess::FdOnly)
-    }
-
-    pub fn open_with_access(
-        path: impl Into<PathBuf>,
-        kind: TableKind,
-        _access: TableAccess,
-    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -787,41 +743,12 @@ mod advise_tests {
     }
 
     #[test]
-    fn table_access_always_fd_only() {
-        assert!(TableAccess::FdOnly.is_fd_only());
-        assert_eq!(
-            TableAccess::for_kind(TableKind::TxOut, false),
-            TableAccess::FdOnly
-        );
-        assert_eq!(
-            TableAccess::for_kind(TableKind::TxOut, true),
-            TableAccess::FdOnly
-        );
-        assert_eq!(
-            TableAccess::for_kind(TableKind::HashHead, true),
-            TableAccess::FdOnly
-        );
-        assert_eq!(
-            TableAccess::for_kind(TableKind::Confirmed, false),
-            TableAccess::FdOnly
-        );
+    fn table_file_create_open_roundtrip() {
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rbitcoin-access-{id}"));
-        let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
-        assert_eq!(f.access(), TableAccess::FdOnly);
-        let _ = std::fs::remove_file(&path);
-        let path2 = std::env::temp_dir().join(format!("rbitcoin-access-h-{id}"));
-        let _ = std::fs::remove_file(&path2);
-        let h = TableFile::create_trailing_header(&path2, TableKind::HashHead).unwrap();
-        assert_eq!(h.access(), TableAccess::FdOnly);
-        let _ = std::fs::remove_file(&path2);
         let path3 = std::env::temp_dir().join(format!("rbitcoin-access-idx-{id}"));
         let _ = std::fs::remove_file(&path3);
-        let idx = TableFile::create_with_access(&path3, TableKind::ArrayLink, TableAccess::FdOnly)
-            .unwrap();
-        assert_eq!(idx.access(), TableAccess::FdOnly);
+        let idx = TableFile::create(&path3, TableKind::ArrayLink).unwrap();
         let payload = 42u32.to_le_bytes();
         let off = FILE_HEADER_LEN as u64;
         idx.write_at_pwrite(off, &payload).unwrap();
@@ -829,8 +756,7 @@ mod advise_tests {
         idx.read_at(off, &mut got).unwrap();
         assert_eq!(got, payload);
         drop(idx);
-        let idx2 =
-            TableFile::open_with_access(&path3, TableKind::ArrayLink, TableAccess::FdOnly).unwrap();
+        let idx2 = TableFile::open(&path3, TableKind::ArrayLink).unwrap();
         let mut got2 = [0u8; 4];
         idx2.read_at(off, &mut got2).unwrap();
         assert_eq!(got2, payload);

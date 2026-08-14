@@ -58,14 +58,6 @@ static LOOKUP_SEALED_PROBE: AtomicU64 = AtomicU64::new(0);
 static ROLLS: AtomicU64 = AtomicU64::new(0);
 static SEALS: AtomicU64 = AtomicU64::new(0);
 
-// Test-only soft-span override (bytes). Thread-local: a sibling test that
-// `test_set_soft_span_bytes(0)` must not reset this thread's roll window.
-// Non-zero wins over env.
-#[cfg(test)]
-thread_local! {
-    static TEST_SOFT_SPAN_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 pub fn sample_lookup_stats() -> HeadLookupStats {
     HeadLookupStats {
         open_probes: LOOKUP_OPEN.swap(0, Ordering::Relaxed),
@@ -386,7 +378,7 @@ impl SegmentedTxHead {
     pub fn soft_span_bytes() -> u64 {
         #[cfg(test)]
         {
-            let o = TEST_SOFT_SPAN_OVERRIDE.with(std::cell::Cell::get);
+            let o = crate::tx_idx::test_soft_span_override();
             if o > 0 {
                 return o;
             }
@@ -402,24 +394,17 @@ impl SegmentedTxHead {
     }
 
     /// Test-only soft-span override (`0` = use env/default). Thread-local.
+    /// Same cell as `tx.idx` so head and idx tests cannot steal each other.
     /// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
     #[cfg(test)]
     pub fn test_set_soft_span_bytes(bytes: u64) {
-        TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(bytes));
+        crate::tx_idx::test_set_soft_span_bytes(bytes);
     }
 
     /// Hold this thread's soft-span override for `f`, then restore.
     #[cfg(test)]
     pub fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
-        let prev = TEST_SOFT_SPAN_OVERRIDE.with(|c| c.replace(bytes));
-        struct Restore(u64);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(self.0));
-            }
-        }
-        let _restore = Restore(prev);
-        f()
+        crate::tx_idx::test_with_soft_span_bytes(bytes, f)
     }
 
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
@@ -1124,17 +1109,33 @@ mod tests {
     fn soft_span_override_is_thread_local() {
         SegmentedTxHead::test_with_soft_span_bytes(48, || {
             assert_eq!(SegmentedTxHead::soft_span_bytes(), 48);
-            let other = std::thread::spawn(SegmentedTxHead::soft_span_bytes)
-                .join()
-                .expect("join");
+            assert_eq!(
+                crate::tx_idx::test_soft_span(),
+                48,
+                "idx must share this thread's head override"
+            );
+            let other = std::thread::spawn(|| {
+                (
+                    SegmentedTxHead::soft_span_bytes(),
+                    crate::tx_idx::test_soft_span(),
+                )
+            })
+            .join()
+            .expect("join");
             assert_eq!(
                 SegmentedTxHead::soft_span_bytes(),
                 48,
                 "holding thread keeps its override"
             );
             assert_ne!(
-                other, 48,
-                "sibling thread must not inherit this test's override (got {other})"
+                other.0, 48,
+                "sibling thread must not inherit this test's override (got {})",
+                other.0
+            );
+            assert_ne!(
+                other.1, 48,
+                "sibling idx must not inherit this test's override (got {})",
+                other.1
             );
         });
     }

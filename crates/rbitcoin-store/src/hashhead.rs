@@ -104,12 +104,37 @@ fn running_as_cargo_test_binary() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HEAD_SCALE: std::cell::Cell<Option<HeadScale>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl HeadScale {
+    /// Hold this thread's scale for `f` (does not mutate process env).
+    #[cfg(test)]
+    pub fn test_with<R>(scale: HeadScale, f: impl FnOnce() -> R) -> R {
+        let prev = TEST_HEAD_SCALE.with(|c| c.replace(Some(scale)));
+        struct Restore(Option<HeadScale>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_HEAD_SCALE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+        f()
+    }
+
     /// Resolve from `RBITCOIN_HEAD_SCALE` (`tiny`/`test`/`mainnet`/`full`).
     ///
     /// Default: [`HeadScale::Mainnet`] for normal binaries; [`HeadScale::Tiny`]
     /// when this crate is under `cfg(test)` or the process is a cargo test binary.
+    /// Tests may pin a value with [`Self::test_with`] (thread-local).
     pub fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(s) = TEST_HEAD_SCALE.with(std::cell::Cell::get) {
+            return s;
+        }
         match std::env::var("RBITCOIN_HEAD_SCALE")
             .map(|s| s.to_ascii_lowercase())
             .ok()
@@ -1243,6 +1268,18 @@ mod tests {
     #[test]
     fn head_scale_prefix_and_pack_helpers() {
         // Under unit tests default scale is Tiny.
+        assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(HeadScale::from_env(), HeadScale::Mainnet);
+            let other = std::thread::spawn(HeadScale::from_env)
+                .join()
+                .expect("join");
+            assert_eq!(
+                other,
+                HeadScale::Tiny,
+                "sibling thread must keep cargo-test Tiny default"
+            );
+        });
         assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
         assert_eq!(
             HeadScale::Tiny.initial_slots(HeadRole::Header),

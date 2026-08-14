@@ -9,6 +9,11 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tests:** head and `tx.idx` share one thread-local soft-span override.
+  `HeadScale::test_with` pins tiny/mainnet without process-global `set_var`.
+
 ### Removed
 
 - **Dead DONTCACHE / IO aliases:** head/idx probe no longer threads an always-false

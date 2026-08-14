@@ -209,7 +209,7 @@ impl TxIdx {
     fn soft_span() -> u64 {
         #[cfg(test)]
         {
-            let o = TEST_SOFT_SPAN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+            let o = test_soft_span_override();
             if o >= IDX_STRIDE {
                 return o.min(HARD_SPAN);
             }
@@ -1295,24 +1295,50 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
     Ok(out)
 }
 
-/// Process-local soft-span override (bytes). Used when env is unset so parallel
-/// `remove_var` races cannot clear a concurrent multi-segment test.
+// Thread-local soft-span override (bytes). Shared with SegmentedTxHead.
+// Non-zero wins over env so parallel tests cannot steal each other's window.
 #[cfg(test)]
-static TEST_SOFT_SPAN_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static TEST_SOFT_SPAN_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Serialize tests that mutate `RBITCOIN_TX_IDX_SOFT_SPAN` (process-global).
-/// Shared with `var_table` multi-segment tests.
 #[cfg(test)]
 pub(crate) fn tests_soft_span_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static SOFT_SPAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SOFT_SPAN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Test-only soft-span override (`0` = use env/default). Hold
-/// [`tests_soft_span_env_lock`] while non-zero to avoid races.
+#[cfg(test)]
+pub(crate) fn test_soft_span_override() -> u64 {
+    TEST_SOFT_SPAN_OVERRIDE.with(std::cell::Cell::get)
+}
+
+/// Test-only soft-span override (`0` = use env/default). Thread-local.
+/// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
 #[cfg(test)]
 pub(crate) fn test_set_soft_span_bytes(bytes: u64) {
-    TEST_SOFT_SPAN_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(bytes));
+}
+
+/// Hold this thread's soft-span override for `f`, then restore.
+#[cfg(test)]
+pub(crate) fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+    let prev = TEST_SOFT_SPAN_OVERRIDE.with(|c| c.replace(bytes));
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Effective idx soft-span (override / env / default, stride + hard cap).
+#[cfg(test)]
+pub(crate) fn test_soft_span() -> u64 {
+    TxIdx::soft_span()
 }
 
 #[cfg(test)]
@@ -1396,32 +1422,29 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _env = tests_soft_span_env_lock();
-        // Tiny soft span → many segments (override wins over parallel env races).
-        test_set_soft_span_bytes(64);
-        let idx = TxIdx::create(&dir, "tx").unwrap();
-        // Three batches that force rolls (span > 64).
-        let s1 = [16u64, 24, 32, 40];
-        idx.append_starts(0, &s1).unwrap();
-        assert_eq!(idx.slot_count(), 4);
-        let s2 = [16 + 128, 16 + 128 + 16]; // far → new segment
-        idx.append_starts(4, &s2).unwrap();
-        assert!(idx.segment_count() >= 2);
-        assert_eq!(idx.record_start(1).unwrap(), 16);
-        assert_eq!(idx.record_start(5).unwrap(), 16 + 128);
-        let (off, len) = idx.record_range_interior(4).unwrap();
-        assert_eq!(off, 40);
-        assert_eq!(len, (16 + 128) - 40);
-        // Reopen.
-        drop(idx);
-        let idx = TxIdx::open(&dir, "tx").unwrap();
-        assert_eq!(idx.slot_count(), 6);
-        assert_eq!(idx.record_start(6).unwrap(), 16 + 128 + 16);
-        let ranges = idx.record_ranges(1, 6, 6, 16 + 128 + 16 + 8).unwrap();
-        assert_eq!(ranges.len(), 6);
-        assert_eq!(ranges[0].0, 16);
-        test_set_soft_span_bytes(0);
-        drop(_env);
+        test_with_soft_span_bytes(64, || {
+            let idx = TxIdx::create(&dir, "tx").unwrap();
+            // Three batches that force rolls (span > 64).
+            let s1 = [16u64, 24, 32, 40];
+            idx.append_starts(0, &s1).unwrap();
+            assert_eq!(idx.slot_count(), 4);
+            let s2 = [16 + 128, 16 + 128 + 16]; // far → new segment
+            idx.append_starts(4, &s2).unwrap();
+            assert!(idx.segment_count() >= 2);
+            assert_eq!(idx.record_start(1).unwrap(), 16);
+            assert_eq!(idx.record_start(5).unwrap(), 16 + 128);
+            let (off, len) = idx.record_range_interior(4).unwrap();
+            assert_eq!(off, 40);
+            assert_eq!(len, (16 + 128) - 40);
+            // Reopen.
+            drop(idx);
+            let idx = TxIdx::open(&dir, "tx").unwrap();
+            assert_eq!(idx.slot_count(), 6);
+            assert_eq!(idx.record_start(6).unwrap(), 16 + 128 + 16);
+            let ranges = idx.record_ranges(1, 6, 6, 16 + 128 + 16 + 8).unwrap();
+            assert_eq!(ranges.len(), 6);
+            assert_eq!(ranges[0].0, 16);
+        });
         // New layout lives under tx.idx/
         assert!(dir.join("tx.idx").join("meta").is_file());
         assert!(!dir.join("tx.idx.meta").exists());

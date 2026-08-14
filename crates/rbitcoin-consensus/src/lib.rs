@@ -587,10 +587,10 @@ pub mod confirm_phase_stats {
 pub use confirm_run::{
     confirm_bq_resolve_wave, confirm_scripts_feed_ahead, confirm_scripts_phase,
     confirm_scripts_phase_async, confirm_wire_load_from_plan, confirm_wire_load_phase,
-    confirm_wire_load_phase_pipelined, confirm_wire_lookup_and_ensure_denserels,
-    confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits, confirm_wire_run,
-    confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
-    join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
+    confirm_wire_load_phase_pipelined, confirm_wire_lookup_stamp,
+    confirm_wire_lookup_stamp_with_hits, confirm_wire_run, confirm_wire_run_preverified,
+    confirm_write_phase, ensure_external_parent_denserels_from_plan, join_scripts_polling,
+    lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
     scripts_stage_from_load_channel, BqResolveWaveStats, ConfirmLoadOutcome, ConfirmScriptOutcome,
     DenserelsWarmStats, LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified,
     ScriptsBatchMeta, ScriptsPhaseHandle, WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS,
@@ -770,32 +770,6 @@ pub fn prepare_block_for_archive_with_txids(
         return Err(ConsensusError::BadBlock("txid count mismatch"));
     }
     block_to_apply_with_txids(query, &block.header, &block.txdata, txids)
-}
-
-/// IBD multi-prep: structure + PoW + TxApply with no store access.
-pub fn prepare_block_for_archive_ibd(
-    params: &ChainParams,
-    block: &Block,
-) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
-    // Soft-fork height gates at confirm (true height). See ValidationContext::archive_structure.
-    let ctx = ValidationContext::archive_structure(params);
-    let txids = validate_block_structure_hashed(block, &ctx)?;
-    let target = Target::from_compact(block.header.bits);
-    if target > params.pow_limit {
-        return Err(ConsensusError::BadHeader("target above pow limit"));
-    }
-    block
-        .header
-        .validate_pow(target)
-        .map_err(|_| ConsensusError::InvalidPow)?;
-    // prev_fk left NULL — writer attaches by known header_fk.
-    use convert::block_to_apply_with_txids_prev;
-    block_to_apply_with_txids_prev(
-        rbitcoin_primitives::Fk::NULL,
-        &block.header,
-        &block.txdata,
-        &txids,
-    )
 }
 
 #[cfg(test)]
@@ -1039,16 +1013,9 @@ mod coverage_tests {
         // prepare helpers stay (CPU-side); confirm is sole Class A.
         let (_hr, _txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
         let (_hr2, _txs2) = prepare_block_for_archive_new(&q, &params, &b1).unwrap();
-        let (_hr3, _txs3) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
         accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
         // already-have prepare after connect
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-
-        // Bad pow limit on prepare_ibd
-        let mut bad = b1.clone();
-        bad.header.bits = CompactTarget::from_consensus(0x1d00_ffff); // mainnet-ish, above regtest limit often
-                                                                      // May fail pow or pow limit depending on params — either is fine.
-        let _ = prepare_block_for_archive_ibd(&params, &bad);
 
         let _ = std::fs::remove_dir_all(&path);
     }

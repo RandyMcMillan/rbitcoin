@@ -1237,11 +1237,6 @@ impl Query {
         Ok(None)
     }
 
-    /// Durable head probe with **body txid only** (no full packed decode).
-    pub fn tx_fk_by_txid_store(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        Ok(self.store.get_fk_by_txid(txid)?)
-    }
-
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -1270,18 +1265,6 @@ impl Query {
 
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {
         &self.confirm_parents
-    }
-
-    /// No-op compatibility: SH dedupe is a height watermark (`sh_indexed_through`),
-    /// not a HashSet warm from durable body.
-    pub fn warm_scripthash_create_index(&self) -> Result<(), QueryError> {
-        // Align watermark with tip if durable SH exists (tip mode resume).
-        if let Some(tip) = self.tip_height() {
-            if self.sh_indexed_through_height().is_none() {
-                self.set_sh_indexed_through_height(Some(tip.0));
-            }
-        }
-        Ok(())
     }
 
     /// Enable/disable durable spend-annotation writes on archive **and** confirm
@@ -2370,7 +2353,6 @@ mod tests {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.
         assert!(q.index_mode().is_tip());
-        assert!(q.index_mode().uses_durable_spends());
 
         let mut prev = Fk::NULL;
         let mut parent_hash: Option<[u8; 32]> = None;
@@ -2420,7 +2402,6 @@ mod tests {
         assert_eq!(fks.len(), 1);
         let tx = q.get_tx(fks[0]).unwrap();
         assert!(q.tx_fk_by_txid(&tx.txid).unwrap().is_some());
-        assert!(q.tx_fk_by_txid_store(&tx.txid).unwrap().is_some());
         let inp = q.tx_input_at_fk(fks[0], &tx, 0).unwrap();
         assert!(inp.is_coinbase());
         let out = q.tx_output_at_fk(fks[0], &tx, 0).unwrap();
@@ -2457,7 +2438,6 @@ mod tests {
         let _ = std::fs::write(q.store().path().join("ibd_utxo.map"), b"x");
         let _ = std::fs::create_dir_all(q.store().path().join("point.runs"));
         q.enter_direct_index_mode().unwrap();
-        q.warm_scripthash_create_index().unwrap();
         let _ = q.finalize_sh_runs();
         let _ = q.scripthash_run_count();
         q.enter_tip_index_mode();
@@ -2552,8 +2532,6 @@ mod tests {
         assert!(IndexMode::Direct.is_direct());
         assert!(!IndexMode::Direct.is_tip());
         assert!(IndexMode::Tip.is_tip());
-        assert!(IndexMode::Direct.uses_durable_spends());
-        assert!(IndexMode::Tip.uses_durable_spends());
 
         let mut b = BatchFullBodies::with_capacity(2);
         assert!(b.is_empty());
@@ -2977,7 +2955,6 @@ mod tests {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        assert!(q.tx_input_run(&empty_tx).unwrap().is_empty());
         assert!(q.tx_input_run_class_a(Fk(1), &empty_tx).unwrap().is_empty());
 
         // ArchiveWritePlan empty helper.

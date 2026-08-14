@@ -129,7 +129,7 @@ pub use tx_table::{
     scan_inwit_prevouts, scan_packed_meta_and_prevouts, spend_meta_backend, spent_abs, InputRecord,
     OutputRecord, SpendMetaBackend, TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
-pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_DONTCACHE_FROM_TAIL, TXID_ENTRY_LEN};
+pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_ENTRY_LEN};
 pub use uring_session::RWF_DONTCACHE;
 
 /// Crate identity for diagnostics and coverage scenarios.

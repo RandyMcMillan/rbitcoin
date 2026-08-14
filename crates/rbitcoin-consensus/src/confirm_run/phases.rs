@@ -345,7 +345,7 @@ pub(super) fn post_commit(
     // batch durable spend annotations after Class C. Load pin must supply
     // denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
-    if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
+    if query.spend_index_enabled() {
         let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk)> =
             Vec::new();
         let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::new();

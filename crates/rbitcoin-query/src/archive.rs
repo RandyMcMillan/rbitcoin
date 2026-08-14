@@ -875,18 +875,6 @@ impl Query {
         }
         Ok(self.store.txs.body_txid(inp.create_fk)?)
     }
-
-    pub fn set_archive_mode(&self, enabled: bool) -> Result<(), QueryError> {
-        self.store.set_archive_mode(enabled)
-    }
-
-    pub fn finalize_through(&self, height: u32) -> Result<(), QueryError> {
-        self.store.finalize_through(height)
-    }
-
-    pub fn archive_epoch(&self) -> rbitcoin_store::ArchiveEpoch {
-        self.store.epoch()
-    }
 }
 
 #[cfg(test)]

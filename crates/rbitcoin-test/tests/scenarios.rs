@@ -1350,10 +1350,9 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     q.flush().unwrap();
     drop(q);
 
-    // Reopen — reconstruct without RAM cache + warm SH create index (no dups).
+    // Reopen — reconstruct without RAM cache; durable SH must not duplicate.
     let q = Query::open_or_create(td.store_path()).unwrap();
     assert_eq!(q.tip_height(), Some(Height(tip_h - 1)));
-    q.warm_scripthash_create_index().unwrap();
     let mut indexed = std::collections::HashSet::new();
     q.store()
         .scripthash
@@ -1436,37 +1435,6 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     let tip_rec = q.get_header(tip_fk).unwrap();
     let again = q.ensure_header(&tip_rec).unwrap();
     assert_eq!(again, tip_fk);
-}
-
-// ─── Archive epoch finalize (no tip wire ring) ───────────────────────────────
-
-#[test]
-fn archive_epoch_finalize() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-    for h in 1..=5u32 {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
-
-    q.set_archive_mode(true).unwrap();
-    q.finalize_through(4).unwrap();
-    let ep = q.archive_epoch();
-    assert!(ep.archive_mode);
-    assert_eq!(ep.finalized_height, Some(4));
-    assert!(ep.is_soft_zone(5));
-    assert!(!ep.is_soft_zone(4));
-
-    let q2 = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q2.archive_epoch().finalized_height, Some(4));
 }
 
 #[test]

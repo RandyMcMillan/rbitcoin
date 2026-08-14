@@ -31,10 +31,6 @@ impl IndexMode {
     pub fn is_tip(self) -> bool {
         matches!(self, Self::Tip)
     }
-    /// Spentness uses durable confirmed-strong annotations.
-    pub fn uses_durable_spends(self) -> bool {
-        matches!(self, Self::Direct | Self::Tip)
-    }
     fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Direct,

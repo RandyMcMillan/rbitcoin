@@ -404,19 +404,6 @@ impl Query {
         Ok(())
     }
 
-    /// Load all inputs for a Class A tx.
-    ///
-    /// Packed rows (`input_start_fk` null): one `get_tx_full` by txid→fk (needs
-    /// head/runs). Prefer [`Self::tx_input_run_class_a`] when the create fk is known
-    /// (catch-up with `tx.head` off).
-    pub fn tx_input_run(&self, tx: &TxRecord) -> Result<Vec<InputRecord>, QueryError> {
-        if tx.input_count == 0 {
-            return Ok(Vec::new());
-        }
-        let fk = self.lookup_tx_fk(&tx.txid)?.ok_or(StoreError::NotFound)?;
-        self.tx_input_run_class_a(fk, tx)
-    }
-
     /// Input run keyed by known create fk (packed body works without `tx.head`).
     pub fn tx_input_run_class_a(
         &self,

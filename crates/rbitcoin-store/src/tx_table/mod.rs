@@ -778,33 +778,6 @@ impl TxTable {
         Ok((out, body_ns, decode_ns))
     }
 
-    /// Shape A archive path: Prefix33 select + **one** denserels body per winner.
-    ///
-    /// - **Miss cands:** Prefix33 only (cheap identity rejects).
-    /// - **Multi-cand winners:** Prefix33 until match, then one OutsDenserels.
-    /// - **Single-cand keys:** denserels-only (identity + outs in one full pread).
-    ///
-    /// Never full-body-probes wrong cands (Shape B). Returns
-    /// `(txid, Option<(fk, Option<(tx, outs, denserels)>)>)` in input order —
-    /// fk may resolve even when denserels decode fails (stamp still works).
-    /// Second value is denserels-wave wall ns (archive `head_dens` timer).
-    pub fn get_fk_and_outs_by_txid_batch(
-        &self,
-        txids: &[[u8; 32]],
-    ) -> Result<
-        (
-            Vec<(
-                [u8; 32],
-                Option<(Fk, Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>)>,
-            )>,
-            u64, /* dens_ns */
-        ),
-        StoreError,
-    > {
-        // Fused machine: batch probe → idx → Prefix33 → denserels (uring when available).
-        crate::head_resolve_denserels::resolve_fk_and_denserels_batch(self, txids)
-    }
-
     /// Bulk `body_range` for many fks (confirm load / reconstruct).
     ///
     /// **Sorted** walk of `tx.idx` via [`VarTable::record_range_batch`] (FdOnly

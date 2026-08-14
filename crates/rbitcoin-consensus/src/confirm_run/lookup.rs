@@ -563,34 +563,6 @@ pub fn confirm_wire_load_from_plan(
     })
 }
 
-/// Plan + ensure denserels into plan-local external_parent_outs (no pin). Unit tests.
-pub fn confirm_wire_lookup_and_ensure_denserels(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, Arc<Block>)],
-    pipeline: Option<&WireLoadPipeline>,
-) -> Result<
-    (
-        Option<rbitcoin_query::ArchiveWritePlan>,
-        DenserelsWarmStats,
-        u64,
-    ),
-    ConsensusError,
-> {
-    let t0 = Instant::now();
-    let (mut plan, _metas, _wire, plan_ns) =
-        wire_lookup_phase(query, params, milestone, blocks, pipeline, None)?;
-    lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-    lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
-
-    let ifo = pipeline.map(|p| &p.in_flight);
-    let warm = ensure_external_parent_denserels_from_plan(query, plan.as_mut(), ifo)?;
-    let work_ns = t0.elapsed().as_nanos() as u64;
-    lookup_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
-    Ok((plan, warm, work_ns))
-}
-
 /// Structure + prepare + plan_batch only (stamp create_fk). Shared by lookup stage.
 pub(super) fn wire_lookup_phase(
     query: &Query,

@@ -24,8 +24,6 @@ pub const TXID_ENTRY_LEN: u64 = 32;
 pub const TXID_OS_PAGE: u64 = 4096;
 /// Entries per OS page (`TXID_OS_PAGE / TXID_ENTRY_LEN` = 128).
 pub const TXID_ENTRIES_PER_PAGE: u64 = TXID_OS_PAGE / TXID_ENTRY_LEN;
-/// Sidefile reads more than this many entries from the **tail** use DONTCACHE.
-pub const TXID_DONTCACHE_FROM_TAIL: u64 = 100_000_000;
 
 /// Dense create_fk → txid table.
 pub struct TxidBody {
@@ -106,12 +104,6 @@ impl TxidBody {
         Ok(Self::entry_offset(fk)? / TXID_OS_PAGE)
     }
 
-    /// Sidefile peeks never request RWF_DONTCACHE (permanent spend-only policy).
-    #[inline]
-    pub fn dontcache_for_fk(&self, _fk: u64) -> bool {
-        false
-    }
-
     pub fn body_read_fd(&self) -> std::os::fd::RawFd {
         self.file.read_fd()
     }
@@ -156,12 +148,7 @@ impl TxidBody {
         }
         let off = Self::entry_offset(id)?;
         let mut buf = [0u8; 32];
-        let rc = crate::bulk_io::pread_single(
-            self.file.read_fd(),
-            off,
-            &mut buf,
-            self.dontcache_for_fk(id),
-        );
+        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut buf, false);
         if rc < 0 {
             return Err(StoreError::io(
                 self.file.path(),
@@ -373,11 +360,6 @@ impl TxidBody {
         }
         Ok(out)
     }
-
-    /// Last DONTCACHE plan for a sidefile read of `fk` (tests / diagnostics).
-    pub fn read_op_dontcache(&self, fk: u64) -> bool {
-        self.dontcache_for_fk(fk)
-    }
 }
 
 #[cfg(test)]
@@ -413,20 +395,6 @@ mod tests {
         let t2 = TxidBody::open(&dir).unwrap();
         assert_eq!(t2.count(), 2);
         assert_eq!(t2.get(Fk(2)).unwrap(), b);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dontcache_for_fk_always_false() {
-        let dir = tmp();
-        let t = TxidBody::create(&dir).unwrap();
-        assert!(!t.dontcache_for_fk(1));
-        t.count.store(
-            TXID_DONTCACHE_FROM_TAIL + 10,
-            std::sync::atomic::Ordering::Release,
-        );
-        assert!(!t.dontcache_for_fk(1));
-        assert!(!t.dontcache_for_fk(TXID_DONTCACHE_FROM_TAIL + 5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -477,7 +445,6 @@ mod tests {
         ));
         // Empty append is fine.
         t.append_batch(2, &[]).unwrap();
-        assert!(!t.read_op_dontcache(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

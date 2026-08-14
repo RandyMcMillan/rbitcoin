@@ -58,10 +58,13 @@ static LOOKUP_SEALED_PROBE: AtomicU64 = AtomicU64::new(0);
 static ROLLS: AtomicU64 = AtomicU64::new(0);
 static SEALS: AtomicU64 = AtomicU64::new(0);
 
-/// Test-only soft-span override (bytes). Non-zero wins over env so parallel
-/// `RBITCOIN_TX_IDX_SOFT_SPAN` mutators in other modules cannot desync this path.
+// Test-only soft-span override (bytes). Thread-local: a sibling test that
+// `test_set_soft_span_bytes(0)` must not reset this thread's roll window.
+// Non-zero wins over env.
 #[cfg(test)]
-static TEST_SOFT_SPAN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static TEST_SOFT_SPAN_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 pub fn sample_lookup_stats() -> HeadLookupStats {
     HeadLookupStats {
@@ -378,14 +381,12 @@ impl SegmentedTxHead {
     /// Body soft-span roll threshold (bytes). Same default as `tx.idx`.
     ///
     /// Production: env `RBITCOIN_TX_IDX_SOFT_SPAN` (min 8). Under test,
-    /// [`test_set_soft_span_bytes`] overrides env when non-zero so parallel
-    /// modules that also poke the env cannot race this path.
+    /// [`test_with_soft_span_bytes`] overrides env when non-zero (thread-local
+    /// so parallel store tests cannot steal each other's roll window).
     pub fn soft_span_bytes() -> u64 {
-        // Process-local override wins in tests so parallel env mutators cannot
-        // desync this path. Env is next; then the production default.
         #[cfg(test)]
         {
-            let o = TEST_SOFT_SPAN_OVERRIDE.load(Ordering::Relaxed);
+            let o = TEST_SOFT_SPAN_OVERRIDE.with(std::cell::Cell::get);
             if o > 0 {
                 return o;
             }
@@ -400,23 +401,21 @@ impl SegmentedTxHead {
         DEFAULT_SOFT_SPAN
     }
 
-    /// Test-only soft-span override (`0` = use env/default). Process-local;
-    /// preferred over env for concurrent store unit tests.
+    /// Test-only soft-span override (`0` = use env/default). Thread-local.
+    /// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
     #[cfg(test)]
     pub fn test_set_soft_span_bytes(bytes: u64) {
-        TEST_SOFT_SPAN_OVERRIDE.store(bytes, Ordering::Relaxed);
+        TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(bytes));
     }
 
-    /// Hold the process-local soft-span override for `f`, then restore.
+    /// Hold this thread's soft-span override for `f`, then restore.
     #[cfg(test)]
     pub fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = TEST_SOFT_SPAN_OVERRIDE.swap(bytes, Ordering::Relaxed);
+        let prev = TEST_SOFT_SPAN_OVERRIDE.with(|c| c.replace(bytes));
         struct Restore(u64);
         impl Drop for Restore {
             fn drop(&mut self) {
-                TEST_SOFT_SPAN_OVERRIDE.store(self.0, Ordering::Relaxed);
+                TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(self.0));
             }
         }
         let _restore = Restore(prev);
@@ -1124,6 +1123,28 @@ mod tests {
         m[0..8].copy_from_slice(&i.to_le_bytes());
         m[8] = 0xA5;
         m
+    }
+
+    /// Sibling tests used to `test_set_soft_span_bytes(0)` on a process-global
+    /// Atomic and steal the 48-byte roll window from
+    /// `tip_then_any_connected_in_cold_beats_unconnected_hot` (stuck at age=2).
+    #[test]
+    fn soft_span_override_is_thread_local() {
+        SegmentedTxHead::test_with_soft_span_bytes(48, || {
+            assert_eq!(SegmentedTxHead::soft_span_bytes(), 48);
+            let other = std::thread::spawn(SegmentedTxHead::soft_span_bytes)
+                .join()
+                .expect("join");
+            assert_eq!(
+                SegmentedTxHead::soft_span_bytes(),
+                48,
+                "holding thread keeps its override"
+            );
+            assert_ne!(
+                other, 48,
+                "sibling thread must not inherit this test's override (got {other})"
+            );
+        });
     }
 
     #[test]

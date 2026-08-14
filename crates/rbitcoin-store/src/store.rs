@@ -2114,6 +2114,11 @@ mod tests {
             let mut n = 10u64;
             let mut guard = 0u32;
             loop {
+                assert_eq!(
+                    SegmentedTxHead::soft_span_bytes(),
+                    48,
+                    "this thread's 48-byte roll window must not be stolen"
+                );
                 let first = s.txs.head.first_fks_snapshot();
                 let age = sealed_age_for_fk(&first, old.0).unwrap_or(0);
                 if age > HEAD_PROBE_HOT_MAX_AGE && s.txs.head.sealed_segment_count() >= 4 {
@@ -2127,8 +2132,9 @@ mod tests {
                 guard += 1;
                 assert!(
                     guard < 80,
-                    "could not roll oldest create into cold age (age={age} segs={})",
-                    s.txs.head.segment_count()
+                    "could not roll oldest create into cold age (age={age} segs={} span={})",
+                    s.txs.head.segment_count(),
+                    SegmentedTxHead::soft_span_bytes()
                 );
             }
             let new = put_one(&s, txid, 2);

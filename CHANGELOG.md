@@ -19,7 +19,9 @@ before 1.0).
 - **Tests:** scripts-phase steal-worker pin records the coordinator thread on
   the handle (not a process-global name). Archive plan/commit wall stats sample
   under an exclusive lock so parallel `sample_and_reset` cannot steal the
-  window.
+  window. Head soft-span override is thread-local so a sibling
+  `test_set_soft_span_bytes(0)` cannot reset another test's 48-byte roll
+  window (`tip_then_any_connected_in_cold_beats_unconnected_hot`).
 
 ### Changed
 

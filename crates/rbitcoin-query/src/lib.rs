@@ -1524,12 +1524,14 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
+        let mut head = self.store.txs.head_resize_size_snapshot();
+        head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),
-            head: self.store.txs.head_resize_size_snapshot(),
+            head,
             inflight_layers: mem.inflight_layers,
             inflight_pins: mem.inflight_pins,
             inflight_bytes: mem.inflight_bytes,

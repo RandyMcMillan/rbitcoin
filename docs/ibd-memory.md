@@ -70,6 +70,8 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 | `conf … parents=` | Sum of `BatchParents` entries in scriptq + writeq (pipeline meter only; no writeq parent budget) |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
+| `fuse8=` ≈ 9 bits × sealed Class A | In-RAM sealed membership filters — intentional; not a leak |
+| `class_c_l2=` ≈ creates/8 | Strong-tx bit image under the Class C in-RAM cap |
 
 Host check / in-process:
 
@@ -85,7 +87,29 @@ known retain structures:
 | `conf loadq` / `scriptq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= sh_mt= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + SH memtable + confirm wire; residual = anon − accounted |
+| `heap … iflight= pstore= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+
+## Residual heap audit (872k / ~1.42 B creates)
+
+`ibd: sizes` at `class_a≈1.416B` (mainnet.log, 2026-08-13) showed
+`anon≈2.2 GiB` vs `accounted≈13 MiB` (`residual≈2.2 GiB`). That gap was a
+**meter hole**, not an unbounded leak. The missing retain is almost all
+intentional:
+
+| Retain | Approx at 1.42 B creates | Notes |
+|--------|-------------------------:|-------|
+| **Sealed `tx.head` fuse8** | **~1.5–1.6 GiB** | `open_file` loads every sealed `.fuse8` fingerprint array into process RAM (~9 bits/key). `file=` stays ~6 MiB because heads are FdOnly. |
+| **Class C L2 `strong_tx`** | **~177 MiB** | 1 bit/create, under the 256 MiB in-RAM cap. |
+| **Open-segment `open_keys`** | **~100–200 MiB** | `Vec<u64>` fuse keys for the unsealed tail. |
+| **`height_by_hash`** | **~60 MiB** | Query comment; still unmetered. |
+| **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |
+
+Meters `fuse8=` / `open_keys=` / `class_c_l2=` now enter `accounted`. After a
+host restart on this build, residual should drop to a few hundred MiB
+(baseline + `height_by_hash` + allocator slack). **Do not add a 64–128 MiB
+process txid→fk map until that post-meter residual is confirmed on the host.**
+The fuse RAM is the real heap cost of segmented heads; a second map is only
+justified if `head_fk` is still the pole after Steps 1–8.
 
 Grep:
 

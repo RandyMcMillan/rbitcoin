@@ -7,6 +7,7 @@ without re-deriving client compatibility from scratch.
 | Note | Status |
 |------|--------|
 | [Class A storage pack](./class-a-storage-pack.md) | Parked. Spent 8 B / thin `txout` meta / script templates (incl. P2A) / inwit Δfk. **Not** `tx_height` (RAM fence shipped). |
+| [Confirm resolve + stamp phase](./confirm-resolve-stamp-phase.md) | Parked. Split lookup so BQ-ready heights head-resolve before stamp claim. |
 
 BIP-352 Electrum tweaks shipped (`--sptweaks`, `OPERATOR.md`, `COMPAT.md`).
 

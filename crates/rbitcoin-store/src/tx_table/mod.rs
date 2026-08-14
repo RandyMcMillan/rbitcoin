@@ -230,7 +230,9 @@ impl OutputRecord {
 }
 
 mod packed;
+mod pending_head;
 pub use packed::*;
+pub(crate) use pending_head::PENDING_HEAD_CAP;
 
 pub struct TxTable {
     /// `txout.body` — meta + outputs (hot).
@@ -245,6 +247,8 @@ pub struct TxTable {
     pub(crate) txids: crate::txid_body::TxidBody,
     /// Datadir secret: keyed head probes + script XOR (schema 12+).
     pub(crate) secret: crate::store_secret::StoreSecret,
+    /// Unflushed head inserts (write-behind). Readers see published snapshot.
+    pending_head: pending_head::PendingHeadInserts,
 }
 
 /// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
@@ -283,6 +287,7 @@ impl TxTable {
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
             secret,
+            pending_head: pending_head::PendingHeadInserts::new(),
         })
     }
 
@@ -394,6 +399,7 @@ impl TxTable {
             head,
             txids,
             secret,
+            pending_head: pending_head::PendingHeadInserts::new(),
         };
         if need_rebuild {
             let bits = t.head_bits();
@@ -416,6 +422,16 @@ impl TxTable {
                 t.head.segment_count()
             );
         } else {
+            // Crash before write-behind drain: head occupancy lags Class A.
+            let n = t.count();
+            let covered = t.head.last_inserted_fk();
+            if covered < n {
+                rbitcoin_log::info!(
+                    "store: tx.head lags Class A covered={covered} n={n} — backfill tail"
+                );
+                t.backfill_head_from(covered.saturating_add(1))?;
+                t.head.flush()?;
+            }
             // Open segment may have creates from a prior process; rebuild fuse
             // keys from Class A so a later seal never FN pre-restart members.
             t.rebuild_open_segment_fuse_keys()?;
@@ -726,6 +742,14 @@ impl TxTable {
     /// order prefers deeper probe slots (newest BIP30-shaped create).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         use std::time::Instant;
+        if let Some(fk) = self.pending_fk(txid) {
+            if self.body_txid(fk)? == *txid {
+                crate::head_resolve_stats::add_pending_hit(1);
+                crate::head_resolve_stats::add_keys(1);
+                crate::head_resolve_stats::add_hit_rank(1);
+                return Ok(Some(fk));
+            }
+        }
         let mixed = self.secret.mix_txid(txid);
         let t_probe = Instant::now();
         let cands = self.head.probe_candidates(&mixed)?;
@@ -1315,27 +1339,18 @@ impl TxTable {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         self.maybe_coupled_roll(items.len() as u64)?;
-        let fks = self
-            .body
-            .put_batch_encode_aligned(items.len(), est_out, |i, buf| {
+        let fks = self.append_stems_one_wave(
+            items.len(),
+            est_out,
+            est_inwit,
+            est_spent,
+            |i, buf| {
                 let (tx, ins, outs) = &items[i];
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
-            })?;
-        let fks_in = self
-            .inwit
-            .put_batch_encode_aligned(items.len(), est_inwit, |i, buf| {
-                encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret));
-            })?;
-        let fks_sp = self
-            .spent
-            .put_batch_encode_aligned(items.len(), est_spent, |i, buf| {
-                encode_spent_zeros(items[i].2.len() as u32, buf);
-            })?;
-        if fks != fks_in || fks != fks_sp {
-            return Err(StoreError::Corrupt(
-                "Class A append fk mismatch across stems",
-            ));
-        }
+            },
+            |i, buf| encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+            |i, buf| encode_spent_zeros(items[i].2.len() as u32, buf),
+        )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -1385,29 +1400,22 @@ impl TxTable {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         self.maybe_coupled_roll(items.len() as u64)?;
-        let fks = self
-            .body
-            .put_batch_encode_aligned(items.len(), est_out, |i, buf| {
+        let fks = self.append_stems_one_wave(
+            items.len(),
+            est_out,
+            est_inwit,
+            est_spent,
+            |i, buf| {
                 let (pin, ins) = &items[i];
                 let (tx, outs) = pin.as_ref();
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
-            })?;
-        let fks_in = self
-            .inwit
-            .put_batch_encode_aligned(items.len(), est_inwit, |i, buf| {
-                encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret));
-            })?;
-        let fks_sp = self
-            .spent
-            .put_batch_encode_aligned(items.len(), est_spent, |i, buf| {
+            },
+            |i, buf| encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+            |i, buf| {
                 let (_tx, outs) = items[i].0.as_ref();
                 encode_spent_zeros(outs.len() as u32, buf);
-            })?;
-        if fks != fks_in || fks != fks_sp {
-            return Err(StoreError::Corrupt(
-                "Class A append fk mismatch across stems",
-            ));
-        }
+            },
+        )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.0.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
@@ -1417,6 +1425,44 @@ impl TxTable {
                 .map(|((pin, _), fk)| (pin.0.txid, *fk))
                 .collect();
             self.head_insert_many(&heads)?;
+        }
+        Ok(fks)
+    }
+
+    /// Encode and write `txout` + `inwit` + `spent` bodies as one pwrite wave.
+    ///
+    /// Order is still body → idx → HWM per stem. Not the spend-annotate machine.
+    fn append_stems_one_wave(
+        &self,
+        n: usize,
+        est_out: usize,
+        est_inwit: usize,
+        est_spent: usize,
+        encode_out: impl FnMut(usize, &mut Vec<u8>),
+        encode_in: impl FnMut(usize, &mut Vec<u8>),
+        encode_sp: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<Vec<Fk>, StoreError> {
+        let Some(p_out) = self.body.prepare_batch_encode(n, est_out, encode_out)? else {
+            return Ok(Vec::new());
+        };
+        let Some(p_in) = self.inwit.prepare_batch_encode(n, est_inwit, encode_in)? else {
+            return Err(StoreError::Corrupt("Class A inwit prepare empty"));
+        };
+        let Some(p_sp) = self.spent.prepare_batch_encode(n, est_spent, encode_sp)? else {
+            return Err(StoreError::Corrupt("Class A spent prepare empty"));
+        };
+        crate::var_table::write_prepared_bodies_one_wave(&[
+            (&self.body, &p_out),
+            (&self.inwit, &p_in),
+            (&self.spent, &p_sp),
+        ])?;
+        let fks = self.body.finish_prepared(p_out)?;
+        let fks_in = self.inwit.finish_prepared(p_in)?;
+        let fks_sp = self.spent.finish_prepared(p_sp)?;
+        if fks != fks_in || fks != fks_sp {
+            return Err(StoreError::Corrupt(
+                "Class A append fk mismatch across stems",
+            ));
         }
         Ok(fks)
     }
@@ -1456,10 +1502,18 @@ impl TxTable {
     /// [`Self::get_fk_by_txid`].
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
+        if let Some(fk) = self.pending_fk(txid) {
+            if self.body_txid(fk)? == *txid {
+                out.push((fk, self.get(fk)?));
+            }
+        }
         let mixed = self.secret.mix_txid(txid);
         // probe_candidates already open-first then sealed newest→oldest, deep-first within.
         let cands = self.head.probe_candidates(&mixed)?;
         for fk in cands {
+            if out.iter().any(|(have, _)| have.0 == fk.0) {
+                continue;
+            }
             if self.body_txid(fk)? != *txid {
                 continue;
             }
@@ -1513,6 +1567,37 @@ impl TxTable {
     /// `on_progress(done_bodies, total_bodies, inserted)` is invoked periodically.
     pub fn backfill_head(&self, on_progress: impl FnMut(u64, u64, u64)) -> Result<u64, StoreError> {
         self.backfill_head_inner(/* force_all */ false, on_progress)
+    }
+
+    /// Insert `txid.body` → `tx.head` for creates `first_fk..=count` (no presence probe).
+    pub fn backfill_head_from(&self, first_fk: u64) -> Result<u64, StoreError> {
+        let n = self.count();
+        if first_fk == 0 || first_fk > n {
+            return Ok(0);
+        }
+        let mut inserted = 0u64;
+        let read_batch: u64 = 65_536;
+        let write_chunk: usize = 65_536;
+        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
+        let mut cur = first_fk;
+        while cur <= n {
+            let end = (cur + read_batch - 1).min(n);
+            let txids = self.body_txid_range(cur, end)?;
+            for (i, txid) in txids.into_iter().enumerate() {
+                batch.push((txid, Fk(cur + i as u64)));
+                if batch.len() >= write_chunk {
+                    inserted += batch.len() as u64;
+                    self.head_insert_many(&batch)?;
+                    batch.clear();
+                }
+            }
+            cur = end + 1;
+        }
+        if !batch.is_empty() {
+            inserted += batch.len() as u64;
+            self.head_insert_many(&batch)?;
+        }
+        Ok(inserted)
     }
 
     /// Insert **every** Class A body into `tx.head` without presence probes.
@@ -1608,6 +1693,39 @@ impl TxTable {
 
     pub fn head_segment_count(&self) -> usize {
         self.head.segment_count()
+    }
+
+    /// Publish txid→fk for resolve before durable `tx.head` drain.
+    pub fn head_note_pending(&self, entries: &[([u8; 32], Fk)]) {
+        self.pending_head.note(entries);
+    }
+
+    /// Resolve a create that is in `txid.body` but not yet in `tx.head`.
+    pub fn pending_fk(&self, txid: &[u8; 32]) -> Option<Fk> {
+        self.pending_head.get(txid)
+    }
+
+    /// Drain the pending insert queue via page-grouped [`Self::head_insert_many`].
+    pub fn head_drain_pending(&self) -> Result<u64, StoreError> {
+        let batch = self.pending_head.take_queued();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        self.head_insert_many(&batch)?;
+        self.pending_head.forget(&batch);
+        Ok(batch.len() as u64)
+    }
+
+    pub fn pending_head_len(&self) -> usize {
+        self.pending_head.len()
+    }
+
+    /// Bound write-behind: drain if the queue is at/over [`PENDING_HEAD_CAP`].
+    pub fn head_drain_pending_if_full(&self) -> Result<(), StoreError> {
+        if self.pending_head.len() >= PENDING_HEAD_CAP {
+            self.head_drain_pending()?;
+        }
+        Ok(())
     }
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
@@ -1716,6 +1834,9 @@ impl TxTable {
             shadow_body_bytes: 0,
             segment_count: self.head.segment_count() as u64,
             sealed_segments: self.head.sealed_segment_count() as u64,
+            fuse8_bytes: self.head.sealed_fuse_resident_bytes(),
+            open_keys_bytes: self.head.open_keys_resident_bytes(),
+            class_c_l2_bytes: 0,
         }
     }
 

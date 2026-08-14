@@ -230,6 +230,14 @@ impl ArrayTable {
 
     /// Persist dirty L2 image. Prefers append-only suffix writes so published
     /// prefix bytes are never overwritten mid-barrier.
+    /// In-RAM L2 image bytes (0 when FdOnly).
+    pub fn l2_resident_bytes(&self) -> u64 {
+        let g = self.data.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()
+            .map(|v| (v.len() as u64).saturating_mul(ELEM))
+            .unwrap_or(0)
+    }
+
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
         let Some(ref v) = *guard else {

@@ -36,6 +36,8 @@ static HIT_RANK_SUM: AtomicU64 = AtomicU64::new(0);
 static HIT_RANK_N: AtomicU64 = AtomicU64::new(0);
 /// Body peeks that did **not** match the wanted txid (wrong cand).
 static MISS_PEEKS: AtomicU64 = AtomicU64::new(0);
+/// Keys resolved from the unflushed head-insert map (write-behind).
+static PENDING_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Winner sealed-age histogram (index = age from tip; last bucket is tail).
 static AGE_HIT: [AtomicU64; AGE_CAP] = [const { AtomicU64::new(0) }; AGE_CAP];
@@ -52,6 +54,8 @@ pub struct Sample {
     pub hit_rank_sum: u64,
     pub hit_rank_n: u64,
     pub miss_peeks: u64,
+    /// Unflushed write-behind map hits.
+    pub pending_hits: u64,
     /// Hits by sealed-age from tip (`age_hit[AGE_CAP-1]` = ages ≥ CAP−1).
     pub age_hit: [u64; AGE_CAP],
 }
@@ -68,6 +72,7 @@ impl Default for Sample {
             hit_rank_sum: 0,
             hit_rank_n: 0,
             miss_peeks: 0,
+            pending_hits: 0,
             age_hit: [0; AGE_CAP],
         }
     }
@@ -252,6 +257,13 @@ pub fn add_miss_peeks(n: u64) {
     }
 }
 
+#[inline]
+pub fn add_pending_hit(n: u64) {
+    if n > 0 {
+        PENDING_HITS.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 pub fn sample_and_reset() -> Sample {
     let mut age_hit = [0u64; AGE_CAP];
     for (i, slot) in AGE_HIT.iter().enumerate() {
@@ -267,6 +279,7 @@ pub fn sample_and_reset() -> Sample {
         hit_rank_sum: HIT_RANK_SUM.swap(0, Ordering::Relaxed),
         hit_rank_n: HIT_RANK_N.swap(0, Ordering::Relaxed),
         miss_peeks: MISS_PEEKS.swap(0, Ordering::Relaxed),
+        pending_hits: PENDING_HITS.swap(0, Ordering::Relaxed),
         age_hit,
     }
 }

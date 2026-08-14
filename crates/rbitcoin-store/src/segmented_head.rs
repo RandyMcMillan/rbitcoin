@@ -260,6 +260,36 @@ impl SegmentedTxHead {
             .sum()
     }
 
+    /// Highest create_fk present in any segment (0 if empty).
+    pub fn last_inserted_fk(&self) -> u64 {
+        let segs = self.segments_snapshot();
+        for s in segs.iter().rev() {
+            let c = s.count.load(Ordering::Relaxed);
+            if c > 0 {
+                return s.first_fk.saturating_add(c).saturating_sub(1);
+            }
+        }
+        0
+    }
+
+    /// In-RAM sealed fuse8 fingerprints (process heap, not file RSS).
+    pub fn sealed_fuse_resident_bytes(&self) -> u64 {
+        self.segments_snapshot()
+            .iter()
+            .map(|s| {
+                s.fuse
+                    .as_ref()
+                    .map(|f| f.fingerprint_bytes() as u64)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Open-segment fuse-key Vec heap (`count × 8`).
+    pub fn open_keys_resident_bytes(&self) -> u64 {
+        (self.open_keys_len() as u64).saturating_mul(8)
+    }
+
     /// Open (unsealed) tail: `(first_fk, count)`. `None` if no segments or tail sealed.
     pub fn open_tail_range(&self) -> Option<(u64, u64)> {
         let segs = self.segments_snapshot();

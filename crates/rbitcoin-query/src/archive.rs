@@ -591,6 +591,17 @@ impl Query {
         let head_total_ns = t_head.elapsed().as_nanos() as u64;
         let head_fk_ns = head_total_ns; // denserels not on plan stamp path
         crate::archive_phase_stats::note_head_dens_wave(0, 0);
+        // Need/hit before stamp so a leftover miss still meters the fail pack.
+        crate::archive_phase_stats::note_resolve_counts(
+            n_headers,
+            need_vec.len() as u64,
+            sticky_hit_n,
+            head_need_n,
+            head_hit_n,
+            0,
+            0,
+        );
+        crate::archive_phase_stats::note_pin_txid(pin_txid_n, pin_txid_ns);
 
         // Pass 3: stamp create_fk on inputs; tip spends list; build shared CreatePin.
         // Outs move into Arc once — packed pin half and batch_pin share that Arc.
@@ -718,16 +729,7 @@ impl Query {
         // heuristics were dead work that cost O(headers) RwLock gets per plan.
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
-        crate::archive_phase_stats::note_resolve_counts(
-            n_headers,
-            need_vec.len() as u64,
-            sticky_hit_n,
-            head_need_n,
-            head_hit_n,
-            batch_stamp,
-            resolved_stamp,
-        );
-        crate::archive_phase_stats::note_pin_txid(pin_txid_n, pin_txid_ns);
+        crate::archive_phase_stats::note_resolve_counts(0, 0, 0, 0, 0, batch_stamp, resolved_stamp);
         crate::archive_phase_stats::note_prep_plan(
             assign_ns,
             collect_ns,

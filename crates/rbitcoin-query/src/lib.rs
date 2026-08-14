@@ -131,7 +131,7 @@ pub use catchup::IndexMode;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::ConfirmPrepared;
-pub use in_flight::{inflight_prune_cutoff, InFlightLayer, InFlightLog, InFlightView};
+pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashChainStats,
     ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,

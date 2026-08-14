@@ -38,26 +38,18 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop creates that leftover TipOnly would accept (head + fence).
+    /// Drop packs whose heights are already confirmed.
     ///
-    /// **Must not use body count alone.** Class A commit is body → head →
-    /// head; during `tx.head` seal/roll the body count jumps while head
-    /// insert is blocked for seconds. Pruning on body count drops in-flight
-    /// parents that head cannot resolve yet → `parent create_fk unresolved`
-    /// and a permanent tip blacklist (mainnet ~269050 first segment seal).
-    ///
-    /// **Must not use `tx.head` occupied alone.** Write drains head in
-    /// parallel with Class C; occupied can jump before `height_fence_extend`.
-    /// TipOnly leftover then wipes the head hit (`connected=false`) and
-    /// blacklists tip+1 (mainnet 929462).
+    /// In-flight is unconfirmed planned creates. Leftover TipOnly is only for
+    /// fence-connected (confirmed) parents. Pruning on occupied / fence_max
+    /// dropped tip-ahead packs after drain but before those heights were
+    /// confirmed — leftover wiped `fk > fence_max` and blacklisted tip+1
+    /// (mainnet 929462 / 931147 / 933474).
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        let head_n = hub.query.tx_head_occupied();
-        let fence_n = hub.query.tx_fence_max_connected_fk();
-        self.in_flight
-            .prune(rbitcoin_query::inflight_prune_cutoff(head_n, fence_n));
+        self.in_flight.prune_through_tip(hub.tip_height());
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
@@ -123,7 +115,8 @@ impl LoadAheadState {
                     .map(|((pin, _), fk)| (*fk, pin)),
             )
         };
-        self.in_flight.note_layer(layer);
+        self.in_flight
+            .note_layer(layer.with_max_height(last_height));
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
@@ -169,8 +162,12 @@ impl LoadAheadState {
             self.next_tx_start = last_id.saturating_add(1).max(1);
         }
         let _ = max_fk;
-        self.in_flight
-            .note_layer(rbitcoin_query::InFlightLayer::from_txid_fks(pairs));
+        let max_height = heights_hashes.iter().map(|(h, _)| *h).max();
+        let mut layer = rbitcoin_query::InFlightLayer::from_txid_fks(pairs);
+        if let Some(h) = max_height {
+            layer = layer.with_max_height(h);
+        }
+        self.in_flight.note_layer(layer);
         if let Some(&(h, hash)) = heights_hashes.last() {
             self.last_loaded = Some((h, hash.to_byte_array()));
         }
@@ -677,7 +674,11 @@ pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
 /// that so a race is not logged as a bare invalid-block.
 pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
     if err == "missing prevout" {
-        format!("{err} (leftover parent create_fk unresolved)")
+        let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
+        format!(
+            "{err} (leftover parent create_fk unresolved leftover_n={} leftover_hit={})",
+            last.head_need, last.head_hit
+        )
     } else {
         err.to_string()
     }

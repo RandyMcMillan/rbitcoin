@@ -25,11 +25,12 @@ before 1.0).
 
 ### Fixed
 
-- **In-flight prune waits for the height fence:** write drains `tx.head` in
-  parallel with Class C, so occupied can jump before `height_fence_extend`.
-  Pruning on occupied alone dropped parents TipOnly leftover then wiped
-  (`connected=false`) and blacklisted tip+1 (mainnet 929462 `missing prevout`).
-  Cutoff is `min(occupied, fence max connected fk)`.
+- **In-flight prune is confirmed tip, not head occupied:** planned creates stay
+  until `tip >= pack max_height`. Occupied/fence_max prune dropped tip-ahead
+  parents after drain while leftover TipOnly still required `height_of` — valid
+  tip+1 blacklisted (mainnet **929462**, **931147**, **933474**). Leftover
+  remains connected-head only. Stamp reject logs `leftover_n/hit` for the fail
+  pack.
 
 - **Load leftover parents are TipOnly `tx.head`, not an invariant:** after the
   BQ wave, some externals remain (same-batch / in-flight / not yet in the

@@ -6,10 +6,9 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop whole layers with `max_fk ≤ cutoff`; rebuild only a
-//! straddling layer as a **new** Arc (body-ahead-of-head seal window).
-//! Cutoff is [`inflight_prune_cutoff`]: min(head occupied, fence-connected
-//! max fk). Occupied alone races head drain ahead of `height_fence_extend`.
+//! **Prune:** drop whole layers whose pack `max_height` is already confirmed
+//! (`tip >= max_height`). Unconfirmed planned creates stay in-flight even after
+//! `tx.head` drain / occupied jumps (mainnet 931147 / 933474).
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -20,22 +19,13 @@ use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// In-flight prune HWM: both durable `tx.head` occupied **and** the height
-/// fence must accept the fk before TipOnly leftover will keep a hit.
-///
-/// `fence_max_connected_fk == 0` (empty fence) keeps every layer.
-#[inline]
-pub fn inflight_prune_cutoff(head_occupied: u64, fence_max_connected_fk: u64) -> u64 {
-    head_occupied.min(fence_max_connected_fk)
-}
-
 /// One planned pack's published creates (immutable after construction).
 #[derive(Debug, Clone)]
 pub struct InFlightLayer {
     creates: HashMap<[u8; 32], Fk>,
     outs: U64Map<CreatePin>,
-    /// Highest create fk id in this layer (whole-layer prune fast path).
-    max_fk: u64,
+    /// Highest block height in this pack. [`None`] = untagged (tip prune keeps it).
+    max_height: Option<u32>,
 }
 
 impl InFlightLayer {
@@ -43,19 +33,23 @@ impl InFlightLayer {
     pub fn from_plan_pins<'a>(pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>) -> Self {
         let mut creates = HashMap::new();
         let mut outs = U64Map::default();
-        let mut max_fk = 0u64;
         for (fk, pin) in pins {
             creates.insert(pin.0.txid, fk);
             if let Some(id) = fk.get() {
-                max_fk = max_fk.max(id);
                 outs.insert(id, Arc::clone(pin));
             }
         }
         Self {
             creates,
             outs,
-            max_fk,
+            max_height: None,
         }
+    }
+
+    /// Tag the pack's highest height so tip prune can drop it after confirm.
+    pub fn with_max_height(mut self, height: u32) -> Self {
+        self.max_height = Some(height);
+        self
     }
 
     /// Creates-only layer (txid→fk) for already-archived packs without denserels pins.
@@ -65,26 +59,18 @@ impl InFlightLayer {
     /// txid→fk here bridges the gap without requiring full CreatePin outs.
     pub fn from_txid_fks(pairs: impl IntoIterator<Item = ([u8; 32], Fk)>) -> Self {
         let mut creates = HashMap::new();
-        let mut max_fk = 0u64;
         for (txid, fk) in pairs {
-            if let Some(id) = fk.get() {
-                max_fk = max_fk.max(id);
-            }
             creates.insert(txid, fk);
         }
         Self {
             creates,
             outs: U64Map::default(),
-            max_fk,
+            max_height: None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.creates.is_empty() && self.outs.is_empty()
-    }
-
-    pub fn max_fk(&self) -> u64 {
-        self.max_fk
     }
 
     pub fn outs_len(&self) -> usize {
@@ -114,49 +100,20 @@ impl InFlightLog {
         self.layers.push(Arc::new(layer));
     }
 
-    /// Drop create material with fk ≤ `head_occupied`.
+    /// Drop packs whose heights are already confirmed. `None` tip keeps all.
     ///
-    /// Whole layers with `max_fk ≤ head_occupied` are dropped. Layers that
-    /// straddle the cutoff are replaced with a **new** Arc containing only
-    /// body-ahead entries (never `make_mut` on a shared layer).
-    pub fn prune(&mut self, head_occupied: u64) {
+    /// Untagged layers (`max_height == None`) stay — production always tags.
+    pub fn prune_through_tip(&mut self, tip: Option<u32>) {
+        let Some(t) = tip else {
+            return;
+        };
         if self.layers.is_empty() {
             return;
         }
-        let mut next = Vec::with_capacity(self.layers.len());
-        for layer in self.layers.drain(..) {
-            if layer.max_fk <= head_occupied {
-                continue;
-            }
-            let any_old = layer.outs.keys().any(|&id| id <= head_occupied);
-            if !any_old {
-                next.push(layer);
-                continue;
-            }
-            let mut creates = HashMap::new();
-            let mut outs = U64Map::default();
-            let mut max_fk = 0u64;
-            for (txid, fk) in &layer.creates {
-                if fk.get().is_some_and(|id| id > head_occupied) {
-                    creates.insert(*txid, *fk);
-                }
-            }
-            for (&id, pin) in &layer.outs {
-                if id > head_occupied {
-                    max_fk = max_fk.max(id);
-                    outs.insert(id, Arc::clone(pin));
-                }
-            }
-            if outs.is_empty() {
-                continue;
-            }
-            next.push(Arc::new(InFlightLayer {
-                creates,
-                outs,
-                max_fk,
-            }));
-        }
-        self.layers = next;
+        self.layers.retain(|layer| match layer.max_height {
+            Some(h) => h > t,
+            None => true,
+        });
         self.layers.shrink_to_fit();
     }
 
@@ -324,64 +281,45 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_body_ahead_of_head() {
-        let mut log = InFlightLog::new();
-        // One layer with fks 85..=100 (simulates seal window batch).
-        let pins: Vec<_> = (85u64..=100)
-            .map(|id| {
-                let p = pin(id);
-                (Fk(id), p)
-            })
-            .collect();
-        let layer = InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p)));
-        log.note_layer(layer);
-        log.prune(90);
-        let v = log.snapshot();
-        for id in 91u64..=100 {
-            assert!(v.get_out(id).is_some(), "keep {id}");
-        }
-        for id in 85u64..=90 {
-            assert!(v.get_out(id).is_none(), "drop {id}");
-        }
-        assert_eq!(log.entry_count(), 10);
-    }
-
-    /// Occupied can race ahead of the height fence (head drain ∥ Class C).
-    /// Cutoff must wait for both — occupied alone drops parents TipOnly
-    /// will not accept yet (mainnet 929462 leftover miss → blacklist).
-    #[test]
-    fn inflight_prune_cutoff_waits_for_fence() {
-        assert_eq!(inflight_prune_cutoff(100, 50), 50);
-        assert_eq!(inflight_prune_cutoff(100, 200), 100);
-        assert_eq!(
-            inflight_prune_cutoff(100, 0),
-            0,
-            "empty fence: keep all in-flight"
-        );
-        let mut log = InFlightLog::new();
-        let p = pin(42);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]));
-        log.prune(inflight_prune_cutoff(42, 0));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "occupied-only prune would drop fk=42 before fence knows it"
-        );
-        log.prune(inflight_prune_cutoff(42, 42));
-        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
-    }
-
-    #[test]
     fn prune_drops_whole_old_layers() {
         let mut log = InFlightLog::new();
         let a = pin(10);
         let b = pin(50);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(3));
         assert_eq!(log.layer_count(), 2);
-        log.prune(10);
+        log.prune_through_tip(Some(1));
         assert_eq!(log.layer_count(), 1);
         assert!(log.snapshot().get_out(50).is_some());
         assert!(log.snapshot().get_out(10).is_none());
+    }
+
+    /// In-flight lives until the pack's heights are confirmed — not until
+    /// `tx.head` occupied (drain can lead tip / fence; mainnet 931147 / 933474).
+    #[test]
+    fn inflight_prune_through_tip() {
+        let mut log = InFlightLog::new();
+        let confirmed = pin(10);
+        let ahead = pin(50);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &confirmed)]).with_max_height(5));
+        // Occupied already covers fk=50 (drain done) but height 6 is not confirmed.
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &ahead)]).with_max_height(6));
+        log.prune_through_tip(None);
+        assert_eq!(log.layer_count(), 2, "no tip: keep every layer");
+
+        log.prune_through_tip(Some(5));
+        let v = log.snapshot();
+        assert!(
+            v.get_create_fk(&confirmed.0.txid).is_none(),
+            "tip>=max_height drops the confirmed pack"
+        );
+        assert!(
+            v.get_create_fk(&ahead.0.txid).is_some(),
+            "max_fk<=occupied must not drop an unconfirmed height"
+        );
+
+        log.prune_through_tip(Some(6));
+        assert!(log.snapshot().is_empty());
     }
 
     #[test]

@@ -364,11 +364,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// Head occupied raced ahead of the fence: prune must keep in-flight so
-    /// stamp does not MissingPrevout (mainnet 929462).
+    /// Head occupied may already cover the parent fk; prune until the parent
+    /// height is confirmed so stamp does not MissingPrevout (931147 / 933474).
     #[test]
-    fn stamp_uses_inflight_when_fence_lags_occupied() {
-        use rbitcoin_query::{inflight_prune_cutoff, InFlightLayer, InFlightLog};
+    fn stamp_uses_inflight_until_tip_covers_parent_height() {
+        use rbitcoin_query::{InFlightLayer, InFlightLog};
         use rbitcoin_store::{OutputRecord, TxRecord};
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
@@ -389,13 +389,13 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]));
-        // Production prune_committed: occupied=99, fence empty (Class C not yet).
-        log.prune(inflight_prune_cutoff(99, 0));
+        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        // Production prune_committed: tip still genesis; occupied already 99.
+        log.prune_through_tip(Some(0));
         let view = log.snapshot();
         assert!(
             view.get_create_fk(&parent_txid).is_some(),
-            "in-flight must survive occupied-ahead-of-fence prune"
+            "in-flight must survive drain while parent height is unconfirmed"
         );
         let b1 = mine_with_txs(
             genesis.block_hash(),
@@ -424,7 +424,7 @@ mod tests {
             Some(&pipe),
             Some(&empty),
         )
-        .expect("in-flight parent must stamp when leftover TipOnly cannot see fence");
+        .expect("in-flight parent must stamp until tip covers the parent height");
         let plan = stamped.plan.expect("plan");
         let spend = plan
             .packed
@@ -433,6 +433,11 @@ mod tests {
             .expect("spend");
         let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
         assert_eq!(inp.create_fk, parent_fk);
+        log.prune_through_tip(Some(1));
+        assert!(
+            log.snapshot().get_create_fk(&parent_txid).is_none(),
+            "confirmed height is leftover TipOnly's job"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -532,6 +537,11 @@ mod tests {
         assert!(
             !msg.contains("invariant: external parent missing BQ TipOnly hit"),
             "leftover miss is unresolved, not the old forbid-head invariant: {msg}"
+        );
+        let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
+        assert!(
+            last.head_need > 0,
+            "fail pack leftover_n must be metered before stamp: {last:?}"
         );
         let _ = std::fs::remove_dir_all(&path);
     }

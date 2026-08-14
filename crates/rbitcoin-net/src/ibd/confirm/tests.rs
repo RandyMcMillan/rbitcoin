@@ -28,42 +28,32 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     ))
 }
 
-/// Body-ahead-of-head (seal window): keep in-flight fks head cannot resolve yet.
+/// Unconfirmed pack stays after head drain; drop only once tip covers it.
 ///
-/// Regression for mainnet tip freeze @269050 — first `tx.head` segment seal
-/// (~3.5s) with body count already past head occupied; pruning on body count
-/// dropped parents and plan failed with `parent create_fk unresolved`.
+/// Occupied/fence_max prune dropped tip-ahead parents (931147 / 933474).
 #[test]
-fn prune_inflight_keeps_body_ahead_of_head() {
+fn prune_inflight_keeps_until_tip_covers_height() {
     let mut log = InFlightLog::new();
-    // head has 1..90; body already wrote 91..100 (seal mid head_insert_many).
     let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
-    log.note_layer(InFlightLayer::from_plan_pins(
-        pins.iter().map(|(f, p)| (*f, p)),
-    ));
-    log.prune(90);
-    let v = log.snapshot();
-    // Head-findable (≤90) dropped; body-ahead (91..100) retained.
-    assert_eq!(log.entry_count(), 10);
-    for id in 91u64..=100 {
-        assert!(v.get_out(id).is_some(), "keep {id}");
-        assert_eq!(v.get_create_fk(&test_pin(id).0.txid), Some(Fk(id)));
-    }
-    for id in 85u64..=90 {
-        assert!(v.get_out(id).is_none(), "drop {id}");
-    }
+    log.note_layer(
+        InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))).with_max_height(10),
+    );
+    log.prune_through_tip(Some(9));
+    assert_eq!(log.entry_count(), 16, "tip < max_height keeps the pack");
+    log.prune_through_tip(Some(10));
+    assert_eq!(log.layer_count(), 0);
 }
 
-/// Head occupied raced ahead of the fence: prune must not drop the layer.
+/// Drain can lead fence; tip prune must still keep the unconfirmed height.
 #[test]
-fn prune_inflight_keeps_when_fence_lags_occupied() {
+fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
     let mut log = InFlightLog::new();
     let p = test_pin(42);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]));
-    log.prune(rbitcoin_query::inflight_prune_cutoff(42, 0));
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+    log.prune_through_tip(Some(0));
     assert!(
         log.snapshot().get_create_fk(&p.0.txid).is_some(),
-        "929462 class: drain-before-fence must keep in-flight"
+        "occupied/fence lag must not drop height > tip"
     );
 }
 
@@ -339,6 +329,8 @@ fn stamp_reject_names_leftover_unresolved() {
     let msg = stamp_reject_operator_msg("missing prevout");
     assert!(msg.contains("missing prevout"), "{msg}");
     assert!(msg.contains("unresolved"), "{msg}");
+    assert!(msg.contains("leftover_n="), "{msg}");
+    assert!(msg.contains("leftover_hit="), "{msg}");
     assert!(
         !msg.contains("corrupt"),
         "must not look like store wipe: {msg}"

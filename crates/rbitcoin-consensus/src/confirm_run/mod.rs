@@ -39,18 +39,21 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod bq_resolve;
 mod lookup;
 mod phases;
 mod pin;
 mod scripts;
 mod write;
 
+pub use bq_resolve::{confirm_bq_resolve_wave, BqResolveWaveStats, BQ_RESOLVE_WAVE_MAX_BLOCKS};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_and_ensure_denserels,
-    confirm_wire_lookup_stamp, ensure_external_parent_denserels_from_plan, DenserelsWarmStats,
-    ParentPinStamp, PlanStampOutcome,
+    confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
+    ensure_external_parent_denserels_from_plan, DenserelsWarmStats, ParentPinStamp,
+    PlanStampOutcome,
 };
 use lookup::{known_create_txid_lookup, stamp_parent_pin_archived};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
@@ -366,10 +369,21 @@ pub fn confirm_wire_load_phase_pipelined(
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
+                    None,
+                    true,
+                    true,
                 )
                 .map_err(ConsensusError::from)?,
             None => query
-                .archive_plan_batch_owned(&mut need)
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    query.tx_body_count().saturating_add(1).max(1),
+                    &rbitcoin_query::InFlightView::empty(),
+                    None,
+                    None,
+                    true,
+                    true,
+                )
                 .map_err(ConsensusError::from)?,
         };
         // Expand each header body range to ordered create fks.

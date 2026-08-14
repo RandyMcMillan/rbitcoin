@@ -1468,6 +1468,33 @@ impl Query {
         g.hash_at_height(height)
     }
 
+    /// Attach TipOnly parent hits on the BQ record (lookup wave). Height must be queued.
+    pub fn block_queue_attach_parent_hits(
+        &self,
+        height: u32,
+        hits: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>,
+    ) -> Result<(), QueryError> {
+        let mut g = self.block_queue.lock().unwrap();
+        Ok(g.attach_parent_hits(height, hits)?)
+    }
+
+    /// Lookup finished TipOnly for this height (even if some keys missed).
+    pub fn block_queue_mark_resolve_complete(&self, height: u32) -> Result<(), QueryError> {
+        let mut g = self.block_queue.lock().unwrap();
+        Ok(g.mark_resolve_complete(height)?)
+    }
+
+    pub fn block_queue_is_resolve_complete(&self, height: u32) -> bool {
+        let g = self.block_queue.lock().unwrap();
+        g.is_resolve_complete(height)
+    }
+
+    /// Clone of attached hits (`None` if height not queued).
+    pub fn block_queue_parent_hits(&self, height: u32) -> Option<rbitcoin_store::BqParentHits> {
+        let g = self.block_queue.lock().unwrap();
+        g.parent_hits(height).cloned()
+    }
+
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
     /// Brief mutex locks only (header plans / SH / heads). Call from the ~5s

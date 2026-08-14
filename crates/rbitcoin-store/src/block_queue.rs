@@ -19,9 +19,15 @@
 //! (`u64::MAX`) aside from OOM.
 
 use crate::error::StoreError;
-use std::collections::BTreeMap;
+use rbitcoin_primitives::Fk;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// TipOnly parent hits attached by lookup. Lifetime is the BQ record.
+///
+/// `txid → (create_fk, txout body range)`. Dropped on dequeue / height drop.
+pub type BqParentHits = HashMap<[u8; 32], (Fk, (u64, u64))>;
 
 /// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
 pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
@@ -65,6 +71,8 @@ struct IndexEntry {
     hash: [u8; 32],
     header_fk: u64,
     payload: Vec<u8>,
+    parent_hits: BqParentHits,
+    resolve_complete: bool,
 }
 
 impl BlockQueue {
@@ -166,6 +174,8 @@ impl BlockQueue {
                 hash,
                 header_fk,
                 payload: payload.to_vec(),
+                parent_hits: HashMap::new(),
+                resolve_complete: false,
             },
         );
         Ok(id)
@@ -282,6 +292,46 @@ impl BlockQueue {
             .iter()
             .find(|(_, e)| e.height == height)
             .map(|(&id, _)| id)
+    }
+
+    fn entry_mut_for_height(&mut self, height: u32) -> Result<&mut IndexEntry, StoreError> {
+        self.index
+            .values_mut()
+            .find(|e| e.height == height)
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Attach TipOnly parent hits. Replaces same-txid keys. Height must be queued.
+    pub fn attach_parent_hits(
+        &mut self,
+        height: u32,
+        hits: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>,
+    ) -> Result<(), StoreError> {
+        let e = self.entry_mut_for_height(height)?;
+        for (txid, fk, range) in hits {
+            e.parent_hits.insert(txid, (fk, range));
+        }
+        Ok(())
+    }
+
+    /// Lookup finished this height: every external parent has a hit (or none exist).
+    pub fn mark_resolve_complete(&mut self, height: u32) -> Result<(), StoreError> {
+        self.entry_mut_for_height(height)?.resolve_complete = true;
+        Ok(())
+    }
+
+    pub fn is_resolve_complete(&self, height: u32) -> bool {
+        self.index
+            .values()
+            .any(|e| e.height == height && e.resolve_complete)
+    }
+
+    /// Borrow hits for `height` (no payload clone). `None` if height not queued.
+    pub fn parent_hits(&self, height: u32) -> Option<&BqParentHits> {
+        self.index
+            .values()
+            .find(|e| e.height == height)
+            .map(|e| &e.parent_hits)
     }
 
     /// Hash of the first queue entry at `height`, if any (no payload clone).
@@ -479,6 +529,48 @@ mod tests {
         assert!(q.dequeue(id).unwrap());
         assert!(!q.contains_height(7));
         let _ = BlockQueue::budget_from_env();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_hits_die_with_dequeue() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let id = q.enqueue(5, [5u8; 32], 1, b"blk").unwrap();
+        q.attach_parent_hits(
+            5,
+            [
+                ([0xAAu8; 32], Fk(10), (16, 32)),
+                ([0xBBu8; 32], Fk(11), (48, 8)),
+            ],
+        )
+        .unwrap();
+        q.mark_resolve_complete(5).unwrap();
+        let hits = q.parent_hits(5).expect("queued");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.get(&[0xAAu8; 32]), Some(&(Fk(10), (16, 32))));
+        assert!(q.is_resolve_complete(5));
+        assert!(q.dequeue(id).unwrap());
+        assert!(q.parent_hits(5).is_none());
+        assert!(!q.is_resolve_complete(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_hits_die_with_dequeue_height_reorg_drop() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(9, [9u8; 32], 1, b"a").unwrap();
+        q.enqueue(10, [10u8; 32], 2, b"b").unwrap();
+        q.attach_parent_hits(10, [([0xCCu8; 32], Fk(3), (0, 1))])
+            .unwrap();
+        q.mark_resolve_complete(10).unwrap();
+        assert_eq!(q.dequeue_height(10).unwrap(), 1);
+        assert!(q.parent_hits(10).is_none());
+        assert!(!q.is_resolve_complete(10));
+        assert!(q.contains_height(9));
+        assert!(q.parent_hits(9).unwrap().is_empty());
+        assert!(q.attach_parent_hits(10, []).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

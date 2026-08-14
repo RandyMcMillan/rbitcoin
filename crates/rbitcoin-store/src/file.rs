@@ -616,7 +616,7 @@ impl TableFile {
         Ok(())
     }
 
-    /// Persist HWM / trailer and `sync_data` (unless deferred).
+    /// Persist HWM / trailer and `sync_data`.
     ///
     /// Skips entirely when no payload write has occurred since the last
     /// successful sync (Class C tip barrier: avoid fsyncing multi‑GiB tables
@@ -627,9 +627,6 @@ impl TableFile {
         }
         let logical = self.published_len.load(Ordering::Acquire);
         self.persist_logical_len(logical)?;
-        if crate::ibd_io_policy::defer_durable_flush() {
-            return Ok(());
-        }
         self.file
             .lock()
             .unwrap()

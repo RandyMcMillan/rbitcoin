@@ -74,7 +74,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 ## Flush
 
 Clean shutdown: `flush_for_shutdown` fsyncs tip/Class C (incl. L2 dirty images) then async Class A.
-Steady path: payload pwrite + HWM publish; `sync_data` unless `defer_durable_flush`.
+Steady path: payload pwrite + HWM publish; `sync_data` on flush barriers.
 Kill mid-payload before HWM publish: readers never see past previous published length.
 
 Connect barrier (`flush_class_c_tip`): headers (if dirty) → strong → height → header_txs → **confirmed last** → soft `tip_seal`.

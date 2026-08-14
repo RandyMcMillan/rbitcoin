@@ -9,7 +9,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
 | Confirm **lookup** | 1 OS thread | load wire from **body queue**; structure + stamp create_fk (Class A planned only) |
 | Confirm **load** | 1 OS thread | pin `txout` outs + assemble from owned stamped plan (no re-lookup / no head resolve) |
-| Confirm **scripts** | 1 OS thread + rayon | **none** — pure CPU |
+| Confirm **scripts** | 1 OS thread + 2 coordinators + `rbtc-scripts` steal | **none** — pure CPU |
 | Confirm **write** | 1 OS thread | **sole Class A appender** (`txout`+`inwit`+`spent`) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 

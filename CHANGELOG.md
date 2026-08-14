@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Script pool:** `try_for_each_parallel` steals on process-wide
+  `rbtc-scripts-*` workers (no per-batch `thread::scope`). Confirm phases run
+  on two `rbtc-script-coord-*` threads so a steal worker is not blocked inside
+  the phase. Pool wait uses a condvar deque (not `recv` under mutex).
+
 - **`--sptweaks` during IBD:** Direct confirm no longer write-throughs the
   thin BIP-352 index (it was 50–80% of fat-era write). After tip, SH
   materialize (if `--shindex`) then a sequential backfill to live tip;

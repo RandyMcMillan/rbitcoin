@@ -1,31 +1,124 @@
 //! Lightweight parallel script-check pool (replaces rayon on the hot path).
 //!
-//! Production only needs: (1) parallel `try_for_each` over script jobs, and
-//! (2) submit/join for mempool accept + async scripts phase. A small
-//! work-stealing loop over `std::thread::scope` avoids pulling rayon +
-//! crossbeam into the consensus crate graph.
+//! Production: (1) [`try_for_each_parallel`] steals indices on the process-wide
+//! `rbtc-scripts-*` workers; (2) [`spawn_detached`] / [`run_detached_join`] for
+//! mempool accept. Confirm scripts phases run on [`spawn_coordinator`], not on
+//! steal workers (a worker must not wait on this pool).
 //!
-//! Mempool admits hop via [`run_detached_join`] onto a **process-wide** worker
-//! set (not one OS thread per tx).
+//! No rayon / crossbeam.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 use crate::error::ConsensusError;
 
+thread_local! {
+    static ON_STEAL_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+fn on_steal_worker() -> bool {
+    ON_STEAL_WORKER.with(|c| c.get())
+}
+
+/// Type-erased `f(&items[i])`. `ctx` is valid until the publishing
+/// [`try_for_each_parallel`] returns (after [`Wave::wait_done`]).
+struct Apply {
+    f: unsafe fn(*const (), usize) -> Result<(), ConsensusError>,
+    ctx: *const (),
+}
+
+// Workers only dereference `ctx` while `in_wave > 0`; the publisher waits
+// for `in_wave == 0` before returning, so the stack `ctx` is still live.
+unsafe impl Send for Apply {}
+unsafe impl Sync for Apply {}
+
+struct Wave {
+    n: usize,
+    next: AtomicUsize,
+    in_wave: AtomicUsize,
+    failed: AtomicBool,
+    first_err: Mutex<Option<ConsensusError>>,
+    apply: Apply,
+    done: Mutex<bool>,
+    done_cv: Condvar,
+}
+
+impl Wave {
+    fn claim(&self) -> Option<usize> {
+        if self.failed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        if i >= self.n {
+            return None;
+        }
+        self.in_wave.fetch_add(1, Ordering::SeqCst);
+        Some(i)
+    }
+
+    fn is_complete(&self) -> bool {
+        let claimed_out =
+            self.next.load(Ordering::Relaxed) >= self.n || self.failed.load(Ordering::Relaxed);
+        claimed_out && self.in_wave.load(Ordering::SeqCst) == 0
+    }
+
+    fn run_one(&self, i: usize) {
+        // SAFETY: `in_wave` was incremented by `claim`; publisher does not
+        // return until `wait_done` sees `in_wave == 0`.
+        let r = unsafe { (self.apply.f)(self.apply.ctx, i) };
+        if let Err(e) = r {
+            self.failed.store(true, Ordering::Relaxed);
+            let mut g = self.first_err.lock().unwrap_or_else(|p| p.into_inner());
+            if g.is_none() {
+                *g = Some(e);
+            }
+        }
+        self.in_wave.fetch_sub(1, Ordering::SeqCst);
+        if self.is_complete() {
+            *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.done_cv.notify_all();
+        }
+    }
+
+    fn wait_done(&self) {
+        let mut g = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        while !self.is_complete() {
+            g = self.done_cv.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+static WAVES: Mutex<Vec<Arc<Wave>>> = Mutex::new(Vec::new());
+
+fn steal_index() -> Option<(Arc<Wave>, usize)> {
+    let waves = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+    for w in waves.iter() {
+        if let Some(i) = w.claim() {
+            return Some((Arc::clone(w), i));
+        }
+    }
+    None
+}
+
 /// Parallel map over `items` until the first error (or all succeed).
 ///
-/// Uses one OS thread per logical CPU (capped by `items.len()`), each claiming
-/// the next index with a shared atomic. On first error, workers stop claiming
-/// new work; in-flight jobs may still finish.
+/// Steal workers (`rbtc-scripts-*`) claim indices. Must not be called from a
+/// steal worker (hard refuse — same-pool wait would deadlock). On first error,
+/// workers stop claiming; in-flight units may still finish.
 pub(crate) fn try_for_each_parallel<T, F>(items: &[T], f: F) -> Result<(), ConsensusError>
 where
     T: Sync,
     F: Fn(&T) -> Result<(), ConsensusError> + Sync,
 {
+    if on_steal_worker() {
+        return Err(ConsensusError::BadBlock(
+            "try_for_each from a script worker",
+        ));
+    }
     if items.is_empty() {
         return Ok(());
     }
@@ -33,38 +126,53 @@ where
         return f(&items[0]);
     }
 
-    let n_workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(items.len())
-        .max(1);
+    struct Ctx<'a, T, F> {
+        items: &'a [T],
+        f: &'a F,
+    }
+    unsafe fn apply<T, F>(ptr: *const (), i: usize) -> Result<(), ConsensusError>
+    where
+        F: Fn(&T) -> Result<(), ConsensusError>,
+    {
+        let ctx = unsafe { &*(ptr as *const Ctx<T, F>) };
+        (ctx.f)(&ctx.items[i])
+    }
 
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let first_err: Mutex<Option<ConsensusError>> = Mutex::new(None);
-
-    thread::scope(|scope| {
-        for _ in 0..n_workers {
-            scope.spawn(|| {
-                while !failed.load(Ordering::Relaxed) {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= items.len() {
-                        return;
-                    }
-                    if let Err(e) = f(&items[i]) {
-                        failed.store(true, Ordering::Relaxed);
-                        let mut g = first_err.lock().unwrap_or_else(|p| p.into_inner());
-                        if g.is_none() {
-                            *g = Some(e);
-                        }
-                        return;
-                    }
-                }
-            });
-        }
+    let ctx = Ctx { items, f: &f };
+    let wave = Arc::new(Wave {
+        n: items.len(),
+        next: AtomicUsize::new(0),
+        in_wave: AtomicUsize::new(0),
+        failed: AtomicBool::new(false),
+        first_err: Mutex::new(None),
+        apply: Apply {
+            f: apply::<T, F>,
+            ctx: (&ctx as *const Ctx<T, F>).cast(),
+        },
+        done: Mutex::new(false),
+        done_cv: Condvar::new(),
     });
+    {
+        WAVES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::clone(&wave));
+    }
+    let pool = workers();
+    pool.cv.notify_all();
+    wave.wait_done();
 
-    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+    WAVES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|w| !Arc::ptr_eq(w, &wave));
+
+    let err = wave
+        .first_err
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    match err {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -115,9 +223,30 @@ fn workers() -> &'static ScriptWorkers {
         for i in 0..n {
             let _ = thread::Builder::new()
                 .name(format!("rbtc-scripts-{i}"))
-                .spawn(move || loop {
-                    let f = recv_job(&pool.jobs, &pool.cv, true);
-                    f();
+                .spawn(move || {
+                    ON_STEAL_WORKER.with(|c| c.set(true));
+                    loop {
+                        if let Some((w, idx)) = steal_index() {
+                            w.run_one(idx);
+                            continue;
+                        }
+                        let mut g = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(job) = g.pop_front() {
+                            drop(g);
+                            job();
+                            continue;
+                        }
+                        if let Some((w, idx)) = steal_index() {
+                            drop(g);
+                            w.run_one(idx);
+                            continue;
+                        }
+                        #[cfg(test)]
+                        IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
+                        let _g = pool.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                        #[cfg(test)]
+                        IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                    }
                 });
             WORKER_SPAWNS.fetch_add(1, Ordering::Relaxed);
         }
@@ -213,6 +342,7 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     #[test]
     fn parallel_all_ok_and_counts() {
@@ -333,5 +463,67 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn try_for_each_runs_on_script_workers() {
+        let before = worker_spawn_count();
+        let items: Vec<u32> = (0..32).collect();
+        let names = Mutex::new(Vec::new());
+        try_for_each_parallel(&items, |_| {
+            names
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(thread::current().name().unwrap_or("").to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(worker_spawn_count(), before);
+        let names = names.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(names.len(), 32);
+        for n in names.iter() {
+            assert!(n.starts_with("rbtc-scripts-"), "item ran on {n:?}");
+        }
+    }
+
+    #[test]
+    fn overlapping_try_for_each_both_complete() {
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let a = {
+            let hits = Arc::clone(&a_hits);
+            thread::spawn(move || {
+                let items: Vec<u32> = (0..16).collect();
+                try_for_each_parallel(&items, |_| {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+            })
+        };
+        let b = {
+            let hits = Arc::clone(&b_hits);
+            thread::spawn(move || {
+                let items: Vec<u32> = (0..16).collect();
+                try_for_each_parallel(&items, |_| {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+            })
+        };
+        a.join().expect("a").expect("a ok");
+        b.join().expect("b").expect("b ok");
+        assert_eq!(a_hits.load(Ordering::Relaxed), 16);
+        assert_eq!(b_hits.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    fn try_for_each_from_script_worker_is_refused() {
+        let got =
+            run_detached_join(|| try_for_each_parallel(&[1u32, 2], |_| Ok(()))).expect("join");
+        let err = got.expect_err("must refuse nested wait");
+        assert!(
+            format!("{err}").contains("try_for_each from a script worker"),
+            "{err}"
+        );
     }
 }

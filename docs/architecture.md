@@ -210,7 +210,7 @@ Test matrix for rules we own: [`docs/consensus-tests.md`](./consensus-tests.md).
 1. **Peer IO** downloads headers/blocks (v2 transport).
 2. **Archive prep/write** encodes and appends Class A (single writer thread).
 3. **Confirm load** pins parent bodies / builds work for a height batch.
-4. **Confirm scripts** verifies scripts in parallel (rayon) with **no store I/O**.
+4. **Confirm scripts** verifies scripts in parallel (`rbtc-scripts` steal) with **no store I/O**.
 5. **Confirm write** structural checks + Class C + spend annotations + SH runs.
 6. At tip: bulk materialize durable scripthash; enable tip-follow, mempool
    relay, Electrum.

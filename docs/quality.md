@@ -128,7 +128,7 @@ audit closures. Do not reopen without new evidence.
 | — | IBD tip-hole cover + relative-slow disconnect | Tip-hole getdata ranks live `speed_sample` bps; stale inflight **6s** re-race (avoid last holders); `far_slots_per_peer=2` while `hole>0`; relative-slow outlier disconnect (`OUTLIER_RATIO=2` + cluster-spread + hysteresis) |
 | — | Page-grouped `txid.body` identity on lookup | Head-resolve ID stage bulk-preads shared 4 KiB sidefile pages, then RAM BIP30 walk (same winners as serial peek) |
 | **R-01** | Mempool read-path decoupling (histogram / frontier / `list_live`) | Published chunks on the fee snapshot; `list_live_meta` for body-free RPC/Esplora |
-| **R-02** | Persistent shared `script_pool` | Process-wide `rbtc-scripts` workers; join does not spawn per admit |
+| **R-02** | Persistent shared `script_pool` | Process-wide `rbtc-scripts` steal `try_for_each`; coordinators own phases; join does not spawn per admit |
 | **R-03** | Default remine pads `1..=103` | Electrum + MempoolHub tests use `pad_empty_from`. Full-suite wall → **Q-37** |
 | **R-04** | `TxGraph` mining-chunk cache | Rebuild only after insert/remove/`rebuild_from` |
 | **Q-22** / **R-05** | Coverage job compiled `cargo-llvm-cov` from crates.io | `taiki-e/install-action` prebuilt `cargo-llvm-cov@0.6.14`, Action **commit-pinned** (CodeQL) |

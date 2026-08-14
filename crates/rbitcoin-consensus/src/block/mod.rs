@@ -1721,6 +1721,7 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 ///
 /// Uses the in-crate [`crate::script_pool`] (not rayon). One job = one
 /// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
+/// Pool threads (`rbtc-scripts-*`) steal jobs; the phase coordinator does not.
 pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
     crate::script_pool::try_for_each_parallel(jobs, verify_one_script_job)
 }

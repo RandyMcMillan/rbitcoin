@@ -18,7 +18,7 @@ Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 | Change | Why it helps the cycle |
 |--------|------------------------|
 | **mimalloc** only on product bins (`rbitcoin-node`, `rbitcoin-cli`) | Store **lib** tests no longer compile `libmimalloc-sys`/`cc`. Production still uses mimalloc on node/cli. |
-| **rayon removed** from consensus | Parallel scripts use in-crate `script_pool` (`std::thread`). Drops rayon + crossbeam from the consensus graph. |
+| **rayon removed** from consensus | Parallel scripts use in-crate `script_pool` (`rbtc-scripts` steal). Drops rayon + crossbeam from the consensus graph. |
 | **xorf + bincode + serde** removed from store | Sealed fuse8 is in-tree (`binary_fuse8` + hand LE layout **v2**). Drops a serde-heavy path from store rebuilds. |
 | **fuse8 v1 → v2 on open** | Legacy fuse files soft-migrate (always-probe + rewrite from Class A); **do not** wipe `tx.head` for fuse payload-only changes. |
 

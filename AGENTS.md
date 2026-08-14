@@ -153,7 +153,7 @@ Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/writ
 |-------|--------|------------------------|
 | **Lookup** | `lookup=` / `lookup_thr` / `stamp_sub` / `lookup_sub` / `head_rd` | claim, resolve, clone, stamp (`struct/prepare/filter/batch/head_fk/stamp/finish`), head probe/idx/body |
 | **Load** | `load=` / `load_budget` / `pin(` / `assemble=` | pin (`plan` / `cold_range` body+dec / `cold_idx` / adopt / range_fill / contract / publish) + assemble (`prevout` paths, sigop, job) |
-| **Scripts** | `script=` (`SCRIPT_NS`) | rayon verify. Milestone skip is still this stage (near-zero when `check_scripts` is false). |
+| **Scripts** | `script=` (`SCRIPT_NS`) | `rbtc-scripts-*` steal verify. Milestone skip is still this stage (near-zero when `check_scripts` is false). |
 | **Write** | `write=` = `write_stage_ms` | table below |
 | **Occupancy** | `loadq` / `scriptq` / `writeq` + `*_hwm`, `thr … busy/wait` | who is the serial pole |
 

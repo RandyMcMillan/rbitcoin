@@ -1,8 +1,7 @@
 //! tests (peeled from ibd/confirm.rs).
 
 use super::{
-    format_conf_q, format_queue_depth, is_confirm_load_retryable, stamp_reject_operator_msg,
-    ConfirmFeed, ConfirmQueueDepths,
+    format_conf_q, format_queue_depth, stamp_reject_operator_msg, ConfirmFeed, ConfirmQueueDepths,
 };
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -339,29 +338,23 @@ fn stamp_reject_names_leftover_unresolved() {
         stamp_reject_operator_msg("unexpected previous header"),
         "unexpected previous header"
     );
-    assert!(!is_confirm_load_retryable(&msg));
 }
 
 #[test]
-fn is_confirm_load_retryable_always_false() {
+fn confirm_load_has_no_soft_requeue_hook() {
     // Policy: no lookup/load soft-requeue. Internal errors permanent; wire
-    // recovery is soft re-getdata / BodyMissing only.
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (parent package not ready, timeout)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (wave body missing from cache)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "confirm: load incomplete (parent header plan missing above tip)"
-    ));
-    assert!(!is_confirm_load_retryable(
-        "archive: parent create_fk unresolved (contiguous batch required)"
-    ));
-    assert!(!is_confirm_load_retryable("script failed: false"));
-    assert!(!is_confirm_load_retryable("prevout already spent"));
-    assert!(!is_confirm_load_retryable("unexpected previous header"));
-    assert!(!is_confirm_load_retryable("invariant: lookup stage miss"));
+    // recovery is soft re-getdata / BodyMissing only. The always-false hook
+    // hid that — production confirm must not name it.
+    let src = include_str!("mod.rs");
+    let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+    assert!(
+        !prod.contains("is_confirm_load_retryable"),
+        "always-false retry hook must stay gone"
+    );
+    assert!(
+        !prod.contains("re-queue (n="),
+        "soft-requeue warn path must stay gone"
+    );
 }
 
 /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).

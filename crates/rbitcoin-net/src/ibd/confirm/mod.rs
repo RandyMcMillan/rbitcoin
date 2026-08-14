@@ -653,22 +653,6 @@ impl ConfirmQueueDepths {
     }
 }
 
-/// True when a lookup/load error should re-queue the batch (not permanent reject).
-///
-/// **Policy:** internal confirm invariants are permanent failures — fix the
-/// root cause (in-flight prune, denserels pin, claim readiness). Soft-looping
-/// hid pipeline bugs and either livelocked tip (requeue forever) or froze it
-/// after a hard blacklist. Wire recovery uses soft re-getdata in
-/// [`super::events::apply_confirm_reject`] (`unexpected previous header` only)
-/// or [`ConfirmEvent::BodyMissing`] — not this path.
-///
-/// Kept as a named hook so multi-block / load error handling stays uniform;
-/// always returns false.
-#[inline]
-pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
-    false
-}
-
 /// Operator line for load stamp reject. Stamp-stage `missing prevout` is the
 /// leftover TipOnly miss remapped from `parent create_fk unresolved` — name
 /// that so a race is not logged as a bare invalid-block.
@@ -1435,16 +1419,6 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = scripts.join();
                             return;
                         }
-                        if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
-                                wire_batch
-                                    .iter()
-                                    .filter(|(_, ha, _)| !hub_load.has_block(ha))
-                                    .map(|(h, ha, _)| (*h, *ha, None))
-                                    .collect();
-                            feed_load.requeue_wire(&retry);
-                            continue;
-                        }
                         let first_hash = wire_batch[0].1;
                         if wire_batch.len() > 1 {
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
@@ -1568,24 +1542,6 @@ pub(crate) fn spawn_confirm_engine(
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
-                        }
-                        if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
-                                heights_hashes
-                                    .iter()
-                                    .filter(|(_, ha)| !hub_load.has_block(ha))
-                                    .map(|(h, ha)| (*h, *ha, None))
-                                    .collect();
-                            feed_load.requeue_wire(&retry);
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n.is_multiple_of(200) {
-                                warn!(
-                                    "ibd: confirm load incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                            continue;
                         }
                         if heights_hashes.len() > 1 {
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =

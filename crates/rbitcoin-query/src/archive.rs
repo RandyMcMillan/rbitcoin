@@ -237,11 +237,26 @@ impl ArchiveWritePlan {
 }
 
 impl Query {
-    pub fn archive_block(&self, header: &HeaderRecord, txs: &[TxApply]) -> Result<Fk, QueryError> {
-        // Single-block path: one clone into owned plan batch.
+    /// Class A only (header + bodies + `tx.head` / `header_txs`). Does **not**
+    /// set tip / fence / strong.
+    ///
+    /// Crash and `plan=None` tests. Not a production IBD API — confirm write
+    /// uses [`Self::archive_plan_batch_from_store`] + [`Self::archive_commit_plan`].
+    ///
+    /// Remaining public `archive_block` wrappers (tests until later slices):
+    /// [`Self::archive_block`], `accept_and_archive_block`, `ChainHub::archive_block`.
+    pub fn commit_class_a_only(
+        &self,
+        header: &HeaderRecord,
+        txs: &[TxApply],
+    ) -> Result<Fk, QueryError> {
         let mut items = vec![(header.clone(), txs.to_vec())];
         let mut out = self.archive_prepared_owned(&mut items)?;
         Ok(out.pop().expect("one archive result"))
+    }
+
+    pub fn archive_block(&self, header: &HeaderRecord, txs: &[TxApply]) -> Result<Fk, QueryError> {
+        self.commit_class_a_only(header, txs)
     }
 
     /// Archive many prepared blocks, **moving** `TxApply` payloads (no re-clone).
@@ -921,6 +936,43 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(50 * 100_000_000, vec![0x51])],
         }
+    }
+
+    /// Confirm write owns plan+commit; it must not call the public archive wrapper.
+    #[test]
+    fn confirm_write_does_not_call_archive_block() {
+        let write = include_str!("../../rbitcoin-consensus/src/confirm_run/write.rs");
+        assert!(
+            !write.contains("archive_block"),
+            "confirm write must use archive_commit_plan, not archive_block"
+        );
+        assert!(
+            write.contains("archive_commit_plan"),
+            "confirm write Class A is archive_commit_plan"
+        );
+    }
+
+    #[test]
+    fn commit_class_a_only_does_not_advance_tip() {
+        use rbitcoin_store::HeaderRecord;
+
+        let (dir, q) = temp_query("class-a-only-no-tip");
+        assert!(q.tip_height().is_none());
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [2u8; 32],
+        };
+        let hfk = q
+            .commit_class_a_only(&header, &[coinbase_apply(1)])
+            .unwrap();
+        assert!(q.tip_height().is_none(), "Class A helper must not set tip");
+        assert!(q.store().header_txs.has_body(hfk).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

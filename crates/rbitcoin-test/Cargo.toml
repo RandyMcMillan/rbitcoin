@@ -12,7 +12,6 @@ publish = false
 rbitcoin-primitives = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-query = { workspace = true }
-rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-net = { workspace = true }
 rbitcoin-rpc = { workspace = true }

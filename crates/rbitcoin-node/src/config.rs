@@ -29,8 +29,6 @@ pub struct NodeConfig {
     pub signet_challenge: Option<ScriptBuf>,
     /// Custom Signet PoW target spacing in seconds.
     pub signet_block_time: Option<u64>,
-    pub archive_durability: bool,
-    pub wire_depth_blocks: u32,
     /// Bind address for P2P listen (`None` = do not listen / default bind later).
     pub p2p_listen: Option<SocketAddr>,
     /// Explicit outbound peers (`--connect`).
@@ -94,8 +92,6 @@ impl Default for NodeConfig {
             network: Network::Mainnet,
             signet_challenge: None,
             signet_block_time: None,
-            archive_durability: true,
-            wire_depth_blocks: 100,
             p2p_listen: None,
             connect: Vec::new(),
             use_seeds: true,
@@ -228,7 +224,6 @@ impl NodeConfig {
                 ));
             }
         }
-        let _ = (self.wire_depth_blocks, self.archive_durability);
         Ok(())
     }
 
@@ -237,7 +232,7 @@ impl NodeConfig {
         self.datadir.join(".cookie")
     }
 
-    /// Create `{datadir}` and standard subdirs (`store`, `mempool`, `wire`) if missing.
+    /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
         let created_root = !self.datadir.exists();
@@ -251,7 +246,7 @@ impl NodeConfig {
                 self.datadir.display()
             )));
         }
-        for sub in ["store", "mempool", "wire"] {
+        for sub in ["store", "mempool"] {
             let p = self.datadir.join(sub);
             std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir { path: p, source })?;
         }

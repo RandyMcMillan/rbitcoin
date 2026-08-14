@@ -803,7 +803,6 @@ dependencies = [
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
- "rbitcoin-wire-cache",
  "tokio",
 ]
 
@@ -869,16 +868,8 @@ dependencies = [
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
- "rbitcoin-wire-cache",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "rbitcoin-wire-cache"
-version = "0.1.0"
-dependencies = [
- "rbitcoin-primitives",
 ]
 
 [[package]]

@@ -568,7 +568,7 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.max_run_secs = max_run_secs;
     }
 
-    // Create --datadir (and store/mempool/wire) before opening the store.
+    // Create --datadir (and store/mempool) before opening the store.
     if let Err(e) = config.ensure_datadir() {
         error!("{e}");
         return ExitCode::FAILURE;

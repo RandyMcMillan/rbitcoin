@@ -148,7 +148,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `consensus_reject_bad_structure_and_milestone` | Consensus | Bad merkle/prev + milestone skip |
 | `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md) |
 | `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
-| `wire_ring_and_archive_epoch` | Wire/epoch | Multi-tip ring + finalize soft zone |
+| `archive_epoch_finalize` | Epoch | Finalize soft zone + reopen |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
 | `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
 | `two_node_header_and_block_sync` | P2P (**default / multinode CI**) | Seeder → peer 8-block IBD |

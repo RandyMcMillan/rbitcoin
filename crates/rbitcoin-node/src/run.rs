@@ -8,7 +8,6 @@ use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEve
 use rbitcoin_query::Query;
 use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle};
 use rbitcoin_store::StoreError;
-use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +18,6 @@ use tokio::sync::{broadcast, Notify};
 pub struct NodeHandle {
     pub config: NodeConfig,
     pub query: Query,
-    pub wire: WireRing,
     /// Durable cluster mempool (opened in `run_p2p` and attached to `ChainHub`).
     /// Smoke-only `run_node` leaves this `None`.
     pub mempool: Option<std::sync::Arc<MempoolHub>>,
@@ -128,18 +126,14 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     });
 }
 
-/// Start the node: ensure datadir, open store, prepare tip wire ring.
+/// Start the node: ensure datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let query = Query::open_or_create(config.store_path())?;
-    let wire_dir = config.datadir.join("wire");
-    let wire = WireRing::with_dir(config.wire_depth_blocks, wire_dir)
-        .map_err(|e| NodeError::Config(format!("wire ring: {e}")))?;
     // Mempool is opened in `run_p2p` after ChainHub has `Arc<Query>`.
     Ok(NodeHandle {
         config,
         query,
-        wire,
         mempool: None,
     })
 }

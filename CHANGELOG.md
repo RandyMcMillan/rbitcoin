@@ -9,6 +9,12 @@ before 1.0).
 
 ## [Unreleased]
 
+### Removed
+
+- **`rbitcoin-wire-cache`:** unused tip wire-format ring crate. Node no longer
+  opens `{datadir}/wire`. Reconstruct + body queue + peer wire serve tip/reorg.
+  On-disk `archive_epoch.wire_depth` bytes stay unread.
+
 ### Changed
 
 - **Agent delivery:** plans land on a worktree topic branch as many small

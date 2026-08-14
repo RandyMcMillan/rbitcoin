@@ -104,7 +104,7 @@ a LevelDB bag.
 - **Historical blocks** are rebuilt from Class A (zip `txout` + `inwit`) rather
   than kept forever as raw wire `blk` files.
 - Tip serve / reorg uses the **in-RAM body queue** and **peer wire**.
-  `{datadir}/wire` is unused (opened, never filled).
+  There is no on-disk tip wire ring (`rbitcoin-wire-cache` is gone).
 - **Epoch finalize** fsyncs buried archive prefixes in steady state; IBD itself
   does not promise Core-class durability mid-catch-up.
 

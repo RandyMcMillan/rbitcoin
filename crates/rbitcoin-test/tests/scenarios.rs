@@ -21,7 +21,6 @@ use rbitcoin_test::{
     assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, smoke_crate_names,
     TestDatadir,
 };
-use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
 
 /// This toolchain's `ExitCode` lacks `PartialEq`; compare via Debug.
@@ -68,21 +67,12 @@ fn node_cli_and_surface_smoke() {
     let file = td.path().join("blocked");
     std::fs::write(&file, b"nope").unwrap();
     assert!(run_node(NodeConfig::default().with_datadir(file)).is_err());
-    let cfg = NodeConfig {
-        wire_depth_blocks: 0,
-        archive_durability: true,
-        ..NodeConfig::default().with_datadir(td.path().join("w0"))
-    };
-    let h = run_node(cfg).unwrap();
-    assert_eq!(h.wire.depth(), 0);
-    h.shutdown().unwrap();
 
     // Placeholder / net surface
     let names = smoke_crate_names();
     assert!(names.contains(&"rbitcoin-store"));
     assert!(names.contains(&"rbitcoin-consensus"));
-    let ring = WireRing::new(100);
-    assert!(ring.is_empty());
+    assert!(!names.iter().any(|n| n.contains("wire-cache")));
     assert!(!Milestone::NONE.skips_scripts_at(0));
     assert!(Milestone { height: 10 }.skips_scripts_at(5));
     assert_eq!(
@@ -1732,74 +1722,27 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     assert_eq!(again, tip_fk);
 }
 
-// ─── Phase 6: wire ring + archive epoch ─────────────────────────────────────
+// ─── Archive epoch finalize (no tip wire ring) ───────────────────────────────
 
 #[test]
-fn wire_ring_and_archive_epoch() {
-    use bitcoin::consensus::Encodable;
-    use rbitcoin_wire_cache::WireRing;
-
+fn archive_epoch_finalize() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
     let params = ChainParams::regtest();
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
 
-    let wire_dir = td.path().join("wire");
-    let ring = WireRing::with_dir(3, &wire_dir).unwrap();
-    assert!(ring.is_empty());
-
     let mut tip = genesis.block_hash();
     let mut tip_time = genesis.header.time;
-    let mut blocks = vec![genesis.clone()];
     for h in 1..=5u32 {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
         accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
-        let mut wire = Vec::new();
-        b.consensus_encode(&mut wire).unwrap();
-        let prev = b.header.prev_blockhash.to_byte_array();
-        ring.push_tip(h, b.block_hash().to_byte_array(), prev, wire)
-            .unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
-        blocks.push(b);
     }
-    // depth 3 → keep heights 3,4,5 (max_height-2..=max)
-    assert!(!ring.contains_height(1));
-    assert!(ring.contains_height(5));
-    assert!(ring
-        .get_by_hash(&blocks[5].block_hash().to_byte_array())
-        .is_some());
 
-    // Competing tip at height 5 (same parent as block 5) — both retained.
-    let fork = mine_regtest_block(
-        blocks[4].block_hash(),
-        blocks[4].header.time + 601,
-        5,
-        vec![],
-    );
-    assert_ne!(fork.block_hash(), blocks[5].block_hash());
-    let mut fork_wire = Vec::new();
-    fork.consensus_encode(&mut fork_wire).unwrap();
-    ring.push(
-        5,
-        fork.block_hash().to_byte_array(),
-        fork.header.prev_blockhash.to_byte_array(),
-        fork_wire,
-        true,
-    )
-    .unwrap();
-    let at5 = ring.get_all_at_height(5);
-    assert_eq!(at5.len(), 2, "both fork tips at height 5 must be held");
-    assert!(ring.contains_hash(&fork.block_hash().to_byte_array()));
-    assert!(ring.contains_hash(&blocks[5].block_hash().to_byte_array()));
-
-    // Finalize through height 4 → drop wire ≤ 4 (both tips at 5 remain)
     q.set_archive_mode(true).unwrap();
     q.finalize_through(4).unwrap();
-    ring.drop_through(4).unwrap();
-    assert!(!ring.contains_height(4));
-    assert_eq!(ring.get_all_at_height(5).len(), 2);
     let ep = q.archive_epoch();
     assert!(ep.archive_mode);
     assert_eq!(ep.finalized_height, Some(4));
@@ -1808,9 +1751,6 @@ fn wire_ring_and_archive_epoch() {
 
     let q2 = Query::open_or_create(td.store_path()).unwrap();
     assert_eq!(q2.archive_epoch().finalized_height, Some(4));
-
-    let ring2 = WireRing::with_dir(3, &wire_dir).unwrap();
-    assert_eq!(ring2.get_all_at_height(5).len(), 2);
 }
 
 #[test]

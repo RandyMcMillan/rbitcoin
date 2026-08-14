@@ -122,6 +122,8 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 
 At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
+`pin_txid%` is lookup `txid→create_fk` from live pins vs `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
+
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next claim-ready body. Tip-batch getdata races up to 4 peers
 (preferring faster live rates) and re-races after ~6s without wire. WARN

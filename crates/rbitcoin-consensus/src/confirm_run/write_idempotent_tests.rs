@@ -1207,6 +1207,127 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Range-fill this window is `PIN_NEW`, not `PIN_CACHE_BODY` / `warm.already`.
+///
+/// Adopt 1 + cold-range 2 → `already=1` (cache), not 3. `pin_hit%` is
+/// `1/(1+2)=33`, not “we just loaded them.”
+#[test]
+fn pin_range_fill_does_not_count_as_cache_hit() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, BatchParents, PipelineParentStore, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-hit-honest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let mk_parent = |tag: u8| {
+        let mut tid = [0u8; 32];
+        tid[0] = tag;
+        tid[1] = 0xee;
+        (
+            TxRecord {
+                txid: tid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![tag], vec![])],
+            vec![OutputRecord::unspent(1000 + tag as i64, vec![0x51, tag])],
+        )
+    };
+    let items = [mk_parent(1), mk_parent(2), mk_parent(3)];
+    let fks = q.store().txs.put_full_batch_indexed(&items, true).unwrap();
+    assert_eq!(fks.len(), 3);
+    let mut ranges = Vec::new();
+    for fk in &fks {
+        ranges.push(q.store().tx_body_range(*fk).unwrap());
+    }
+
+    // Live pin for parent 0 only (same Weak lifecycle as outs share).
+    let store = Arc::new(PipelineParentStore::new());
+    let mut keep = BatchParents::with_store(Arc::clone(&store), 1);
+    keep.insert_owned(
+        fks[0],
+        items[0].0.clone(),
+        vec![(0, items[0].2[0].clone())],
+        vec![0],
+        Some(false),
+        Some(ranges[0]),
+        Vec::new(),
+    );
+    keep.publish_to_store();
+
+    let spend_tx = TxRecord {
+        txid: [0x5cu8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 3,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_ins: Vec<InputRecord> = (0..3)
+        .map(|i| InputRecord {
+            prev_txid: items[i].0.txid,
+            create_fk: fks[i],
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        })
+        .collect();
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins,
+    )];
+    plan.planned_fks = vec![Fk(100)];
+    for i in 0..3 {
+        if let Some(id) = fks[i].get() {
+            plan.external_parent_ranges.insert(id, ranges[i]);
+            plan.external_parent_txids.insert(id, items[i].0.txid);
+        }
+    }
+
+    let (_parents, _thin, warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &ParentPinStamp::from_plan(&plan),
+        &[],
+        &[],
+        None,
+        Some(&store),
+    )
+    .expect("adopt 1 + range-fill 2");
+    assert_eq!(warm.parents, 3);
+    assert_eq!(
+        warm.already, 1,
+        "range-fills must not increment already / PIN_CACHE_BODY"
+    );
+    drop(keep);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Multi-out parent: ensure/pin keep only spent need-vouts (no n_out expand).
 #[test]
 fn ensure_external_sparse_need_not_full_output_count() {

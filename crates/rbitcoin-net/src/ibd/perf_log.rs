@@ -1214,7 +1214,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
     // Load stage detail: plan batch + pin mix + assemble.
-    // pin_hit% = plan / (plan+cold) for this window's pin path mix.
+    // pin_hit% = PIN_CACHE_BODY / (PIN_CACHE_BODY + PIN_NEW).
+    // CACHE_BODY is adopt / plan / in-flight / same-batch only — this
+    // window's cold range-fills increment PIN_NEW, not cache.
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
         let tot = hits.saturating_add(s.load_pin_new);
@@ -1953,8 +1955,15 @@ mod tests {
         assert!(line.contains("wire_arc="), "{line}");
         assert!(line.contains("prepare="), "{line}");
         assert!(line.contains("pin_win=40ms"), "{line}");
-        // pin_hit% = 8/(8+12) = 40.
+        // pin_hit% = cache / (cache+new). Cache is adopt/plan reuse only
+        // (this-window range-fills are pin_new). 8/(8+12)=40; 1+2 → 33.
         assert!(line.contains("pin_hit%=40"), "{line}");
+        s.load_pin_cache_body = 1;
+        s.load_pin_new = 2;
+        let line33 = format_info(&s);
+        assert!(line33.contains("pin_hit%=33"), "{line33}");
+        s.load_pin_cache_body = 8;
+        s.load_pin_new = 12;
         assert!(!line.contains("denserels_hit%"), "{line}");
         assert!(line.contains("cold_io=14ms"), "{line}");
         // I1–I4 fields present with zero path counts when unset.

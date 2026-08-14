@@ -783,12 +783,8 @@ pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
 /// Segmented `tx.head` occupancy for IBD size logs.
 ///
 /// Name is historical (`HeadResizeSizeSnapshot`); there is no shadow resize.
-/// `shadow_*` fields are always zero (compat with older size-log parsers).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HeadResizeSizeSnapshot {
-    /// Always false — segment roll is synchronous on insert.
-    pub active: bool,
-    pub cursor: u64,
     pub class_a_n: u64,
     pub primary_bits: u32,
     pub primary_slots: u64,
@@ -796,12 +792,6 @@ pub struct HeadResizeSizeSnapshot {
     pub primary_occupied: u64,
     /// Logical size of one segment head file (`slots × entry_bytes`).
     pub primary_body_bytes: u64,
-    /// Deprecated (always 0) — was mono-head shadow geometry.
-    pub shadow_bits: u32,
-    pub shadow_slots: u64,
-    pub shadow_entry_b: u8,
-    pub shadow_occupied: u64,
-    pub shadow_body_bytes: u64,
     pub segment_count: u64,
     pub sealed_segments: u64,
     /// In-RAM sealed fuse8 fingerprints (process heap).

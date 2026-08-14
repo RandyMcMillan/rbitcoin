@@ -943,27 +943,6 @@ pub mod class_c_phase_stats {
     }
 }
 
-/// Connect prevout resolution counters (reset by the IBD sampler).
-///
-/// Coarse hit counts only. Time splits live in consensus `confirm_phase_stats`
-/// (`ASM_PREV_*` / `asm_prev_us_per_in` on `ibd: perf`).
-pub mod connect_prevout_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    pub static WAVE_HIT: AtomicU64 = AtomicU64::new(0);
-    pub static CLASS_A_HIT: AtomicU64 = AtomicU64::new(0);
-    pub static STORE_MISS: AtomicU64 = AtomicU64::new(0);
-
-    /// `(wave_hit, class_a_hit, store_miss)` then reset.
-    pub fn sample_and_reset() -> (u64, u64, u64) {
-        (
-            WAVE_HIT.swap(0, Ordering::Relaxed),
-            CLASS_A_HIT.swap(0, Ordering::Relaxed),
-            STORE_MISS.swap(0, Ordering::Relaxed),
-        )
-    }
-}
-
 /// Wire-rebuild body load counters (IBD sampler).
 ///
 /// Historical name `wave_fill_stats` — only store body decode remains live.
@@ -1712,7 +1691,14 @@ impl Query {
 
     /// Output `vout` of a tx row (run-addressed).
     pub fn tx_output(&self, tx: &TxRecord, vout: u32) -> Result<OutputRecord, QueryError> {
-        self.tx_output_attributed(tx, vout, false)
+        if vout >= tx.output_count {
+            return Err(StoreError::NotFound);
+        }
+        // Prefer full-run cache via fk when we know it (txid→fk process cache).
+        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
+            return self.tx_output_at_fk(fk, tx, vout);
+        }
+        Err(StoreError::NotFound)
     }
 
     /// Output at `vout` for a known create fk (packed Class A works without head).
@@ -1722,51 +1708,12 @@ impl Query {
         tx: &TxRecord,
         vout: u32,
     ) -> Result<OutputRecord, QueryError> {
-        self.tx_output_at_fk_attributed(create_fk, tx, vout, false)
-    }
-
-    /// Like [`Self::tx_output`] but records connect cold-path counters when
-    /// `count_connect` is true.
-    ///
-    /// Packed rows without `tx.head` need [`Self::tx_output_at_fk_attributed`].
-    pub fn tx_output_attributed(
-        &self,
-        tx: &TxRecord,
-        vout: u32,
-        count_connect: bool,
-    ) -> Result<OutputRecord, QueryError> {
-        if vout >= tx.output_count {
-            return Err(StoreError::NotFound);
-        }
-        // Prefer full-run cache via fk when we know it (txid→fk process cache).
-        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            return self.tx_output_at_fk_attributed(fk, tx, vout, count_connect);
-        }
-        Err(StoreError::NotFound)
-    }
-
-    /// Packed output load by known create fk + optional connect counters.
-    pub fn tx_output_at_fk_attributed(
-        &self,
-        create_fk: Fk,
-        tx: &TxRecord,
-        vout: u32,
-        count_connect: bool,
-    ) -> Result<OutputRecord, QueryError> {
-        use std::sync::atomic::Ordering;
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
         // Packed Class A — one body IO.
         let (_, _, outs) = self.store.get_tx_full(create_fk)?;
-        let out = outs
-            .get(vout as usize)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if count_connect {
-            connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(out)
+        outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
     }
 
     pub fn put_spend(
@@ -2257,19 +2204,14 @@ mod tests {
         assert_eq!(lp.pin_new_n, 9);
         assert_eq!(confirm_load_stats::LastPinPhases::ms(2_000_000), 2);
 
-        // class_c / connect_prevout counters are process-global; exercise the
-        // APIs without exact equality (parallel tests may sample/reset between).
+        // class_c counters are process-global; exercise the APIs without exact
+        // equality (parallel tests may sample/reset between).
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
         class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);
         class_c_phase_stats::TIP_NS.store(3, AtomicOrdering::Relaxed);
         let _ = class_c_phase_stats::sample_and_reset();
         let _ = class_c_phase_stats::sample_sh_sub_and_reset();
         let _ = class_c_phase_stats::sample_sh_collect_src_and_reset();
-
-        connect_prevout_stats::WAVE_HIT.store(1, AtomicOrdering::Relaxed);
-        connect_prevout_stats::CLASS_A_HIT.store(2, AtomicOrdering::Relaxed);
-        connect_prevout_stats::STORE_MISS.store(3, AtomicOrdering::Relaxed);
-        let _ = connect_prevout_stats::sample_and_reset();
 
         wave_fill_stats::add_count(&wave_fill_stats::BODY_STORE, 2);
         wave_fill_stats::add(&wave_fill_stats::BODY_STORE_NS, 9);
@@ -2765,7 +2707,7 @@ mod tests {
         assert!(q.tx_input(&trec, 0).is_ok());
         assert!(q.tx_output(&trec, 0).is_ok());
         assert!(q.tx_input(&trec, 99).is_err());
-        assert!(q.tx_output_attributed(&trec, 0, true).is_ok());
+        assert!(q.tx_output(&trec, 0).is_ok());
 
         // confirm_blocks_run errors: non-contiguous, wrong first height, null fk.
         assert!(q
@@ -2864,7 +2806,7 @@ mod tests {
             output_start_fk: Fk::NULL,
             output_count: 1,
         };
-        assert!(q.tx_output_attributed(&fake, 0, false).is_err());
+        assert!(q.tx_output(&fake, 0).is_err());
 
         // disconnect again until empty-ish
         while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {

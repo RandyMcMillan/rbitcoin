@@ -1730,19 +1730,12 @@ impl TxTable {
         let occ = self.head.occupied();
         let body_bytes = slots.saturating_mul(u64::from(self.head.entry_bytes()));
         HeadResizeSizeSnapshot {
-            active: false,
-            cursor: 0,
             class_a_n: n,
             primary_bits: bits,
             primary_slots: slots,
             primary_entry_b: self.head.entry_bytes(),
             primary_occupied: occ,
             primary_body_bytes: body_bytes,
-            shadow_bits: 0,
-            shadow_slots: 0,
-            shadow_entry_b: 0,
-            shadow_occupied: 0,
-            shadow_body_bytes: 0,
             segment_count: self.head.segment_count() as u64,
             sealed_segments: self.head.sealed_segment_count() as u64,
             fuse8_bytes: self.head.sealed_fuse_resident_bytes(),

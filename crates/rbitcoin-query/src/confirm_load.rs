@@ -528,7 +528,6 @@ impl Query {
         crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok((st, batch_parents, batch_thin, batch_bodies))
     }
-
 }
 
 /// True when `fks` is empty or non-decreasing by Class A id (archive order).

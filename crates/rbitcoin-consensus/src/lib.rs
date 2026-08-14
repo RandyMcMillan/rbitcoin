@@ -387,8 +387,7 @@ pub mod confirm_phase_stats {
     /// cold_ns, cold_n, fk_ns)`.
     #[inline]
     #[allow(clippy::type_complexity)]
-    pub fn sample_assemble_prevout_detail_and_reset(
-    ) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn sample_assemble_prevout_detail_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             ASM_IN_N.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_NS.swap(0, Ordering::Relaxed),

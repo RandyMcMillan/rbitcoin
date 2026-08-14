@@ -6,10 +6,9 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop whole layers whose pack `max_height` is already on the
-//! height fence (`fence_tip >= max_height`). Unconfirmed planned creates stay
-//! in-flight even after `tx.head` drain and after `confirmed[]` HWM jumps
-//! (mainnet 931147 / 933474 / 945952).
+//! **Prune:** drop a layer only when leftover TipOnly would accept those
+//! creates: fence `covers_fk_span` of the pack's fks (not max height alone).
+//! Pending write-behind is accepted without a fence. Mainnet 950545.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -27,6 +26,9 @@ pub struct InFlightLayer {
     outs: U64Map<CreatePin>,
     /// Highest block height in this pack. [`None`] = untagged (tip prune keeps it).
     max_height: Option<u32>,
+    /// Inclusive create-fk span (leftover-ready prune).
+    fk_lo: Option<u64>,
+    fk_hi: Option<u64>,
 }
 
 impl InFlightLayer {
@@ -34,16 +36,22 @@ impl InFlightLayer {
     pub fn from_plan_pins<'a>(pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>) -> Self {
         let mut creates = HashMap::new();
         let mut outs = U64Map::default();
+        let mut fk_lo: Option<u64> = None;
+        let mut fk_hi: Option<u64> = None;
         for (fk, pin) in pins {
             creates.insert(pin.0.txid, fk);
             if let Some(id) = fk.get() {
                 outs.insert(id, Arc::clone(pin));
+                fk_lo = Some(fk_lo.map_or(id, |l| l.min(id)));
+                fk_hi = Some(fk_hi.map_or(id, |h| h.max(id)));
             }
         }
         Self {
             creates,
             outs,
             max_height: None,
+            fk_lo,
+            fk_hi,
         }
     }
 
@@ -60,14 +68,30 @@ impl InFlightLayer {
     /// txid→fk here bridges the gap without requiring full CreatePin outs.
     pub fn from_txid_fks(pairs: impl IntoIterator<Item = ([u8; 32], Fk)>) -> Self {
         let mut creates = HashMap::new();
+        let mut fk_lo: Option<u64> = None;
+        let mut fk_hi: Option<u64> = None;
         for (txid, fk) in pairs {
             creates.insert(txid, fk);
+            if let Some(id) = fk.get() {
+                fk_lo = Some(fk_lo.map_or(id, |l| l.min(id)));
+                fk_hi = Some(fk_hi.map_or(id, |h| h.max(id)));
+            }
         }
         Self {
             creates,
             outs: U64Map::default(),
             max_height: None,
+            fk_lo,
+            fk_hi,
         }
+    }
+
+    /// Leftover TipOnly would accept every create in this layer.
+    fn leftover_would_accept(&self, fence: &rbitcoin_store::HeightFence) -> bool {
+        let (Some(lo), Some(hi)) = (self.fk_lo, self.fk_hi) else {
+            return false;
+        };
+        fence.covers_fk_span(lo, hi)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,6 +123,19 @@ impl InFlightLog {
             return;
         }
         self.layers.push(Arc::new(layer));
+    }
+
+    /// Drop layers leftover TipOnly would accept (`covers_fk_span`).
+    ///
+    /// Max fence height alone is not enough (hole / past last run). Untagged
+    /// or empty-span layers stay.
+    pub fn prune_if_leftover_ready(&mut self, fence: &rbitcoin_store::HeightFence) {
+        if self.layers.is_empty() {
+            return;
+        }
+        self.layers
+            .retain(|layer| !layer.leftover_would_accept(fence));
+        self.layers.shrink_to_fit();
     }
 
     /// Drop packs whose heights are already on the fence. `None` keeps all.
@@ -322,6 +359,42 @@ mod tests {
 
         log.prune_through_tip(Some(6));
         assert!(log.snapshot().is_empty());
+    }
+
+    /// fence_tip >= max_height is not leftover-ready when the pack's fks sit
+    /// in a hole / past the last run (mainnet 950545 leftover 1752/1751).
+    #[test]
+    fn prune_keeps_layer_when_fence_tip_covers_height_not_fks() {
+        use rbitcoin_store::{FenceRun, HeightFence};
+        let mut log = InFlightLog::new();
+        let p = pin(10);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2));
+        let fence = HeightFence::from_runs(vec![
+            FenceRun {
+                first_fk: 1,
+                count: 2,
+                height: 0,
+            },
+            FenceRun {
+                first_fk: 20,
+                count: 3,
+                height: 2,
+            },
+        ]);
+        assert_eq!(fence.max_height(), Some(2));
+        assert!(!fence.covers_fk_span(10, 10));
+        log.prune_if_leftover_ready(&fence);
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "must not prune until leftover TipOnly would accept these fks"
+        );
+        let covered = HeightFence::from_runs(vec![FenceRun {
+            first_fk: 10,
+            count: 1,
+            height: 2,
+        }]);
+        log.prune_if_leftover_ready(&covered);
+        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
     }
 
     #[test]

@@ -34,6 +34,12 @@ before 1.0).
 
 ### Fixed
 
+- **Leftover pending needs no fence; in-flight prune waits for fk span:**
+  write-behind `pending_fk` is already a Class A identity — TipOnly leftover
+  no longer requires `height_of`. In-flight drops a layer only when
+  `covers_fk_span` of that pack's create fks (not fence max height).
+  Mainnet **950545** `leftover_n=1752 hit=1751` after PR #37.
+
 - **Class C open repair is a fence complement, not a full-bit walk:**
   `Query::open` revalidates the tip window first (last six heights now also
   require those `header_txs` runs to be all-strong), rebuilds the fence on

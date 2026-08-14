@@ -296,11 +296,15 @@ impl Store {
         self.fence().max_connected_fk()
     }
 
+    /// Clone of the RAM fence (leftover / in-flight prune).
+    pub fn height_fence_snapshot(&self) -> crate::height_fence::HeightFence {
+        self.fence().clone()
+    }
+
     /// Highest height whose Class A run is on the RAM fence (`None` if empty).
     ///
-    /// Leftover TipOnly accepts a create iff [`HeightFence::height_of`] is
-    /// `Some`. In-flight may drop a pack only when this covers `max_height`.
-    /// `tip_height` (`confirmed[]` HWM) can lead this by one `set_many`.
+    /// Max height on the fence. In-flight prune also requires
+    /// [`HeightFence::covers_fk_span`] of the pack's fks.
     pub fn fence_tip_height(&self) -> Option<u32> {
         self.fence().max_height()
     }

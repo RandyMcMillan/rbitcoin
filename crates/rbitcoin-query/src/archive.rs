@@ -550,12 +550,33 @@ impl Query {
         // Cheap TipOnly (open head + ages ≤3 sealed). Never treat a leftover as Corrupt.
         let t_head = Instant::now();
         if !need_head.is_empty() {
-            let leftover_pend = need_head
-                .iter()
-                .filter(|t| self.store.txs.pending_fk(t).is_some())
-                .count() as u64;
+            // Write-behind is Class A identity. Bind it here without a fence
+            // so drain ∥ Class C cannot miss after in-flight prune (950545).
+            // TipOnly batch below still fence-gates pending (BIP30).
+            let mut leftover_pend = 0u64;
+            let mut still_need: Vec<[u8; 32]> = Vec::with_capacity(need_head.len());
+            for t in need_head {
+                if let Some(fk) = self.store.txs.pending_fk(&t) {
+                    if let Ok(range) = self.store.txs.body_range(fk) {
+                        leftover_pend = leftover_pend.saturating_add(1);
+                        resolved.insert(t, fk);
+                        head_hit_n = head_hit_n.saturating_add(1);
+                        if let Some(id) = fk.get() {
+                            external_parent_ranges.insert(id, range);
+                            external_parent_txids.insert(id, t);
+                        }
+                        continue;
+                    }
+                }
+                still_need.push(t);
+            }
+            need_head = still_need;
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            let hits = if need_head.is_empty() {
+                Vec::new()
+            } else {
+                self.store.get_fk_by_txid_batch(&need_head)?
+            };
             let first_fks = self.store.txs.head_first_fks_snapshot();
             let mut age0 = 0u64;
             let mut age3 = 0u64;
@@ -958,6 +979,12 @@ mod tests {
             "plan stamp must not last-chance-fill leftovers"
         );
         assert!(
+            prod.contains("pending_fk")
+                && prod.find("pending_fk").unwrap()
+                    < prod.find("get_fk_by_txid_batch(&need_head)").unwrap(),
+            "leftover must bind pending without fence before TipOnly batch"
+        );
+        assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
             "confirm plan must TipOnly-batch leftovers"
         );
@@ -1172,6 +1199,51 @@ mod tests {
         q.archive_commit_plan(plan_a).unwrap();
         q.archive_commit_plan(plan_b).unwrap();
         assert_eq!(q.tx_body_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After commit, parent is pending (not fence-connected). Leftover must
+    /// stamp from pending without height_of (950545).
+    #[test]
+    fn leftover_stamps_pending_parent_without_fence() {
+        let (dir, q) = temp_query("leftover-pending");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        q.archive_commit_plan(plan_a).unwrap();
+        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
+        assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
+        assert!(q.store().txs.pending_fk(&parent_txid).is_some());
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xef;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
+            .expect("pending leftover must stamp without fence");
+        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

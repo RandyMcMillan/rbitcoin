@@ -418,6 +418,9 @@ fn apply_pending_hits(
         let Some(fk) = table.pending_fk(txid) else {
             continue;
         };
+        // Confirm leftover binds pending *before* this TipOnly machine
+        // (archive.rs). Here fence still applies so BIP30 / connected
+        // resolve does not treat write-behind as a confirmed instance.
         if let Some(h) = heights {
             if h.height_of(fk).is_none() {
                 continue;

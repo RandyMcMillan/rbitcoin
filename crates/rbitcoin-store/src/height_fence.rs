@@ -167,6 +167,29 @@ impl HeightFence {
         out
     }
 
+    /// True when every create fk in inclusive `lo..=hi` sits in a fence run.
+    ///
+    /// In-flight prune: leftover TipOnly accepts a span only if this is true
+    /// (max height on the fence is not enough — holes / past last run end).
+    pub fn covers_fk_span(&self, lo: u64, hi: u64) -> bool {
+        if lo == 0 || hi < lo || self.runs.is_empty() {
+            return false;
+        }
+        let mut need = lo;
+        while need <= hi {
+            let i = self.runs.partition_point(|r| r.first_fk <= need);
+            if i == 0 {
+                return false;
+            }
+            let r = self.runs[i - 1];
+            if !r.contains(need) {
+                return false;
+            }
+            need = r.first_fk.saturating_add(u64::from(r.count));
+        }
+        true
+    }
+
     /// Highest confirmed height present on any run (`None` if empty).
     ///
     /// In-flight prune HWM. Distinct from `confirmed[]` length (`tip_height`):
@@ -274,6 +297,21 @@ mod tests {
         let f = HeightFence::from_runs(vec![run(1, 2, 0), run(10, 3, 2)]);
         assert_eq!(f.max_height(), Some(2));
         assert_eq!(f.max_connected_fk(), 12);
+    }
+
+    #[test]
+    fn height_fence_covers_fk_span() {
+        assert!(!HeightFence::empty().covers_fk_span(1, 1));
+        let f = HeightFence::from_runs(vec![run(1, 2, 0), run(6, 3, 1)]);
+        assert!(f.covers_fk_span(1, 2));
+        assert!(f.covers_fk_span(6, 8));
+        assert!(!f.covers_fk_span(3, 5), "hole is not leftover-visible");
+        assert!(
+            !f.covers_fk_span(1, 8),
+            "span that includes a hole is not covered"
+        );
+        assert!(!f.covers_fk_span(8, 10), "past last run end");
+        assert!(f.covers_fk_span(7, 7));
     }
 
     #[test]

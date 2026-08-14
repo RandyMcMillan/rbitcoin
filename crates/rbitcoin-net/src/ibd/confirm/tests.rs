@@ -43,11 +43,10 @@ fn prune_inflight_keeps_until_tip_covers_height() {
     assert_eq!(log.layer_count(), 0);
 }
 
-/// Production prune_committed must drop on fence coverage, not confirmed HWM.
-/// `set_many` then leftover `get_fk_by_txid_batch` holding the fence lock made
-/// tip lead fence (mainnet 945952).
+/// Production prune_committed must drop only when leftover would accept the
+/// pack's fks (`covers_fk_span`), not fence max height alone (950545).
 #[test]
-fn prune_committed_uses_fence_tip_not_confirmed_hwm() {
+fn prune_committed_uses_leftover_ready_not_fence_tip() {
     let src = include_str!("mod.rs");
     let prune = src
         .split("fn prune_committed")
@@ -55,14 +54,12 @@ fn prune_committed_uses_fence_tip_not_confirmed_hwm() {
         .and_then(|s| s.split("fn publish_mem_stats").next())
         .expect("prune_committed");
     assert!(
-        prune.contains("fence_tip_height"),
-        "in-flight prune must use fence coverage, not confirmed[] HWM: {prune}"
+        prune.contains("prune_if_leftover_ready"),
+        "prune must use leftover-ready (fk span), not fence_tip alone: {prune}"
     );
     assert!(
-        prune.contains("prune_through_tip(hub.query.fence_tip_height())")
-            || prune.contains("prune_through_tip(self.fence")
-            || prune.contains("prune_through_tip(hub.query.store().fence_tip_height())"),
-        "prune_through_tip must take fence_tip_height: {prune}"
+        !prune.contains("prune_through_tip"),
+        "height-only prune is not leftover-ready: {prune}"
     );
 }
 

@@ -2,8 +2,9 @@
 
 Active on the four-stage pipeline (no fifth OS thread). IBD **lookup** is the
 BQ-ahead TipOnly `head_fk` wave; **load** claims resolve-complete heights and
-stamps from BQ hits (no external `head_fk`). One-shot `confirm_wire_run` /
-`accept_branch` still stamps in-process with TipOnly.
+stamps from BQ hits plus leftover TipOnly `tx.head` (open head / ages ≤3
+sealed). Remaining externals after the wave are expected. One-shot
+`confirm_wire_run` / `accept_branch` still stamps in-process with TipOnly.
 
 See the lookup-BQ-ahead plan (session) and `confirm_bq_resolve_wave`.
 

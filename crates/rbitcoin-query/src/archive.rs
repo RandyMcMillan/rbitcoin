@@ -356,7 +356,6 @@ impl Query {
             &crate::InFlightView::empty(),
             None,
             None,
-            true,
             false,
         )
     }
@@ -377,11 +376,13 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, true, false)
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, false)
     }
 
     /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
-    /// (`txid → create_fk` + range) before `tx.head`.
+    /// (`txid → create_fk` + range) and optional BQ-ahead hits before `tx.head`.
+    /// Remaining externals after those caches take a TipOnly (`tip_only`) or
+    /// TipThenAny batch — they are not an invariant miss.
     pub fn archive_plan_batch_from_store(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
@@ -389,8 +390,7 @@ impl Query {
         in_flight: &crate::InFlightView,
         parent_store: Option<&crate::PipelineParentStore>,
         pre_resolved: Option<&rbitcoin_store::BqParentHits>,
-        allow_head: bool,
-        // Confirm one-shot: true (connected only). archive_block: false.
+        // Confirm: true (connected only). archive_block: false.
         tip_only: bool,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
@@ -553,15 +553,12 @@ impl Query {
         for (id, range) in pin_ranges {
             external_parent_ranges.insert(id, range);
         }
+        // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
+        // Confirm: cheap TipOnly (open head + ages ≤3 sealed). archive_block
+        // may take unconnected rows. Never treat a leftover as Corrupt.
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
-            if !allow_head {
-                return Err(StoreError::Corrupt(
-                    "invariant: external parent missing BQ TipOnly hit",
-                ));
-            }
-            // Confirm: TipOnly. Standalone archive_block may take unconnected rows.
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = if tip_only {
                 self.store.get_fk_by_txid_batch(&need_head)?
@@ -937,6 +934,10 @@ mod tests {
         assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
             "confirm plan must TipOnly-batch leftovers"
+        );
+        assert!(
+            !prod.contains("invariant: external parent missing BQ TipOnly hit"),
+            "leftover parents must TipOnly-head, not forbid as invariant"
         );
         assert!(
             !prod.contains("get_fk_by_txid(&inp.prev_txid)"),
@@ -1407,7 +1408,6 @@ mod tests {
                     &crate::InFlightView::empty(),
                     Some(store.as_ref()),
                     None,
-                    true,
                     false,
                 )
                 .expect("pin-txid stamp");

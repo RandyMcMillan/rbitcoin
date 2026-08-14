@@ -15,11 +15,19 @@ before 1.0).
   external parents for at most **8** ready body-queue heights in one
   `get_fk_by_txid_batch` wave and attaches hits on the BQ record. Load claims
   only resolve-complete heights (soft **8000** inputs, typically 1–3 dense
-  blocks — not a ~32-block pack) and stamps from those hits — no second
-  `tx.head` probe, no `TipThenAny` last-chance on the confirm path. One-shot
-  `accept_branch` / `confirm_wire_run` still stamp in-process with TipOnly.
+  blocks — not a ~32-block pack) and stamps from those hits plus a leftover
+  TipOnly `tx.head` for parents not in live caches (almost all open head; the
+  rest ages ≤3 sealed). No `TipThenAny` last-chance on the confirm path.
+  One-shot `accept_branch` / `confirm_wire_run` still stamp in-process with
+  TipOnly.
 
 ### Fixed
+
+- **Load leftover parents are TipOnly `tx.head`, not an invariant:** after the
+  BQ wave, some externals remain (same-batch / in-flight / not yet in the
+  wave hits). Treating those as `Corrupt("external parent missing BQ TipOnly
+  hit")` rejected a valid mainnet block at 928640 and stalled IBD. Load now
+  TipOnly-heads leftovers; a true miss is still unresolved (not TipThenAny).
 
 - **Lookup nested io_uring on write-behind pending hits:** IBD
   `ibd-confirm-lookup` panicked (`nested thread-local io_uring`) when stamp

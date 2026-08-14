@@ -152,8 +152,8 @@ Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/writ
 
 | Stage | Tokens | What must stay visible |
 |-------|--------|------------------------|
-| **Lookup** | `lookup=` / `lookup_thr` / `stamp_sub` / `lookup_sub` / `head_rd` | claim, resolve, clone, stamp (`struct/prepare/filter/batch/pin_txid/pin_txid%/pin_txid_ms/head_n/head_fk/stamp/finish`), head probe/idx/body; `us/pin_txid` on perf_dbg |
-| **Load** | `load=` / `load_budget` / `pin(` / `assemble=` | pin (`plan` / `cold_range` body+dec / `cold_idx` / adopt / range_fill / contract / publish) + assemble (`prevout` paths, sigop, job) |
+| **Lookup** | `lookup=` / `lookup_thr` / `head_rd` | BQ-ahead TipOnly `head_fk` (`head_n` / blocks-per-wave). `lookup_thr resolve=` is BQ decode in the wave. Does **not** claim. |
+| **Load** | `load=` / `load_budget` / `pin(` / `assemble=` / stamp_sub | claim resolve-complete + structure/stamp from BQ hits (no external `head_fk`) + pin + assemble |
 | **Scripts** | `script=` (`SCRIPT_NS`) | `rbtc-scripts-*` steal verify. Milestone skip is still this stage (near-zero when `check_scripts` is false). |
 | **Write** | `write=` = `write_stage_ms` | table below |
 | **Occupancy** | `loadq` / `scriptq` / `writeq` + `*_hwm`, `thr … busy/wait` | who is the serial pole |

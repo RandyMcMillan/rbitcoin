@@ -357,4 +357,94 @@ mod tests {
         assert!(q.block_queue_is_resolve_complete(2));
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    #[test]
+    fn load_without_bq_hit_is_invariant_not_tipthenany() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+        let cb1 = b1.txdata[0].compute_txid().to_byte_array();
+        q.disconnect_tip().unwrap();
+        let _ = params;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: [0x22; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: rbitcoin_primitives::Fk::NULL,
+                input_count: 1,
+                output_start_fk: rbitcoin_primitives::Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: cb1,
+                create_fk: rbitcoin_primitives::Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(rbitcoin_primitives::Fk(1), vec![child])];
+        let err = q
+            .archive_plan_batch_from_store(
+                &mut need,
+                1,
+                &rbitcoin_query::InFlightView::empty(),
+                None,
+                Some(&rbitcoin_store::BqParentHits::default()),
+                false,
+            )
+            .expect_err("missing BQ hit must not TipThenAny-fill");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invariant: external parent missing BQ TipOnly hit"),
+            "got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn bq_wave_then_forbid_head_confirms_empty_block() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+            .unwrap();
+        confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
+        assert!(q.block_queue_is_resolve_complete(1));
+        let hits = q.block_queue_parent_hits(1).unwrap();
+        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
+            &q,
+            &params,
+            Milestone::NONE,
+            &items,
+            None,
+            Some(&hits),
+            false,
+        )
+        .expect("coinbase-only block needs no external head");
+        let mat = crate::confirm_wire_load_from_plan(
+            &q,
+            &params,
+            Milestone::NONE,
+            stamped,
+            None,
+            &ScriptPreverified::new(),
+        )
+        .expect("load");
+        let ok = crate::confirm_scripts_phase(mat.batch).expect("scripts");
+        crate::confirm_write_phase(&q, &params, Milestone::NONE, ok.batch).expect("write");
+        assert_eq!(q.tip_height().map(|h| h.0), Some(1));
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

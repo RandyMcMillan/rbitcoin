@@ -9,6 +9,15 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
+  external parents for many ready body-queue heights in one
+  `get_fk_by_txid_batch` wave and attaches hits on the BQ record. Load claims
+  only resolve-complete heights and stamps from those hits — no second
+  `tx.head` probe, no `TipThenAny` last-chance on the confirm path. One-shot
+  `accept_branch` / `confirm_wire_run` still stamp in-process with TipOnly.
+
 ### Fixed
 
 - **Lookup nested io_uring on write-behind pending hits:** IBD

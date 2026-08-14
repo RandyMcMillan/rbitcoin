@@ -51,8 +51,9 @@ pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_and_ensure_denserels,
-    confirm_wire_lookup_stamp, ensure_external_parent_denserels_from_plan, DenserelsWarmStats,
-    ParentPinStamp, PlanStampOutcome,
+    confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
+    ensure_external_parent_denserels_from_plan, DenserelsWarmStats, ParentPinStamp,
+    PlanStampOutcome,
 };
 use lookup::{known_create_txid_lookup, stamp_parent_pin_archived};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
@@ -368,6 +369,8 @@ pub fn confirm_wire_load_phase_pipelined(
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
+                    None,
+                    true,
                 )
                 .map_err(ConsensusError::from)?,
             None => query

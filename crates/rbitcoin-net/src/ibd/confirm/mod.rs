@@ -5,7 +5,7 @@ use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::{PlanStampOutcome, WireLoadPipeline};
+use rbitcoin_consensus::WireLoadPipeline;
 use rbitcoin_log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -199,14 +199,14 @@ impl LoadAheadState {
 /// re-claims the same batch (duplicate work).
 pub(crate) struct ConfirmFeed {
     pub(crate) inner: std::sync::Mutex<ConfirmFeedInner>,
-    cv: std::sync::Condvar,
+    pub(crate) cv: std::sync::Condvar,
     stop: AtomicBool,
 }
 
 pub(crate) struct ConfirmFeedInner {
     /// height → (hash, optional wire — normally `None`; body queue holds payloads)
     pub(crate) ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
-    /// Claimed by lookup; not yet written or released. Offer must not re-note.
+    /// Claimed by load; not yet written or released. Offer must not re-note.
     pub(crate) inflight: std::collections::HashSet<u32>,
 }
 
@@ -246,6 +246,10 @@ impl ConfirmFeed {
             }
         }
         self.cv.notify_one();
+    }
+
+    pub(crate) fn notify(&self) {
+        self.cv.notify_all();
     }
 
     /// Return heights to the ready map (optionally with wire bodies).
@@ -411,17 +415,6 @@ fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
     let q = c.load.saturating_add(c.script).saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
-}
-
-/// Lookup-stage output: stamp + pipeline-local parent denserels for load pin.
-struct LookupDone {
-    /// Heights/hashes for feed finish/requeue bookkeeping.
-    heights_hashes: Vec<(u32, BlockHash)>,
-    /// Structure + plan batch (create_fk stamped); head-miss parents carry
-    /// denserels on `ArchiveWritePlan::external_parent_outs`.
-    stamped: PlanStampOutcome,
-    /// In-flight creates/outs for load pin (prior uncommitted batches).
-    pipeline: WireLoadPipeline,
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -873,10 +866,8 @@ pub(crate) mod confirm_thr_stats {
 
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
-/// Lookup (claim + structure + stamp create_fk) → loadq →
-/// load (pin denserels + assemble) → scriptq → scripts → writeq → write.
-/// Overlap: lookup(N+1) head-stamp ∥ load(N) denserels ∥ scripts ∥ write.
-/// Handoff is owned [`PlanStampOutcome`] (pipeline pins only).
+/// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
+/// from BQ hits + pin + assemble) → scriptq → scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
@@ -887,8 +878,7 @@ pub(crate) fn spawn_confirm_engine(
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
     let caps = confirm_queue_caps();
-    // loadq: lookup → load; scriptq: load → scripts; writeq: scripts → write.
-    let (loadq_tx, loadq_rx) = std::sync::mpsc::sync_channel::<LookupDone>(caps.load);
+    // scriptq: load → scripts; writeq: scripts → write.
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
@@ -1219,39 +1209,301 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Load: stamped batches → pin denserels + assemble → scripts.
+    // Load: claim resolve-complete BQ heights → stamp from BQ hits → pin → scripts.
     let hub_load = Arc::clone(&hub);
     let feed_load = Arc::clone(&feed);
     let event_tx_load = event_tx.clone();
     let loop_stats_load = Arc::clone(&loop_stats);
     let queues_load = Arc::clone(&queues);
+    let load_ahead_reset_load = Arc::clone(&load_ahead_reset);
     let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!(
-                "ibd: confirm load on dedicated OS thread (loadq → pin denserels+assemble)"
+                "ibd: confirm load on dedicated OS thread (claim resolve-complete → stamp+pin)"
             );
+            let mut lookup_ahead = LoadAheadState::new(&hub_load);
             loop {
-                let t_recv = Instant::now();
-                let done = match loadq_rx.recv() {
-                    Ok(d) => d,
-                    Err(_) => break,
-                };
-                confirm_thr_stats::add_load_recv_wait(t_recv.elapsed());
-                let n = done.heights_hashes.len();
-                queues_load.note_lookup_recv(n);
                 if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     break;
                 }
+                let t_claim = Instant::now();
+                if load_ahead_reset_load.swap(false, Ordering::AcqRel) {
+                    lookup_ahead.clear_all(&hub_load);
+                }
+                lookup_ahead.prune_committed(&hub_load);
+                let batch: (Vec<(u32, BlockHash, bitcoin::Block)>, u32) = {
+                    let mut g = feed_load.inner.lock().unwrap();
+                    let found: Option<(Vec<(u32, BlockHash, bitcoin::Block)>, u32)> = loop {
+                        if feed_load.stopped() {
+                            drop(g);
+                            drop(mat_tx);
+                            let _ = scripts.join();
+                            return;
+                        }
+                        let tip = hub_load.tip_height();
+                        let tip_h = tip.unwrap_or(0);
+                        let path_lo = if tip.is_none() {
+                            0u32
+                        } else {
+                            tip_h.saturating_add(1)
+                        };
+                        g.ready.retain(|&h, _| h >= path_lo);
+                        g.inflight.retain(|&h| h >= path_lo);
 
-                let plan_ns = done.stamped.work_ns;
-                let heights_hashes = done.heights_hashes;
-                let pipe = done.pipeline;
-                if heights_hashes.is_empty() {
+                        let mut claim_at = path_lo;
+                        let claim_ahead = max_claim_ahead();
+                        while g.inflight.contains(&claim_at)
+                            && claim_at < path_lo.saturating_add(claim_ahead)
+                        {
+                            claim_at = claim_at.saturating_add(1);
+                        }
+                        let claim_start = if claim_at > path_lo.saturating_add(claim_ahead)
+                        {
+                            None
+                        } else if g.inflight.contains(&claim_at) {
+                            None
+                        } else if g.ready.contains_key(&claim_at) {
+                            Some(claim_at)
+                        } else {
+                            None
+                        };
+                        if let Some(expect) = claim_start {
+                            let claim_hi = path_lo.saturating_add(claim_ahead);
+                            let soft_inputs = confirm_batch_max_inputs();
+                            let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
+                            drop(g);
+                            let mut run: Vec<(u32, BlockHash, bitcoin::Block)> =
+                                Vec::with_capacity(hard_blocks.min(32));
+                            let mut sum_inputs = 0u32;
+                            let mut h = expect;
+                            let mut body_missing: Vec<(u32, BlockHash)> = Vec::new();
+                            let t_pack_io = Instant::now();
+                            while run.len() < hard_blocks && h <= claim_hi {
+                                let (hash, opt_wire) = {
+                                    let mut gg = feed_load.inner.lock().unwrap();
+                                    if gg.inflight.contains(&h) {
+                                        break;
+                                    }
+                                    let Some(entry) = gg.ready.get(&h).cloned() else {
+                                        break;
+                                    };
+                                    // BQ-ahead: wait for lookup wave unless test-injected wire.
+                                    if entry.1.is_none()
+                                        && !hub_load.query.block_queue_is_resolve_complete(h)
+                                    {
+                                        break;
+                                    }
+                                    gg.ready.remove(&h);
+                                    entry
+                                };
+                                if hub_load.has_block(&hash) {
+                                    h = h.saturating_add(1);
+                                    continue;
+                                }
+                                let block = if let Some(b) = opt_wire {
+                                    b
+                                } else {
+                                    match load_decode_bq_block(&hub_load, h, &hash) {
+                                        Ok(b) => b,
+                                        Err(PackWireErr::Missing) => {
+                                            body_missing.push((h, hash));
+                                            break;
+                                        }
+                                        Err(PackWireErr::HashMismatch | PackWireErr::Decode) => {
+                                            body_missing.push((h, hash));
+                                            let _ = hub_load.query.block_queue_dequeue_height(h);
+                                            break;
+                                        }
+                                    }
+                                };
+                                let inputs = block_input_count(&block);
+                                {
+                                    let mut gg = feed_load.inner.lock().unwrap();
+                                    gg.inflight.insert(h);
+                                }
+                                run.push((h, hash, block));
+                                sum_inputs = sum_inputs.saturating_add(inputs);
+                                h = h.saturating_add(1);
+                                if pack_stop_after(
+                                    sum_inputs,
+                                    run.len(),
+                                    soft_inputs,
+                                    hard_blocks,
+                                ) {
+                                    break;
+                                }
+                            }
+                            confirm_thr_stats::add_lookup_resolve(t_pack_io.elapsed());
+                            if !body_missing.is_empty() {
+                                for (mh, mhash) in &body_missing {
+                                    let _ = event_tx_load.send(ConfirmEvent::BodyMissing {
+                                        hash: *mhash,
+                                    });
+                                    feed_load.finish(std::iter::once(*mh));
+                                }
+                            }
+                            if !run.is_empty() {
+                                break Some((run, sum_inputs));
+                            }
+                            g = feed_load.inner.lock().unwrap();
+                            continue;
+                        }
+                        let (gg, wait_res) = feed_load
+                            .cv
+                            .wait_timeout(g, Duration::from_millis(20))
+                            .unwrap();
+                        g = gg;
+                        if wait_res.timed_out() {
+                            break None;
+                        }
+                    };
+                    match found {
+                        Some(x) => x,
+                        None => {
+                            confirm_thr_stats::add_load_recv_wait(t_claim.elapsed());
+                            continue;
+                        }
+                    }
+                };
+                confirm_thr_stats::add_load_recv_wait(t_claim.elapsed());
+
+                let (batch, _batch_inputs) = batch;
+                if batch.is_empty() {
                     continue;
                 }
-                let expect_h = heights_hashes[0].0;
+                let expect_h = batch[0].0;
+                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
+                    let req: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
+                        .iter()
+                        .map(|(h, ha, b)| (*h, *ha, Some(b.clone())))
+                        .collect();
+                    feed_load.requeue_wire(&req);
+                    drop(mat_tx);
+                    let _ = scripts.join();
+                    return;
+                }
+
+                let store_path_lo = match hub_load.tip_height() {
+                    None => 0u32,
+                    Some(t) => t.saturating_add(1),
+                };
+                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
+                let use_pipe = pipe.path_lo >= store_path_lo;
+                let wire_batch = batch;
+                let t_clone = Instant::now();
+                let plan_items: Vec<(
+                    rbitcoin_primitives::Height,
+                    std::sync::Arc<bitcoin::Block>,
+                )> = wire_batch
+                    .iter()
+                    .map(|(h, _, w)| {
+                        (
+                            rbitcoin_primitives::Height(*h),
+                            std::sync::Arc::new(w.clone()),
+                        )
+                    })
+                    .collect();
+                confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
+                let mut merged = rbitcoin_store::BqParentHits::default();
+                let mut all_complete = true;
+                for (h, _, _) in &wire_batch {
+                    if !hub_load.query.block_queue_is_resolve_complete(*h) {
+                        all_complete = false;
+                    }
+                    if let Some(hits) = hub_load.query.block_queue_parent_hits(*h) {
+                        merged.extend(hits);
+                    }
+                }
+                // Test-injected wire may skip the wave; one-shot TipOnly then.
+                let allow_head = !all_complete;
+                let t_stamp = Instant::now();
+                let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp_with_hits(
+                    &hub_load.query,
+                    &hub_load.params,
+                    hub_load.milestone,
+                    &plan_items,
+                    if use_pipe { Some(&pipe) } else { None },
+                    if merged.is_empty() {
+                        None
+                    } else {
+                        Some(&merged)
+                    },
+                    allow_head,
+                );
+                confirm_thr_stats::add_load_work(t_stamp.elapsed());
+                let stamped = match plan_res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("confirm cancelled") || feed_load.stopped() {
+                            drop(mat_tx);
+                            let _ = scripts.join();
+                            return;
+                        }
+                        if is_confirm_load_retryable(&msg) {
+                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
+                                wire_batch
+                                    .iter()
+                                    .filter(|(_, ha, _)| !hub_load.has_block(ha))
+                                    .map(|(h, ha, _)| (*h, *ha, None))
+                                    .collect();
+                            feed_load.requeue_wire(&retry);
+                            continue;
+                        }
+                        let first_hash = wire_batch[0].1;
+                        if wire_batch.len() > 1 {
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
+                                wire_batch
+                                    .iter()
+                                    .skip(1)
+                                    .filter(|(_, ha, _)| !hub_load.has_block(ha))
+                                    .map(|(h, ha, _)| (*h, *ha, None))
+                                    .collect();
+                            feed_load.requeue_wire(&tail);
+                        }
+                        feed_load.finish(std::iter::once(expect_h));
+                        lookup_ahead.clear_all(&hub_load);
+                        loop_stats_load
+                            .confirm_reject_stops
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {e}"
+                        );
+                        let _ = event_tx_load.send(ConfirmEvent::Reject {
+                            height: expect_h,
+                            hash: first_hash,
+                            err: msg,
+                        });
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                };
+                if let Some(ref p) = stamped.plan {
+                    if let Some((lh, raw)) = wire_batch
+                        .iter()
+                        .map(|(h, ha, _)| (*h, ha.to_byte_array()))
+                        .max_by_key(|(h, _)| *h)
+                    {
+                        lookup_ahead.note_lookup_ok(&hub_load, p, lh, raw);
+                    }
+                } else {
+                    let hh: Vec<(u32, BlockHash)> = wire_batch
+                        .iter()
+                        .map(|(h, ha, _)| (*h, *ha))
+                        .collect();
+                    lookup_ahead.note_archived_creates(&hub_load, &hh);
+                }
+                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
+                let plan_ns = stamped.work_ns;
+                let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
+                    .iter()
+                    .map(|(h, ha, _)| (*h, *ha))
+                    .collect();
+                let n = heights_hashes.len();
+                queues_load.note_lookup_recv(n);
                 let first_hash = heights_hashes[0].1;
+                let _ = wire_batch;
 
                 struct LiveGuard<'a> {
                     stats: &'a LoopStats,
@@ -1269,7 +1521,7 @@ pub(crate) fn spawn_confirm_engine(
 
                 // Pin denserels (Allow) + assemble using owned stamped plan — no re-lookup.
                 let t_work = Instant::now();
-                let mat_res = hub_load.confirm_wire_load_from_plan(done.stamped, Some(&pipe));
+                let mat_res = hub_load.confirm_wire_load_from_plan(stamped, Some(&pipe));
                 confirm_thr_stats::add_load_work(t_work.elapsed());
                 drop(_live_guard);
 
@@ -1377,507 +1629,75 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-load");
 
-    // Lookup: claim feed → resolve wire → stamp+ensure denserels → loadq.
+    // Lookup: BQ-ahead TipOnly head_fk only (does not claim).
     let queues_lookup = Arc::clone(&queues);
-    let load_ahead_reset_lookup = Arc::clone(&load_ahead_reset);
     let lookup_join = std::thread::Builder::new()
         .name("ibd-confirm-lookup".into())
         .spawn(move || {
-            info!(
-                "ibd: confirm lookup on dedicated OS thread (claim → stamp create_fk → load queue/{})",
-                load_queue_cap()
-            );
-            let mut lookup_ahead = LoadAheadState::new(&hub);
+            info!("ibd: confirm lookup on dedicated OS thread (BQ-ahead TipOnly head_fk)");
+            let _ = queues_lookup;
             loop {
                 if feed.stopped() {
                     break;
                 }
-                // BQ-ahead TipOnly wave: attach hits on unclaimed ready heights
-                // before this thread claims a pack. Load will consume the hits
-                // (Step 3); until then stamp still runs and stays green.
-                {
-                    let t_wave = Instant::now();
-                    let skip: std::collections::HashSet<u32> = {
-                        let g = feed.inner.lock().unwrap();
-                        g.inflight.iter().copied().collect()
-                    };
-                    let tip = hub.tip_height();
-                    let path_lo = if tip.is_none() {
-                        0u32
-                    } else {
-                        tip.unwrap_or(0).saturating_add(1)
-                    };
-                    let mut wave_h: Vec<u32> = hub
-                        .query
-                        .block_queue_list_meta()
-                        .into_iter()
-                        .map(|m| m.height)
-                        .filter(|h| {
-                            *h >= path_lo
-                                && !skip.contains(h)
-                                && !hub.query.block_queue_is_resolve_complete(*h)
-                        })
-                        .collect();
-                    wave_h.sort_unstable();
-                    wave_h.dedup();
-                    if wave_h.len() > rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS {
-                        wave_h.truncate(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
-                    }
-                    if !wave_h.is_empty() {
-                        if let Err(e) = rbitcoin_consensus::confirm_bq_resolve_wave(
-                            &hub.query,
-                            &hub.params,
-                            &wave_h,
-                        ) {
-                            warn!("ibd: bq resolve wave: {e}");
-                        }
-                    }
-                    confirm_thr_stats::add_lookup_other(t_wave.elapsed());
-                }
-                let t_claim = Instant::now();
-                // Packed run: fully decoded wire + total input count (confirm-side).
-                let batch: (Vec<(u32, BlockHash, bitcoin::Block)>, u32) = {
-                    let mut g = feed.inner.lock().unwrap();
-                    let found: Option<(Vec<(u32, BlockHash, bitcoin::Block)>, u32)> = loop {
-                        if feed.stopped() {
-                            drop(g);
-                            drop(loadq_tx);
-                            let _ = load_join.join();
-                            return;
-                        }
-                        let tip = hub.tip_height();
-                        let tip_h = tip.unwrap_or(0);
-                        let path_lo = if tip.is_none() {
-                            0u32
-                        } else {
-                            tip_h.saturating_add(1)
-                        };
-                        g.ready.retain(|&h, _| h >= path_lo);
-                        g.inflight.retain(|&h| h >= path_lo);
-
-                        let mut claim_at = path_lo;
-                        let claim_ahead = max_claim_ahead();
-                        while g.inflight.contains(&claim_at)
-                            && claim_at < path_lo.saturating_add(claim_ahead)
-                        {
-                            claim_at = claim_at.saturating_add(1);
-                        }
-                        let claim_start = if claim_at > path_lo.saturating_add(claim_ahead)
-                        {
-                            None
-                        } else if g.inflight.contains(&claim_at) {
-                            None
-                        } else if g.ready.contains_key(&claim_at) {
-                            Some(claim_at)
-                        } else {
-                            None
-                        };
-                        if let Some(expect) = claim_start {
-                            let claim_hi = path_lo.saturating_add(claim_ahead);
-                            let soft_inputs = confirm_batch_max_inputs();
-                            let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
-                            // Online pack: BQ load+decode+count one height at a time.
-                            // Drop feed lock while doing IO so other note/finish continue.
-                            drop(g);
-                            let mut run: Vec<(u32, BlockHash, bitcoin::Block)> =
-                                Vec::with_capacity(hard_blocks.min(32));
-                            let mut sum_inputs = 0u32;
-                            let mut h = expect;
-                            let mut body_missing: Vec<(u32, BlockHash)> = Vec::new();
-                            let t_pack_io = Instant::now();
-                            while run.len() < hard_blocks && h <= claim_hi {
-                                let (hash, _opt_wire) = {
-                                    let mut gg = feed.inner.lock().unwrap();
-                                    if gg.inflight.contains(&h) {
-                                        break;
-                                    }
-                                    let Some(entry) = gg.ready.remove(&h) else {
-                                        break;
-                                    };
-                                    entry
-                                };
-                                if hub.has_block(&hash) {
-                                    h = h.saturating_add(1);
-                                    continue;
-                                }
-                                // Prefer test-injected wire; production loads from BQ.
-                                let block = if let Some(b) = _opt_wire {
-                                    b
-                                } else {
-                                    match load_decode_bq_block(&hub, h, &hash) {
-                                        Ok(b) => b,
-                                        Err(PackWireErr::Missing) => {
-                                            body_missing.push((h, hash));
-                                            break;
-                                        }
-                                        Err(PackWireErr::HashMismatch | PackWireErr::Decode) => {
-                                            body_missing.push((h, hash));
-                                            // Bad wire for this height — drop BQ rec so densify re-gets.
-                                            let _ = hub.query.block_queue_dequeue_height(h);
-                                            break;
-                                        }
-                                    }
-                                };
-                                let inputs = block_input_count(&block);
-                                {
-                                    let mut gg = feed.inner.lock().unwrap();
-                                    gg.inflight.insert(h);
-                                }
-                                run.push((h, hash, block));
-                                sum_inputs = sum_inputs.saturating_add(inputs);
-                                h = h.saturating_add(1);
-                                if pack_stop_after(
-                                    sum_inputs,
-                                    run.len(),
-                                    soft_inputs,
-                                    hard_blocks,
-                                ) {
-                                    break;
-                                }
-                            }
-                            // BQ load+decode wall (was plan_resolve before online pack).
-                            confirm_thr_stats::add_lookup_resolve(t_pack_io.elapsed());
-                            if !body_missing.is_empty() {
-                                for (mh, mhash) in &body_missing {
-                                    let _ = event_tx.send(ConfirmEvent::BodyMissing {
-                                        hash: *mhash,
-                                    });
-                                    // Height was removed from ready but not inflight.
-                                    feed.finish(std::iter::once(*mh));
-                                }
-                            }
-                            if !run.is_empty() {
-                                break Some((run, sum_inputs));
-                            }
-                            g = feed.inner.lock().unwrap();
-                            continue;
-                        }
-                        let (gg, wait_res) = feed
-                            .cv
-                            .wait_timeout(g, Duration::from_millis(20))
-                            .unwrap();
-                        g = gg;
-                        if wait_res.timed_out() {
-                            break None;
-                        }
-                    };
-                    match found {
-                        Some(x) => x,
-                        None => {
-                            confirm_thr_stats::add_lookup_claim(t_claim.elapsed());
-                            continue;
-                        }
-                    }
+                let t_sel = Instant::now();
+                let skip: std::collections::HashSet<u32> = {
+                    let g = feed.inner.lock().unwrap();
+                    g.inflight.iter().copied().collect()
                 };
-                confirm_thr_stats::add_lookup_claim(t_claim.elapsed());
-
-                let (batch, batch_inputs) = batch;
-                if batch.is_empty() {
-                    let t_sleep = Instant::now();
-                    std::thread::sleep(Duration::from_millis(20));
-                    confirm_thr_stats::add_lookup_claim(t_sleep.elapsed());
-                    continue;
-                }
-
-                // Strict invariant: every packed entry is fully decoded (no resolve fill).
-                debug_assert!(
-                    !batch.is_empty(),
-                    "pack produced empty batch after non-empty check"
-                );
-
-                let expect_h = batch[0].0;
-                if feed.stopped() || hub.query.confirm_cancelled() {
-                    // Requeue claimed heights so they are not stuck inflight.
-                    let req: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                        .iter()
-                        .map(|(h, ha, b)| (*h, *ha, Some(b.clone())))
-                        .collect();
-                    feed.requeue_wire(&req);
-                    drop(loadq_tx);
-                    let _ = load_join.join();
-                    return;
-                }
-
-                let t_other = Instant::now();
-                if load_ahead_reset_lookup.swap(false, Ordering::AcqRel) {
-                    lookup_ahead.clear_all(&hub);
-                }
-                lookup_ahead.prune_committed(&hub);
-                confirm_thr_stats::add_lookup_other(t_other.elapsed());
-
-                // Live wall for stall watchdog / perf while plan runs (often multi-s).
-                struct LiveGuard<'a> {
-                    stats: &'a LoopStats,
-                }
-                impl Drop for LiveGuard<'_> {
-                    fn drop(&mut self) {
-                        self.stats.confirm_end();
-                    }
-                }
-                loop_stats.confirm_begin(
-                    expect_h,
-                    batch.len() as u32,
-                    batch_inputs,
-                );
-                let _live_guard = LiveGuard {
-                    stats: &loop_stats,
+                let tip = hub.tip_height();
+                let path_lo = if tip.is_none() {
+                    0u32
+                } else {
+                    tip.unwrap_or(0).saturating_add(1)
                 };
-
-                // Pack always leaves decoded wire — Arc once for stamp/load (no re-decode).
-                let wire_batch: Vec<(u32, BlockHash, std::sync::Arc<bitcoin::Block>)> = batch
+                let mut wave_h: Vec<u32> = hub
+                    .query
+                    .block_queue_list_meta()
                     .into_iter()
-                    .map(|(h, ha, w)| (h, ha, std::sync::Arc::new(w)))
+                    .map(|m| m.height)
+                    .filter(|h| {
+                        *h >= path_lo
+                            && !skip.contains(h)
+                            && !hub.query.block_queue_is_resolve_complete(*h)
+                    })
                     .collect();
-                let store_path_lo = match hub.tip_height() {
-                    None => 0u32,
-                    Some(t) => t.saturating_add(1),
-                };
-                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
-                let use_pipe = pipe.path_lo >= store_path_lo;
-                let mut wire_batch = wire_batch;
-                let t_clone = Instant::now();
-                let plan_items: Vec<(
-                    rbitcoin_primitives::Height,
-                    std::sync::Arc<bitcoin::Block>,
-                )> = wire_batch
-                    .iter()
-                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), std::sync::Arc::clone(w)))
-                    .collect();
-                confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
-                let t_stamp = Instant::now();
-                let plan_res = hub.confirm_wire_lookup_phase(
-                    &plan_items,
-                    if use_pipe { Some(&pipe) } else { None },
-                );
-                // stamp wall continues through multi-block split retry below.
-                let plan_res = match plan_res {
-                    Err(e) if wire_batch.len() > 1 => {
-                        let msg = e.to_string();
-                        if feed.stopped()
-                            || hub.query.confirm_cancelled()
-                            || msg.contains("confirm cancelled")
-                        {
-                            Err(e)
-                        } else if msg.contains("confirm without archive")
-                            || msg.contains("NotFound")
-                            || msg.contains("not found")
-                            || is_confirm_load_retryable(&msg)
-                        {
-                            Err(e)
-                        } else {
-                            warn!(
-                                "ibd: confirm lookup multi-block fail @ {expect_h} n={} — \
-                                 retry first alone, re-queue tail: {msg}",
-                                wire_batch.len()
-                            );
-                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
-                                .iter()
-                                .skip(1)
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&tail);
-                            // Only the first height remains for this plan attempt.
-                            wire_batch.truncate(1);
-                            let one_in = block_input_count(wire_batch[0].2.as_ref());
-                            loop_stats.confirm_begin(expect_h, 1, one_in);
-                            let one = [(
-                                rbitcoin_primitives::Height(expect_h),
-                                std::sync::Arc::clone(&wire_batch[0].2),
-                            )];
-                            hub.confirm_wire_lookup_phase(
-                                &one,
-                                if use_pipe { Some(&pipe) } else { None },
-                            )
+                wave_h.sort_unstable();
+                wave_h.dedup();
+                if wave_h.len() > rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS {
+                    wave_h.truncate(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
+                }
+                confirm_thr_stats::add_lookup_other(t_sel.elapsed());
+                let mut did = false;
+                if !wave_h.is_empty() {
+                    let t_wave = Instant::now();
+                    match rbitcoin_consensus::confirm_bq_resolve_wave(
+                        &hub.query,
+                        &hub.params,
+                        &wave_h,
+                    ) {
+                        Ok(st) if st.heights > 0 => {
+                            did = true;
+                            queues_lookup.note_lookup_send(st.heights as usize);
+                            feed.notify();
                         }
+                        Ok(_) => {}
+                        Err(e) => warn!("ibd: bq resolve wave: {e}"),
                     }
-                    other => other,
-                };
-                confirm_thr_stats::add_lookup_stamp(t_stamp.elapsed());
-                drop(_live_guard);
-
-                match plan_res {
-                    Ok(None) => {
-                        let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
-                            .iter()
-                            .filter(|(_, ha, _)| !hub.has_block(ha))
-                            .map(|(h, ha, _)| (*h, *ha, None))
-                            .collect();
-                        if !retry.is_empty() {
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n.is_multiple_of(500) {
-                                debug!(
-                                    "ibd: confirm lookup empty outcome first={expect_h} n={} \
-                                     (path not contiguous / already confirmed; re-queue, count={n})",
-                                    retry.len()
-                                );
-                            }
-                            feed.requeue_wire(&retry);
-                            std::thread::sleep(Duration::from_millis(5));
-                        } else {
-                            feed.finish(wire_batch.iter().map(|(h, _, _)| *h));
-                        }
+                    confirm_thr_stats::add_lookup_stamp(t_wave.elapsed());
+                }
+                if !did {
+                    let t_wait = Instant::now();
+                    let g = feed.inner.lock().unwrap();
+                    if feed.stopped() {
+                        break;
                     }
-                    Ok(Some(stamped)) => {
-                        let work_ns = stamped.work_ns;
-                        let stamp_ms = work_ns / 1_000_000;
-                        // Reserve create fks for plan(N+1) while this batch is still
-                        // in load/scripts/write (load-ahead in-flight).
-                        let t_note = Instant::now();
-                        if let Some(ref p) = stamped.plan {
-                            if let Some((lh, raw)) = wire_batch
-                                .iter()
-                                .map(|(h, ha, _)| (*h, ha.to_byte_array()))
-                                .max_by_key(|(h, _)| *h)
-                            {
-                                lookup_ahead.note_lookup_ok(&hub, p, lh, raw);
-                            }
-                        } else {
-                            // plan=None: Class A already on disk — still publish
-                            // create txid→fk so tip-ahead packs can resolve parents
-                            // before head probe catches up.
-                            let hh: Vec<(u32, BlockHash)> = wire_batch
-                                .iter()
-                                .map(|(h, ha, _)| (*h, *ha))
-                                .collect();
-                            lookup_ahead.note_archived_creates(&hub, &hh);
-                        }
-                        // Pipeline after note_lookup_ok: load pin sees prior+this offline denserels.
-                        let pipe_for_prep = lookup_ahead.pipeline_for(expect_h, store_path_lo);
-                        confirm_thr_stats::add_lookup_other(t_note.elapsed());
-                        let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
-                            .iter()
-                            .map(|(h, ha, _)| (*h, *ha))
-                            .collect();
-                        let n = heights_hashes.len();
-                        let t_send = Instant::now();
-                        if loadq_tx
-                            .send(LookupDone {
-                                heights_hashes,
-                                stamped,
-                                pipeline: pipe_for_prep,
-                            })
-                            .is_err()
-                        {
-                            info!("ibd: confirm lookup→load channel closed");
-                            let _ = load_join.join();
-                            return;
-                        }
-                        let send_ms = t_send.elapsed().as_millis() as u64;
-                        confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
-                        queues_lookup.note_lookup_send(n);
-                        // Per-batch stamp is often 0.5–1.5s while 5s plan wall is multi-s
-                        // (many packs). Use the same 500ms gate as the old one-liner so
-                        // every notable pack gets batch/head_fk breakdown — not only >2s.
-                        if stamp_ms > 500 {
-                            let st = rbitcoin_consensus::plan_stamp_sub_stats::last_stamp();
-                            let planb = rbitcoin_query::archive_phase_stats::last_plan_batch();
-                            let ms = rbitcoin_query::archive_phase_stats::LastPlanBatch::ms;
-                            let sms = rbitcoin_consensus::plan_stamp_sub_stats::LastStamp::ms;
-                            let head_hit_pct = if planb.head_need > 0 {
-                                (100 * planb.head_hit) / planb.head_need
-                            } else {
-                                0
-                            };
-                            // "slow" when stamp >2s; otherwise still full detail (was bare one-liner).
-                            let tag = if stamp_ms > 2_000 {
-                                "confirm lookup slow"
-                            } else {
-                                "confirm lookup"
-                            };
-                            info!(
-                                "ibd: {tag} batch={n} first={expect_h} stamp_ms={stamp_ms} \
-                                 send_w={send_ms}ms \
-                                 stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms) \
-                                 plan_batch(assign={}ms collect={}ms sticky={}ms inflight={}ms \
-                                 head_fk={}ms head_dens={}ms stamp={}ms finish={}ms) \
-                                 resolve(ext_need={} head_need={} head_hit={} hit%={} \
-                                 batch_stamp={} resolved_stamp={})",
-                                sms(st.struct_ns),
-                                sms(st.prepare_ns),
-                                sms(st.filter_ns),
-                                sms(st.batch_ns),
-                                ms(planb.assign_ns),
-                                ms(planb.collect_ns),
-                                ms(planb.sticky_ns),
-                                ms(planb.inflight_ns),
-                                ms(planb.head_fk_ns),
-                                ms(planb.head_dens_ns),
-                                ms(planb.stamp_ns),
-                                ms(planb.finish_ns),
-                                planb.ext_need,
-                                planb.head_need,
-                                planb.head_hit,
-                                head_hit_pct,
-                                planb.batch_stamp,
-                                planb.resolved_stamp,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("confirm cancelled") || feed.stopped() {
-                            drop(loadq_tx);
-                            let _ = load_join.join();
-                            return;
-                        }
-                        if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
-                                .iter()
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&retry);
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n.is_multiple_of(200) {
-                                warn!(
-                                    "ibd: confirm lookup incomplete first={expect_h} — re-queue (n={n}): {msg}"
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                            continue;
-                        }
-                        let (expect, hash, _) = wire_batch[0];
-                        if wire_batch.len() > 1 {
-                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
-                                .iter()
-                                .skip(1)
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&tail);
-                        }
-                        // Permanent reject path: wipe tip-ahead HWM so the next
-                        // ordered claim does not inherit a poisoned next_tx_start.
-                        lookup_ahead.clear_all(&hub);
-                        // **Do not** requeue the rejected tip height here.
-                        // Soft BadPrev never blacklists — requeue caused a 10ms
-                        // claim→reject spin (mainnet 1574b @961634) while mids
-                        // densified and tip froze. Main-thread apply_confirm_reject
-                        // decides soft re-get / await / permanent blacklist; offer
-                        // re-notes only when claim_ready again.
-                        feed.finish(std::iter::once(expect));
-                        loop_stats
-                            .confirm_reject_stops
-                            .fetch_add(1, Ordering::Relaxed);
-                        static N: AtomicU32 = AtomicU32::new(0);
-                        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n <= 8 || n.is_multiple_of(50) {
-                            warn!("ibd: confirm lookup reject {hash} @ {expect}: {e} (n={n})");
-                        }
-                        let _ = event_tx.send(ConfirmEvent::Reject {
-                            height: expect,
-                            hash,
-                            err: msg,
-                        });
-                        // Brief pause so main can apply reject / densify before we claim again.
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+                    let (_gg, _) = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    confirm_thr_stats::add_lookup_send_wait(t_wait.elapsed());
+                    confirm_thr_stats::add_lookup_claim(t_wait.elapsed());
                 }
             }
-            drop(loadq_tx);
+            feed.notify();
             let _ = load_join.join();
             info!("ibd: confirm lookup exit");
         })

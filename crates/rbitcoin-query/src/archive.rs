@@ -350,7 +350,14 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_batch_from_store(need, start, &crate::InFlightView::empty(), None)
+        self.archive_plan_batch_from_store(
+            need,
+            start,
+            &crate::InFlightView::empty(),
+            None,
+            None,
+            true,
+        )
     }
 
     /// Like [`Self::archive_plan_batch_owned`], but assign create fks from
@@ -369,7 +376,7 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None)
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, true)
     }
 
     /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
@@ -380,6 +387,8 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
         parent_store: Option<&crate::PipelineParentStore>,
+        pre_resolved: Option<&rbitcoin_store::BqParentHits>,
+        allow_head: bool,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -498,6 +507,20 @@ impl Query {
         }
         let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
 
+        if let Some(hits) = pre_resolved {
+            for t in &need_vec {
+                if resolved.contains_key(t) {
+                    continue;
+                }
+                if let Some((fk, range)) = hits.get(t) {
+                    resolved.insert(*t, *fk);
+                    if let Some(id) = fk.get() {
+                        pin_ranges.push((id, *range));
+                    }
+                }
+            }
+        }
+
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -530,11 +553,14 @@ impl Query {
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
+            if !allow_head {
+                return Err(StoreError::Corrupt(
+                    "invariant: external parent missing BQ TipOnly hit",
+                ));
+            }
+            // Confirm: connected-only. RPC/reconstruct keep get_fk_by_txid (TipThenAny).
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = self.store.get_fk_by_txid_batch_mode(
-                &need_head,
-                rbitcoin_store::TxidResolveMode::TipThenAny,
-            )?;
+            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
             for (txid, row) in hits {
                 if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);
@@ -573,21 +599,9 @@ impl Query {
                         inp.create_fk = cfk;
                         resolved_stamp = resolved_stamp.saturating_add(1);
                     } else {
-                        // Last chance: single head probe (batch may have missed
-                        // a race mid-insert). Still fail if absent.
-                        // Range is filled after stamp (idx) so load never re-probes head.
-                        if let Ok(Some(cfk)) = self.store.get_fk_by_txid(&inp.prev_txid) {
-                            inp.create_fk = cfk;
-                            resolved.insert(inp.prev_txid, cfk);
-                            if let Some(id) = cfk.get() {
-                                external_parent_txids.insert(id, inp.prev_txid);
-                            }
-                            resolved_stamp = resolved_stamp.saturating_add(1);
-                        } else {
-                            return Err(StoreError::Corrupt(
-                                "archive: parent create_fk unresolved (contiguous batch required)",
-                            ));
-                        }
+                        return Err(StoreError::Corrupt(
+                            "archive: parent create_fk unresolved (contiguous batch required)",
+                        ));
                     }
                 }
                 if archive_spends {
@@ -900,6 +914,24 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(50 * 100_000_000, vec![0x51])],
         }
+    }
+
+    #[test]
+    fn archive_plan_confirm_head_is_tiponly_no_last_chance() {
+        let src = include_str!("archive.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            prod.contains("get_fk_by_txid_batch(&need_head)"),
+            "confirm plan must TipOnly-batch leftovers"
+        );
+        assert!(
+            !prod.contains("TxidResolveMode::TipThenAny"),
+            "TipThenAny leak must be gone from archive plan"
+        );
+        assert!(
+            !prod.contains("get_fk_by_txid(&inp.prev_txid)"),
+            "last-chance TipThenAny probe must be gone"
+        );
     }
 
     /// batch_pin Arc denserels match encode+decode layout (PR-A/B pin handoff).
@@ -1364,6 +1396,8 @@ mod tests {
                     1,
                     &crate::InFlightView::empty(),
                     Some(store.as_ref()),
+                    None,
+                    true,
                 )
                 .expect("pin-txid stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));

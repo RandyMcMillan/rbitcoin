@@ -326,9 +326,32 @@ pub fn confirm_wire_lookup_stamp(
     blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
+    confirm_wire_lookup_stamp_with_hits(query, params, milestone, blocks, pipeline, None, true)
+}
+
+/// Like [`confirm_wire_lookup_stamp`] with BQ-ahead hits.
+///
+/// IBD load: `allow_head = false` after a resolve-complete wave.
+/// One-shot / reorg: `allow_head = true` (TipOnly batch, no TipThenAny).
+pub fn confirm_wire_lookup_stamp_with_hits(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Arc<Block>)],
+    pipeline: Option<&WireLoadPipeline>,
+    pre_resolved: Option<&rbitcoin_store::BqParentHits>,
+    allow_head: bool,
+) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
-    let (plan, metas, wire_blocks, plan_ns) =
-        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+    let (plan, metas, wire_blocks, plan_ns) = wire_lookup_phase(
+        query,
+        params,
+        milestone,
+        blocks,
+        pipeline,
+        pre_resolved,
+        allow_head,
+    )?;
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_pin = match plan.as_ref() {
         Some(p) => ParentPinStamp::from_plan(p),
@@ -565,7 +588,7 @@ pub fn confirm_wire_lookup_and_ensure_denserels(
 > {
     let t0 = Instant::now();
     let (mut plan, _metas, _wire, plan_ns) =
-        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+        wire_lookup_phase(query, params, milestone, blocks, pipeline, None, true)?;
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
 
@@ -583,6 +606,8 @@ pub(super) fn wire_lookup_phase(
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WireLoadPipeline>,
+    pre_resolved: Option<&rbitcoin_store::BqParentHits>,
+    allow_head: bool,
 ) -> Result<
     (
         Option<rbitcoin_query::ArchiveWritePlan>,
@@ -735,10 +760,19 @@ pub(super) fn wire_lookup_phase(
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
+                    pre_resolved,
+                    allow_head,
                 )
                 .map_err(ConsensusError::from)?,
             None => query
-                .archive_plan_batch_owned(&mut need)
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    query.tx_body_count().saturating_add(1).max(1),
+                    &rbitcoin_query::InFlightView::empty(),
+                    None,
+                    pre_resolved,
+                    allow_head,
+                )
                 .map_err(ConsensusError::from)?,
         };
         // Expand each header body range to ordered create fks.

@@ -436,6 +436,9 @@ fn key_done(
 }
 
 /// Write-behind map: txid.body is published, tx.head may still be draining.
+///
+/// Uses serial [`VarTable::record_range`] (may open TLS `pread_batch`). Must
+/// run **outside** the plan `with_thread_local` machine.
 fn apply_pending_hits(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -641,9 +644,22 @@ fn resolve_fk_and_range_uring(
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-    // TLS ring for head probe waves; sidefile ID is page-grouped pread.
+    // Pending hits use serial record_range (TLS pread_batch). Do that before
+    // the plan machine holds the ring — otherwise record_range nests.
+    let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
+    let mut connected = vec![false; txids.len()];
+    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
+
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        resolve_fk_and_range_uring_on(session, table, txids, heights, tip_only)
+        resolve_fk_and_range_uring_on(
+            session,
+            table,
+            txids,
+            heights,
+            tip_only,
+            &mut winner,
+            &mut connected,
+        )
     })?
 }
 
@@ -653,22 +669,20 @@ fn resolve_fk_and_range_uring_on(
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    connected: &mut [bool],
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
 
-    let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
-    let mut connected = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
     let mut idx_ns = 0u64;
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
-
-    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
 
     // ── Wave 1: hot head pages (uring) + page-grouped ID/IDX ──────────────
     let t_probe = Instant::now();
@@ -685,8 +699,8 @@ fn resolve_fk_and_range_uring_on(
         txids,
         &age0,
         side,
-        &mut winner,
-        &mut connected,
+        winner,
+        connected,
         heights,
         /*skip_if_won=*/ false,
         &mut body_lookups,
@@ -702,8 +716,8 @@ fn resolve_fk_and_range_uring_on(
         txids,
         &older_hot,
         side,
-        &mut winner,
-        &mut connected,
+        winner,
+        connected,
         heights,
         /*skip_if_won=*/ true,
         &mut body_lookups,
@@ -743,8 +757,8 @@ fn resolve_fk_and_range_uring_on(
             txids,
             &cold_cands,
             side,
-            &mut winner,
-            &mut connected,
+            winner,
+            connected,
             heights,
             /*skip_if_won=*/ true,
             &mut body_lookups,
@@ -939,6 +953,46 @@ mod tests {
                 assert_eq!(t.body.record_range(*fk).unwrap(), *range);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write-behind pending hit must not nest TLS: apply_pending_hits runs
+    /// *before* the plan `with_thread_local` (mainnet 2026-08-14 lookup panic
+    /// while drain sealed `tx.head` file_id=47).
+    #[test]
+    fn uring_pending_write_behind_does_not_nest_tls() {
+        let dir = tmp("pending-uring");
+        let t = TxTable::create(&dir).unwrap();
+        let mut tid = [0u8; 32];
+        tid[0] = 0x51;
+        let tx = TxRecord {
+            txid: tid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let fks = t
+            .put_full_batch_indexed(
+                &[(
+                    tx,
+                    vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                    vec![OutputRecord::unspent(50, vec![0x51])],
+                )],
+                /*index=*/ false,
+            )
+            .unwrap();
+        t.head_note_pending(&[(tid, fks[0])]);
+        let via = resolve_fk_and_range_batch(&t, &[tid]).unwrap();
+        assert_eq!(via.len(), 1);
+        let (got_tid, row) = &via[0];
+        assert_eq!(*got_tid, tid);
+        let (fk, range) = row.expect("pending write-behind must stamp fk+range");
+        assert_eq!(fk, fks[0]);
+        assert_eq!(t.body.record_range(fk).unwrap(), range);
+        assert!(range.1 > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -18,6 +18,7 @@ mod file;
 mod fuse8_filter;
 mod hashhead;
 mod head_resolve_denserels;
+mod head_resolve_pick;
 pub mod head_resolve_stats;
 mod header_table;
 mod height_fence;

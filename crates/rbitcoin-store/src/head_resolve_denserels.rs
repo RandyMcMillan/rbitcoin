@@ -130,15 +130,33 @@ fn resolve_fk_and_range_pread(
     let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(hot_cands.iter().map(|c| c.len() as u64).sum());
+    let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
     id_idx_wave(
         table,
         txids,
-        &hot_cands,
+        &age0,
         side,
         &mut winner,
         &mut connected,
         heights,
         /*skip_if_won=*/ false,
+        &mut body_lookups,
+        &mut miss_peeks,
+        &mut id_ns,
+        &mut idx_ns,
+        &first_fks,
+        &mut local_age,
+        None,
+    )?;
+    id_idx_wave(
+        table,
+        txids,
+        &older_hot,
+        side,
+        &mut winner,
+        &mut connected,
+        heights,
+        /*skip_if_won=*/ true,
         &mut body_lookups,
         &mut miss_peeks,
         &mut id_ns,
@@ -428,77 +446,82 @@ fn id_idx_wave(
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
     mut session: Option<&mut UringSession>,
 ) -> Result<(), StoreError> {
-    // ── ID stage: page-grouped bulk fill for all active cands ─────────────
-    let mut all_fks: Vec<Fk> = Vec::new();
-    for (ki, cands) in cands_by_key.iter().enumerate() {
-        if key_done(ki, skip_if_won, winner, connected, heights) {
-            continue;
-        }
-        all_fks.extend_from_slice(cands);
-    }
-    let t_id = Instant::now();
-    let (id_map, _pages) = match session.as_deref_mut() {
-        Some(sess) => side.get_many_page_grouped_on_session(&all_fks, sess)?,
-        None => side.get_many_page_grouped(&all_fks)?,
-    };
-    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-    *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
+    use crate::head_resolve_pick::{miss_peeks_in_prefix, next_id_cand, pick_winner};
+    use std::collections::HashMap;
 
-    // ── RAM match then one IDX page-grouped fill ──────────────────────────
-    // With a height table: collect every body_txid match in this wave, then
-    // pick the newest connected (`tx_height` Some). First-match-and-stop would
-    // hide an older connected sibling behind a just-archived unconnected row.
-    // BIP30 / height-fence pick is **before** idx (only the chosen fk is ranged).
-    let mut chosen_kis: Vec<usize> = Vec::new();
-    let mut chosen_fks: Vec<Fk> = Vec::new();
-    for (ki, cands) in cands_by_key.iter().enumerate() {
-        if key_done(ki, skip_if_won, winner, connected, heights) {
-            continue;
-        }
-        let mut matches: Vec<Fk> = Vec::new();
-        for (rank0, &fk) in cands.iter().enumerate() {
-            let rank = (rank0 + 1) as u64;
-            let Some(id) = fk.get() else {
-                *miss_peeks = miss_peeks.saturating_add(1);
-                continue;
-            };
-            let Some(got) = id_map.get(&id) else {
-                *miss_peeks = miss_peeks.saturating_add(1);
-                continue;
-            };
-            if *got != txids[ki] {
-                *miss_peeks = miss_peeks.saturating_add(1);
+    let n = cands_by_key.len();
+    let mut filled = vec![0usize; n];
+    let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    // Rank rounds: identity-fill cand[r] across unfinished keys, then stop a
+    // key once it has a connected (or no-fence first) txid match. Older cands
+    // stay out of the ID set. Newer unconnected still do not win (BIP30).
+    loop {
+        let mut round: Vec<Fk> = Vec::new();
+        for ki in 0..n {
+            if key_done(ki, skip_if_won, winner, connected, heights) {
                 continue;
             }
-            crate::head_resolve_stats::add_hit_rank(rank);
-            matches.push(fk);
-        }
-        if matches.is_empty() {
-            continue;
-        }
-        let chosen = if let Some(ht) = heights {
-            // Per-slot pread (`get`), never `get_batch`: we may be inside the
-            // held resolve ring (AGENTS.md: do not nest TLS io_uring).
-            let mut picked = None;
-            for &fk in &matches {
-                if ht.height_of(fk).is_some() {
-                    picked = Some(fk);
-                    break;
+            let Some(fk) =
+                next_id_cand(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
+            else {
+                continue;
+            };
+            filled[ki] = filled[ki].saturating_add(1);
+            if let Some(id) = fk.get() {
+                if !id_map.contains_key(&id) {
+                    round.push(fk);
                 }
             }
-            if let Some(fk) = picked {
-                connected[ki] = true;
-                fk
-            } else if winner[ki].is_some() {
-                continue;
-            } else {
-                matches[0]
-            }
-        } else {
-            matches[0]
+        }
+        if round.is_empty() {
+            break;
+        }
+        let t_id = Instant::now();
+        let (more, _pages) = match session.as_deref_mut() {
+            Some(sess) => side.get_many_page_grouped_on_session(&round, sess)?,
+            None => side.get_many_page_grouped(&round)?,
         };
-        chosen_kis.push(ki);
-        chosen_fks.push(chosen);
+        *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+        *body_lookups = body_lookups.saturating_add(more.len() as u64);
+        id_map.extend(more);
+    }
+
+    // Pick + one IDX page-grouped fill. Fence pick is before idx.
+    let mut chosen_kis: Vec<usize> = Vec::new();
+    let mut chosen_fks: Vec<Fk> = Vec::new();
+    for ki in 0..n {
+        if key_done(ki, skip_if_won, winner, connected, heights) {
+            continue;
+        }
+        *miss_peeks = miss_peeks.saturating_add(miss_peeks_in_prefix(
+            &cands_by_key[ki],
+            filled[ki],
+            &txids[ki],
+            &id_map,
+        ));
+        if let Some((fk, rank)) =
+            pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
+        {
+            crate::head_resolve_stats::add_hit_rank(rank);
+            connected[ki] = heights.is_some();
+            chosen_kis.push(ki);
+            chosen_fks.push(fk);
+            continue;
+        }
+        // No connected hit. TipThenAny: first txid match in the filled prefix.
+        if heights.is_some() {
+            if winner[ki].is_some() {
+                continue;
+            }
+            if let Some((fk, rank)) =
+                pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, None)
+            {
+                crate::head_resolve_stats::add_hit_rank(rank);
+                chosen_kis.push(ki);
+                chosen_fks.push(fk);
+            }
+        }
     }
     let t_idx = Instant::now();
     let ranges = body_ranges_batched(table, &chosen_fks, session)?;
@@ -618,15 +641,33 @@ fn resolve_fk_and_range_uring_on(
     cands_total = cands_total.saturating_add(hot_cands.iter().map(|v| v.len() as u64).sum());
     debug_assert_eq!(session.in_flight(), 0);
 
+    let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
     id_idx_wave(
         table,
         txids,
-        &hot_cands,
+        &age0,
         side,
         &mut winner,
         &mut connected,
         heights,
         /*skip_if_won=*/ false,
+        &mut body_lookups,
+        &mut miss_peeks,
+        &mut id_ns,
+        &mut idx_ns,
+        &first_fks,
+        &mut local_age,
+        Some(session),
+    )?;
+    id_idx_wave(
+        table,
+        txids,
+        &older_hot,
+        side,
+        &mut winner,
+        &mut connected,
+        heights,
+        /*skip_if_won=*/ true,
         &mut body_lookups,
         &mut miss_peeks,
         &mut id_ns,

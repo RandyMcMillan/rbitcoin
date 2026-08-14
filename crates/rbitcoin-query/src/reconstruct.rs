@@ -5,21 +5,11 @@ use crate::U64Map;
 use std::time::Instant;
 
 impl Query {
-    /// Body for wire rebuild / RPC.
-    ///
-    /// Prefer batch-local full decode from confirm load ([`BatchFullBodies`]);
-    /// store via `tx.idx` is the fallback.
+    /// Body for wire rebuild / RPC via `tx.idx`.
     fn load_body_for_wire(
         &self,
         fk: Fk,
-        batch: Option<&crate::BatchFullBodies>,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
-        if let Some(b) = batch {
-            if let Some((tx, inputs, outs)) = b.get_owned(fk) {
-                // Match historical order: (meta, outs, inputs) for reconstruct_tx.
-                return Ok((tx, outs, inputs));
-            }
-        }
         self.load_body_from_store(fk)
     }
 
@@ -95,18 +85,9 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        self.reconstruct_tx_with_batch(tx_fk, None)
-    }
-
-    /// Like [`Self::reconstruct_tx`], using load-stage full bodies when present.
-    pub fn reconstruct_tx_with_batch(
-        &self,
-        tx_fk: Fk,
-        batch: Option<&crate::BatchFullBodies>,
-    ) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_for_wire(tx_fk, batch)?;
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_for_wire(tx_fk)?;
         let mut cache = U64Map::default();
-        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache, batch)?;
+        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
@@ -162,7 +143,6 @@ impl Query {
         &self,
         inputs: &mut [InputRecord],
         cache: &mut U64Map<[u8; 32]>,
-        batch: Option<&crate::BatchFullBodies>,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
             if inp.is_coinbase() {
@@ -181,14 +161,7 @@ impl Query {
                 inp.prev_txid = txid;
                 continue;
             }
-            // Schema 13: packed body meta has no leading txid. BatchFullBodies may
-            // still hold a zero identity until stamped from `txid.body`. Prefer a
-            // non-zero batch hit; never treat all-zero as resolved (that made
-            // multi-input wire rebuild look like double-spends of null:0).
-            let txid = match batch.and_then(|b| b.txid(Fk(id))) {
-                Some(t) if t != [0u8; 32] => t,
-                _ => self.store.txs.body_txid(Fk(id))?,
-            };
+            let txid = self.store.txs.body_txid(Fk(id))?;
             if txid == [0u8; 32] {
                 return Err(StoreError::Corrupt(
                     "wire rebuild: create identity still zero after txid.body",
@@ -222,25 +195,21 @@ impl Query {
             .map(Some)
     }
 
-    /// Wire rebuild when header row + tx fk list are already known (confirm batch).
+    /// Wire rebuild when header row + tx fk list are already known.
     pub fn reconstruct_archived_block_from_parts(
         &self,
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
     ) -> Result<Block, QueryError> {
-        self.reconstruct_archived_block_from_parts_cached(rec, tx_fks, None, None)
+        self.reconstruct_archived_block_from_parts_cached(rec, tx_fks, None)
     }
 
-    /// Confirm hot path: full bodies from load-stage [`BatchFullBodies`] when
-    /// present (no second store decode); store fallback for RPC / miss.
-    ///
     /// `prev_hash`: when set (load header plan), wire header needs no store IO.
     pub fn reconstruct_archived_block_from_parts_cached(
         &self,
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
         prev_hash: Option<[u8; 32]>,
-        batch_bodies: Option<&crate::BatchFullBodies>,
     ) -> Result<Block, QueryError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("block has no transactions"));
@@ -250,13 +219,8 @@ impl Query {
         // Dedup create_fk → txid across the whole block.
         let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
         for fk in tx_fks {
-            let (rec_tx, stored_outputs, mut stored_inputs) =
-                self.load_body_for_wire(fk, batch_bodies)?;
-            self.fill_input_prev_txids_cached(
-                &mut stored_inputs,
-                &mut prev_txid_cache,
-                batch_bodies,
-            )?;
+            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_for_wire(fk)?;
+            self.fill_input_prev_txids_cached(&mut stored_inputs, &mut prev_txid_cache)?;
             txdata.push(Self::transaction_from_class_a(
                 rec_tx,
                 stored_outputs,

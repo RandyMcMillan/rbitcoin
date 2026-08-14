@@ -852,17 +852,6 @@ fn confirm_structural_rejects_already_spent_prevout() {
     let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
     commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    let spend_hash = b_spend.block_hash().to_byte_array();
-    let (_st, batch_parents, _thin, _bodies) =
-        q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
-    let create_fk = q
-        .tx_fk_by_txid(cb1.as_byte_array())
-        .unwrap()
-        .expect("cb create fk");
-    assert!(
-        batch_parents.has_parent_out(create_fk, 0),
-        "unspent parent content available in per-batch pin map before first confirm"
-    );
 
     accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
@@ -936,19 +925,6 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
     run.push((Height(spend_h), b_spend));
     commit_class_a_run(&q, &params, &run, ms).unwrap();
-
-    // Runway the run: parent pin + prevout scan; same-batch create must not
-    // leave the spend height unready.
-    let items: Vec<(u32, [u8; 32])> = run
-        .iter()
-        .map(|(h, b)| (h.0, b.block_hash().to_byte_array()))
-        .collect();
-    let _ = q.load_confirm_parents(&items).unwrap();
-    let heights: Vec<u32> = items.iter().map(|(h, _)| *h).collect();
-    assert!(
-        q.is_confirm_load_ready(&heights),
-        "scanned batch must be ready even if spend reserved the create height parent"
-    );
 
     confirm_wire_run(&q, &params, ms, &run)
         .expect("same-run create then spend must confirm (open reserve not a deadlock)");
@@ -1572,17 +1548,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     run.push((Height(spend_h), b_spend));
     commit_class_a_run(&q, &params, &run, ms).unwrap();
 
-    // Inline confirm load (parent pin).
-    let items: Vec<(u32, [u8; 32])> = run
-        .iter()
-        .map(|(h, b)| (h.0, b.block_hash().to_byte_array()))
-        .collect();
-    let (st, _bp, _thin, _bodies) = q.load_confirm_parents(&items).unwrap();
-    assert!(st.blocks > 0);
-    let snap = q.parent_cache_perf_snapshot();
-    assert!(snap.4 > 0, "plans after load");
-    assert!(q.is_confirm_load_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));
-
     // LOAD
     let mat = confirm_wire_load_phase(&q, &params, ms, &run, &none).expect("load");
     assert!(!mat.batch.is_empty());
@@ -1606,10 +1571,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     // Combined load entry on empty: reject empty.
     let empty = confirm_wire_load_phase(&q, &params, ms, &[], &none);
     assert!(empty.is_err());
-
-    // Heights ≤ tip are not re-loaded (work filtered out).
-    let (st2, _, _, _) = q.load_confirm_parents(&items).unwrap();
-    assert_eq!(st2.blocks, 0);
 }
 
 /// Multi-block confirm load with a non-coinbase spend must not permanent-BadPrev

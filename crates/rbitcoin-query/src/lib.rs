@@ -1,7 +1,6 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
 mod archive;
-mod batch_full_bodies;
 mod batch_parents;
 mod catchup;
 mod chain_view;
@@ -122,7 +121,6 @@ pub mod process_mem_stats {
 }
 
 pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
-pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
@@ -140,12 +138,12 @@ pub use wave_prevout::ThinInput;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///
-/// Accrued by `load_confirm_parents` (now called inline from confirm load).
-/// Pair with [`Query::parent_cache_perf_snapshot`] for cache watermarks.
+/// Accrued by wire pin (`pin_for_wire_batch`).
+/// Pair with [`Query::parent_cache_perf_snapshot`] for header-plan occupancy.
 pub mod confirm_load_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Pin/load wall: full `load_confirm_parents` on hash path; pin wall on wire path.
+    /// Pin/load wall (wire pin).
     pub static NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +333,7 @@ pub mod confirm_load_stats {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn note(st: &crate::confirm_load::ConfirmLoadStats, ns: u64) {
         if ns > 0 {
@@ -2462,23 +2461,7 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.tip_height(), Some(Height(2)));
 
-        // load_confirm_parents empty / already-confirmed heights.
-        let (st, _, _, _) = q.load_confirm_parents(&[]).unwrap();
-        let _ = st.blocks;
-        let (st2, _, _, _) = q
-            .load_confirm_parents(&[(0, hashes[0]), (1, hashes[1])])
-            .unwrap();
-        let _ = st2;
-
-        // Cancelled load path.
-        q.request_confirm_cancel();
-        let cancelled = q.load_confirm_parents(&[(10, [9u8; 32])]);
-        assert!(cancelled.is_err());
-        q.clear_confirm_cancel();
-
         q.advance_parent_cache_tip(2);
-        q.seed_parent_cache(&[(3, hashes[3])]);
-        assert!(q.is_confirm_load_ready(&[]));
 
         // resume_work_path: max 0 → empty.
         assert!(q
@@ -2532,27 +2515,6 @@ mod tests {
         assert!(IndexMode::Direct.is_direct());
         assert!(!IndexMode::Direct.is_tip());
         assert!(IndexMode::Tip.is_tip());
-
-        let mut b = BatchFullBodies::with_capacity(2);
-        assert!(b.is_empty());
-        b.insert(
-            Fk::NULL,
-            1,
-            TxRecord {
-                txid: [0; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            },
-            vec![],
-            vec![],
-            None,
-            vec![],
-        );
-        assert!(b.is_empty()); // null fk ignored
 
         let mut bp = BatchParents::new();
         assert!(bp.is_empty());
@@ -2661,19 +2623,7 @@ mod tests {
         assert_eq!(arch.txdata.len(), 3);
         // archived path does not require header.hash == wire block_hash.
         assert_eq!(arch.txdata[0].input.len(), 1);
-        // Batch-local body path.
-        let mut batch = BatchFullBodies::new();
-        let full = q.store().get_tx_full(fks0[0]).unwrap();
-        batch.insert(
-            fks0[0],
-            0,
-            full.0.clone(),
-            full.1.clone(),
-            full.2.clone(),
-            None,
-            vec![],
-        );
-        let tx2 = q.reconstruct_tx_with_batch(fks0[0], Some(&batch)).unwrap();
+        let tx2 = q.reconstruct_tx(fks0[0]).unwrap();
         assert_eq!(tx2.output.len(), 1);
         // Empty tx list → corrupt.
         let (_hfk, hrec) = q.get_header_by_hash(&hashes[0]).unwrap().unwrap();
@@ -2726,14 +2676,8 @@ mod tests {
                 .txs
                 .put_full_batch_indexed(&[(spend_tx, spend_ins, spend_outs)], true)
                 .unwrap()[0];
-            // Batch entry for parent with **zero** packed identity (pre-stamp).
-            let mut batch_z = BatchFullBodies::new();
-            let (mut ptx, pins, pouts) = q.store().get_tx_full(parent_fk).unwrap();
-            ptx.txid = [0u8; 32];
-            batch_z.insert(parent_fk, 0, ptx, pins, pouts, None, vec![]);
-            assert_eq!(batch_z.txid(parent_fk), None);
             let rebuilt = q
-                .reconstruct_tx_with_batch(spend_fk, Some(&batch_z))
+                .reconstruct_tx(spend_fk)
                 .expect("wire rebuild must resolve create id via txid.body");
             assert_eq!(rebuilt.input.len(), 2);
             for inp in &rebuilt.input {
@@ -2826,22 +2770,8 @@ mod tests {
         let path = q.resume_work_path_after_tip(hashes[2], 2, 5).unwrap();
         let _ = path;
 
-        // confirm_load of height above tip with archived body (archive-only ahead).
-        // Archive header+body at height 3 without confirm.
         let (h3, ta3) = coinbase_block(3, prev, Some(hashes[2]));
-        let h3hash = h3.hash;
         q.commit_class_a_only(&h3, &[ta3]).unwrap();
-        let (st, parents, thin, bodies) = q.load_confirm_parents(&[(3, h3hash)]).unwrap();
-        assert!(st.blocks >= 1 || bodies.len() >= 1 || !parents.is_empty() || thin.is_empty());
-        let _ = thin;
-        // Missing header / no body paths.
-        let (st2, _, _, _) = q.load_confirm_parents(&[(9, [0xbb; 32])]).unwrap();
-        let _ = st2;
-        // Header without body.
-        let (st3, _, _, _) = q.load_confirm_parents(&[(10, orphan.hash)]).unwrap();
-        let _ = st3;
-
-        let _ = q.parent_cache_ready_through();
         let _ = q.parent_cache_perf_snapshot();
 
         // Archive empty batch.
@@ -2940,10 +2870,7 @@ mod tests {
         let (h2, ta2) = coinbase_block(2, prev, Some(hashes[1]));
         let h2hash = h2.hash;
         q.commit_class_a_only(&h2, &[ta2]).unwrap();
-        q.request_confirm_cancel();
-        let err = q.load_confirm_parents(&[(2, h2hash)]);
-        assert!(err.is_err(), "cancel must abort load");
-        q.clear_confirm_cancel();
+        let _ = h2hash;
 
         // Empty input/output run helpers.
         let empty_tx = TxRecord {
@@ -3095,16 +3022,7 @@ mod tests {
             }])
             .is_err());
 
-        // load_confirm_parents: height ≤ tip skipped; cancel; missing header
-        let (st, _, _, _) = q.load_confirm_parents(&[(0, h1hash)]).unwrap();
-        let _ = st;
-        q.request_confirm_cancel();
-        assert!(q.load_confirm_parents(&[(9, [0xab; 32])]).is_err());
-        q.clear_confirm_cancel();
-        // Missing header hash at tip+1 → continue (no panic)
-        let (_st, bp, _, _) = q.load_confirm_parents(&[(2, [0xde; 32])]).unwrap();
-        let _ = bp;
-
+        let _ = h1hash;
         let _ = parent_txid;
         let _ = std::fs::remove_dir_all(&dir);
     }

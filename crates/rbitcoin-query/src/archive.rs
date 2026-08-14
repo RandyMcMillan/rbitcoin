@@ -346,13 +346,7 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_batch_from_store(
-            need,
-            start,
-            &crate::InFlightView::empty(),
-            None,
-            None,
-        )
+        self.archive_plan_batch_from_store(need, start, &crate::InFlightView::empty(), None, None)
     }
 
     /// Like [`Self::archive_plan_batch_owned`], but assign create fks from
@@ -1218,16 +1212,21 @@ mod tests {
     #[test]
     fn plan_head_resolved_parents_plan_local_only() {
         let (dir, q) = temp_query("plan-creates-only");
-        // Parent on disk + head.
+        // Parent connected (TipOnly plan stamp).
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::HeaderRecord;
         let parent = coinbase_apply(1);
         let parent_txid = parent.tx.txid;
-        q.store
-            .txs
-            .put_full_batch_indexed(
-                &[(parent.tx, parent.inputs, parent.outputs)],
-                /*index=*/ true,
-            )
-            .unwrap();
+        let ph = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [1u8; 32],
+        };
+        q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         assert_eq!(q.tx_body_count(), 1);
 
         let mut child_txid = [0u8; 32];

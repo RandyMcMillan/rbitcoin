@@ -1331,7 +1331,7 @@ pub(crate) fn spawn_confirm_engine(
                                     break;
                                 }
                             }
-                            confirm_thr_stats::add_lookup_resolve(t_pack_io.elapsed());
+                            confirm_thr_stats::add_load_work(t_pack_io.elapsed());
                             if !body_missing.is_empty() {
                                 for (mh, mhash) in &body_missing {
                                     let _ = event_tx_load.send(ConfirmEvent::BodyMissing {

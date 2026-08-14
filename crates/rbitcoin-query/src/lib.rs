@@ -426,6 +426,12 @@ pub mod archive_phase_stats {
     pub static PIN_TXID_N: AtomicU64 = AtomicU64::new(0);
     /// Wall of that consult (RAM).
     pub static PIN_TXID_NS: AtomicU64 = AtomicU64::new(0);
+    /// Leftover TipOnly: pending-head hits among `head_need`.
+    pub static LEFTOVER_PEND: AtomicU64 = AtomicU64::new(0);
+    /// Leftover hit ages ≤0 / ≤3 / hit count (for leftover_cdf).
+    pub static LEFTOVER_AGE0: AtomicU64 = AtomicU64::new(0);
+    pub static LEFTOVER_AGE3: AtomicU64 = AtomicU64::new(0);
+    pub static LEFTOVER_AGE_N: AtomicU64 = AtomicU64::new(0);
     /// Fks that received plan denserels in Shape A fused head resolve.
     pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
     /// Sum of packed body lengths read in denserels wave (when ranges known).
@@ -476,6 +482,10 @@ pub mod archive_phase_stats {
         pub head_hit: u64,
         pub pin_txid_n: u64,
         pub pin_txid_ns: u64,
+        pub leftover_pend: u64,
+        pub leftover_cdf0_pct: u64,
+        pub leftover_cdf3_pct: u64,
+        pub leftover_age_n: u64,
         pub head_dens_fks: u64,
         pub head_dens_bytes: u64,
         pub batch_stamp: u64,
@@ -557,6 +567,26 @@ pub mod archive_phase_stats {
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
             pin_txid_n: PIN_TXID_N.swap(0, Ordering::Relaxed),
             pin_txid_ns: PIN_TXID_NS.swap(0, Ordering::Relaxed),
+            leftover_pend: LEFTOVER_PEND.swap(0, Ordering::Relaxed),
+            leftover_cdf0_pct: {
+                let n = LEFTOVER_AGE_N.load(Ordering::Relaxed);
+                let a0 = LEFTOVER_AGE0.swap(0, Ordering::Relaxed);
+                if n == 0 {
+                    0
+                } else {
+                    a0.saturating_mul(100) / n
+                }
+            },
+            leftover_cdf3_pct: {
+                let n = LEFTOVER_AGE_N.load(Ordering::Relaxed);
+                let a3 = LEFTOVER_AGE3.swap(0, Ordering::Relaxed);
+                if n == 0 {
+                    0
+                } else {
+                    a3.saturating_mul(100) / n
+                }
+            },
+            leftover_age_n: LEFTOVER_AGE_N.swap(0, Ordering::Relaxed),
             head_dens_fks: HEAD_DENS_FKS.swap(0, Ordering::Relaxed),
             head_dens_bytes: HEAD_DENS_BYTES.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
@@ -622,6 +652,17 @@ pub mod archive_phase_stats {
             LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
             LAST_BATCH_STAMP.store(batch_stamp, Ordering::Relaxed);
             LAST_RESOLVED_STAMP.store(resolved_stamp, Ordering::Relaxed);
+        });
+    }
+
+    /// Leftover TipOnly pending hits + winner age buckets (load stamp).
+    #[inline]
+    pub fn note_leftover_mix(pend: u64, age0: u64, age3: u64, age_n: u64) {
+        exclusive::with(|| {
+            add(&LEFTOVER_PEND, pend);
+            add(&LEFTOVER_AGE0, age0);
+            add(&LEFTOVER_AGE3, age3);
+            add(&LEFTOVER_AGE_N, age_n);
         });
     }
 

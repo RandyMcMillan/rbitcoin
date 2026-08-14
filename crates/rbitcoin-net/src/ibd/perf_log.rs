@@ -294,6 +294,10 @@ pub(crate) struct IbdPerfSample {
     pub arch_ext_need: u64,
     pub arch_head_need: u64,
     pub arch_head_hit: u64,
+    pub leftover_pend: u64,
+    pub leftover_cdf0_pct: u64,
+    pub leftover_cdf3_pct: u64,
+    pub leftover_age_n: u64,
     /// Unique prev_txids resolved from live pipeline pins (not in-flight).
     pub arch_pin_txid: u64,
     pub arch_pin_txid_ms: u64,
@@ -545,6 +549,10 @@ impl Default for IbdPerfSample {
             arch_ext_need: 0,
             arch_head_need: 0,
             arch_head_hit: 0,
+            leftover_pend: 0,
+            leftover_cdf0_pct: 0,
+            leftover_cdf3_pct: 0,
+            leftover_age_n: 0,
             arch_pin_txid: 0,
             arch_pin_txid_ms: 0,
             arch_batch_stamp: 0,
@@ -963,6 +971,10 @@ pub(crate) fn sample(
         arch_ext_need: arch_res.ext_need,
         arch_head_need: arch_res.head_need,
         arch_head_hit: arch_res.head_hit,
+        leftover_pend: arch_res.leftover_pend,
+        leftover_cdf0_pct: arch_res.leftover_cdf0_pct,
+        leftover_cdf3_pct: arch_res.leftover_cdf3_pct,
+        leftover_age_n: arch_res.leftover_age_n,
         arch_pin_txid: arch_res.pin_txid_n,
         arch_pin_txid_ms: ns_ms(arch_res.pin_txid_ns),
         arch_batch_stamp: arch_res.batch_stamp,
@@ -1115,7 +1127,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms write={}ms \
-         lookup_thr busy={}ms(claim={}ms resolve={}ms clone={}ms stamp={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms resolve={}ms clone={}ms wave={}ms other={}ms send_w={}ms) \
          thr load=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
@@ -1151,8 +1163,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         out.push_str(&format!(
             " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
              batch_assign={}ms collect={}ms pin_txid={} pin_txid%={} pin_txid_ms={} \
-             head_n={} head_fk={}ms head_dens={}ms head={}ms \
-             stamp={}ms finish={}ms)",
+             leftover_n={} leftover_hit={} leftover_ms={} leftover_pend={} leftover_cdf0={} leftover_cdf3={} leftover_age_n={} \
+             head_dens={}ms head={}ms stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
             s.stamp_filter_ms,
@@ -1163,7 +1175,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             pin_txid_pct(s),
             s.arch_pin_txid_ms,
             s.arch_head_need,
+            s.arch_head_hit,
             s.stamp_batch_head_fk_ms,
+            s.leftover_pend,
+            s.leftover_cdf0_pct,
+            s.leftover_cdf3_pct,
+            s.leftover_age_n,
             s.stamp_batch_head_dens_ms,
             s.stamp_batch_head_ms,
             s.stamp_batch_stamp_ms,
@@ -2128,7 +2145,8 @@ mod tests {
         assert!(info.contains("pin_txid=15"), "{info}");
         assert!(info.contains("pin_txid%=37"), "{info}");
         assert!(info.contains("pin_txid_ms=2"), "{info}");
-        assert!(info.contains("head_n=25"), "{info}");
+        assert!(info.contains("leftover_n=25"), "{info}");
+        assert!(info.contains("leftover_hit="), "{info}");
         assert!(info.contains("head_loc(cdf0=10"), "{info}");
         assert!(info.contains("lookup_sub(blks=4"), "{info}");
         let dbg = format_debug(&s);

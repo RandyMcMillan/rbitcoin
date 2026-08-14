@@ -200,8 +200,6 @@ pub mod confirm_phase_stats {
     /// Prevout path splits (ns + counts; sum of path ns ≈ ASM_PREVOUT_NS).
     pub static ASM_PREV_BATCH_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_BATCH_N: AtomicU64 = AtomicU64::new(0);
-    pub static ASM_PREV_RES_NS: AtomicU64 = AtomicU64::new(0);
-    pub static ASM_PREV_RES_N: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_SAME_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_SAME_N: AtomicU64 = AtomicU64::new(0);
     pub static ASM_PREV_COLD_NS: AtomicU64 = AtomicU64::new(0);
@@ -385,18 +383,16 @@ pub mod confirm_phase_stats {
         )
     }
 
-    /// Prevout path detail: `(in_n, batch_ns, batch_n, res_ns, res_n, same_ns, same_n,
+    /// Prevout path detail: `(in_n, batch_ns, batch_n, same_ns, same_n,
     /// cold_ns, cold_n, fk_ns)`.
     #[inline]
     #[allow(clippy::type_complexity)]
     pub fn sample_assemble_prevout_detail_and_reset(
-    ) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    ) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             ASM_IN_N.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_NS.swap(0, Ordering::Relaxed),
             ASM_PREV_BATCH_N.swap(0, Ordering::Relaxed),
-            ASM_PREV_RES_NS.swap(0, Ordering::Relaxed),
-            ASM_PREV_RES_N.swap(0, Ordering::Relaxed),
             ASM_PREV_SAME_NS.swap(0, Ordering::Relaxed),
             ASM_PREV_SAME_N.swap(0, Ordering::Relaxed),
             ASM_PREV_COLD_NS.swap(0, Ordering::Relaxed),
@@ -582,20 +578,6 @@ pub mod confirm_phase_stats {
             SPEND_META_NS.swap(0, Ordering::Relaxed),
             SPEND_META_N.swap(0, Ordering::Relaxed),
         )
-    }
-
-    /// Backward-compat alias — returns zeros for removed mmap half of the tuple.
-    #[inline]
-    pub fn sample_spend_ann_ab_and_reset() -> (u64, u64, u64, u64, u64, u64) {
-        let (ns, n, skip, pread) = sample_spend_ann_and_reset();
-        (0, 0, ns, n, skip, pread)
-    }
-
-    /// Backward-compat alias — mmap half is always zero.
-    #[inline]
-    pub fn sample_spend_meta_ab_and_reset() -> (u64, u64, u64, u64) {
-        let (ns, n) = sample_spend_meta_and_reset();
-        (0, 0, ns, n)
     }
 }
 
@@ -954,8 +936,6 @@ mod coverage_tests {
         ASM_IN_N.store(100, Ordering::Relaxed);
         ASM_PREV_BATCH_NS.store(1000, Ordering::Relaxed);
         ASM_PREV_BATCH_N.store(80, Ordering::Relaxed);
-        ASM_PREV_RES_NS.store(200, Ordering::Relaxed);
-        ASM_PREV_RES_N.store(10, Ordering::Relaxed);
         ASM_PREV_SAME_NS.store(50, Ordering::Relaxed);
         ASM_PREV_SAME_N.store(5, Ordering::Relaxed);
         ASM_PREV_COLD_NS.store(300, Ordering::Relaxed);
@@ -963,7 +943,7 @@ mod coverage_tests {
         ASM_PREV_FK_NS.store(40, Ordering::Relaxed);
         assert_eq!(
             sample_assemble_prevout_detail_and_reset(),
-            (100, 1000, 80, 200, 10, 50, 5, 300, 5, 40)
+            (100, 1000, 80, 50, 5, 300, 5, 40)
         );
         let _ = sample_assemble_cold_why_and_reset();
         ASM_PREV_COLD_NULL_FK_N.store(1, Ordering::Relaxed);
@@ -985,12 +965,6 @@ mod coverage_tests {
         let _ = sample_ensure_mix_and_reset();
         let _ = sample_spend_ann_and_reset();
         let _ = sample_spend_meta_and_reset();
-        let ab = sample_spend_ann_ab_and_reset();
-        assert_eq!(ab.0, 0);
-        assert_eq!(ab.1, 0);
-        let mb = sample_spend_meta_ab_and_reset();
-        assert_eq!(mb.0, 0);
-        assert_eq!(mb.1, 0);
     }
 
     #[test]

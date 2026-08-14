@@ -396,26 +396,6 @@ pub(super) fn post_commit(
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);
 
-    // IBD (Direct): skip per-spend unpin — tip GC drops the same parent outs.
-    // Tip mode: still retire spent sparse parents so long-lived cache stays lean.
-    let t_unpin = Instant::now();
-    if query.index_mode() != rbitcoin_query::IndexMode::Direct {
-        let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
-            .iter()
-            .flat_map(|p| {
-                p.spends.iter().filter_map(|(_txid, vout, _sfk, cfk)| {
-                    if cfk.is_null() {
-                        None
-                    } else {
-                        Some((*cfk, *vout))
-                    }
-                })
-            })
-            .collect();
-        let _ = query.unpin_spent_parent_outs(&all_spends);
-    }
-    confirm_phase_stats::UNPIN_NS.fetch_add(t_unpin.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
     // Prune confirm-parent cache for heights at/below new tip.
     let mut tip_gc_ns = 0u64;
     if let Some(tip) = prepared.last().map(|p| p.height.0) {

@@ -793,12 +793,6 @@ impl Query {
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
-        // write_sticky_ns stays 0 (legacy slot; process pin FIFO removed).
-        let sticky_ns = 0u64;
-
-        // No body DONTNEED after Class A commit: Class A never leads tip, so
-        // just-written pages may still be tip-hot for confirm/cache.
-        // write_dontneed_ns stays 0 (legacy phase-stat slot).
         let total_ns = t0.elapsed().as_nanos() as u64;
         crate::archive_phase_stats::note_write_commit(
             total_ns,
@@ -807,8 +801,6 @@ impl Query {
             head_ns,
             spend_ns,
             htxs_ns,
-            sticky_ns,
-            0, // dontneed_ns — lead heuristic removed
             n_blocks.max(1),
         );
         Ok(true)

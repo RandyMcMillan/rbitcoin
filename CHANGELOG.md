@@ -11,6 +11,10 @@ before 1.0).
 
 ### Removed
 
+- **Zero meters:** `WRITE_STICKY` / `WRITE_DONTNEED`, `ASM_PREV_RES_*`,
+  `pin_spent_ns` / `unpin_spent_parent_outs`, `archive_resolve_stats` alias,
+  and mmap-half `sample_spend_*_ab_*` helpers.
+
 - **Hash-only confirm:** `confirm_archived_*`, hash `confirm_load_phase` /
   `confirm_script_phase`, `wire_rebuild`, and `ChainHub::confirm_hash` /
   `confirm_run`. Confirm is wire-only (`confirm_wire_*`). Store fixtures

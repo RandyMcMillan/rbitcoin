@@ -174,25 +174,23 @@ Aligned with AGENTS.md TDD + suite speed:
 ### Mid-plan gates vs plan-end gates
 
 Multi-step plan execution uses **targeted** verification between slices.
-**Full** workspace suite and coverage run **once at plan end** — not after every
-intermediate commit — unless the story *is* those gates.
+**Full** workspace suite, clippy `-D warnings`, and coverage are **GitHub
+Actions** on the plan PR — not a local plan-end ritual. See
+[`AGENTS.md`](../AGENTS.md) (worktree + PR).
 
-**Musl** is **not** a feature-branch plan gate. Build/install the static musl
-binary **only on `master` (or `main`) after a successful commit** — see
-[`AGENTS.md`](../AGENTS.md) (commit + musl table). Plan work on `rpc/…` /
-`feat/…` ends with suite + coverage on that branch; musl happens after merge
-to master (and a clean post-commit tree).
+**Musl** is **not** a plan-branch gate. Install the static musl binary **only
+on `master`/`main` after the PR merges**.
 
 | When | Run |
 |------|-----|
-| **Each plan step** | Targeted tests for crates/modules touched (`cargo test -p …`); optional crate-local clippy; Red→green on the step contract |
-| **Not mid-plan** | `cargo test --workspace`, `./scripts/coverage.sh`, full workspace `clippy … -D warnings`, `nix build .#rbitcoin-musl` / musl install |
-| **Final plan step only** | `cargo fmt --all -- --check`, workspace clippy `-D warnings`, `cargo test --workspace`, `./scripts/coverage.sh` (≥90%) |
-| **Musl install** | **Only** on `master`/`main`, **after** commit (never mid-plan, never uncommitted, never only on a feature branch) |
+| **Each plan step** | Targeted tests for crates/modules touched (`cargo test -p …`); Red→green on the step contract; **one logical commit** |
+| **Not locally (default)** | `cargo test --workspace`, `./scripts/coverage.sh`, workspace `clippy … -D warnings`, `nix build .#rbitcoin-musl` |
+| **Plan coded** | Push the worktree branch; **one PR** for the whole plan (many commits) |
+| **Plan complete** | Required Actions checks on that PR are **green** (`fmt` / `deny` / `clippy` / `test` / `multinode` / `coverage`). Poll after open and after every fixup push. |
+| **Musl install** | **Only** on `master`/`main` after merge |
 
 Logical commits per step still follow public hygiene; each checkpoint must leave
-**targeted** tests green. Master CI remains the bar for pushes; plan-end is when
-the agent proves the full local gate set (except musl, which waits for master).
+**targeted** tests green. Do not call the plan done on a red PR.
 
 **Suite speed is a first-class planning constraint.** More steps ⇒ more tests ⇒
 we must keep each Red thin. A plan that multiplies multi-second full-store opens
@@ -288,6 +286,13 @@ Before closing a step:
 - [ ] Refactor left all related tests green  
 - [ ] No known red left for “later in the plan”  
 
+Before closing a **plan**:
+
+- [ ] Work landed on a worktree topic branch (not local `master`)  
+- [ ] One PR contains the plan’s commits  
+- [ ] Required GitHub Actions checks on that PR are green  
+
+
 ---
 
 ## References (ideas, not process religion)
@@ -295,4 +300,4 @@ Before closing a step:
 - Extreme Programming: planning game, stories, small releases, TDD, refactoring  
 - Bill Wake — **INVEST** user stories  
 - Vertical story slicing (value through the stack, not layer-by-layer)  
-- Project: [AGENTS.md](../AGENTS.md) (TDD, lean-code, concurrency, musl commit recipe)
+- Project: [AGENTS.md](../AGENTS.md) (TDD, worktree + PR, lean-code, concurrency, musl after merge)

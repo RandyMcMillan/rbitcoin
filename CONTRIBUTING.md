@@ -22,7 +22,15 @@
 Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
 checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`, `test`,
 `multinode`, `coverage`) so a red run shows which gate failed without digging
-into a monolithic job log. Locally:
+into a monolithic job log.
+
+**Agents** implement on a **git worktree** topic branch, commit per plan step,
+and open **one PR** per plan. They do **not** run the full workspace suite or
+coverage locally by default — they poll these Actions jobs to green. See
+[`AGENTS.md`](./AGENTS.md) (worktree + PR) and
+[`docs/how-we-plan.md`](./docs/how-we-plan.md).
+
+Humans who want the same gates offline:
 
 ```bash
 nix develop   # or nix-shell — both pin via flake.lock (rust-toolchain.toml is 1.95.0)

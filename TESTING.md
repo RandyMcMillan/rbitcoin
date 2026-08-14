@@ -72,7 +72,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / every edit) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **tier A multi-node IBD** (8-block single-hop + cold reconstruct) + reorg + short IBD error-path smokes. |
+| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **tier A multi-node IBD** (8-block single-hop + cold reconstruct) + reorg + short IBD error-path smokes. Agents use targeted `-p` tests locally; this suite runs on the PR. |
 | **CI multinode job** | same as tier A filters | Required job after fmt/clippy/test (coverage cadence) |
 | **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
 | **Ignored benches** | `cargo test -p rbitcoin-net --test freeze_benches -- --ignored` etc. | Optional perf / contention probes |

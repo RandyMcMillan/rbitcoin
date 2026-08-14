@@ -38,18 +38,20 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs whose heights are already confirmed.
+    /// Drop packs whose heights are already fence-connected.
     ///
-    /// In-flight is unconfirmed planned creates. Leftover TipOnly is only for
-    /// fence-connected (confirmed) parents. Pruning on occupied / fence_max
-    /// dropped tip-ahead packs after drain but before those heights were
-    /// confirmed — leftover wiped `fk > fence_max` and blacklisted tip+1
-    /// (mainnet 929462 / 931147 / 933474).
+    /// In-flight is planned creates leftover TipOnly would not accept.
+    /// Leftover TipOnly is fence-connected only (`height_of`). Prune on
+    /// `confirmed[]` HWM (`hub.tip_height`) dropped layers after `set_many`
+    /// while leftover still saw the old fence — open-head hits wiped, valid
+    /// tip+1 blacklisted (mainnet 945952; 929462 / 931147 / 933474 were the
+    /// occupied-HWM form of the same implication).
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        self.in_flight.prune_through_tip(hub.tip_height());
+        self.in_flight
+            .prune_through_tip(hub.query.fence_tip_height());
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);

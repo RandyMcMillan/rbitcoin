@@ -1563,6 +1563,11 @@ impl Query {
         self.store.tip_height()
     }
 
+    /// Highest height on the RAM fence. In-flight prune HWM — not [`Self::tip_height`].
+    pub fn fence_tip_height(&self) -> Option<u32> {
+        self.store.fence_tip_height()
+    }
+
     pub fn tip_header_fk(&self) -> Result<Option<Fk>, QueryError> {
         match self.tip_height() {
             None => Ok(None),

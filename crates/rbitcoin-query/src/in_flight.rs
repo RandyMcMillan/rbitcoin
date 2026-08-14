@@ -6,9 +6,10 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop whole layers whose pack `max_height` is already confirmed
-//! (`tip >= max_height`). Unconfirmed planned creates stay in-flight even after
-//! `tx.head` drain / occupied jumps (mainnet 931147 / 933474).
+//! **Prune:** drop whole layers whose pack `max_height` is already on the
+//! height fence (`fence_tip >= max_height`). Unconfirmed planned creates stay
+//! in-flight even after `tx.head` drain and after `confirmed[]` HWM jumps
+//! (mainnet 931147 / 933474 / 945952).
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -100,9 +101,10 @@ impl InFlightLog {
         self.layers.push(Arc::new(layer));
     }
 
-    /// Drop packs whose heights are already confirmed. `None` tip keeps all.
+    /// Drop packs whose heights are already on the fence. `None` keeps all.
     ///
-    /// Untagged layers (`max_height == None`) stay — production always tags.
+    /// Callers must pass **fence** tip (`Query::fence_tip_height`), not
+    /// `confirmed[]` HWM. Untagged layers (`max_height == None`) stay.
     pub fn prune_through_tip(&mut self, tip: Option<u32>) {
         let Some(t) = tip else {
             return;
@@ -294,8 +296,8 @@ mod tests {
         assert!(log.snapshot().get_out(10).is_none());
     }
 
-    /// In-flight lives until the pack's heights are confirmed — not until
-    /// `tx.head` occupied (drain can lead tip / fence; mainnet 931147 / 933474).
+    /// In-flight lives until the pack's heights are on the fence — not until
+    /// `tx.head` occupied or `confirmed[]` HWM (mainnet 931147 / 945952).
     #[test]
     fn inflight_prune_through_tip() {
         let mut log = InFlightLog::new();

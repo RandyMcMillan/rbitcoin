@@ -298,6 +298,9 @@ pub(crate) struct IbdPerfSample {
     pub arch_ext_need: u64,
     pub arch_head_need: u64,
     pub arch_head_hit: u64,
+    /// Unique prev_txids resolved from live pipeline pins (not in-flight).
+    pub arch_pin_txid: u64,
+    pub arch_pin_txid_ms: u64,
     pub arch_batch_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
@@ -548,6 +551,8 @@ impl Default for IbdPerfSample {
             arch_ext_need: 0,
             arch_head_need: 0,
             arch_head_hit: 0,
+            arch_pin_txid: 0,
+            arch_pin_txid_ms: 0,
             arch_batch_stamp: 0,
             arch_resolve_ns: 0,
             arch_resolve_blocks: 0,
@@ -971,6 +976,8 @@ pub(crate) fn sample(
         arch_ext_need: arch_res.ext_need,
         arch_head_need: arch_res.head_need,
         arch_head_hit: arch_res.head_hit,
+        arch_pin_txid: arch_res.pin_txid_n,
+        arch_pin_txid_ms: ns_ms(arch_res.pin_txid_ns),
         arch_batch_stamp: arch_res.batch_stamp,
         arch_resolve_ns: arch_res.resolve_ns,
         arch_resolve_blocks: arch_res.blocks,
@@ -1023,6 +1030,23 @@ pub(crate) fn sample(
 
 fn ns_ms(ns: u64) -> u64 {
     ns / 1_000_000
+}
+
+fn pin_txid_pct(s: &IbdPerfSample) -> u64 {
+    let tot = s.arch_pin_txid.saturating_add(s.arch_head_need);
+    if tot == 0 {
+        0
+    } else {
+        (100 * s.arch_pin_txid) / tot
+    }
+}
+
+fn us_pin_txid(s: &IbdPerfSample) -> u64 {
+    if s.arch_pin_txid == 0 {
+        0
+    } else {
+        s.arch_pin_txid_ms.saturating_mul(1000) / s.arch_pin_txid
+    }
 }
 
 /// Append ` key=value` only when `v != 0` (keeps DEBUG free of ghost columns).
@@ -1140,7 +1164,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     {
         out.push_str(&format!(
             " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
-             batch_assign={}ms collect={}ms head_fk={}ms head_dens={}ms head={}ms \
+             batch_assign={}ms collect={}ms pin_txid={} pin_txid%={} pin_txid_ms={} \
+             head_n={} head_fk={}ms head_dens={}ms head={}ms \
              stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
@@ -1148,6 +1173,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.stamp_batch_ms,
             s.stamp_batch_assign_ms,
             s.stamp_batch_collect_ms,
+            s.arch_pin_txid,
+            pin_txid_pct(s),
+            s.arch_pin_txid_ms,
+            s.arch_head_need,
             s.stamp_batch_head_fk_ms,
             s.stamp_batch_head_dens_ms,
             s.stamp_batch_head_ms,
@@ -1510,12 +1539,17 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | plan_batch assign={} collect={} inflight={} head_fk={} head_dens={} head={} \
+            " | plan_batch assign={} collect={} inflight={} pin_txid={}/{} pin_txid_ms={} \
+             us/pin_txid={} head_fk={} head_dens={} head={} \
              stamp={} finish={} resolve_us/blk={} ext={} head_hit={}/{} \
              stamp_n batch={}",
             s.arch_prep_assign_ms,
             s.arch_prep_collect_ms,
             s.arch_prep_inflight_ms,
+            s.arch_pin_txid,
+            s.arch_head_need,
+            s.arch_pin_txid_ms,
+            us_pin_txid(s),
             s.arch_prep_head_fk_ms,
             s.arch_prep_head_dens_ms,
             s.arch_prep_head_ms,
@@ -2061,6 +2095,8 @@ mod tests {
         s.arch_resolve_blocks = 4;
         s.arch_head_hit = 20;
         s.arch_head_need = 25;
+        s.arch_pin_txid = 15;
+        s.arch_pin_txid_ms = 2;
         s.arch_batch_stamp = 4;
         s.arch_prep_probe_ms = 8;
         s.arch_prep_idx_ms = 4;
@@ -2088,10 +2124,16 @@ mod tests {
         s.thr_lookup_stamp_ms = 1;
         let info = format_info(&s);
         assert!(info.contains("stamp_sub("), "{info}");
+        assert!(info.contains("pin_txid=15"), "{info}");
+        assert!(info.contains("pin_txid%=37"), "{info}");
+        assert!(info.contains("pin_txid_ms=2"), "{info}");
+        assert!(info.contains("head_n=25"), "{info}");
         assert!(info.contains("head_loc(cdf0=10"), "{info}");
         assert!(info.contains("lookup_sub(blks=4"), "{info}");
         let dbg = format_debug(&s);
         assert!(dbg.contains("plan_batch "), "{dbg}");
+        assert!(dbg.contains("pin_txid=15/25"), "{dbg}");
+        assert!(dbg.contains("us/pin_txid=133"), "{dbg}");
         assert!(dbg.contains("head_rd("), "{dbg}");
         assert!(dbg.contains("probe_us/key="), "{dbg}");
         assert!(

@@ -730,7 +730,12 @@ pub(super) fn wire_lookup_phase(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_batch_from(&mut need, p.next_tx_start.max(1), &p.in_flight)
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    p.next_tx_start.max(1),
+                    &p.in_flight,
+                    Some(p.parent_store.as_ref()),
+                )
                 .map_err(ConsensusError::from)?,
             None => query
                 .archive_plan_batch_owned(&mut need)

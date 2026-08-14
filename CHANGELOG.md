@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Lookup stamp:** consult live `PipelineParentStore` by prev_txid before
+  `tx.head` (`pin_txid=` / `pin_txid%` / `pin_txid_ms` / `head_n` /
+  `us/pin_txid` on `ibd: perf`). Remaining head idx fills are page-grouped
+  (follow-on).
+
 - **Schema 16:** drop `tx_height.body` (~5 GiB). Create height is a resident
   fence from `confirmed[]` + `header_txs_*` (O(blocks), RAM bsearch). Reorg
   holes return unconnected. Schema 15 stores soft-open (unlink leftover file).

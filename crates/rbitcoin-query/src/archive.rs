@@ -350,7 +350,7 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_batch_from(need, start, &crate::InFlightView::empty())
+        self.archive_plan_batch_from_store(need, start, &crate::InFlightView::empty(), None)
     }
 
     /// Like [`Self::archive_plan_batch_owned`], but assign create fks from
@@ -368,6 +368,18 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
+    ) -> Result<ArchiveWritePlan, QueryError> {
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None)
+    }
+
+    /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
+    /// (`txid → create_fk` + range) before `tx.head`.
+    pub fn archive_plan_batch_from_store(
+        &self,
+        need: &mut [(Fk, Vec<TxApply>)],
+        next_tx_start: u64,
+        in_flight: &crate::InFlightView,
+        parent_store: Option<&crate::PipelineParentStore>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -445,7 +457,8 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        // sticky_* slots kept at 0 (process pin FIFO removed; head + in-flight only).
+        // sticky_* slots kept at 0 (process pin FIFO removed). Live pins are
+        // consulted via PipelineParentStore::lookup_txid (same Weak lifecycle).
         let sticky_ns = 0u64;
         let sticky_hit_n = 0u64;
         let mut resolved: HashMap<[u8; 32], Fk> = HashMap::with_capacity(need_vec.len() / 2);
@@ -463,6 +476,27 @@ impl Query {
             }
         }
         let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
+
+        // Live pipeline pins (same Weak lifetime as outs share). Not in-flight
+        // creates and not the killed process pin FIFO.
+        let t_pin_txid = Instant::now();
+        let mut pin_txid_n = 0u64;
+        let mut pin_ranges: Vec<(u64, (u64, u64))> = Vec::new();
+        if let Some(store) = parent_store {
+            for t in &need_vec {
+                if resolved.contains_key(t) {
+                    continue;
+                }
+                if let Some((fk, range)) = store.lookup_txid(t) {
+                    resolved.insert(*t, fk);
+                    if let Some(id) = fk.get() {
+                        pin_ranges.push((id, range));
+                    }
+                    pin_txid_n = pin_txid_n.saturating_add(1);
+                }
+            }
+        }
+        let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
 
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
@@ -484,11 +518,14 @@ impl Query {
                 resolved.len().saturating_add(need_head.len()),
                 Default::default(),
             );
-        // Reverse map for in-flight / head binds already in `resolved`.
+        // Reverse map for in-flight / pin / head binds already in `resolved`.
         for (txid, fk) in &resolved {
             if let Some(id) = fk.get() {
                 external_parent_txids.insert(id, *txid);
             }
+        }
+        for (id, range) in pin_ranges {
+            external_parent_ranges.insert(id, range);
         }
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
@@ -660,6 +697,7 @@ impl Query {
             batch_stamp,
             resolved_stamp,
         );
+        crate::archive_phase_stats::note_pin_txid(pin_txid_n, pin_txid_ns);
         crate::archive_phase_stats::note_prep_plan(
             assign_ns,
             collect_ns,
@@ -1242,6 +1280,82 @@ mod tests {
         assert!(Arc::ptr_eq(&ifo_pin, &plan.batch_pin[0]));
         assert_eq!(Arc::strong_count(&plan.batch_pin[0]), 3);
         q.archive_commit_plan(plan).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live pipeline pin supplies create_fk + range without `tx.head`.
+    #[test]
+    fn archive_plan_batch_from_store_hits_pin_txid() {
+        use crate::{BatchParents, PipelineParentStore};
+        use std::sync::Arc;
+        let (dir, q) = temp_query("pin-txid-stamp");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x11;
+            t
+        };
+        let store = Arc::new(PipelineParentStore::new());
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 1);
+        bp.insert_owned(
+            Fk(99),
+            TxRecord {
+                txid: parent_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![(0, OutputRecord::unspent(1, vec![0x51]))],
+            vec![0],
+            Some(false),
+            Some((5000, 40)),
+            Vec::new(),
+        );
+        bp.publish_to_store();
+        let _keep = bp;
+
+        let child_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x22;
+            t
+        };
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(Fk(1), vec![child])];
+        let _ = crate::archive_phase_stats::sample_and_reset();
+        let plan = q
+            .archive_plan_batch_from_store(
+                &mut need,
+                1,
+                &crate::InFlightView::empty(),
+                Some(store.as_ref()),
+            )
+            .expect("pin-txid stamp");
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));
+        assert_eq!(plan.external_parent_ranges.get(&99), Some(&(5000, 40)));
+        let mix = crate::archive_phase_stats::sample_and_reset();
+        assert_eq!(mix.pin_txid_n, 1);
+        assert_eq!(mix.head_need, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

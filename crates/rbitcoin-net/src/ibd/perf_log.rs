@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, loadq/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, ready=/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
 //! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **load_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
@@ -29,9 +29,9 @@
 //! See `AGENTS.md` “Confirm pipeline timers”. `write=` must equal `write_stage_ms`.
 //!
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
-//! `loadq`/`scriptq` stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
-//! `loadq_hwm=` (OS-thread occupancy + queue high-water). High load_recv_wait
-//! + empty loadq_hwm ⇒ lookup is the production pole.
+//! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
+//! `ready=` + `scriptq_hwm=` (OS-thread occupancy + queue high-water). High
+//! load_recv_wait + ready=0 ⇒ lookup is the production pole.
 //!
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
@@ -240,7 +240,7 @@ pub(crate) struct IbdPerfSample {
     /// Max scriptq depth since last 5s sample.
     pub conf_script_q_hwm: usize,
     pub conf_write_q_hwm: usize,
-    // OS-thread occupancy (ms) — wait vs busy; explains empty loadq vs work sums.
+    // OS-thread occupancy (ms) — wait vs busy; explains idle load vs work sums.
     pub thr_lookup_claim_ms: u64,
     pub thr_lookup_resolve_ms: u64,
     pub thr_lookup_clone_ms: u64,
@@ -1108,8 +1108,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Four-stage confirm **work** walls (sums; may mis-rank vs empty loadq).
-    // Prefer thr busy/wait + loadq_hwm for long-pole diagnosis.
+    // Four-stage confirm **work** walls (sums; may mis-rank vs idle load).
+    // Prefer thr busy/wait + ready= / scriptq_hwm for long-pole diagnosis.
     let load_wall_ms = load_stage_wall_ms(s);
     let thr_lookup_busy = s
         .thr_lookup_resolve_ms

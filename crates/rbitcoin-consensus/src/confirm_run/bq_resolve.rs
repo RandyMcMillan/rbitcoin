@@ -248,7 +248,7 @@ mod tests {
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
             prod.contains("get_fk_by_txid_batch(&keys)"),
-            "wave must use TipOnly batch API"
+            "wave must use TipOnly 2-wave batch API (not a separate full-depth probe)"
         );
         assert!(
             !prod.contains("TxidResolveMode::TipThenAny"),

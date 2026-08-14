@@ -146,7 +146,7 @@ lose the bottleneck.
 | Tests | Pin the new token on `format_info` / `write_stage_ms` (or `last_write_phases`) the way `tweaks=` is pinned. |
 | Not OK | Silent index, flush, secp, body walk, memtable lock, or sidecar join on lookup/load/scripts/write. “Meter it later.” |
 
-Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/write busy/wait=` + `loadq_hwm` / `scriptq_hwm` / `writeq_hwm`, not work-sum alone.
+Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/write busy/wait=` + `ready=` / `scriptq_hwm` / `writeq_hwm`, not work-sum alone.
 
 ### Current inventory (keep this list honest)
 

@@ -71,7 +71,7 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 ## Practical rules
 
 1. Do **not** spawn a second Class A writer while IBD confirm write is running.
-2. Pipeline depth: lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2) via bounded loadq/scriptq/writeq.
+2. Pipeline depth: lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2) via BQ `ready=` + bounded scriptq/writeq.
 3. Scripts for batch N may run while load does N+1 and write does N−1. Scripts never touch disk.
 4. **Load ahead of store tip:** lookup may stamp batch N+1 while write has not advanced tip.
    Lookup holds a **reserved create-fk HWM** and **in-flight create/out maps** from

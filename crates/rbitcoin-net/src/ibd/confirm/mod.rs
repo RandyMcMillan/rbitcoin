@@ -728,7 +728,7 @@ fn drain_script_ok_write_queue(
 /// OS-thread occupancy for the confirm pipeline (lookup / load / scripts / write).
 ///
 /// Stage `plan_ms` / `script_ms` / … are **work** sums and mis-rank the long
-/// pole when loadq is empty. These timers include **wait** (claim, recv, send
+/// pole when scriptq is empty. These timers include **wait** (claim, recv, send
 /// block) so a 5s window can show who is busy vs idle.
 pub(crate) mod confirm_thr_stats {
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -120,7 +120,7 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 
 | Line | Level | Use |
 |------|-------|-----|
-| `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
+| `ibd: progress` | INFO | Tip rate, `ready=` (BQ resolve-complete, not a queue), `scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
 | `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **load / script / write** walls; live confirm `h= n= in=`; **`pin_txid=` / `pin_txid%` / `pin_txid_ms=` / `head_n=`** (create_fk from live pins vs `tx.head`); pin/write detail |
 | `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
@@ -183,7 +183,7 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. Legacy mono-head datadirs require reindex |
-| Confirm stages | **lookup · load · scripts · write** | Pipeline queues **hardcoded** loadq=8 · scriptq=4 · writeq=20. **Load** packs tip-contiguous runs by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch (not ~32). IBD **lookup** TipOnly-resolves at most **8** BQ-ready heights per wave. |
+| Confirm stages | **lookup · load · scripts · write** | Real queues **scriptq=4 · writeq=20**. **`ready=`** is BQ resolve-complete inventory (no lookup→load channel). **Load** packs tip-contiguous runs by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch (not ~32). IBD **lookup** TipOnly-resolves at most **8** BQ-ready heights per wave. |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

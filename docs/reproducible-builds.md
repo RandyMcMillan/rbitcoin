@@ -74,6 +74,14 @@ path is the same for both packages.
 Day-to-day: one `nix build .#rbitcoin-musl` (or `./scripts/repro-build.sh`).
 After the deps layer is in the store, app-only changes rebuild far less.
 
+**GitHub Actions:** [`.github/workflows/musl.yml`](../.github/workflows/musl.yml)
+runs that same one-build path after a **green** `ci` **push** to `master`/`main`
+(and on `workflow_dispatch`). It stages with
+`scripts/stage-musl-artifacts.sh` (`file(1)` must say statically linked) and
+uploads `rbitcoin-node`, `rbitcoin-cli`, `SHA256SUMS` as
+`rbitcoin-musl-x86_64-linux-<12-sha>`. Not a required check; not
+`repro-check.sh`.
+
 **Byte-identity gate** (`./scripts/repro-check.sh`) still forces two clean
 `--rebuild`s — use it for release verification, not every commit.
 

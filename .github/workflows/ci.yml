@@ -69,6 +69,8 @@ jobs:
           workspaces: ". -> target/dev"
       - name: build bins
         run: cargo build -p rbitcoin-node -p rbitcoin-cli
+      - name: stage-musl-artifacts self-test
+        run: ./scripts/stage-musl-artifacts.test.sh
       - name: cargo test
         run: cargo test --workspace
 

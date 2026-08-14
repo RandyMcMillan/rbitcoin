@@ -50,6 +50,11 @@ nix build .#rbitcoin-musl
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
+Green **push** CI on `master`/`main` also runs [`.github/workflows/musl.yml`](./.github/workflows/musl.yml)
+and uploads `rbitcoin-musl-x86_64-linux-<sha>` (90 days). That is a snapshot,
+not the byte-identity gate (`repro-check.sh`). Download from the **musl**
+check on the commit, not from the `ci` run.
+
 ## Commits
 
 - Small, reviewable commits with complete sentences in the message body.

@@ -29,6 +29,13 @@ that produces a Nix-glibc dynamic link that fails outside the store. Dev/test
 builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
+**CI snapshots:** every green `master` (or `main`) `ci` run starts workflow
+`musl`, which uploads `rbitcoin-musl-x86_64-linux-<12-hex>` (`rbitcoin-node`,
+`rbitcoin-cli`, `SHA256SUMS`) on that Actions run (90-day retention). Open the
+commit → Checks → **musl** → Artifacts. Not a required PR check. Retry from
+Actions → musl → Run workflow. Local `target/release/` install is still
+`nix build .#rbitcoin-musl` on a clean master tree.
+
 ## CLI (operator-first)
 
 Routine knobs are **CLI / conf**, not required env vars. Clean smoke:

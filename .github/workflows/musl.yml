@@ -1,0 +1,105 @@
+# Portable static musl binaries after a **green** master `ci` run.
+#
+# Not a required PR check. Failures show as the `musl` workflow only.
+# Uses `nix build .#rbitcoin-musl` (same as scripts/repro-build.sh) — never
+# host `cargo build --release`.
+#
+# Triggers:
+#   - workflow_run: `ci` succeeded on a **push** to master/main
+#   - workflow_dispatch: rebuild a ref (retry / operator request)
+#
+# Artifacts: rbitcoin-musl-x86_64-linux-<12-sha> (node, cli, SHA256SUMS).
+# First run is a cold crane deps layer; later runs restore the Nix store cache.
+
+name: musl
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref or SHA to build (empty = this branch tip)
+        required: false
+        default: ""
+
+concurrency:
+  group: musl-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # workflow_run is privileged (default-branch workflow + GITHUB_TOKEN).
+    # CodeQL actions/untrusted-checkout/critical requires an explicit same-repo
+    # check before checkout+run of head_sha (branch filter alone is not enough).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        contains(fromJSON('["master", "main"]'), github.event.workflow_run.head_branch) &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    env:
+      # workflow_run.head_sha is the green commit. dispatch: input or tip.
+      BUILD_REF: ${{ github.event.workflow_run.head_sha || inputs.ref || github.sha }}
+    steps:
+      - name: Checkout green revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_REF }}
+          # Do not write GITHUB_TOKEN into .git — later steps run tree scripts.
+          persist-credentials: false
+
+      # workflow_run's github.sha is the default-branch tip, not the green
+      # commit. Name artifacts from the tree we actually built.
+      - name: Record built SHA
+        id: meta
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            max-jobs = auto
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: musl-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: musl-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: musl-${{ runner.os }}-
+          purge-last-accessed: P7D
+          purge-primary-key: never
+
+      - name: Build musl (flake)
+        run: ./scripts/repro-build.sh musl ./result
+
+      - name: Stage artifacts
+        run: ./scripts/stage-musl-artifacts.sh ./result ./dist
+
+      - name: Upload musl binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rbitcoin-musl-x86_64-linux-${{ steps.meta.outputs.short }}
+          path: |
+            dist/rbitcoin-node
+            dist/rbitcoin-cli
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90

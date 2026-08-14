@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow
+  `musl` builds `nix build .#rbitcoin-musl` and uploads
+  `rbitcoin-node` / `rbitcoin-cli` + `SHA256SUMS` (90 days). Not a required
+  PR check. Manual retry: Actions → musl → Run workflow.
+
 ### Fixed
 
 - **Tests:** scripts-phase steal-worker pin records the coordinator thread on

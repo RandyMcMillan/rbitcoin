@@ -183,6 +183,12 @@ which gate failed: **`fmt`**, **`clippy`**, **`test`**, **`multinode`**, **`cove
 **Do not push or leave a commit that would fail any of them.** A red CI on
 `master` is incomplete work.
 
+Workflow [`musl.yml`](.github/workflows/musl.yml) is **not** required. After
+`ci` succeeds on a **push** to `master`/`main`, it builds
+`nix build .#rbitcoin-musl` and uploads node/cli + `SHA256SUMS`. A red `musl`
+run does not fail the required `ci` jobs; fix or re-run that workflow. Do not
+add `musl` as a required PR status.
+
 ### Required before a code commit
 
 From `nix-shell` (or the same **rustc 1.95** class CI pins). The shell sets

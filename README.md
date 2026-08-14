@@ -128,8 +128,10 @@ cargo test --workspace
 ```
 
 Operator binary: always the static install under `./target/release/` (or
-`./result/bin/`). Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental
-mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+`./result/bin/`). After green `master` CI, the **musl** workflow uploads the
+same pair as an Actions artifact (see [`OPERATOR.md`](./OPERATOR.md)).
+Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 ## Crate map
 

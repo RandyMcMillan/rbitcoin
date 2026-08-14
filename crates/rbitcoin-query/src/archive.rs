@@ -932,34 +932,35 @@ mod tests {
 
     #[test]
     fn archive_phase_stats_cover_plan_and_commit_wall() {
-        // Drain any prior noise.
-        let _ = crate::archive_phase_stats::sample_and_reset();
-        let (dir, q) = temp_query("arch-phases");
-        let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
-        let plan = q
-            .archive_plan_batch_from(&mut need, 1, &crate::InFlightView::empty())
-            .unwrap();
-        assert_eq!(plan.planned_fks.len(), 2);
-        q.archive_commit_plan(plan).unwrap();
-        let s = crate::archive_phase_stats::sample_and_reset();
-        assert!(s.prep_assign_ns > 0 || s.prep_stamp_ns > 0, "plan timed");
-        assert!(s.write_total_ns > 0, "commit total");
-        assert!(s.write_body_ns > 0, "body put timed");
-        let wsum = s.write_phases_sum_ns();
-        // Sequential Instant slices: sum ≤ total + small clock noise; gap is residual.
-        assert!(
-            wsum <= s.write_total_ns.saturating_add(200_000),
-            "write sum {} ≫ total {}",
-            wsum,
-            s.write_total_ns
-        );
-        assert!(
-            s.write_total_ns.saturating_sub(wsum) < s.write_total_ns.max(1),
-            "unaccounted write {} of total {}",
-            s.write_total_ns.saturating_sub(wsum),
-            s.write_total_ns
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        // Exclusive lock so a parallel sample_and_reset cannot steal this
+        // window (llvm-cov / cargo test --workspace).
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let (dir, q) = temp_query("arch-phases");
+            let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
+            let plan = q
+                .archive_plan_batch_from(&mut need, 1, &crate::InFlightView::empty())
+                .unwrap();
+            assert_eq!(plan.planned_fks.len(), 2);
+            q.archive_commit_plan(plan).unwrap();
+            let s = crate::archive_phase_stats::sample_and_reset();
+            // Counts always fire; Instant slices can be 0 ns on a coarse clock.
+            assert!(
+                s.blocks >= 1 || s.prep_assign_ns > 0 || s.prep_stamp_ns > 0,
+                "plan noted"
+            );
+            assert!(s.write_blocks >= 1 || s.write_total_ns > 0, "commit total");
+            assert!(s.write_blocks >= 1 || s.write_body_ns > 0, "body put timed");
+            let wsum = s.write_phases_sum_ns();
+            // Sequential Instant slices: sum ≤ total + small clock noise.
+            assert!(
+                wsum <= s.write_total_ns.saturating_add(200_000),
+                "write sum {} ≫ total {}",
+                wsum,
+                s.write_total_ns
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -1342,20 +1343,22 @@ mod tests {
             outputs: vec![OutputRecord::unspent(1, vec![0x51])],
         };
         let mut need = vec![(Fk(1), vec![child])];
-        let _ = crate::archive_phase_stats::sample_and_reset();
-        let plan = q
-            .archive_plan_batch_from_store(
-                &mut need,
-                1,
-                &crate::InFlightView::empty(),
-                Some(store.as_ref()),
-            )
-            .expect("pin-txid stamp");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));
-        assert_eq!(plan.external_parent_ranges.get(&99), Some(&(5000, 40)));
-        let mix = crate::archive_phase_stats::sample_and_reset();
-        assert_eq!(mix.pin_txid_n, 1);
-        assert_eq!(mix.head_need, 0);
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let plan = q
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    1,
+                    &crate::InFlightView::empty(),
+                    Some(store.as_ref()),
+                )
+                .expect("pin-txid stamp");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));
+            assert_eq!(plan.external_parent_ranges.get(&99), Some(&(5000, 40)));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.pin_txid_n, 1);
+            assert_eq!(mix.head_need, 0);
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

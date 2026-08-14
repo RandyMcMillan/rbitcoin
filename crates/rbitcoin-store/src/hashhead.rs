@@ -77,7 +77,6 @@ const REHASH_WARN_MS: u128 = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadRole {
     Header,
-    Tx,
     ScriptHash,
 }
 
@@ -143,7 +142,7 @@ impl HeadScale {
             // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
                 HeadRole::Header => 1 << 20,
-                HeadRole::ScriptHash | HeadRole::Tx => 1 << 22,
+                HeadRole::ScriptHash => 1 << 22,
             },
         }
     }
@@ -151,12 +150,11 @@ impl HeadScale {
 
 /// Effective initial slots for `role` (env scale + optional per-role override).
 ///
-/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_TX`, `_SCRIPTHASH`
+/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_SCRIPTHASH`
 /// (decimal slot count, rounded up to power of two).
 pub fn initial_slots_for(role: HeadRole) -> u64 {
     let env_key = match role {
         HeadRole::Header => "RBITCOIN_HEAD_SLOTS_HEADER",
-        HeadRole::Tx => "RBITCOIN_HEAD_SLOTS_TX",
         HeadRole::ScriptHash => "RBITCOIN_HEAD_SLOTS_SCRIPTHASH",
     };
     if let Ok(s) = std::env::var(env_key) {
@@ -1122,8 +1120,8 @@ mod tests {
 
     #[test]
     fn mainnet_scale_slot_targets() {
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Tx), 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Tx) >= 64);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::ScriptHash), 64);
+        assert!(HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash) >= 64);
         assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
     }
 
@@ -1251,7 +1249,10 @@ mod tests {
             DEFAULT_SLOTS
         );
         assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 20);
-        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Tx), 1 << 22);
+        assert_eq!(
+            HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash),
+            1 << 22
+        );
         assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
         let full = [0xABu8; 32];
         let p = head_key_prefix(&full);

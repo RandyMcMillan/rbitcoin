@@ -3,7 +3,6 @@
 //! ## Operator env (single switch)
 //! - `RBITCOIN_IO=uring|pread` — all bulk read/write paths (default: uring if available).
 //! - `RBITCOIN_IO=mmap` (legacy) → demoted to **pread** (one-time warn).
-//! - `RBITCOIN_IO_URING=0` → **pread** when `RBITCOIN_IO` unset (deprecated alias).
 //!
 //! Per-path env overrides are **removed** — one global `RBITCOIN_IO` only.
 //!
@@ -71,18 +70,6 @@ fn global_read_from_env() -> Option<ReadIoBackend> {
             return Some(b);
         }
     }
-    if let Ok(s) = std::env::var("RBITCOIN_IO_URING") {
-        if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                rbitcoin_log::info!(
-                    "store: RBITCOIN_IO_URING=0 is deprecated; use RBITCOIN_IO=pread"
-                );
-            }
-            return Some(ReadIoBackend::Pread);
-        }
-    }
     None
 }
 
@@ -90,11 +77,6 @@ fn global_write_from_env() -> Option<WriteIoBackend> {
     if let Ok(s) = std::env::var("RBITCOIN_IO") {
         if let Some(b) = parse_write_token(&s) {
             return Some(b);
-        }
-    }
-    if let Ok(s) = std::env::var("RBITCOIN_IO_URING") {
-        if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
-            return Some(WriteIoBackend::Pwrite);
         }
     }
     None
@@ -193,9 +175,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_io_envs() {
-        for k in ["RBITCOIN_IO", "RBITCOIN_IO_URING"] {
-            std::env::remove_var(k);
-        }
+        std::env::remove_var("RBITCOIN_IO");
     }
 
     #[test]
@@ -239,14 +219,12 @@ mod tests {
         assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO_URING", "0");
-        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
-        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
-        clear_io_envs();
-        std::env::set_var("RBITCOIN_IO_URING", "false");
-        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
-        clear_io_envs();
-        std::env::set_var("RBITCOIN_IO_URING", "off");
-        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
+        assert_eq!(
+            global_read_from_env(),
+            None,
+            "RBITCOIN_IO_URING is not an alias; use RBITCOIN_IO=pread"
+        );
+        assert_eq!(global_write_from_env(), None);
         clear_io_envs();
         // Unknown RBITCOIN_IO token → None (fall through).
         std::env::set_var("RBITCOIN_IO", "not-a-backend");

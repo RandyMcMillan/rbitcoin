@@ -220,7 +220,7 @@ fn fill_idx_pages(
     bufs: &mut [Vec<u8>],
 ) -> bool {
     // Staged SQEs on the held plan ring (no nested TLS bulk_io session).
-    let flags = crate::dontcache_policy::idx_sqe_rw_flags(0, 1);
+    let flags = 0i32;
     for (i, page) in pages.iter().enumerate() {
         let ud = crate::uring_session::pack_ud(UD_KIND_IDX, i as u32);
         if sess

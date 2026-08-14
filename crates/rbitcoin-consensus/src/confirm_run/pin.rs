@@ -333,7 +333,7 @@ pub(super) fn pin_for_wire_batch(
             let n_range = range_jobs.len() as u64;
             let (decoded, body_ns, dec_ns) = query
                 .store()
-                .get_outs_denserels_by_range_batch(&range_jobs)
+                .get_outs_by_range_batch(&range_jobs)
                 .map_err(ConsensusError::from)?;
             let rng_ns = body_ns.saturating_add(dec_ns);
             cold_range_batch_ns = cold_range_batch_ns.saturating_add(rng_ns);

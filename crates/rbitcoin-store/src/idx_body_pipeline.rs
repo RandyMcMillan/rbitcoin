@@ -146,14 +146,13 @@ pub fn run_idx_body_pipeline_backend(
         let len = jobs[i].body.len();
         let ptr = jobs[i].body.as_mut_ptr();
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        // Confirm load/pin: leave pages cacheable for write-stage meta + pure-write
-        // annotate RMW (see dontcache_policy::body_read_confirm).
+        // Confirm load/pin: leave pages cacheable for write-stage meta + annotate RMW.
         read_ops.push(ReadOp {
             fd: body_fd,
             offset: off,
             buf: slice,
             result: i32::MIN,
-            dontcache: crate::dontcache_policy::body_read_confirm(),
+            dontcache: false,
         });
     }
     bulk_io::pread_batch_backend(&mut read_ops, backend);
@@ -221,7 +220,7 @@ fn extend_truncated_txout_jobs(
             offset: off,
             buf: slice,
             result: i32::MIN,
-            dontcache: crate::dontcache_policy::body_read_confirm(),
+            dontcache: false,
         });
     }
     bulk_io::pread_batch_backend(&mut ops, backend);

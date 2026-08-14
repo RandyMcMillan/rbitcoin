@@ -130,6 +130,14 @@ impl Sample {
     }
 }
 
+/// Sealed age from tip for segment index `si` in a vec of `n_segs` (last = tip).
+///
+/// Used by the two-wave probe split and winner-age stats. Not a DONTCACHE gate.
+#[inline]
+pub fn sealed_age_from_index(si: usize, n_segs: usize) -> u32 {
+    n_segs.saturating_sub(1).saturating_sub(si) as u32
+}
+
 /// Map `create_fk` → sealed-age from tip using segment `first_fk` boundaries.
 ///
 /// `first_fks[si]` is the inclusive start of segment `si` (last = open/tip).
@@ -153,10 +161,7 @@ pub fn sealed_age_for_fk(first_fks: &[u64], fk: u64) -> Option<u32> {
     if first_fks[lo] > fk {
         return None;
     }
-    Some(crate::dontcache_policy::sealed_age_from_index(
-        lo,
-        first_fks.len(),
-    ))
+    Some(sealed_age_from_index(lo, first_fks.len()))
 }
 
 /// Bucket index for a sealed-age (ages ≥ CAP−1 share the last bucket).
@@ -307,6 +312,10 @@ mod tests {
         assert_eq!(sealed_age_for_fk(&first, 200), Some(0));
         assert_eq!(sealed_age_for_fk(&first, 999_999), Some(0));
         assert_eq!(sealed_age_for_fk(&[], 1), None);
+        assert_eq!(sealed_age_from_index(5, 6), 0);
+        assert_eq!(sealed_age_from_index(0, 6), 5);
+        assert_eq!(sealed_age_from_index(2, 6), 3);
+        assert_eq!(sealed_age_from_index(0, 0), 0);
         assert_eq!(age_bucket(0), 0);
         assert_eq!(age_bucket(3), 3);
         assert_eq!(age_bucket(100), AGE_CAP - 1);

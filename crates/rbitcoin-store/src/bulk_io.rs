@@ -13,7 +13,7 @@
 //!
 //! # Controls
 //!
-//! - `RBITCOIN_IO_URING=0` — force libc `pread`/`pwrite` fallback.
+//! - `RBITCOIN_IO=pread` — force libc `pread`/`pwrite` fallback (see `io_backend`).
 //! - `RBITCOIN_BULK_IO_WORKERS` — parallel pread workers when uring is off
 //!   (default `min(CPUs, 16)`; `1` = serial). Writes fall back to serial pwrite.
 //!
@@ -100,8 +100,11 @@ pub fn io_uring_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let want = std::env::var("RBITCOIN_IO_URING")
-                .map(|s| s != "0" && s != "false" && s != "off")
+            let want = std::env::var("RBITCOIN_IO")
+                .map(|s| {
+                    let t = s.trim().to_ascii_lowercase();
+                    t != "pread" && t != "fd" && t != "libc" && t != "pwrite" && t != "mmap"
+                })
                 .unwrap_or(true);
             if !want {
                 URING_MODE.store(2, Ordering::Relaxed);
@@ -112,7 +115,7 @@ pub fn io_uring_enabled() -> bool {
             if !ok && !URING_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
                 rbitcoin_log::warn!(
                     "store: io_uring unavailable — bulk reads use pread fallback \
-                     (set RBITCOIN_IO_URING=0 to silence)"
+                     (set RBITCOIN_IO=pread to silence)"
                 );
             }
             ok
@@ -261,7 +264,7 @@ pub fn test_take_last_write_dontcache() -> Vec<bool> {
 /// should fall back). `apply` is only invoked after a successful full-page read.
 /// When `apply` returns `false` (clean / abort), that page is not written.
 ///
-/// On non-Linux or `RBITCOIN_IO_URING=0`, returns `false` immediately.
+/// On non-Linux or `RBITCOIN_IO=pread`, returns `false` immediately.
 ///
 /// Reusable primitive for tests; `tx.head` insert is a separate production path.
 #[cfg(test)]

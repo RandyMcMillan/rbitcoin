@@ -503,8 +503,7 @@ impl SegmentedTxHead {
 
 /// Wave-1 sealed-age cap: open (age 0) + sealed ages `1..=` this.
 ///
-/// Independent of [`crate::dontcache_policy::head_or_idx_segment_index`]
-/// (that flag is spend-annotate pwrite only and is always false for head).
+/// Independent of spend-annotate RWF_DONTCACHE (pwrite only; never head probe).
 pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
 
 /// Which head segments to probe (two-wave resolve vs full baseline).
@@ -524,7 +523,7 @@ impl HeadProbeWave {
         matches!(self, HeadProbeWave::All | HeadProbeWave::Hot)
     }
 
-    /// `age` = [`crate::dontcache_policy::sealed_age_from_index`] for the seg.
+    /// `age` = [`crate::head_resolve_stats::sealed_age_from_index`] for the seg.
     #[inline]
     fn includes_sealed_age(self, age: u32) -> bool {
         match self {
@@ -642,12 +641,9 @@ impl SegmentedTxHead {
             }
             if !pass_keys.is_empty() {
                 LOOKUP_OPEN.fetch_add(pass_keys.len() as u64, Ordering::Relaxed);
-                let dc = crate::dontcache_policy::head_or_idx_segment_index(n_segs - 1, n_segs);
                 let rel_lists = match session.as_mut() {
-                    Some(s) => last
-                        .head
-                        .probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
-                    None => last.head.probe_fks_batch_dontcache(&pass_keys, dc)?,
+                    Some(s) => last.head.probe_fks_batch_on_session(&pass_keys, s)?,
+                    None => last.head.probe_fks_batch(&pass_keys)?,
                 };
                 for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                     for r in rels.into_iter().rev() {
@@ -671,12 +667,10 @@ impl SegmentedTxHead {
             if !seg.sealed {
                 continue;
             }
-            let age = crate::dontcache_policy::sealed_age_from_index(si, n_segs);
+            let age = crate::head_resolve_stats::sealed_age_from_index(si, n_segs);
             if !wave.includes_sealed_age(age) {
                 continue;
             }
-            // Page-cache flag only (always false under spend-pwrite DONTCACHE).
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };
@@ -701,10 +695,8 @@ impl SegmentedTxHead {
                 continue;
             }
             let rel_lists = match session.as_mut() {
-                Some(s) => seg
-                    .head
-                    .probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
-                None => seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?,
+                Some(s) => seg.head.probe_fks_batch_on_session(&pass_keys, s)?,
+                None => seg.head.probe_fks_batch(&pass_keys)?,
             };
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {

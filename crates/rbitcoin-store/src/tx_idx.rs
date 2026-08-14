@@ -236,8 +236,7 @@ impl TxIdx {
         if i >= seg.count {
             return Err(StoreError::NotFound);
         }
-        let dc = crate::dontcache_policy::head_or_idx_segment_index(si, segs.len());
-        read_start(seg, i, dc)
+        read_start(seg, i)
     }
 
     /// `(offset, len)` for interior id (`id < count`); needs start(id+1).
@@ -250,8 +249,6 @@ impl TxIdx {
         let segs = self.segments_snapshot();
         let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
         let seg = &segs[si];
-        let n_segs = segs.len();
-        let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
         let i = id - seg.first_fk;
         if i + 1 >= seg.count {
             // Need next segment or last-record path — fall back.
@@ -268,7 +265,7 @@ impl TxIdx {
         let page1 = align_down(off1, IDX_OS_PAGE);
         if page0 == page1 {
             let mut starts = Vec::with_capacity(2);
-            read_starts_page_aligned(seg, i, i + 1, &mut starts, dc)?;
+            read_starts_page_aligned(seg, i, i + 1, &mut starts)?;
             if starts.len() != 2 {
                 return Err(StoreError::Corrupt("tx.idx dual extract"));
             }
@@ -329,7 +326,6 @@ impl TxIdx {
             return Ok(());
         }
         let segs = self.segments_snapshot();
-        let n_segs = segs.len();
         let mut id = first;
         while id <= last {
             let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
@@ -338,9 +334,8 @@ impl TxIdx {
             let take_last = last.min(seg_last_fk);
             let i0 = id - seg.first_fk;
             let i1 = take_last - seg.first_fk;
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             // OS-page-aligned bulk read covering [i0..=i1], then extract slots.
-            read_starts_page_aligned(seg, i0, i1, out, dc)?;
+            read_starts_page_aligned(seg, i0, i1, out)?;
             id = take_last + 1;
         }
         Ok(())
@@ -401,13 +396,11 @@ impl TxIdx {
                 continue;
             }
             page_buf[..want].fill(0);
-            // Permanent spend-only: idx peeks never DONTCACHE.
-            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, segs.len());
             let rc = crate::bulk_io::pread_single(
                 seg.file.read_fd(),
                 page_off,
                 &mut page_buf[..want],
-                dc,
+                false,
             );
             if rc < 0 {
                 return Err(StoreError::io(
@@ -506,8 +499,6 @@ impl TxIdx {
 
         {
             use crate::bulk_io::{self, ReadOp};
-            // Sealed age from tip: last segment is open/newest (age 0).
-            let n_segs = segs.len();
             // SAFETY: each pages[i] is a distinct allocation.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
             for (i, (si, page_off)) in page_keys.iter().enumerate() {
@@ -520,7 +511,7 @@ impl TxIdx {
                     offset: *page_off,
                     buf: slice,
                     result: i32::MIN,
-                    dontcache: crate::dontcache_policy::head_or_idx_segment_index(*si, n_segs),
+                    dontcache: false,
                 });
             }
             bulk_io::pread_batch_backend(&mut ops, backend);
@@ -976,8 +967,8 @@ fn check_published_starts_monotone(segs: &[Segment]) -> Result<(), StoreError> {
         if a.count == 0 || b.count == 0 {
             continue;
         }
-        let last_a = read_start(a, a.count - 1, false)?;
-        let first_b = read_start(b, 0, false)?;
+        let last_a = read_start(a, a.count - 1)?;
+        let first_b = read_start(b, 0)?;
         if first_b <= last_a {
             return Err(StoreError::Corrupt(IDX_OPEN_DOUBLE_APPEND));
         }
@@ -1000,7 +991,7 @@ fn check_published_starts_monotone(segs: &[Segment]) -> Result<(), StoreError> {
         let i0 = seg.count - take;
         let i1 = seg.count - 1;
         let mut chunk = Vec::with_capacity(take as usize);
-        read_starts_page_aligned(seg, i0, i1, &mut chunk, false)?;
+        read_starts_page_aligned(seg, i0, i1, &mut chunk)?;
         remain = remain.saturating_sub(chunk.len() as u64);
         starts.extend(chunk.into_iter().rev());
     }
@@ -1034,26 +1025,23 @@ fn decode_abs(seg: &Segment, rel: u32) -> Result<u64, StoreError> {
         .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
-fn read_start(seg: &Segment, i: u64, dontcache: bool) -> Result<u64, StoreError> {
+fn read_start(seg: &Segment, i: u64) -> Result<u64, StoreError> {
     // Single slot: still go through page-aligned read (one OS page) so cold
     // probes share the page cache with neighbors.
     let mut out = Vec::with_capacity(1);
-    read_starts_page_aligned(seg, i, i, &mut out, dontcache)?;
+    read_starts_page_aligned(seg, i, i, &mut out)?;
     out.into_iter()
         .next()
         .ok_or(StoreError::Corrupt("tx.idx empty page extract"))
 }
 
 /// Read slots `[i0..=i1]` via OS-page-aligned preads (one read per page).
-///
-/// `dontcache` follows schema-13 head/idx sealed-age policy (open + past 3 sealed
-/// stay cacheable; older set RWF_DONTCACHE on uring SQEs via bulk_io).
+/// Idx peeks never set RWF_DONTCACHE (spend-pwrite only).
 fn read_starts_page_aligned(
     seg: &Segment,
     i0: u64,
     i1: u64,
     out: &mut Vec<u64>,
-    dontcache: bool,
 ) -> Result<(), StoreError> {
     if i1 < i0 {
         return Ok(());
@@ -1068,7 +1056,7 @@ fn read_starts_page_aligned(
             break;
         }
         let mut page = vec![0u8; want];
-        let rc = crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page, dontcache);
+        let rc = crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page, false);
         if rc < 0 {
             return Err(StoreError::io(
                 seg.file.path(),
@@ -1442,8 +1430,7 @@ mod tests {
 
     /// Serial `record_start` page loads never set DONTCACHE (permanent spend-only).
     ///
-    /// Policy is age-independent (`head_or_idx_segment_index` always false); a
-    /// single segment is enough. Soft-span env is locked to avoid parallel races.
+    /// Single segment is enough. Soft-span env is locked to avoid parallel races.
     #[test]
     fn serial_record_start_never_dontcache() {
         use crate::bulk_io;

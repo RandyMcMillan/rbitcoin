@@ -127,7 +127,7 @@ pub fn ensure_external_parent_denserels_from_plan(
             let n_range = by_range.len() as u64;
             let (decoded, body_ns, dec_ns) = query
                 .store()
-                .get_outs_denserels_by_range_batch(&by_range)
+                .get_outs_by_range_batch(&by_range)
                 .map_err(ConsensusError::from)?;
             let rng_ns = body_ns.saturating_add(dec_ns);
             if rng_ns > 0 {

@@ -163,7 +163,6 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 | Env | Values | Note |
 |-----|--------|------|
 | **`RBITCOIN_IO`** | `uring` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
-| `RBITCOIN_IO_URING=0` | deprecated | Same as `RBITCOIN_IO=pread` |
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 

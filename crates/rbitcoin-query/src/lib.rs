@@ -172,7 +172,7 @@ pub mod confirm_load_stats {
     pub static PIN_PUBLISH_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels wall (range + idx). Prefer split fields when diagnosing.
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
-    /// Cold denserels via plan stamp body range (`get_outs_denserels_by_range_batch`).
+    /// Cold denserels via plan stamp body range (`get_outs_by_range_batch`).
     pub static COLD_RANGE_NS: AtomicU64 = AtomicU64::new(0);
     pub static COLD_RANGE_N: AtomicU64 = AtomicU64::new(0);
     /// Sub-wall of cold range: body pread only (N2.0).

@@ -314,7 +314,7 @@ impl VarTable {
             offset: start,
             buf: body_blob,
             result: i32::MIN,
-            dontcache: crate::dontcache_policy::body_write(),
+            dontcache: false,
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
@@ -539,12 +539,7 @@ impl VarTable {
         if buf.is_empty() {
             return Ok(());
         }
-        let rc = crate::bulk_io::pread_single(
-            self.body.read_fd(),
-            offset,
-            buf,
-            crate::dontcache_policy::body_read_generic(),
-        );
+        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf, false);
         if rc < 0 {
             return Err(StoreError::io(
                 self.body.path(),

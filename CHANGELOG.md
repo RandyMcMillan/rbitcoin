@@ -9,6 +9,14 @@ before 1.0).
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead DONTCACHE / IO aliases:** head/idx probe no longer threads an always-false
+  DONTCACHE flag. `sealed_age_from_index` lives with winner-age stats.
+  Dropped `get_outs_denserels_by_range_batch`, `spend_meta_backend_next`,
+  `load_needs_resize`, `HeadRole::Tx` / `RBITCOIN_HEAD_SLOTS_TX`, and
+  `RBITCOIN_IO_URING` (`RBITCOIN_IO=pread` is the only pread hatch).
+
 ### Added
 
 - **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow

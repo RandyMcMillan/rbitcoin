@@ -8,12 +8,12 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 |------|-----------|--------------|
 | Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
 | Confirm **lookup** | 1 OS thread | load wire from **body queue**; structure + stamp create_fk (Class A planned only) |
-| Confirm **load** | 1 OS thread | pin `txout` outs + assemble from owned stamped plan (no re-lookup / no head resolve) |
+| Confirm **load** | 1 OS thread | stamp from BQ hits + leftover TipOnly `tx.head`; pin `txout` + assemble |
 | Confirm **scripts** | 1 OS thread + 2 coordinators + `rbtc-scripts` steal | **none** — pure CPU |
 | Confirm **write** | 1 OS thread | **sole Class A appender** (`txout`+`inwit`+`spent`) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → **lookup** (structure + stamp create_fk) → **load** (pin `txout` + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Load must **not** re-run lookup head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → no cold idx on load). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
+**Height-ordered unified pipeline (current):** peer → **body queue** → **lookup** (BQ-ahead TipOnly `head_fk` wave) → **load** (structure + stamp from BQ hits + leftover TipOnly `tx.head` + pin `txout` + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Load leftovers are cheap (open head / ages ≤3 sealed), not a second full-head walk and not TipThenAny. Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
 **Load claim pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do **not** treat ~32 as pack size (that was 8000/250 mid-chain, not fat-era).
 

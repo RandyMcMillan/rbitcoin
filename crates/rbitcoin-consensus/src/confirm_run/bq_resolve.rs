@@ -364,8 +364,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Wave may miss a parent that is already connected in `tx.head`.
+    /// Load stamp must TipOnly-head the leftover — not Corrupt-as-invariant.
     #[test]
-    fn load_without_bq_hit_is_invariant_not_tipthenany() {
+    fn load_stamp_leftover_parent_via_tiponly_head() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let g_cb = genesis.txdata[0].compute_txid();
+        let expect_fk = q
+            .store()
+            .get_fk_by_txid_tip(&g_cb.to_byte_array())
+            .unwrap()
+            .expect("genesis coinbase is connected");
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        let empty = rbitcoin_store::BqParentHits::default();
+        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
+            &q,
+            &params,
+            Milestone::NONE,
+            &items,
+            None,
+            Some(&empty),
+        )
+        .expect("leftover connected parent must TipOnly-head, not invariant");
+        let plan = stamped.plan.expect("new body needs a plan");
+        let spend = plan
+            .packed
+            .iter()
+            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+            .expect("spend tx");
+        let inp = spend
+            .1
+            .iter()
+            .find(|i| !i.is_coinbase())
+            .expect("spend input");
+        assert_eq!(inp.prev_txid, g_cb.to_byte_array());
+        assert_eq!(inp.create_fk, expect_fk);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Leftover TipOnly must not resurrect an abandoned (disconnected) Class A row.
+    #[test]
+    fn load_leftover_disconnected_parent_is_not_tipthenany() {
         use rbitcoin_query::TxApply;
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
         let (path, q) = tmp_query();
@@ -405,20 +453,20 @@ mod tests {
                 &rbitcoin_query::InFlightView::empty(),
                 None,
                 Some(&rbitcoin_store::BqParentHits::default()),
-                false,
                 true,
             )
-            .expect_err("missing BQ hit must not TipThenAny-fill");
+            .expect_err("disconnected leftover must not TipThenAny-fill");
         let msg = err.to_string();
+        assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");
         assert!(
-            msg.contains("invariant: external parent missing BQ TipOnly hit"),
-            "got: {msg}"
+            !msg.contains("invariant: external parent missing BQ TipOnly hit"),
+            "leftover miss is unresolved, not the old forbid-head invariant: {msg}"
         );
         let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
-    fn bq_wave_then_forbid_head_confirms_empty_block() {
+    fn bq_wave_then_stamp_confirms_empty_block() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -437,7 +485,6 @@ mod tests {
             &items,
             None,
             Some(&hits),
-            false,
         )
         .expect("coinbase-only block needs no external head");
         let mat = crate::confirm_wire_load_from_plan(

@@ -867,7 +867,8 @@ pub(crate) mod confirm_thr_stats {
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
-/// from BQ hits + pin + assemble) → scriptq → scripts → writeq → write.
+/// from BQ hits + leftover TipOnly `tx.head` + pin + assemble) → scriptq →
+/// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
@@ -1209,7 +1210,7 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Load: claim resolve-complete BQ heights → stamp from BQ hits → pin → scripts.
+    // Load: claim resolve-complete BQ heights → stamp (BQ hits + leftover TipOnly) → pin → scripts.
     let hub_load = Arc::clone(&hub);
     let feed_load = Arc::clone(&feed);
     let event_tx_load = event_tx.clone();
@@ -1408,17 +1409,11 @@ pub(crate) fn spawn_confirm_engine(
                     .collect();
                 confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
                 let mut merged = rbitcoin_store::BqParentHits::default();
-                let mut all_complete = true;
                 for (h, _, _) in &wire_batch {
-                    if !hub_load.query.block_queue_is_resolve_complete(*h) {
-                        all_complete = false;
-                    }
                     if let Some(hits) = hub_load.query.block_queue_parent_hits(*h) {
                         merged.extend(hits);
                     }
                 }
-                // Test-injected wire may skip the wave; one-shot TipOnly then.
-                let allow_head = !all_complete;
                 let t_stamp = Instant::now();
                 let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp_with_hits(
                     &hub_load.query,
@@ -1431,7 +1426,6 @@ pub(crate) fn spawn_confirm_engine(
                     } else {
                         Some(&merged)
                     },
-                    allow_head,
                 );
                 confirm_thr_stats::add_load_work(t_stamp.elapsed());
                 let stamped = match plan_res {

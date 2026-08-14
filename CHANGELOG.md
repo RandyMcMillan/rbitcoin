@@ -9,6 +9,15 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
+  on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
+  other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag
+  and both hot and cold files stay in `--datadir`. Conf: `datadir-cold=`.
+  Existing split: move `inwit.body` + `inwit.idx/` yourself; the hot store
+  records `inwit.reloc` so a later open without the flag refuses.
+
 ### Changed
 
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves

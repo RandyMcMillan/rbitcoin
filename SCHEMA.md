@@ -37,6 +37,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     header.body / header.head    # Class A headers + hash index
     txout.body / txout.idx/                         # Class A outs (hot)
     inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
+    inwit.reloc                  # optional: inwit lives under --datadir-cold/store
     spent.body / spent.idx/                         # sole-spender 9 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
@@ -54,7 +55,15 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
   wire/                          # unused (opened, never filled)
+
+<datadir-cold>/                  # only when --datadir-cold is set
+  store/
+    inwit.body / inwit.idx/      # same files; not duplicated under <datadir>/store
 ```
+
+`--datadir` holds both stems by default. `--datadir-cold PATH` places only
+`inwit.body` + `inwit.idx/` under `PATH/store/` (and writes `inwit.reloc` in
+the hot store). Pin / SH / spend-annotate stay on the hot volume.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.

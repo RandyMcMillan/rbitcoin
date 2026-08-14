@@ -16,7 +16,6 @@ CLI still sets process env for library readers where needed today:
 | CLI / conf | Env bridge (transitional) |
 |------------|---------------------------|
 | `--maxinbound` / `--maxconnections` | `RBITCOIN_P2P_MAX_INBOUND` via `NodeConfig::apply_operator_env` |
-| `--archive-queue-mb` | `RBITCOIN_ARCHIVE_QUEUE_MB` when flag set |
 
 Long term: pass config structs; drop `set_var` bridges.
 

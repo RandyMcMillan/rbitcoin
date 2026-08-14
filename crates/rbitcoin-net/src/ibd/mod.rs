@@ -29,9 +29,7 @@ mod status;
 
 // reorg module used by events/state; public surface via crate::most_work + tests.
 
-use archive::{
-    rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue, ArchiveQueueBudget,
-};
+use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
@@ -357,13 +355,6 @@ pub async fn ibd_cancellable(
         }
     }
 
-    // Soft densify meter (far-scale / can_assign). Primary depth gate is durable
-    // BQ soft time-depth; this budget has no dual-track job charges anymore.
-    let archive_queued = ArchiveQueueBudget::from_env();
-    info!(
-        "ibd: soft densify budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
-        archive_queued.budget_bytes() / (1024 * 1024)
-    );
     let loop_stats = Arc::new(LoopStats::default());
     // Seed Class A body count from disk (not zero at restart).
     let store_class_a_bodies = hub.query.archived_block_count().unwrap_or(0);
@@ -384,12 +375,7 @@ pub async fn ibd_cancellable(
     let confirm_feed = Arc::new(ConfirmFeed::new());
     // Body queue is RAM-only (no durable wire payloads). Same-process residual
     // still notes feed readiness; after restart the queue is empty.
-    match rehydrate_block_queue_into_confirm(
-        hub.as_ref(),
-        &mut st,
-        confirm_feed.as_ref(),
-        &archive_queued,
-    ) {
+    match rehydrate_block_queue_into_confirm(hub.as_ref(), &mut st, confirm_feed.as_ref()) {
         Ok(n) if n > 0 => {
             rbitcoin_log::debug!("ibd: rehydrate: noted {n} in-RAM body queue entries");
         }
@@ -465,7 +451,7 @@ pub async fn ibd_cancellable(
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                    // Unified wire path charged archive_queued on receive; release here.
+                    // Body accepted — drop from ordered and mark archived.
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -524,22 +510,19 @@ pub async fn ibd_cancellable(
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // Soft BQ assign (no hysteresis): under ~100 MiB free densify ahead; over
         // that only the next ~1 min of confirm work at tip rate. Peer reads /
-        // block_queue_offer never consult soft limits. Archive soft RAM still
-        // gates densify. Tip-hole race always runs. Window covered → Critical.
-        let far_scale = archive_queued.far_admission_scale();
+        // block_queue_offer never consult soft limits. Tip-hole race always
+        // runs. Window covered → Critical.
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let _ = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
         let (_bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
         let bq_window_covered =
             rbitcoin_query::soft_confirm_window_covered(bq_count as u32, bq_bytes, tip_rate_opt);
-        let archive_can_assign = archive_queued.can_assign();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
         let depth = if archive_pipeline_saturated(
             st.body.pending_len(),
             st.inflight.len(),
             bq_window_covered,
-            archive_queued.fill_ratio(),
         ) {
             AssignDepth::Critical
         } else {
@@ -550,10 +533,8 @@ pub async fn ibd_cancellable(
             hub.as_ref(),
             &cfg,
             &loop_stats,
-            far_scale,
             write_next,
             depth,
-            archive_can_assign,
             tip_rate_opt,
         );
 
@@ -579,7 +560,7 @@ pub async fn ibd_cancellable(
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                    // Unified wire path charged archive_queued on receive; release here.
+                    // Body accepted — drop from ordered and mark archived.
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -621,33 +602,25 @@ pub async fn ibd_cancellable(
         // pipeline still runs Critical only (write_next race / tip hole).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
-            let far_scale2 = archive_queued.far_admission_scale();
             let tip_rate2 = tip_rate_tracker.eta_rate(Instant::now());
             let _ = hub.query.block_queue_update_soft_pressure(tip_rate2);
             let (_b2, bq_bytes2, bq_count2) = hub.query.block_queue_stats();
             let covered2 =
                 rbitcoin_query::soft_confirm_window_covered(bq_count2 as u32, bq_bytes2, tip_rate2);
-            let archive_can2 = archive_queued.can_assign();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
-            let depth2 = if archive_pipeline_saturated(
-                st.body.pending_len(),
-                st.inflight.len(),
-                covered2,
-                archive_queued.fill_ratio(),
-            ) {
-                AssignDepth::Critical
-            } else {
-                AssignDepth::Full
-            };
+            let depth2 =
+                if archive_pipeline_saturated(st.body.pending_len(), st.inflight.len(), covered2) {
+                    AssignDepth::Critical
+                } else {
+                    AssignDepth::Full
+                };
             assign_work_ordered(
                 &mut st,
                 hub.as_ref(),
                 &cfg,
                 &loop_stats,
-                far_scale2,
                 write_next2,
                 depth2,
-                archive_can2,
                 tip_rate2,
             );
         }
@@ -983,7 +956,6 @@ pub async fn ibd_cancellable(
                 && prog.tip_hole == 0
                 && !conf_busy
                 && st.inflight.is_empty()
-                && archive_queued.count() == 0
                 && prog.ready_hwm > prog.tip.saturating_add(1)
             {
                 let expect = prog.tip.saturating_add(1);
@@ -1023,8 +995,7 @@ pub async fn ibd_cancellable(
         // on headers_done while max_peer_height still dwarfs our tip (signet:
         // false headers_done at h≈2000 with peers at ~313k). See `exit` module.
         let tip_h = hub.tip_height().unwrap_or(0);
-        let arch_q = archive_queued.count();
-        if path_drained(&st, arch_q)
+        if path_drained(&st)
             && (peer_caught_up(&st, tip_h)
                 || (st.headers_done && header_lag_behind_peers(&st, tip_h) <= 2))
         {
@@ -1038,8 +1009,7 @@ pub async fn ibd_cancellable(
             );
             update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
             let tip_h = hub.tip_height().unwrap_or(0);
-            let arch_q = archive_queued.count();
-            if catchup_complete_after_drain(&st, tip_h, arch_q) {
+            if catchup_complete_after_drain(&st, tip_h) {
                 info!(
                     "ibd: catch-up complete tip={tip_h} max_peer_height={} max_ready={} headers_done={} — exiting IBD",
                     st.max_peer_height, st.max_ready_height, st.headers_done
@@ -1056,14 +1026,7 @@ pub async fn ibd_cancellable(
         // All peers dead — never treat mid-chain peer death as catch-up complete.
         if st.slots.iter().all(|s| !s.alive) {
             let tip_h = hub.tip_height().unwrap_or(0);
-            let arch_q = archive_queued.count();
-            match all_peers_dead_action(
-                &st,
-                tip_h,
-                arch_q,
-                redial_handle.is_some(),
-                dark_redial_empty,
-            ) {
+            match all_peers_dead_action(&st, tip_h, redial_handle.is_some(), dark_redial_empty) {
                 AllPeersDead::CatchupComplete => {
                     info!(
                         "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_ready={} — exiting IBD",
@@ -1175,10 +1138,9 @@ pub async fn ibd_cancellable(
                 if last_progress.elapsed() > cfg.stall
                     && st.ordered.is_empty()
                     && st.inflight.is_empty()
-                    && archive_queued.count() == 0
                 {
                     let tip_h = hub.tip_height().unwrap_or(0);
-                    if catchup_complete_after_drain(&st, tip_h, 0) {
+                    if catchup_complete_after_drain(&st, tip_h) {
                         info!(
                             "ibd: catch-up complete (stall, path empty) tip={tip_h} max_peer_height={} — exiting IBD",
                             st.max_peer_height
@@ -1351,10 +1313,10 @@ mod archive_sat_tests {
 
     #[test]
     fn archive_pipeline_saturated_gates_full_assign() {
-        assert!(!archive_pipeline_saturated(0, 0, false, 0.0));
-        assert!(!archive_pipeline_saturated(200, 32, true, 0.95));
-        assert!(!archive_pipeline_saturated(96, 0, false, 0.0));
-        assert!(archive_pipeline_saturated(0, 0, false, 0.85));
-        assert!(archive_pipeline_saturated(200, 15, true, 0.0));
+        assert!(!archive_pipeline_saturated(0, 0, false));
+        assert!(!archive_pipeline_saturated(200, 32, true));
+        assert!(!archive_pipeline_saturated(96, 0, false));
+        assert!(archive_pipeline_saturated(0, 0, true));
+        assert!(archive_pipeline_saturated(200, 15, true));
     }
 }

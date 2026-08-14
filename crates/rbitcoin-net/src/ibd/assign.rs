@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 /// How much assign work to do this call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AssignDepth {
-    /// Tip-batch multi-peer only (archive soft saturated / no densify room).
+    /// Tip-batch multi-peer only (BQ soft window covered / no densify room).
     Critical,
     /// Tip batch + densify (gap always; frontier when soft depth allows).
     Full,
@@ -72,22 +72,20 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// True when soft BQ confirm window is already covered (or archive RAM full)
-/// and getdata inflight is low → Critical (tip race only, skip densify walk).
+/// True when soft BQ confirm window is already covered and getdata inflight
+/// is low → Critical (tip race only, skip densify walk).
 ///
 /// High `pending` alone is **not** saturated — pending means we already hold wire.
 pub(crate) fn archive_pipeline_saturated(
     _pending_len: usize,
     inflight_len: usize,
     bq_confirm_window_covered: bool,
-    archive_fill_ratio: f64,
 ) -> bool {
-    inflight_len < 16 && (bq_confirm_window_covered || archive_fill_ratio >= 0.85)
+    inflight_len < 16 && bq_confirm_window_covered
 }
 
 /// Assign getdata for the body-queue pipeline.
 ///
-/// `archive_can_assign`: soft archive RAM headroom for densify.
 /// `tip_rate_blocks_per_s`: tip confirm rate for the soft confirm-time window
 /// when BQ payload is over [`rbitcoin_query::BQ_SOFT_FREE_BYTES`].
 pub(crate) fn assign_work_ordered(
@@ -95,10 +93,8 @@ pub(crate) fn assign_work_ordered(
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
-    _archive_feed_scale: f64,
     _archive_write_next: u32,
     depth: AssignDepth,
-    archive_can_assign: bool,
     tip_rate_blocks_per_s: Option<f64>,
 ) {
     let t0 = Instant::now();
@@ -176,8 +172,8 @@ pub(crate) fn assign_work_ordered(
         st.assign_rot = peer_i;
     }
 
-    // 2) Densify only when archive soft has room and not Critical.
-    if !archive_can_assign || matches!(depth, AssignDepth::Critical) {
+    // 2) Densify only when not Critical (BQ soft window already covered).
+    if matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -730,28 +726,19 @@ mod tests {
         st.slots.iter_mut().for_each(|s| s.alive = false);
         let stats = LoopStats::default();
         let cfg = IbdConfig::for_test();
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn scale_and_saturated_helpers() {
-        assert!(!archive_pipeline_saturated(0, 20, false, 1.0));
-        assert!(!archive_pipeline_saturated(96, 0, false, 0.0));
-        assert!(archive_pipeline_saturated(0, 0, false, 0.85));
-        assert!(archive_pipeline_saturated(200, 15, true, 0.0));
-        assert!(!archive_pipeline_saturated(0, 32, true, 0.9));
+        assert!(!archive_pipeline_saturated(0, 20, false));
+        assert!(!archive_pipeline_saturated(96, 0, false));
+        assert!(!archive_pipeline_saturated(0, 0, false));
+        assert!(archive_pipeline_saturated(0, 0, true));
+        assert!(archive_pipeline_saturated(200, 15, true));
+        assert!(!archive_pipeline_saturated(0, 32, true));
     }
 
     #[test]
@@ -1162,17 +1149,7 @@ mod tests {
             !super::super::progress::claim_ready(&hub, &mut st.body, 2, &want2),
             "zombie pending must not be claim-ready"
         );
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(
             st.inflight.contains_key(&want2),
             "densify must re-get zombie pending at ht=2; inflight={:?}",
@@ -1222,17 +1199,7 @@ mod tests {
             !super::super::progress::claim_ready(&hub, &mut st.body, 2, &want2),
             "wrong BQ at ht=2 must not be claim-ready for want2"
         );
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(
             st.inflight.contains_key(&want2),
             "densify must re-get correct work-path hash at ht=2; inflight={:?}",
@@ -1295,17 +1262,7 @@ mod tests {
         }
         st.reorg.set_awaiting(held, vec![need]);
         st.body.mark_missing(need);
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(
             st.inflight.contains_key(&need),
             "reorg need must getdata by hash despite wrong BQ height occupant; inflight={:?}",
@@ -1348,17 +1305,8 @@ mod tests {
             }
         }
 
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None, // under free floor — full densify ahead
-        );
+        // Under free floor — full densify ahead.
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
 
         let far: Vec<u32> = st
             .inflight
@@ -1427,17 +1375,7 @@ mod tests {
         let path_lo = 1u32;
         let band_hi = path_lo + win - 1;
 
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            rate,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, rate);
 
         let issued_hts: Vec<u32> = st
             .inflight
@@ -1488,17 +1426,8 @@ mod tests {
         }
         assert!(hub.query.block_queue_stats().1 < BQ_SOFT_FREE_BYTES);
 
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            Some(0.1), // rate would only allow 6 if restricted — must still densify past that
-        );
+        // Rate would only allow 6 if restricted — must still densify past that.
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, Some(0.1));
 
         let issued_hts: Vec<u32> = st
             .inflight
@@ -1551,17 +1480,7 @@ mod tests {
         st.reorg.set_awaiting(held, vec![need]);
         st.body.mark_missing(need);
         assert_eq!(st.reorg.need_getdata(), vec![need]);
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(
             st.inflight.contains_key(&need),
             "reorg need_getdata must be issued as getdata"
@@ -1589,32 +1508,12 @@ mod tests {
             st.body.mark_missing(hash);
         }
 
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Critical,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Critical, None);
         let after_crit = st.inflight.len();
         assert!(after_crit > 0, "critical should still issue tip/race");
 
         let n_before = st.inflight.len();
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            false, // archive cannot assign
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(st.inflight.len() <= n_before + 8);
 
         let hashes: Vec<_> = st.inflight.keys().copied().collect();
@@ -1636,17 +1535,7 @@ mod tests {
             st.body.mark_missing(hash);
         }
 
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(st.inflight.len() > 0);
         assert!(stats.assign_issued.load(Ordering::Relaxed) > 0);
 
@@ -1656,17 +1545,7 @@ mod tests {
             st.slots[0].in_flight.insert(hash);
         }
         let n_full = st.inflight.len();
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            5,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 5, AssignDepth::Full, None);
         assert!(st.inflight.len() <= n_full + 2);
 
         st.inflight.clear();
@@ -1681,17 +1560,7 @@ mod tests {
             st.slots[0].in_flight.insert(hash);
             inflight_add_peer(&mut st.inflight, hash, 0);
         }
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            0.5,
-            1,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
         assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
 
         // Claim-ready: pending **with** body-queue wire (not Class A alone).
@@ -1708,17 +1577,7 @@ mod tests {
         st.slots.iter_mut().for_each(|s| s.in_flight.clear());
         st.max_ready_height = 12;
         st.max_ordered_height = 12;
-        assign_work_ordered(
-            &mut st,
-            &hub,
-            &cfg,
-            &stats,
-            1.0,
-            13,
-            AssignDepth::Full,
-            true,
-            None,
-        );
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 13, AssignDepth::Full, None);
         assert!(
             st.inflight.is_empty(),
             "claim-ready tip band must not re-get; inflight={:?}",

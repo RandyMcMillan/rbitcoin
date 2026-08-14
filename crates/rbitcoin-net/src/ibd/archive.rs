@@ -1,4 +1,4 @@
-//! Archive queue budget + body-queue rehydrate into confirm.
+//! Body-queue rehydrate into confirm after restart.
 //!
 //! Dual-track archive-job Class A pipeline was removed — confirm is sole Class A.
 //! After restart the RAM body queue is empty; Class A bodies on the tip path are
@@ -10,117 +10,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
-
-/// Default soft densify budget (~512 MiB). Override with `RBITCOIN_ARCHIVE_QUEUE_MB`.
-///
-/// Historically charged dual-track archive jobs; now a soft densify/far-scale
-/// meter only (no job charge/release on the unified body-queue path).
-pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
-
-/// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.
-pub const ARCHIVE_PRESSURE_ENTER: f64 = 0.90;
-/// Leave pressure only after fill ≤ this (hysteresis vs enter).
-pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
-
-/// Soft densify meter for getdata admission (not a receive/decode gate).
-///
-/// [`Self::can_assign`] is false once fill ≥ budget — stop new densify getdata.
-/// Soft [`Self::far_admission_scale`] (proportional + 90%/70% hysteresis) scales
-/// densify capacity before the hard stop. Dual-track job charge/release is gone;
-/// without a charger this stays empty and always admits (durable BQ soft depth
-/// is the primary densify gate).
-pub(crate) struct ArchiveQueueBudget {
-    count: AtomicUsize,
-    bytes: AtomicUsize,
-    budget: usize,
-    /// Latched high-fill mode: once ≥ [`ARCHIVE_PRESSURE_ENTER`], stays until
-    /// ≤ [`ARCHIVE_PRESSURE_EXIT`].
-    pressure: AtomicBool,
-}
-
-impl ArchiveQueueBudget {
-    pub fn new(budget: usize) -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            bytes: AtomicUsize::new(0),
-            // At least 16 MiB so tiny overrides still leave room for a few blocks.
-            budget: budget.max(16 * 1024 * 1024),
-            pressure: AtomicBool::new(false),
-        }
-    }
-
-    pub fn from_env() -> Arc<Self> {
-        let budget = std::env::var("RBITCOIN_ARCHIVE_QUEUE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
-        Arc::new(Self::new(budget))
-    }
-
-    pub fn budget_bytes(&self) -> usize {
-        self.budget
-    }
-
-    pub fn count(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
-    }
-
-    /// Charged bytes / budget (may be > 1 when oversubscribed).
-    pub fn fill_ratio(&self) -> f64 {
-        let b = self.budget.max(1) as f64;
-        self.bytes() as f64 / b
-    }
-
-    /// Update pressure latch from current fill; return far admission scale in **0..=1**.
-    ///
-    /// - **Pressure (A):** enter at fill ≥ 0.90, exit only at fill ≤ 0.70 → scale 0.
-    /// - **Proportional (B):** outside pressure, `scale = (1 - fill).clamp(0, 1)`
-    ///   so half-full budget ≈ half far work (smooth BW, no cliff at budget).
-    ///
-    /// Tip-hole race is **not** gated by this (assign always covers tip holes).
-    pub fn far_admission_scale(&self) -> f64 {
-        let fill = self.fill_ratio();
-        let was = self.pressure.load(Ordering::Relaxed);
-        let (scale, pressure) = Self::far_scale_from(fill, was);
-        self.pressure.store(pressure, Ordering::Relaxed);
-        scale
-    }
-
-    /// Pure helper: scale from fill + pressure latch (shared by production + tests).
-    pub(crate) fn far_scale_from(fill: f64, mut pressure: bool) -> (f64, bool) {
-        if fill >= ARCHIVE_PRESSURE_ENTER {
-            pressure = true;
-        } else if fill <= ARCHIVE_PRESSURE_EXIT {
-            pressure = false;
-        }
-        let scale = if pressure {
-            0.0
-        } else {
-            (1.0 - fill).clamp(0.0, 1.0)
-        };
-        (scale, pressure)
-    }
-
-    /// True while charged fill is **strictly below** budget — issue densify
-    /// getdata. Soft meter (no dual-track job charges on the unified path).
-    pub fn can_assign(&self) -> bool {
-        self.bytes() < self.budget
-    }
-}
 
 pub(crate) fn rehydrate_block_queue_into_confirm(
     hub: &ChainHub,
     st: &mut super::state::IbdWorkState,
     confirm_feed: &super::confirm::ConfirmFeed,
-    _archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
     use rbitcoin_log::{info, warn};
 
@@ -399,78 +294,6 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
         );
     }
     Ok(n)
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use super::{
-        ArchiveQueueBudget, ARCHIVE_PRESSURE_ENTER, ARCHIVE_PRESSURE_EXIT,
-        DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES,
-    };
-
-    #[test]
-    fn budget_empty_can_assign() {
-        // `new` clamps to ≥16 MiB; use that floor as the explicit budget.
-        let floor = 16 * 1024 * 1024;
-        let b = ArchiveQueueBudget::new(floor);
-        assert!(b.can_assign());
-        assert_eq!(b.count(), 0);
-        assert_eq!(b.bytes(), 0);
-        assert_eq!(b.budget_bytes(), floor);
-        assert!((b.fill_ratio() - 0.0).abs() < 1e-9);
-        assert!((b.far_admission_scale() - 1.0).abs() < 1e-9);
-        // Below floor still clamps up.
-        let tiny = ArchiveQueueBudget::new(1024 * 1024);
-        assert_eq!(tiny.budget_bytes(), floor);
-    }
-
-    #[test]
-    fn far_scale_from_pressure_hysteresis_and_proportional() {
-        // Enter pressure at ≥0.90 → scale 0.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(ARCHIVE_PRESSURE_ENTER, false);
-        assert!(p);
-        assert_eq!(s, 0.0);
-        // Stay in pressure between exit and enter.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(0.80, true);
-        assert!(p);
-        assert_eq!(s, 0.0);
-        // Exit pressure at ≤0.70 → proportional scale.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(ARCHIVE_PRESSURE_EXIT, true);
-        assert!(!p);
-        assert!((s - (1.0 - ARCHIVE_PRESSURE_EXIT)).abs() < 1e-9);
-        // Half full, not in pressure → scale 0.5.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(0.5, false);
-        assert!(!p);
-        assert!((s - 0.5).abs() < 1e-9);
-        // Overfull still pressure.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(1.2, false);
-        assert!(p);
-        assert_eq!(s, 0.0);
-        // Empty → scale 1.
-        let (s, p) = ArchiveQueueBudget::far_scale_from(0.0, false);
-        assert!(!p);
-        assert!((s - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn new_clamps_tiny_budget_and_from_env_default() {
-        let b = ArchiveQueueBudget::new(1);
-        assert!(b.budget_bytes() >= 16 * 1024 * 1024);
-        // from_env uses RBITCOIN_ARCHIVE_QUEUE_MB or default.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_ARCHIVE_QUEUE_MB");
-        std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB");
-        let b = ArchiveQueueBudget::from_env();
-        assert_eq!(b.budget_bytes(), DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
-        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "32");
-        let b2 = ArchiveQueueBudget::from_env();
-        assert_eq!(b2.budget_bytes(), 32 * 1024 * 1024);
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", v),
-            None => std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB"),
-        }
-    }
 }
 
 #[cfg(test)]

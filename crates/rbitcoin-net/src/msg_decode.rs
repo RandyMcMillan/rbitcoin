@@ -90,8 +90,8 @@ async fn decode_with_permit(
 /// semaphore fails (optional re-request path for framed block hashes).
 ///
 /// **Invariant:** readers must not await a decode permit (or any other soft
-/// archive-queue gate) before the next TCP read. Soft queue budget is enforced
-/// only by stopping new block *requests* (`can_assign` / getdata), never by
+/// body-queue gate) before the next TCP read. Soft BQ depth is enforced
+/// only by stopping new block *requests* (getdata assign), never by
 /// refusing to read or decode data a peer already sends for a prior request.
 pub fn spawn_decode_then_with_err<F, E>(frame: FramedMessage, on_done: F, on_err: E)
 where

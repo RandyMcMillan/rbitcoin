@@ -11,6 +11,9 @@ before 1.0).
 
 ### Removed
 
+- **Archive queue budget:** uncharged `ArchiveQueueBudget` / `--archive-queue-mb` /
+  `RBITCOIN_ARCHIVE_QUEUE_MB`. Densify is gated by body-queue soft depth only.
+
 - **`rbitcoin-wire-cache`:** unused tip wire-format ring crate. Node no longer
   opens `{datadir}/wire`. Reconstruct + body queue + peer wire serve tip/reorg.
   On-disk `archive_epoch.wire_depth` bytes stay unread.

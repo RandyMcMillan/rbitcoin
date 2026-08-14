@@ -1,6 +1,6 @@
 //! Diagnose tip stall / PrevoutSpent at tip+1 on a signet datadir.
 use bitcoin::hashes::Hash;
-use rbitcoin_consensus::{confirm_archived_at, ChainParams, Milestone};
+use rbitcoin_consensus::{confirm_wire_run, ChainParams, Milestone};
 use rbitcoin_primitives::{hex_encode, Height};
 use rbitcoin_query::Query;
 
@@ -125,7 +125,11 @@ fn main() {
     let ms = Milestone::NONE;
     eprintln!("confirming height {} …", e0.height);
     let t0 = std::time::Instant::now();
-    match confirm_archived_at(&q, &params, Height(e0.height), &e0.hash, ms) {
+    let Some(block) = q.reconstruct_archived_block(&e0.hash).expect("reconstruct") else {
+        eprintln!("no Class A body for tip+1; cannot confirm without wire");
+        return;
+    };
+    match confirm_wire_run(&q, &params, ms, &[(Height(e0.height), block)]) {
         Ok(_) => eprintln!("CONFIRM OK in {:?}", t0.elapsed()),
         Err(e) => eprintln!("CONFIRM ERR in {:?}: {e}", t0.elapsed()),
     }

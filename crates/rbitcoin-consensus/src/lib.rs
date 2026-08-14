@@ -599,27 +599,13 @@ pub mod confirm_phase_stats {
     }
 }
 
-/// Confirm one archived tip+1 block (see [`confirm_archived_run`]).
-pub fn confirm_archived_at(
-    query: &Query,
-    params: &ChainParams,
-    height: Height,
-    block_hash: &[u8; 32],
-    milestone: Milestone,
-) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
-    let fks = confirm_archived_run(query, params, milestone, &[(height, *block_hash)])?;
-    Ok(fks[0])
-}
-
-/// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
+/// Confirm a contiguous tip-extension run of wire blocks (sync all stages).
 ///
-/// See [`confirm_run`]: load → scripts → write. IBD uses the split
-/// phases for 3-stage pipeline overlap.
+/// See [`confirm_wire_run`]: lookup → load → scripts → write. IBD uses the split
+/// phases for pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
-    confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_feed_ahead,
-    confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_load_from_plan,
-    confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
+    confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
+    confirm_wire_load_from_plan, confirm_wire_load_phase, confirm_wire_load_phase_pipelined,
     confirm_wire_lookup_and_ensure_denserels, confirm_wire_lookup_stamp, confirm_wire_run,
     confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
     join_scripts_polling, lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
@@ -631,7 +617,7 @@ pub use confirm_run::{
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).
 ///
 /// **Same path as IBD confirm:** structure + header checks, then Class A
-/// archive, then [`confirm_archived_run`] (load pin denserels → scripts →
+/// archive, then [`confirm_wire_run`] (lookup → load pin denserels → scripts →
 /// structural → Class C → abs spend annotate). No empty-pin
 /// [`validate_block_connect`] and no separate `put_spend_batch_by_create`.
 ///
@@ -1057,7 +1043,7 @@ mod coverage_tests {
         accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
         // already archived branch
         let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
-        confirm_archived_at(&q, &params, Height(1), &b1.block_hash().to_byte_array(), ms).unwrap();
+        confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
 
         // Bad pow limit on prepare_ibd
         let mut bad = b1.clone();

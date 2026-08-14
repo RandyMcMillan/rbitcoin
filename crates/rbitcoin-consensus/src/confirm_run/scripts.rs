@@ -311,19 +311,3 @@ pub mod scripts_feed_test_sync {
         }
     }
 }
-
-/// LOAD + SCRIPTS in one call (tests / tip path / ChainHub compat).
-///
-/// Work is full load (Class A + parents) + pure scripts.
-pub fn confirm_script_phase(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, [u8; 32])],
-) -> Result<ConfirmScriptOutcome, ConsensusError> {
-    let mat = confirm_load_phase(query, params, milestone, blocks)?;
-    let mat_ns = mat.work_ns;
-    let mut ok = confirm_scripts_phase(mat.batch)?;
-    ok.work_ns = ok.work_ns.saturating_add(mat_ns);
-    Ok(ok)
-}

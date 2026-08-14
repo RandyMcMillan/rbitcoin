@@ -6,8 +6,7 @@ use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction, Work};
 use rbitcoin_consensus::{
-    accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
+    accept_and_archive_block, accept_and_connect_block_preverified, confirm_scripts_phase,
     confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
     confirm_wire_lookup_stamp, confirm_write_phase, genesis_block, header_to_record, ChainParams,
     Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
@@ -232,53 +231,6 @@ impl ChainHub {
         Ok(())
     }
 
-    /// Confirm `hash` at tip+1 if its body is archived.
-    pub fn confirm_hash(&self, height: u32, hash: BlockHash) -> Result<AcceptOutcome, NetError> {
-        let outcomes = self.confirm_run(&[(height, hash)])?;
-        Ok(outcomes
-            .into_iter()
-            .next()
-            .unwrap_or(AcceptOutcome::AlreadyHave))
-    }
-
-    /// Filter batch to unconfirmed archived heights (contiguous tip extension).
-    fn prepare_confirm_need(
-        &self,
-        blocks: &[(u32, BlockHash)],
-    ) -> Result<(Vec<(Height, [u8; 32])>, Vec<(u32, BlockHash)>), NetError> {
-        let mut need: Vec<(Height, [u8; 32])> = Vec::with_capacity(blocks.len());
-        let mut need_meta: Vec<(u32, BlockHash)> = Vec::with_capacity(blocks.len());
-        for &(height, hash) in blocks {
-            if self.has_block(&hash) {
-                continue;
-            }
-            if !self.is_archived(&hash) {
-                return Err(NetError::Protocol("confirm without archive"));
-            }
-            need.push((Height(height), hash.to_byte_array()));
-            need_meta.push((height, hash));
-        }
-        Ok((need, need_meta))
-    }
-
-    /// LOAD stage: Class A load + pin parents → resolve → wave → wire → assemble.
-    /// Hand result to [`Self::confirm_scripts`].
-    pub fn confirm_load_phase(
-        &self,
-        blocks: &[(u32, BlockHash)],
-    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
-        if blocks.is_empty() {
-            return Ok(None);
-        }
-        let (need, _) = self.prepare_confirm_need(blocks)?;
-        if need.is_empty() {
-            return Ok(None);
-        }
-        let ok = confirm_load_phase(&self.query, &self.params, self.milestone, &need)
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
-        Ok(Some(ok))
-    }
-
     /// Contiguous tip-extension slice for plan (Arc wire; skip already confirmed).
     fn confirm_wire_contig_arc(
         &self,
@@ -447,23 +399,6 @@ impl ChainHub {
         confirm_scripts_phase(batch).map_err(|e| NetError::Consensus(e.to_string()))
     }
 
-    /// MATERIALIZE + SCRIPTS (compat). Prefer split stages in IBD.
-    pub fn confirm_script_phase(
-        &self,
-        blocks: &[(u32, BlockHash)],
-    ) -> Result<Option<rbitcoin_consensus::ConfirmScriptOutcome>, NetError> {
-        if blocks.is_empty() {
-            return Ok(None);
-        }
-        let (need, _) = self.prepare_confirm_need(blocks)?;
-        if need.is_empty() {
-            return Ok(None);
-        }
-        let ok = confirm_script_phase(&self.query, &self.params, self.milestone, &need)
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
-        Ok(Some(ok))
-    }
-
     /// WRITE stage: structural + Class C + spend annotate (ordered).
     pub fn confirm_write(&self, batch: ScriptOkBatch) -> Result<Vec<AcceptOutcome>, NetError> {
         let meta: Vec<(u32, BlockHash)> = batch
@@ -477,48 +412,6 @@ impl ChainHub {
         Ok(meta
             .iter()
             .map(|&(height, _)| AcceptOutcome::Accepted { height })
-            .collect())
-    }
-
-    /// Confirm a contiguous tip-extension run (sync script + write).
-    pub fn confirm_run(&self, blocks: &[(u32, BlockHash)]) -> Result<Vec<AcceptOutcome>, NetError> {
-        if blocks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut already: HashSet<BlockHash> = HashSet::new();
-        for &(_, hash) in blocks {
-            if self.has_block(&hash) {
-                already.insert(hash);
-            }
-        }
-        let (need, need_meta) = self.prepare_confirm_need(blocks)?;
-        if need.is_empty() {
-            return Ok(blocks
-                .iter()
-                .map(|&(_, hash)| {
-                    if already.contains(&hash) {
-                        AcceptOutcome::AlreadyHave
-                    } else {
-                        AcceptOutcome::AlreadyHave
-                    }
-                })
-                .collect());
-        }
-        confirm_archived_run(&self.query, &self.params, self.milestone, &need)
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
-        self.note_confirmed_tip(&need_meta)?;
-        let done: HashSet<BlockHash> = need_meta.iter().map(|(_, h)| *h).collect();
-        Ok(blocks
-            .iter()
-            .map(|&(height, hash)| {
-                if already.contains(&hash) {
-                    AcceptOutcome::AlreadyHave
-                } else if done.contains(&hash) {
-                    AcceptOutcome::Accepted { height }
-                } else {
-                    AcceptOutcome::AlreadyHave
-                }
-            })
             .collect())
     }
 
@@ -1405,24 +1298,21 @@ mod tests {
         hub.archive_block(1, b1.clone()).unwrap();
         assert!(hub.is_archived(&h1));
 
-        // Confirm empty / already-have paths.
-        assert!(hub.confirm_run(&[]).unwrap().is_empty());
-        assert!(hub.confirm_load_phase(&[]).unwrap().is_none());
-        assert!(hub.confirm_script_phase(&[]).unwrap().is_none());
-
-        let outs = hub.confirm_run(&[(1, h1)]).unwrap();
-        assert_eq!(outs.len(), 1);
-        assert!(matches!(outs[0], AcceptOutcome::Accepted { height: 1 }));
+        // Confirm via wire (already archived Class A).
+        assert!(hub.confirm_wire_load_phase(&[]).unwrap().is_none());
+        let acc = hub.accept_block(b1.clone()).unwrap();
+        assert!(matches!(acc, AcceptOutcome::Accepted { height: 1 }));
         assert_eq!(hub.tip_height(), Some(1));
         // Already confirmed → AlreadyHave.
-        let outs2 = hub.confirm_run(&[(1, h1)]).unwrap();
-        assert!(matches!(outs2[0], AcceptOutcome::AlreadyHave));
         assert!(matches!(
-            hub.confirm_hash(1, h1).unwrap(),
+            hub.accept_block(b1.clone()).unwrap(),
             AcceptOutcome::AlreadyHave
         ));
-        // Load phase on already-confirmed → None.
-        assert!(hub.confirm_load_phase(&[(1, h1)]).unwrap().is_none());
+        // Wire load on already-confirmed → None.
+        assert!(hub
+            .confirm_wire_load_phase(&[(Height(1), b1.clone())])
+            .unwrap()
+            .is_none());
 
         // Unknown parent.
         let orphan = mine(BlockHash::from_byte_array([9u8; 32]), 1_300_000_200, 99);
@@ -1446,16 +1336,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_confirm_without_archive_errors() {
+    fn accept_unknown_parent_errors() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let b1 = mine(gen, 1_300_000_500, 1);
-        let h1 = b1.block_hash();
-        hub.ensure_header(&b1.header).unwrap();
-        // Body not archived → confirm without archive.
-        let err = hub.confirm_run(&[(1, h1)]).unwrap_err();
-        assert!(matches!(err, NetError::Protocol(_)));
+        let orphan = mine(BlockHash::from_byte_array([9u8; 32]), 1_300_000_500, 99);
+        assert!(matches!(
+            hub.accept_block(orphan).unwrap_err(),
+            NetError::Protocol(_)
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1589,20 +1477,14 @@ mod tests {
     }
 
     #[test]
-    fn confirm_load_script_split_after_archive() {
+    fn confirm_wire_script_split() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         let b1 = mine(gen, 1_300_004_000, 1);
-        let h1 = b1.block_hash();
-        hub.ensure_header(&b1.header).unwrap();
-        hub.archive_block(1, b1).unwrap();
-
-        // Load phase returns Some for archived tip+1.
-        let loaded = hub.confirm_load_phase(&[(1, h1)]).unwrap();
+        let loaded = hub.confirm_wire_load_phase(&[(Height(1), b1)]).unwrap();
         assert!(loaded.is_some());
         let batch = loaded.unwrap();
-        // Scripts pure stage.
         let script_out = hub.confirm_scripts(batch.batch).unwrap();
         let write_out = hub.confirm_write(script_out.batch).unwrap();
         assert_eq!(write_out.len(), 1);
@@ -1611,9 +1493,6 @@ mod tests {
             AcceptOutcome::Accepted { height: 1 }
         ));
         assert_eq!(hub.tip_height(), Some(1));
-
-        // confirm_script_phase empty need after already confirmed.
-        assert!(hub.confirm_script_phase(&[(1, h1)]).unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

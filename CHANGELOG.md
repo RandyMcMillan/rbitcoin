@@ -11,6 +11,11 @@ before 1.0).
 
 ### Removed
 
+- **Hash-only confirm:** `confirm_archived_*`, hash `confirm_load_phase` /
+  `confirm_script_phase`, `wire_rebuild`, and `ChainHub::confirm_hash` /
+  `confirm_run`. Confirm is wire-only (`confirm_wire_*`). Store fixtures
+  `Query::connect_block` / `confirm_blocks_run` stay.
+
 - **Archive queue budget:** uncharged `ArchiveQueueBudget` / `--archive-queue-mb` /
   `RBITCOIN_ARCHIVE_QUEUE_MB`. Densify is gated by body-queue soft depth only.
 

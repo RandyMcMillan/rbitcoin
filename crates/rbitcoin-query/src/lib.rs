@@ -2579,8 +2579,8 @@ mod tests {
         let got = bp2.get_parent_outs_needed(Fk(2), &[0, 1]).unwrap();
         assert!(!got.2);
         assert_eq!(got.1.len(), 2);
-        bp2.set_spent_range_only(Fk(2), (100, 27));
-        assert_eq!(bp2.get_spender_abs(Fk(2), 1), Some(109));
+        bp2.set_spent_range_only(Fk(2), (100, 24));
+        assert_eq!(bp2.get_spender_abs(Fk(2), 1), Some(108));
         assert!(bp2.get_parent_outs_needed(Fk(2), &[9]).is_none());
     }
 
@@ -2623,6 +2623,34 @@ mod tests {
         assert_eq!(arch.txdata[0].input.len(), 1);
         let tx2 = q.reconstruct_tx(fks0[0]).unwrap();
         assert_eq!(tx2.output.len(), 1);
+
+        // Schema-17 kinds expand at decode; reconstruct must emit wire scripts.
+        {
+            let mut p2tr = vec![0x51, 0x20];
+            p2tr.extend_from_slice(&[0x55u8; 32]);
+            let p2a = vec![0x51, 0x02, 0x4e, 0x73];
+            let rec = TxRecord {
+                txid: [0x77u8; 32],
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 2,
+            };
+            let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+            let outs = vec![
+                OutputRecord::unspent(1, p2tr.clone()),
+                OutputRecord::unspent(2, p2a.clone()),
+            ];
+            let fk = q
+                .store()
+                .put_tx_full_batch_indexed(&[(rec, ins, outs)], true)
+                .unwrap()[0];
+            let wire = q.reconstruct_tx(fk).unwrap();
+            assert_eq!(wire.output[0].script_pubkey.as_bytes(), p2tr.as_slice());
+            assert_eq!(wire.output[1].script_pubkey.as_bytes(), p2a.as_slice());
+        }
         // Empty tx list → corrupt.
         let (_hfk, hrec) = q.get_header_by_hash(&hashes[0]).unwrap().unwrap();
         assert!(q

@@ -30,8 +30,8 @@ use rbitcoin_store::{
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
     merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
     set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
-    RunWritePolicy, ScriptHashEntry, ScriptHashRecord, SortedRunPath, Store, StoreError,
-    FANIN_TARGET_STREAM_RUNS,
+    RunWritePolicy, ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
+    SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -275,19 +275,15 @@ pub fn sh_catalog_total_records(runs_dir: &Path) -> u64 {
     }
     n
 }
-use crate::U64Set;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Linear dedup is fine for short chains; switch to a set past this length.
-const CHAIN_SET_THRESHOLD: usize = 16;
-
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
-pub const SH_RUN_KEY_LEN: u32 = 32;
+pub const SH_RUN_KEY_LEN: u32 = SH_RUN_SORT_KEY_LEN;
 
 const DEFAULT_MEMTABLE_CAP: usize = 1_000_000;
 const HARD_MEMTABLE_MUL: usize = 2;
@@ -417,9 +413,24 @@ fn decode_rec_fixed(buf: &[u8]) -> ([u8; 32], Fk) {
     (sh, tx_fk)
 }
 
-#[inline]
-fn chain_has_fk(chain: &[ScriptHashEntry], fk: Fk) -> bool {
-    chain.iter().any(|e| e.create_tx_fk == fk)
+/// Sort + unique `(scripthash, create_fk)` then encode a 40-byte-key run body.
+fn encode_sh_run_body_sorted_unique(pairs: &mut [([u8; 32], Fk)]) -> Vec<u8> {
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
+    let mut body = Vec::with_capacity(pairs.len().saturating_mul(SH_RUN_REC_LEN as usize));
+    let mut prev: Option<([u8; 32], u64)> = None;
+    for &(sh, fk) in pairs.iter() {
+        if fk.is_null() {
+            continue;
+        }
+        if let Some((psh, pfk)) = prev {
+            if psh == sh && pfk == fk.0 {
+                continue;
+            }
+        }
+        prev = Some((sh, fk.0));
+        body.extend_from_slice(&encode_rec(&sh, fk));
+    }
+    body
 }
 
 // ── SEAL (max durable create_fk in cataloged runs) ───────────────────────────
@@ -507,12 +518,7 @@ impl RunMemtable for Inner {
             return Ok(0);
         }
         let mut recs = std::mem::take(&mut self.pending);
-        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
-        recs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-        let mut body = Vec::with_capacity(recs.len() * SH_RUN_REC_LEN as usize);
-        for (sh, fk) in &recs {
-            body.extend_from_slice(&encode_rec(sh, *fk));
-        }
+        let body = encode_sh_run_body_sorted_unique(&mut recs);
         let l0_dir = self.ctrl.runs_dir.join("l0");
         std::fs::create_dir_all(&l0_dir).map_err(|e| StoreError::io(&l0_dir, e))?;
         let path = next_run_path(&l0_dir, self.ctrl.next_seq);
@@ -782,31 +788,13 @@ impl ShRunBuilder {
         if creates.is_empty() {
             return Ok((0, 0));
         }
-        creates.sort_unstable_by(|a, b| {
-            a.scripthash
-                .cmp(&b.scripthash)
-                .then_with(|| a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
-        });
-        let mut body = Vec::with_capacity(creates.len().saturating_mul(SH_RUN_REC_LEN as usize));
-        let mut max_fk = 0u64;
-        let mut n = 0u64;
-        let mut prev: Option<([u8; 32], u64)> = None;
-        for rec in creates.iter() {
-            if rec.create_tx_fk.is_null() {
-                continue;
-            }
-            let fk = rec.create_tx_fk.0;
-            // Dedup identical (sh, fk) after sort.
-            if let Some((psh, pfk)) = prev {
-                if psh == rec.scripthash && pfk == fk {
-                    continue;
-                }
-            }
-            prev = Some((rec.scripthash, fk));
-            max_fk = max_fk.max(fk);
-            body.extend_from_slice(&encode_rec(&rec.scripthash, rec.create_tx_fk));
-            n = n.saturating_add(1);
-        }
+        let mut pairs: Vec<([u8; 32], Fk)> = creates
+            .iter()
+            .map(|r| (r.scripthash, r.create_tx_fk))
+            .collect();
+        let body = encode_sh_run_body_sorted_unique(&mut pairs);
+        let n = (body.len() / SH_RUN_REC_LEN as usize) as u64;
+        let max_fk = max_fk_in_body(&body);
         if body.is_empty() {
             return Ok((0, 0));
         }
@@ -1225,10 +1213,6 @@ impl ShRunBuilder {
             stream_inputs.len()
         );
         let t0 = Instant::now();
-        let mut cur_key: Option<[u8; 32]> = None;
-        let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
-        let mut long_seen: Option<U64Set> = None;
-        let mut unique_in = 0u64;
         let mut last_log: Option<Instant> = None;
         let mut recs_this_key = 0u64;
         let mut max_fk_seen = 0u64;
@@ -1249,60 +1233,11 @@ impl ShRunBuilder {
             if tx_fk.0 > max_fk_seen {
                 max_fk_seen = tx_fk.0;
             }
-            if cur_key != Some(sh) {
-                if let Some(prev) = cur_key {
-                    if !chain.is_empty() {
-                        unique_in = unique_in.saturating_add(1);
-                        session.put_chain(prev, &chain)?;
-                        chain.clear();
-                        long_seen = None;
-                        recs_this_key = 0;
-                        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                            return Err(StoreError::Cancelled("scripthash materialize stream"));
-                        }
-                        if materialize_status_should_emit(
-                            last_log,
-                            Instant::now(),
-                            MATERIALIZE_STATUS_INTERVAL,
-                            recs_this_key,
-                            true,
-                        ) {
-                            log_materialize_status(
-                                &mut last_log,
-                                session.keys_written(),
-                                session.creates_written(),
-                                0,
-                                session.shards_flushed(),
-                                n_shards,
-                                total_recs,
-                                session.body_flush_ns,
-                                session.head_fill_ns,
-                                t0,
-                            );
-                        }
-                    }
-                }
-                cur_key = Some(sh);
-            }
-            let is_dup = if let Some(ref set) = long_seen {
-                set.contains(&tx_fk.0)
-            } else {
-                chain_has_fk(&chain, tx_fk)
-            };
-            if !is_dup {
-                chain.push(ScriptHashEntry::new(tx_fk));
-                if let Some(ref mut set) = long_seen {
-                    set.insert(tx_fk.0);
-                } else if chain.len() >= CHAIN_SET_THRESHOLD {
-                    let mut set =
-                        U64Set::with_capacity_and_hasher(chain.len() * 2, Default::default());
-                    for e in &chain {
-                        set.insert(e.create_tx_fk.0);
-                    }
-                    long_seen = Some(set);
-                }
-            }
+            session.push_sorted_fk(sh, tx_fk)?;
             recs_this_key = recs_this_key.saturating_add(1);
+            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                return Err(StoreError::Cancelled("scripthash materialize stream"));
+            }
             // Clock only on the stride — Instant::now every rec would add ~4% at 2 M rec/s.
             if recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY)
                 && materialize_status_should_emit(
@@ -1313,11 +1248,15 @@ impl ShRunBuilder {
                     false,
                 )
             {
+                let pending = session
+                    .stream_creates_written()
+                    .saturating_sub(session.creates_written())
+                    as usize;
                 log_materialize_status(
                     &mut last_log,
                     session.keys_written(),
                     session.creates_written(),
-                    chain.len(),
+                    pending,
                     session.shards_flushed(),
                     n_shards,
                     total_recs,
@@ -1337,12 +1276,8 @@ impl ShRunBuilder {
             return Err(StoreError::Cancelled(msg));
         }
         stream_result?;
-        if let Some(prev) = cur_key.take() {
-            if !chain.is_empty() {
-                unique_in = unique_in.saturating_add(1);
-                session.put_chain(prev, &chain)?;
-            }
-        }
+        session.finish_key()?;
+        let unique_in = session.keys_written();
         let stream_ns = t_stream.elapsed().as_nanos() as u64;
 
         let t_finish = Instant::now();
@@ -1817,7 +1752,7 @@ fn sh_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_store::Store;
+    use rbitcoin_store::{read_run_body, Store};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1849,6 +1784,53 @@ mod tests {
             155_568_193
         );
         assert_eq!(materialize_status_creates(u64::MAX, 8), u64::MAX);
+    }
+
+    #[test]
+    fn materialize_streams_megakey_without_full_chain_vec() {
+        let src = include_str!("sh_builder.rs");
+        let start = src
+            .find("let stream_result = for_each_merged_rec_opts")
+            .expect("materialize stream");
+        let body = src[start..].split("stream_result?;").next().unwrap();
+        assert!(
+            !body.contains("U64Set") && !body.contains("long_seen") && !body.contains("chain.push"),
+            "materialize must stream FKs, not collect a full-key Vec/U64Set"
+        );
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-stream-mega-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut sh = [0u8; 32];
+        sh[0] = 0x51;
+        let n_fks = 600u64;
+        let mut body = Vec::new();
+        for i in 1..=n_fks {
+            body.extend_from_slice(&encode_rec(&sh, Fk(i)));
+        }
+        write_sorted_run(
+            &next_run_path(&runs_dir, 1),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+        )
+        .unwrap();
+        let written = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert_eq!(written, n_fks);
+        assert_eq!(store.scripthash.entries(&sh).unwrap().len(), n_fks as usize);
+        match store.scripthash.head_value(&sh).unwrap().unwrap() {
+            rbitcoin_store::ShHeadValue::Paged { .. } => {}
+            other => panic!("expected paged megakey, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1911,6 +1893,43 @@ mod tests {
         let (mfk, n) = b.spill_creates_catalog(&mut more).unwrap();
         assert_eq!(n, 1);
         assert_eq!(mfk, 99);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_creates_catalog_writes_key_len_40_and_dedups() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-spill40-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let sh_a = [0x11u8; 32];
+        let sh_b = [0x22u8; 32];
+        let mut creates = vec![
+            ScriptHashRecord::from_fk(sh_b, Fk(5)),
+            ScriptHashRecord::from_fk(sh_a, Fk(3)),
+            ScriptHashRecord::from_fk(sh_a, Fk(3)),
+            ScriptHashRecord::from_fk(sh_a, Fk(1)),
+        ];
+        let (mfk, n) = b.spill_creates_catalog(&mut creates).unwrap();
+        assert_eq!(n, 3, "dup (sh,fk) dropped; three unique records");
+        assert_eq!(mfk, 5);
+        let runs = list_runs(&dir.join("scripthash.runs")).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].key_len, 40);
+        assert_eq!(runs[0].rec_len, 40);
+        let body = read_run_body(&runs[0]).unwrap();
+        assert_eq!(body.len(), 3 * SH_RUN_REC_LEN as usize);
+        let (_s0, f0) = decode_rec_fixed(&body[0..40]);
+        let (_s1, f1) = decode_rec_fixed(&body[40..80]);
+        let (_s2, f2) = decode_rec_fixed(&body[80..120]);
+        assert!(f0.0 < f1.0 || _s0 < _s1);
+        assert_eq!((_s0, f0), (sh_a, Fk(1)));
+        assert_eq!((_s1, f1), (sh_a, Fk(3)));
+        assert_eq!((_s2, f2), (sh_b, Fk(5)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2238,7 +2257,8 @@ mod tests {
             for i in 0..1000u64 {
                 let mut sh = [0u8; 32];
                 sh[0] = seq as u8;
-                sh[1..9].copy_from_slice(&i.to_le_bytes());
+                // BE so 32-byte sh memcmp matches increasing i (LE would invert 255/256).
+                sh[1..9].copy_from_slice(&i.to_be_bytes());
                 body.extend_from_slice(&encode_rec(&sh, Fk(seq * 10_000 + i)));
             }
             let path = next_run_path(&runs_dir, seq);

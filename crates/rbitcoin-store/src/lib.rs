@@ -2,7 +2,6 @@
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
-//! Archive epochs: on-disk leftover (`archive_mode` / `finalized_height` / `wire_depth` unread).
 
 mod address_head;
 mod array_table;
@@ -12,7 +11,6 @@ mod bulk_io;
 mod chain;
 mod compact;
 mod dontcache_policy;
-mod epoch;
 mod error;
 mod file;
 mod fuse8_filter;
@@ -61,7 +59,6 @@ pub use block_queue::{
     BlockQueue, BqParentHits, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
-pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
@@ -79,9 +76,9 @@ pub use io_backend::{
 };
 pub use point_table::PointRecord;
 pub use scripthash::{
-    has_sh_run_rebuild_source, load_include_hwm, script_hash, store_include_hwm, ColdProgress,
-    ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable, COLD_PROGRESS_NAME,
-    INCLUDE_HWM_NAME,
+    has_sh_run_rebuild_source, load_include_hwm, script_hash, sh_run_catalog_key_len_ok,
+    store_include_hwm, ColdProgress, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord,
+    ScriptHashTable, COLD_PROGRESS_NAME, INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,

@@ -1,5 +1,4 @@
 use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
-use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
 use crate::height_fence::HeightFence;
@@ -11,7 +10,6 @@ use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STOR
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
 /// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
@@ -115,7 +113,7 @@ pub struct Store {
     cold_path: Option<PathBuf>,
     pub headers: HeaderTable,
     pub txs: TxTable,
-    /// Multi-spender list nodes only (sole spends live on create outputs).
+    /// Multi-spender overflow (`spent.ovf`). Sole spends live on create outputs.
     pub spenders: SpenderTable,
     pub scripthash: ScriptHashTable,
     pub confirmed: ConfirmedTable,
@@ -125,7 +123,6 @@ pub struct Store {
     pub header_txs: HeaderTxsTable,
     /// Resident create-height fence (confirmed[] + header_txs). No `tx_height.body`.
     height_fence: std::sync::RwLock<HeightFence>,
-    epoch: Mutex<ArchiveEpoch>,
 }
 
 /// How txid → Class A fk picks among rows with the same txid.
@@ -158,8 +155,6 @@ impl Store {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
         write_meta(&path)?;
-        let epoch = ArchiveEpoch::default();
-        epoch.store(&path)?;
         let inwit_dir = resolve_inwit_dir(&layout)?;
         let txs = TxTable::create_with_head_layout_inwit(
             &path,
@@ -179,7 +174,6 @@ impl Store {
             strong_tx: StrongTxTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
-            epoch: Mutex::new(epoch),
             path,
             cold_path,
         })
@@ -196,7 +190,19 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        let epoch = ArchiveEpoch::load(&path)?;
+        let leftover_epoch = path.join("archive_epoch");
+        if leftover_epoch.exists() {
+            eprintln!(
+                "store: dropping leftover archive_epoch (unread dual-path leftover; schema 17 does not keep it)"
+            );
+            let _ = std::fs::remove_file(&leftover_epoch);
+        }
+        let leftover_wire = path.join("wire");
+        if leftover_wire.exists() {
+            eprintln!("store: dropping leftover store/wire (unused; body queue is RAM-only)");
+            let _ = std::fs::remove_dir_all(&leftover_wire);
+            let _ = std::fs::remove_file(&leftover_wire);
+        }
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open(&path)?
@@ -234,7 +240,16 @@ impl Store {
             );
             let _ = std::fs::remove_file(&leftover_h);
         }
-        if meta_ver == 15 && SCHEMA_VERSION == 16 {
+        crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
+        if class_a_has_creates(&path) && txout_meta_lacks_layout17(&path) {
+            return Err(StoreError::Corrupt(
+                "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
+            ));
+        }
+        if meta_ver == 15 && SCHEMA_VERSION >= 16 {
+            rewrite_meta_current(&path)?;
+        }
+        if meta_ver == 16 && SCHEMA_VERSION >= 17 {
             rewrite_meta_current(&path)?;
         }
         let inwit_dir = resolve_inwit_dir(&layout)?;
@@ -252,7 +267,6 @@ impl Store {
             strong_tx: StrongTxTable::open(&path)?,
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
-            epoch: Mutex::new(epoch),
             path,
             cold_path,
         })
@@ -613,11 +627,11 @@ impl Store {
         Ok(out)
     }
 
-    /// Annotate spends using absolute 9-byte spender-meta offsets (pin layout).
+    /// Annotate spends using absolute 8-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
     /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
-    /// go to `spenders.body` inline on read completion. Returns edges that still
+    /// go to `spent.ovf` inline on read completion. Returns edges that still
     /// need a full cold path (OOB abs).
     pub fn put_spend_batch_by_abs_meta(
         &self,
@@ -768,7 +782,7 @@ impl Store {
     /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
     ///
     /// Outs are content-only (spender fields cleared). `spender_rels[v]` is the
-    /// relative offset of the 9-byte annotation within the packed body.
+    /// relative offset of the 8-byte annotation within the spent record.
     pub fn get_tx_meta_and_outputs_batch_at(
         &self,
         ranges: &[(u64, u64)],
@@ -776,7 +790,7 @@ impl Store {
         self.txs.get_meta_and_outputs_batch_at(ranges)
     }
 
-    /// Bulk 9-byte spender meta at absolute `tx.body` offsets.
+    /// Bulk 8-byte spender meta at absolute `spent.body` offsets.
     ///
     /// Backend from global `RBITCOIN_IO` (see [`crate::spend_meta_backend`]).
     pub fn get_spender_meta_at_abs_batch(
@@ -813,7 +827,7 @@ impl Store {
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.
     ///
     /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD
-    /// (would touch `spenders.body`).
+    /// (would touch `spent.ovf`).
     pub fn has_confirmed_strong_spender_create(
         &self,
         create_tx_fk: Fk,
@@ -1192,10 +1206,27 @@ impl Store {
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
     }
+}
 
-    pub fn epoch(&self) -> ArchiveEpoch {
-        self.epoch.lock().unwrap().clone()
+/// True when `txout.body` has creates whose first meta byte lacks LAYOUT17.
+fn txout_meta_lacks_layout17(dir: &Path) -> bool {
+    let path = dir.join("txout.body");
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 16];
+    if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
+        return false;
     }
+    let published = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
+    if published <= 16 {
+        return false;
+    }
+    let mut first = [0u8; 1];
+    if std::io::Read::read_exact(&mut f, &mut first).is_err() {
+        return false;
+    }
+    first[0] & 0x80 == 0
 }
 
 fn class_a_has_creates(dir: &Path) -> bool {
@@ -1758,7 +1789,6 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert!(!s.scripthash.has_durable_index());
         drop(s);
-        assert_eq!(SCHEMA_VERSION, 16);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
 
         let s = Store::open(&dir).unwrap();
@@ -1822,6 +1852,214 @@ mod tests {
         }
         // Meta left at 13 (no silent bump on refuse).
         assert_eq!(read_store_meta_ver(&dir), 13);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 16 leftover SH runs (`key_len=32`) cannot open under 17.
+    #[test]
+    fn open_schema16_legacy_sh_runs_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 16);
+        let runs = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let mut rec = [0u8; 40];
+        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+        crate::sorted_run::write_sorted_run(&runs.join("000001.run"), 32, 40, &rec).unwrap();
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for key_len=32 scripthash.runs"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(
+                    m,
+                    "schema 17 refuses key_len=32 scripthash.runs; wipe store/scripthash.runs and rematerialize"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 16);
+        assert!(dir.join("scripthash.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema-15 16-byte Class A meta with creates cannot open under 17.
+    #[test]
+    fn open_legacy_class_a_with_creates_refused() {
+        use crate::file::{TableFile, FILE_HEADER_LEN};
+        use rbitcoin_primitives::TableKind;
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x11u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        {
+            let f = TableFile::open(&dir.join("txout.body"), TableKind::TxOut).unwrap();
+            let mut b = [0u8; 1];
+            f.read_at(FILE_HEADER_LEN as u64, &mut b).unwrap();
+            b[0] &= !0x80;
+            f.write_at(FILE_HEADER_LEN as u64, &b).unwrap();
+            f.flush().unwrap();
+        }
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for 16-layout Class A with creates"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(
+                    m,
+                    "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn class_a_v17_roundtrip_templates() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let p2pkh = {
+            let mut sc = vec![0x76, 0xa9, 0x14];
+            sc.extend_from_slice(&[0x11u8; 20]);
+            sc.extend_from_slice(&[0x88, 0xac]);
+            sc
+        };
+        let p2tr = {
+            let mut sc = vec![0x51, 0x20];
+            sc.extend_from_slice(&[0x55u8; 32]);
+            sc
+        };
+        let p2wsh = {
+            let mut sc = vec![0x00, 0x20];
+            sc.extend_from_slice(&[0x44u8; 32]);
+            sc
+        };
+        let opreturn = {
+            let data = [0xdeu8, 0xad, 0xbe, 0xef];
+            let mut sc = vec![0x6a, data.len() as u8];
+            sc.extend_from_slice(&data);
+            sc
+        };
+        let p2a = vec![0x51, 0x02, 0x4e, 0x73];
+        let high_ver = i32::from_le_bytes([0x00, 0x00, 0x00, 0x80]);
+
+        let v1 = (
+            TxRecord {
+                txid: [1u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            vec![OutputRecord::unspent(1, p2pkh.clone())],
+        );
+        let v2 = (
+            TxRecord {
+                txid: [2u8; 32],
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 2,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            vec![
+                OutputRecord::unspent(2, p2tr.clone()),
+                OutputRecord::unspent(3, p2wsh.clone()),
+            ],
+        );
+        let v3 = (
+            TxRecord {
+                txid: [3u8; 32],
+                version: 3,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 2,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            vec![
+                OutputRecord::unspent(0, opreturn.clone()),
+                OutputRecord::unspent(4, p2a.clone()),
+            ],
+        );
+        let hi = (
+            TxRecord {
+                txid: [4u8; 32],
+                version: high_ver,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            vec![OutputRecord::unspent(5, vec![0x51])],
+        );
+        let fks = s
+            .put_tx_full_batch_indexed(&[v1, v2, v3, hi], true)
+            .unwrap();
+        assert_eq!(fks.len(), 4);
+
+        let raw = s.txs.body.get_raw(fks[0]).unwrap();
+        assert_eq!(raw[0] & 0x80, 0x80, "LAYOUT17 on first create");
+        let (rec1, outs1) = s.get_tx_meta_and_outputs(fks[0]).unwrap();
+        assert_eq!(rec1.version, 1);
+        assert_eq!(outs1[0].script, p2pkh);
+
+        let (rec2, outs2) = s.get_tx_meta_and_outputs(fks[1]).unwrap();
+        assert_eq!(rec2.version, 2);
+        assert_eq!(outs2[0].script, p2tr);
+        assert_eq!(outs2[1].script, p2wsh);
+        let raw2 = s.txs.body.get_raw(fks[1]).unwrap();
+        let (_, meta_n) = TxRecord::decode_body_meta(&raw2).unwrap();
+        assert_eq!(raw2[meta_n] & 0x0f, crate::compact::SCRIPT_KIND_V17_P2TR);
+
+        let (rec3, outs3) = s.get_tx_meta_and_outputs(fks[2]).unwrap();
+        assert_eq!(rec3.version, 3);
+        assert_eq!(outs3[0].script, opreturn);
+        assert_eq!(outs3[1].script, p2a);
+
+        let (rec4, outs4) = s.get_tx_meta_and_outputs(fks[3]).unwrap();
+        assert_eq!(rec4.version, high_ver);
+        assert_eq!(outs4[0].script, vec![0x51]);
+
+        let (soff, slen) = s.tx_spent_range(fks[1]).unwrap();
+        assert_eq!(slen, 2 * OutputRecord::SPENT_SLOT_LEN as u64);
+        assert_eq!(
+            s.txs.get_output_spender_meta_at(soff, slen, 0).unwrap().1,
+            Fk::NULL
+        );
+
+        s.flush().unwrap();
+        drop(s);
+        let s2 = Store::open(&dir).unwrap();
+        let (_, outs) = s2.get_tx_meta_and_outputs(fks[1]).unwrap();
+        assert_eq!(outs[0].script, p2tr);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 16 with no SH run catalog soft-opens to current meta.
+    #[test]
+    fn open_schema16_no_sh_runs_soft_opens() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 16);
+        let s = Store::open(&dir).unwrap();
+        drop(s);
+        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2403,6 +2641,30 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn schema17_create_does_not_write_archive_epoch() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        assert!(
+            !dir.join("archive_epoch").exists(),
+            "unread leftover must not be created"
+        );
+        assert!(dir.join("spent.ovf").exists());
+        assert!(!dir.join("spenders.body").exists());
+        assert!(!dir.join("tx.body").exists());
+        assert!(!dir.join("wire").exists());
+        s.flush().unwrap();
+        drop(s);
+        std::fs::write(dir.join("archive_epoch"), b"junk").unwrap();
+        std::fs::create_dir_all(dir.join("wire")).unwrap();
+        std::fs::write(dir.join("wire").join("leftover"), b"x").unwrap();
+        let s = Store::open(&dir).unwrap();
+        assert!(!dir.join("archive_epoch").exists());
+        assert!(!dir.join("wire").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

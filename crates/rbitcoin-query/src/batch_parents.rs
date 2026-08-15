@@ -930,7 +930,9 @@ impl BatchParents {
         let lay = e.load_layout();
         let (off, len) = lay.spent_range?;
         let abs = rbitcoin_store::spent_abs(off, vout);
-        if abs.saturating_add(9) > off.saturating_add(len) {
+        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+            > off.saturating_add(len)
+        {
             return None;
         }
         Some(abs)
@@ -1185,9 +1187,9 @@ mod tests {
         assert!(a.has_parent_out(Fk(1), 0));
         assert!(a.has_parent_out(Fk(1), 1));
         assert!(a.has_parent_out(Fk(2), 0));
-        a.set_spent_range_only(Fk(1), (1000, 27));
+        a.set_spent_range_only(Fk(1), (1000, 24));
         assert_eq!(a.get_spender_abs(Fk(1), 0), Some(1000));
-        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1009));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1008));
         assert_eq!(a.get_parent_coinbase(Fk(1)), Some(false));
         assert_eq!(a.get_parent_coinbase(Fk(2)), Some(true));
     }
@@ -1209,8 +1211,8 @@ mod tests {
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
         assert!(!bp.pin_covered(Fk(9), &[0, 3]));
         assert!(!bp.has_parent_out(Fk(9), 1));
-        bp.set_spent_range_only(Fk(9), (2000, 27));
-        assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(2018));
+        bp.set_spent_range_only(Fk(9), (2000, 24));
+        assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(2016));
         assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
         assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
         assert!(bp.has_abs_layout(Fk(9)));
@@ -1239,7 +1241,7 @@ mod tests {
         assert!(!bp.has_spender_rels(Fk(3)));
         bp.set_body_range_only(Fk(3), (500, 80));
         assert!(!bp.has_abs_layout(Fk(3)));
-        bp.set_spent_range_only(Fk(3), (500, 18));
+        bp.set_spent_range_only(Fk(3), (500, 16));
         assert!(bp.has_abs_layout(Fk(3)));
         assert_eq!(bp.get_spender_abs(Fk(3), 0), Some(500));
     }
@@ -1271,7 +1273,7 @@ mod tests {
             vec![(0, SPENDER_REL_UNKNOWN)],
         );
         assert!(bp.get_spender_abs(Fk(1), 0).is_none());
-        bp.set_spent_range_only(Fk(1), (100, 9));
+        bp.set_spent_range_only(Fk(1), (100, 8));
         assert_eq!(bp.get_spender_abs(Fk(1), 0), Some(100));
         assert!(bp.get_spender_abs(Fk(1), 1).is_none());
     }
@@ -1534,11 +1536,11 @@ mod tests {
             "checked must keep prep-merged vout 1 after write set_layout"
         );
         assert!(writer.has_parent_out(Fk(1), 1));
-        writer.set_spent_range_only(Fk(1), (1000, 27));
+        writer.set_spent_range_only(Fk(1), (1000, 24));
         assert_eq!(writer.get_spender_abs(Fk(1), 0), Some(1000));
         assert_eq!(
             writer.get_spender_abs(Fk(1), 1),
-            Some(1009),
+            Some(1008),
             "spent abs covers peer vout after merge"
         );
     }
@@ -1653,8 +1655,8 @@ mod tests {
         assert_eq!(a.len(), n_parents);
         assert_eq!(b.len(), n_parents);
         assert!(a.pin_covered(Fk(1), &[0, 1]));
-        a.set_spent_range_only(Fk(1), (1000, 27));
-        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1009));
+        a.set_spent_range_only(Fk(1), (1000, 24));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(1008));
         let n = n_parents as f64;
         eprintln!(
             "pin_compose_multi_pack n={n_parents} \
@@ -1880,8 +1882,8 @@ mod tests {
             "layout fill must not clone outs half"
         );
         assert_eq!(lay.body_range, Some((500, 80)));
-        bp.set_spent_range_only(Fk(1), (800, 27));
-        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(809));
+        bp.set_spent_range_only(Fk(1), (800, 24));
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(808));
     }
 
     /// PipelineParentStore size_snapshot / gc + set_layout_sparse / body_range_only edges.
@@ -1931,11 +1933,11 @@ mod tests {
         assert_eq!(bp.get_body_range(Fk(1)), Some((200, 50)));
         assert!(!bp.has_abs_layout(Fk(1)));
         assert!(!bp.has_spender_rels(Fk(1)));
-        bp.set_spent_range_only(Fk(1), (200, 27));
+        bp.set_spent_range_only(Fk(1), (200, 24));
         assert!(bp.has_abs_layout(Fk(1)));
         // No-op when layout already covers same range+rels.
         bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[]);
-        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(209));
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(208));
 
         // set_body_range_only updates range; same range is no-op.
         bp.set_body_range_only(Fk(2), (300, 60));

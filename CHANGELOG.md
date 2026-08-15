@@ -71,6 +71,19 @@ before 1.0).
 
 ### Changed
 
+- **Schema 17 (durable) — wipe the datadir and redo IBD.** Opening a
+  store that already has Class A creates (schema 15/16 16-byte meta /
+  9-byte spent) or leftover `key_len=32` SH runs is refused. Empty
+  Class A still soft-opens. This is meant to be the last full-datadir
+  reindex for the Class A / B / C layout; later work (inwit Δfk, a new
+  consensus script kind) would be schema 18 and should not require
+  another wipe of `txout` / `spent` / heads. Layout in 17: SH runs
+  unique `(scripthash, create_fk)` at `key_len=40`; megakey pages are
+  uleb fk0+deltas; thin LAYOUT17 `txout` meta; script kinds 0–9; 8-byte
+  spent slots; overflow is `spent.ovf`; reserved inwit bits 4–7 and
+  spent flags other than `MULTI_SPENDER` are Corrupt. Leftover
+  `archive_epoch` and `store/wire` are unlinked on open.
+
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
   external parents for at most **8** ready body-queue heights in one
   `get_fk_by_txid_batch` wave and attaches hits on the BQ record. Load claims

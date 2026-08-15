@@ -1,7 +1,8 @@
-# Class A storage pack (future)
+# Class A storage pack
 
-Parked from a 2026-08 storage-cost session. **Not** the `tx_height` drop
-(that shipped separately: resident height fence, no `tx_height.body`).
+Hot slices **landed in schema 17**: spent 8 B, thin `txout` meta, script
+templates 0–9 including P2A. **Not** the `tx_height` drop (RAM fence).
+Inwit Δfk remains parked as **schema 18 / inwit-only** (cold, ~3% of inwit).
 
 **Goal:** Cut schema-15 Class A disk without maps, without variable spent
 slots, and without collapsing the annotate io_uring machine. One later

@@ -55,23 +55,28 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **17 (durable):** SH `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent;
+///         megakey pages are uleb deltas. Soft-open 16 when leftover
+///         `scripthash.runs` are absent or already `key_len=40`.
 /// **16:** Drop `tx_height.body`; create height is a RAM fence from `confirmed[]` +
 ///         `header_txs_*`. Soft-open schema 15 (unlink leftover file). Class A unchanged.
 /// **15:** Class A split (`txout` / `inwit` / `spent`) + Class B SH slabs / sorted heads.
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 16;
+pub const SCHEMA_VERSION: u16 = 17;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **15** soft-opens (Class A unchanged; leftover `tx_height.body` dropped).
+/// Schema **17** is durable. Schema **16**
+/// soft-opens when SH run catalogs are compatible (see store open). Schema
+/// **15** soft-opens (Class A unchanged; leftover `tx_height.body` dropped).
 /// Schema **13**/**14** may open only when Class A is empty and SH is empty/missing
 /// (silent meta rewrite). A **materialized** page-era SH index, or a packed
 /// `tx.body` with creates, is refused (wipe + IBD).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 16 && matches!(ver, 13..=15))
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 17 && matches!(ver, 13..=16))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -211,7 +216,7 @@ pub enum TableKind {
     SpTweaks = 15,
     /// Class A input-side + witness (`inwit.body`).
     Inwit = 16,
-    /// Class A sole-spender slots (`spent.body`, 9 B × n_out).
+    /// Class A sole-spender slots (`spent.body`, 8 B × n_out).
     Spent = 17,
 }
 
@@ -297,8 +302,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(17));
         assert!(schema_file_openable(16));
         assert!(schema_file_openable(15));
         assert!(schema_file_openable(14));

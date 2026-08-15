@@ -436,6 +436,22 @@ fn write_sorted_run_file(
             "sorted run: body not multiple of rec_len",
         ));
     }
+    // Full-record keys (SH: key_len == rec_len == 40) must be unique and ordered.
+    // Other families (key_len < rec_len) keep payload-only ties.
+    if key_len == rec_len && !records.is_empty() {
+        let rl = rec_len as usize;
+        let mut prev: Option<&[u8]> = None;
+        for rec in records.chunks_exact(rl) {
+            if let Some(p) = prev {
+                if rec_key_cmp(rec, p, key_len as usize, rec_len) != Ordering::Greater {
+                    return Err(StoreError::Corrupt(
+                        "sorted run: records not strictly increasing",
+                    ));
+                }
+            }
+            prev = Some(rec);
+        }
+    }
     let count = (records.len() / rec_len as usize) as u64;
     let body_crc32 = crc32(records);
     if let Some(parent) = path.parent() {
@@ -747,8 +763,29 @@ struct MergeHead {
     idx: usize,
 }
 
+/// Compare two fixed records for merge / write order.
+///
+/// SH catalogs (`key_len == rec_len == 40`) sort by scripthash then **numeric**
+/// little-endian create_fk — not raw 40-byte memcmp (fk 255 < 256).
+fn rec_key_cmp(a: &[u8], b: &[u8], key_len: usize, rec_len: u32) -> Ordering {
+    if key_len == 40 && rec_len == 40 && a.len() >= 40 && b.len() >= 40 {
+        match a[..32].cmp(&b[..32]) {
+            Ordering::Equal => {
+                let fa = u64::from_le_bytes(a[32..40].try_into().unwrap());
+                let fb = u64::from_le_bytes(b[32..40].try_into().unwrap());
+                fa.cmp(&fb)
+            }
+            o => o,
+        }
+    } else {
+        let n = key_len.min(a.len()).min(b.len());
+        a[..n].cmp(&b[..n])
+    }
+}
+
 fn head_less(a: &MergeHead, b: &MergeHead, key_len: usize) -> bool {
-    match a.cursor.rec()[..key_len].cmp(&b.cursor.rec()[..key_len]) {
+    let rec_len = a.cursor.rec_len as u32;
+    match rec_key_cmp(a.cursor.rec(), b.cursor.rec(), key_len, rec_len) {
         Ordering::Less => true,
         Ordering::Greater => false,
         Ordering::Equal => a.idx < b.idx,
@@ -773,6 +810,16 @@ fn sift_down(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
         heap.swap(i, smallest);
         i = smallest;
     }
+}
+
+/// When the compare key is the whole record (`key_len == rec_len`), equal
+/// keys are true duplicates — emit once. Payload-bearing families
+/// (`key_len < rec_len`) keep all equal-key records.
+fn should_skip_dup_key(key_len: usize, rec_len: u32, prev: Option<&[u8]>, rec: &[u8]) -> bool {
+    if key_len != rec_len as usize {
+        return false;
+    }
+    prev.is_some_and(|p| p == rec)
 }
 
 fn sift_up(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
@@ -920,12 +967,19 @@ pub fn for_each_merged_rec_opts(
     for i in (0..heap.len()).rev() {
         sift_down(&mut heap, i, key_len);
     }
+    let mut prev_rec: Option<Vec<u8>> = None;
     while !heap.is_empty() {
         let mut min = heap.swap_remove(0);
         if !heap.is_empty() {
             sift_down(&mut heap, 0, key_len);
         }
-        on_rec(min.cursor.rec())?;
+        let rec = min.cursor.rec();
+        if !should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec) {
+            on_rec(rec)?;
+            if key_len == rec_len as usize {
+                prev_rec = Some(rec.to_vec());
+            }
+        }
         if min.cursor.fill_next()? {
             heap.push(min);
             let last = heap.len() - 1;
@@ -947,7 +1001,9 @@ pub struct MergeToFileResult {
 /// Stream-merge `inputs` into `out_path` **without** MANIFEST updates or deleting
 /// inputs. Caller manages catalog / cleanup. At most open `|inputs|` cursors.
 ///
-/// Equal keys: all records kept (SH multi-create). Streaming write (no full body RAM).
+/// Equal full-record keys (`key_len == rec_len`, SH) are deduped. Equal
+/// prefix keys with extra payload (`key_len < rec_len`) are all kept.
+/// Streaming write (no full body RAM).
 /// Uses [`RunWritePolicy::CATALOG`] (durable, unpaced, DONTNEED). Does not CRC-verify
 /// inputs (caller trusted them at spill); catalog [`merge_runs`] verifies.
 pub fn merge_runs_to_file(
@@ -965,7 +1021,7 @@ pub fn merge_runs_to_file_with_policy(
     verify_crc: bool,
 ) -> Result<MergeToFileResult, StoreError> {
     if inputs.is_empty() {
-        let run = write_sorted_run_file(out_path, 32, 40, &[], policy)?;
+        let run = write_sorted_run_file(out_path, 40, 40, &[], policy)?;
         return Ok(MergeToFileResult {
             run,
             max_u64_at_32: 0,
@@ -1009,28 +1065,35 @@ pub fn merge_runs_to_file_with_policy(
             .map_err(|e| io_err(&tmp, e))?;
         let hdr = [0u8; HEADER_LEN];
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        let mut prev_rec: Option<Vec<u8>> = None;
         while !heap.is_empty() {
             let mut min = heap.swap_remove(0);
             if !heap.is_empty() {
                 sift_down(&mut heap, 0, key_len);
             }
             let rec = min.cursor.rec();
-            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
-            if track_fk && rec.len() >= 40 {
-                let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
-                if fk > max_u64_at_32 {
-                    max_u64_at_32 = fk;
+            let skip = should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec);
+            if !skip {
+                f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+                if track_fk && rec.len() >= 40 {
+                    let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+                    if fk > max_u64_at_32 {
+                        max_u64_at_32 = fk;
+                    }
                 }
-            }
-            for &b in rec {
-                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
-            }
-            count = count.saturating_add(1);
-            if policy.pace {
-                pace_since = pace_since.saturating_add(rec.len());
-                if pace_since >= PACE_CHUNK_BYTES {
-                    pace_since = 0;
-                    std::thread::sleep(PACE_SLEEP);
+                for &b in rec {
+                    body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
+                }
+                count = count.saturating_add(1);
+                if policy.pace {
+                    pace_since = pace_since.saturating_add(rec.len());
+                    if pace_since >= PACE_CHUNK_BYTES {
+                        pace_since = 0;
+                        std::thread::sleep(PACE_SLEEP);
+                    }
+                }
+                if key_len == rec_len as usize {
+                    prev_rec = Some(rec.to_vec());
                 }
             }
             if min.cursor.fill_next()? {
@@ -2022,6 +2085,60 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    fn sh_rec(sh0: u8, fk: u64) -> [u8; 40] {
+        let mut r = [0u8; 40];
+        r[0] = sh0;
+        r[32..40].copy_from_slice(&fk.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn sh_merge_orders_fks_across_runs_and_dedups() {
+        let d = tmp_dir();
+        let mut a = Vec::new();
+        a.extend_from_slice(&sh_rec(0xAA, 1));
+        a.extend_from_slice(&sh_rec(0xAA, 5));
+        a.extend_from_slice(&sh_rec(0xAA, 255));
+        a.extend_from_slice(&sh_rec(0xAA, 257));
+        let mut b = Vec::new();
+        b.extend_from_slice(&sh_rec(0xAA, 2));
+        b.extend_from_slice(&sh_rec(0xAA, 5));
+        b.extend_from_slice(&sh_rec(0xAA, 256));
+        write_sorted_run(&d.join("000001.run"), 40, 40, &a).unwrap();
+        write_sorted_run(&d.join("000002.run"), 40, 40, &b).unwrap();
+        let r1 = open_run(&d.join("000001.run")).unwrap();
+        let r2 = open_run(&d.join("000002.run")).unwrap();
+        let mut fks = Vec::new();
+        for_each_merged_rec(&[r1, r2], |rec| {
+            fks.push(u64::from_le_bytes(rec[32..40].try_into().unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fks,
+            vec![1, 2, 5, 255, 256, 257],
+            "merge must numeric-FK-order (255<256) and dedup"
+        );
+        let out = next_run_path(&d, 9);
+        let merged = merge_runs_to_file(
+            &[
+                open_run(&d.join("000001.run")).unwrap(),
+                open_run(&d.join("000002.run")).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(merged.count, 6);
+        assert_eq!(merged.key_len, 40);
+        let body = read_run_body(&merged).unwrap();
+        let mut got = Vec::new();
+        for chunk in body.chunks_exact(40) {
+            got.push(u64::from_le_bytes(chunk[32..40].try_into().unwrap()));
+        }
+        assert_eq!(got, vec![1, 2, 5, 255, 256, 257]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn for_each_merged_rec_orders_keys() {
         let d = tmp_dir();
@@ -2525,6 +2642,38 @@ mod tests {
         let out = next_run_path(&d, 9);
         let merged = merge_runs(&[], &out).unwrap();
         assert_eq!(merged.count, 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// When key_len == rec_len the body is the sort key: must be strictly increasing.
+    #[test]
+    fn write_sorted_run_rejects_unsorted_when_key_len_eq_rec() {
+        let d = tmp_dir();
+        let mut rec_hi = [0u8; 40];
+        rec_hi[31] = 2;
+        rec_hi[32..40].copy_from_slice(&2u64.to_le_bytes());
+        let mut rec_lo = [0u8; 40];
+        rec_lo[31] = 1;
+        rec_lo[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(&rec_hi);
+        body.extend_from_slice(&rec_lo);
+        match write_sorted_run(&d.join("desc.run"), 40, 40, &body) {
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("not strictly increasing"),
+                    "expected order error, got {m}"
+                );
+            }
+            other => panic!("expected Corrupt unsorted, got {other:?}"),
+        }
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&rec_lo);
+        ok.extend_from_slice(&rec_hi);
+        let run = write_sorted_run(&d.join("000001.run"), 40, 40, &ok).unwrap();
+        assert_eq!(run.key_len, 40);
+        assert_eq!(run.rec_len, 40);
+        assert_eq!(run.count, 2);
         let _ = fs::remove_dir_all(&d);
     }
 

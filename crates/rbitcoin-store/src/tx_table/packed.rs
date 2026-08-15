@@ -113,11 +113,7 @@ impl InputRecord {
         }
         let flags = buf[0];
         let mut off = 1usize;
-        if flags & input_flags::RESERVED4 != 0 {
-            return Err(StoreError::Corrupt(
-                "input reserved flag set (wipe datadir for schema v10)",
-            ));
-        }
+        check_inwit_flags(flags)?;
         let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
             (Fk::NULL, u32::MAX)
         } else {
@@ -176,11 +172,7 @@ impl InputRecord {
         }
         let flags = buf[0];
         let mut off = 1usize;
-        if flags & input_flags::RESERVED4 != 0 {
-            return Err(StoreError::Corrupt(
-                "input reserved flag set (wipe datadir for schema v10)",
-            ));
-        }
+        check_inwit_flags(flags)?;
         let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
             (Fk::NULL, u32::MAX)
         } else {
@@ -385,7 +377,7 @@ pub(super) fn xor_script_region_in_output(
     if start >= buf.len() {
         return;
     }
-    let flags = buf[start];
+    let kind = buf[start] & 0x0f;
     let mut off = start + 1;
     // uleb128 value
     loop {
@@ -398,18 +390,45 @@ pub(super) fn xor_script_region_in_output(
             break;
         }
     }
-    if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) != 0 {
+    if off > buf.len() {
         return;
     }
-    let Ok((slen, n)) = read_compact_size(&buf[off..]) else {
-        return;
+    xor_script_kind_v17_payload(kind, &mut buf[off..], secret);
+}
+
+/// XOR the at-rest v17 script payload (hash/data only; CompactSize stays plaintext).
+pub(super) fn xor_script_kind_v17_payload(
+    kind: u8,
+    disk: &mut [u8],
+    secret: &crate::store_secret::StoreSecret,
+) {
+    use crate::compact::{
+        read_compact_size, SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH,
+        SCRIPT_KIND_V17_OP_TRUE, SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH,
+        SCRIPT_KIND_V17_P2TR, SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
     };
-    off += n;
-    let slen = slen as usize;
-    if off + slen > buf.len() {
-        return;
+    match kind {
+        SCRIPT_KIND_V17_EMPTY | SCRIPT_KIND_V17_OP_TRUE | SCRIPT_KIND_V17_P2A => {}
+        SCRIPT_KIND_V17_P2PKH | SCRIPT_KIND_V17_P2SH | SCRIPT_KIND_V17_P2WPKH => {
+            if disk.len() >= 20 {
+                secret.xor_bytes(0, &mut disk[..20]);
+            }
+        }
+        SCRIPT_KIND_V17_P2WSH | SCRIPT_KIND_V17_P2TR => {
+            if disk.len() >= 32 {
+                secret.xor_bytes(0, &mut disk[..32]);
+            }
+        }
+        SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
+            if let Ok((slen, n)) = read_compact_size(disk) {
+                let slen = slen as usize;
+                if n + slen <= disk.len() {
+                    secret.xor_bytes(0, &mut disk[n..n + slen]);
+                }
+            }
+        }
+        _ => {}
     }
-    secret.xor_bytes(0, &mut buf[off..off + slen]);
 }
 
 /// Decode `count` inputs; returns records + bytes consumed (allows trailing data).
@@ -441,7 +460,7 @@ pub fn next_tx_body_start(cursor: u64) -> u64 {
     cursor.saturating_add(7) & !7u64
 }
 
-/// Encode `txout.body` payload (schema **15**): `meta(16) || output_run`.
+/// Encode `txout.body` payload (schema **17**): thin meta || output_run.
 ///
 /// Inputs/witness go to [`encode_inwit_with_secret`]. Spender slots go to
 /// [`encode_spent_zeros`]. `inputs` is accepted for call-site compatibility
@@ -481,10 +500,53 @@ pub fn encode_inwit_with_secret(
     encode_input_run_secret(inputs, out, secret);
 }
 
-/// Encode a zeroed `spent.body` run (`9 × n_out` bytes).
+/// Encode a zeroed `spent.body` run (`8 × n_out` bytes).
 pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
     out.resize(out.len().saturating_add(n), 0);
+}
+
+/// Schema-17 spent slot width (same as [`OutputRecord::SPENT_SLOT_LEN`]).
+pub const SPENT_SLOT_V17_LEN: usize = 8;
+const SPENT_FIELD_V17_MAX: u64 = (1u64 << 56) - 1;
+
+fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
+    if flags & (input_flags::RESERVED4 | input_flags::RESERVED_HIGH) != 0 {
+        return Err(StoreError::Corrupt("inwit reserved flags"));
+    }
+    Ok(())
+}
+
+fn check_spent_flags(flags: u8) -> Result<(), StoreError> {
+    if flags & !output_flags::MULTI_SPENDER != 0 {
+        return Err(StoreError::Corrupt("v17 spent reserved flags"));
+    }
+    Ok(())
+}
+
+/// Encode flags + u56 spender field. `fk ≥ 2^56` is Corrupt.
+pub fn encode_spent_slot_v17(flags: u8, field: Fk) -> Result<[u8; 8], StoreError> {
+    check_spent_flags(flags)?;
+    if field.0 > SPENT_FIELD_V17_MAX {
+        return Err(StoreError::Corrupt("v17 spent field exceeds u56"));
+    }
+    let mut slot = [0u8; 8];
+    slot[0] = flags;
+    let le = field.0.to_le_bytes();
+    slot[1..8].copy_from_slice(&le[..7]);
+    Ok(slot)
+}
+
+/// Decode an 8-byte v17 spent slot.
+pub fn decode_spent_slot_v17(raw: &[u8]) -> Result<(u8, Fk), StoreError> {
+    if raw.len() < SPENT_SLOT_V17_LEN {
+        return Err(StoreError::Corrupt("short v17 spent slot"));
+    }
+    let flags = raw[0];
+    check_spent_flags(flags)?;
+    let mut le = [0u8; 8];
+    le[..7].copy_from_slice(&raw[1..8]);
+    Ok((flags, Fk(u64::from_le_bytes(le))))
 }
 
 /// Spent abs for `vout` given the create's `spent.body` range start.
@@ -561,13 +623,9 @@ pub fn decode_packed_tx_with_spender_rels_secret(
 /// Used by [`crate::idx_body_pipeline`] to decide whether a 4 KiB Outs read must
 /// be extended to the full idx span.
 pub fn txout_first_page_complete(raw: &[u8]) -> bool {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return false;
-    }
-    let Ok(meta) = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN]) else {
+    let Ok((meta, mut off)) = TxRecord::decode_body_meta(raw) else {
         return false;
     };
-    let mut off = TxRecord::BODY_META_LEN;
     for _ in 0..meta.output_count {
         match OutputRecord::skip_at(&raw[off..]) {
             Ok(n) => off += n,
@@ -593,10 +651,7 @@ pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, 
 
 /// [`scan_inwit_prevouts`] plus meta from a `txout` record (meta only uses first 16 B).
 pub fn scan_packed_meta_and_prevouts(raw: &[u8]) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return Err(StoreError::Corrupt("short packed Class A tx"));
-    }
-    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
+    let (meta, _) = TxRecord::decode_body_meta(raw)?;
     Ok((meta, Vec::new()))
 }
 
@@ -607,7 +662,7 @@ pub fn decode_packed_tx_outs_only(raw: &[u8]) -> Result<(TxRecord, Vec<OutputRec
 }
 
 /// Like [`decode_packed_tx_outs_only`], plus dense relative offsets of each
-/// output's 9-byte spender meta within the packed payload.
+/// output's start within the packed txout payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
@@ -618,11 +673,7 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
     raw: &[u8],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return Err(StoreError::Corrupt("short packed Class A tx"));
-    }
-    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-    let mut off = TxRecord::BODY_META_LEN;
+    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let n_out = meta.output_count as usize;
     let mut outputs = Vec::with_capacity(n_out);
     let mut spender_rels = Vec::with_capacity(n_out);
@@ -631,19 +682,11 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
             return Err(StoreError::Corrupt("packed outputs short"));
         }
         spender_rels.push(off as u32);
-        let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
+        let (mut rec, used) = OutputRecord::decode_at_secret(&raw[off..], secret)?;
         off += used;
         rec.spender_field = Fk::NULL;
         rec.multi_spender = false;
         outputs.push(rec);
-    }
-    if let Some(sec) = secret {
-        for o in &mut outputs {
-            if o.script.is_empty() || o.script == [0x51] {
-                continue;
-            }
-            sec.xor_bytes(0, &mut o.script);
-        }
     }
     check_trailing_zero_pad(raw, off)?;
     if outputs.len() as u32 != meta.output_count {
@@ -659,11 +702,7 @@ pub fn scan_packed_p2tr_outs(
     raw: &[u8],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<(u32, [u8; 32], u64)>, StoreError> {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return Err(StoreError::Corrupt("short packed Class A tx"));
-    }
-    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-    let mut off = TxRecord::BODY_META_LEN;
+    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut out = Vec::new();
     for vout in 0..meta.output_count {
         if off >= raw.len() {
@@ -672,34 +711,21 @@ pub fn scan_packed_p2tr_outs(
         if raw.len() - off < 2 {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let flags = raw[off];
+        let kind = raw[off] & 0x0f;
         let mut o = off + 1;
         let (v, n) = read_uleb128(&raw[o..])?;
         o += n;
         let value = if v > i64::MAX as u64 { 0 } else { v as u64 };
-        if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) != 0 {
-            off = o;
-            continue;
-        }
-        let (slen, n) = read_compact_size(&raw[o..])?;
-        o += n;
-        let slen = slen as usize;
-        if raw.len() < o + slen {
-            return Err(StoreError::Corrupt("output script truncated"));
-        }
-        if slen == 34 {
-            let mut sc = [0u8; 34];
-            sc.copy_from_slice(&raw[o..o + 34]);
+        let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
+        if kind == crate::compact::SCRIPT_KIND_V17_P2TR && used == 32 {
+            let mut xonly = [0u8; 32];
+            xonly.copy_from_slice(&raw[o..o + 32]);
             if let Some(sec) = secret {
-                sec.xor_bytes(0, &mut sc);
+                sec.xor_bytes(0, &mut xonly);
             }
-            if sc[0] == 0x51 && sc[1] == 0x20 {
-                let mut xonly = [0u8; 32];
-                xonly.copy_from_slice(&sc[2..]);
-                out.push((vout, xonly, value));
-            }
+            out.push((vout, xonly, value));
         }
-        off = o + slen;
+        off = o + used;
     }
     check_trailing_zero_pad(raw, off)?;
     Ok(out)
@@ -716,11 +742,7 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
     need_vouts: &[u32],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>), StoreError> {
-    if raw.len() < TxRecord::BODY_META_LEN {
-        return Err(StoreError::Corrupt("short packed Class A tx"));
-    }
-    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
-    let mut off = TxRecord::BODY_META_LEN;
+    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let n_out = meta.output_count;
     // Empty need → all vouts (full materialize path without a second full decode).
     let take_all = need_vouts.is_empty();
@@ -738,15 +760,10 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
         let rel = off as u32;
         let want = take_all || (need_i < need_vouts.len() && need_vouts[need_i] == vout);
         if want {
-            let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
+            let (mut rec, used) = OutputRecord::decode_at_secret(&raw[off..], secret)?;
             off += used;
             rec.spender_field = Fk::NULL;
             rec.multi_spender = false;
-            if let Some(sec) = secret {
-                if !rec.script.is_empty() && rec.script != [0x51] {
-                    sec.xor_bytes(0, &mut rec.script);
-                }
-            }
             live.push((vout, rec));
             sparse.push((vout, rel));
             if !take_all {
@@ -777,7 +794,7 @@ pub fn clear_output_spender_fields(outs: &mut [OutputRecord]) {
 /// True when `raw` looks like a schema-13+ packed Class A payload (body meta).
 #[inline]
 pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
-    raw.len() >= TxRecord::BODY_META_LEN
+    TxRecord::decode_body_meta(raw).is_ok()
 }
 
 /// Segmented `tx.head` occupancy for IBD size logs.

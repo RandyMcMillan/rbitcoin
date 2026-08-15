@@ -118,7 +118,7 @@ pub(crate) struct IbdPerfSample {
     pub structural_ms: u64,
     /// Structural sub: durable spentness probes.
     pub structural_spent_ms: u64,
-    /// Spent sub: pin abs + on-disk 9-byte meta pread.
+    /// Spent sub: pin abs + on-disk 8-byte meta pread.
     pub spent_abs_ms: u64,
     /// Spent sub: is_confirmed_strong_at on non-null fields.
     pub spent_strong_ms: u64,

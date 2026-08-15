@@ -1,4 +1,4 @@
-//! Multi-spender list body (schema v5).
+//! Multi-spender overflow (`spent.ovf`, schema 17).
 //!
 //! Common case stores a sole `spending_tx_fk` on the create output. Only when an
 //! outpoint has multiple annotated spenders do we allocate nodes here.
@@ -12,15 +12,37 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SPENDER_RECORD_LEN: usize = 16;
+/// Multi-spender overflow next to `spent.body` (schema 17).
+pub const SPENT_OVF_NAME: &str = "spent.ovf";
+const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
 pub struct SpenderTable {
     body: TableFile,
     count: AtomicU64,
 }
 
+fn spent_ovf_path(dir: &Path) -> Result<std::path::PathBuf, StoreError> {
+    let ovf = dir.join(SPENT_OVF_NAME);
+    let legacy = dir.join(LEGACY_SPENDERS_BODY);
+    match (ovf.exists(), legacy.exists()) {
+        (true, true) => {
+            eprintln!(
+                "store: dropping leftover {LEGACY_SPENDERS_BODY} (schema 17 uses {SPENT_OVF_NAME})"
+            );
+            let _ = std::fs::remove_file(&legacy);
+        }
+        (false, true) => {
+            eprintln!("store: renaming {LEGACY_SPENDERS_BODY} → {SPENT_OVF_NAME}");
+            std::fs::rename(&legacy, &ovf).map_err(|e| StoreError::io(&legacy, e))?;
+        }
+        _ => {}
+    }
+    Ok(ovf)
+}
+
 impl SpenderTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        let body = TableFile::create(dir.join("spenders.body"), TableKind::Spender)?;
+        let body = TableFile::create(dir.join(SPENT_OVF_NAME), TableKind::Spender)?;
         Ok(Self {
             body,
             count: AtomicU64::new(0),
@@ -28,7 +50,7 @@ impl SpenderTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let path = dir.join("spenders.body");
+        let path = spent_ovf_path(dir)?;
         if !path.exists() {
             return Self::create(dir);
         }
@@ -107,6 +129,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = SpenderTable::create(&dir).unwrap();
+        assert!(dir.join("spent.ovf").exists(), "schema 17 name");
+        assert!(
+            !dir.join("spenders.body").exists(),
+            "legacy filename must not be created"
+        );
         let a = t.append(Fk(10), Fk::NULL).unwrap();
         let b = t.append(Fk(11), a).unwrap();
         assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
@@ -150,7 +177,7 @@ mod tests {
         t.append(Fk(1), Fk::NULL).unwrap();
         drop(t);
         // Shrink below HWM so open clamps logical_len to a non-multiple of 16.
-        let body = dir.join("spenders.body");
+        let body = dir.join("spent.ovf");
         std::fs::OpenOptions::new()
             .write(true)
             .open(&body)
@@ -161,6 +188,32 @@ mod tests {
             SpenderTable::open(&dir),
             Err(StoreError::Corrupt(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_renames_leftover_spenders_body_to_spent_ovf() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-spender-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let t = SpenderTable::create(&dir).unwrap();
+            t.append(Fk(7), Fk::NULL).unwrap();
+            t.flush().unwrap();
+        }
+        std::fs::rename(dir.join("spent.ovf"), dir.join("spenders.body")).unwrap();
+        assert!(!dir.join("spent.ovf").exists());
+        let t = SpenderTable::open(&dir).unwrap();
+        assert!(dir.join("spent.ovf").exists());
+        assert!(!dir.join("spenders.body").exists());
+        assert_eq!(t.count(), 1);
+        assert_eq!(t.get(Fk(1)).unwrap(), (Fk(7), Fk::NULL));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

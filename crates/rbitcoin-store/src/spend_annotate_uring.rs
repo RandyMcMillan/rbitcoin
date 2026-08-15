@@ -1,13 +1,13 @@
 //! Completion-driven io_uring RMW for Class A spender-meta annotation.
 //!
-//! Hot path: known absolute offset of the 9-byte `(spender_field:u64, flags:u8)`
-//! in `tx.body`. Machine:
+//! Hot path: known absolute offset of the 8-byte `(flags:u8, spender_field:u56)`
+//! in `spent.body`. Machine:
 //!
-//! 1. Submit pread of 9 B  
+//! 1. Submit pread of 8 B  
 //! 2. On read: decide sole / multi / promote / idempotent  
 //!    - multi or promote: **inline** mmap [`SpenderTable::append`] (needs read
 //!      result; same-outpoint edges are serialized so list order is stable)  
-//! 3. Submit pwrite of updated 9 B  
+//! 3. Submit pwrite of updated 8 B  
 //! 4. On write: free the slot and arm more work  
 //!
 //! At most one in-flight RMW per absolute offset (reorg double-annotate on the
@@ -16,14 +16,14 @@
 use crate::compact::output_flags;
 use crate::error::StoreError;
 use crate::spender_table::SpenderTable;
-use crate::tx_table::TxTable;
+use crate::tx_table::{decode_spent_slot_v17, encode_spent_slot_v17, OutputRecord, TxTable};
 use crate::uring_session::{self, UringSession};
 use crate::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 
-const META_LEN: usize = 9;
+const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
 const MAX_SLOTS: usize = 128;
 
 enum Phase {
@@ -191,8 +191,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                             continue;
                         }
 
-                        let field = Fk(u64::from_le_bytes(st.buf[0..8].try_into().unwrap()));
-                        let flags0 = st.buf[8];
+                        let (flags0, field) = decode_spent_slot_v17(&st.buf)?;
                         let multi = flags0 & output_flags::MULTI_SPENDER != 0;
 
                         let (new_multi, new_field, skip_write) = if !multi && field.is_null() {
@@ -225,12 +224,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                             continue;
                         }
 
-                        st.buf[0..8].copy_from_slice(&new_field.0.to_le_bytes());
-                        if new_multi {
-                            st.buf[8] = flags0 | output_flags::MULTI_SPENDER;
+                        let new_flags = if new_multi {
+                            flags0 | output_flags::MULTI_SPENDER
                         } else {
-                            st.buf[8] = flags0 & !output_flags::MULTI_SPENDER;
-                        }
+                            flags0 & !output_flags::MULTI_SPENDER
+                        };
+                        st.buf = encode_spent_slot_v17(new_flags, new_field)?;
                         st.phase = Phase::Writing;
                         // Keep slot occupied for write buffer stability.
                         slots[slot] = Some(st);
@@ -344,7 +343,7 @@ fn next_ready(
 /// Selected via global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
-    /// Page-RMW via io_uring (pread page, poke 9 B slots, pwrite page).
+    /// Page-RMW via io_uring (pread page, poke 8 B slots, pwrite page).
     Uring,
     /// Page-RMW via libc pread + pwrite (positional, no ring).
     Pwrite,
@@ -373,9 +372,7 @@ fn decide_annotate(
 ) -> Result<AnnotateOp, StoreError> {
     let multi = flags & output_flags::MULTI_SPENDER != 0;
     if !multi && field.is_null() {
-        let mut meta = [0u8; META_LEN];
-        meta[0..8].copy_from_slice(&spend_fk.0.to_le_bytes());
-        meta[8] = flags & !output_flags::MULTI_SPENDER;
+        let meta = encode_spent_slot_v17(flags & !output_flags::MULTI_SPENDER, spend_fk)?;
         return Ok(AnnotateOp::Write(meta));
     }
     if !multi && field == spend_fk {
@@ -385,16 +382,12 @@ fn decide_annotate(
         // Promote sole → multi.
         let e1 = spenders.append(field, Fk::NULL)?;
         let e2 = spenders.append(spend_fk, e1)?;
-        let mut meta = [0u8; META_LEN];
-        meta[0..8].copy_from_slice(&e2.0.to_le_bytes());
-        meta[8] = flags | output_flags::MULTI_SPENDER;
+        let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e2)?;
         return Ok(AnnotateOp::Write(meta));
     }
     // Already multi: prepend list node.
     let e = spenders.append(spend_fk, field)?;
-    let mut meta = [0u8; META_LEN];
-    meta[0..8].copy_from_slice(&e.0.to_le_bytes());
-    meta[8] = flags | output_flags::MULTI_SPENDER;
+    let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e)?;
     Ok(AnnotateOp::Write(meta))
 }
 
@@ -406,7 +399,7 @@ struct SpentPageGroup {
     writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>,
 }
 
-/// Page span covering the 9-byte slot at `abs` (`[lo, hi)`).
+/// Page span covering the 8-byte slot at `abs` (`[lo, hi)`).
 #[inline]
 fn spent_meta_page_span(abs: u64) -> (u64, u64) {
     let page = crate::tx_table::BODY_PAGE_SIZE;
@@ -428,7 +421,7 @@ fn clip_spent_page_window(span_lo: u64, span_hi: u64, body_pub: u64) -> Option<(
 
 /// Group abs-sorted writes into non-overlapping `spent.body` page spans.
 ///
-/// Same-page slots share one RMW. A 9 B slot that straddles a page boundary
+/// Same-page slots share one RMW. An 8 B slot that straddles a page boundary
 /// extends the span so the next page's writes merge (no overlapping in-flight
 /// RMWs). Adjacent pages without a straddle stay separate.
 fn group_writes_by_spent_page(
@@ -504,7 +497,7 @@ fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk)>, writes: &[(u64, Fk, u32, Fk, 
 
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 9 B slots →
+/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 8 B slots →
 /// pwrite page). Returns OOB edges as cold (caller must hard-fail).
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
@@ -557,7 +550,7 @@ pub fn put_spend_batch_by_abs_meta_known(
     }
 }
 
-/// libc page-RMW (pread + pwrite, no ring) for prepared 9-byte metas.
+/// libc page-RMW (pread + pwrite, no ring) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_pwrite(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
@@ -583,7 +576,7 @@ fn put_spend_batch_pure_write_pwrite(
     Ok(cold)
 }
 
-/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 9-byte metas.
+/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_uring(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
@@ -1010,10 +1003,10 @@ mod tests {
     fn pure_write_two_pages_both_land() {
         for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
             let (dir, t, spenders) = temp_table();
-            // 500 × 9 B from file offset 16 crosses 4096.
-            let (cfk, off, _len) = put_n_outs(&t, 500, 0x33);
+            // 512 × 8 B from file offset 16 crosses 4096 (slot 510 starts at 4096).
+            let (cfk, off, _len) = put_n_outs(&t, 512, 0x33);
             let abs0 = crate::tx_table::spent_abs(off, 0);
-            let abs_last = crate::tx_table::spent_abs(off, 499);
+            let abs_last = crate::tx_table::spent_abs(off, 511);
             assert_ne!(
                 abs0 & !0xfff,
                 abs_last & !0xfff,
@@ -1024,7 +1017,7 @@ mod tests {
             let cold = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 499, Fk(2))],
+                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 511, Fk(2))],
                 &[k0, k1],
                 backend,
             )
@@ -1077,14 +1070,16 @@ mod tests {
     #[test]
     fn group_writes_by_spent_page_merges_same_page() {
         let meta = [1u8; META_LEN];
+        let slot = META_LEN as u64;
         let writes = [
             (16u64, Fk(1), 0, Fk(10), meta),
-            (34u64, Fk(1), 2, Fk(12), meta),
+            (16 + 2 * slot, Fk(1), 2, Fk(12), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 16 + 27);
+        let rec = 3 * slot;
+        let g = group_writes_by_spent_page(&writes, 16 + rec);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
-        assert_eq!(g[0].len, 27);
+        assert_eq!(g[0].len, rec as usize);
         assert_eq!(g[0].writes.len(), 2);
     }
 
@@ -1095,7 +1090,7 @@ mod tests {
             (16u64, Fk(1), 0, Fk(10), meta),
             (4096u64 + 16, Fk(2), 0, Fk(12), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 4096 + 16 + 9);
+        let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
         assert_eq!(g[1].off, 4096);
@@ -1104,15 +1099,19 @@ mod tests {
     #[test]
     fn group_writes_by_spent_page_merges_straddle() {
         let meta = [1u8; META_LEN];
-        // 4093..4102 crosses the 4 KiB boundary; next slot starts at 4102.
+        let slot = META_LEN as u64;
+        // Slot starts 3 bytes before the 4 KiB page end so the RMW straddles.
+        let first = 4096u64 - 3;
+        let second = first + slot;
+        let end = second + slot;
         let writes = [
-            (4093u64, Fk(1), 0, Fk(10), meta),
-            (4102u64, Fk(1), 1, Fk(11), meta),
+            (first, Fk(1), 0, Fk(10), meta),
+            (second, Fk(1), 1, Fk(11), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 4111);
+        let g = group_writes_by_spent_page(&writes, end);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].writes.len(), 2);
-        assert!(g[0].off <= 4093);
-        assert!(g[0].off + g[0].len as u64 >= 4111);
+        assert!(g[0].off <= first);
+        assert!(g[0].off + g[0].len as u64 >= end);
     }
 }

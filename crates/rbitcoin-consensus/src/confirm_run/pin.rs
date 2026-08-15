@@ -571,7 +571,7 @@ pub(super) fn ensure_spend_abs_layouts(
         vouts.dedup();
     }
 
-    // Stamp spent.body ranges first so abs = spent_off + 9×vout (idx only).
+    // Stamp spent.body ranges first so abs = spent_off + SLOT×vout (idx only).
     {
         let mut spent_fks: Vec<rbitcoin_primitives::Fk> =
             need.keys().map(|id| rbitcoin_primitives::Fk(*id)).collect();

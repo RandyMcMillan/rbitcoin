@@ -159,7 +159,7 @@ pub mod confirm_phase_stats {
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable spentness probes only (subset of structural).
     pub static STRUCTURAL_SPENT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Spent sub: pin abs collect + bulk 9-byte on-disk meta pread.
+    /// Spent sub: pin abs collect + bulk 8-byte on-disk meta pread.
     pub static STRUCTURAL_SPENT_ABS_NS: AtomicU64 = AtomicU64::new(0);
     /// Spent sub: `is_confirmed_strong_at` on non-null spender fields.
     pub static STRUCTURAL_SPENT_STRONG_NS: AtomicU64 = AtomicU64::new(0);

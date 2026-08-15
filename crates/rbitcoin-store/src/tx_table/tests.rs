@@ -1,6 +1,12 @@
 //! Tx table unit tests (peeled).
 
 use super::*;
+use crate::compact::{
+    classify_script, decode_script_kind_v17, encode_script_kind_v17, expand_script_kind,
+    SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
+    SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
+    SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
+};
 use crate::segmented_head::SegmentedTxHead;
 use rbitcoin_primitives::{Fk, TableKind};
 
@@ -454,7 +460,7 @@ fn packed_output_spender_rels_multi_vout_one_walk() {
     // Schema 15: decode rels are txout output starts (not spent denserels).
     let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
     assert_eq!(decode_rels.len(), 4);
-    let mut off = TxRecord::BODY_META_LEN;
+    let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
     for (i, _) in outputs.iter().enumerate() {
         assert_eq!(decode_rels[i] as usize, off);
         assert!(off < raw.len());
@@ -541,7 +547,7 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
         let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
         assert_eq!(decode_rels.len(), outputs.len());
-        let mut off = TxRecord::BODY_META_LEN;
+        let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
         for (i, _) in outputs.iter().enumerate() {
             assert_eq!(decode_rels[i] as usize, off);
             off += OutputRecord::skip_at(&raw[off..]).unwrap();
@@ -1312,7 +1318,7 @@ fn get_output_spender_metas_at_one_walk() {
     assert!(!metas[1].1 && metas[1].2.is_null());
     assert!(!metas[2].1 && metas[2].2 == Fk(20));
 
-    // Bulk 9-byte abs preads match spent_abs (pin → write spentness path).
+    // Bulk 8-byte abs preads match spent_abs (pin → write spentness path).
     let (toff, tlen) = t.body_range(fks[0]).unwrap();
     let decoded = t.get_meta_and_outputs_batch_at(&[(toff, tlen)]).unwrap();
     let (_meta, outs, rels) = decoded[0].as_ref().expect("decode with rels");
@@ -1525,7 +1531,7 @@ fn tx_fixed_roundtrip() {
         output_count: 2,
     };
     let enc = rec.encode();
-    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    assert!(enc.len() > 32, "txid + thin meta");
     assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
 }
 
@@ -1555,8 +1561,7 @@ fn packed_tx_roundtrip() {
     let mut enc = Vec::new();
     encode_packed_tx(&tx, &inputs, &outputs, &mut enc);
     assert!(is_packed_tx_payload(&enc));
-    // Body meta starts without leading txid (schema 13).
-    assert_eq!(enc.len() >= TxRecord::BODY_META_LEN, true);
+    assert!(enc.len() >= 3, "thin LAYOUT17 meta");
     let (dtx, _dins, douts) = decode_packed_tx(&enc).unwrap();
     assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
     assert_eq!(dtx.input_count, 1);
@@ -1613,15 +1618,18 @@ fn inwit_and_txout_secret_xor_roundtrip() {
 
 #[test]
 fn short_or_truncated_packed_body_rejected() {
-    // Too short for body meta (schema 15 meta is 16 B).
     assert!(!is_packed_tx_payload(&[]));
     assert!(!is_packed_tx_payload(&[0u8; 15]));
     assert!(matches!(
         decode_packed_tx(&[0u8; 15]),
         Err(StoreError::Corrupt(_))
     ));
-    // 16 B zero meta = 0 in / 0 out — valid empty txout (+ trailing zero pad).
-    assert!(decode_packed_tx(&[0u8; 31]).is_ok());
+    // v17 empty tx (0 in / 0 out) is a valid packed payload.
+    let empty = rec_meta(1, 0, 0, 0);
+    let mut empty_raw = Vec::new();
+    empty.encode_body_meta_into(&mut empty_raw);
+    assert!(is_packed_tx_payload(&empty_raw));
+    assert!(decode_packed_tx(&empty_raw).is_ok());
     // Meta claims inputs/outputs but payload ends after body meta.
     let rec = TxRecord {
         txid: [1u8; 32],
@@ -1707,7 +1715,7 @@ fn packed_encode_decode_flags_and_error_arms() {
         output_count: 3,
     };
     let enc = meta.encode();
-    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    assert!(enc.len() > 32);
     let dec = TxRecord::decode(&enc).unwrap();
     assert_eq!(dec.txid, meta.txid);
     assert_eq!(dec.version, -1);
@@ -1831,8 +1839,8 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert!(is_packed_tx_payload(&raw));
     assert!(!is_packed_tx_payload(&[]));
     assert!(!is_packed_tx_payload(&[0u8; 15]));
-    assert!(is_packed_tx_payload(&[0u8; 20])); // length gate only; decode may still fail
-    assert!(is_packed_tx_payload(&[0u8; 64]));
+    assert!(!is_packed_tx_payload(&[0u8; 20]));
+    assert!(!is_packed_tx_payload(&[0u8; 64]));
     let (m, ins, outs) = decode_packed_tx(&raw).unwrap();
     assert_eq!(m.txid, [0u8; 32], "body decode: no leading txid");
     assert_eq!(m.input_start_fk, Fk::NULL);
@@ -2133,21 +2141,17 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
     for (j, fk) in fks.iter().enumerate() {
         let (off, len) = t.body.record_range(*fk).unwrap();
         assert_eq!(off % 8, 0, "fk={} off={}", fk.0, off);
-        assert!(len >= TxRecord::BODY_META_LEN as u64);
+        assert!(len >= 3, "thin LAYOUT17 meta");
         let txid = t.body_txid(*fk).unwrap();
         assert_eq!(txid, items[j].0.txid, "sidefile identity");
         let (meta, ins, outs) = t.get_full(*fk).unwrap();
         assert_eq!(meta.txid, items[j].0.txid);
         assert_eq!(ins.len(), 1);
         assert_eq!(outs.len(), 1);
-        // Body meta no longer begins with txid (schema 13).
-        let mut prefix = [0u8; 4];
+        // Body meta is LAYOUT17 flags, not a leading txid.
+        let mut prefix = [0u8; 1];
         t.body.read_prefix_at(off, len, &mut prefix).unwrap();
-        assert_eq!(
-            i32::from_le_bytes(prefix),
-            items[j].0.version,
-            "body starts with version, not txid"
-        );
+        assert_eq!(prefix[0] & 0x80, 0x80, "body starts with LAYOUT17");
     }
     // Multi-batch: second batch pads from previous end.
     let mut more = Vec::new();
@@ -2520,4 +2524,330 @@ fn refuse_legacy_mono_head_on_create() {
     let s = format!("{err}");
     assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {
+    TxRecord {
+        txid: [0u8; 32],
+        version,
+        locktime,
+        input_start_fk: Fk::NULL,
+        input_count: n_in,
+        output_start_fk: Fk::NULL,
+        output_count: n_out,
+    }
+}
+
+#[test]
+fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
+    let rec = rec_meta(1, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(
+        buf,
+        vec![0x89, 0x01, 0x01],
+        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb 1,1"
+    );
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(got.version, 1);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 1);
+    assert_eq!(got.output_count, 1);
+}
+
+#[test]
+fn body_meta_v17_v2_locktime_zero() {
+    let rec = rec_meta(2, 0, 1, 2);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0], 0x8A, "LAYOUT17|VER_2|LOCKTIME_ZERO");
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got.version, 2);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.output_count, 2);
+}
+
+#[test]
+fn body_meta_v17_locktime_tip_is_uleb() {
+    let rec = rec_meta(2, 800_000, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0] & 0x80, 0x80, "LAYOUT17 set");
+    assert_eq!(buf[0] & 0x08, 0, "LOCKTIME_ZERO clear");
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got.locktime, 800_000);
+    assert_eq!(got.version, 2);
+    assert!(buf.len() < 16, "must beat 16 B meta");
+}
+
+#[test]
+fn body_meta_v17_high_bit_version_is_explicit_i32() {
+    let ver = i32::from_le_bytes([0x00, 0x00, 0x00, 0x80]);
+    let rec = rec_meta(ver, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0] & 0x07, 0, "no VER_1/2/3 for high-bit nVersion");
+    assert_eq!(&buf[1..5], &[0x00, 0x00, 0x00, 0x80]);
+    let (got, _) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(got.version, ver);
+}
+
+#[test]
+fn body_meta_v17_rejects_missing_layout_bit() {
+    // Schema-15 v1 meta starts 01 00 00 00 — must not parse as v17.
+    let legacy = [1u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+    match decode_body_meta_v17(&legacy) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("LAYOUT17") || m.contains("legacy"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+fn p2pkh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0x76, 0xa9, 0x14];
+    s.extend_from_slice(&h160);
+    s.extend_from_slice(&[0x88, 0xac]);
+    s
+}
+
+fn p2sh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0xa9, 0x14];
+    s.extend_from_slice(&h160);
+    s.push(0x87);
+    s
+}
+
+fn p2wpkh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0x00, 0x14];
+    s.extend_from_slice(&h160);
+    s
+}
+
+fn p2wsh_script(h256: [u8; 32]) -> Vec<u8> {
+    let mut s = vec![0x00, 0x20];
+    s.extend_from_slice(&h256);
+    s
+}
+
+fn p2tr_script(xonly: [u8; 32]) -> Vec<u8> {
+    let mut s = vec![0x51, 0x20];
+    s.extend_from_slice(&xonly);
+    s
+}
+
+fn assert_kind_roundtrip(script: &[u8], kind: u8, classify_payload: &[u8], disk: &[u8]) {
+    assert_eq!(classify_script(script), (kind, classify_payload));
+    let mut buf = Vec::new();
+    let enc_kind = encode_script_kind_v17(script, &mut buf);
+    assert_eq!(enc_kind, kind);
+    assert_eq!(buf, disk);
+    let (got, n) = decode_script_kind_v17(kind, &buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got, script);
+    assert_eq!(expand_script_kind(kind, classify_payload).unwrap(), script);
+}
+
+#[test]
+fn script_kind_v17_empty() {
+    assert_kind_roundtrip(&[], SCRIPT_KIND_V17_EMPTY, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_op_true() {
+    assert_kind_roundtrip(&[0x51], SCRIPT_KIND_V17_OP_TRUE, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_p2pkh() {
+    let h = [0x11u8; 20];
+    assert_kind_roundtrip(&p2pkh_script(h), SCRIPT_KIND_V17_P2PKH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2sh() {
+    let h = [0x22u8; 20];
+    assert_kind_roundtrip(&p2sh_script(h), SCRIPT_KIND_V17_P2SH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2wpkh() {
+    let h = [0x33u8; 20];
+    assert_kind_roundtrip(&p2wpkh_script(h), SCRIPT_KIND_V17_P2WPKH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2wsh() {
+    let h = [0x44u8; 32];
+    assert_kind_roundtrip(&p2wsh_script(h), SCRIPT_KIND_V17_P2WSH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2tr_expands_to_wire() {
+    let x = [0x55u8; 32];
+    let script = p2tr_script(x);
+    assert_eq!(script[0], 0x51);
+    assert_eq!(script[1], 0x20);
+    assert_eq!(&script[2..], &x);
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_P2TR, &x, &x);
+}
+
+#[test]
+fn script_kind_v17_op_return_single_push() {
+    let data = [0xde, 0xad, 0xbe, 0xef];
+    let mut script = vec![0x6a, data.len() as u8];
+    script.extend_from_slice(&data);
+    let mut disk = Vec::new();
+    crate::compact::write_compact_size(&mut disk, data.len() as u64);
+    disk.extend_from_slice(&data);
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_OP_RETURN_PUSH, &data, &disk);
+}
+
+#[test]
+fn script_kind_v17_p2a_expands_to_wire() {
+    let script = [0x51, 0x02, 0x4e, 0x73];
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_P2A, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_p2pkh_lookalike_stays_raw() {
+    let mut script = p2pkh_script([0x11; 20]);
+    script.push(0x00);
+    assert_eq!(script.len(), 26);
+    let (kind, payload) = classify_script(&script);
+    assert_eq!(kind, SCRIPT_KIND_V17_RAW);
+    assert_eq!(payload, script);
+    let mut buf = Vec::new();
+    let enc_kind = encode_script_kind_v17(&script, &mut buf);
+    assert_eq!(enc_kind, SCRIPT_KIND_V17_RAW);
+    let mut expect = Vec::new();
+    crate::compact::write_compact_size(&mut expect, script.len() as u64);
+    expect.extend_from_slice(&script);
+    assert_eq!(buf, expect);
+    let (got, n) = decode_script_kind_v17(enc_kind, &buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got, script);
+}
+
+#[test]
+fn script_kind_v17_op_return_pushdata1_stays_raw() {
+    // Non-canonical PUSHDATA1 for a 4-byte payload must not take kind 8.
+    let script = vec![0x6a, 0x4c, 0x04, 0xde, 0xad, 0xbe, 0xef];
+    assert_eq!(classify_script(&script).0, SCRIPT_KIND_V17_RAW);
+}
+
+#[test]
+fn spent_slot_v17_unspent_is_eight_zero_bytes() {
+    let slot = encode_spent_slot_v17(0, Fk::NULL).unwrap();
+    assert_eq!(slot, [0u8; 8]);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(flags, 0);
+    assert!(field.is_null());
+}
+
+#[test]
+fn spent_slot_v17_sole_fk_roundtrip() {
+    let fk = Fk(0x0001_0203_0405_0607);
+    let slot = encode_spent_slot_v17(0, fk).unwrap();
+    assert_eq!(slot[0], 0, "flags first");
+    assert_eq!(&slot[1..], &[0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(flags, 0);
+    assert_eq!(field, fk);
+}
+
+#[test]
+fn spent_slot_v17_multi_list_head_roundtrip() {
+    let head = Fk(42);
+    let slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, head).unwrap();
+    assert_eq!(slot[0], output_flags::MULTI_SPENDER);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(
+        flags & output_flags::MULTI_SPENDER,
+        output_flags::MULTI_SPENDER
+    );
+    assert_eq!(field, head);
+}
+
+#[test]
+fn spent_slot_v17_fk_at_2pow56_is_corrupt() {
+    match encode_spent_slot_v17(0, Fk(1u64 << 56)) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("56") || m.contains("u56"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn spent_slot_v17_len_constant_is_eight() {
+    assert_eq!(OutputRecord::SPENT_SLOT_LEN, 8);
+}
+
+#[test]
+fn spent_span_matches_slot_len_times_n_out() {
+    for n_out in [0u32, 1, 4, 500] {
+        let mut buf = Vec::new();
+        encode_spent_zeros(n_out, &mut buf);
+        assert_eq!(buf.len(), n_out as usize * OutputRecord::SPENT_SLOT_LEN);
+        let off = 16u64;
+        for vout in 0..n_out {
+            assert_eq!(
+                spent_abs(off, vout),
+                off + u64::from(vout) * OutputRecord::SPENT_SLOT_LEN as u64
+            );
+        }
+    }
+}
+
+#[test]
+fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
+    let rec = InputRecord::coinbase(u32::MAX, vec![], vec![]);
+    let mut raw = rec.encode();
+    raw[0] |= 1 << 5;
+    match InputRecord::decode_at(&raw) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("reserved") || m.contains("inwit"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+    raw[0] = 1 << 7;
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&raw),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn reserved_flag_v17_spent_unknown_bits_are_corrupt() {
+    match encode_spent_slot_v17(1, Fk::NULL) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("spent") || m.contains("flag"), "{m}");
+        }
+        other => panic!("expected Corrupt on encode, got {other:?}"),
+    }
+    let mut slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, Fk(3)).unwrap();
+    slot[0] |= 1 << 0;
+    match decode_spent_slot_v17(&slot) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("spent") || m.contains("flag"), "{m}");
+        }
+        other => panic!("expected Corrupt on decode, got {other:?}"),
+    }
+}
+
+#[test]
+fn script_kind_v17_kind_ten_is_corrupt() {
+    match decode_script_kind_v17(10, &[]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(
+                m.contains("script kind") || m.contains("SCRIPT_KIND"),
+                "{m}"
+            );
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
 }

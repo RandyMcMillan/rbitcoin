@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 16`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 17`, durable).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | **Current** |
+| **17** | **Durable.** SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`. Refuse leftover `key_len=32` runs, raw-u64 SH pages, and 16-layout Class A. | **Current** |
+| **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
 | **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
@@ -30,7 +31,24 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v16 (current)
+## v17 (durable)
+
+Closed layout. SH run catalogs are unique `(scripthash, create_fk)` at
+`key_len=40`. Schema-16 `key_len=32` catalogs are refused.
+
+Hot Class A: thin LAYOUT17 `txout` meta, script kinds **0–9** (unknown
+kind is Corrupt — a new implicit-width template is 18), 8 B spent slots,
+`spent.ovf` overflow. Inwit flags bits 4–7 and spent flags other than
+`MULTI_SPENDER` are Corrupt. Inwit prevout is still `create_fk:u64` +
+CompactSize vout (Δfk is an **18 / inwit-only** follow-up).
+
+Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
+pages (`ver=0`, `n>0`) rematerialize.
+
+`archive_epoch` is gone. Create does not plant `wire/` or packed
+`tx.body`. Open unlinks leftover `archive_epoch` and `store/wire`.
+
+## v16
 
 Create height is no longer a 4 B/tx L0 file. A resident fence is built from
 `confirmed[]` + `header_txs_first/count` (O(blocks), ~16 B/height). Point

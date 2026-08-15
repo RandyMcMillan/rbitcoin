@@ -1,6 +1,7 @@
 use crate::address_head::HeadLayout;
 use crate::compact::{
-    input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
+    decode_script_kind_v17, encode_script_kind_v17, input_flags, output_flags, read_compact_size,
+    read_uleb128, script_kind_v17_disk_used, write_compact_size, write_uleb128,
 };
 use crate::error::StoreError;
 use crate::segmented_head::SegmentedTxHead;
@@ -10,7 +11,7 @@ use std::path::Path;
 
 /// Class A tx row (no wire blob — reconstruct from txout + inwit).
 ///
-/// On-disk `txout.body` (schema **15**): **16 B meta** then outputs (no spender).
+/// On-disk `txout.body` (schema **17**): thin LAYOUT17 meta then outputs (no spender).
 /// Identity lives in [`crate::txid_body::TxidBody`]. `txid` is filled in-memory
 /// from the sidefile (or caller) after decode. `input_start_fk` / `output_start_fk`
 /// stay [`Fk::NULL`] in RAM (legacy split-run address unused).
@@ -28,7 +29,7 @@ pub struct TxRecord {
 }
 
 impl TxRecord {
-    /// On-disk `txout` meta length (schema 15: version, locktime, counts).
+    /// Upper bound for buffer estimates (schema-15 16 B; v17 typical is 3).
     pub const BODY_META_LEN: usize = 4 + 4 + 4 + 4; // 16
     /// Full in-memory encode size (txid + body meta); used for estimates only.
     pub const ENCODED_LEN: usize = 32 + Self::BODY_META_LEN;
@@ -40,13 +41,9 @@ impl TxRecord {
         self.encode_body_meta_into(out);
     }
 
-    /// Encode `txout` body meta (schema 15: no I/O fks).
+    /// Encode `txout` body meta (schema 17 thin LAYOUT17).
     pub fn encode_body_meta_into(&self, out: &mut Vec<u8>) {
-        out.reserve(Self::BODY_META_LEN);
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.extend_from_slice(&self.locktime.to_le_bytes());
-        out.extend_from_slice(&self.input_count.to_le_bytes());
-        out.extend_from_slice(&self.output_count.to_le_bytes());
+        encode_body_meta_v17(self, out);
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -57,29 +54,118 @@ impl TxRecord {
 
     /// Decode full record with leading txid (soft / test buffers).
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < Self::ENCODED_LEN {
+        if buf.len() < 32 {
             return Err(StoreError::Corrupt("short tx record"));
         }
-        let mut rec = Self::decode_body_meta(&buf[32..32 + Self::BODY_META_LEN])?;
+        let (mut rec, _) = Self::decode_body_meta(&buf[32..])?;
         rec.txid = buf[0..32].try_into().unwrap();
         Ok(rec)
     }
 
-    /// Decode `txout` body meta (schema 15); `txid` left zero for caller fill.
-    pub fn decode_body_meta(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < Self::BODY_META_LEN {
-            return Err(StoreError::Corrupt("short tx body meta"));
-        }
-        Ok(Self {
-            txid: [0u8; 32],
-            version: i32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            locktime: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            input_start_fk: Fk::NULL,
-            input_count: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            output_start_fk: Fk::NULL,
-            output_count: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-        })
+    /// Decode schema-17 thin `txout` meta. Returns `(record, bytes consumed)`.
+    pub fn decode_body_meta(buf: &[u8]) -> Result<(Self, usize), StoreError> {
+        decode_body_meta_v17(buf)
     }
+}
+
+/// Schema-17 thin `txout` meta flags (codec only until Class A cutover).
+/// Bit 7 must be set so a v1 schema-15 prefix (`01 00 00 00`) cannot decode.
+const BODY_META_V17_LAYOUT17: u8 = 1 << 7;
+const BODY_META_V17_VER_1: u8 = 1 << 0;
+const BODY_META_V17_VER_2: u8 = 1 << 1;
+const BODY_META_V17_VER_3: u8 = 1 << 2;
+const BODY_META_V17_LOCKTIME_ZERO: u8 = 1 << 3;
+const BODY_META_V17_RESERVED: u8 = 0x70;
+const BODY_META_V17_VER_MASK: u8 = BODY_META_V17_VER_1 | BODY_META_V17_VER_2 | BODY_META_V17_VER_3;
+
+/// Encode schema-17 thin meta. Production still writes [`TxRecord::encode_body_meta_into`].
+pub(crate) fn encode_body_meta_v17(rec: &TxRecord, out: &mut Vec<u8>) {
+    let mut flags = BODY_META_V17_LAYOUT17;
+    match rec.version {
+        1 => flags |= BODY_META_V17_VER_1,
+        2 => flags |= BODY_META_V17_VER_2,
+        3 => flags |= BODY_META_V17_VER_3,
+        _ => {}
+    }
+    if rec.locktime == 0 {
+        flags |= BODY_META_V17_LOCKTIME_ZERO;
+    }
+    out.push(flags);
+    if flags & BODY_META_V17_VER_MASK == 0 {
+        out.extend_from_slice(&rec.version.to_le_bytes());
+    }
+    if rec.locktime != 0 {
+        write_uleb128(out, u64::from(rec.locktime));
+    }
+    write_uleb128(out, u64::from(rec.input_count));
+    write_uleb128(out, u64::from(rec.output_count));
+}
+
+/// Decode schema-17 thin meta. Rejects schema-15 16-byte prefixes (no LAYOUT17 bit).
+pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), StoreError> {
+    if buf.is_empty() {
+        return Err(StoreError::Corrupt("short v17 txout meta"));
+    }
+    let flags = buf[0];
+    if flags & BODY_META_V17_LAYOUT17 == 0 {
+        return Err(StoreError::Corrupt(
+            "legacy txout meta missing LAYOUT17 bit",
+        ));
+    }
+    if flags & BODY_META_V17_RESERVED != 0 {
+        return Err(StoreError::Corrupt("v17 txout meta reserved flags"));
+    }
+    let ver_bits = flags & BODY_META_V17_VER_MASK;
+    if ver_bits.count_ones() > 1 {
+        return Err(StoreError::Corrupt("v17 txout meta multiple VER bits"));
+    }
+    let mut off = 1usize;
+    let version = if ver_bits == 0 {
+        if buf.len() < off + 4 {
+            return Err(StoreError::Corrupt("short v17 txout version"));
+        }
+        let v = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        off += 4;
+        v
+    } else if ver_bits == BODY_META_V17_VER_1 {
+        1
+    } else if ver_bits == BODY_META_V17_VER_2 {
+        2
+    } else {
+        3
+    };
+    let locktime = if flags & BODY_META_V17_LOCKTIME_ZERO != 0 {
+        0
+    } else {
+        let (v, n) = read_uleb128(&buf[off..])?;
+        if v > u64::from(u32::MAX) {
+            return Err(StoreError::Corrupt("v17 locktime overflow"));
+        }
+        off += n;
+        v as u32
+    };
+    let (nin, n1) = read_uleb128(&buf[off..])?;
+    if nin > u64::from(u32::MAX) {
+        return Err(StoreError::Corrupt("v17 input_count overflow"));
+    }
+    off += n1;
+    let (nout, n2) = read_uleb128(&buf[off..])?;
+    if nout > u64::from(u32::MAX) {
+        return Err(StoreError::Corrupt("v17 output_count overflow"));
+    }
+    off += n2;
+    Ok((
+        TxRecord {
+            txid: [0u8; 32],
+            version,
+            locktime,
+            input_start_fk: Fk::NULL,
+            input_count: nin as u32,
+            output_start_fk: Fk::NULL,
+            output_count: nout as u32,
+        },
+        off,
+    ))
 }
 
 /// Class A output (addressed via `tx.output_start_fk` run + local vout).
@@ -87,7 +173,7 @@ impl TxRecord {
 pub struct OutputRecord {
     pub value: i64,
     pub script: Vec<u8>,
-    /// Schema v5: sole `spending_tx_fk` if !multi; else head fk into `spenders.body`.
+    /// Schema v5: sole `spending_tx_fk` if !multi; else head fk into `spent.ovf`.
     pub spender_field: Fk,
     /// When true, `spender_field` is a multi-list head (not a single spending_tx_fk).
     pub multi_spender: bool,
@@ -103,25 +189,18 @@ impl OutputRecord {
         }
     }
 
-    /// Encode `txout` payload (schema 15: **no** spender bytes; those live in `spent.body`).
+    /// Encode `txout` payload (schema 17: kind nibble + template payload; no spender).
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        let mut flags = 0u8;
-        if self.script.is_empty() {
-            flags |= output_flags::EMPTY_SCRIPT;
-        } else if self.script == [0x51] {
-            flags |= output_flags::OP_TRUE;
-        }
-        out.push(flags);
+        let flags_at = out.len();
+        out.push(0);
         let v = if self.value < 0 {
             0u64
         } else {
             self.value as u64
         };
         write_uleb128(out, v);
-        if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) == 0 {
-            write_compact_size(out, self.script.len() as u64);
-            out.extend_from_slice(&self.script);
-        }
+        let kind = encode_script_kind_v17(&self.script, out);
+        out[flags_at] = kind;
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -132,15 +211,21 @@ impl OutputRecord {
 
     /// Decode one `txout` output; spender fields are left null (load from `spent.body`).
     pub fn decode_at(buf: &[u8]) -> Result<(Self, usize), StoreError> {
+        Self::decode_at_secret(buf, None)
+    }
+
+    pub fn decode_at_secret(
+        buf: &[u8],
+        secret: Option<&crate::store_secret::StoreSecret>,
+    ) -> Result<(Self, usize), StoreError> {
         if buf.is_empty() {
             return Err(StoreError::Corrupt("short output record"));
         }
         let flags = buf[0];
-        if flags & output_flags::MULTI_SPENDER != 0 {
-            return Err(StoreError::Corrupt(
-                "txout output must not carry MULTI_SPENDER",
-            ));
+        if flags & 0xf0 != 0 {
+            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
         }
+        let kind = flags & 0x0f;
         let mut off = 1usize;
         let (v, n) = read_uleb128(&buf[off..])?;
         off += n;
@@ -148,21 +233,15 @@ impl OutputRecord {
             return Err(StoreError::Corrupt("output value too large"));
         }
         let value = v as i64;
-        let script = if flags & output_flags::EMPTY_SCRIPT != 0 {
-            Vec::new()
-        } else if flags & output_flags::OP_TRUE != 0 {
-            vec![0x51]
+        let used = script_kind_v17_disk_used(kind, &buf[off..])?;
+        let script = if let Some(sec) = secret {
+            let mut payload = buf[off..off + used].to_vec();
+            packed::xor_script_kind_v17_payload(kind, &mut payload, sec);
+            decode_script_kind_v17(kind, &payload)?.0
         } else {
-            let (slen, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            let slen = slen as usize;
-            if buf.len() < off + slen {
-                return Err(StoreError::Corrupt("output script truncated"));
-            }
-            let s = buf[off..off + slen].to_vec();
-            off += slen;
-            s
+            decode_script_kind_v17(kind, &buf[off..])?.0
         };
+        off += used;
         Ok((
             Self {
                 value,
@@ -180,18 +259,14 @@ impl OutputRecord {
             return Err(StoreError::Corrupt("short output record"));
         }
         let flags = buf[0];
+        if flags & 0xf0 != 0 {
+            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
+        }
+        let kind = flags & 0x0f;
         let mut off = 1usize;
         let (_v, n) = read_uleb128(&buf[off..])?;
         off += n;
-        if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) == 0 {
-            let (slen, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            let slen = slen as usize;
-            if buf.len() < off + slen {
-                return Err(StoreError::Corrupt("output script truncated"));
-            }
-            off += slen;
-        }
+        off += script_kind_v17_disk_used(kind, &buf[off..])?;
         Ok(off)
     }
 
@@ -211,22 +286,25 @@ impl OutputRecord {
     /// Exact on-wire length matching [`Self::encode_into`].
     #[inline]
     pub fn encoded_len_exact(&self) -> usize {
-        use crate::compact::{compact_size_len, uleb128_len};
+        use crate::compact::{classify_script, compact_size_len, uleb128_len};
+        use crate::compact::{SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_RAW};
         let v = if self.value < 0 {
             0u64
         } else {
             self.value as u64
         };
-        let mut n = 1 + uleb128_len(v);
-        if self.script.is_empty() || self.script == [0x51] {
-        } else {
-            n += compact_size_len(self.script.len() as u64) + self.script.len();
-        }
-        n
+        let (kind, payload) = classify_script(&self.script);
+        let payload_len = match kind {
+            SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
+                compact_size_len(payload.len() as u64) + payload.len()
+            }
+            _ => payload.len(),
+        };
+        1 + uleb128_len(v) + payload_len
     }
 
     /// Sole-spender slot length in `spent.body`.
-    pub const SPENT_SLOT_LEN: usize = 9;
+    pub const SPENT_SLOT_LEN: usize = 8;
 }
 
 mod packed;
@@ -239,7 +317,7 @@ pub struct TxTable {
     pub(crate) body: VarTable,
     /// `inwit.body` — inputs + witness (cold).
     pub(crate) inwit: VarTable,
-    /// `spent.body` — 9 B × n_out sole-spender slots.
+    /// `spent.body` — 8 B × n_out sole-spender slots.
     pub(crate) spent: VarTable,
     /// Segmented fixed-bits heads + seal-time fuse8.
     pub(crate) head: SegmentedTxHead,
@@ -251,7 +329,7 @@ pub struct TxTable {
     pending_head: pending_head::PendingHeadInserts,
 }
 
-/// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
+/// Backend for bulk structural 8-byte spender-meta reads on `tx.body`.
 ///
 /// Selected via global `RBITCOIN_IO` (see [`crate::io_backend`]).
 /// Body peeks are never mmap'd.
@@ -903,8 +981,8 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets (confirm write).
     ///
-    /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 9 B → decide
-    /// sole / multi / promote → pwrite; `spenders.body` appends run **inline** on
+    /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 8 B → decide
+    /// sole / multi / promote → pwrite; `spent.ovf` appends run **inline** on
     /// the read completion (mmap). Same abs serialized. Fallback: mmap RMW.
     ///
     /// Returns edges that still need a full cold path (OOB abs / deferred).
@@ -914,7 +992,7 @@ impl TxTable {
         spenders: &crate::spender_table::SpenderTable,
         abs_edges: &[(u64, Fk, u32, Fk)],
     ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
-        const META_LEN: u64 = 9;
+        const META_LEN: u64 = OutputRecord::SPENT_SLOT_LEN as u64;
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -944,11 +1022,7 @@ impl TxTable {
                 continue;
             }
             let cur = self.spent.with_bytes_at(abs, META_LEN, |raw| {
-                if raw.len() < 9 {
-                    return Err(StoreError::Corrupt("spender meta short"));
-                }
-                let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
-                let flags = raw[8];
+                let (flags, field) = decode_spent_slot_v17(raw)?;
                 Ok((field, flags))
             });
             let Ok((field, flags)) = cur else {
@@ -968,13 +1042,12 @@ impl TxTable {
                 let e = spenders.append(spend_fk, field)?;
                 (true, e)
             };
-            let mut meta = [0u8; 9];
-            meta[0..8].copy_from_slice(&new_field.0.to_le_bytes());
-            if new_multi {
-                meta[8] = flags | output_flags::MULTI_SPENDER;
+            let new_flags = if new_multi {
+                flags | output_flags::MULTI_SPENDER
             } else {
-                meta[8] = flags & !output_flags::MULTI_SPENDER;
-            }
+                flags & !output_flags::MULTI_SPENDER
+            };
+            let meta = encode_spent_slot_v17(new_flags, new_field)?;
             if let Err(_) = self.spent.write_body_abs(abs, &meta) {
                 cold.push((create_fk, vout, spend_fk));
             }
@@ -982,7 +1055,7 @@ impl TxTable {
         Ok(cold)
     }
 
-    /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
+    /// Bulk 8-byte spender meta reads at absolute `spent.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
     /// Backend from [`spend_meta_backend`] / global `RBITCOIN_IO` /
@@ -1039,7 +1112,7 @@ impl TxTable {
         backend: crate::io_backend::ReadIoBackend,
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
-        const META_LEN: usize = 9;
+        const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
         let body_fd = self.spent.body_read_fd();
         let body_pub = self.spent.body_published_len();
         let body_path = self.spent.body_file_path();
@@ -1085,8 +1158,9 @@ impl TxTable {
                 continue;
             }
             let b = &bufs[i];
-            let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
-            let flags = b[8];
+            let Ok((flags, field)) = decode_spent_slot_v17(b) else {
+                continue;
+            };
             out[i] = Some((field, flags));
         }
         Ok(out)
@@ -1128,17 +1202,14 @@ impl TxTable {
     ) -> Result<(bool, Fk), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
-        if abs.saturating_add(9) > end {
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        self.spent.with_bytes_at(abs, 9, |raw| {
-            if raw.len() < 9 {
-                return Err(StoreError::Corrupt("spent meta short"));
-            }
-            let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
-            let multi = raw[8] & output_flags::MULTI_SPENDER != 0;
-            Ok((multi, field))
-        })
+        self.spent
+            .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
+                let (flags, field) = decode_spent_slot_v17(raw)?;
+                Ok((flags & output_flags::MULTI_SPENDER != 0, field))
+            })
     }
 
     /// One packed body walk: spender meta for many vouts (ascending).
@@ -1185,16 +1256,15 @@ impl TxTable {
     ) -> Result<(), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
-        if abs.saturating_add(9) > end {
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        let mut slot = [0u8; 9];
-        slot[0..8].copy_from_slice(&field.0.to_le_bytes());
-        slot[8] = if multi {
+        let flags = if multi {
             output_flags::MULTI_SPENDER
         } else {
             0
         };
+        let slot = encode_spent_slot_v17(flags, field)?;
         self.spent.write_body_abs(abs, &slot)?;
         Ok(())
     }

@@ -1,13 +1,20 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 16` (`rbitcoin_primitives`).  
-**Status:** unstable until 1.0 — most layout changes are reindex-only.  
-**13/14→16 open:** Empty Class A (no creates) + empty/missing SH may silently
-rewrite `meta` to 16. A packed `tx.body` **with creates**, or a durable page-era
+**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
+**Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
+byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).  
+**13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
+rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
 `txout` + `inwit` + `spent` (not a single packed `tx.body`).  
-**15→16 open:** Soft migrate — Class A unchanged; leftover `tx_height.body` is
-unlinked; create height is the RAM fence.  
+**15→17 open:** leftover `tx_height.body` is unlinked (RAM fence). Class A
+with creates in the 16-byte-meta / 9-byte-spent layout is **refused**
+(wipe datadir and redo IBD). Empty Class A may rewrite `meta`.  
+**16→17 open:** Soft migrate when `scripthash.runs` is missing/empty or every
+run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) and leftover
+raw-u64 megakey pages are **refused** (wipe `store/scripthash.runs` and
+rematerialize). Sealed SH head/body kept only if pages are already delta
+(`ver=1`). Class A with 16-layout creates is refused the same as 15→17.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -18,7 +25,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Class A body | **Split** `txout` (outs) + `inwit` (ins+wit) + `spent` (9 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
+| Class A body | **Split** `txout` (thin meta + template outs) + `inwit` + `spent` (8 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
 | Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand without Prefix33 body peeks |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
 | Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
@@ -38,11 +45,11 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     txout.body / txout.idx/                         # Class A outs (hot)
     inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
     inwit.reloc                  # optional: inwit lives under --datadir-cold/store
-    spent.body / spent.idx/                         # sole-spender 9 B × n_out
+    spent.body / spent.idx/                         # sole-spender 8 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head/                     # meta + NNNNNN + .fuse8 (segmented 25-bit)
-    spenders.body                # multi-spender list nodes only
+    spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
     # tx_height.body retired in 16 (RAM fence from confirmed + header_txs)
@@ -51,10 +58,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.body / scripthash.head/NN[.idx]        # Class B (slabs + sorted heads; no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
-    archive_epoch
-    scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
+    scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
-  wire/                          # unused (opened, never filled)
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -77,7 +82,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **16** |
+| 4 | 2 | Schema version (u16) — **17** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -96,6 +101,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | 9 | array_link (idx files, dense arrays) |
 | 10 | hash_head |
 | 11 | scripthash |
+| 13 | spender (`spent.ovf` multi-list) |
 | 14 | txid_body (`txid.body`) |
 | 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
 | 16 | inwit (`inwit.body`) |
@@ -162,13 +168,13 @@ Append-published with Class A body/idx on the sole Class A write path. Count mus
 Each create_fk has three 8-aligned var records (coupled idx `first_fk` / `file_id`):
 
 ```text
-txout.body  S:  meta 16B (version, locktime, in_count, out_count) | outputs (no spender)
+txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
 inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
-spent.body Ss:  9 B × out_count  (spender u64 + flags). Multi overflow → spenders.body
+spent.body Ss:  8 B × out_count  (flags + u56 field). Multi overflow → spent.ovf
 ```
 
 Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
-Pin / SH / Cake read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 9×vout`).
+Pin / SH / Cake read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `inwit`. First-page Outs reads are 4 KiB; truncated outs extend
 to the full idx span.
 
@@ -182,8 +188,12 @@ There is **no** leading magic byte and **no** leading txid (schema 11–12 store
 
 Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt.
 
-**Body meta (schema 15, 16 B):** version, locktime, `input_count`, `output_count`.
-`input_start_fk` / `output_start_fk` stay null in RAM. Soft `TxRecord.txid` is filled from the sidefile on get paths.
+**Body meta (schema 17, variable):** first byte bit 7 = `LAYOUT17` (required).
+Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 = locktime 0
+(else uleb locktime); then uleb `input_count` and `output_count`. Typical
+v2+locktime 0 is **3 B**. Schema-15 16-byte prefixes (v1 starts `01 00 00 00`)
+are not accepted. `input_start_fk` / `output_start_fk` stay null in RAM.
+Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
 **IO policy (RWF_DONTCACHE):** permanent **spend-annotate `spent.body` pwrites only** (fd-only drop after spender meta write — not `madvise`). Class A append, confirm/load body reads, generic body reads, and head/idx/sidefile peeks do **not** set the flag. Kernel ENOTSUP demotes capability for the process.
 
@@ -215,7 +225,7 @@ Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 
 
 | Field | Encoding |
 |-------|----------|
-| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV` |
+| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV`; bits 4–7 reserved (Corrupt) |
 | prev | coinbase (`NULL_PREV`): no payload; else **`create_fk:u64` LE** + CompactSize vout |
 | sequence | omitted if `SEQ_FINAL`; else u32 LE |
 | script_sig | omitted if empty; else CompactSize len + bytes |
@@ -231,28 +241,40 @@ Legacy `LOCAL_PREV` is **rejected** on decode.
 ### Output encoding (`txout.body`)
 
 ```text
-flags:u8 | uleb128 value | [CompactSize script…]
+flags:u8 (bits 0–3 SCRIPT_KIND, bits 4–7 reserved 0)
+uleb128 value
+kind payload:
+  0 RAW            CompactSize + bytes
+  1 EMPTY          none
+  2 OP_TRUE        none
+  3–5 P2PKH/P2SH/P2WPKH   20 B hash
+  6–7 P2WSH/P2TR          32 B
+  8 OP_RETURN_PUSH CompactSize + data (canonical single push)
+  9 P2A            none (`51 02 4e 73`)
+  10–15            reserved — decode **Corrupt** (no implicit width)
 ```
 
-No spender bytes. `MULTI_SPENDER` on a `txout` output is corrupt.
+Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
+covers hash/data only. Spender flags live only on `spent`. A new consensus
+script type with a new implicit width is **schema 18**.
 
 ### Sole-spender slot (`spent.body`)
 
-9 B per vout at `Ss + 9×vout`:
+8 B per vout at `Ss + 8×vout` (512 slots / 4 KiB page):
 
 | Offset | Field |
 |--------|-------|
-| 0–7 | `spender_field` u64 LE (0 = unspent; else sole `spending_tx_fk` or multi-list head) |
-| 8 | flags (`MULTI_SPENDER` bit 2) |
+| 0 | flags (`MULTI_SPENDER` bit 2; other bits reserved, Corrupt) |
+| 1–7 | `spender_field` u56 LE (0 = unspent; else sole `spending_tx_fk` or multi-list head) |
 
 | `MULTI_SPENDER` | `spender_field` |
 |-----------------|-----------------|
 | 0 | 0 = unspent; else sole **spending_tx_fk** |
-| 1 | head fk into `spenders.body` |
+| 1 | head fk into `spent.ovf` |
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 
-### Multi-spender list (`spenders.body`)
+### Multi-spender overflow (`spent.ovf`)
 
 Fixed 16 B records, append-only: `spending_tx_fk:u64 | next:u64`.  
 Only when an outpoint has **≥2** annotated spenders.
@@ -396,14 +418,18 @@ store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as s
   that alloc only.
 - Geometric slabs class 0–6 (`32 B`–`2 KiB`; cap `4 << class`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
-- Megakey **pages**: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to
-  **510** raw `u64` fks. Chain first→last; last-page append only.
+- Megakey **pages** (4 KiB): `next:u64` | `n_fks:u16` | `ver:u8=1` | pad 5 B
+  | ULEB128 `fk0` + ULEB128 gaps. Page is full when the next uleb does not
+  fit (often well above 510 sequential FKs). `ver=0` with `n_fks>0` is a
+  leftover raw-u64 page — rematerialize. Chain first→last; last-page append only.
 - Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 
 ### Query join
 
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
-IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry (slab/page packer).
+IBD may stage creates in **sorted runs** (`key_len=40`, unique
+`(scripthash, create_tx_fk)`) and bulk-materialize durable SH at tip
+entry (slab/page packer). Schema-16 `key_len=32` catalogs are refused.
 
 **Decision:** inline for 1–2-use scripts (~95 % of keys); geometric slabs for
 typical multi-use; page chains only for megakeys. Query cost for busy wallets is
@@ -442,12 +468,6 @@ On open: after tip-window revalidate, one `repair_class_c_above_tip` unstrongs b
 
 ---
 
-## Archive epoch (`archive_epoch`)
-
-Small control file (~32 B): magic, schema version, `archive_mode` flag, optional `finalized_height`, `wire_depth`. Bytes stay on disk; **`archive_mode`, `finalized_height`, and `wire_depth` are unread** (leftovers from a removed tip wire ring / archive-ahead finalize). Confirm is sole Class A; no production writer updates these fields.
-
----
-
 ## Mainnet census (this tree’s reference datadir, 2026-08-13)
 
 Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
@@ -455,9 +475,9 @@ Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
 
 | File | Packed 13/14 | Schema 15 |
 |------|--------------|-----------|
-| `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (16 B meta + outs, no spender) |
+| `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (schema 15; 17 thin meta + templates cut ~18–26 GiB) |
 | `inwit.body` | — | **~486 GiB** (ins + witness; cold) |
-| `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** |
+| `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** schema 15; **~21 GiB** after 8 B slots |
 | `{stem}.idx` | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** (grow-tight; do not 256 MiB-slab each) |
 | `txid.body` / `tx.head` | 42.23 / 8.23 GiB | unchanged |
 

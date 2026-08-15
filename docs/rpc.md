@@ -66,13 +66,14 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
+| `generatetoaddress` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
 
 ## Permanent gaps (will not match Core)
 
 | Method / area | Why |
 |---------------|-----|
 | Wallet RPC | No keystore |
-| Mining / GBT / `generatetoaddress` | Non-goal |
+| Mining / GBT | Non-goal. Regtest `generate*` / `submitblock` are harness-only (see above). |
 | `createrawtransaction` / `combinerawtransaction` | Wallet-adjacent footgun; use external tools |
 | `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate |
 | Address history via Core method names | Use Electrum/Esplora with `--shindex` |

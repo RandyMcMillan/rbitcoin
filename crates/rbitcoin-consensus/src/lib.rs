@@ -113,9 +113,10 @@ pub fn verify_tx_scripts_detached(
 }
 
 pub use block::{
-    bip34_height_script, bip68_active_for_tx, block_subsidy, is_final_tx, sequence_locks_satisfied,
-    validate_block_connect, validate_block_structure, validate_block_structure_hashed,
-    ValidationContext, LOCKTIME_THRESHOLD,
+    apply_witness_commitment, bip34_height_script, bip68_active_for_tx, block_has_witness,
+    block_subsidy, is_final_tx, sequence_locks_satisfied, validate_block_connect,
+    validate_block_structure, validate_block_structure_hashed, ValidationContext,
+    LOCKTIME_THRESHOLD,
 };
 pub use convert::{block_to_apply, block_to_apply_with_txids, header_to_record};
 pub use error::ConsensusError;
@@ -123,7 +124,7 @@ pub use header::{expected_next_bits, median_time_past, validate_header};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
 pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
-pub use regtest_pad::{mine_empty_regtest, pad_empty_from};
+pub use regtest_pad::{mine_empty_regtest, mine_regtest_paying, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{
     backfill_sp_tweaks, backfill_sp_tweaks_cancellable, tweak_from_tx, tweaks_at_height,

@@ -11,6 +11,11 @@ before 1.0).
 
 ### Added
 
+- **Regtest generate / submitblock (harness only):** `generatetoaddress`,
+  `generateblock`, `generate`, and `submitblock` mine or accept through
+  `ChainHub::accept_block` (same confirm path as P2P). Refused on mainnet /
+  signet / testnet. Not a mining product (no GBT).
+
 - **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
   shallow gitlink at `9be056a`. `cargo test` hard-links or copies
   `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from

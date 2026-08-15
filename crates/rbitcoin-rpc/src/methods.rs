@@ -2,7 +2,7 @@
 
 use bitcoin::consensus::{deserialize, encode::serialize_hex, Encodable};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
+use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{hex_decode, hex_encode, Height, Network};
 use rbitcoin_query::Query;
@@ -49,6 +49,29 @@ pub struct RpcContext {
     pub initial_block_download: Arc<AtomicBool>,
     /// `getnetworkinfo.subversion` (BIP14 / Core `-uacomment` shape).
     pub subversion: String,
+    /// Regtest generate/submitblock. Node attaches [`ChainHub`] via this trait.
+    pub regtest: Option<Arc<dyn RpcRegtest>>,
+}
+
+/// Outcome of `submitblock` (Core: `null` or a reject-reason string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitBlockOutcome {
+    Accepted,
+    Duplicate,
+    IgnoredWeaker,
+    Rejected(String),
+}
+
+/// Regtest-only mine + accept. Implemented by the node (not a mining product).
+pub trait RpcRegtest: Send + Sync {
+    fn generate_to_script(
+        &self,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<Vec<BlockHash>, String>;
+
+    fn submit_block(&self, block: Block) -> SubmitBlockOutcome;
 }
 
 impl RpcContext {
@@ -238,12 +261,14 @@ pub fn dispatch(
         "decodescript" => decodescript(&params),
         "validateaddress" => validateaddress(ctx, &params),
         "estimatesmartfee" => estimatesmartfee(ctx, &params),
+        "generatetoaddress" => generatetoaddress(ctx, &params),
+        "generateblock" => generateblock(ctx, &params),
+        "generate" => generate(ctx, &params),
+        "submitblock" => submitblock(ctx, &params),
         "createrawtransaction"
         | "combinerawtransaction"
         | "scantxoutset"
         | "getblocktemplate"
-        | "submitblock"
-        | "generatetoaddress"
         | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
@@ -291,6 +316,10 @@ const METHOD_LIST: &[&str] = &[
     "decodescript",
     "validateaddress",
     "estimatesmartfee",
+    "generatetoaddress",
+    "generateblock",
+    "generate",
+    "submitblock",
 ];
 
 fn method_help(m: &str) -> String {
@@ -304,6 +333,18 @@ fn method_help(m: &str) -> String {
         "getblockchaininfo" => {
             "getblockchaininfo\nReturns tip height, chain name, and IBD flag.".into()
         }
+        "generatetoaddress" => "generatetoaddress nblocks address (maxtries)\n\
+             Regtest harness only. Mines nblocks paying address via the P2P accept path."
+            .into(),
+        "generateblock" => "generateblock output transactions\n\
+             Regtest harness only. One block paying output (address or hex script)."
+            .into(),
+        "generate" => "generate nblocks (maxtries)\n\
+             Regtest harness only. Mines to OP_TRUE (no wallet)."
+            .into(),
+        "submitblock" => "submitblock hexdata (dummy)\n\
+             Regtest harness only. Accepts a serialized block via the P2P path."
+            .into(),
         "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
         other if METHOD_LIST.contains(&other) => format!("{other} — see docs/rpc.md"),
         other => format!("unknown method {other}"),
@@ -802,6 +843,124 @@ fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
     }))
 }
 
+fn require_regtest(ctx: &RpcContext, method: &str) -> Result<(), Value> {
+    if ctx.network != Network::Regtest {
+        return Err(rpc_error(ERR_MISC, format!("{method} is regtest only")));
+    }
+    Ok(())
+}
+
+fn require_regtest_miner<'a>(
+    ctx: &'a RpcContext,
+    method: &str,
+) -> Result<&'a dyn RpcRegtest, Value> {
+    require_regtest(ctx, method)?;
+    ctx.regtest
+        .as_deref()
+        .ok_or_else(|| rpc_error(ERR_MISC, format!("{method} requires a live chain hub")))
+}
+
+fn decode_output_script(ctx: &RpcContext, s: &str) -> Result<ScriptBuf, Value> {
+    let btc_net = match ctx.network {
+        Network::Mainnet => BtcNetwork::Bitcoin,
+        Network::Testnet => BtcNetwork::Testnet,
+        Network::Signet => BtcNetwork::Signet,
+        Network::Regtest => BtcNetwork::Regtest,
+    };
+    if let Ok(a) = s.parse::<Address<_>>() {
+        match a.require_network(btc_net) {
+            Ok(addr) => return Ok(addr.script_pubkey()),
+            Err(_) => {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMS,
+                    "address is not valid for this network",
+                ));
+            }
+        }
+    }
+    let bytes = hex_decode(s).map_err(|e| {
+        rpc_error(
+            ERR_INVALID_PARAMS,
+            format!("output must be an address or hex script: {e}"),
+        )
+    })?;
+    Ok(ScriptBuf::from_bytes(bytes))
+}
+
+fn hashes_json(hashes: &[BlockHash]) -> Value {
+    json!(hashes.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+}
+
+fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["nblocks", "address", "maxtries"])?;
+    let miner = require_regtest_miner(ctx, "generatetoaddress")?;
+    let nblocks = params.req_u64(0, "nblocks")? as u32;
+    let addr = params.req_str(1, "address")?;
+    let _maxtries = params.opt_u64(2, "maxtries")?;
+    let script = decode_output_script(ctx, addr)?;
+    let hashes = miner
+        .generate_to_script(nblocks, script, Vec::new())
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(hashes_json(&hashes))
+}
+
+fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["output", "transactions"])?;
+    let miner = require_regtest_miner(ctx, "generateblock")?;
+    let output = params.req_str(0, "output")?;
+    let script = decode_output_script(ctx, output)?;
+    let mut extra = Vec::new();
+    if let Some(arr) = params.get_array(1, "transactions") {
+        for v in arr {
+            let hex = v
+                .as_str()
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "transactions entries must be hex"))?;
+            extra.push(decode_tx_hex(hex)?);
+        }
+    } else if params.get(1, "transactions").is_some() {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMS,
+            "transactions must be an array",
+        ));
+    } else {
+        return Err(rpc_error(ERR_INVALID_PARAMS, "transactions required"));
+    }
+    let hashes = miner
+        .generate_to_script(1, script, extra)
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    let hash = hashes
+        .first()
+        .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
+    Ok(json!({ "hash": hash.to_string() }))
+}
+
+fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["nblocks", "maxtries"])?;
+    let miner = require_regtest_miner(ctx, "generate")?;
+    let nblocks = params.req_u64(0, "nblocks")? as u32;
+    let _maxtries = params.opt_u64(1, "maxtries")?;
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let hashes = miner
+        .generate_to_script(nblocks, script, Vec::new())
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(hashes_json(&hashes))
+}
+
+fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["hexdata", "dummy"])?;
+    let miner = require_regtest_miner(ctx, "submitblock")?;
+    let hex = params.req_str(0, "hexdata")?;
+    let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    let block: Block = deserialize(&raw)
+        .map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("block decode: {e}")))?;
+    match miner.submit_block(block) {
+        SubmitBlockOutcome::Accepted => Ok(Value::Null),
+        SubmitBlockOutcome::Duplicate => Ok(json!("duplicate")),
+        SubmitBlockOutcome::IgnoredWeaker => Ok(json!("inconclusive")),
+        SubmitBlockOutcome::Rejected(reason) => Ok(json!(reason)),
+    }
+}
+
 fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
     let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
@@ -913,6 +1072,7 @@ mod tests {
                 &["testnode0"],
             )
             .unwrap(),
+            regtest: None,
         };
         (ctx, dir)
     }
@@ -1145,6 +1305,7 @@ mod tests {
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(true)),
             subversion: "/rbitcoin:0.1.0/".into(),
+            regtest: None,
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -1183,6 +1344,7 @@ mod tests {
             connections: Arc::new(AtomicU64::new(1)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
             subversion: "/rbitcoin:0.1.0/".into(),
+            regtest: None,
         };
 
         let tip_h = chain.tip_height();
@@ -1378,6 +1540,157 @@ mod tests {
             miss_raw["message"],
             "No such mempool or blockchain transaction"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TestMiner(Arc<rbitcoin_net::ChainHub>);
+
+    impl RpcRegtest for TestMiner {
+        fn generate_to_script(
+            &self,
+            nblocks: u32,
+            script_pubkey: ScriptBuf,
+            extra_txs: Vec<Transaction>,
+        ) -> Result<Vec<BlockHash>, String> {
+            self.0
+                .generate_to_script(nblocks, script_pubkey, extra_txs)
+                .map_err(|e| e.to_string())
+        }
+
+        fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
+            match self.0.accept_block(block) {
+                Ok(rbitcoin_net::AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
+                Ok(rbitcoin_net::AcceptOutcome::AlreadyHave) => SubmitBlockOutcome::Duplicate,
+                Ok(rbitcoin_net::AcceptOutcome::IgnoredWeaker) => SubmitBlockOutcome::IgnoredWeaker,
+                Err(e) => SubmitBlockOutcome::Rejected(e.to_string()),
+            }
+        }
+    }
+
+    fn ctx_regtest_hub() -> (RpcContext, PathBuf, Arc<rbitcoin_net::ChainHub>) {
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-gen-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Arc::new(rbitcoin_net::ChainHub::new(
+            Query::open_or_create(dir.join("store")).unwrap(),
+            ChainParams::regtest(),
+            Milestone::NONE,
+        ));
+        hub.ensure_genesis().unwrap();
+        let mp = MempoolHub::open_with_weight(dir.join("mempool"), hub.query.clone(), 300_000_000)
+            .unwrap();
+        mp.set_relay_enabled(true);
+        let ctx = RpcContext {
+            query: hub.query.clone(),
+            mempool: Some(mp),
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(0)),
+            initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: "/rbitcoin:0.1.0/".into(),
+            regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
+        };
+        (ctx, dir, hub)
+    }
+
+    fn p2wpkh_regtest() -> (String, ScriptBuf) {
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Address, WPubkeyHash};
+        let wpkh = WPubkeyHash::from_byte_array([0x75; 20]);
+        let script = ScriptBuf::new_p2wpkh(&wpkh);
+        let addr = Address::from_script(&script, BtcNetwork::Regtest)
+            .expect("p2wpkh script is a valid address");
+        (addr.to_string(), script)
+    }
+
+    #[test]
+    fn generate_refuses_on_mainnet() {
+        let (mut ctx, dir, _hub) = ctx_regtest_hub();
+        ctx.network = Network::Mainnet;
+        let (addr, _) = p2wpkh_regtest();
+        for m in [
+            "generatetoaddress",
+            "generateblock",
+            "generate",
+            "submitblock",
+        ] {
+            let e = match m {
+                "generatetoaddress" => dispatch(&ctx, m, vec![json!(1), json!(addr.clone())]),
+                "generateblock" => dispatch(&ctx, m, vec![json!(addr.clone()), json!([])]),
+                "generate" => dispatch(&ctx, m, vec![json!(1)]),
+                _ => dispatch(&ctx, m, vec![json!("00")]),
+            }
+            .unwrap_err();
+            let msg = e["message"].as_str().unwrap_or("");
+            assert!(
+                msg.contains("regtest only"),
+                "{m} must refuse on mainnet: {e}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_one_to_p2wpkh() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let (addr, script) = p2wpkh_regtest();
+        let hashes = dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        let arr = hashes.as_array().expect("hash array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
+        let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        assert_eq!(best, arr[0]);
+        let blk = dispatch(&ctx, "getblock", vec![best, json!(2)]).unwrap();
+        let hex = blk["tx"][0]["vout"][0]["scriptPubKey"]["hex"]
+            .as_str()
+            .unwrap();
+        assert_eq!(hex, rbitcoin_primitives::hex_encode(script.as_bytes()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submitblock_good_and_bad_merkle() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let good = mine_regtest_paying(prev, time, 1, script.clone(), vec![]);
+        let good_hex = rbitcoin_primitives::hex_encode(serialize(&good));
+        let r = dispatch(&ctx, "submitblock", vec![json!(good_hex)]).unwrap();
+        assert!(r.is_null(), "good submitblock: {r}");
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
+
+        let prev2 = hub.tip_hash().unwrap();
+        let time2 = hub.tip_header().unwrap().time + 1;
+        let mut bad = mine_regtest_paying(prev2, time2, 2, script, vec![]);
+        bad.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0xab; 32]);
+        // Re-grind so we fail on merkle, not PoW.
+        let target = bitcoin::Target::from_compact(bad.header.bits);
+        for nonce in 0..u32::MAX {
+            bad.header.nonce = nonce;
+            if bad.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let bad_hex = rbitcoin_primitives::hex_encode(serialize(&bad));
+        let r = dispatch(&ctx, "submitblock", vec![json!(bad_hex)]).unwrap();
+        assert!(!r.is_null(), "bad merkle must not be accepted: {r}");
+        let msg = r.as_str().unwrap_or("");
+        assert!(
+            msg.to_ascii_lowercase().contains("merkle")
+                || msg.contains("consensus")
+                || msg.contains("bad"),
+            "bad merkle reject: {r}"
+        );
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

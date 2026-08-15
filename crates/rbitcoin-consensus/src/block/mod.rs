@@ -5,7 +5,7 @@ use crate::params::ChainParams;
 use bitcoin::block::Block;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
-use bitcoin::{Amount, OutPoint, Transaction, TxOut};
+use bitcoin::{Amount, OutPoint, Transaction, TxOut, Witness};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{FkMap, Query, U32Map, U64Map};
 use std::borrow::Borrow;
@@ -186,6 +186,38 @@ pub fn block_has_witness(block: &Block) -> bool {
         .txdata
         .iter()
         .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+}
+
+/// BIP141: set coinbase reserved witness + `OP_RETURN` commitment (nonce = zeros).
+///
+/// Updates `header.merkle_root`. Caller still grinds PoW. No-op when no witness.
+pub fn apply_witness_commitment(block: &mut Block) {
+    if !block_has_witness(block) || block.txdata.is_empty() {
+        return;
+    }
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let reserved = [0u8; 32];
+    block.txdata[0].input[0].witness = Witness::from_slice(&[reserved.to_vec()]);
+    let mut leaves = Vec::with_capacity(block.txdata.len());
+    leaves.push([0u8; 32]);
+    for tx in block.txdata.iter().skip(1) {
+        leaves.push(tx.compute_wtxid().to_byte_array());
+    }
+    let witness_root = merkle_root_bytes(&leaves);
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&witness_root);
+    buf[32..].copy_from_slice(&reserved);
+    let hash = sha256d::Hash::hash(&buf);
+    let mut spk = Vec::with_capacity(38);
+    spk.extend_from_slice(&MAGIC);
+    spk.extend_from_slice(&hash.to_byte_array());
+    block.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    });
+    if let Some(root) = block.compute_merkle_root() {
+        block.header.merkle_root = root;
+    }
 }
 
 /// Core-style legacy sigop count (CHECKSIG=1, CHECKMULTISIG=20 or accurate N).

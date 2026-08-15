@@ -1,12 +1,14 @@
 use crate::config::NodeConfig;
 use crate::error::NodeError;
+use crate::regtest_rpc::HubRegtest;
 use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_esplora::{run_esplora, EsploraConfig};
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
+use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
-use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle};
+use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle, RpcRegtest};
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -604,7 +606,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
                 ),
             };
-            match run_rpc(rcfg, Arc::clone(&node.hub.query), Some(mempool.clone())).await {
+            let miner: Option<Arc<dyn RpcRegtest>> = if config.network == Network::Regtest {
+                Some(Arc::new(HubRegtest(Arc::clone(&node.hub))))
+            } else {
+                None
+            };
+            match run_rpc(
+                rcfg,
+                Arc::clone(&node.hub.query),
+                Some(mempool.clone()),
+                miner,
+            )
+            .await
+            {
                 Ok(h) => {
                     h.initial_block_download
                         .store(!tip_follow_ready, Ordering::SeqCst);

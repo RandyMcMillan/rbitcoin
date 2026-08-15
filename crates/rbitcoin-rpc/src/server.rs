@@ -1,7 +1,7 @@
 //! HTTP JSON-RPC server (axum) with Basic auth.
 
 use crate::auth::{parse_basic_auth, resolve_rpc_auth, RpcAuth};
-use crate::methods::{handle_request, RpcContext};
+use crate::methods::{handle_request, RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -65,6 +65,7 @@ pub async fn run_rpc(
     config: RpcConfig,
     query: Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
+    regtest: Option<Arc<dyn RpcRegtest>>,
 ) -> Result<RpcHandle, String> {
     let (auth, cookie_path) = resolve_rpc_auth(
         &config.datadir,
@@ -92,6 +93,7 @@ pub async fn run_rpc(
             rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
                 .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")))
         }),
+        regtest,
     });
 
     let listener = TcpListener::bind(config.listen)
@@ -277,7 +279,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
         };
-        let handle = run_rpc(cfg, q, Some(mp)).await.unwrap();
+        let handle = run_rpc(cfg, q, Some(mp), None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let count = post_rpc(

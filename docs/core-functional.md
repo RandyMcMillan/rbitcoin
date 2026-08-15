@@ -102,18 +102,21 @@ script pass.
 | `harness` | `test_runner.py`, `combine_logs.py`, framework self-tests |
 | `unknown` | **illegal** |
 
-## CI (later)
+## CI
 
-Nightly + `workflow_dispatch`, and PRs labeled **`core-functional`**.
-Unlabeled PRs keep the cargo gates only.
+[`.github/workflows/core-functional.yml`](../.github/workflows/core-functional.yml)
+runs `scripts/core-functional/nightly.sh` on a nightly cron, on
+`workflow_dispatch`, and on PRs labeled **`core-functional`**. Unlabeled
+PRs keep the cargo gates only. Label the PR when touching the harness
+(see `AGENTS.md`).
 
-`scripts/core-functional/nightly.sh` is that job: sparse-init the pin,
-check the inventory, **warn** (do not fail) if a newer Bitcoin Core
-*release* exists than `inventory.toml` `pin`, then `run.sh --list`
-(later the `run` suite). The warning compares **semver of final
-releases**, not GitHub’s `/releases/latest` — Core still ships older
-maintenance tags after a newer major. Bump `third_party/bitcoin`, the
-JSON corpora, and the inventory when it fires.
+The job sparse-inits the pin, checks the inventory, **warns** (does not
+fail) if a newer Bitcoin Core *release* exists than `inventory.toml`
+`pin`, then `run.sh --list` (later the `run` suite). The warning
+compares **semver of final releases**, not GitHub’s `/releases/latest`
+— Core still ships older maintenance tags after a newer major. Bump
+`third_party/bitcoin`, the JSON corpora, and the inventory when it
+fires.
 
 ```bash
 python3 scripts/core-functional/check_core_release.py --latest v31.1

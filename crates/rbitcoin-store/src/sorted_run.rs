@@ -443,7 +443,7 @@ fn write_sorted_run_file(
         let mut prev: Option<&[u8]> = None;
         for rec in records.chunks_exact(rl) {
             if let Some(p) = prev {
-                if rec <= p {
+                if rec_key_cmp(rec, p, key_len as usize, rec_len) != Ordering::Greater {
                     return Err(StoreError::Corrupt(
                         "sorted run: records not strictly increasing",
                     ));
@@ -763,8 +763,29 @@ struct MergeHead {
     idx: usize,
 }
 
+/// Compare two fixed records for merge / write order.
+///
+/// SH catalogs (`key_len == rec_len == 40`) sort by scripthash then **numeric**
+/// little-endian create_fk — not raw 40-byte memcmp (fk 255 < 256).
+fn rec_key_cmp(a: &[u8], b: &[u8], key_len: usize, rec_len: u32) -> Ordering {
+    if key_len == 40 && rec_len == 40 && a.len() >= 40 && b.len() >= 40 {
+        match a[..32].cmp(&b[..32]) {
+            Ordering::Equal => {
+                let fa = u64::from_le_bytes(a[32..40].try_into().unwrap());
+                let fb = u64::from_le_bytes(b[32..40].try_into().unwrap());
+                fa.cmp(&fb)
+            }
+            o => o,
+        }
+    } else {
+        let n = key_len.min(a.len()).min(b.len());
+        a[..n].cmp(&b[..n])
+    }
+}
+
 fn head_less(a: &MergeHead, b: &MergeHead, key_len: usize) -> bool {
-    match a.cursor.rec()[..key_len].cmp(&b.cursor.rec()[..key_len]) {
+    let rec_len = a.cursor.rec_len as u32;
+    match rec_key_cmp(a.cursor.rec(), b.cursor.rec(), key_len, rec_len) {
         Ordering::Less => true,
         Ordering::Greater => false,
         Ordering::Equal => a.idx < b.idx,
@@ -2077,11 +2098,12 @@ mod tests {
         let mut a = Vec::new();
         a.extend_from_slice(&sh_rec(0xAA, 1));
         a.extend_from_slice(&sh_rec(0xAA, 5));
-        a.extend_from_slice(&sh_rec(0xAA, 9));
+        a.extend_from_slice(&sh_rec(0xAA, 255));
+        a.extend_from_slice(&sh_rec(0xAA, 257));
         let mut b = Vec::new();
         b.extend_from_slice(&sh_rec(0xAA, 2));
         b.extend_from_slice(&sh_rec(0xAA, 5));
-        b.extend_from_slice(&sh_rec(0xAA, 10));
+        b.extend_from_slice(&sh_rec(0xAA, 256));
         write_sorted_run(&d.join("000001.run"), 40, 40, &a).unwrap();
         write_sorted_run(&d.join("000002.run"), 40, 40, &b).unwrap();
         let r1 = open_run(&d.join("000001.run")).unwrap();
@@ -2092,7 +2114,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(fks, vec![1, 2, 5, 9, 10], "merge must FK-order and dedup");
+        assert_eq!(
+            fks,
+            vec![1, 2, 5, 255, 256, 257],
+            "merge must numeric-FK-order (255<256) and dedup"
+        );
         let out = next_run_path(&d, 9);
         let merged = merge_runs_to_file(
             &[
@@ -2102,14 +2128,14 @@ mod tests {
             &out,
         )
         .unwrap();
-        assert_eq!(merged.count, 5);
+        assert_eq!(merged.count, 6);
         assert_eq!(merged.key_len, 40);
         let body = read_run_body(&merged).unwrap();
         let mut got = Vec::new();
         for chunk in body.chunks_exact(40) {
             got.push(u64::from_le_bytes(chunk[32..40].try_into().unwrap()));
         }
-        assert_eq!(got, vec![1, 2, 5, 9, 10]);
+        assert_eq!(got, vec![1, 2, 5, 255, 256, 257]);
         let _ = fs::remove_dir_all(&d);
     }
 

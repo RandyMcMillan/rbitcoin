@@ -24,6 +24,12 @@ before 1.0).
   CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
   and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
 
+- **Core release pin warning:** `check_core_release.py` (used by
+  `scripts/core-functional/nightly.sh`) warns — does not fail — when a
+  newer final Bitcoin Core release exists than `inventory.toml` `pin`.
+  Semver of published finals, not GitHub `/releases/latest`. Bump the
+  submodule, fixtures, and inventory when it fires.
+
 - **Core functional bitcoind shim:** `scripts/core-functional/bitcoind`
   starts `rbitcoin-node` from TestNode argv (`-datadir` → `DIR/regtest`
   so the cookie is `{datadir}/regtest/.cookie`). Clean chain:

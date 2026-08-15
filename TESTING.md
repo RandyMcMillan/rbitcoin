@@ -185,8 +185,9 @@ Inventory for Bitcoin Core **v31.1** functional tests lives in
 ([`docs/core-functional.md`](docs/core-functional.md)).
 `python3 scripts/core-functional/check_inventory.py` is the completeness
 gate. `run.sh` may only invoke inventory `run` names (all skip today).
-The bitcoind shim / nightly job come in later PRs. Default `cargo test`
-does **not** invoke Core’s Python suite.
+The nightly job (`scripts/core-functional/nightly.sh`) warns — it does
+not fail — when a newer Bitcoin Core release exists than the inventory
+pin. Default `cargo test` does **not** invoke Core’s Python suite.
 
 ```bash
 python3 scripts/core-functional/check_inventory.py
@@ -195,6 +196,7 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/run.sh.test.sh
 ./scripts/core-functional/run.sh --list
 ./scripts/core-functional/bitcoind.test.sh
+./scripts/core-functional/check_core_release.test.sh
 # cargo test stages Core JSON from the submodule:
 ./scripts/core-functional/init-submodule.sh
 ./scripts/core-functional/sync-core-fixtures.sh --check

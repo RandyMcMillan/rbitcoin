@@ -32,6 +32,38 @@ pub(crate) fn should_rerequest_headers_on_empty_lag(streak: u32) -> bool {
     streak == 1 || (streak > 0 && streak.is_multiple_of(8))
 }
 
+/// After a non-empty `headers` that added nothing to `ordered`.
+///
+/// Tip chatter is 1–3 already-known hashes from every peer. `live==0` must
+/// **not** re-issue getheaders on each of those (that loop was ~1k/s at
+/// mainnet tip). Full 2000-header windows and real lag still advance.
+pub(crate) fn should_advance_locator_after_known_batch(
+    live: usize,
+    lag: u32,
+    full_window: bool,
+    need_headroom: bool,
+) -> bool {
+    if live == 0 {
+        return false;
+    }
+    full_window || lag > 2 || need_headroom
+}
+
+/// How many peers to `getheaders` when the ordered path is empty.
+///
+/// Mid-sync (`lag > 2`): fan a few so one zombie cannot stall. Near tip
+/// (`lag ≤ 2`): never fan — remaining work is inflight/BQ/confirm, not
+/// another locator walk. Caller marks `headers_done` when fan is 0.
+pub(crate) fn empty_path_header_fan(lag: u32, inflight: usize, alive: usize) -> usize {
+    if lag <= 2 {
+        return 0;
+    }
+    if inflight > 0 {
+        return 1.min(alive);
+    }
+    alive.min(4).max(1)
+}
+
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
 ///
 /// Must stay rare: mainnet ~1M headers ≈ 200–300ms per call. Same cadence as
@@ -215,5 +247,26 @@ mod tests {
             reseeds < regets,
             "reseed={reseeds} must be rarer than reget={regets}"
         );
+
+        // Already-known 1-header at tip must not re-getheaders (storm).
+        assert!(!should_advance_locator_after_known_batch(0, 0, false, true));
+        assert!(!should_advance_locator_after_known_batch(
+            0, 0, false, false
+        ));
+        // Live path + full window still advances.
+        assert!(should_advance_locator_after_known_batch(
+            8_000, 0, true, false
+        ));
+        assert!(should_advance_locator_after_known_batch(
+            8_000, 10, false, false
+        ));
+
+        // Empty path near tip: no fan (finish sync / SH / tip follow).
+        assert_eq!(empty_path_header_fan(0, 0, 29), 0);
+        assert_eq!(empty_path_header_fan(2, 3, 29), 0);
+        // Mid-sync empty: fan (cap 4); one peer if getdata already inflight.
+        assert_eq!(empty_path_header_fan(100, 0, 29), 4);
+        assert_eq!(empty_path_header_fan(100, 5, 29), 1);
+        assert_eq!(empty_path_header_fan(100, 0, 2), 2);
     }
 }

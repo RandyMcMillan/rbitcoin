@@ -540,7 +540,10 @@ pub fn connecting_hashes_heavier_disconnected(
         .height_of_hash(&join.to_byte_array())
         .map_err(|e| NetError::Consensus(e.to_string()))?
     {
-        if let Ok(next) = hub.query.wire_header_at_height(Height(jh.0.saturating_add(1))) {
+        if let Ok(next) = hub
+            .query
+            .wire_header_at_height(Height(jh.0.saturating_add(1)))
+        {
             if next.block_hash() == path[0] {
                 return Ok(None);
             }

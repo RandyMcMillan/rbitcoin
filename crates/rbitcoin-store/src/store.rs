@@ -1,5 +1,4 @@
 use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
-use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
 use crate::height_fence::HeightFence;
@@ -11,7 +10,6 @@ use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STOR
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
 /// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
@@ -115,7 +113,7 @@ pub struct Store {
     cold_path: Option<PathBuf>,
     pub headers: HeaderTable,
     pub txs: TxTable,
-    /// Multi-spender list nodes only (sole spends live on create outputs).
+    /// Multi-spender overflow (`spent.ovf`). Sole spends live on create outputs.
     pub spenders: SpenderTable,
     pub scripthash: ScriptHashTable,
     pub confirmed: ConfirmedTable,
@@ -125,7 +123,6 @@ pub struct Store {
     pub header_txs: HeaderTxsTable,
     /// Resident create-height fence (confirmed[] + header_txs). No `tx_height.body`.
     height_fence: std::sync::RwLock<HeightFence>,
-    epoch: Mutex<ArchiveEpoch>,
 }
 
 /// How txid → Class A fk picks among rows with the same txid.
@@ -158,8 +155,6 @@ impl Store {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
         write_meta(&path)?;
-        let epoch = ArchiveEpoch::default();
-        epoch.store(&path)?;
         let inwit_dir = resolve_inwit_dir(&layout)?;
         let txs = TxTable::create_with_head_layout_inwit(
             &path,
@@ -179,7 +174,6 @@ impl Store {
             strong_tx: StrongTxTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
-            epoch: Mutex::new(epoch),
             path,
             cold_path,
         })
@@ -196,7 +190,13 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        let epoch = ArchiveEpoch::load(&path)?;
+        let leftover_epoch = path.join("archive_epoch");
+        if leftover_epoch.exists() {
+            eprintln!(
+                "store: dropping leftover archive_epoch (unread dual-path leftover; schema 17 does not keep it)"
+            );
+            let _ = std::fs::remove_file(&leftover_epoch);
+        }
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open(&path)?
@@ -261,7 +261,6 @@ impl Store {
             strong_tx: StrongTxTable::open(&path)?,
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
-            epoch: Mutex::new(epoch),
             path,
             cold_path,
         })
@@ -626,7 +625,7 @@ impl Store {
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
     /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
-    /// go to `spenders.body` inline on read completion. Returns edges that still
+    /// go to `spent.ovf` inline on read completion. Returns edges that still
     /// need a full cold path (OOB abs).
     pub fn put_spend_batch_by_abs_meta(
         &self,
@@ -822,7 +821,7 @@ impl Store {
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.
     ///
     /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD
-    /// (would touch `spenders.body`).
+    /// (would touch `spent.ovf`).
     pub fn has_confirmed_strong_spender_create(
         &self,
         create_tx_fk: Fk,
@@ -1200,10 +1199,6 @@ impl Store {
         self.scripthash.flush_async()?;
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
-    }
-
-    pub fn epoch(&self) -> ArchiveEpoch {
-        self.epoch.lock().unwrap().clone()
     }
 }
 
@@ -2640,6 +2635,25 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn schema17_create_does_not_write_archive_epoch() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        assert!(
+            !dir.join("archive_epoch").exists(),
+            "unread leftover must not be created"
+        );
+        assert!(dir.join("spent.ovf").exists());
+        assert!(!dir.join("spenders.body").exists());
+        s.flush().unwrap();
+        drop(s);
+        std::fs::write(dir.join("archive_epoch"), b"junk").unwrap();
+        let s = Store::open(&dir).unwrap();
+        assert!(!dir.join("archive_epoch").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -173,7 +173,7 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
 pub struct OutputRecord {
     pub value: i64,
     pub script: Vec<u8>,
-    /// Schema v5: sole `spending_tx_fk` if !multi; else head fk into `spenders.body`.
+    /// Schema v5: sole `spending_tx_fk` if !multi; else head fk into `spent.ovf`.
     pub spender_field: Fk,
     /// When true, `spender_field` is a multi-list head (not a single spending_tx_fk).
     pub multi_spender: bool,
@@ -982,7 +982,7 @@ impl TxTable {
     /// Annotate spends at known absolute spender-meta offsets (confirm write).
     ///
     /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 9 B → decide
-    /// sole / multi / promote → pwrite; `spenders.body` appends run **inline** on
+    /// sole / multi / promote → pwrite; `spent.ovf` appends run **inline** on
     /// the read completion (mmap). Same abs serialized. Fallback: mmap RMW.
     ///
     /// Returns edges that still need a full cold path (OOB abs / deferred).

@@ -2,7 +2,6 @@
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
-//! Archive epochs: on-disk leftover (`archive_mode` / `finalized_height` / `wire_depth` unread).
 
 mod address_head;
 mod array_table;
@@ -12,7 +11,6 @@ mod bulk_io;
 mod chain;
 mod compact;
 mod dontcache_policy;
-mod epoch;
 mod error;
 mod file;
 mod fuse8_filter;
@@ -61,7 +59,6 @@ pub use block_queue::{
     BlockQueue, BqParentHits, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
-pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};

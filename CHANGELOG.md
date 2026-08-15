@@ -79,6 +79,9 @@ before 1.0).
   meta, script kinds 0–9 (P2TR/P2A included), and 8-byte spent slots.
   Opening a store with creates in the 16-byte / 9-byte Class A layout
   is refused (wipe datadir and redo IBD). Empty Class A soft-opens.
+  Multi-spender overflow is `spent.ovf` (leftover `spenders.body` is
+  renamed on open). `archive_epoch` is no longer written; a leftover
+  file is unlinked on open (unread dual-path leftover).
   More 17 layout changes may follow before 18.
 
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves

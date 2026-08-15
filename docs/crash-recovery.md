@@ -49,7 +49,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 
 ## Spends (v5: annotation on create outputs)
 
-- Sole spender: 9 B slot on **`spent.body`**. Multi: `MULTI_SPENDER` + `spenders.body` list.
+- Sole spender: 8 B slot on **`spent.body`**. Multi: `MULTI_SPENDER` + `spent.ovf` list.
 - Annotations may remain after disconnect / for non-strong spenders.
 - Best-chain spentness: annotation + `is_confirmed_strong(spender)`.
 - Kill-safe: stale/non-strong fields do not false-positive if filter is applied.

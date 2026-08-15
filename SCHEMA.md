@@ -48,7 +48,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head/                     # meta + NNNNNN + .fuse8 (segmented 25-bit)
-    spenders.body                # multi-spender list nodes only
+    spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
     # tx_height.body retired in 16 (RAM fence from confirmed + header_txs)
@@ -57,7 +57,6 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.body / scripthash.head/NN[.idx]        # Class B (slabs + sorted heads; no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
-    archive_epoch
     scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
   wire/                          # unused (opened, never filled)
@@ -170,7 +169,7 @@ Each create_fk has three 8-aligned var records (coupled idx `first_fk` / `file_i
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
 inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
-spent.body Ss:  8 B × out_count  (flags + u56 field). Multi overflow → spenders.body
+spent.body Ss:  8 B × out_count  (flags + u56 field). Multi overflow → spent.ovf
 ```
 
 Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
@@ -268,11 +267,11 @@ covers hash/data only. Spender flags live only on `spent`.
 | `MULTI_SPENDER` | `spender_field` |
 |-----------------|-----------------|
 | 0 | 0 = unspent; else sole **spending_tx_fk** |
-| 1 | head fk into `spenders.body` |
+| 1 | head fk into `spent.ovf` |
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 
-### Multi-spender list (`spenders.body`)
+### Multi-spender overflow (`spent.ovf`)
 
 Fixed 16 B records, append-only: `spending_tx_fk:u64 | next:u64`.  
 Only when an outpoint has **≥2** annotated spenders.
@@ -461,12 +460,6 @@ Schema 15 leftover `tx_height.body` is unlinked on open (logged).
 `is_confirmed_strong(tx)` ⇔ strong ∧ fence contains the fk (implies height ≤ tip
 and membership in `confirmed[h]` header_txs).  
 On open: after tip-window revalidate, one `repair_class_c_above_tip` unstrongs bits not on the fence (complement of fence runs — not a full-bit walk).
-
----
-
-## Archive epoch (`archive_epoch`)
-
-Small control file (~32 B): magic, schema version, `archive_mode` flag, optional `finalized_height`, `wire_depth`. Bytes stay on disk; **`archive_mode`, `finalized_height`, and `wire_depth` are unread** (leftovers from a removed tip wire ring / archive-ahead finalize). Confirm is sole Class A; no production writer updates these fields.
 
 ---
 

@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **17** | **In flight.** SH runs `key_len=40`; Class A thin meta + script kinds + 8 B spent. Refuse leftover `key_len=32` runs and 16-layout Class A with creates. More 17 may follow. | **Current (open)** |
+| **17** | **In flight.** SH runs `key_len=40`; Class A thin meta + script kinds + 8 B spent; `spent.ovf`; drop `archive_epoch`. Refuse leftover `key_len=32` runs and 16-layout Class A. More 17 may follow. | **Current (open)** |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
@@ -44,6 +44,15 @@ fixed **8 B** spent slots (`flags + u56`). Decode expands templates to
 wire scripts. Class A with creates in the 16-byte meta / 9-byte spent
 layout is refused (wipe datadir and redo IBD). Empty Class A may rewrite
 `meta`. `inwit` prevout encoding is unchanged (Δfk is a follow-up).
+
+Multi-spender list nodes live in **`spent.ovf`** (same 16 B records as
+legacy `spenders.body`). Open renames a leftover `spenders.body` when
+`spent.ovf` is missing.
+
+**`archive_epoch` is gone.** The file was an unread leftover from the
+removed archive/wire dual path (`archive_mode` / `finalized_height` /
+`wire_depth` were serialized and never consulted). Create no longer
+writes it; open unlinks a leftover file.
 
 Sealed SH head/body stay. Further 17 file-layout changes may land before 18.
 

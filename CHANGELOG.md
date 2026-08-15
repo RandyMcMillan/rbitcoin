@@ -24,6 +24,11 @@ before 1.0).
   CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
   and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
 
+- **Core functional runner:** `scripts/core-functional/run.sh` invokes Core
+  `test_runner.py` only for inventory `run` names (`--v2transport`,
+  `--exclude` every skip). A skip name fails `not in run set`. `--list` /
+  `--dry-run` need no node. Default `cargo test` does not call it.
+
 - **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
   classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
   reason; `analog` required for prune / LevelDB / UTXO-set skips).

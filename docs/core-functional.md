@@ -17,6 +17,23 @@ if the pin is missing; see
 ./scripts/core-functional/sync-core-fixtures.sh --check
 python3 scripts/core-functional/check_inventory.py \
   --tests-dir third_party/bitcoin/test/functional
+./scripts/core-functional/run.sh --list
+```
+
+## Runner
+
+`scripts/core-functional/run.sh` is the only way we invoke Core’s
+`test_runner.py`. It runs the inventory checker, then only inventory
+`run` names, with `--v2transport` and `--exclude` for every `skip`.
+A `skip` or unknown name fails with `not in run set` / `unknown test`.
+`--list` prints `run` names (none today). `--dry-run` prints the
+command and writes `config.ini` (wallet/zmq/ipc off) without starting
+a node. Default `cargo test` never calls this.
+
+```bash
+./scripts/core-functional/run.sh --list
+./scripts/core-functional/run.sh --dry-run
+./scripts/core-functional/run.sh.test.sh
 ```
 
 ## Check the inventory

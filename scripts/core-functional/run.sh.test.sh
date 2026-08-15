@@ -129,6 +129,7 @@ fi
 DRY_OUT="$("$RUN" --dry-run --inventory "$INV" --tests-dir "$TESTS" \
   --config-out "$WORKDIR/config.ini" feature_help.py 2>/dev/null || true)"
 if printf '%s' "$DRY_OUT" | grep -q -- '--v2transport' \
+  && printf '%s' "$DRY_OUT" | grep -q -- '--jobs' \
   && printf '%s' "$DRY_OUT" | grep -q 'feature_help.py'; then
   echo "ok - dry-run run name"
   PASS=$((PASS + 1))
@@ -150,23 +151,32 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# --- dry-run exclude includes skip names (no leak if runner expands) ---
-if printf '%s' "$DRY_OUT" | grep -q -- '--exclude' \
-  && printf '%s' "$DRY_OUT" | grep -q 'wallet_basic.py'; then
-  echo "ok - dry-run excludes skips"
-  PASS=$((PASS + 1))
-else
-  echo "not ok - dry-run excludes skips (got: $DRY_OUT)"
+# --- dry-run of a run name does not pass skip names to the runner ---
+if printf '%s' "$DRY_OUT" | grep -q 'wallet_basic.py'; then
+  echo "not ok - dry-run leaked skip name (got: $DRY_OUT)"
   FAIL=$((FAIL + 1))
+else
+  echo "ok - dry-run does not leak skip names"
+  PASS=$((PASS + 1))
 fi
 
-# --- real inventory: all skip today → --list empty, default dry-run is 0 ---
-assert_stdout_empty_names "real inventory --list is empty" \
+# --- real inventory: first-green run set ---
+assert_stdout "real inventory --list includes feature_help" "feature_help.py" \
   "$RUN" --list
-assert_stdout "real inventory dry-run empty" "0 run tests" \
-  "$RUN" --dry-run
+assert_stdout "real inventory --list includes feature_uacomment" "feature_uacomment.py" \
+  "$RUN" --list
 assert_fail_msg "real inventory skip refused" "not in run set: wallet_basic.py" \
   "$RUN" --dry-run wallet_basic.py
+DRY_REAL="$("$RUN" --dry-run 2>/dev/null || true)"
+if printf '%s' "$DRY_REAL" | grep -q 'feature_help.py' \
+  && printf '%s' "$DRY_REAL" | grep -q 'feature_uacomment.py' \
+  && printf '%s' "$DRY_REAL" | grep -q -- '--v2transport'; then
+  echo "ok - real inventory dry-run first-green set"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - real inventory dry-run first-green set (got: $DRY_REAL)"
+  FAIL=$((FAIL + 1))
+fi
 
 echo
 echo "$PASS passed, $FAIL failed"

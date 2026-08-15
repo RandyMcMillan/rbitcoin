@@ -15,6 +15,36 @@ python3 "$HERE/check_inventory.py" \
   --tests-dir "$ROOT/third_party/bitcoin/test/functional"
 # Warn-only: a newer Core release must not red the job.
 python3 "$HERE/check_core_release.py"
-# Today the run set is empty; later this becomes the full `run` suite.
-"$HERE/run.sh" --list
+# Inventory `run` set (feature_help + feature_uacomment today). Needs a node.
+abs_node() {
+  local p="$1"
+  if [[ "$p" = /* ]]; then
+    printf '%s' "$p"
+  else
+    printf '%s' "$ROOT/$p"
+  fi
+}
+
+if [[ -n "${RBITCOIN_NODE:-}" && -x "$(abs_node "$RBITCOIN_NODE")" ]]; then
+  export RBITCOIN_NODE="$(abs_node "$RBITCOIN_NODE")"
+elif command -v cargo >/dev/null 2>&1; then
+  cargo build -p rbitcoin-node
+  CAND=""
+  if [[ -n "${CARGO_TARGET_DIR:-}" && -x "${CARGO_TARGET_DIR}/debug/rbitcoin-node" ]]; then
+    CAND="${CARGO_TARGET_DIR}/debug/rbitcoin-node"
+  elif [[ -x "$ROOT/target/debug/rbitcoin-node" ]]; then
+    CAND="$ROOT/target/debug/rbitcoin-node"
+  elif [[ -x "$ROOT/target/dev/debug/rbitcoin-node" ]]; then
+    CAND="$ROOT/target/dev/debug/rbitcoin-node"
+  fi
+  if [[ -n "$CAND" ]]; then
+    export RBITCOIN_NODE="$(abs_node "$CAND")"
+  fi
+fi
+if [[ -n "${RBITCOIN_NODE:-}" && -x "${RBITCOIN_NODE}" ]]; then
+  "$HERE/run.sh"
+else
+  echo "core-functional nightly: no rbitcoin-node; --list only" >&2
+  "$HERE/run.sh" --list
+fi
 echo "core-functional nightly: inventory + release-pin check done"

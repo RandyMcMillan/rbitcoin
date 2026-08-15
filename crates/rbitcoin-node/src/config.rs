@@ -80,6 +80,8 @@ pub struct NodeConfig {
     pub conf_log_level: Option<String>,
     /// Optional JSONL API call log (`--api-log` / `api_log=`). Electrum, Esplora, RPC.
     pub api_log: Option<PathBuf>,
+    /// Core `-uacomment` fragments (BIP14 parens in subversion).
+    pub uacomments: Vec<String>,
 }
 
 impl Default for NodeConfig {
@@ -111,11 +113,18 @@ impl Default for NodeConfig {
             conf_path: None,
             conf_log_level: None,
             api_log: None,
+            uacomments: Vec::new(),
         }
     }
 }
 
 impl NodeConfig {
+    /// `/rbitcoin:VERSION/` or `/rbitcoin:VERSION(comment; …)/`.
+    pub fn subversion(&self) -> Result<String, crate::error::NodeError> {
+        rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &self.uacomments)
+            .map_err(crate::error::NodeError::Config)
+    }
+
     pub fn with_datadir(mut self, datadir: impl Into<PathBuf>) -> Self {
         self.datadir = datadir.into();
         self
@@ -421,6 +430,9 @@ impl NodeConfig {
                 }
                 "rpcpassword" | "rpc_password" => {
                     self.rpc_password = Some(val.to_string());
+                }
+                "uacomment" => {
+                    self.uacomments.push(val.to_string());
                 }
                 "milestone" | "assumevalid_height" | "assumevalidheight" => {
                     self.milestone_height = val

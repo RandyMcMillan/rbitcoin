@@ -8,8 +8,8 @@ mod server;
 
 pub use auth::{parse_basic_auth, read_cookie_file, resolve_rpc_auth, write_cookie_file, RpcAuth};
 pub use methods::{
-    dispatch, handle_request, rpc_error, RpcContext, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
-    ERR_MISC,
+    dispatch, handle_request, rpc_error, RpcContext, RpcParams, RpcRegtest, SubmitBlockOutcome,
+    ERR_INVALID_PARAMETER, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, ERR_MISC,
 };
 pub use server::{basic_auth_header, post_rpc, run_rpc, RpcConfig, RpcHandle};
 

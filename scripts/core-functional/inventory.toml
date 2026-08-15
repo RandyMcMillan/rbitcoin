@@ -182,8 +182,7 @@ reason = "harness"
 
 [[test]]
 name = "feature_help.py"
-status = "skip"
-reason = "rpc-missing"
+status = "run"
 
 [[test]]
 name = "feature_includeconf.py"
@@ -329,8 +328,7 @@ reason = "rpc-missing"
 
 [[test]]
 name = "feature_uacomment.py"
-status = "skip"
-reason = "rpc-missing"
+status = "run"
 
 [[test]]
 name = "feature_unsupported_utxo_db.py"

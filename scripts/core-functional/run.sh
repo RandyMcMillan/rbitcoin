@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Run inventory `run` tests via Core test_runner.py. Skip names cannot be invoked.
+# Run inventory `run` tests via Core test_runner.py. Skip names cannot be invoked
+# (select_tests.py --require-run). We pass an explicit name list — do not
+# --exclude every skip; Core fail_on_warn exits if an exclude is not in the
+# current test list.
 #
 # Default cargo test never calls this. No node for --list / --dry-run.
 set -euo pipefail
@@ -52,7 +55,6 @@ fi
 "${CHECK[@]}" >&2
 
 mapfile -t RUN_NAMES < <(python3 "$HERE/select_tests.py" --inventory "$INVENTORY" --print-run)
-mapfile -t SKIP_NAMES < <(python3 "$HERE/select_tests.py" --inventory "$INVENTORY" --print-skip)
 
 if [[ "$LIST" -eq 1 ]]; then
   if [[ ${#RUN_NAMES[@]} -gt 0 ]]; then
@@ -83,26 +85,28 @@ if [[ ${#NORM[@]} -eq 0 ]]; then
   exit 0
 fi
 
-CORE_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
-SRC_DIR="$(cd "$CORE_ROOT/.." && pwd)"
+# test_runner joins BUILDDIR/test/functional. Both dirs are the Core tree.
+CORE_SRC="$(cd "$TESTS_DIR/../.." && pwd)"
 if [[ -z "$CONFIG_OUT" ]]; then
-  CONFIG_OUT="${CORE_ROOT}/config.ini"
+  CONFIG_OUT="${TESTS_DIR}/../config.ini"
 fi
 
 sed \
-  -e "s|@SRCDIR@|${SRC_DIR}|g" \
-  -e "s|@BUILDDIR@|${CORE_ROOT}|g" \
+  -e "s|@SRCDIR@|${CORE_SRC}|g" \
+  -e "s|@BUILDDIR@|${CORE_SRC}|g" \
   "$HERE/config.ini.template" >"$CONFIG_OUT"
 
 SHIM="${HERE}/bitcoind"
+# --jobs 1: test_runner only runs create_cache.py when jobs>1 and N>1.
+# That cache is Core blocks/ + LevelDB + setmocktime (step 9); we never
+# consume it. Sequential is fine for the first-green pair.
 CMD=(
   python3 "${TESTS_DIR}/test_runner.py"
   --v2transport
+  --jobs
+  1
+  "${NORM[@]}"
 )
-for s in "${SKIP_NAMES[@]+"${SKIP_NAMES[@]}"}"; do
-  CMD+=(--exclude "$s")
-done
-CMD+=("${NORM[@]}")
 
 if [[ "$DRY" -eq 1 ]]; then
   printf '%q ' "${CMD[@]}"

@@ -31,7 +31,11 @@ impl NetConfig {
         Self {
             magic: Magic::REGTEST,
             listen,
-            user_agent: "/rbitcoin:0.1.0/".into(),
+            user_agent: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
         }
     }
 }
@@ -309,7 +313,11 @@ mod tests {
         let cfg = NetConfig::for_regtest(None);
         assert_eq!(cfg.magic, Magic::REGTEST);
         assert!(cfg.listen.is_none());
-        assert_eq!(cfg.user_agent, "/rbitcoin:0.1.0/");
+        assert_eq!(
+            cfg.user_agent,
+            rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
+                .unwrap()
+        );
     }
 
     #[test]

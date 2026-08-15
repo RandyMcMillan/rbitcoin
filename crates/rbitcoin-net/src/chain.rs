@@ -4,11 +4,12 @@ use crate::cache::BlockCache;
 use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, Transaction, Work};
+use bitcoin::{Block, BlockHash, ScriptBuf, Transaction, Work};
 use rbitcoin_consensus::{
     accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
     confirm_wire_load_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
-    ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
+    mine_regtest_paying, ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch,
+    ScriptPreverified, WireLoadPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -346,6 +347,61 @@ impl ChainHub {
         drop(confirmed);
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
+    ///
+    /// Regtest harness only. Extra txs go in the first block. Ensures genesis.
+    pub fn generate_to_script(
+        &self,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<Vec<BlockHash>, NetError> {
+        self.ensure_genesis()?;
+        if nblocks == 0 {
+            return Ok(Vec::new());
+        }
+        if nblocks > 10_000 {
+            return Err(NetError::Consensus("nblocks too large (max 10000)".into()));
+        }
+        let mut hashes = Vec::with_capacity(nblocks as usize);
+        let mut extras = extra_txs;
+        for i in 0..nblocks {
+            let tip_h = self
+                .tip_height()
+                .ok_or(NetError::Protocol("generate: no tip"))?;
+            let prev = self
+                .tip_hash()
+                .ok_or(NetError::Protocol("generate: no tip hash"))?;
+            let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(tip_time);
+            let time = tip_time.saturating_add(1).max(now);
+            let txs = if i == 0 {
+                std::mem::take(&mut extras)
+            } else {
+                Vec::new()
+            };
+            let block = mine_regtest_paying(
+                prev,
+                time,
+                tip_h.saturating_add(1),
+                script_pubkey.clone(),
+                txs,
+            );
+            match self.accept_block(block.clone())? {
+                AcceptOutcome::Accepted { .. } => hashes.push(block.block_hash()),
+                other => {
+                    return Err(NetError::Consensus(format!(
+                        "generate did not extend tip: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(hashes)
     }
 
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.

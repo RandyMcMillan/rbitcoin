@@ -1,5 +1,9 @@
 # Core-class JSON-RPC (rbitcoin)
 
+`params` may be a JSON **array** (positional) or **object** (Core named
+keys such as `blockhash`, `verbosity`, `txid`, `hexstring`). Missing
+required keys are `-32602`; unknown named keys are `-8`.
+
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
 This is **not** full Core parity: no wallet, no mining GBT, no `scantxoutset`,
 no `createrawtransaction`. Prefer **Electrum / Esplora** (with `--shindex`) for
@@ -53,6 +57,7 @@ still wait for durable SH when shindex is on.
 | Method | Notes |
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
+| `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |
@@ -62,13 +67,14 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
+| `generatetoaddress` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
 
 ## Permanent gaps (will not match Core)
 
 | Method / area | Why |
 |---------------|-----|
 | Wallet RPC | No keystore |
-| Mining / GBT / `generatetoaddress` | Non-goal |
+| Mining / GBT | Non-goal. Regtest `generate*` / `submitblock` are harness-only (see above). |
 | `createrawtransaction` / `combinerawtransaction` | Wallet-adjacent footgun; use external tools |
 | `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate |
 | Address history via Core method names | Use Electrum/Esplora with `--shindex` |

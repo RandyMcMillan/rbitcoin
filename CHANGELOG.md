@@ -11,6 +11,19 @@ before 1.0).
 
 ### Added
 
+- **`syncwithvalidationinterfacequeue`:** no-op `null`. Core’s framework
+  calls it from `sync_mempools`; we have no wallet/index callback queue.
+
+- **First unmodified Core functional scripts:** inventory marks
+  `feature_help.py` and `feature_uacomment.py` `run`.
+  `scripts/core-functional/run.sh` invokes those two via Core’s
+  `test_runner.py` (still never from default `cargo test`).
+
+- **Regtest generate / submitblock (harness only):** `generatetoaddress`,
+  `generateblock`, `generate`, and `submitblock` mine or accept through
+  `ChainHub::accept_block` (same confirm path as P2P). Refused on mainnet /
+  signet / testnet. Not a mining product (no GBT).
+
 - **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
   shallow gitlink at `9be056a`. `cargo test` hard-links or copies
   `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from

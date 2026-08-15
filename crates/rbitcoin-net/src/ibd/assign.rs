@@ -106,6 +106,10 @@ pub(crate) fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
+    // Heavier header path that does not meet tip: getdata the connecting
+    // prefix (BIP110-class) instead of waiting on a dead tip+1.
+    let _ = super::reorg::consider_disconnected_heavier(st, hub);
+
     let tip = hub.tip_height().unwrap_or(0);
     let path_lo = if hub.tip_height().is_none() {
         0u32

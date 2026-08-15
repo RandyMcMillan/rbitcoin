@@ -8,7 +8,7 @@ use crate::most_work::{
     select_most_work, sum_work, work_better, InvalidHashSet, SelectOutcome, WorkCandidate,
 };
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash};
+use bitcoin::{Block, BlockHash, CompactTarget, Target};
 use rbitcoin_log::{info, warn};
 use rbitcoin_primitives::Height;
 use std::collections::HashMap;
@@ -425,6 +425,181 @@ fn gather_path_to_best_parent(
         cur = prev;
     }
     None
+}
+
+fn parent_hash_of(hub: &ChainHub, hash: BlockHash) -> Result<Option<BlockHash>, NetError> {
+    let Some((_, rec)) = hub
+        .query
+        .get_header_by_hash(&hash.to_byte_array())
+        .map_err(|e| NetError::Consensus(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if rec.prev_fk.is_null() {
+        return Ok(Some(BlockHash::from_byte_array([0u8; 32])));
+    }
+    let parent = hub
+        .query
+        .get_header(rec.prev_fk)
+        .map_err(|e| NetError::Consensus(e.to_string()))?;
+    Ok(Some(BlockHash::from_byte_array(parent.hash)))
+}
+
+fn header_work_of(hub: &ChainHub, hash: BlockHash) -> Result<Option<bitcoin::Work>, NetError> {
+    let Some((_, rec)) = hub
+        .query
+        .get_header_by_hash(&hash.to_byte_array())
+        .map_err(|e| NetError::Consensus(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work(),
+    ))
+}
+
+fn our_work_from_lca(hub: &ChainHub, lca_height: u32) -> Result<bitcoin::Work, NetError> {
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let mut our = Vec::new();
+    if tip_h > lca_height {
+        for h in (lca_height + 1)..=tip_h {
+            let hdr = hub
+                .query
+                .wire_header_at_height(Height(h))
+                .map_err(|e| NetError::Consensus(e.to_string()))?;
+            our.push(hdr.work());
+        }
+    }
+    Ok(sum_work(our.into_iter()))
+}
+
+/// Index of the last hash in the shortest prefix of `path` (oldest-first)
+/// whose header work strictly beats our tip from the same LCA.
+pub fn shortest_heavier_header_prefix(
+    hub: &ChainHub,
+    path: &[BlockHash],
+) -> Result<Option<usize>, NetError> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let Some(parent) = parent_hash_of(hub, path[0])? else {
+        return Ok(None);
+    };
+    let lca_h = hub
+        .query
+        .height_of_hash(&parent.to_byte_array())
+        .map_err(|e| NetError::Consensus(e.to_string()))?
+        .map(|h| h.0)
+        .unwrap_or(0);
+    let ours = our_work_from_lca(hub, lca_h)?;
+    let mut acc = bitcoin::Work::from_be_bytes([0u8; 32]);
+    for (i, h) in path.iter().enumerate() {
+        let Some(w) = header_work_of(hub, *h)? else {
+            return Ok(None);
+        };
+        acc = acc + w;
+        if work_better(acc, ours) {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// Unconfirmed hashes from after the best-chain LCA to `candidate` (oldest-first)
+/// when that header path does not connect to the current tip and is strictly
+/// heavier than our tip from the same LCA.
+///
+/// Callers getdata these **connecting** hashes instead of waiting for a child
+/// of the losing tip (BIP110-class: majority 961632/33 while tip is the
+/// 2-block minority).
+pub fn connecting_hashes_heavier_disconnected(
+    hub: &ChainHub,
+    candidate: BlockHash,
+) -> Result<Option<Vec<BlockHash>>, NetError> {
+    let Some(tip) = hub.tip_hash() else {
+        return Ok(None);
+    };
+    if candidate == tip || hub.has_block(&candidate) {
+        return Ok(None);
+    }
+    let Some(prev) = parent_hash_of(hub, candidate)? else {
+        return Ok(None);
+    };
+    if prev == tip {
+        // Normal tip+1 extension — not a disconnected most-work chain.
+        return Ok(None);
+    }
+    let path = header_hashes_to_best_ancestor(hub, candidate)?;
+    if path.is_empty() {
+        return Ok(None);
+    }
+    // Did not reach a confirmed ancestor: still search the unknown join.
+    let Some(join_parent) = parent_hash_of(hub, path[0])? else {
+        return Ok(Some(path));
+    };
+    if !hub.has_block(&join_parent) && join_parent.to_byte_array() != [0u8; 32] {
+        return Ok(Some(path));
+    }
+    if shortest_heavier_header_prefix(hub, &path)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+/// Register a connecting-hash search for a heavier header path that does not
+/// meet the current tip. Explore tip is the **shortest** prefix that beats
+/// current tip work — not the header horizon.
+pub fn note_disconnected_heavier(
+    reorg: &mut IbdReorgState,
+    hub: &ChainHub,
+    candidate: BlockHash,
+) -> Result<bool, NetError> {
+    let Some(path) = connecting_hashes_heavier_disconnected(hub, candidate)? else {
+        return Ok(false);
+    };
+    let tip_idx = shortest_heavier_header_prefix(hub, &path)?.unwrap_or(path.len() - 1);
+    let end = (tip_idx + 1).min(path.len()).min(IbdReorgState::HELD_CAP);
+    if end == 0 {
+        return Ok(false);
+    }
+    let prefix = &path[..end];
+    let explore_tip = prefix[prefix.len() - 1];
+    reorg.register_explore(prefix.iter().copied(), Some(explore_tip));
+    info!(
+        "ibd: heavier chain does not connect at tip — search {} connecting block(s) to {explore_tip} (candidate {candidate})",
+        prefix.len()
+    );
+    Ok(true)
+}
+
+/// Scan work-path candidates (tip+1 and the far header) for a heavier
+/// disconnected fork and register connecting getdata.
+pub fn consider_disconnected_heavier(
+    st: &mut super::state::IbdWorkState,
+    hub: &ChainHub,
+) -> Result<bool, NetError> {
+    // Already searching connecting hashes — do not re-walk a long header path.
+    if !st.reorg.explore_need_hashes().is_empty() {
+        return Ok(false);
+    }
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let mut cands = Vec::new();
+    if let Some(&h) = st.height_to_hash.get(&tip_h.saturating_add(1)) {
+        cands.push(h);
+    }
+    if let Some(&h) = st.height_to_hash.get(&st.max_ordered_height) {
+        if !cands.contains(&h) {
+            cands.push(h);
+        }
+    }
+    let mut any = false;
+    for h in cands {
+        if note_disconnected_heavier(&mut st.reorg, hub, h)? {
+            any = true;
+            break;
+        }
+    }
+    Ok(any)
 }
 
 /// True if candidate tip work (header) is strictly better than our tip path
@@ -1060,6 +1235,162 @@ mod tests {
         let weak = apply_reorg_branch(&hub, &[side], &mut reorg2).unwrap();
         assert!(matches!(weak, AcceptOutcome::IgnoredWeaker));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn distinct_sib(mut b: Block, avoid: BlockHash) -> Block {
+        if b.block_hash() == avoid {
+            let target = Target::from_compact(b.header.bits);
+            for nonce in 0..u32::MAX {
+                b.header.nonce = nonce;
+                if b.header.validate_pow(target).is_ok() && b.block_hash() != avoid {
+                    break;
+                }
+            }
+        }
+        b
+    }
+
+    /// BIP110-class: tip on a 2-block loser; heavier winner headers do not
+    /// connect at tip+1. Name the connecting hashes (not a dead-tip child).
+    #[test]
+    fn heavier_disconnected_path_names_connecting_hashes() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_060_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_060_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), l2.block_hash());
+
+        let w1 = distinct_sib(mine(gen, 1_500_060_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_060_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_060_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_060_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+
+        // Connected loser child is not a disconnected heavier path.
+        let l3 = mine(l2.block_hash(), 1_500_060_300, 3);
+        hub.ensure_header(&l3.header).unwrap();
+        assert!(
+            connecting_hashes_heavier_disconnected(&hub, l3.block_hash())
+                .unwrap()
+                .is_none(),
+            "child of current tip is a normal extension, not a connecting search"
+        );
+
+        let path = connecting_hashes_heavier_disconnected(&hub, w4.block_hash())
+            .unwrap()
+            .expect("heavier winner that does not connect at tip must name a path");
+        assert_eq!(
+            path,
+            vec![
+                w1.block_hash(),
+                w2.block_hash(),
+                w3.block_hash(),
+                w4.block_hash()
+            ],
+            "path must be winner mids from LCA, not the loser tip+1"
+        );
+        assert!(!path.contains(&l3.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Register only the shortest prefix that beats tip work; apply it once
+    /// those connecting bodies are held — no BadPrev, no full-horizon gather.
+    #[test]
+    fn note_disconnected_heavier_fetches_connecting_prefix_and_reorgs() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_061_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_061_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+
+        let w1 = distinct_sib(mine(gen, 1_500_061_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_061_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_061_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_061_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+        let w5 = mine(w4.block_hash(), 1_500_061_501, 5);
+        hub.ensure_header(&w5.header).unwrap();
+
+        let mut reorg = IbdReorgState::new();
+        assert!(
+            note_disconnected_heavier(&mut reorg, &hub, w5.block_hash()).unwrap(),
+            "must register a connecting search for the heavier disconnected path"
+        );
+        let need = reorg.need_getdata();
+        assert!(
+            need.contains(&w1.block_hash())
+                && need.contains(&w2.block_hash())
+                && need.contains(&w3.block_hash()),
+            "must search for connecting mids; need={need:?}"
+        );
+        assert!(
+            !need.contains(&w5.block_hash()),
+            "must not wait to gather the whole heavier horizon; need={need:?}"
+        );
+        assert_eq!(
+            reorg.explore_tips(),
+            &[w3.block_hash()],
+            "explore tip is the shortest prefix that beats loser work"
+        );
+
+        reorg.hold_body(w1.clone());
+        reorg.hold_body(w2.clone());
+        reorg.hold_body(w3.clone());
+        let mut bodies = HashMap::new();
+        bodies.insert(w1.block_hash(), w1.clone());
+        bodies.insert(w2.block_hash(), w2.clone());
+        bodies.insert(w3.block_hash(), w3.clone());
+        let out = try_apply_best_candidate(&hub, &bodies, &[w3.block_hash()], &mut reorg)
+            .unwrap()
+            .expect("connecting prefix must reorg without BadPrev");
+        assert!(matches!(out, AcceptOutcome::Accepted { height: 3 }));
+        assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Work-path tip+1 / far header (no resume seed) still registers the
+    /// connecting prefix — the live IBD hook, not BadPrev.
+    #[test]
+    fn consider_disconnected_from_work_path_without_resume_seed() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_062_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_062_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        let w1 = distinct_sib(mine(gen, 1_500_062_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_062_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_062_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_062_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+
+        let mut st =
+            super::super::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        st.record_height(w3.block_hash(), 3);
+        st.record_height(w4.block_hash(), 4);
+        st.max_ordered_height = 4;
+        assert!(consider_disconnected_heavier(&mut st, &hub).unwrap());
+        let need = st.reorg.need_getdata();
+        assert!(
+            need.contains(&w1.block_hash()) && need.contains(&w2.block_hash()),
+            "live consider must search connecting mids without resume seed; need={need:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

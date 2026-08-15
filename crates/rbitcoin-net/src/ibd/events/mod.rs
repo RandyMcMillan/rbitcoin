@@ -220,6 +220,8 @@ pub(crate) fn apply_peer_event(
                 }
             }
             if added > 0 {
+                let _ = super::reorg::consider_disconnected_heavier(st, hub);
+                let _ = try_complete_awaiting_reorg(st, hub);
                 if st.ordered_set.len() == added {
                     // First headers of this run (tip=0 cold start).
                     info!(

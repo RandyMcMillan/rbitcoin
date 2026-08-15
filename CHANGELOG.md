@@ -34,6 +34,11 @@ before 1.0).
 
 ### Fixed
 
+- **IBD searches connecting blocks for a heavier disconnected header chain:**
+  if tip+1 / the far work-path header does not meet the current tip, walk
+  prev to the best-chain LCA and getdata the shortest prefix whose work beats
+  the losing tip (then `accept_branch`). Do not wait for the dead fork to
+  grow (BIP110-class stall at 961633).
 - **Leftover pending needs no fence; in-flight prune waits for fk span:**
   write-behind `pending_fk` is already a Class A identity — TipOnly leftover
   no longer requires `height_of`. In-flight drops a layer only when

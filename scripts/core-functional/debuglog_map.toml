@@ -1,0 +1,11 @@
+# rbitcoin stderr / log line → Core debug.log substring(s).
+# match is a regex (case-sensitive). emit may use {1}, {2}, … captures.
+# Applied by the bitcoind shim. Unmapped strings stay skip reason core-log.
+
+[[rule]]
+match = 'rpc: listening on 127\.0\.0\.1:(\d+)'
+emit = ['Bound to 127.0.0.1:{1}']
+
+[[rule]]
+match = 'rbitcoin-node listening on 127\.0\.0\.1:(\d+)'
+emit = ['Bound to 127.0.0.1:{1}']

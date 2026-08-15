@@ -526,13 +526,25 @@ pub fn connecting_hashes_heavier_disconnected(
     if path.is_empty() {
         return Ok(None);
     }
-    // Join = parent of the first unconfirmed hash. If that is the tip, this
-    // is the best-chain extension (far header at h=8 while tip is 1) — not a fork.
+    // Join = parent of the first unconfirmed hash.
     let Some(join) = parent_hash_of(hub, path[0])? else {
         return Ok(Some(path));
     };
-    if join == tip {
+    if join == tip || path.iter().any(|h| *h == tip) {
         return Ok(None);
+    }
+    // `has_block` can lag the published tip. If join is on the best chain and
+    // path[0] is the next best-chain header, this is a linear extension.
+    if let Some(jh) = hub
+        .query
+        .height_of_hash(&join.to_byte_array())
+        .map_err(|e| NetError::Consensus(e.to_string()))?
+    {
+        if let Ok(next) = hub.query.wire_header_at_height(Height(jh.0.saturating_add(1))) {
+            if next.block_hash() == path[0] {
+                return Ok(None);
+            }
+        }
     }
     if !hub.has_block(&join) && join.to_byte_array() != [0u8; 32] {
         return Ok(Some(path));
@@ -577,6 +589,10 @@ pub fn consider_disconnected_heavier(
 ) -> Result<bool, NetError> {
     // Already searching connecting hashes — do not re-walk a long header path.
     if !st.reorg.explore_need_hashes().is_empty() {
+        return Ok(false);
+    }
+    // No fetch hole: confirm can advance. Do not race a linear extension.
+    if super::progress::tip_fetch_hole(hub, &st.height_to_hash, &mut st.body) == 0 {
         return Ok(false);
     }
     let tip_h = hub.tip_height().unwrap_or(0);

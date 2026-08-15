@@ -197,6 +197,12 @@ impl Store {
             );
             let _ = std::fs::remove_file(&leftover_epoch);
         }
+        let leftover_wire = path.join("wire");
+        if leftover_wire.exists() {
+            eprintln!("store: dropping leftover store/wire (unused; body queue is RAM-only)");
+            let _ = std::fs::remove_dir_all(&leftover_wire);
+            let _ = std::fs::remove_file(&leftover_wire);
+        }
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open(&path)?
@@ -2647,11 +2653,16 @@ mod tests {
         );
         assert!(dir.join("spent.ovf").exists());
         assert!(!dir.join("spenders.body").exists());
+        assert!(!dir.join("tx.body").exists());
+        assert!(!dir.join("wire").exists());
         s.flush().unwrap();
         drop(s);
         std::fs::write(dir.join("archive_epoch"), b"junk").unwrap();
+        std::fs::create_dir_all(dir.join("wire")).unwrap();
+        std::fs::write(dir.join("wire").join("leftover"), b"x").unwrap();
         let s = Store::open(&dir).unwrap();
         assert!(!dir.join("archive_epoch").exists());
+        assert!(!dir.join("wire").exists());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

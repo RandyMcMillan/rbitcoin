@@ -343,7 +343,7 @@ fn next_ready(
 /// Selected via global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
-    /// Page-RMW via io_uring (pread page, poke 9 B slots, pwrite page).
+    /// Page-RMW via io_uring (pread page, poke 8 B slots, pwrite page).
     Uring,
     /// Page-RMW via libc pread + pwrite (positional, no ring).
     Pwrite,
@@ -399,7 +399,7 @@ struct SpentPageGroup {
     writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>,
 }
 
-/// Page span covering the 9-byte slot at `abs` (`[lo, hi)`).
+/// Page span covering the 8-byte slot at `abs` (`[lo, hi)`).
 #[inline]
 fn spent_meta_page_span(abs: u64) -> (u64, u64) {
     let page = crate::tx_table::BODY_PAGE_SIZE;
@@ -421,7 +421,7 @@ fn clip_spent_page_window(span_lo: u64, span_hi: u64, body_pub: u64) -> Option<(
 
 /// Group abs-sorted writes into non-overlapping `spent.body` page spans.
 ///
-/// Same-page slots share one RMW. A 9 B slot that straddles a page boundary
+/// Same-page slots share one RMW. An 8 B slot that straddles a page boundary
 /// extends the span so the next page's writes merge (no overlapping in-flight
 /// RMWs). Adjacent pages without a straddle stay separate.
 fn group_writes_by_spent_page(
@@ -497,7 +497,7 @@ fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk)>, writes: &[(u64, Fk, u32, Fk, 
 
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 9 B slots →
+/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 8 B slots →
 /// pwrite page). Returns OOB edges as cold (caller must hard-fail).
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
@@ -550,7 +550,7 @@ pub fn put_spend_batch_by_abs_meta_known(
     }
 }
 
-/// libc page-RMW (pread + pwrite, no ring) for prepared 9-byte metas.
+/// libc page-RMW (pread + pwrite, no ring) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_pwrite(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
@@ -576,7 +576,7 @@ fn put_spend_batch_pure_write_pwrite(
     Ok(cold)
 }
 
-/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 9-byte metas.
+/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_uring(
     txs: &TxTable,
     writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],

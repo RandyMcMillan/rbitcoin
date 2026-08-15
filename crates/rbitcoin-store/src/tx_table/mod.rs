@@ -981,7 +981,7 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets (confirm write).
     ///
-    /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 9 B → decide
+    /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 8 B → decide
     /// sole / multi / promote → pwrite; `spent.ovf` appends run **inline** on
     /// the read completion (mmap). Same abs serialized. Fallback: mmap RMW.
     ///
@@ -1055,7 +1055,7 @@ impl TxTable {
         Ok(cold)
     }
 
-    /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
+    /// Bulk 8-byte spender meta reads at absolute `spent.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
     /// Backend from [`spend_meta_backend`] / global `RBITCOIN_IO` /

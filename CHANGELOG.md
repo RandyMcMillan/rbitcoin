@@ -71,18 +71,14 @@ before 1.0).
 
 ### Changed
 
-- **Schema 17 (in flight) — SH runs + Class A hot pack:** leftover
-  schema-16 `scripthash.runs` (`key_len=32`) are refused (wipe
-  `store/scripthash.runs` and rematerialize). Merge emits unique
-  `(scripthash, create_fk)` order; cold megakey pack writes a 4 KiB page
-  as it fills (≤510 FKs in RAM). Class A writes thin LAYOUT17 `txout`
-  meta, script kinds 0–9 (P2TR/P2A included), and 8-byte spent slots.
-  Opening a store with creates in the 16-byte / 9-byte Class A layout
-  is refused (wipe datadir and redo IBD). Empty Class A soft-opens.
-  Multi-spender overflow is `spent.ovf` (leftover `spenders.body` is
-  renamed on open). `archive_epoch` is no longer written; a leftover
-  file is unlinked on open (unread dual-path leftover).
-  More 17 layout changes may follow before 18.
+- **Schema 17 (durable) — SH runs + Class A hot pack + page deltas:**
+  leftover schema-16 `scripthash.runs` (`key_len=32`) are refused.
+  Megakey pages store uleb fk0+deltas (more than 510 sequential FKs per
+  4 KiB page). Class A writes thin LAYOUT17 `txout` meta, script kinds
+  0–9, and 8-byte spent slots. Inwit bits 5–7 and spent flags other than
+  `MULTI_SPENDER` are Corrupt. 16-layout Class A with creates is refused.
+  Overflow is `spent.ovf`. `archive_epoch` and leftover `store/wire` are
+  unlinked on open. Inwit Δfk is **not** in 17 (optional 18, inwit only).
 
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
   external parents for at most **8** ready body-queue heights in one

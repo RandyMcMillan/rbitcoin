@@ -1318,7 +1318,7 @@ fn get_output_spender_metas_at_one_walk() {
     assert!(!metas[1].1 && metas[1].2.is_null());
     assert!(!metas[2].1 && metas[2].2 == Fk(20));
 
-    // Bulk 9-byte abs preads match spent_abs (pin → write spentness path).
+    // Bulk 8-byte abs preads match spent_abs (pin → write spentness path).
     let (toff, tlen) = t.body_range(fks[0]).unwrap();
     let decoded = t.get_meta_and_outputs_batch_at(&[(toff, tlen)]).unwrap();
     let (_meta, outs, rels) = decoded[0].as_ref().expect("decode with rels");
@@ -2810,10 +2810,7 @@ fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
     raw[0] |= 1 << 5;
     match InputRecord::decode_at(&raw) {
         Err(StoreError::Corrupt(m)) => {
-            assert!(
-                m.contains("reserved") || m.contains("inwit"),
-                "{m}"
-            );
+            assert!(m.contains("reserved") || m.contains("inwit"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }

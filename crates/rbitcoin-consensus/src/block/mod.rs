@@ -1315,7 +1315,7 @@ fn check_coinbase_subsidy(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StructuralPhaseNs {
     pub spent_ns: u64,
-    /// Pin abs collect + bulk on-disk 9-byte spender meta pread.
+    /// Pin abs collect + bulk on-disk 8-byte spender meta pread.
     pub spent_abs_ns: u64,
     /// `is_confirmed_strong_at` on non-null fields (still durable authority).
     pub spent_strong_ns: u64,
@@ -1336,7 +1336,7 @@ pub(crate) struct StructuralPhaseNs {
 /// load does not walk create height for every parent. Heights: bulk fence.
 /// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
-/// **Spentness:** pin denserels → abs + bulk 9-byte meta. Sparse durable-**spent**
+/// **Spentness:** pin denserels → abs + bulk 8-byte meta. Sparse durable-**spent**
 /// set (not unspent). Missing abs / short meta is hard `Err`. **Multi-list** after
 /// reorg annotate is a protocol cold walk (`has_confirmed_strong_spender_create`)
 /// — not a hard fail (tip-follow reorgs leave multi flags by design). Snapshots
@@ -1467,7 +1467,7 @@ pub(crate) fn structural_validate_spends(
 
     let tip = query.tip_height().map(|h| h.0);
 
-    // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
+    // Hot path: bulk 8-byte spender meta at pin offsets (on-disk authority).
     // Serial with create_h heights below — combined multi-fd wave was measured
     // neutral/worse (body DONTCACHE peeks + height slots).
     let mut spent_strong_ns = 0u64;

@@ -49,7 +49,7 @@ for unknown-height bodies (mark missing → re-getdata).
   `--shindex`, default off), not a second process re-indexing blk files.
   Tip-follow does **not** wait on SH materialize; Electrum/Esplora do.
   SH catalog runs are unique `(scripthash, create_fk)`; cold megakey pages
-  stream at 510 FKs (schema 17, in flight).
+  stream into 4 KiB delta pages (schema 17).
 - **JSON-RPC** (optional) is a Core-class **subset** over archive + mempool —
   see [`rpc.md`](./rpc.md).
 

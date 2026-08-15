@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 17`, in flight).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 17`, durable).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **17** | **In flight.** SH runs `key_len=40`; Class A thin meta + script kinds + 8 B spent; `spent.ovf`; drop `archive_epoch`. Refuse leftover `key_len=32` runs and 16-layout Class A. More 17 may follow. | **Current (open)** |
+| **17** | **Durable.** SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`. Refuse leftover `key_len=32` runs, raw-u64 SH pages, and 16-layout Class A. | **Current** |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
@@ -31,30 +31,22 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v17 (in flight)
+## v17 (durable)
 
-Not a closed layout. This version starts with an incompatible SH **run**
-contract: catalog records are sorted and unique on the full 40-byte
-`{scripthash[32]|create_fk[8]}` key (`key_len=40`). Schema-16 catalogs
-(`key_len=32`) are refused — wipe `store/scripthash.runs` and rematerialize.
+Closed layout. SH run catalogs are unique `(scripthash, create_fk)` at
+`key_len=40`. Schema-16 `key_len=32` catalogs are refused.
 
-The same 17 cutover packs **hot Class A**: thin LAYOUT17 `txout` meta
-(typical 3 B), script-kind templates 0–9 (including P2TR and P2A), and
-fixed **8 B** spent slots (`flags + u56`). Decode expands templates to
-wire scripts. Class A with creates in the 16-byte meta / 9-byte spent
-layout is refused (wipe datadir and redo IBD). Empty Class A may rewrite
-`meta`. `inwit` prevout encoding is unchanged (Δfk is a follow-up).
+Hot Class A: thin LAYOUT17 `txout` meta, script kinds **0–9** (unknown
+kind is Corrupt — a new implicit-width template is 18), 8 B spent slots,
+`spent.ovf` overflow. Inwit flags bits 4–7 and spent flags other than
+`MULTI_SPENDER` are Corrupt. Inwit prevout is still `create_fk:u64` +
+CompactSize vout (Δfk is an **18 / inwit-only** follow-up).
 
-Multi-spender list nodes live in **`spent.ovf`** (same 16 B records as
-legacy `spenders.body`). Open renames a leftover `spenders.body` when
-`spent.ovf` is missing.
+Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
+pages (`ver=0`, `n>0`) rematerialize.
 
-**`archive_epoch` is gone.** The file was an unread leftover from the
-removed archive/wire dual path (`archive_mode` / `finalized_height` /
-`wire_depth` were serialized and never consulted). Create no longer
-writes it; open unlinks a leftover file.
-
-Sealed SH head/body stay. Further 17 file-layout changes may land before 18.
+`archive_epoch` is gone. Create does not plant `wire/` or packed
+`tx.body`. Open unlinks leftover `archive_epoch` and `store/wire`.
 
 ## v16
 

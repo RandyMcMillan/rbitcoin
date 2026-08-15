@@ -55,9 +55,9 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **17 (in flight):** SH run catalog `key_len=40` (unique `(scripthash, create_fk)`).
-///         Further 17 layout changes may follow before 18. Soft-open 16 when
-///         leftover `scripthash.runs` are absent or already `key_len=40`.
+/// **17 (durable):** SH `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent;
+///         megakey pages are uleb deltas. Soft-open 16 when leftover
+///         `scripthash.runs` are absent or already `key_len=40`.
 /// **16:** Drop `tx_height.body`; create height is a RAM fence from `confirmed[]` +
 ///         `header_txs_*`. Soft-open schema 15 (unlink leftover file). Class A unchanged.
 /// **15:** Class A split (`txout` / `inwit` / `spent`) + Class B SH slabs / sorted heads.
@@ -68,7 +68,7 @@ pub const SCHEMA_VERSION: u16 = 17;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **17** is in flight (more 17 changes may follow). Schema **16**
+/// Schema **17** is durable. Schema **16**
 /// soft-opens when SH run catalogs are compatible (see store open). Schema
 /// **15** soft-opens (Class A unchanged; leftover `tx_height.body` dropped).
 /// Schema **13**/**14** may open only when Class A is empty and SH is empty/missing

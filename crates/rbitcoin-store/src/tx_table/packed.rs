@@ -662,7 +662,7 @@ pub fn decode_packed_tx_outs_only(raw: &[u8]) -> Result<(TxRecord, Vec<OutputRec
 }
 
 /// Like [`decode_packed_tx_outs_only`], plus dense relative offsets of each
-/// output's 9-byte spender meta within the packed payload.
+/// output's start within the packed txout payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {

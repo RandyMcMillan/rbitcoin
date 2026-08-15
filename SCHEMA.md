@@ -1,8 +1,8 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **in flight**
-(more 17 layout changes may follow before 18).  
-**Status:** unstable until 1.0 — most layout changes are reindex-only.  
+**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
+**Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
+byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).  
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
@@ -11,9 +11,10 @@ rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 with creates in the 16-byte-meta / 9-byte-spent layout is **refused**
 (wipe datadir and redo IBD). Empty Class A may rewrite `meta`.  
 **16→17 open:** Soft migrate when `scripthash.runs` is missing/empty or every
-run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) are **refused**
-(wipe `store/scripthash.runs` and rematerialize). Sealed SH head/body kept.
-Class A with 16-layout creates is refused the same as 15→17.  
+run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) and leftover
+raw-u64 megakey pages are **refused** (wipe `store/scripthash.runs` and
+rematerialize). Sealed SH head/body kept only if pages are already delta
+(`ver=1`). Class A with 16-layout creates is refused the same as 15→17.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -59,7 +60,6 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
-  wire/                          # unused (opened, never filled)
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -82,7 +82,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **17** (in flight) |
+| 4 | 2 | Schema version (u16) — **17** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -101,6 +101,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | 9 | array_link (idx files, dense arrays) |
 | 10 | hash_head |
 | 11 | scripthash |
+| 13 | spender (`spent.ovf` multi-list) |
 | 14 | txid_body (`txid.body`) |
 | 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
 | 16 | inwit (`inwit.body`) |
@@ -224,7 +225,7 @@ Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 
 
 | Field | Encoding |
 |-------|----------|
-| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV` |
+| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV`; bits 4–7 reserved (Corrupt) |
 | prev | coinbase (`NULL_PREV`): no payload; else **`create_fk:u64` LE** + CompactSize vout |
 | sequence | omitted if `SEQ_FINAL`; else u32 LE |
 | script_sig | omitted if empty; else CompactSize len + bytes |
@@ -250,10 +251,12 @@ kind payload:
   6–7 P2WSH/P2TR          32 B
   8 OP_RETURN_PUSH CompactSize + data (canonical single push)
   9 P2A            none (`51 02 4e 73`)
+  10–15            reserved — decode **Corrupt** (no implicit width)
 ```
 
 Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
-covers hash/data only. Spender flags live only on `spent`.
+covers hash/data only. Spender flags live only on `spent`. A new consensus
+script type with a new implicit width is **schema 18**.
 
 ### Sole-spender slot (`spent.body`)
 
@@ -261,7 +264,7 @@ covers hash/data only. Spender flags live only on `spent`.
 
 | Offset | Field |
 |--------|-------|
-| 0 | flags (`MULTI_SPENDER` bit 2) |
+| 0 | flags (`MULTI_SPENDER` bit 2; other bits reserved, Corrupt) |
 | 1–7 | `spender_field` u56 LE (0 = unspent; else sole `spending_tx_fk` or multi-list head) |
 
 | `MULTI_SPENDER` | `spender_field` |
@@ -415,8 +418,10 @@ store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as s
   that alloc only.
 - Geometric slabs class 0–6 (`32 B`–`2 KiB`; cap `4 << class`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
-- Megakey **pages**: `next_page_off:u64` | `n_fks:u16` | reserved 6 B | up to
-  **510** raw `u64` fks. Chain first→last; last-page append only.
+- Megakey **pages** (4 KiB): `next:u64` | `n_fks:u16` | `ver:u8=1` | pad 5 B
+  | ULEB128 `fk0` + ULEB128 gaps. Page is full when the next uleb does not
+  fit (often well above 510 sequential FKs). `ver=0` with `n_fks>0` is a
+  leftover raw-u64 page — rematerialize. Chain first→last; last-page append only.
 - Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 
 ### Query join

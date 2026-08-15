@@ -627,7 +627,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Annotate spends using absolute 9-byte spender-meta offsets (pin layout).
+    /// Annotate spends using absolute 8-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
     /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
@@ -782,7 +782,7 @@ impl Store {
     /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
     ///
     /// Outs are content-only (spender fields cleared). `spender_rels[v]` is the
-    /// relative offset of the 9-byte annotation within the packed body.
+    /// relative offset of the 8-byte annotation within the spent record.
     pub fn get_tx_meta_and_outputs_batch_at(
         &self,
         ranges: &[(u64, u64)],
@@ -790,7 +790,7 @@ impl Store {
         self.txs.get_meta_and_outputs_batch_at(ranges)
     }
 
-    /// Bulk 9-byte spender meta at absolute `tx.body` offsets.
+    /// Bulk 8-byte spender meta at absolute `spent.body` offsets.
     ///
     /// Backend from global `RBITCOIN_IO` (see [`crate::spend_meta_backend`]).
     pub fn get_spender_meta_at_abs_batch(

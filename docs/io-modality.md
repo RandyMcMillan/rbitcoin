@@ -40,7 +40,7 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 |------|-----|----------|
 | Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `inwit`) |
 | Head-resolve identity | `RBITCOIN_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
-| Spend-meta 9 B peeks | `RBITCOIN_IO` | uring/pread on **`spent.body` FD** |
+| Spend-meta 8 B peeks | `RBITCOIN_IO` | uring/pread on **`spent.body` FD** |
 | Spend pure-write annotate | `RBITCOIN_IO` | uring/pwrite or pwrite on **`spent.body` FD** |
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
@@ -53,7 +53,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 |--------|------|--------|
 | **`txout.body`** | L0 | Hot outs (pin / SH / Cake); pread/pwrite/uring |
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
-| **`spent.body`** | L0 | 9 B×n_out sole-spender; annotate RMW |
+| **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
 | **`txout.idx` / `inwit.idx` / `spent.idx`** | L0 | Append pwrite; reads pread; **grow-tight** (~1 MiB) |
 | **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (fd pread/pwrite) |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |

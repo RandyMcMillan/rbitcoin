@@ -16,14 +16,14 @@
 use crate::compact::output_flags;
 use crate::error::StoreError;
 use crate::spender_table::SpenderTable;
-use crate::tx_table::TxTable;
+use crate::tx_table::{OutputRecord, TxTable};
 use crate::uring_session::{self, UringSession};
 use crate::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 
-const META_LEN: usize = 9;
+const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
 const MAX_SLOTS: usize = 128;
 
 enum Phase {
@@ -1077,14 +1077,16 @@ mod tests {
     #[test]
     fn group_writes_by_spent_page_merges_same_page() {
         let meta = [1u8; META_LEN];
+        let slot = META_LEN as u64;
         let writes = [
             (16u64, Fk(1), 0, Fk(10), meta),
-            (34u64, Fk(1), 2, Fk(12), meta),
+            (16 + 2 * slot, Fk(1), 2, Fk(12), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 16 + 27);
+        let rec = 3 * slot;
+        let g = group_writes_by_spent_page(&writes, 16 + rec);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
-        assert_eq!(g[0].len, 27);
+        assert_eq!(g[0].len, rec as usize);
         assert_eq!(g[0].writes.len(), 2);
     }
 
@@ -1095,7 +1097,7 @@ mod tests {
             (16u64, Fk(1), 0, Fk(10), meta),
             (4096u64 + 16, Fk(2), 0, Fk(12), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 4096 + 16 + 9);
+        let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
         assert_eq!(g[1].off, 4096);
@@ -1104,15 +1106,19 @@ mod tests {
     #[test]
     fn group_writes_by_spent_page_merges_straddle() {
         let meta = [1u8; META_LEN];
-        // 4093..4102 crosses the 4 KiB boundary; next slot starts at 4102.
+        let slot = META_LEN as u64;
+        // Slot starts 3 bytes before the 4 KiB page end so the RMW straddles.
+        let first = 4096u64 - 3;
+        let second = first + slot;
+        let end = second + slot;
         let writes = [
-            (4093u64, Fk(1), 0, Fk(10), meta),
-            (4102u64, Fk(1), 1, Fk(11), meta),
+            (first, Fk(1), 0, Fk(10), meta),
+            (second, Fk(1), 1, Fk(11), meta),
         ];
-        let g = group_writes_by_spent_page(&writes, 4111);
+        let g = group_writes_by_spent_page(&writes, end);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].writes.len(), 2);
-        assert!(g[0].off <= 4093);
-        assert!(g[0].off + g[0].len as u64 >= 4111);
+        assert!(g[0].off <= first);
+        assert!(g[0].off + g[0].len as u64 >= end);
     }
 }

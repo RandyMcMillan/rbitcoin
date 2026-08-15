@@ -1020,7 +1020,7 @@ impl TxTable {
         spenders: &crate::spender_table::SpenderTable,
         abs_edges: &[(u64, Fk, u32, Fk)],
     ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
-        const META_LEN: u64 = 9;
+        const META_LEN: u64 = OutputRecord::SPENT_SLOT_LEN as u64;
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -1050,7 +1050,7 @@ impl TxTable {
                 continue;
             }
             let cur = self.spent.with_bytes_at(abs, META_LEN, |raw| {
-                if raw.len() < 9 {
+                if raw.len() < OutputRecord::SPENT_SLOT_LEN {
                     return Err(StoreError::Corrupt("spender meta short"));
                 }
                 let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
@@ -1074,7 +1074,7 @@ impl TxTable {
                 let e = spenders.append(spend_fk, field)?;
                 (true, e)
             };
-            let mut meta = [0u8; 9];
+            let mut meta = [0u8; OutputRecord::SPENT_SLOT_LEN];
             meta[0..8].copy_from_slice(&new_field.0.to_le_bytes());
             if new_multi {
                 meta[8] = flags | output_flags::MULTI_SPENDER;
@@ -1145,7 +1145,7 @@ impl TxTable {
         backend: crate::io_backend::ReadIoBackend,
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
-        const META_LEN: usize = 9;
+        const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
         let body_fd = self.spent.body_read_fd();
         let body_pub = self.spent.body_published_len();
         let body_path = self.spent.body_file_path();
@@ -1234,17 +1234,18 @@ impl TxTable {
     ) -> Result<(bool, Fk), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
-        if abs.saturating_add(9) > end {
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        self.spent.with_bytes_at(abs, 9, |raw| {
-            if raw.len() < 9 {
-                return Err(StoreError::Corrupt("spent meta short"));
-            }
-            let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
-            let multi = raw[8] & output_flags::MULTI_SPENDER != 0;
-            Ok((multi, field))
-        })
+        self.spent
+            .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
+                if raw.len() < OutputRecord::SPENT_SLOT_LEN {
+                    return Err(StoreError::Corrupt("spent meta short"));
+                }
+                let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
+                let multi = raw[8] & output_flags::MULTI_SPENDER != 0;
+                Ok((multi, field))
+            })
     }
 
     /// One packed body walk: spender meta for many vouts (ascending).
@@ -1291,10 +1292,10 @@ impl TxTable {
     ) -> Result<(), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
-        if abs.saturating_add(9) > end {
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        let mut slot = [0u8; 9];
+        let mut slot = [0u8; OutputRecord::SPENT_SLOT_LEN];
         slot[0..8].copy_from_slice(&field.0.to_le_bytes());
         slot[8] = if multi {
             output_flags::MULTI_SPENDER

@@ -2790,6 +2790,22 @@ fn spent_slot_v17_len_constant_still_nine() {
 }
 
 #[test]
+fn spent_span_matches_slot_len_times_n_out() {
+    for n_out in [0u32, 1, 4, 500] {
+        let mut buf = Vec::new();
+        encode_spent_zeros(n_out, &mut buf);
+        assert_eq!(buf.len(), n_out as usize * OutputRecord::SPENT_SLOT_LEN);
+        let off = 16u64;
+        for vout in 0..n_out {
+            assert_eq!(
+                spent_abs(off, vout),
+                off + u64::from(vout) * OutputRecord::SPENT_SLOT_LEN as u64
+            );
+        }
+    }
+}
+
+#[test]
 fn script_kind_v17_kind_ten_is_corrupt() {
     match decode_script_kind_v17(10, &[]) {
         Err(StoreError::Corrupt(m)) => {

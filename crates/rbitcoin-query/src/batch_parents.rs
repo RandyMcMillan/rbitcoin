@@ -930,7 +930,9 @@ impl BatchParents {
         let lay = e.load_layout();
         let (off, len) = lay.spent_range?;
         let abs = rbitcoin_store::spent_abs(off, vout);
-        if abs.saturating_add(9) > off.saturating_add(len) {
+        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+            > off.saturating_add(len)
+        {
             return None;
         }
         Some(abs)

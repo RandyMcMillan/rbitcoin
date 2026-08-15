@@ -97,13 +97,32 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# Unknown flags are ignored (stderr) and do not abort.
-if ERR="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -notarealflag 2>&1 >/dev/null)" \
-  && printf '%s' "$ERR" | grep -q 'ignoring unknown flag'; then
-  echo "ok - unknown flag ignored"
+# Unknown flags abort like Core (feature_help.py -fakearg).
+assert_fail_msg "unknown flag parse error" "Error parsing command line arguments" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -notarealflag
+
+# -h / -version exit 0 on stdout without starting the node.
+if OUTH="$("$SHIM" -datadir="$DATADIR" -h 2>/dev/null)" && printf '%s' "$OUTH" | grep -q Options; then
+  echo "ok - -h prints Options"
   PASS=$((PASS + 1))
 else
-  echo "not ok - unknown flag ignored (got: $ERR)"
+  echo "not ok - -h prints Options"
+  FAIL=$((FAIL + 1))
+fi
+if OUTV="$("$SHIM" -datadir="$DATADIR" -version 2>/dev/null)" && printf '%s' "$OUTV" | grep -qi version; then
+  echo "ok - -version prints version"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -version prints version"
+  FAIL=$((FAIL + 1))
+fi
+
+OUT4="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -uacomment=testnode0 2>/dev/null)"
+if printf '%s' "$OUT4" | grep -q -- '--uacomment=testnode0'; then
+  echo "ok - uacomment forwarded"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - uacomment forwarded (got: $OUT4)"
   FAIL=$((FAIL + 1))
 fi
 

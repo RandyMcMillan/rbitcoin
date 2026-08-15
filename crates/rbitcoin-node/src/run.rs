@@ -596,6 +596,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 rpc_user: config.rpc_user.clone(),
                 rpc_password: config.rpc_password.clone(),
                 cookie_path: Some(config.rpc_cookie_path()),
+                subversion: Some(
+                    rbitcoin_primitives::rbitcoin_subversion(
+                        env!("CARGO_PKG_VERSION"),
+                        &config.uacomments,
+                    )
+                    .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
+                ),
             };
             match run_rpc(rcfg, Arc::clone(&node.hub.query), Some(mempool.clone())).await {
                 Ok(h) => {

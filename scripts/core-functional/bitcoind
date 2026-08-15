@@ -76,6 +76,9 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
     p2pport: str | None = None
     network = "regtest"
     debug = False
+    want_help = False
+    want_version = False
+    uacomments: list[str] = []
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -112,25 +115,38 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
                     p2pport = hostport.rsplit(":", 1)[1]
         elif key == "regtest":
             network = "regtest"
+        elif key == "uacomment":
+            uacomments.append(val or "")
+        elif key in ("h", "help"):
+            want_help = True
+        elif key == "version":
+            want_version = True
         elif key in ("debug",) or (key == "loglevel" and val):
             debug = True
         elif key in (
             "server",
             "disablewallet",
             "v2transport",
-            "uacomment",
             "logtimemicros",
             "debugexclude",
             "logthreadnames",
             "logsourcelocations",
             "nologratelimit",
-            "help",
             "print-cmd",
         ):
             pass
         else:
-            print(f"bitcoind: ignoring unknown flag {a}", file=sys.stderr)
+            print("Error parsing command line arguments", file=sys.stderr)
+            raise SystemExit(1)
         i += 1
+
+    if want_help:
+        print("Options")
+        print("rbitcoin-node (test-only bitcoind shim)")
+        raise SystemExit(0)
+    if want_version:
+        print("rbitcoin-node version")
+        raise SystemExit(0)
 
     if datadir is None:
         raise SystemExit("bitcoind: -datadir is required")
@@ -165,6 +181,8 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
     ]
     if debug:
         cmd += ["--log-level", "debug"]
+    for c in uacomments:
+        cmd += [f"--uacomment={c}"]
     return cmd, node_dir
 
 

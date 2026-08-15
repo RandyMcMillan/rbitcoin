@@ -52,6 +52,7 @@ where
     // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
     let mut log_level_cli: Option<Option<Level>> = None;
     let mut api_log: Option<PathBuf> = None;
+    let mut uacomments: Vec<String> = Vec::new();
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -65,7 +66,8 @@ where
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
-    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
+    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--uacomment STR] \\\n\
+    [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
 Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
@@ -383,6 +385,19 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
+            "--uacomment" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --uacomment requires a value");
+                    return ExitCode::from(2);
+                }
+                uacomments.push(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
+            other if other.starts_with("--uacomment=") => {
+                uacomments.push(other["--uacomment=".len()..].to_string());
+                i += 1;
+            }
             "--api-log" => {
                 i += 1;
                 if i >= args.len() {
@@ -428,6 +443,16 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
             eprintln!("error: {e}");
             return ExitCode::from(2);
         }
+    }
+    if !uacomments.is_empty() {
+        config.uacomments.extend(uacomments);
+    }
+    // Validate UA before any log init so feature_uacomment can fullmatch stderr.
+    if let Err(e) =
+        rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
+    {
+        eprintln!("{e}");
+        return ExitCode::from(1);
     }
 
     // Logging: CLI --log-level > conf log_level > RBITCOIN_LOG / RUST_LOG > Info.

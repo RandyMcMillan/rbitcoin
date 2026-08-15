@@ -12,6 +12,43 @@ use std::fmt;
 /// Workspace schema / API version string for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// BIP14 user-agent / `getnetworkinfo.subversion`.
+///
+/// Core shape: `/rbitcoin:0.1.0/` or `/rbitcoin:0.1.0(testnode0; foo)/`.
+/// Rejects `/ : ( )` and non-ASCII in comments; total length must be ≤256.
+pub fn rbitcoin_subversion(
+    pkg_version: &str,
+    comments: &[impl AsRef<str>],
+) -> Result<String, String> {
+    for c in comments {
+        let c = c.as_ref();
+        for ch in c.chars() {
+            if matches!(ch, '/' | ':' | '(' | ')') || !ch.is_ascii() {
+                return Err(format!(
+                    "Error: User Agent comment ({ch}) contains unsafe characters."
+                ));
+            }
+        }
+    }
+    let s = if comments.is_empty() {
+        format!("/rbitcoin:{pkg_version}/")
+    } else {
+        let joined = comments
+            .iter()
+            .map(|c| c.as_ref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("/rbitcoin:{pkg_version}({joined})/")
+    };
+    if s.len() > 256 {
+        return Err(format!(
+            "Error: Total length of network version string ({}) exceeds maximum length (256). Reduce the number or size of uacomments.",
+            s.len()
+        ));
+    }
+    Ok(s)
+}
+
 /// File magic for store tables: ASCII `RBT1`.
 pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
@@ -268,5 +305,24 @@ mod tests {
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));
         assert!(!schema_file_openable(0));
+    }
+
+    #[test]
+    fn subversion_comments_and_rejects() {
+        assert_eq!(
+            rbitcoin_subversion("0.1.0", &[] as &[&str]).unwrap(),
+            "/rbitcoin:0.1.0/"
+        );
+        let s = rbitcoin_subversion("0.1.0", &["testnode0"]).unwrap();
+        assert_eq!(s, "/rbitcoin:0.1.0(testnode0)/");
+        assert_eq!(&s[s.len() - 12..s.len() - 1], "(testnode0)");
+        let s = rbitcoin_subversion("0.1.0", &["testnode0", "foo"]).unwrap();
+        assert_eq!(s, "/rbitcoin:0.1.0(testnode0; foo)/");
+        assert!(rbitcoin_subversion("0.1.0", &["a/b"])
+            .unwrap_err()
+            .contains("unsafe"));
+        assert!(rbitcoin_subversion("0.1.0", &["a".repeat(256)])
+            .unwrap_err()
+            .contains("exceeds maximum"));
     }
 }

@@ -47,6 +47,8 @@ pub struct RpcContext {
     pub connections: Arc<AtomicU64>,
     /// `true` while IBD catch-up is incomplete (node sets).
     pub initial_block_download: Arc<AtomicBool>,
+    /// `getnetworkinfo.subversion` (BIP14 / Core `-uacomment` shape).
+    pub subversion: String,
 }
 
 impl RpcContext {
@@ -520,7 +522,7 @@ fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
 fn getnetworkinfo(ctx: &RpcContext) -> Value {
     json!({
         "version": 270000,
-        "subversion": format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")),
+        "subversion": ctx.subversion,
         "protocolversion": 70016,
         "localservices": "0000000000000409",
         "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED", "P2P_V2"],
@@ -541,7 +543,7 @@ fn getnetworkinfo(ctx: &RpcContext) -> Value {
 fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(json!({
-            "loaded": false,
+            "loaded": true,
             "size": 0,
             "bytes": 0,
             "usage": 0,
@@ -906,6 +908,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(2)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &["testnode0"],
+            )
+            .unwrap(),
         };
         (ctx, dir)
     }
@@ -934,6 +941,7 @@ mod tests {
         assert_eq!(info["initialblockdownload"], false);
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["size"], 0);
+        assert_eq!(mem["loaded"], true);
         let raw = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
         assert_eq!(raw, json!([]));
         let _ = std::fs::remove_dir_all(&dir);
@@ -945,6 +953,17 @@ mod tests {
         let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
         // Empty mempool → negative feerate with errors.
         assert!(r["feerate"].as_f64().unwrap() < 0.0 || r.get("rbitcoin_model").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mempoolinfo_loaded_and_uacomment() {
+        let (ctx, dir) = ctx_empty();
+        let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        let sub = info["subversion"].as_str().unwrap();
+        assert!(sub.ends_with("(testnode0)/"), "{sub}");
+        let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(mem["loaded"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1125,8 +1144,10 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(true)),
+            subversion: "/rbitcoin:0.1.0/".into(),
         };
-        let _ = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
+        let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(mem2["loaded"], true);
         let _ = dispatch(&ctx2, "getrawmempool", vec![json!(true)]).unwrap();
         let _ = dispatch(&ctx2, "estimatesmartfee", vec![json!(1)]).unwrap();
         let _ = dispatch(&ctx2, "sendrawtransaction", vec![json!("00")]);
@@ -1161,6 +1182,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(1)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: "/rbitcoin:0.1.0/".into(),
         };
 
         let tip_h = chain.tip_height();

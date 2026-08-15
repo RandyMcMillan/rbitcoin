@@ -30,6 +30,8 @@ pub struct RpcConfig {
     pub rpc_password: Option<String>,
     /// Override cookie path (default `{datadir}/.cookie`).
     pub cookie_path: Option<PathBuf>,
+    /// `getnetworkinfo.subversion`. Empty → `/rbitcoin:VERSION/`.
+    pub subversion: Option<String>,
 }
 
 /// Live RPC server handle.
@@ -86,6 +88,10 @@ pub async fn run_rpc(
         stop: Arc::clone(&stop),
         connections: Arc::clone(&connections),
         initial_block_download: Arc::clone(&ibd),
+        subversion: config.subversion.clone().unwrap_or_else(|| {
+            rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
+                .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")))
+        }),
     });
 
     let listener = TcpListener::bind(config.listen)
@@ -269,6 +275,7 @@ mod tests {
             rpc_user: Some("testuser".into()),
             rpc_password: Some("testpass".into()),
             cookie_path: None,
+            subversion: None,
         };
         let handle = run_rpc(cfg, q, Some(mp)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;

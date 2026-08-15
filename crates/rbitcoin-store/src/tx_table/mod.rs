@@ -82,6 +82,106 @@ impl TxRecord {
     }
 }
 
+/// Schema-17 thin `txout` meta flags (codec only until Class A cutover).
+/// Bit 7 must be set so a v1 schema-15 prefix (`01 00 00 00`) cannot decode.
+pub(crate) const BODY_META_V17_LAYOUT17: u8 = 1 << 7;
+pub(crate) const BODY_META_V17_VER_1: u8 = 1 << 0;
+pub(crate) const BODY_META_V17_VER_2: u8 = 1 << 1;
+pub(crate) const BODY_META_V17_VER_3: u8 = 1 << 2;
+pub(crate) const BODY_META_V17_LOCKTIME_ZERO: u8 = 1 << 3;
+const BODY_META_V17_RESERVED: u8 = 0x70;
+const BODY_META_V17_VER_MASK: u8 = BODY_META_V17_VER_1 | BODY_META_V17_VER_2 | BODY_META_V17_VER_3;
+
+/// Encode schema-17 thin meta. Production still writes [`TxRecord::encode_body_meta_into`].
+pub(crate) fn encode_body_meta_v17(rec: &TxRecord, out: &mut Vec<u8>) {
+    let mut flags = BODY_META_V17_LAYOUT17;
+    match rec.version {
+        1 => flags |= BODY_META_V17_VER_1,
+        2 => flags |= BODY_META_V17_VER_2,
+        3 => flags |= BODY_META_V17_VER_3,
+        _ => {}
+    }
+    if rec.locktime == 0 {
+        flags |= BODY_META_V17_LOCKTIME_ZERO;
+    }
+    out.push(flags);
+    if flags & BODY_META_V17_VER_MASK == 0 {
+        out.extend_from_slice(&rec.version.to_le_bytes());
+    }
+    if rec.locktime != 0 {
+        write_uleb128(out, u64::from(rec.locktime));
+    }
+    write_uleb128(out, u64::from(rec.input_count));
+    write_uleb128(out, u64::from(rec.output_count));
+}
+
+/// Decode schema-17 thin meta. Rejects schema-15 16-byte prefixes (no LAYOUT17 bit).
+pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), StoreError> {
+    if buf.is_empty() {
+        return Err(StoreError::Corrupt("short v17 txout meta"));
+    }
+    let flags = buf[0];
+    if flags & BODY_META_V17_LAYOUT17 == 0 {
+        return Err(StoreError::Corrupt(
+            "legacy txout meta missing LAYOUT17 bit",
+        ));
+    }
+    if flags & BODY_META_V17_RESERVED != 0 {
+        return Err(StoreError::Corrupt("v17 txout meta reserved flags"));
+    }
+    let ver_bits = flags & BODY_META_V17_VER_MASK;
+    if ver_bits.count_ones() > 1 {
+        return Err(StoreError::Corrupt("v17 txout meta multiple VER bits"));
+    }
+    let mut off = 1usize;
+    let version = if ver_bits == 0 {
+        if buf.len() < off + 4 {
+            return Err(StoreError::Corrupt("short v17 txout version"));
+        }
+        let v = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        off += 4;
+        v
+    } else if ver_bits == BODY_META_V17_VER_1 {
+        1
+    } else if ver_bits == BODY_META_V17_VER_2 {
+        2
+    } else {
+        3
+    };
+    let locktime = if flags & BODY_META_V17_LOCKTIME_ZERO != 0 {
+        0
+    } else {
+        let (v, n) = read_uleb128(&buf[off..])?;
+        if v > u64::from(u32::MAX) {
+            return Err(StoreError::Corrupt("v17 locktime overflow"));
+        }
+        off += n;
+        v as u32
+    };
+    let (nin, n1) = read_uleb128(&buf[off..])?;
+    if nin > u64::from(u32::MAX) {
+        return Err(StoreError::Corrupt("v17 input_count overflow"));
+    }
+    off += n1;
+    let (nout, n2) = read_uleb128(&buf[off..])?;
+    if nout > u64::from(u32::MAX) {
+        return Err(StoreError::Corrupt("v17 output_count overflow"));
+    }
+    off += n2;
+    Ok((
+        TxRecord {
+            txid: [0u8; 32],
+            version,
+            locktime,
+            input_start_fk: Fk::NULL,
+            input_count: nin as u32,
+            output_start_fk: Fk::NULL,
+            output_count: nout as u32,
+        },
+        off,
+    ))
+}
+
 /// Class A output (addressed via `tx.output_start_fk` run + local vout).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputRecord {

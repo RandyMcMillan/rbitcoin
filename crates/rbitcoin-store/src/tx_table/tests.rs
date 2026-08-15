@@ -2521,3 +2521,84 @@ fn refuse_legacy_mono_head_on_create() {
     assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {
+    TxRecord {
+        txid: [0u8; 32],
+        version,
+        locktime,
+        input_start_fk: Fk::NULL,
+        input_count: n_in,
+        output_start_fk: Fk::NULL,
+        output_count: n_out,
+    }
+}
+
+#[test]
+fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
+    let rec = rec_meta(1, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(
+        buf,
+        vec![0x89, 0x01, 0x01],
+        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb 1,1"
+    );
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(got.version, 1);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 1);
+    assert_eq!(got.output_count, 1);
+}
+
+#[test]
+fn body_meta_v17_v2_locktime_zero() {
+    let rec = rec_meta(2, 0, 1, 2);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0], 0x8A, "LAYOUT17|VER_2|LOCKTIME_ZERO");
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got.version, 2);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.output_count, 2);
+}
+
+#[test]
+fn body_meta_v17_locktime_tip_is_uleb() {
+    let rec = rec_meta(2, 800_000, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0] & 0x80, 0x80, "LAYOUT17 set");
+    assert_eq!(buf[0] & 0x08, 0, "LOCKTIME_ZERO clear");
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got.locktime, 800_000);
+    assert_eq!(got.version, 2);
+    assert!(buf.len() < 16, "must beat 16 B meta");
+}
+
+#[test]
+fn body_meta_v17_high_bit_version_is_explicit_i32() {
+    let ver = i32::from_le_bytes([0x00, 0x00, 0x00, 0x80]);
+    let rec = rec_meta(ver, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf[0] & 0x07, 0, "no VER_1/2/3 for high-bit nVersion");
+    assert_eq!(&buf[1..5], &[0x00, 0x00, 0x00, 0x80]);
+    let (got, _) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(got.version, ver);
+}
+
+#[test]
+fn body_meta_v17_rejects_missing_layout_bit() {
+    // Schema-15 v1 meta starts 01 00 00 00 — must not parse as v17.
+    let legacy = [1u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+    match decode_body_meta_v17(&legacy) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("LAYOUT17") || m.contains("legacy"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}

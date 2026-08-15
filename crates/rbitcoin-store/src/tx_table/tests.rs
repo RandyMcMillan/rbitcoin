@@ -2804,6 +2804,45 @@ fn spent_span_matches_slot_len_times_n_out() {
 }
 
 #[test]
+fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
+    let rec = InputRecord::coinbase(u32::MAX, vec![], vec![]);
+    let mut raw = rec.encode();
+    raw[0] |= 1 << 5;
+    match InputRecord::decode_at(&raw) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(
+                m.contains("reserved") || m.contains("inwit"),
+                "{m}"
+            );
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+    raw[0] = 1 << 7;
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&raw),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn reserved_flag_v17_spent_unknown_bits_are_corrupt() {
+    match encode_spent_slot_v17(1, Fk::NULL) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("spent") || m.contains("flag"), "{m}");
+        }
+        other => panic!("expected Corrupt on encode, got {other:?}"),
+    }
+    let mut slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, Fk(3)).unwrap();
+    slot[0] |= 1 << 0;
+    match decode_spent_slot_v17(&slot) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("spent") || m.contains("flag"), "{m}");
+        }
+        other => panic!("expected Corrupt on decode, got {other:?}"),
+    }
+}
+
+#[test]
 fn script_kind_v17_kind_ten_is_corrupt() {
     match decode_script_kind_v17(10, &[]) {
         Err(StoreError::Corrupt(m)) => {

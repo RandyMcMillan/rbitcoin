@@ -121,6 +121,9 @@ pub mod input_flags {
     pub const NULL_PREV: u8 = 1 << 3;
     /// Reserved / unused (v9 and earlier LOCAL_PREV; rejected if set).
     pub const RESERVED4: u8 = 1 << 4;
+    /// Bits 5–7 reserved (schema 17 freeze). Reject so a later Δfk writer
+    /// cannot be silently misparsed.
+    pub const RESERVED_HIGH: u8 = 0xE0;
 }
 
 /// Output record flags (schema v5).

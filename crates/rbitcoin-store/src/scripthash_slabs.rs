@@ -2,7 +2,8 @@
 //!
 //! Occupancy helpers compare schema-14 4 KiB page allocation against
 //! schema-15 size-class slabs (megakeys still use pages). Encode/decode of
-//! the fk stream is shared by slab payloads and megakey pages.
+//! the fk stream is shared by slab payloads and megakey pages
+//! ([`encode_fk_delta_stream`]).
 
 use crate::compact::{read_uleb128, uleb128_len, write_uleb128};
 use crate::error::StoreError;

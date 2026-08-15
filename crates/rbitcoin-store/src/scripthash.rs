@@ -21,8 +21,8 @@ use crate::scripthash_layout::{
 use crate::scripthash_overflow::{ovf_dir, ovf_seg_path};
 use crate::scripthash_overflow::{ovf_segment_slots, ShOverflowStack};
 use crate::scripthash_pages::{
-    sh_page_count_for_entries, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk,
-    sh_page_pack, sh_page_set_next, sh_page_try_append, SH_PAGE_FK_CAP, SH_PAGE_SIZE,
+    sh_page_chunk_ranges, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk, sh_page_pack,
+    sh_page_set_next, sh_page_try_append, sh_page_would_append, SH_PAGE_SIZE,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
@@ -1600,15 +1600,16 @@ impl ScriptHashTable {
         // Pre-allocate all pages, then pack each with next known — one write per page
         // (no RMW of the previous page to fix up next). Offsets may be non-contiguous
         // when freelist reuses slabs.
-        let n_pages = sh_page_count_for_entries(live.len());
+        let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
+        let chunks = sh_page_chunk_ranges(&fks)?;
+        let n_pages = chunks.len();
         let mut offs = Vec::with_capacity(n_pages);
         for _ in 0..n_pages {
             offs.push(self.alloc_page(alloc)?);
         }
         let mut page = [0u8; SH_PAGE_SIZE];
         for (pi, &off) in offs.iter().enumerate() {
-            let start = pi * SH_PAGE_FK_CAP;
-            let end = (start + SH_PAGE_FK_CAP).min(live.len());
+            let (start, end) = chunks[pi];
             let next = offs.get(pi + 1).copied().unwrap_or(0);
             sh_page_pack(&mut page, &live[start..end], next)?;
             self.body.write_at(off, &page)?;
@@ -1984,7 +1985,7 @@ pub struct ScriptHashBulkSession<'a> {
     open_key: Option<BulkOpenKey>,
 }
 
-/// One unfinished key in [`ScriptHashBulkSession`] (≤ [`SH_PAGE_FK_CAP`] FKs).
+/// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
 struct BulkOpenKey {
     key: [u8; 32],
     buf: Vec<u64>,
@@ -2044,18 +2045,19 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
             self.open_key = Some(BulkOpenKey {
                 key,
-                buf: Vec::with_capacity(SH_PAGE_FK_CAP),
+                buf: Vec::with_capacity(512),
                 n_total: 0,
                 first_page: None,
                 last_fk: None,
             });
         }
-        if self
-            .open_key
-            .as_ref()
-            .is_some_and(|o| o.buf.len() == SH_PAGE_FK_CAP)
-        {
-            self.write_open_full_page_with_next()?;
+        if let Some(open) = self.open_key.as_ref() {
+            if !open.buf.is_empty() {
+                let cur: Vec<Fk> = open.buf.iter().copied().map(Fk).collect();
+                if !sh_page_would_append(&cur, fk)? {
+                    self.write_open_full_page_with_next()?;
+                }
+            }
         }
         let open = self
             .open_key
@@ -2283,17 +2285,17 @@ impl<'a> ScriptHashBulkSession<'a> {
             return Err(StoreError::Corrupt("scripthash bulk page chain empty"));
         }
         let base = (bump + 4095) & !4095;
-        let n_pages = sh_page_count_for_entries(entries.len());
+        let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
+        let chunks = sh_page_chunk_ranges(&fks)?;
+        let n_pages = chunks.len();
         let end = base.saturating_add((n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64));
         body.ensure_capacity(end)?;
         if end > body.logical_len() {
             body.set_logical_len(end)?;
         }
         let mut page = [0u8; SH_PAGE_SIZE];
-        for pi in 0..n_pages {
+        for (pi, &(start, end_i)) in chunks.iter().enumerate() {
             let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
-            let start = pi * SH_PAGE_FK_CAP;
-            let end_i = (start + SH_PAGE_FK_CAP).min(entries.len());
             let next = if pi + 1 < n_pages {
                 off + SH_PAGE_SIZE as u64
             } else {
@@ -2782,12 +2784,12 @@ mod tests {
     /// from last page only (sorted chain).
     #[test]
     fn put_create_batch_skips_leq_max_appends_higher() {
-        use crate::scripthash_pages::SH_PAGE_FK_CAP;
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         let sh = script_hash(&[0xab]);
-        // Fill past two pages so last page holds the max.
-        let n = SH_PAGE_FK_CAP * 2 + 5;
+        // Fill past one delta page so last page holds the max.
+        let n = SH_PAGE_STREAM_MAX + 5;
         let first: Vec<_> = (1..=n as u64).map(|i| rec(sh, i, 0)).collect();
         assert_eq!(t.put_create_batch(&first).unwrap(), n);
         assert_eq!(t.entries(&sh).unwrap().len(), n);
@@ -2872,20 +2874,15 @@ mod tests {
         for (i, (_, e)) in ents.iter().enumerate() {
             assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
         }
-        // Grow past one page (510 FKs/page): force multi-page with many puts.
+        // Grow to megakey pages (≥257 FKs).
         let mut heads2 = HashMap::new();
         let sh2 = script_hash(&[0x7b]);
         let many: Vec<_> = (1..=600u32).map(|v| rec(sh2, u64::from(v), v)).collect();
         let (nm, _) = t.put_create_batch_append(&many, &mut heads2).unwrap();
         assert_eq!(nm, 600);
         match t.head_value(&sh2).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert_ne!(first_page, last_page, "600 fks need >1 page");
-            }
-            other => panic!("expected multi-page, got {other:?}"),
+            ShHeadValue::Paged { .. } => {}
+            other => panic!("expected paged megakey, got {other:?}"),
         }
         assert_eq!(t.entries(&sh2).unwrap().len(), 600);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3662,10 +3659,10 @@ mod tests {
 
     #[test]
     fn bulk_session_stream_megakey_caps_buf_at_page() {
-        use crate::scripthash_pages::{SH_PAGE_FK_CAP, SH_PAGE_SIZE};
+        use crate::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
-        let n = SH_PAGE_FK_CAP * 2 + 3;
+        let n = SH_PAGE_STREAM_MAX + 10;
         let mut sh = [0u8; 32];
         sh[0] = 0x42;
         let mut session = t.bulk_session(1).unwrap();
@@ -3674,13 +3671,13 @@ mod tests {
             session.push_sorted_fk(sh, Fk(i)).unwrap();
             peak = peak.max(session.buffered_fks());
             assert!(
-                session.buffered_fks() <= SH_PAGE_FK_CAP,
+                session.buffered_fks() <= SH_PAGE_STREAM_MAX,
                 "buf={} after fk={i}",
                 session.buffered_fks()
             );
         }
         session.finish_key().unwrap();
-        assert!(peak <= SH_PAGE_FK_CAP, "peak buf={peak}");
+        assert!(peak <= SH_PAGE_STREAM_MAX, "peak buf={peak}");
         let (creates, keys, _, _) = session.finish().unwrap();
         assert_eq!(keys, 1);
         assert_eq!(creates, n as u64);
@@ -3690,7 +3687,7 @@ mod tests {
                 first_page,
                 last_page,
             } => {
-                assert_eq!(last_page, first_page + 2 * SH_PAGE_SIZE as u64);
+                assert_eq!(last_page, first_page + SH_PAGE_SIZE as u64);
             }
             other => panic!("expected paged, got {other:?}"),
         }
@@ -3722,11 +3719,11 @@ mod tests {
     /// writes next links on first write — no previous-page RMW).
     #[test]
     fn bulk_session_megakey_page_chain_contiguous_once() {
-        use crate::scripthash_pages::{SH_PAGE_FK_CAP, SH_PAGE_SIZE};
+        use crate::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
-        // Two full pages + 3 FKs → 3 pages.
-        let n = SH_PAGE_FK_CAP * 2 + 3;
+        // Sequential FKs fill ~4080/page; this n spans two pages.
+        let n = SH_PAGE_STREAM_MAX + 10;
         let mut sh = [0u8; 32];
         sh[0] = 0x10;
         sh[1] = 0xee;
@@ -3751,7 +3748,7 @@ mod tests {
         // Contiguous bump layout: last = first + (n_pages-1)*4096.
         assert_eq!(
             last,
-            first + 2 * SH_PAGE_SIZE as u64,
+            first + SH_PAGE_SIZE as u64,
             "bulk chain pages must be contiguous at bump"
         );
         assert!(first > 0 && first % (SH_PAGE_SIZE as u64) == 0);

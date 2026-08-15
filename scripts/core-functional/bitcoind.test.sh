@@ -58,6 +58,20 @@ rpcport=18443
 server=1
 EOF
 
+# Relative RBITCOIN_NODE is resolved from the repo root (TestNode cwd is a tmpdir).
+REL_FAKE="scripts/core-functional/.bitcoind-test-fake-node"
+ln -sfn "$FAKE" "$ROOT/$REL_FAKE"
+cleanup_rel() { rm -f "$ROOT/$REL_FAKE"; cleanup; }
+trap cleanup_rel EXIT
+if RBITCOIN_NODE="$REL_FAKE" OUT_REL="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest 2>/dev/null)" \
+  && printf '%s' "$OUT_REL" | grep -q -- '.bitcoind-test-fake-node'; then
+  echo "ok - relative RBITCOIN_NODE resolves from repo root"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - relative RBITCOIN_NODE resolves from repo root"
+  FAIL=$((FAIL + 1))
+fi
+
 OUT="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -debug 2>/dev/null)"
 if printf '%s' "$OUT" | grep -q -- "--network regtest" \
   && printf '%s' "$OUT" | grep -q -- "--datadir ${DATADIR}/regtest" \

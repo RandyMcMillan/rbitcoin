@@ -16,14 +16,29 @@ python3 "$HERE/check_inventory.py" \
 # Warn-only: a newer Core release must not red the job.
 python3 "$HERE/check_core_release.py"
 # Inventory `run` set (feature_help + feature_uacomment today). Needs a node.
-if [[ -n "${RBITCOIN_NODE:-}" && -x "${RBITCOIN_NODE}" ]]; then
-  :
+abs_node() {
+  local p="$1"
+  if [[ "$p" = /* ]]; then
+    printf '%s' "$p"
+  else
+    printf '%s' "$ROOT/$p"
+  fi
+}
+
+if [[ -n "${RBITCOIN_NODE:-}" && -x "$(abs_node "$RBITCOIN_NODE")" ]]; then
+  export RBITCOIN_NODE="$(abs_node "$RBITCOIN_NODE")"
 elif command -v cargo >/dev/null 2>&1; then
   cargo build -p rbitcoin-node
-  if [[ -x "${CARGO_TARGET_DIR:-target}/debug/rbitcoin-node" ]]; then
-    export RBITCOIN_NODE="${CARGO_TARGET_DIR:-target}/debug/rbitcoin-node"
-  elif [[ -x target/dev/debug/rbitcoin-node ]]; then
-    export RBITCOIN_NODE="target/dev/debug/rbitcoin-node"
+  CAND=""
+  if [[ -n "${CARGO_TARGET_DIR:-}" && -x "${CARGO_TARGET_DIR}/debug/rbitcoin-node" ]]; then
+    CAND="${CARGO_TARGET_DIR}/debug/rbitcoin-node"
+  elif [[ -x "$ROOT/target/debug/rbitcoin-node" ]]; then
+    CAND="$ROOT/target/debug/rbitcoin-node"
+  elif [[ -x "$ROOT/target/dev/debug/rbitcoin-node" ]]; then
+    CAND="$ROOT/target/dev/debug/rbitcoin-node"
+  fi
+  if [[ -n "$CAND" ]]; then
+    export RBITCOIN_NODE="$(abs_node "$CAND")"
   fi
 fi
 if [[ -n "${RBITCOIN_NODE:-}" && -x "${RBITCOIN_NODE}" ]]; then

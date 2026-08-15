@@ -436,6 +436,22 @@ fn write_sorted_run_file(
             "sorted run: body not multiple of rec_len",
         ));
     }
+    // Full-record keys (SH: key_len == rec_len == 40) must be unique and ordered.
+    // Other families (key_len < rec_len) keep payload-only ties.
+    if key_len == rec_len && !records.is_empty() {
+        let rl = rec_len as usize;
+        let mut prev: Option<&[u8]> = None;
+        for rec in records.chunks_exact(rl) {
+            if let Some(p) = prev {
+                if rec <= p {
+                    return Err(StoreError::Corrupt(
+                        "sorted run: records not strictly increasing",
+                    ));
+                }
+            }
+            prev = Some(rec);
+        }
+    }
     let count = (records.len() / rec_len as usize) as u64;
     let body_crc32 = crc32(records);
     if let Some(parent) = path.parent() {
@@ -965,7 +981,7 @@ pub fn merge_runs_to_file_with_policy(
     verify_crc: bool,
 ) -> Result<MergeToFileResult, StoreError> {
     if inputs.is_empty() {
-        let run = write_sorted_run_file(out_path, 32, 40, &[], policy)?;
+        let run = write_sorted_run_file(out_path, 40, 40, &[], policy)?;
         return Ok(MergeToFileResult {
             run,
             max_u64_at_32: 0,
@@ -2525,6 +2541,38 @@ mod tests {
         let out = next_run_path(&d, 9);
         let merged = merge_runs(&[], &out).unwrap();
         assert_eq!(merged.count, 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// When key_len == rec_len the body is the sort key: must be strictly increasing.
+    #[test]
+    fn write_sorted_run_rejects_unsorted_when_key_len_eq_rec() {
+        let d = tmp_dir();
+        let mut rec_hi = [0u8; 40];
+        rec_hi[31] = 2;
+        rec_hi[32..40].copy_from_slice(&2u64.to_le_bytes());
+        let mut rec_lo = [0u8; 40];
+        rec_lo[31] = 1;
+        rec_lo[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(&rec_hi);
+        body.extend_from_slice(&rec_lo);
+        match write_sorted_run(&d.join("desc.run"), 40, 40, &body) {
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("not strictly increasing"),
+                    "expected order error, got {m}"
+                );
+            }
+            other => panic!("expected Corrupt unsorted, got {other:?}"),
+        }
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&rec_lo);
+        ok.extend_from_slice(&rec_hi);
+        let run = write_sorted_run(&d.join("000001.run"), 40, 40, &ok).unwrap();
+        assert_eq!(run.key_len, 40);
+        assert_eq!(run.rec_len, 40);
+        assert_eq!(run.count, 2);
         let _ = fs::remove_dir_all(&d);
     }
 

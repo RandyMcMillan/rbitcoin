@@ -28,10 +28,10 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    merge_runs_with_policy, next_run_path, prefix_shard_of,
-    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority, write_sorted_run,
-    write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
-    SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
+    merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
+    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
+    RunWritePolicy, ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
+    SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -1250,7 +1250,8 @@ impl ShRunBuilder {
             {
                 let pending = session
                     .stream_creates_written()
-                    .saturating_sub(session.creates_written()) as usize;
+                    .saturating_sub(session.creates_written())
+                    as usize;
                 log_materialize_status(
                     &mut last_log,
                     session.keys_written(),

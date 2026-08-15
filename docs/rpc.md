@@ -61,13 +61,16 @@ still wait for durable SH when shindex is on.
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |
-| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | Best-effort; BIP324 v2-only; peer detail stub |
+| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table |
+| `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
 | `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub |
 | `getrawtransaction` | Class A + mempool |
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
 | `generatetoaddress` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
+| `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
+| `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. |
 
 ## Permanent gaps (will not match Core)
 

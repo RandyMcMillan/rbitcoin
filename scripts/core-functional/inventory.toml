@@ -996,8 +996,7 @@ reason = "rpc-missing"
 
 [[test]]
 name = "rpc_uptime.py"
-status = "skip"
-reason = "rpc-missing"
+status = "run"
 
 [[test]]
 name = "rpc_users.py"

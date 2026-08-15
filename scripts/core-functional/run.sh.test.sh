@@ -165,11 +165,14 @@ assert_stdout "real inventory --list includes feature_help" "feature_help.py" \
   "$RUN" --list
 assert_stdout "real inventory --list includes feature_uacomment" "feature_uacomment.py" \
   "$RUN" --list
+assert_stdout "real inventory --list includes rpc_uptime" "rpc_uptime.py" \
+  "$RUN" --list
 assert_fail_msg "real inventory skip refused" "not in run set: wallet_basic.py" \
   "$RUN" --dry-run wallet_basic.py
 DRY_REAL="$("$RUN" --dry-run 2>/dev/null || true)"
 if printf '%s' "$DRY_REAL" | grep -q 'feature_help.py' \
   && printf '%s' "$DRY_REAL" | grep -q 'feature_uacomment.py' \
+  && printf '%s' "$DRY_REAL" | grep -q 'rpc_uptime.py' \
   && printf '%s' "$DRY_REAL" | grep -q -- '--v2transport'; then
   echo "ok - real inventory dry-run first-green set"
   PASS=$((PASS + 1))

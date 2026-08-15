@@ -11,6 +11,24 @@ before 1.0).
 
 ### Added
 
+- **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
+  and park via `ChainHub`; reconsider re-accepts; precious prefers an
+  equal-work sibling.
+
+- **Debug.log mapper:** `scripts/core-functional/debuglog_map.toml` plus
+  shim line pump. First extra Core script: `rpc_uptime.py` (setmocktime
+  range + uptime ignores mock).
+
+- **Regtest `setmocktime`:** `NodeClock` (AtomicI64; `0` = wall). Generate
+  timestamps and future-header checks honor the mock. Not a process
+  `time()` hook (log stamps stay wall).
+
+- **Live `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection`:**
+  sessions register after BIP324 handshake. `addnode onetry` dials via the
+  same outbound path as tip-follow. `subver` is the peer's version UA
+  (our `-uacomment` is advertised on our `version`). `bytesrecv_per_msg.pong`
+  is counted so Core `connect_nodes` can wait for handshake.
+
 - **`syncwithvalidationinterfacequeue`:** no-op `null`. Core’s framework
   calls it from `sync_mempools`; we have no wallet/index callback queue.
 

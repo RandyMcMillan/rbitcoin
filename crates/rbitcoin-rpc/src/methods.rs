@@ -51,6 +51,10 @@ pub struct RpcContext {
     pub subversion: String,
     /// Regtest generate/submitblock. Node attaches [`ChainHub`] via this trait.
     pub regtest: Option<Arc<dyn RpcRegtest>>,
+    /// Live P2P sessions (`getpeerinfo` / `addnode` / `disconnectnode`).
+    pub peers: Option<Arc<rbitcoin_net::PeerHub>>,
+    /// Live chain (invalidate / reconsider / precious).
+    pub chain: Option<Arc<rbitcoin_net::ChainHub>>,
 }
 
 /// Outcome of `submitblock` (Core: `null` or a reject-reason string).
@@ -72,6 +76,9 @@ pub trait RpcRegtest: Send + Sync {
     ) -> Result<Vec<BlockHash>, String>;
 
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome;
+
+    /// `0` = wall clock. Regtest harness only.
+    fn set_mock_time(&self, timestamp: i64) -> Result<(), String>;
 }
 
 impl RpcContext {
@@ -86,6 +93,8 @@ pub fn rpc_error(code: i64, message: impl Into<String>) -> Value {
 }
 
 pub const ERR_MISC: i64 = -1;
+/// Core `RPC_CLIENT_NODE_NOT_CONNECTED`.
+pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
 pub const ERR_INVALID_PARAMETER: i64 = -8;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
@@ -252,8 +261,11 @@ pub fn dispatch(
         }
         "getpeerinfo" => {
             params.reject_unknown(&[])?;
-            Ok(json!([])) // best-effort stub; peer detail not exposed yet
+            Ok(getpeerinfo(ctx))
         }
+        "addnode" => addnode(ctx, &params),
+        "disconnectnode" => disconnectnode(ctx, &params),
+        "addconnection" => addconnection(ctx, &params),
         "getmempoolinfo" => {
             params.reject_unknown(&[])?;
             getmempoolinfo(ctx)
@@ -271,6 +283,10 @@ pub fn dispatch(
         "generateblock" => generateblock(ctx, &params),
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
+        "setmocktime" => setmocktime(ctx, &params),
+        "invalidateblock" => invalidateblock(ctx, &params),
+        "reconsiderblock" => reconsiderblock(ctx, &params),
+        "preciousblock" => preciousblock(ctx, &params),
         "createrawtransaction"
         | "combinerawtransaction"
         | "scantxoutset"
@@ -313,6 +329,9 @@ const METHOD_LIST: &[&str] = &[
     "getnetworkinfo",
     "getconnectioncount",
     "getpeerinfo",
+    "addnode",
+    "disconnectnode",
+    "addconnection",
     "getmempoolinfo",
     "getrawmempool",
     "getmempoolentry",
@@ -327,6 +346,10 @@ const METHOD_LIST: &[&str] = &[
     "generateblock",
     "generate",
     "submitblock",
+    "setmocktime",
+    "invalidateblock",
+    "reconsiderblock",
+    "preciousblock",
 ];
 
 fn method_help(m: &str) -> String {
@@ -565,6 +588,121 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     tip.saturating_sub(height.0).saturating_add(1)
+}
+
+fn getpeerinfo(ctx: &RpcContext) -> Value {
+    let Some(hub) = ctx.peers.as_ref() else {
+        return json!([]);
+    };
+    let rows: Vec<Value> = hub.snapshot().into_iter().map(peerinfo_json).collect();
+    json!(rows)
+}
+
+fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
+    let mut recv = serde_json::Map::new();
+    for (k, v) in p.bytesrecv_per_msg {
+        recv.insert(k, json!(v));
+    }
+    let mut sent = serde_json::Map::new();
+    for (k, v) in p.bytessent_per_msg {
+        sent.insert(k, json!(v));
+    }
+    json!({
+        "id": p.id,
+        "addr": p.addr.to_string(),
+        "addrbind": p.addrbind.to_string(),
+        "subver": p.subver,
+        "inbound": p.inbound,
+        "services": format!("{:016x}", p.services),
+        "servicesnames": services_names(p.services),
+        "startingheight": p.startingheight,
+        "bytesrecv_per_msg": recv,
+        "bytessent_per_msg": sent,
+        "connection_type": p.conn_type.as_str(),
+        "transport_protocol_type": "v2",
+        "network": "ipv4",
+        "synced_headers": -1,
+        "synced_blocks": -1,
+    })
+}
+
+fn services_names(bits: u64) -> Vec<&'static str> {
+    let mut n = Vec::new();
+    if bits & 1 != 0 {
+        n.push("NETWORK");
+    }
+    if bits & 8 != 0 {
+        n.push("WITNESS");
+    }
+    if bits & 0x400 != 0 {
+        n.push("NETWORK_LIMITED");
+    }
+    if bits & 0x800 != 0 {
+        n.push("P2P_V2");
+    }
+    n
+}
+
+fn require_peers(ctx: &RpcContext) -> Result<&rbitcoin_net::PeerHub, Value> {
+    ctx.peers
+        .as_deref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "P2P session table not attached"))
+}
+
+fn addnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["node", "command", "v2transport"])?;
+    let hub = require_peers(ctx)?;
+    let node = params.req_str(0, "node")?;
+    let cmd = params.req_str(1, "command")?;
+    let _v2 = params.opt_bool(2, "v2transport")?;
+    let addr = rbitcoin_net::parse_peer_addr(node)
+        .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    hub.addnode(addr, cmd).map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(Value::Null)
+}
+
+fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["address", "nodeid"])?;
+    let hub = require_peers(ctx)?;
+    if let Some(id) = params.opt_u64(1, "nodeid")? {
+        if !hub.disconnect_id(id) {
+            return Err(rpc_error(
+                ERR_CLIENT_NODE_NOT_CONNECTED,
+                "Node not found in connected nodes",
+            ));
+        }
+        return Ok(Value::Null);
+    }
+    if let Some(a) = params.get(0, "address").and_then(|v| v.as_str()) {
+        let addr = rbitcoin_net::parse_peer_addr(a)
+            .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+        if !hub.disconnect_addr(addr) {
+            return Err(rpc_error(
+                ERR_CLIENT_NODE_NOT_CONNECTED,
+                "Node not found in connected nodes",
+            ));
+        }
+        return Ok(Value::Null);
+    }
+    Err(rpc_error(ERR_INVALID_PARAMS, "address or nodeid required"))
+}
+
+fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["address", "connection_type", "v2transport"])?;
+    let hub = require_peers(ctx)?;
+    let address = params.req_str(0, "address")?;
+    let typ_s = params.req_str(1, "connection_type")?;
+    let _v2 = params.opt_bool(2, "v2transport")?.unwrap_or(true);
+    let addr = rbitcoin_net::parse_peer_addr(address)
+        .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    let typ =
+        rbitcoin_net::PeerConnType::parse(typ_s).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e))?;
+    hub.addconnection(addr, typ)
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(json!({
+        "address": address,
+        "connection_type": typ.as_str(),
+    }))
 }
 
 fn getnetworkinfo(ctx: &RpcContext) -> Value {
@@ -953,6 +1091,85 @@ fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     Ok(hashes_json(&hashes))
 }
 
+fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["timestamp"])?;
+    require_regtest(ctx, "setmocktime")?;
+    let miner = require_regtest_miner(ctx, "setmocktime")?;
+    let raw = params.req(0, "timestamp")?;
+    let ts = mocktime_i64(raw)?;
+    miner
+        .set_mock_time(ts)
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(Value::Null)
+}
+
+fn mocktime_i64(v: &Value) -> Result<i64, Value> {
+    let n = match v {
+        Value::Number(n) => n,
+        _ => {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "timestamp must be an integer",
+            ));
+        }
+    };
+    let i = n
+        .as_i64()
+        .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()));
+    let Some(i) = i else {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "timestamp must be an integer",
+        ));
+    };
+    if i < 0 || i > 9_223_372_036 {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Mocktime must be in the range [0, 9223372036], not {i}."),
+        ));
+    }
+    Ok(i)
+}
+
+fn require_chain(ctx: &RpcContext) -> Result<&rbitcoin_net::ChainHub, Value> {
+    ctx.chain
+        .as_deref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "chain hub not attached"))
+}
+
+fn parse_blockhash_param(params: &RpcParams) -> Result<bitcoin::BlockHash, Value> {
+    let hex = params.req_str(0, "blockhash")?;
+    let b = parse_hash32_display(hex)?;
+    Ok(bitcoin::BlockHash::from_byte_array(b))
+}
+
+fn invalidateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.invalidate_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(Value::Null)
+}
+
+fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.reconsider_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(Value::Null)
+}
+
+fn preciousblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.precious_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(Value::Null)
+}
+
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexdata", "dummy"])?;
     let miner = require_regtest_miner(ctx, "submitblock")?;
@@ -1080,6 +1297,8 @@ mod tests {
             )
             .unwrap(),
             regtest: None,
+            peers: None,
+            chain: None,
         };
         (ctx, dir)
     }
@@ -1314,6 +1533,8 @@ mod tests {
             initial_block_download: Arc::new(AtomicBool::new(true)),
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: None,
+            peers: None,
+            chain: None,
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -1353,6 +1574,8 @@ mod tests {
             initial_block_download: Arc::new(AtomicBool::new(false)),
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: None,
+            peers: None,
+            chain: None,
         };
 
         let tip_h = chain.tip_height();
@@ -1573,6 +1796,11 @@ mod tests {
                 Err(e) => SubmitBlockOutcome::Rejected(e.to_string()),
             }
         }
+
+        fn set_mock_time(&self, timestamp: i64) -> Result<(), String> {
+            self.0.clock.set_mock(timestamp);
+            Ok(())
+        }
     }
 
     fn ctx_regtest_hub() -> (RpcContext, PathBuf, Arc<rbitcoin_net::ChainHub>) {
@@ -1602,6 +1830,8 @@ mod tests {
             initial_block_download: Arc::new(AtomicBool::new(false)),
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
+            peers: None,
+            chain: Some(Arc::clone(&hub)),
         };
         (ctx, dir, hub)
     }
@@ -1626,11 +1856,13 @@ mod tests {
             "generateblock",
             "generate",
             "submitblock",
+            "setmocktime",
         ] {
             let e = match m {
                 "generatetoaddress" => dispatch(&ctx, m, vec![json!(1), json!(addr.clone())]),
                 "generateblock" => dispatch(&ctx, m, vec![json!(addr.clone()), json!([])]),
                 "generate" => dispatch(&ctx, m, vec![json!(1)]),
+                "setmocktime" => dispatch(&ctx, m, vec![json!(1)]),
                 _ => dispatch(&ctx, m, vec![json!("00")]),
             }
             .unwrap_err();
@@ -1700,5 +1932,203 @@ mod tests {
         );
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_reconsider_tip() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let tip = dispatch(&ctx, "getbestblockhash", vec![])
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        dispatch(&ctx, "invalidateblock", vec![json!(tip.clone())]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
+        dispatch(&ctx, "reconsiderblock", vec![json!(tip)]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_negative_is_invalid_parameter() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let e = dispatch(&ctx, "setmocktime", vec![json!(-1)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Mocktime must be in the range [0, 9223372036], not -1."),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_generate_uses_mock() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let mock = 1_600_000_000u64;
+        dispatch(&ctx, "setmocktime", vec![json!(mock)]).unwrap();
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        let hdr = dispatch(&ctx, "getblockheader", vec![best]).unwrap();
+        let t = hdr["time"].as_u64().unwrap();
+        assert!(
+            t >= mock && t < mock + 600,
+            "generate time {t} should honor mock {mock}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_future_header_uses_mock() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let mock = 1_600_000_000u64;
+        dispatch(&ctx, "setmocktime", vec![json!(mock)]).unwrap();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let far = (mock + 3 * 3600) as u32;
+        let far_block = mine_regtest_paying(prev, far, 1, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&far_block));
+        let r = dispatch(&ctx, "submitblock", vec![json!(hex)]).unwrap();
+        let msg = r.as_str().unwrap_or("");
+        assert!(
+            msg.contains("future") || msg.contains("timestamp"),
+            "future header vs mock now: {r}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getpeerinfo_empty_without_hub() {
+        let (ctx, dir) = ctx_empty();
+        let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        assert_eq!(r, json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getpeerinfo_lists_registered_session() {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use rbitcoin_net::{PeerConnType, PeerHub};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (mut ctx, dir) = ctx_empty();
+        let hub = PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&bind, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:0.1.0(testnode0)/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let live = hub.register(addr, bind, &ver, false, PeerConnType::OutboundFullRelay);
+        live.note_recv("pong", 8);
+        ctx.peers = Some(hub);
+        let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        let arr = r.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["subver"], "/rbitcoin:0.1.0(testnode0)/");
+        assert_eq!(arr[0]["inbound"], false);
+        assert_eq!(arr[0]["addr"], "127.0.0.1:18444");
+        assert!(arr[0]["bytesrecv_per_msg"]["pong"].as_u64().unwrap() >= 29);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addnode_and_disconnectnode_on_table() {
+        use rbitcoin_net::PeerHub;
+        let (mut ctx, dir) = ctx_empty();
+        let hub = PeerHub::new();
+        ctx.peers = Some(hub);
+        let e = dispatch(&ctx, "addnode", vec![json!("127.0.0.1:1"), json!("onetry")]).unwrap_err();
+        assert!(e["message"].as_str().unwrap().contains("dialer"), "{e}");
+        let e = dispatch(&ctx, "disconnectnode", vec![json!("127.0.0.1:1")]).unwrap_err();
+        assert_eq!(e["code"], ERR_CLIENT_NODE_NOT_CONNECTED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn addnode_two_nodes_see_each_other() {
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_net::P2PNode;
+        use rbitcoin_query::Query;
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-2n-{n}"));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let qa = Query::open_or_create(dir.join("a/store")).unwrap();
+        let qb = Query::open_or_create(dir.join("b/store")).unwrap();
+        let params = ChainParams::regtest();
+        let na = P2PNode::start_with_agent(
+            "127.0.0.1:0".parse().unwrap(),
+            qa,
+            params.clone(),
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(testnode0)/".into(),
+        )
+        .await
+        .unwrap();
+        let nb = P2PNode::start_with_agent(
+            "127.0.0.1:0".parse().unwrap(),
+            qb,
+            params,
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(testnode1)/".into(),
+        )
+        .await
+        .unwrap();
+        let (mut ctx_a, _d0) = ctx_empty();
+        ctx_a.peers = Some(Arc::clone(&na.peers));
+        let (mut ctx_b, _d1) = ctx_empty();
+        ctx_b.peers = Some(Arc::clone(&nb.peers));
+        let baddr = nb.local_addr.to_string();
+        dispatch(&ctx_a, "addnode", vec![json!(baddr), json!("onetry")]).unwrap();
+        let mut saw = false;
+        for _ in 0..80 {
+            let pa = dispatch(&ctx_a, "getpeerinfo", vec![]).unwrap();
+            let pb = dispatch(&ctx_b, "getpeerinfo", vec![]).unwrap();
+            let a_ok = pa.as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode1)/" && p["inbound"] == false)
+            });
+            let b_ok = pb.as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode0)/" && p["inbound"] == true)
+            });
+            if a_ok && b_ok {
+                saw = true;
+                let pong = pa[0]["bytesrecv_per_msg"]["pong"].as_u64().unwrap_or(0);
+                assert!(pong >= 29, "pong bytes {pong}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(saw, "two nodes must see each other via addnode");
+        na.shutdown().await;
+        // nb moved? keep drop
+        let _ = nb;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(_d0);
+        let _ = std::fs::remove_dir_all(_d1);
     }
 }

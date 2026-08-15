@@ -51,11 +51,12 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`) | done | Archive reconstruct |
-| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`) | partial | BIP324 v2-only; peer detail stub |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy |
 | Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |
-| Regtest `generatetoaddress` / `generateblock` / `generate` / `submitblock` | harness | **Regtest only.** Same confirm/accept path as P2P. Not a mining product. |
+| Regtest `generatetoaddress` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness | **Regtest only.** Same confirm/accept path as P2P. `setmocktime` is not a wall-clock hook. |
+| `invalidateblock` / `reconsiderblock` / `preciousblock` | done | Disconnect/re-accept; precious = equal-work preference |
 | Wallet / mining / GBT | **never** | Non-goal (no GBT / wallet keys) |
 | `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
 | `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB |

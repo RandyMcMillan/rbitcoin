@@ -28,6 +28,11 @@ impl RpcRegtest for HubRegtest {
             Err(e) => SubmitBlockOutcome::Rejected(e.to_string()),
         }
     }
+
+    fn set_mock_time(&self, timestamp: i64) -> Result<(), String> {
+        self.0.clock.set_mock(timestamp);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

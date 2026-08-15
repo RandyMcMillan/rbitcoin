@@ -6,6 +6,7 @@ use crate::error::NetError;
 use crate::ibd::IbdConfig;
 use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
 use crate::peer_dos::{inbound_semaphore, max_inbound_from_env};
+use crate::peers::{DialRequest, PeerConnType, PeerHub};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -53,6 +54,9 @@ pub struct P2PNode {
     /// Live outbound tip-follow sessions (inc/dec inside session task).
     follow_live: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
+    /// Live sessions for RPC getpeerinfo / addnode / disconnectnode.
+    pub peers: Arc<PeerHub>,
+    user_agent: String,
 }
 
 pub struct P2PHandle {
@@ -69,6 +73,17 @@ impl P2PNode {
         params: ChainParams,
         milestone: Milestone,
     ) -> Result<Self, NetError> {
+        Self::start_with_agent(listen, query, params, milestone, default_user_agent()).await
+    }
+
+    /// Like [`Self::start`] with an explicit BIP14 user-agent (RPC `subversion`).
+    pub async fn start_with_agent(
+        listen: SocketAddr,
+        query: Query,
+        params: ChainParams,
+        milestone: Milestone,
+        user_agent: String,
+    ) -> Result<Self, NetError> {
         let magic = magic_for_params(&params);
         let hub = Arc::new(ChainHub::new(query, params, milestone));
         hub.ensure_genesis()?;
@@ -78,9 +93,15 @@ impl P2PNode {
         let local_addr = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        let peers = PeerHub::new();
+        let (dial_tx, mut dial_rx) = tokio::sync::mpsc::unbounded_channel::<DialRequest>();
+        peers.set_dialer(dial_tx);
+
         let hub_c = hub.clone();
         let shutdown_c = shutdown.clone();
         let magic_c = magic;
+        let peers_in = peers.clone();
+        let ua_in = user_agent.clone();
         let max_inbound = max_inbound_from_env();
         let inbound_sem = inbound_semaphore(max_inbound);
         let accept_task = tokio::spawn(async move {
@@ -104,10 +125,16 @@ impl P2PNode {
                         let hub = hub_c.clone();
                         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
                         let tip_rx = hub.subscribe_tips();
+                        let peers = peers_in.clone();
+                        let ua = ua_in.clone();
+                        let bind = match stream.local_addr() {
+                            Ok(a) => a,
+                            Err(_) => our,
+                        };
                         tokio::spawn(async move {
                             let _permit = permit; // held for full session lifetime
-                            let (_ver, reader, writer) = match connect_and_handshake(
-                                stream, magic_c, our, peer_addr, height, true,
+                            let (ver, reader, writer) = match connect_and_handshake(
+                                stream, magic_c, our, peer_addr, height, true, &ua,
                             )
                             .await
                             {
@@ -120,18 +147,46 @@ impl P2PNode {
                                     return;
                                 }
                             };
-                            // Inbound: serve + tip announce + active getheaders pull.
+                            let sess =
+                                peers.register(peer_addr, bind, &ver, true, PeerConnType::Inbound);
+                            let id = sess.id;
                             let meta = FollowSessionMeta {
                                 peer: Some(peer_addr),
                                 live: None,
+                                session: Some(sess),
                             };
                             let _ =
                                 peer_session_with(reader, writer, magic_c, hub, tip_rx, meta).await;
+                            peers.unregister(id);
                         });
                     }
                     Ok(Err(_)) => break,
                     Err(_) => continue,
                 }
+            }
+        });
+
+        let follow_live = Arc::new(AtomicUsize::new(0));
+        let dial_hub = hub.clone();
+        let dial_peers = peers.clone();
+        let dial_ua = user_agent.clone();
+        let dial_live = follow_live.clone();
+        let dial_shutdown = shutdown.clone();
+        let dial_task = tokio::spawn(async move {
+            while let Some(req) = dial_rx.recv().await {
+                if dial_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let hub = dial_hub.clone();
+                let peers = dial_peers.clone();
+                let ua = dial_ua.clone();
+                let live = dial_live.clone();
+                tokio::spawn(async move {
+                    let _ = run_outbound_session(
+                        req.addr, magic, local_addr, hub, peers, ua, live, req.typ,
+                    )
+                    .await;
+                });
             }
         });
 
@@ -142,9 +197,16 @@ impl P2PNode {
             local_addr,
             magic,
             shutdown,
-            follow_live: Arc::new(AtomicUsize::new(0)),
-            tasks: vec![accept_task],
+            follow_live,
+            tasks: vec![accept_task, dial_task],
+            peers,
+            user_agent,
         })
+    }
+
+    /// BIP14 subversion advertised in `version` (same as RPC `getnetworkinfo`).
+    pub fn set_user_agent(&mut self, ua: impl Into<String>) {
+        self.user_agent = ua.into();
     }
 
     /// Number of live outbound tip-follow sessions.
@@ -209,25 +271,17 @@ impl P2PNode {
     /// any gap (e.g. blocks mined during SH materialize) is filled actively.
     /// Call [`Self::sync`] first when far behind (multi-thousand height IBD).
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
-        let stream = TcpStream::connect(peer).await?;
-        let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
-        let (_ver, reader, writer) =
-            connect_and_handshake(stream, self.magic, self.local_addr, peer, height, false).await?;
-        let hub = self.hub.clone();
-        let tip_rx = hub.subscribe_tips();
-        let magic = self.magic;
-        let live = self.follow_live.clone();
-        // Count as live now (handshake done); session task decrements on exit.
-        live.fetch_add(1, Ordering::SeqCst);
-        let meta = FollowSessionMeta {
-            peer: Some(peer),
-            live: Some(live),
-        };
-        let task = tokio::spawn(async move {
-            let _ = peer_session_with(reader, writer, magic, hub, tip_rx, meta).await;
-        });
-        self.tasks.push(task);
-        Ok(())
+        run_outbound_session(
+            peer,
+            self.magic,
+            self.local_addr,
+            self.hub.clone(),
+            self.peers.clone(),
+            self.user_agent.clone(),
+            self.follow_live.clone(),
+            PeerConnType::OutboundFullRelay,
+        )
+        .await
     }
 
     pub async fn wait_height(&self, height: u32, timeout: Duration) -> Result<(), NetError> {
@@ -271,6 +325,40 @@ impl P2PNode {
         // (or callers that need durability flush explicitly). Double multi‑GiB
         // msync/fdatasync was a multi-minute host freeze on exit.
     }
+}
+
+fn default_user_agent() -> String {
+    rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
+        .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")))
+}
+
+async fn run_outbound_session(
+    peer: SocketAddr,
+    magic: Magic,
+    local: SocketAddr,
+    hub: Arc<ChainHub>,
+    peers: Arc<PeerHub>,
+    user_agent: String,
+    follow_live: Arc<AtomicUsize>,
+    typ: PeerConnType,
+) -> Result<(), NetError> {
+    let stream = TcpStream::connect(peer).await?;
+    let bind = stream.local_addr().unwrap_or(local);
+    let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
+    let (ver, reader, writer) =
+        connect_and_handshake(stream, magic, local, peer, height, false, &user_agent).await?;
+    let sess = peers.register(peer, bind, &ver, false, typ);
+    let id = sess.id;
+    follow_live.fetch_add(1, Ordering::SeqCst);
+    let tip_rx = hub.subscribe_tips();
+    let meta = FollowSessionMeta {
+        peer: Some(peer),
+        live: Some(follow_live),
+        session: Some(sess),
+    };
+    let out = peer_session_with(reader, writer, magic, hub, tip_rx, meta).await;
+    peers.unregister(id);
+    out
 }
 
 /// Map our Network enum to bitcoin Magic.

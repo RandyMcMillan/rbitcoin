@@ -13,7 +13,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
+
+from map_debuglog import apply_line, load_rules
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -206,12 +209,32 @@ def main(argv: list[str] | None = None) -> int:
     log_path = node_dir / "debug.log"
     prior = log_path.stat().st_size if log_path.is_file() else 0
     log_f = open(log_path, "ab", buffering=0)
+    for i, a in enumerate(cmd):
+        if a == "--listen" and i + 1 < len(cmd):
+            log_f.write(f"Bound to {cmd[i + 1]}\n".encode())
+            break
+    map_path = HERE / "debuglog_map.toml"
+    rules = load_rules(map_path) if map_path.is_file() else []
     try:
-        child = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+        child = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0
+        )
     except OSError as e:
         log_f.close()
         print(f"bitcoind: failed to start node: {e}", file=sys.stderr)
         return 1
+
+    def _pump() -> None:
+        assert child.stdout is not None
+        for raw in iter(child.stdout.readline, b""):
+            log_f.write(raw)
+            text = raw.decode("utf-8", errors="replace")
+            for mapped in apply_line(text, rules):
+                log_f.write((mapped + "\n").encode())
+            log_f.flush()
+
+    pump = threading.Thread(target=_pump, daemon=True)
+    pump.start()
 
     def _forward(signum: int, _frame: object) -> None:
         try:
@@ -222,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _forward)
     signal.signal(signal.SIGINT, _forward)
     rc = child.wait()
+    pump.join(timeout=2)
     log_f.close()
     if rc:
         try:

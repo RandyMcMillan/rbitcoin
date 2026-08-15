@@ -175,6 +175,8 @@ pub(crate) async fn spawn_peer(
     sinks: PeerEventSinks,
 ) -> Result<PeerSlot, NetError> {
     let stream = TcpStream::connect(addr).await?;
+    let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
+        .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
     let (ver, reader, writer) = connect_and_handshake(
         stream,
         magic,
@@ -182,6 +184,7 @@ pub(crate) async fn spawn_peer(
         addr,
         tip_h.map(|h| h as i32).unwrap_or(0),
         false,
+        &ua,
     )
     .await?;
     // Peer's advertised chain height — used as IBD progress horizon when our

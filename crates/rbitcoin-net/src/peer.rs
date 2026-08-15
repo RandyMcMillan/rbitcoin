@@ -76,6 +76,8 @@ pub struct FollowSessionMeta {
     pub peer: Option<SocketAddr>,
     /// Live outbound follow count (inc on start, dec on exit).
     pub live: Option<Arc<AtomicUsize>>,
+    /// RPC session row (bytes + disconnect).
+    pub session: Option<Arc<crate::peers::LivePeer>>,
 }
 
 /// Decrements the live follow counter when a session task exits.
@@ -102,6 +104,7 @@ pub async fn connect_and_handshake(
     their_addr: SocketAddr,
     start_height: i32,
     inbound: bool,
+    user_agent: &str,
 ) -> Result<(VersionMessage, V2Reader, V2Writer), NetError> {
     let (mut reader, mut writer) = open_v2(stream, magic, inbound).await?;
     let their_version = application_handshake(
@@ -112,6 +115,7 @@ pub async fn connect_and_handshake(
         their_addr,
         start_height,
         inbound,
+        user_agent,
     )
     .await?;
     Ok((their_version, reader, writer))
@@ -126,6 +130,7 @@ async fn application_handshake(
     their_addr: SocketAddr,
     start_height: i32,
     inbound: bool,
+    user_agent: &str,
 ) -> Result<VersionMessage, NetError> {
     let services = local_service_flags();
     let now = SystemTime::now()
@@ -139,11 +144,7 @@ async fn application_handshake(
         receiver: Address::new(&their_addr, ServiceFlags::NONE),
         sender: Address::new(&our_addr, services),
         nonce: rand_nonce(),
-        user_agent: rbitcoin_primitives::rbitcoin_subversion(
-            env!("CARGO_PKG_VERSION"),
-            &[] as &[&str],
-        )
-        .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
+        user_agent: user_agent.to_string(),
         start_height,
         // Advertise willingness to receive tx inv when we have a mempool hub.
         // Actual inv processing is gated on MempoolHub::relay_enabled (tip mode).
@@ -196,6 +197,11 @@ async fn application_handshake(
     Ok(their_version)
 }
 
+fn framed_cmd(frame: &FramedMessage) -> String {
+    let end = frame.command.iter().position(|&b| b == 0).unwrap_or(12);
+    String::from_utf8_lossy(&frame.command[..end]).into_owned()
+}
+
 fn rand_nonce() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     // Concurrent dials often share the same wall-clock instant; a counter keeps
@@ -246,6 +252,8 @@ pub async fn peer_session_with(
         }),
     )
     .await;
+    // So `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29.
+    let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(rand_nonce())).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
 
@@ -284,10 +292,20 @@ pub async fn peer_session_with(
     // First tick completes immediately — skip so we don't double the bootstrap send.
     headers_poll.tick().await;
 
+    let session = meta.session.clone();
     let result = async {
         loop {
+            if session
+                .as_ref()
+                .is_some_and(|s| s.stop.load(Ordering::Relaxed))
+            {
+                return Ok(());
+            }
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep(Duration::from_millis(50)), if session.is_some() => {
+                    continue;
+                }
                 tip = tip_rx.recv() => {
                     match tip {
                         Ok(ev) => {
@@ -380,6 +398,9 @@ pub async fn peer_session_with(
                         }
                         Err(e) => return Err(e),
                     };
+                    if let Some(ref sess) = session {
+                        sess.note_recv(&framed_cmd(&frame), frame.payload_len() as u64);
+                    }
                     // Per-peer rate limit (msg + byte window) — disconnect when abused.
                     let frame_len = frame.payload_len();
                     if !rate.note(frame_len) {

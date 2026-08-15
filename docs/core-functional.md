@@ -27,8 +27,8 @@ python3 scripts/core-functional/check_inventory.py \
 `run` names, with `--v2transport`. A `skip` or unknown name fails with
 `not in run set` / `unknown test` (we do not `--exclude` every skip —
 Core exits if an exclude is not in the current test list).
-`--list` prints `run` names (`feature_help.py`, `feature_uacomment.py`
-today). `--dry-run` prints the command and writes `config.ini`
+`--list` prints `run` names (`feature_help.py`, `feature_uacomment.py`,
+`rpc_uptime.py` today). `--dry-run` prints the command and writes `config.ini`
 (wallet/zmq/ipc off) without starting a node. Default `cargo test`
 never calls this.
 
@@ -128,6 +128,18 @@ python3 scripts/core-functional/check_core_release.py --latest v31.1
 ./scripts/core-functional/check_core_release.test.sh
 # live list (network):
 python3 scripts/core-functional/check_core_release.py
+```
+
+## Debug.log map
+
+`debuglog_map.toml` + `map_debuglog.py`: the shim tails node stdio into
+`regtest/debug.log` and appends mapped Core substrings (line-buffered).
+Add a `[[rule]]` (`match` regex → `emit` lines with `{1}` captures) and
+flip the inventory row to `run` when every `assert_debug_log` string the
+test can hit is mapped or emitted natively. Unmapped stays `core-log`.
+
+```bash
+./scripts/core-functional/map_debuglog_test.sh
 ```
 
 ## Analog column

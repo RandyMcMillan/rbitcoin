@@ -791,6 +791,16 @@ fn sift_down(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
     }
 }
 
+/// When the compare key is the whole record (`key_len == rec_len`), equal
+/// keys are true duplicates — emit once. Payload-bearing families
+/// (`key_len < rec_len`) keep all equal-key records.
+fn should_skip_dup_key(key_len: usize, rec_len: u32, prev: Option<&[u8]>, rec: &[u8]) -> bool {
+    if key_len != rec_len as usize {
+        return false;
+    }
+    prev.is_some_and(|p| p == rec)
+}
+
 fn sift_up(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
     while i > 0 {
         let p = (i - 1) / 2;
@@ -936,12 +946,19 @@ pub fn for_each_merged_rec_opts(
     for i in (0..heap.len()).rev() {
         sift_down(&mut heap, i, key_len);
     }
+    let mut prev_rec: Option<Vec<u8>> = None;
     while !heap.is_empty() {
         let mut min = heap.swap_remove(0);
         if !heap.is_empty() {
             sift_down(&mut heap, 0, key_len);
         }
-        on_rec(min.cursor.rec())?;
+        let rec = min.cursor.rec();
+        if !should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec) {
+            on_rec(rec)?;
+            if key_len == rec_len as usize {
+                prev_rec = Some(rec.to_vec());
+            }
+        }
         if min.cursor.fill_next()? {
             heap.push(min);
             let last = heap.len() - 1;
@@ -963,7 +980,9 @@ pub struct MergeToFileResult {
 /// Stream-merge `inputs` into `out_path` **without** MANIFEST updates or deleting
 /// inputs. Caller manages catalog / cleanup. At most open `|inputs|` cursors.
 ///
-/// Equal keys: all records kept (SH multi-create). Streaming write (no full body RAM).
+/// Equal full-record keys (`key_len == rec_len`, SH) are deduped. Equal
+/// prefix keys with extra payload (`key_len < rec_len`) are all kept.
+/// Streaming write (no full body RAM).
 /// Uses [`RunWritePolicy::CATALOG`] (durable, unpaced, DONTNEED). Does not CRC-verify
 /// inputs (caller trusted them at spill); catalog [`merge_runs`] verifies.
 pub fn merge_runs_to_file(
@@ -1025,28 +1044,35 @@ pub fn merge_runs_to_file_with_policy(
             .map_err(|e| io_err(&tmp, e))?;
         let hdr = [0u8; HEADER_LEN];
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        let mut prev_rec: Option<Vec<u8>> = None;
         while !heap.is_empty() {
             let mut min = heap.swap_remove(0);
             if !heap.is_empty() {
                 sift_down(&mut heap, 0, key_len);
             }
             let rec = min.cursor.rec();
-            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
-            if track_fk && rec.len() >= 40 {
-                let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
-                if fk > max_u64_at_32 {
-                    max_u64_at_32 = fk;
+            let skip = should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec);
+            if !skip {
+                f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+                if track_fk && rec.len() >= 40 {
+                    let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+                    if fk > max_u64_at_32 {
+                        max_u64_at_32 = fk;
+                    }
                 }
-            }
-            for &b in rec {
-                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
-            }
-            count = count.saturating_add(1);
-            if policy.pace {
-                pace_since = pace_since.saturating_add(rec.len());
-                if pace_since >= PACE_CHUNK_BYTES {
-                    pace_since = 0;
-                    std::thread::sleep(PACE_SLEEP);
+                for &b in rec {
+                    body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
+                }
+                count = count.saturating_add(1);
+                if policy.pace {
+                    pace_since = pace_since.saturating_add(rec.len());
+                    if pace_since >= PACE_CHUNK_BYTES {
+                        pace_since = 0;
+                        std::thread::sleep(PACE_SLEEP);
+                    }
+                }
+                if key_len == rec_len as usize {
+                    prev_rec = Some(rec.to_vec());
                 }
             }
             if min.cursor.fill_next()? {
@@ -2035,6 +2061,55 @@ mod tests {
         // Re-claim is idempotent (open as-is).
         let again = claim_run_for_materialize(&mats[0]).unwrap();
         assert_eq!(again.path, claimed.path);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn sh_rec(sh0: u8, fk: u64) -> [u8; 40] {
+        let mut r = [0u8; 40];
+        r[0] = sh0;
+        r[32..40].copy_from_slice(&fk.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn sh_merge_orders_fks_across_runs_and_dedups() {
+        let d = tmp_dir();
+        let mut a = Vec::new();
+        a.extend_from_slice(&sh_rec(0xAA, 1));
+        a.extend_from_slice(&sh_rec(0xAA, 5));
+        a.extend_from_slice(&sh_rec(0xAA, 9));
+        let mut b = Vec::new();
+        b.extend_from_slice(&sh_rec(0xAA, 2));
+        b.extend_from_slice(&sh_rec(0xAA, 5));
+        b.extend_from_slice(&sh_rec(0xAA, 10));
+        write_sorted_run(&d.join("000001.run"), 40, 40, &a).unwrap();
+        write_sorted_run(&d.join("000002.run"), 40, 40, &b).unwrap();
+        let r1 = open_run(&d.join("000001.run")).unwrap();
+        let r2 = open_run(&d.join("000002.run")).unwrap();
+        let mut fks = Vec::new();
+        for_each_merged_rec(&[r1, r2], |rec| {
+            fks.push(u64::from_le_bytes(rec[32..40].try_into().unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fks, vec![1, 2, 5, 9, 10], "merge must FK-order and dedup");
+        let out = next_run_path(&d, 9);
+        let merged = merge_runs_to_file(
+            &[
+                open_run(&d.join("000001.run")).unwrap(),
+                open_run(&d.join("000002.run")).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(merged.count, 5);
+        assert_eq!(merged.key_len, 40);
+        let body = read_run_body(&merged).unwrap();
+        let mut got = Vec::new();
+        for chunk in body.chunks_exact(40) {
+            got.push(u64::from_le_bytes(chunk[32..40].try_into().unwrap()));
+        }
+        assert_eq!(got, vec![1, 2, 5, 9, 10]);
         let _ = fs::remove_dir_all(&d);
     }
 

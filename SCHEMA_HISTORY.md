@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **17** | **In flight.** SH runs `key_len=40` (unique `(sh, fk)`); refuse leftover `key_len=32` catalogs. More 17 changes expected. | **Current (open)** |
+| **17** | **In flight.** SH runs `key_len=40`; Class A thin meta + script kinds + 8 B spent. Refuse leftover `key_len=32` runs and 16-layout Class A with creates. More 17 may follow. | **Current (open)** |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
@@ -37,8 +37,15 @@ Not a closed layout. This version starts with an incompatible SH **run**
 contract: catalog records are sorted and unique on the full 40-byte
 `{scripthash[32]|create_fk[8]}` key (`key_len=40`). Schema-16 catalogs
 (`key_len=32`) are refused — wipe `store/scripthash.runs` and rematerialize.
-Class A and sealed SH head/body are unchanged. Further 17 file-layout
-changes may land before 18.
+
+The same 17 cutover packs **hot Class A**: thin LAYOUT17 `txout` meta
+(typical 3 B), script-kind templates 0–9 (including P2TR and P2A), and
+fixed **8 B** spent slots (`flags + u56`). Decode expands templates to
+wire scripts. Class A with creates in the 16-byte meta / 9-byte spent
+layout is refused (wipe datadir and redo IBD). Empty Class A may rewrite
+`meta`. `inwit` prevout encoding is unchanged (Δfk is a follow-up).
+
+Sealed SH head/body stay. Further 17 file-layout changes may land before 18.
 
 ## v16
 

@@ -6,7 +6,7 @@ without re-deriving client compatibility from scratch.
 
 | Note | Status |
 |------|--------|
-| [Class A storage pack](./class-a-storage-pack.md) | Parked. Spent 8 B / thin `txout` meta / script templates (incl. P2A) / inwit Δfk. **Not** `tx_height` (RAM fence shipped). |
+| [Class A storage pack](./class-a-storage-pack.md) | **Landing on schema 17** (PR 45): spent 8 B, thin meta, script kinds 0–9 including P2A. Inwit Δfk still parked (cold). |
 | [Confirm resolve + stamp phase](./confirm-resolve-stamp-phase.md) | **Shipped** (#29/#33). BQ-ahead TipOnly lookup; load stamps leftover TipOnly. |
 
 BIP-352 Electrum tweaks shipped (`--sptweaks`, `OPERATOR.md`, `COMPAT.md`).

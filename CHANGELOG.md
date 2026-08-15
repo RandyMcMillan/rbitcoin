@@ -71,13 +71,15 @@ before 1.0).
 
 ### Changed
 
-- **Schema 17 (in flight) — SH run catalogs are `key_len=40`:** leftover
+- **Schema 17 (in flight) — SH runs + Class A hot pack:** leftover
   schema-16 `scripthash.runs` (`key_len=32`) are refused (wipe
-  `store/scripthash.runs` and rematerialize). Empty/missing catalogs
-  soft-open; sealed SH head and Class A stay. Merge emits unique
+  `store/scripthash.runs` and rematerialize). Merge emits unique
   `(scripthash, create_fk)` order; cold megakey pack writes a 4 KiB page
-  as it fills (≤510 FKs in RAM). More 17 layout changes may follow
-  before 18.
+  as it fills (≤510 FKs in RAM). Class A writes thin LAYOUT17 `txout`
+  meta, script kinds 0–9 (P2TR/P2A included), and 8-byte spent slots.
+  Opening a store with creates in the 16-byte / 9-byte Class A layout
+  is refused (wipe datadir and redo IBD). Empty Class A soft-opens.
+  More 17 layout changes may follow before 18.
 
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
   external parents for at most **8** ready body-queue heights in one

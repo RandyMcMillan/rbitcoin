@@ -460,7 +460,7 @@ fn packed_output_spender_rels_multi_vout_one_walk() {
     // Schema 15: decode rels are txout output starts (not spent denserels).
     let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
     assert_eq!(decode_rels.len(), 4);
-    let mut off = TxRecord::BODY_META_LEN;
+    let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
     for (i, _) in outputs.iter().enumerate() {
         assert_eq!(decode_rels[i] as usize, off);
         assert!(off < raw.len());
@@ -547,7 +547,7 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
         let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
         assert_eq!(decode_rels.len(), outputs.len());
-        let mut off = TxRecord::BODY_META_LEN;
+        let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
         for (i, _) in outputs.iter().enumerate() {
             assert_eq!(decode_rels[i] as usize, off);
             off += OutputRecord::skip_at(&raw[off..]).unwrap();
@@ -1531,7 +1531,7 @@ fn tx_fixed_roundtrip() {
         output_count: 2,
     };
     let enc = rec.encode();
-    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    assert!(enc.len() > 32, "txid + thin meta");
     assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
 }
 
@@ -1561,8 +1561,7 @@ fn packed_tx_roundtrip() {
     let mut enc = Vec::new();
     encode_packed_tx(&tx, &inputs, &outputs, &mut enc);
     assert!(is_packed_tx_payload(&enc));
-    // Body meta starts without leading txid (schema 13).
-    assert_eq!(enc.len() >= TxRecord::BODY_META_LEN, true);
+    assert!(enc.len() >= 3, "thin LAYOUT17 meta");
     let (dtx, _dins, douts) = decode_packed_tx(&enc).unwrap();
     assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
     assert_eq!(dtx.input_count, 1);
@@ -1619,15 +1618,18 @@ fn inwit_and_txout_secret_xor_roundtrip() {
 
 #[test]
 fn short_or_truncated_packed_body_rejected() {
-    // Too short for body meta (schema 15 meta is 16 B).
     assert!(!is_packed_tx_payload(&[]));
     assert!(!is_packed_tx_payload(&[0u8; 15]));
     assert!(matches!(
         decode_packed_tx(&[0u8; 15]),
         Err(StoreError::Corrupt(_))
     ));
-    // 16 B zero meta = 0 in / 0 out — valid empty txout (+ trailing zero pad).
-    assert!(decode_packed_tx(&[0u8; 31]).is_ok());
+    // v17 empty tx (0 in / 0 out) is a valid packed payload.
+    let empty = rec_meta(1, 0, 0, 0);
+    let mut empty_raw = Vec::new();
+    empty.encode_body_meta_into(&mut empty_raw);
+    assert!(is_packed_tx_payload(&empty_raw));
+    assert!(decode_packed_tx(&empty_raw).is_ok());
     // Meta claims inputs/outputs but payload ends after body meta.
     let rec = TxRecord {
         txid: [1u8; 32],
@@ -1713,7 +1715,7 @@ fn packed_encode_decode_flags_and_error_arms() {
         output_count: 3,
     };
     let enc = meta.encode();
-    assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
+    assert!(enc.len() > 32);
     let dec = TxRecord::decode(&enc).unwrap();
     assert_eq!(dec.txid, meta.txid);
     assert_eq!(dec.version, -1);
@@ -1837,8 +1839,8 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert!(is_packed_tx_payload(&raw));
     assert!(!is_packed_tx_payload(&[]));
     assert!(!is_packed_tx_payload(&[0u8; 15]));
-    assert!(is_packed_tx_payload(&[0u8; 20])); // length gate only; decode may still fail
-    assert!(is_packed_tx_payload(&[0u8; 64]));
+    assert!(!is_packed_tx_payload(&[0u8; 20]));
+    assert!(!is_packed_tx_payload(&[0u8; 64]));
     let (m, ins, outs) = decode_packed_tx(&raw).unwrap();
     assert_eq!(m.txid, [0u8; 32], "body decode: no leading txid");
     assert_eq!(m.input_start_fk, Fk::NULL);
@@ -2139,21 +2141,17 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
     for (j, fk) in fks.iter().enumerate() {
         let (off, len) = t.body.record_range(*fk).unwrap();
         assert_eq!(off % 8, 0, "fk={} off={}", fk.0, off);
-        assert!(len >= TxRecord::BODY_META_LEN as u64);
+        assert!(len >= 3, "thin LAYOUT17 meta");
         let txid = t.body_txid(*fk).unwrap();
         assert_eq!(txid, items[j].0.txid, "sidefile identity");
         let (meta, ins, outs) = t.get_full(*fk).unwrap();
         assert_eq!(meta.txid, items[j].0.txid);
         assert_eq!(ins.len(), 1);
         assert_eq!(outs.len(), 1);
-        // Body meta no longer begins with txid (schema 13).
-        let mut prefix = [0u8; 4];
+        // Body meta is LAYOUT17 flags, not a leading txid.
+        let mut prefix = [0u8; 1];
         t.body.read_prefix_at(off, len, &mut prefix).unwrap();
-        assert_eq!(
-            i32::from_le_bytes(prefix),
-            items[j].0.version,
-            "body starts with version, not txid"
-        );
+        assert_eq!(prefix[0] & 0x80, 0x80, "body starts with LAYOUT17");
     }
     // Multi-batch: second batch pads from previous end.
     let mut more = Vec::new();
@@ -2785,8 +2783,8 @@ fn spent_slot_v17_fk_at_2pow56_is_corrupt() {
 }
 
 #[test]
-fn spent_slot_v17_len_constant_still_nine() {
-    assert_eq!(OutputRecord::SPENT_SLOT_LEN, 9);
+fn spent_slot_v17_len_constant_is_eight() {
+    assert_eq!(OutputRecord::SPENT_SLOT_LEN, 8);
 }
 
 #[test]

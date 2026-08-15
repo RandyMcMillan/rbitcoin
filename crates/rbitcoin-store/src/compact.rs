@@ -343,13 +343,33 @@ fn encode_op_return_push(data: &[u8]) -> Result<Vec<u8>, StoreError> {
     Ok(s)
 }
 
-// Keep the landing codecs compiled on the lib target until production cutover.
-const _: () = {
-    let _: fn(&[u8]) -> (u8, &[u8]) = classify_script;
-    let _: fn(u8, &[u8]) -> Result<Vec<u8>, StoreError> = expand_script_kind;
-    let _: fn(&[u8], &mut Vec<u8>) -> u8 = encode_script_kind_v17;
-    let _: fn(u8, &[u8]) -> Result<(Vec<u8>, usize), StoreError> = decode_script_kind_v17;
-};
+/// On-disk payload length for a v17 script kind (no expand).
+pub fn script_kind_v17_disk_used(kind: u8, buf: &[u8]) -> Result<usize, StoreError> {
+    match kind {
+        SCRIPT_KIND_V17_EMPTY | SCRIPT_KIND_V17_OP_TRUE | SCRIPT_KIND_V17_P2A => Ok(0),
+        SCRIPT_KIND_V17_P2PKH | SCRIPT_KIND_V17_P2SH | SCRIPT_KIND_V17_P2WPKH => {
+            if buf.len() < 20 {
+                return Err(StoreError::Corrupt("short v17 hash160 script payload"));
+            }
+            Ok(20)
+        }
+        SCRIPT_KIND_V17_P2WSH | SCRIPT_KIND_V17_P2TR => {
+            if buf.len() < 32 {
+                return Err(StoreError::Corrupt("short v17 hash256 script payload"));
+            }
+            Ok(32)
+        }
+        SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
+            let (slen, n) = read_compact_size(buf)?;
+            let slen = slen as usize;
+            if buf.len() < n + slen {
+                return Err(StoreError::Corrupt("v17 script payload truncated"));
+            }
+            Ok(n + slen)
+        }
+        _ => Err(StoreError::Corrupt("v17 reserved script kind")),
+    }
+}
 
 #[cfg(test)]
 mod tests {

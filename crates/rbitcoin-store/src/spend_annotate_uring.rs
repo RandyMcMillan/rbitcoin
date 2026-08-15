@@ -1,13 +1,13 @@
 //! Completion-driven io_uring RMW for Class A spender-meta annotation.
 //!
-//! Hot path: known absolute offset of the 9-byte `(spender_field:u64, flags:u8)`
-//! in `tx.body`. Machine:
+//! Hot path: known absolute offset of the 8-byte `(flags:u8, spender_field:u56)`
+//! in `spent.body`. Machine:
 //!
-//! 1. Submit pread of 9 B  
+//! 1. Submit pread of 8 B  
 //! 2. On read: decide sole / multi / promote / idempotent  
 //!    - multi or promote: **inline** mmap [`SpenderTable::append`] (needs read
 //!      result; same-outpoint edges are serialized so list order is stable)  
-//! 3. Submit pwrite of updated 9 B  
+//! 3. Submit pwrite of updated 8 B  
 //! 4. On write: free the slot and arm more work  
 //!
 //! At most one in-flight RMW per absolute offset (reorg double-annotate on the
@@ -16,7 +16,7 @@
 use crate::compact::output_flags;
 use crate::error::StoreError;
 use crate::spender_table::SpenderTable;
-use crate::tx_table::{OutputRecord, TxTable};
+use crate::tx_table::{decode_spent_slot_v17, encode_spent_slot_v17, OutputRecord, TxTable};
 use crate::uring_session::{self, UringSession};
 use crate::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
@@ -191,8 +191,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                             continue;
                         }
 
-                        let field = Fk(u64::from_le_bytes(st.buf[0..8].try_into().unwrap()));
-                        let flags0 = st.buf[8];
+                        let (flags0, field) = decode_spent_slot_v17(&st.buf)?;
                         let multi = flags0 & output_flags::MULTI_SPENDER != 0;
 
                         let (new_multi, new_field, skip_write) = if !multi && field.is_null() {
@@ -225,12 +224,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                             continue;
                         }
 
-                        st.buf[0..8].copy_from_slice(&new_field.0.to_le_bytes());
-                        if new_multi {
-                            st.buf[8] = flags0 | output_flags::MULTI_SPENDER;
+                        let new_flags = if new_multi {
+                            flags0 | output_flags::MULTI_SPENDER
                         } else {
-                            st.buf[8] = flags0 & !output_flags::MULTI_SPENDER;
-                        }
+                            flags0 & !output_flags::MULTI_SPENDER
+                        };
+                        st.buf = encode_spent_slot_v17(new_flags, new_field)?;
                         st.phase = Phase::Writing;
                         // Keep slot occupied for write buffer stability.
                         slots[slot] = Some(st);
@@ -373,9 +372,7 @@ fn decide_annotate(
 ) -> Result<AnnotateOp, StoreError> {
     let multi = flags & output_flags::MULTI_SPENDER != 0;
     if !multi && field.is_null() {
-        let mut meta = [0u8; META_LEN];
-        meta[0..8].copy_from_slice(&spend_fk.0.to_le_bytes());
-        meta[8] = flags & !output_flags::MULTI_SPENDER;
+        let meta = encode_spent_slot_v17(flags & !output_flags::MULTI_SPENDER, spend_fk)?;
         return Ok(AnnotateOp::Write(meta));
     }
     if !multi && field == spend_fk {
@@ -385,16 +382,12 @@ fn decide_annotate(
         // Promote sole → multi.
         let e1 = spenders.append(field, Fk::NULL)?;
         let e2 = spenders.append(spend_fk, e1)?;
-        let mut meta = [0u8; META_LEN];
-        meta[0..8].copy_from_slice(&e2.0.to_le_bytes());
-        meta[8] = flags | output_flags::MULTI_SPENDER;
+        let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e2)?;
         return Ok(AnnotateOp::Write(meta));
     }
     // Already multi: prepend list node.
     let e = spenders.append(spend_fk, field)?;
-    let mut meta = [0u8; META_LEN];
-    meta[0..8].copy_from_slice(&e.0.to_le_bytes());
-    meta[8] = flags | output_flags::MULTI_SPENDER;
+    let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e)?;
     Ok(AnnotateOp::Write(meta))
 }
 
@@ -1010,10 +1003,10 @@ mod tests {
     fn pure_write_two_pages_both_land() {
         for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
             let (dir, t, spenders) = temp_table();
-            // 500 × 9 B from file offset 16 crosses 4096.
-            let (cfk, off, _len) = put_n_outs(&t, 500, 0x33);
+            // 512 × 8 B from file offset 16 crosses 4096 (slot 510 starts at 4096).
+            let (cfk, off, _len) = put_n_outs(&t, 512, 0x33);
             let abs0 = crate::tx_table::spent_abs(off, 0);
-            let abs_last = crate::tx_table::spent_abs(off, 499);
+            let abs_last = crate::tx_table::spent_abs(off, 511);
             assert_ne!(
                 abs0 & !0xfff,
                 abs_last & !0xfff,
@@ -1024,7 +1017,7 @@ mod tests {
             let cold = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 499, Fk(2))],
+                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 511, Fk(2))],
                 &[k0, k1],
                 backend,
             )

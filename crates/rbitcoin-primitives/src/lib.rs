@@ -216,7 +216,7 @@ pub enum TableKind {
     SpTweaks = 15,
     /// Class A input-side + witness (`inwit.body`).
     Inwit = 16,
-    /// Class A sole-spender slots (`spent.body`, 9 B × n_out).
+    /// Class A sole-spender slots (`spent.body`, 8 B × n_out).
     Spent = 17,
 }
 

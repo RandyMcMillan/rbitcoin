@@ -1,5 +1,9 @@
 # Core-class JSON-RPC (rbitcoin)
 
+`params` may be a JSON **array** (positional) or **object** (Core named
+keys such as `blockhash`, `verbosity`, `txid`, `hexstring`). Missing
+required keys are `-32602`; unknown named keys are `-8`.
+
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
 This is **not** full Core parity: no wallet, no mining GBT, no `scantxoutset`,
 no `createrawtransaction`. Prefer **Electrum / Esplora** (with `--shindex`) for

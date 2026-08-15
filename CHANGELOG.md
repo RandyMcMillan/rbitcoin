@@ -34,6 +34,11 @@ before 1.0).
 
 ### Fixed
 
+- **Disconnecting a confirmed block logs `DisconnectTip` at warn:**
+  `Query::disconnect_tip` (every reorg / tip restore) emits
+  `DisconnectTip: hash=… height=… tx=…` so leaving the best chain is
+  never silent.
+
 - **IBD searches connecting blocks for a heavier disconnected header chain:**
   if tip+1 / the far work-path header does not meet the current tip, walk
   prev to the best-chain LCA and getdata the shortest prefix whose work beats

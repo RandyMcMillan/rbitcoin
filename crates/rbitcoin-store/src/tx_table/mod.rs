@@ -84,11 +84,11 @@ impl TxRecord {
 
 /// Schema-17 thin `txout` meta flags (codec only until Class A cutover).
 /// Bit 7 must be set so a v1 schema-15 prefix (`01 00 00 00`) cannot decode.
-pub(crate) const BODY_META_V17_LAYOUT17: u8 = 1 << 7;
-pub(crate) const BODY_META_V17_VER_1: u8 = 1 << 0;
-pub(crate) const BODY_META_V17_VER_2: u8 = 1 << 1;
-pub(crate) const BODY_META_V17_VER_3: u8 = 1 << 2;
-pub(crate) const BODY_META_V17_LOCKTIME_ZERO: u8 = 1 << 3;
+const BODY_META_V17_LAYOUT17: u8 = 1 << 7;
+const BODY_META_V17_VER_1: u8 = 1 << 0;
+const BODY_META_V17_VER_2: u8 = 1 << 1;
+const BODY_META_V17_VER_3: u8 = 1 << 2;
+const BODY_META_V17_LOCKTIME_ZERO: u8 = 1 << 3;
 const BODY_META_V17_RESERVED: u8 = 0x70;
 const BODY_META_V17_VER_MASK: u8 = BODY_META_V17_VER_1 | BODY_META_V17_VER_2 | BODY_META_V17_VER_3;
 
@@ -181,6 +181,12 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
         off,
     ))
 }
+
+// Keep the landing codecs compiled on the lib target until production cutover.
+const _: () = {
+    let _: fn(&TxRecord, &mut Vec<u8>) = encode_body_meta_v17;
+    let _: fn(&[u8]) -> Result<(TxRecord, usize), StoreError> = decode_body_meta_v17;
+};
 
 /// Class A output (addressed via `tx.output_start_fk` run + local vout).
 #[derive(Clone, Debug, PartialEq, Eq)]

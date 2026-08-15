@@ -1,6 +1,12 @@
 //! Tx table unit tests (peeled).
 
 use super::*;
+use crate::compact::{
+    classify_script, decode_script_kind_v17, encode_script_kind_v17, expand_script_kind,
+    SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
+    SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
+    SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
+};
 use crate::segmented_head::SegmentedTxHead;
 use rbitcoin_primitives::{Fk, TableKind};
 
@@ -2598,6 +2604,151 @@ fn body_meta_v17_rejects_missing_layout_bit() {
     match decode_body_meta_v17(&legacy) {
         Err(StoreError::Corrupt(m)) => {
             assert!(m.contains("LAYOUT17") || m.contains("legacy"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+fn p2pkh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0x76, 0xa9, 0x14];
+    s.extend_from_slice(&h160);
+    s.extend_from_slice(&[0x88, 0xac]);
+    s
+}
+
+fn p2sh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0xa9, 0x14];
+    s.extend_from_slice(&h160);
+    s.push(0x87);
+    s
+}
+
+fn p2wpkh_script(h160: [u8; 20]) -> Vec<u8> {
+    let mut s = vec![0x00, 0x14];
+    s.extend_from_slice(&h160);
+    s
+}
+
+fn p2wsh_script(h256: [u8; 32]) -> Vec<u8> {
+    let mut s = vec![0x00, 0x20];
+    s.extend_from_slice(&h256);
+    s
+}
+
+fn p2tr_script(xonly: [u8; 32]) -> Vec<u8> {
+    let mut s = vec![0x51, 0x20];
+    s.extend_from_slice(&xonly);
+    s
+}
+
+fn assert_kind_roundtrip(script: &[u8], kind: u8, classify_payload: &[u8], disk: &[u8]) {
+    assert_eq!(classify_script(script), (kind, classify_payload));
+    let mut buf = Vec::new();
+    let enc_kind = encode_script_kind_v17(script, &mut buf);
+    assert_eq!(enc_kind, kind);
+    assert_eq!(buf, disk);
+    let (got, n) = decode_script_kind_v17(kind, &buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got, script);
+    assert_eq!(expand_script_kind(kind, classify_payload).unwrap(), script);
+}
+
+#[test]
+fn script_kind_v17_empty() {
+    assert_kind_roundtrip(&[], SCRIPT_KIND_V17_EMPTY, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_op_true() {
+    assert_kind_roundtrip(&[0x51], SCRIPT_KIND_V17_OP_TRUE, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_p2pkh() {
+    let h = [0x11u8; 20];
+    assert_kind_roundtrip(&p2pkh_script(h), SCRIPT_KIND_V17_P2PKH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2sh() {
+    let h = [0x22u8; 20];
+    assert_kind_roundtrip(&p2sh_script(h), SCRIPT_KIND_V17_P2SH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2wpkh() {
+    let h = [0x33u8; 20];
+    assert_kind_roundtrip(&p2wpkh_script(h), SCRIPT_KIND_V17_P2WPKH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2wsh() {
+    let h = [0x44u8; 32];
+    assert_kind_roundtrip(&p2wsh_script(h), SCRIPT_KIND_V17_P2WSH, &h, &h);
+}
+
+#[test]
+fn script_kind_v17_p2tr_expands_to_wire() {
+    let x = [0x55u8; 32];
+    let script = p2tr_script(x);
+    assert_eq!(script[0], 0x51);
+    assert_eq!(script[1], 0x20);
+    assert_eq!(&script[2..], &x);
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_P2TR, &x, &x);
+}
+
+#[test]
+fn script_kind_v17_op_return_single_push() {
+    let data = [0xde, 0xad, 0xbe, 0xef];
+    let mut script = vec![0x6a, data.len() as u8];
+    script.extend_from_slice(&data);
+    let mut disk = Vec::new();
+    crate::compact::write_compact_size(&mut disk, data.len() as u64);
+    disk.extend_from_slice(&data);
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_OP_RETURN_PUSH, &data, &disk);
+}
+
+#[test]
+fn script_kind_v17_p2a_expands_to_wire() {
+    let script = [0x51, 0x02, 0x4e, 0x73];
+    assert_kind_roundtrip(&script, SCRIPT_KIND_V17_P2A, &[], &[]);
+}
+
+#[test]
+fn script_kind_v17_p2pkh_lookalike_stays_raw() {
+    let mut script = p2pkh_script([0x11; 20]);
+    script.push(0x00);
+    assert_eq!(script.len(), 26);
+    let (kind, payload) = classify_script(&script);
+    assert_eq!(kind, SCRIPT_KIND_V17_RAW);
+    assert_eq!(payload, script);
+    let mut buf = Vec::new();
+    let enc_kind = encode_script_kind_v17(&script, &mut buf);
+    assert_eq!(enc_kind, SCRIPT_KIND_V17_RAW);
+    let mut expect = Vec::new();
+    crate::compact::write_compact_size(&mut expect, script.len() as u64);
+    expect.extend_from_slice(&script);
+    assert_eq!(buf, expect);
+    let (got, n) = decode_script_kind_v17(enc_kind, &buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(got, script);
+}
+
+#[test]
+fn script_kind_v17_op_return_pushdata1_stays_raw() {
+    // Non-canonical PUSHDATA1 for a 4-byte payload must not take kind 8.
+    let script = vec![0x6a, 0x4c, 0x04, 0xde, 0xad, 0xbe, 0xef];
+    assert_eq!(classify_script(&script).0, SCRIPT_KIND_V17_RAW);
+}
+
+#[test]
+fn script_kind_v17_kind_ten_is_corrupt() {
+    match decode_script_kind_v17(10, &[]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(
+                m.contains("script kind") || m.contains("SCRIPT_KIND"),
+                "{m}"
+            );
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }

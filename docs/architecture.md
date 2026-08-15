@@ -119,6 +119,7 @@ headers / BQ / pending
     → MostWorkSelector (skip invalid-marked)
     → gather bodies (BQ · held-by-hash side bodies · Class A)
     → ChainHub::accept_branch (snapshot → disconnect → connect;
+         each disconnect logs DisconnectTip at warn;
          mid-branch fail restores prior tip; mark invalid; re-rank)
 ```
 

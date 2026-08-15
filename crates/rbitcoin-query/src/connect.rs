@@ -467,10 +467,16 @@ impl Query {
     /// Unstrong-before-tip would make tip txs fail `is_confirmed_strong` while
     /// tip is still high (permanent if kill). Mid-kill after tip shrink leaves
     /// strong **not on the new fence** → `repair_class_c_above_tip` heals.
+    ///
+    /// Every successful tip shrink logs [`format_disconnect_tip_line`] at **warn**.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
+        let hash = self
+            .header_at_height(height)?
+            .map(|(_, rec)| rec.hash)
+            .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
         // 1. Scripthash unlink only — do **not** clear strong yet.
@@ -504,6 +510,7 @@ impl Query {
         self.store.confirmed.disconnect_tip(height)?;
         self.store.height_fence_pop_tip(height);
         self.store.flush_confirmed_only()?;
+        log_disconnect_tip(height.0, &hash, tx_fks.len());
         // Height index: tip−1 remove when map was current; else rebuild on next ensure.
         if let Some(new_tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(new_tip);
@@ -522,4 +529,17 @@ impl Query {
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         Ok(())
     }
+}
+
+/// Operator line for one confirmed-block disconnect (reorg / restore).
+///
+/// Hash is Core display-order hex (`BlockHash` `Display`).
+pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], n_tx: usize) -> String {
+    let hash = BlockHash::from_byte_array(*hash);
+    format!("DisconnectTip: hash={hash} height={height} tx={n_tx}")
+}
+
+fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
+    // Warn: leaving a confirmed block is not the common path (reorg).
+    rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
 }

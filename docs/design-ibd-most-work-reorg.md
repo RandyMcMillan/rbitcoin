@@ -84,7 +84,8 @@ Re-rank → Attempt N → tip = N
 | Soft corrupt wire (prev unknown) | Re-getdata only — not a reorg |
 
 **Apply order:** assemble full path → `work_better` → `accept_branch`. Never
-disconnect until bodies are gathered. Mid-branch connect failure restores the
+disconnect until bodies are gathered. Each `disconnect_tip` logs
+`DisconnectTip` at warn. Mid-branch connect failure restores the
 pre-attempt tip hash (snapshot before disconnect).
 
 ## IBD triggers

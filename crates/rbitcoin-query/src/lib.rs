@@ -128,7 +128,7 @@ pub use batch_parents::{
 pub use catchup::IndexMode;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
-pub use connect::ConfirmPrepared;
+pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashChainStats,
@@ -2197,6 +2197,71 @@ mod tests {
         confirm_load_stats::COLD_IDX_NS.store(2_000_000, AtomicOrdering::Relaxed);
         confirm_load_stats::COLD_IDX_N.store(5, AtomicOrdering::Relaxed);
         let _ = confirm_load_stats::sample_and_reset();
+    }
+
+    /// Disconnecting a confirmed block must emit an info/warn line (not debug).
+    /// Source pin: every `disconnect_tip` path is the sole durable disconnect.
+    #[test]
+    fn disconnect_tip_logs_each_block_at_least_info() {
+        let src = include_str!("connect.rs");
+        let start = src
+            .find("pub fn disconnect_tip")
+            .expect("Query::disconnect_tip");
+        let rest = &src[start..];
+        let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("log_disconnect_tip(")
+                || body.contains("warn!")
+                || body.contains("info!"),
+            "disconnect_tip must log each leaving block at info/warn: {body}"
+        );
+        let log_body = src
+            .split("fn log_disconnect_tip")
+            .nth(1)
+            .expect("log_disconnect_tip helper")
+            .lines()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log_body.contains("warn!") || log_body.contains("info!"),
+            "disconnect log must be at least info: {log_body}"
+        );
+        assert!(
+            !log_body.contains("debug!") && !log_body.contains("trace!"),
+            "must not hide disconnects at debug/trace: {log_body}"
+        );
+
+        let (dir, q) = temp_query("disconnect-log");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let (h1, t1) = coinbase_block(1, q.tip_header_fk().unwrap().unwrap(), Some(hash0));
+        let hash1 = h1.hash;
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(1)));
+
+        q.disconnect_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        let line = format_disconnect_tip_line(1, &hash1, 1);
+        assert!(
+            line.contains("height=1"),
+            "disconnect line must name height: {line}"
+        );
+        assert!(
+            line.to_ascii_lowercase().contains("disconnect"),
+            "disconnect line must say disconnect: {line}"
+        );
+        let hash_disp = BlockHash::from_byte_array(hash1).to_string();
+        assert!(
+            line.contains(&hash_disp),
+            "disconnect line must name the leaving hash {hash_disp}: {line}"
+        );
+
+        q.disconnect_tip().unwrap();
+        assert!(q.tip_height().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.

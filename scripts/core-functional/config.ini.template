@@ -1,0 +1,27 @@
+# Written by scripts/core-functional/run.sh. Not a Core cmake product.
+# BITCOIND is the env override (see test_framework.util.get_binary_paths).
+
+[environment]
+CLIENT_NAME=Bitcoin Core
+CLIENT_BUGREPORT=https://github.com/reardencode/rbitcoin/issues
+SRCDIR=@SRCDIR@
+BUILDDIR=@BUILDDIR@
+EXEEXT=
+RPCAUTH=
+
+[components]
+ENABLE_WALLET=false
+BUILD_BENCH=false
+ENABLE_CLI=false
+ENABLE_BITCOIN_TX=false
+BUILD_BITCOIN_TX=false
+ENABLE_BITCOIN_UTIL=false
+ENABLE_BITCOIN_CHAINSTATE=false
+ENABLE_WALLET_TOOL=false
+ENABLE_BITCOIND=true
+ENABLE_FUZZ_BINARY=false
+ENABLE_ZMQ=false
+ENABLE_EMBEDDED_ASMAP=false
+ENABLE_EXTERNAL_SIGNER=false
+ENABLE_USDT_TRACEPOINTS=false
+ENABLE_IPC=false

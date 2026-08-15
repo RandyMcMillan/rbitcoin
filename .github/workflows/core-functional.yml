@@ -1,0 +1,36 @@
+# Core functional gate: nightly + dispatch + PRs labeled `core-functional`.
+# Unlabeled PRs do not start this job. Default cargo test never calls nightly.sh.
+#
+# Today the inventory `run` set is empty: job is sparse-init + inventory +
+# Core-release warn (does not fail) + run.sh --list.
+name: core-functional
+
+on:
+  schedule:
+    # Off the hour so we do not pile onto the public Actions stampede.
+    - cron: "27 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: core-functional-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  core-functional:
+    name: core-functional
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'core-functional')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: nightly (inventory + Core-release warn + --list)
+        run: ./scripts/core-functional/nightly.sh

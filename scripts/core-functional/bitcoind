@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Test-only bitcoind → rbitcoin-node adapter. Not the operator CLI.
+
+Maps Core TestNode argv + bitcoin.conf onto rbitcoin-node flags.
+`-datadir=DIR` becomes `--datadir DIR/regtest` so the cookie lands at
+`DIR/regtest/.cookie` (what BitcoinTestFramework tails).
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+
+
+def parse_kv(arg: str) -> tuple[str, str | None]:
+    a = arg[1:] if arg.startswith("-") else arg
+    # Core uses -name or -name=value (one dash). Allow --name too.
+    a = a[1:] if a.startswith("-") else a
+    if "=" in a:
+        k, v = a.split("=", 1)
+        return k, v
+    return a, None
+
+
+def read_conf(path: Path) -> dict[str, str]:
+    """Read bitcoin.conf. Later [section] keys override earlier ones."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("["):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip().lower()] = v.strip()
+    return out
+
+
+def find_node() -> Path:
+    env = os.environ.get("RBITCOIN_NODE")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return p
+        raise SystemExit(f"RBITCOIN_NODE={env} is not a file")
+    cands: list[Path] = []
+    td = os.environ.get("CARGO_TARGET_DIR")
+    if td:
+        cands += [Path(td) / "debug" / "rbitcoin-node", Path(td) / "release" / "rbitcoin-node"]
+    cands += [
+        ROOT / "target/dev/debug/rbitcoin-node",
+        ROOT / "target/debug/rbitcoin-node",
+    ]
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    which = shutil.which("rbitcoin-node")
+    if which:
+        return Path(which)
+    raise SystemExit(
+        "rbitcoin-node not found; set RBITCOIN_NODE or cargo build -p rbitcoin-node"
+    )
+
+
+def translate(argv: list[str]) -> tuple[list[str], Path]:
+    """Return (rbitcoin-node argv including binary, node datadir)."""
+    datadir: Path | None = None
+    rpcport: str | None = None
+    p2pport: str | None = None
+    network = "regtest"
+    debug = False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--print-cmd",):
+            i += 1
+            continue
+        key, val = parse_kv(a)
+        if val is None and key in (
+            "datadir",
+            "rpcport",
+            "port",
+            "bind",
+            "uacomment",
+            "loglevel",
+            "conf",
+        ):
+            i += 1
+            if i >= len(argv):
+                raise SystemExit(f"bitcoind: {a} requires a value")
+            val = argv[i]
+        if key == "datadir":
+            datadir = Path(val or "")
+        elif key == "rpcport":
+            rpcport = val
+        elif key == "port":
+            p2pport = val
+        elif key == "bind" and val:
+            # Skip Core's extra onion bind (127.0.0.1:P=onion).
+            if val.endswith("=onion") or "=onion" in val:
+                pass
+            else:
+                hostport = val.split("=", 1)[0]
+                if ":" in hostport:
+                    p2pport = hostport.rsplit(":", 1)[1]
+        elif key == "regtest":
+            network = "regtest"
+        elif key in ("debug",) or (key == "loglevel" and val):
+            debug = True
+        elif key in (
+            "server",
+            "disablewallet",
+            "v2transport",
+            "uacomment",
+            "logtimemicros",
+            "debugexclude",
+            "logthreadnames",
+            "logsourcelocations",
+            "nologratelimit",
+            "help",
+            "print-cmd",
+        ):
+            pass
+        else:
+            print(f"bitcoind: ignoring unknown flag {a}", file=sys.stderr)
+        i += 1
+
+    if datadir is None:
+        raise SystemExit("bitcoind: -datadir is required")
+
+    conf = read_conf(datadir / "bitcoin.conf")
+    if conf.get("regtest") in ("1", "true"):
+        network = "regtest"
+    if rpcport is None:
+        rpcport = conf.get("rpcport")
+    if p2pport is None:
+        p2pport = conf.get("port")
+    if rpcport is None:
+        rpcport = "18443"
+    if p2pport is None:
+        p2pport = "18444"
+
+    node_dir = datadir / network
+    node_dir.mkdir(parents=True, exist_ok=True)
+
+    node = find_node()
+    cmd = [
+        str(node),
+        "--network",
+        network,
+        "--datadir",
+        str(node_dir),
+        "--rpc-listen",
+        f"127.0.0.1:{rpcport}",
+        "--listen",
+        f"127.0.0.1:{p2pport}",
+        "--no-seeds",
+    ]
+    if debug:
+        cmd += ["--log-level", "debug"]
+    return cmd, node_dir
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    print_cmd = "--print-cmd" in argv
+    cmd, node_dir = translate(argv)
+    pid_path = node_dir / "bitcoind.pid"
+    if print_cmd:
+        print(" ".join(cmd))
+        print(f"pidfile {pid_path}", file=sys.stderr)
+        return 0
+    pid_path.write_text(f"{os.getpid()}\n")
+    os.execv(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

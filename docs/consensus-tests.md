@@ -19,18 +19,20 @@ cargo test -p rbitcoin-test --test scenarios consensus_
 
 ## Core consensus corpora (1:1 surface)
 
-Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
-`https://github.com/bitcoin/bitcoin` `master` (or a pinned tag) when expanding coverage.
+Staged each `cargo test` run from the Bitcoin Core **v31.1** submodule
+`third_party/bitcoin/src/test/data/` (MIT). Offline after
+`./scripts/core-functional/init-submodule.sh`. Bump the gitlink pin when
+refreshing; do not check copies into `tests/fixtures/`.
 
 | Fixture | Path | Harness | Success criterion |
 |---------|------|---------|-------------------|
-| `script_tests.json` | `crates/rbitcoin-consensus/tests/fixtures/` | `script::core_vectors::core_script_tests_all_rows` | **every** data row; `fail == 0` (no allowlist) |
+| `script_tests.json` | `third_party/bitcoin/src/test/data/` (staged to `$CARGO_TARGET_DIR/core-data/`) | `script::core_vectors::core_script_tests_all_rows` | **every** data row; `fail == 0` (no allowlist) |
 | `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept |
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 
 ### How the harness works
 
-1. Load vendored JSON (not network).
+1. Stage JSON from the submodule (not network, not an in-tree copy).
 2. Parse Core script language / hex txs.
 3. Build Core-style **credit/spend** txs (script_tests) or deserialize fixture txs (tx_*).
 4. Call shipped **`verify_job_all_inputs(ScriptCheckJob)`** (or bare EvalScript+P2SH path when `WITNESS` flag is off — Core treats v0 programs as bare without that flag).
@@ -42,7 +44,7 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 - There is **no** row skip inventory. A mismatch fails the test; fix the engine or
   the fixture interpretation before commit.
 - **Status:** all three Core JSON corpora green on the shipped path
-  (`script_tests` ~1233/1233, `tx_valid` 121/121, `tx_invalid` 93/93).
+  (`script_tests` 1222/1222 on Core v31.1, `tx_valid` 121/121, `tx_invalid` 93/93).
 
 ### rust-bitcoin vs Core fixtures
 

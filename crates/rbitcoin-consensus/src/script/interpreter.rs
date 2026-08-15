@@ -2207,6 +2207,85 @@ mod success_and_disabled_tests {
         assert!(eval(&script_ok, SigVersion::TapScript).expect("minimal empty if"));
     }
 
+    /// Local extras dropped from `script_tests.json` when pinning Core v31.1.
+    /// VERIFY must abort so a trailing `OP_1` cannot turn a failed check into success.
+    #[test]
+    fn checksigverify_then_op1_does_not_succeed() {
+        // <empty sig> <33-byte key> CHECKSIGVERIFY OP_1
+        let mut script = vec![0x00, 0x21];
+        script.extend_from_slice(&[
+            0x02, 0x86, 0x5c, 0x40, 0x29, 0x3a, 0x68, 0x0c, 0xb9, 0xc0, 0x20, 0xe7, 0xb1, 0xe1,
+            0x06, 0xd8, 0xc1, 0x91, 0x6d, 0x3c, 0xef, 0x99, 0xaa, 0x43, 0x1a, 0x56, 0xd2, 0x53,
+            0xe6, 0x92, 0x56, 0xda, 0xc0,
+        ]);
+        script.extend_from_slice(&[0xad, 0x51]); // CHECKSIGVERIFY 1
+        let err = eval(&script, SigVersion::Base).unwrap_err();
+        assert!(
+            format!("{err}").contains("CHECKSIGVERIFY"),
+            "VERIFY must hard-fail (not push false): {err}"
+        );
+
+        // Same with CHECKSIG (not VERIFY): false then 1 → script succeeds.
+        let mut soft = script.clone();
+        let n = soft.len();
+        soft[n - 2] = 0xac; // CHECKSIG
+        eval(&soft, SigVersion::Base).expect("CHECKSIG + OP_1 must succeed on a failed check");
+    }
+
+    #[test]
+    fn checkmultisigverify_then_op1_does_not_succeed() {
+        // dummy, empty sig, m=1, <key>, n=1, CHECKMULTISIGVERIFY, OP_1
+        let mut script = vec![0x00, 0x00, 0x51, 0x21];
+        script.extend_from_slice(&[
+            0x02, 0x86, 0x5c, 0x40, 0x29, 0x3a, 0x68, 0x0c, 0xb9, 0xc0, 0x20, 0xe7, 0xb1, 0xe1,
+            0x06, 0xd8, 0xc1, 0x91, 0x6d, 0x3c, 0xef, 0x99, 0xaa, 0x43, 0x1a, 0x56, 0xd2, 0x53,
+            0xe6, 0x92, 0x56, 0xda, 0xc0,
+        ]);
+        script.extend_from_slice(&[0x51, 0xaf, 0x51]);
+        let err = eval(&script, SigVersion::Base).unwrap_err();
+        assert!(
+            format!("{err}").contains("CHECKMULTISIGVERIFY"),
+            "CMSVERIFY must hard-fail (not push false): {err}"
+        );
+    }
+
+    #[test]
+    fn cltv_empty_stack_is_invalid() {
+        let err = eval(&[0xb1], SigVersion::Base).unwrap_err();
+        assert!(
+            format!("{err}").contains("stack"),
+            "empty-stack CLTV: {err}"
+        );
+    }
+
+    #[test]
+    fn cltv_and_csv_negative_zero_is_not_negative() {
+        // 0x80 is scriptnum negative-zero → 0, not < 0.
+        assert_eq!(scriptnum_decode_width(&[0x80], 5, false).unwrap(), 0);
+
+        // eval() uses nLockTime=0 and final nSequence (Core script_tests template).
+        // CLTV(0) then fails final-sequence / unsatisfied — never "negative".
+        let cltv = vec![0x01, 0x80, 0xb1];
+        let err = eval(&cltv, SigVersion::Base).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.to_lowercase().contains("negative"),
+            "0x80 must not take the CLTV-negative branch: {msg}"
+        );
+        assert!(
+            msg.contains("CLTV") || msg.contains("final"),
+            "expected unsatisfied/final, got {msg}"
+        );
+
+        let csv = vec![0x01, 0x80, 0xb2];
+        let err = eval(&csv, SigVersion::Base).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.to_lowercase().contains("negative"),
+            "0x80 must not take the CSV-negative branch: {msg}"
+        );
+    }
+
     #[test]
     fn cltv_negative_locktime_rejected() {
         // OP_1NEGATE CLTV …

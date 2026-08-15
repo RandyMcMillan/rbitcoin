@@ -234,6 +234,10 @@ Required PR/push jobs (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml
 The UI shows which gate failed. **`musl.yml`** is **not** required (runs after
 green `master` `ci` and uploads node/cli + `SHA256SUMS`).
 
+Label **`core-functional`** when the PR touches the Core functional harness
+(shim, `run.sh`, generate, named params, peer RPCs, inventory). That runs
+`scripts/core-functional/nightly.sh`. Unlabeled PRs keep the cargo gates only.
+
 `origin` stays **SSH** (`git@github.com:reardencode/rbitcoin.git`). The operator
 auths over SSH only. This VM has **no** GitHub App SSH key (`Permission denied
 (publickey)`). The App token from `~/.config/rbitcoin-grok/gh-login.sh` (~1h)

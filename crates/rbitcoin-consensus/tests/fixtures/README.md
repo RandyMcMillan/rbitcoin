@@ -2,23 +2,22 @@
 
 | File | Origin | License |
 |------|--------|---------|
-| `script_tests.json` | Bitcoin Core `src/test/data/script_tests.json` | MIT |
-| `tx_valid.json` | Bitcoin Core `src/test/data/tx_valid.json` | MIT |
-| `tx_invalid.json` | Bitcoin Core `src/test/data/tx_invalid.json` | MIT |
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
 | `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
 
-Core JSON files are vendored for offline CI. Update by re-fetching from
-`https://github.com/bitcoin/bitcoin` `master` (or a pinned tag) when expanding coverage:
+Core JSON corpora (`script_tests.json`, `tx_valid.json`, `tx_invalid.json`)
+are **not** checked in here. Each `cargo test` run hard-links or copies them
+from Bitcoin Core **v31.1**
+(`9be056a8a72b624dae9623b2f7bded92c2a21c91`) at
+`third_party/bitcoin/src/test/data/` into `$CARGO_TARGET_DIR/core-data/`.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/script_tests.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/script_tests.json
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/tx_valid.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/tx_valid.json
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/tx_invalid.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/tx_invalid.json
+./scripts/core-functional/init-submodule.sh   # also invoked by cargo test / coverage.sh if missing
+./scripts/core-functional/sync-core-fixtures.sh --check   # submodule present; no copies here
 ```
+
+Do **not** curl from `master` and do **not** add rows to those JSON files —
+add a rust unit instead.
 
 ## Harness
 

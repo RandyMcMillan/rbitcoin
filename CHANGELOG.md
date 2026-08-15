@@ -11,6 +11,44 @@ before 1.0).
 
 ### Added
 
+- **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
+  shallow gitlink at `9be056a`. `cargo test` hard-links or copies
+  `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from
+  `src/test/data` into `$CARGO_TARGET_DIR/core-data` every run (no in-tree
+  copies). Missing pin: the fixture helper and `scripts/coverage.sh` run
+  `./scripts/core-functional/init-submodule.sh` (sparse ~16 MiB).
+  `sync-core-fixtures.sh --check` requires the three files in the submodule
+  and none under `tests/fixtures/`.
+
+- **Local extras after the v31.1 pin:** rust units for CHECKSIGVERIFY /
+  CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
+  and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
+
+- **Core functional nightly job:** `.github/workflows/core-functional.yml`
+  runs `scripts/core-functional/nightly.sh` on cron, `workflow_dispatch`,
+  and PRs labeled `core-functional`. Unlabeled PRs keep cargo gates only.
+  The job warns — does not fail — when a newer final Bitcoin Core release
+  exists than `inventory.toml` `pin` (semver of published finals, not
+  GitHub `/releases/latest`). Bump the submodule, fixtures, and inventory
+  when it fires.
+
+- **Core functional bitcoind shim:** `scripts/core-functional/bitcoind`
+  starts `rbitcoin-node` from TestNode argv (`-datadir` → `DIR/regtest`
+  so the cookie is `{datadir}/regtest/.cookie`). Clean chain:
+  `getblockcount` is 0; RPC `stop` shuts down. Not the operator CLI.
+
+- **Core functional runner:** `scripts/core-functional/run.sh` invokes Core
+  `test_runner.py` only for inventory `run` names (`--v2transport`,
+  `--exclude` every skip). A skip name fails `not in run set`. `--list` /
+  `--dry-run` need no node. Default `cargo test` does not call it.
+
+- **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
+  classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
+  reason; `analog` required for prune / LevelDB / UTXO-set skips).
+  `python3 scripts/core-functional/check_inventory.py` fails on an unknown
+  or incomplete row. See [`docs/core-functional.md`](docs/core-functional.md).
+  No Core scripts run in default `cargo test` yet.
+
 - **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
   on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
   other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag

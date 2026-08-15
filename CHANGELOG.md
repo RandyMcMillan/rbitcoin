@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Core v31.1 submodule + fixture check:** `third_party/bitcoin` is a
+  shallow gitlink at `9be056a`. `scripts/core-functional/sync-core-fixtures.sh
+  --check` requires in-tree `script_tests.json` / `tx_valid.json` /
+  `tx_invalid.json` to match `src/test/data/`. `cargo test` still uses the
+  copies and does not need the submodule.
+  `./scripts/core-functional/init-submodule.sh` does the sparse checkout.
+
 - **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
   classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
   reason; `analog` required for prune / LevelDB / UTXO-set skips).

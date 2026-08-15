@@ -2,12 +2,21 @@
 
 Pin: **Bitcoin Core v31.1** (`9be056a8a72b624dae9623b2f7bded92c2a21c91`).
 
-This directory of scripts (`scripts/core-functional/`) will grow a shim and
-runner. **Step 0 (this doc):** classify every Core `test/functional/*.py` and
-refuse an incomplete inventory. We do **not** copy the 267 test files; they
-will come from a submodule in a later PR.
+`scripts/core-functional/` holds the inventory, checkers, and (later) the
+bitcoind shim. Core’s Python tests and `src/test/data` live in the
+**`third_party/bitcoin` submodule** (v31.1). We do **not** copy the 267
+`*.py` files into this repo.
 
-Default `cargo test` never runs these Python tests.
+Default `cargo test` never runs those Python tests. Consensus JSON corpora
+are in-tree copies of the submodule files (see
+`crates/rbitcoin-consensus/tests/fixtures/README.md`).
+
+```bash
+./scripts/core-functional/init-submodule.sh
+./scripts/core-functional/sync-core-fixtures.sh --check
+python3 scripts/core-functional/check_inventory.py \
+  --tests-dir third_party/bitcoin/test/functional
+```
 
 ## Check the inventory
 

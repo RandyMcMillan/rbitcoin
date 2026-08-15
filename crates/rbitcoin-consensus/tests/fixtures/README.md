@@ -8,17 +8,20 @@
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
 | `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
 
-Core JSON files are vendored for offline CI. Update by re-fetching from
-`https://github.com/bitcoin/bitcoin` `master` (or a pinned tag) when expanding coverage:
+Core JSON files are **in-tree copies** so `cargo test` works without a
+submodule. Source of truth is Bitcoin Core **v31.1**
+(`9be056a8a72b624dae9623b2f7bded92c2a21c91`) at
+`third_party/bitcoin/src/test/data/` after:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/script_tests.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/script_tests.json
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/tx_valid.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/tx_valid.json
-curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/tx_invalid.json \
-  -o crates/rbitcoin-consensus/tests/fixtures/tx_invalid.json
+./scripts/core-functional/init-submodule.sh
+./scripts/core-functional/sync-core-fixtures.sh --check   # must be silent-ok
+# after a pin bump:
+./scripts/core-functional/sync-core-fixtures.sh --write
 ```
+
+Do **not** curl from `master`. Extra local rows do not belong in these JSON
+files — add a rust unit instead.
 
 ## Harness
 

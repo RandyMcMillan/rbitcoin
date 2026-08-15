@@ -42,7 +42,7 @@ Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
 - There is **no** row skip inventory. A mismatch fails the test; fix the engine or
   the fixture interpretation before commit.
 - **Status:** all three Core JSON corpora green on the shipped path
-  (`script_tests` ~1233/1233, `tx_valid` 121/121, `tx_invalid` 93/93).
+  (`script_tests` 1222/1222 on Core v31.1, `tx_valid` 121/121, `tx_invalid` 93/93).
 
 ### rust-bitcoin vs Core fixtures
 

@@ -21,6 +21,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+# Core JSON corpora are staged from the v31.1 submodule (not in-tree copies).
+./scripts/core-functional/init-submodule.sh
+
 # Ensure bins exist for binary smoke scenarios (instrumented tree).
 cargo build -p rbitcoin-node -p rbitcoin-cli
 

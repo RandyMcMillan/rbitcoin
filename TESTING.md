@@ -191,7 +191,7 @@ gate. The bitcoind shim / `run.sh` / nightly job come in later PRs. Default
 python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/check_inventory_test.sh
 ./scripts/core-functional/sync-core-fixtures.test.sh
-# needs submodule (optional for cargo test):
+# cargo test stages Core JSON from the submodule:
 ./scripts/core-functional/init-submodule.sh
 ./scripts/core-functional/sync-core-fixtures.sh --check
 ```

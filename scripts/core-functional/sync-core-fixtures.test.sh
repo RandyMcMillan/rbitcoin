@@ -44,25 +44,24 @@ trap cleanup EXIT
 
 CORE="$WORKDIR/core-data"
 OURS="$WORKDIR/fixtures"
+STAGE="$WORKDIR/stage"
 mkdir -p "$CORE" "$OURS"
 printf '{}\n' >"$CORE/script_tests.json"
 printf '{}\n' >"$CORE/tx_valid.json"
 printf '{}\n' >"$CORE/tx_invalid.json"
-cp "$CORE/script_tests.json" "$OURS/script_tests.json"
-cp "$CORE/tx_valid.json" "$OURS/tx_valid.json"
-cp "$CORE/tx_invalid.json" "$OURS/tx_invalid.json"
 
-assert_ok "check matches" \
+assert_ok "check with no in-tree copies" \
   "$SYNC" --check --core-data "$CORE" --fixtures "$OURS"
 
 printf 'stale\n' >"$OURS/script_tests.json"
-assert_fail_msg "check reports mismatch" "fixture mismatch: script_tests.json" \
+assert_fail_msg "check rejects in-tree copy" "in-tree copy must not exist: script_tests.json" \
   "$SYNC" --check --core-data "$CORE" --fixtures "$OURS"
+rm -f "$OURS/script_tests.json"
 
-assert_ok "write restores" \
-  "$SYNC" --write --core-data "$CORE" --fixtures "$OURS"
-assert_ok "check after write" \
-  "$SYNC" --check --core-data "$CORE" --fixtures "$OURS"
+assert_ok "write stages dest" \
+  "$SYNC" --write --core-data "$CORE" --dest "$STAGE"
+test -f "$STAGE/tx_valid.json"
+assert_ok "staged file exists" true
 
 rm -f "$CORE/tx_valid.json"
 assert_fail_msg "missing core file" "missing core fixture: tx_valid.json" \

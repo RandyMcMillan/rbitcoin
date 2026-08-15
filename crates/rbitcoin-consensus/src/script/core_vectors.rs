@@ -15,12 +15,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::script::Script;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::Value;
-use std::path::PathBuf;
 
 fn load_json() -> Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/script_tests.json");
-    let s = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("missing {path:?}: {e} (vendor Core script_tests.json)"));
+    let path = super::core_fixture::stage_core_json("script_tests.json");
+    let s = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing {path:?}: {e}"));
     serde_json::from_str(&s).expect("script_tests.json")
 }
 

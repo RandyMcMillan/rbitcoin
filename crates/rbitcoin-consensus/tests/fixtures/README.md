@@ -2,26 +2,22 @@
 
 | File | Origin | License |
 |------|--------|---------|
-| `script_tests.json` | Bitcoin Core `src/test/data/script_tests.json` | MIT |
-| `tx_valid.json` | Bitcoin Core `src/test/data/tx_valid.json` | MIT |
-| `tx_invalid.json` | Bitcoin Core `src/test/data/tx_invalid.json` | MIT |
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
 | `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
 
-Core JSON files are **in-tree copies** so `cargo test` works without a
-submodule. Source of truth is Bitcoin Core **v31.1**
+Core JSON corpora (`script_tests.json`, `tx_valid.json`, `tx_invalid.json`)
+are **not** checked in here. Each `cargo test` run hard-links or copies them
+from Bitcoin Core **v31.1**
 (`9be056a8a72b624dae9623b2f7bded92c2a21c91`) at
-`third_party/bitcoin/src/test/data/` after:
+`third_party/bitcoin/src/test/data/` into `$CARGO_TARGET_DIR/core-data/`.
 
 ```bash
-./scripts/core-functional/init-submodule.sh
-./scripts/core-functional/sync-core-fixtures.sh --check   # must be silent-ok
-# after a pin bump:
-./scripts/core-functional/sync-core-fixtures.sh --write
+./scripts/core-functional/init-submodule.sh   # also invoked by cargo test / coverage.sh if missing
+./scripts/core-functional/sync-core-fixtures.sh --check   # submodule present; no copies here
 ```
 
-Do **not** curl from `master`. Extra local rows do not belong in these JSON
-files — add a rust unit instead.
+Do **not** curl from `master` and do **not** add rows to those JSON files —
+add a rust unit instead.
 
 ## Harness
 

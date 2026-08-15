@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Shallow, sparse checkout of bitcoin/bitcoin @ the inventory pin (v31.1).
-# cargo test does not need this — only fixture --check and later the Python runner.
+# cargo test stages script_tests.json / tx_*.json from src/test/data each run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEST="${ROOT}/third_party/bitcoin"
 PIN_SHA="9be056a8a72b624dae9623b2f7bded92c2a21c91"
 URL="https://github.com/bitcoin/bitcoin.git"
+
+# cargo test may stage fixtures from several processes at once.
+mkdir -p "$(dirname "$DEST")"
+exec 9>"$(dirname "$DEST")/.init-bitcoin.lock"
+flock 9
 
 if [[ ! -e "${DEST}/.git" && ! -f "${DEST}/.git" ]]; then
   mkdir -p "$(dirname "$DEST")"

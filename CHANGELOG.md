@@ -11,12 +11,18 @@ before 1.0).
 
 ### Added
 
-- **Core v31.1 submodule + fixture check:** `third_party/bitcoin` is a
-  shallow gitlink at `9be056a`. `scripts/core-functional/sync-core-fixtures.sh
-  --check` requires in-tree `script_tests.json` / `tx_valid.json` /
-  `tx_invalid.json` to match `src/test/data/`. `cargo test` still uses the
-  copies and does not need the submodule.
-  `./scripts/core-functional/init-submodule.sh` does the sparse checkout.
+- **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
+  shallow gitlink at `9be056a`. `cargo test` hard-links or copies
+  `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from
+  `src/test/data` into `$CARGO_TARGET_DIR/core-data` every run (no in-tree
+  copies). Missing pin: the fixture helper and `scripts/coverage.sh` run
+  `./scripts/core-functional/init-submodule.sh` (sparse ~16 MiB).
+  `sync-core-fixtures.sh --check` requires the three files in the submodule
+  and none under `tests/fixtures/`.
+
+- **Local extras after the v31.1 pin:** rust units for CHECKSIGVERIFY /
+  CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
+  and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
 
 - **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
   classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +

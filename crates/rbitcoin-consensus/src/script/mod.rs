@@ -13,6 +13,8 @@ mod p2wpkh;
 mod p2wsh;
 
 #[cfg(test)]
+mod core_fixture;
+#[cfg(test)]
 mod core_tx_vectors;
 #[cfg(test)]
 mod core_vectors;

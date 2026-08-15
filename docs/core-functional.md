@@ -8,7 +8,8 @@ bitcoind shim. Core’s Python tests and `src/test/data` live in the
 `*.py` files into this repo.
 
 Default `cargo test` never runs those Python tests. Consensus JSON corpora
-are in-tree copies of the submodule files (see
+are staged from the submodule each run (the helper runs `init-submodule.sh`
+if the pin is missing; see
 `crates/rbitcoin-consensus/tests/fixtures/README.md`).
 
 ```bash

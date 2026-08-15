@@ -17,9 +17,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
+    super::core_fixture::stage_core_json(name)
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {

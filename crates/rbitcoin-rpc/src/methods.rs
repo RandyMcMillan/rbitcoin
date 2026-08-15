@@ -53,6 +53,8 @@ pub struct RpcContext {
     pub regtest: Option<Arc<dyn RpcRegtest>>,
     /// Live P2P sessions (`getpeerinfo` / `addnode` / `disconnectnode`).
     pub peers: Option<Arc<rbitcoin_net::PeerHub>>,
+    /// Live chain (invalidate / reconsider / precious).
+    pub chain: Option<Arc<rbitcoin_net::ChainHub>>,
 }
 
 /// Outcome of `submitblock` (Core: `null` or a reject-reason string).
@@ -282,6 +284,9 @@ pub fn dispatch(
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
+        "invalidateblock" => invalidateblock(ctx, &params),
+        "reconsiderblock" => reconsiderblock(ctx, &params),
+        "preciousblock" => preciousblock(ctx, &params),
         "createrawtransaction"
         | "combinerawtransaction"
         | "scantxoutset"
@@ -342,6 +347,9 @@ const METHOD_LIST: &[&str] = &[
     "generate",
     "submitblock",
     "setmocktime",
+    "invalidateblock",
+    "reconsiderblock",
+    "preciousblock",
 ];
 
 fn method_help(m: &str) -> String {
@@ -1085,11 +1093,80 @@ fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["timestamp"])?;
+    require_regtest(ctx, "setmocktime")?;
     let miner = require_regtest_miner(ctx, "setmocktime")?;
-    let ts = params.req_u64(0, "timestamp")?;
+    let raw = params.req(0, "timestamp")?;
+    let ts = mocktime_i64(raw)?;
     miner
-        .set_mock_time(ts as i64)
+        .set_mock_time(ts)
         .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(Value::Null)
+}
+
+fn mocktime_i64(v: &Value) -> Result<i64, Value> {
+    let n = match v {
+        Value::Number(n) => n,
+        _ => {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "timestamp must be an integer",
+            ));
+        }
+    };
+    let i = n
+        .as_i64()
+        .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()));
+    let Some(i) = i else {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "timestamp must be an integer",
+        ));
+    };
+    if i < 0 || i > 9_223_372_036 {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Mocktime must be in the range [0, 9223372036], not {i}."),
+        ));
+    }
+    Ok(i)
+}
+
+fn require_chain(ctx: &RpcContext) -> Result<&rbitcoin_net::ChainHub, Value> {
+    ctx.chain
+        .as_deref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "chain hub not attached"))
+}
+
+fn parse_blockhash_param(params: &RpcParams) -> Result<bitcoin::BlockHash, Value> {
+    let hex = params.req_str(0, "blockhash")?;
+    let b = parse_hash32_display(hex)?;
+    Ok(bitcoin::BlockHash::from_byte_array(b))
+}
+
+fn invalidateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.invalidate_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(Value::Null)
+}
+
+fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.reconsider_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(Value::Null)
+}
+
+fn preciousblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let hub = require_chain(ctx)?;
+    let hash = parse_blockhash_param(params)?;
+    hub.precious_block(hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     Ok(Value::Null)
 }
 
@@ -1221,6 +1298,7 @@ mod tests {
             .unwrap(),
             regtest: None,
             peers: None,
+            chain: None,
         };
         (ctx, dir)
     }
@@ -1456,6 +1534,7 @@ mod tests {
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: None,
             peers: None,
+            chain: None,
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -1496,6 +1575,7 @@ mod tests {
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: None,
             peers: None,
+            chain: None,
         };
 
         let tip_h = chain.tip_height();
@@ -1751,6 +1831,7 @@ mod tests {
             subversion: "/rbitcoin:0.1.0/".into(),
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
             peers: None,
+            chain: Some(Arc::clone(&hub)),
         };
         (ctx, dir, hub)
     }
@@ -1850,6 +1931,39 @@ mod tests {
             "bad merkle reject: {r}"
         );
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_reconsider_tip() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let tip = dispatch(&ctx, "getbestblockhash", vec![])
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        dispatch(&ctx, "invalidateblock", vec![json!(tip.clone())]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
+        dispatch(&ctx, "reconsiderblock", vec![json!(tip)]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_negative_is_invalid_parameter() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let e = dispatch(&ctx, "setmocktime", vec![json!(-1)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Mocktime must be in the range [0, 9223372036], not -1."),
+            "{e}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

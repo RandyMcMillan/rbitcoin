@@ -182,6 +182,7 @@ impl PeerHub {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, Arc::clone(&peer));
+        rbitcoin_log::debug!("Added connection peer={id}");
         peer
     }
 

@@ -56,6 +56,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |
 | Regtest `generatetoaddress` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness | **Regtest only.** Same confirm/accept path as P2P. `setmocktime` is not a wall-clock hook. |
+| `invalidateblock` / `reconsiderblock` / `preciousblock` | done | Disconnect/re-accept; precious = equal-work preference |
 | Wallet / mining / GBT | **never** | Non-goal (no GBT / wallet keys) |
 | `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
 | `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB |

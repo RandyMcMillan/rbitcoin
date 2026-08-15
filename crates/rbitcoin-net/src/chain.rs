@@ -14,7 +14,7 @@ use rbitcoin_consensus::{
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, Notify};
@@ -55,6 +55,9 @@ pub struct ChainHub {
     mempool: std::sync::OnceLock<Arc<crate::tx_relay::MempoolHub>>,
     /// Regtest `setmocktime` / generate timestamps. Default is wall clock.
     pub clock: Arc<rbitcoin_consensus::NodeClock>,
+    invalidated: RwLock<HashSet<BlockHash>>,
+    parked: RwLock<HashMap<BlockHash, Block>>,
+    precious: RwLock<Option<BlockHash>>,
 }
 
 impl ChainHub {
@@ -76,6 +79,9 @@ impl ChainHub {
             connect_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
             clock: rbitcoin_consensus::NodeClock::new(),
+            invalidated: RwLock::new(HashSet::new()),
+            parked: RwLock::new(HashMap::new()),
+            precious: RwLock::new(None),
         }
     }
 
@@ -404,12 +410,73 @@ impl ChainHub {
         Ok(hashes)
     }
 
+    /// Disconnect `hash` and descendants from the tip. Parked for reconsider.
+    pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), NetError> {
+        let Some(h) = self
+            .query
+            .height_of_hash(&hash.to_byte_array())
+            .map_err(|e| NetError::Consensus(e.to_string()))?
+        else {
+            return Err(NetError::Consensus("block not found".into()));
+        };
+        let tip = self.tip_height().unwrap_or(0);
+        if h.0 > tip {
+            return Err(NetError::Consensus("block not on tip path".into()));
+        }
+        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        for ht in (h.0..=tip).rev() {
+            if let Some(b) = self.block_at_height(ht)? {
+                let bh = b.block_hash();
+                self.invalidated.write().unwrap().insert(bh);
+                self.parked.write().unwrap().insert(bh, b);
+            }
+        }
+        let keep = h.0.saturating_sub(1);
+        self.disconnect_to(keep)?;
+        Ok(())
+    }
+
+    /// Allow `hash` again and try to accept parked blocks starting at it.
+    pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), NetError> {
+        self.invalidated.write().unwrap().remove(&hash);
+        let parked = self.parked.write().unwrap().remove(&hash);
+        if let Some(b) = parked {
+            self.accept_block(b)?;
+            // Descendants parked with the same invalidate.
+            let mut more: Vec<Block> = self
+                .parked
+                .write()
+                .unwrap()
+                .drain()
+                .map(|(_, b)| b)
+                .collect();
+            more.sort_by_key(|b| b.header.time);
+            for b in more {
+                self.invalidated.write().unwrap().remove(&b.block_hash());
+                let _ = self.accept_block(b);
+            }
+        }
+        Ok(())
+    }
+
+    /// Prefer this hash among equal-work competing tips.
+    pub fn precious_block(&self, hash: BlockHash) -> Result<(), NetError> {
+        *self.precious.write().unwrap() = Some(hash);
+        if let Some(b) = self.parked.read().unwrap().get(&hash).cloned() {
+            let _ = self.accept_block(b);
+        }
+        Ok(())
+    }
+
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
     pub fn accept_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
         // Fast path without lock (common AlreadyHave).
         if self.tip_hash() == Some(hash) || self.has_block(&hash) {
             return Ok(AcceptOutcome::AlreadyHave);
+        }
+        if self.invalidated.read().unwrap().contains(&hash) {
+            return Err(NetError::Consensus("block is invalidated".into()));
         }
 
         let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -457,7 +524,10 @@ impl ChainHub {
                     let cur = self
                         .block_at_height(tip_h)?
                         .ok_or(NetError::Protocol("missing current tip block"))?;
-                    if block.header.work() > cur.header.work() {
+                    let precious = *self.precious.read().unwrap() == Some(hash);
+                    if block.header.work() > cur.header.work()
+                        || (block.header.work() == cur.header.work() && precious)
+                    {
                         self.disconnect_to(parent_h.0)?;
                         self.connect_at(new_height, block)?;
                         return Ok(AcceptOutcome::Accepted { height: new_height });

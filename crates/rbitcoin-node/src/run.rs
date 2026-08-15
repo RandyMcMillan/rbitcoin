@@ -666,6 +666,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // First tick fires immediately — skip so window is a full 5s.
         perf_tick.tick().await;
+        let mut rpc_stop_tick = tokio::time::interval(Duration::from_millis(50));
+        rpc_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        rpc_stop_tick.tick().await;
         let mut window_blocks: u64 = 0;
 
         loop {
@@ -682,14 +685,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 Tip(TipEvent),
                 Poll,
                 Perf,
+                RpcStop,
                 Stop,
             }
             // Prefer shutdown, then the 5s perf tick when both ready. Do **not**
             // put tip_rx ahead of perf under `biased` — multi-block catch-up can
             // keep tip events always ready and starve meters (no tip: perf lines).
+            let rpc_live = rpc_handle.is_some();
             let wake = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => Wake::Stop,
+                _ = rpc_stop_tick.tick(), if rpc_live => Wake::RpcStop,
                 _ = perf_tick.tick() => Wake::Perf,
                 ev = tip_rx.recv() => match ev {
                     Ok(e) => Wake::Tip(e),
@@ -714,6 +720,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
             if matches!(wake, Wake::Stop) {
                 break;
+            }
+            if matches!(wake, Wake::RpcStop) {
+                continue;
             }
 
             if matches!(wake, Wake::Perf) {

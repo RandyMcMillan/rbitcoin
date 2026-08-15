@@ -24,17 +24,21 @@ python3 scripts/core-functional/check_inventory.py \
 
 `scripts/core-functional/run.sh` is the only way we invoke Core’s
 `test_runner.py`. It runs the inventory checker, then only inventory
-`run` names, with `--v2transport` and `--exclude` for every `skip`.
-A `skip` or unknown name fails with `not in run set` / `unknown test`.
-`--list` prints `run` names (none today). `--dry-run` prints the
-command and writes `config.ini` (wallet/zmq/ipc off) without starting
-a node. Default `cargo test` never calls this.
+`run` names, with `--v2transport`. A `skip` or unknown name fails with
+`not in run set` / `unknown test` (we do not `--exclude` every skip —
+Core exits if an exclude is not in the current test list).
+`--list` prints `run` names (`feature_help.py`, `feature_uacomment.py`
+today). `--dry-run` prints the command and writes `config.ini`
+(wallet/zmq/ipc off) without starting a node. Default `cargo test`
+never calls this.
 
 `scripts/core-functional/bitcoind` is the TestNode binary: `-datadir=DIR`
 → `--datadir DIR/regtest` (cookie + `bitcoind.pid` under `DIR/regtest`),
 `-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
-127.0.0.1, `--no-seeds`. Unknown Core flags are ignored. Operator CLI
-is unchanged.
+127.0.0.1, `--no-seeds`. Node stdio goes to `regtest/debug.log`; only
+`Error:` lines (UA / init) are copied to the shim stderr so TestNode’s
+clean-stop check matches Core. Unknown Core flags fail parse. Operator
+CLI is unchanged.
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
@@ -76,9 +80,10 @@ Without it, the checker uses `scripts/core-functional/v31.1-tests.txt`
 A file on disk (or in `v31.1-tests.txt`) that is missing from the inventory,
 or an inventory row with no file, **fails the checker**.
 
-`run` means an **unmodified** Core script is green against rbitcoin. First
-pass is almost all `skip`. Flip to `run` only in the PR that makes that
-script pass.
+`run` means an **unmodified** Core script is green against rbitcoin. Flip
+to `run` only in the PR that makes that script pass. First green pair:
+`feature_help.py` (shim `-h`/`-version`/`-fakearg`) and
+`feature_uacomment.py` (`getnetworkinfo.subversion` BIP14 parens).
 
 ## Skip reasons
 
@@ -112,11 +117,11 @@ PRs keep the cargo gates only. Label the PR when touching the harness
 
 The job sparse-inits the pin, checks the inventory, **warns** (does not
 fail) if a newer Bitcoin Core *release* exists than `inventory.toml`
-`pin`, then `run.sh --list` (later the `run` suite). The warning
-compares **semver of final releases**, not GitHub’s `/releases/latest`
-— Core still ships older maintenance tags after a newer major. Bump
-`third_party/bitcoin`, the JSON corpora, and the inventory when it
-fires.
+`pin`, then runs the inventory `run` set when a node binary can be
+built (otherwise `--list` only). The warning compares **semver of
+final releases**, not GitHub’s `/releases/latest` — Core still ships
+older maintenance tags after a newer major. Bump `third_party/bitcoin`,
+the JSON corpora, and the inventory when it fires.
 
 ```bash
 python3 scripts/core-functional/check_core_release.py --latest v31.1

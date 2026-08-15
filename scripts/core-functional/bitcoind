@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -196,7 +198,40 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pidfile {pid_path}", file=sys.stderr)
         return 0
     pid_path.write_text(f"{os.getpid()}\n")
-    os.execv(cmd[0], cmd)
+    # TestNode tails this process's stderr and requires it empty on a clean
+    # stop. Core writes logs to debug.log (printtoconsole=0). Keep that shape:
+    # node stdio → {datadir}/debug.log; only `Error:` lines on shim stderr.
+    log_path = node_dir / "debug.log"
+    prior = log_path.stat().st_size if log_path.is_file() else 0
+    log_f = open(log_path, "ab", buffering=0)
+    try:
+        child = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+    except OSError as e:
+        log_f.close()
+        print(f"bitcoind: failed to start node: {e}", file=sys.stderr)
+        return 1
+
+    def _forward(signum: int, _frame: object) -> None:
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, _forward)
+    signal.signal(signal.SIGINT, _forward)
+    rc = child.wait()
+    log_f.close()
+    if rc:
+        try:
+            with log_path.open("rb") as f:
+                f.seek(prior)
+                text = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            text = ""
+        errs = [ln for ln in text.splitlines() if ln.startswith("Error:")]
+        if errs:
+            print("\n".join(errs), file=sys.stderr)
+    return int(rc) if rc is not None else 1
 
 
 if __name__ == "__main__":

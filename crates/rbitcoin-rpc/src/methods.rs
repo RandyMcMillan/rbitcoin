@@ -213,9 +213,15 @@ pub fn dispatch(
             Ok(json!(ctx.uptime_secs()))
         }
         "stop" => {
-            params.reject_unknown(&[])?;
+            params.reject_unknown(&["wait"])?;
+            let _wait = params.opt_u64(0, "wait")?;
             ctx.stop.store(true, Ordering::SeqCst);
             Ok(json!("rbitcoin stopping"))
+        }
+        "syncwithvalidationinterfacequeue" => {
+            params.reject_unknown(&[])?;
+            // Core waits for wallet/index callbacks. We have no that queue.
+            Ok(Value::Null)
         }
         "getblockchaininfo" => {
             params.reject_unknown(&[])?;
@@ -296,6 +302,7 @@ const METHOD_LIST: &[&str] = &[
     "getrpcinfo",
     "uptime",
     "stop",
+    "syncwithvalidationinterfacequeue",
     "getblockchaininfo",
     "getblockcount",
     "getbestblockhash",
@@ -1243,6 +1250,7 @@ mod tests {
         // Control / network always succeed on empty store.
         for m in [
             "uptime",
+            "syncwithvalidationinterfacequeue",
             "getnetworkinfo",
             "getconnectioncount",
             "getpeerinfo",

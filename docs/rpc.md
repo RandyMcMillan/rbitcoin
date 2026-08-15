@@ -57,6 +57,7 @@ still wait for durable SH when shindex is on.
 | Method | Notes |
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
+| `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |

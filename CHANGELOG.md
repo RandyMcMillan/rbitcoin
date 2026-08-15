@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
+  classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
+  reason; `analog` required for prune / LevelDB / UTXO-set skips).
+  `python3 scripts/core-functional/check_inventory.py` fails on an unknown
+  or incomplete row. See [`docs/core-functional.md`](docs/core-functional.md).
+  No Core scripts run in default `cargo test` yet.
+
 - **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
   on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
   other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag

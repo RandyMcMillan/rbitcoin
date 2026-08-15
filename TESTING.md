@@ -180,7 +180,17 @@ New features: add a high-level scenario; remove obsolete lower-level tests in th
 
 ## Core differential
 
-Not yet wired. Future: pin bitcoind version, run shared RPC scripts on regtest against both nodes.
+Inventory for Bitcoin Core **v31.1** functional tests lives in
+[`scripts/core-functional/`](scripts/core-functional/)
+([`docs/core-functional.md`](docs/core-functional.md)).
+`python3 scripts/core-functional/check_inventory.py` is the completeness
+gate. The bitcoind shim / `run.sh` / nightly job come in later PRs. Default
+`cargo test` does **not** invoke Core’s Python suite.
+
+```bash
+python3 scripts/core-functional/check_inventory.py
+./scripts/core-functional/check_inventory_test.sh
+```
 
 ## Fault injectors
 

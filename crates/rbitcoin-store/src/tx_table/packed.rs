@@ -487,6 +487,39 @@ pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     out.resize(out.len().saturating_add(n), 0);
 }
 
+/// Schema-17 spent slot width (codec only; [`OutputRecord::SPENT_SLOT_LEN`] is still 9).
+pub const SPENT_SLOT_V17_LEN: usize = 8;
+const SPENT_FIELD_V17_MAX: u64 = (1u64 << 56) - 1;
+
+/// Encode flags + u56 spender field. `fk ≥ 2^56` is Corrupt. Production still writes 9 B.
+pub fn encode_spent_slot_v17(flags: u8, field: Fk) -> Result<[u8; 8], StoreError> {
+    if field.0 > SPENT_FIELD_V17_MAX {
+        return Err(StoreError::Corrupt("v17 spent field exceeds u56"));
+    }
+    let mut slot = [0u8; 8];
+    slot[0] = flags;
+    let le = field.0.to_le_bytes();
+    slot[1..8].copy_from_slice(&le[..7]);
+    Ok(slot)
+}
+
+/// Decode an 8-byte v17 spent slot.
+pub fn decode_spent_slot_v17(raw: &[u8]) -> Result<(u8, Fk), StoreError> {
+    if raw.len() < SPENT_SLOT_V17_LEN {
+        return Err(StoreError::Corrupt("short v17 spent slot"));
+    }
+    let flags = raw[0];
+    let mut le = [0u8; 8];
+    le[..7].copy_from_slice(&raw[1..8]);
+    Ok((flags, Fk(u64::from_le_bytes(le))))
+}
+
+// Keep the landing codec compiled on the lib target until production cutover.
+const _: () = {
+    let _: fn(u8, Fk) -> Result<[u8; 8], StoreError> = encode_spent_slot_v17;
+    let _: fn(&[u8]) -> Result<(u8, Fk), StoreError> = decode_spent_slot_v17;
+};
+
 /// Spent abs for `vout` given the create's `spent.body` range start.
 #[inline]
 pub fn spent_abs(spent_off: u64, vout: u32) -> u64 {

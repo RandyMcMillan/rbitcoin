@@ -2742,6 +2742,54 @@ fn script_kind_v17_op_return_pushdata1_stays_raw() {
 }
 
 #[test]
+fn spent_slot_v17_unspent_is_eight_zero_bytes() {
+    let slot = encode_spent_slot_v17(0, Fk::NULL).unwrap();
+    assert_eq!(slot, [0u8; 8]);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(flags, 0);
+    assert!(field.is_null());
+}
+
+#[test]
+fn spent_slot_v17_sole_fk_roundtrip() {
+    let fk = Fk(0x0001_0203_0405_0607);
+    let slot = encode_spent_slot_v17(0, fk).unwrap();
+    assert_eq!(slot[0], 0, "flags first");
+    assert_eq!(&slot[1..], &[0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(flags, 0);
+    assert_eq!(field, fk);
+}
+
+#[test]
+fn spent_slot_v17_multi_list_head_roundtrip() {
+    let head = Fk(42);
+    let slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, head).unwrap();
+    assert_eq!(slot[0], output_flags::MULTI_SPENDER);
+    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    assert_eq!(
+        flags & output_flags::MULTI_SPENDER,
+        output_flags::MULTI_SPENDER
+    );
+    assert_eq!(field, head);
+}
+
+#[test]
+fn spent_slot_v17_fk_at_2pow56_is_corrupt() {
+    match encode_spent_slot_v17(0, Fk(1u64 << 56)) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("56") || m.contains("u56"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn spent_slot_v17_len_constant_still_nine() {
+    assert_eq!(OutputRecord::SPENT_SLOT_LEN, 9);
+}
+
+#[test]
 fn script_kind_v17_kind_ten_is_corrupt() {
     match decode_script_kind_v17(10, &[]) {
         Err(StoreError::Corrupt(m)) => {

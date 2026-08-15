@@ -74,6 +74,9 @@ pub trait RpcRegtest: Send + Sync {
     ) -> Result<Vec<BlockHash>, String>;
 
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome;
+
+    /// `0` = wall clock. Regtest harness only.
+    fn set_mock_time(&self, timestamp: i64) -> Result<(), String>;
 }
 
 impl RpcContext {
@@ -278,6 +281,7 @@ pub fn dispatch(
         "generateblock" => generateblock(ctx, &params),
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
+        "setmocktime" => setmocktime(ctx, &params),
         "createrawtransaction"
         | "combinerawtransaction"
         | "scantxoutset"
@@ -337,6 +341,7 @@ const METHOD_LIST: &[&str] = &[
     "generateblock",
     "generate",
     "submitblock",
+    "setmocktime",
 ];
 
 fn method_help(m: &str) -> String {
@@ -1078,6 +1083,16 @@ fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     Ok(hashes_json(&hashes))
 }
 
+fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["timestamp"])?;
+    let miner = require_regtest_miner(ctx, "setmocktime")?;
+    let ts = params.req_u64(0, "timestamp")?;
+    miner
+        .set_mock_time(ts as i64)
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    Ok(Value::Null)
+}
+
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexdata", "dummy"])?;
     let miner = require_regtest_miner(ctx, "submitblock")?;
@@ -1701,6 +1716,11 @@ mod tests {
                 Err(e) => SubmitBlockOutcome::Rejected(e.to_string()),
             }
         }
+
+        fn set_mock_time(&self, timestamp: i64) -> Result<(), String> {
+            self.0.clock.set_mock(timestamp);
+            Ok(())
+        }
     }
 
     fn ctx_regtest_hub() -> (RpcContext, PathBuf, Arc<rbitcoin_net::ChainHub>) {
@@ -1755,11 +1775,13 @@ mod tests {
             "generateblock",
             "generate",
             "submitblock",
+            "setmocktime",
         ] {
             let e = match m {
                 "generatetoaddress" => dispatch(&ctx, m, vec![json!(1), json!(addr.clone())]),
                 "generateblock" => dispatch(&ctx, m, vec![json!(addr.clone()), json!([])]),
                 "generate" => dispatch(&ctx, m, vec![json!(1)]),
+                "setmocktime" => dispatch(&ctx, m, vec![json!(1)]),
                 _ => dispatch(&ctx, m, vec![json!("00")]),
             }
             .unwrap_err();
@@ -1828,6 +1850,45 @@ mod tests {
             "bad merkle reject: {r}"
         );
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_generate_uses_mock() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let mock = 1_600_000_000u64;
+        dispatch(&ctx, "setmocktime", vec![json!(mock)]).unwrap();
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        let hdr = dispatch(&ctx, "getblockheader", vec![best]).unwrap();
+        let t = hdr["time"].as_u64().unwrap();
+        assert!(
+            t >= mock && t < mock + 600,
+            "generate time {t} should honor mock {mock}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setmocktime_future_header_uses_mock() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let mock = 1_600_000_000u64;
+        dispatch(&ctx, "setmocktime", vec![json!(mock)]).unwrap();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let far = (mock + 3 * 3600) as u32;
+        let far_block = mine_regtest_paying(prev, far, 1, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&far_block));
+        let r = dispatch(&ctx, "submitblock", vec![json!(hex)]).unwrap();
+        let msg = r.as_str().unwrap_or("");
+        assert!(
+            msg.contains("future") || msg.contains("timestamp"),
+            "future header vs mock now: {r}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

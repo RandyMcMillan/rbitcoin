@@ -11,6 +11,10 @@ before 1.0).
 
 ### Added
 
+- **Regtest `setmocktime`:** `NodeClock` (AtomicI64; `0` = wall). Generate
+  timestamps and future-header checks honor the mock. Not a process
+  `time()` hook (log stamps stay wall).
+
 - **Live `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection`:**
   sessions register after BIP324 handshake. `addnode onetry` dials via the
   same outbound path as tip-follow. `subver` is the peer's version UA

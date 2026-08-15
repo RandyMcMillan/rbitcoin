@@ -53,6 +53,8 @@ pub struct ChainHub {
     ///
     /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
     mempool: std::sync::OnceLock<Arc<crate::tx_relay::MempoolHub>>,
+    /// Regtest `setmocktime` / generate timestamps. Default is wall clock.
+    pub clock: Arc<rbitcoin_consensus::NodeClock>,
 }
 
 impl ChainHub {
@@ -73,6 +75,7 @@ impl ChainHub {
             confirmed,
             connect_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
+            clock: rbitcoin_consensus::NodeClock::new(),
         }
     }
 
@@ -375,10 +378,7 @@ impl ChainHub {
                 .tip_hash()
                 .ok_or(NetError::Protocol("generate: no tip hash"))?;
             let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(tip_time);
+            let now = self.clock.now_secs() as u32;
             let time = tip_time.saturating_add(1).max(now);
             let txs = if i == 0 {
                 std::mem::take(&mut extras)
@@ -586,14 +586,17 @@ impl ChainHub {
         // Phase 0 tip SH measure: clear window so this block's stats are clean.
         tip_accept_stats_reset();
         let t_wall = std::time::Instant::now();
-        accept_and_connect_block_preverified(
-            &self.query,
-            &self.params,
-            Height(height),
-            &block,
-            self.milestone,
-            &preverified,
-        )
+        let now = self.clock.now_secs();
+        rbitcoin_consensus::with_now(now, || {
+            accept_and_connect_block_preverified(
+                &self.query,
+                &self.params,
+                Height(height),
+                &block,
+                self.milestone,
+                &preverified,
+            )
+        })
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
         // Tip-mode only: remove_for_block no-ops while relay is off (IBD).

@@ -1,6 +1,7 @@
 //! Block and transaction validation / confirmability.
 
 mod block;
+mod clock;
 mod confirm_run;
 mod convert;
 mod error;
@@ -118,6 +119,7 @@ pub use block::{
     validate_block_structure, validate_block_structure_hashed, ValidationContext,
     LOCKTIME_THRESHOLD,
 };
+pub use clock::{current_now, wall_now, with_now, NodeClock};
 pub use convert::{block_to_apply, block_to_apply_with_txids, header_to_record};
 pub use error::ConsensusError;
 pub use header::{expected_next_bits, median_time_past, validate_header};

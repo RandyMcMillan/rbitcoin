@@ -11,6 +11,12 @@ before 1.0).
 
 ### Added
 
+- **Live `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection`:**
+  sessions register after BIP324 handshake. `addnode onetry` dials via the
+  same outbound path as tip-follow. `subver` is the peer's version UA
+  (our `-uacomment` is advertised on our `version`). `bytesrecv_per_msg.pong`
+  is counted so Core `connect_nodes` can wait for handshake.
+
 - **`syncwithvalidationinterfacequeue`:** no-op `null`. Core’s framework
   calls it from `sync_mempools`; we have no wallet/index callback queue.
 

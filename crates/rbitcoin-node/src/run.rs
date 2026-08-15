@@ -209,7 +209,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
 
     let query = handle.query;
-    let mut node = P2PNode::start(listen, query, params.clone(), milestone)
+    let p2p_ua =
+        rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
+            .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
+    let mut node = P2PNode::start_with_agent(listen, query, params.clone(), milestone, p2p_ua)
         .await
         .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
 
@@ -616,6 +619,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 Arc::clone(&node.hub.query),
                 Some(mempool.clone()),
                 miner,
+                Some(Arc::clone(&node.peers)),
             )
             .await
             {

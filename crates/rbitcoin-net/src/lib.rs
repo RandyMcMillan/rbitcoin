@@ -10,6 +10,7 @@ mod most_work;
 mod msg_decode;
 mod peer;
 mod peer_dos;
+mod peers;
 mod seeds;
 mod service;
 mod tx_relay;
@@ -31,6 +32,7 @@ pub use peer_dos::{
     inbound_semaphore, max_inbound_from_env, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC,
     DEFAULT_MAX_INBOUND, DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
 };
+pub use peers::{parse_peer_addr, DialRequest, LivePeer, PeerConnType, PeerHub, PeerInfo};
 pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
     resolve_fixed_seeds, AddrMan, PeerEntry, PeerFlags,

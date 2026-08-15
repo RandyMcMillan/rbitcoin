@@ -51,7 +51,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`) | done | Archive reconstruct |
-| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`) | partial | BIP324 v2-only; peer detail stub |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy |
 | Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |

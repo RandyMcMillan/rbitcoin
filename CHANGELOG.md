@@ -34,6 +34,13 @@ before 1.0).
 
 ### Fixed
 
+- **SH bulk materialize heartbeats during a megakey:** status INFO only ran after
+  `put_chain` (unique-key boundary). One scripthash can absorb tens of millions
+  of creates with no key change — mainnet shard 1 went ~6.5 min silent
+  (`keys≈36.6M→38.6M`, `creates≈92.7M→155.6M`) and looked stalled. The loop now
+  samples the 10 s interval every 64 Ki recs of the same key and prints
+  `pending≈` (in-progress chain) so `creates`/`pct` keep moving.
+
 - **IBD tip no longer storms getheaders / re-admits:** already-known 1-header
   announces (inflight, BQ-pending, or height ≤ tip) stay off `ordered`. Empty
   `ordered` near the peer horizon marks `headers_done` instead of fanning

@@ -28,11 +28,10 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    merge_runs_with_policy, next_run_path, prefix_shard_of, read_run_body,
+    merge_runs_with_policy, next_run_path, prefix_shard_of,
     reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority, write_sorted_run,
-    write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashEntry,
-    ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
-    SH_RUN_SORT_KEY_LEN,
+    write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
+    SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -276,15 +275,11 @@ pub fn sh_catalog_total_records(runs_dir: &Path) -> u64 {
     }
     n
 }
-use crate::U64Set;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-/// Linear dedup is fine for short chains; switch to a set past this length.
-const CHAIN_SET_THRESHOLD: usize = 16;
 
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
@@ -436,11 +431,6 @@ fn encode_sh_run_body_sorted_unique(pairs: &mut [([u8; 32], Fk)]) -> Vec<u8> {
         body.extend_from_slice(&encode_rec(&sh, fk));
     }
     body
-}
-
-#[inline]
-fn chain_has_fk(chain: &[ScriptHashEntry], fk: Fk) -> bool {
-    chain.iter().any(|e| e.create_tx_fk == fk)
 }
 
 // ── SEAL (max durable create_fk in cataloged runs) ───────────────────────────
@@ -1223,10 +1213,6 @@ impl ShRunBuilder {
             stream_inputs.len()
         );
         let t0 = Instant::now();
-        let mut cur_key: Option<[u8; 32]> = None;
-        let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
-        let mut long_seen: Option<U64Set> = None;
-        let mut unique_in = 0u64;
         let mut last_log: Option<Instant> = None;
         let mut recs_this_key = 0u64;
         let mut max_fk_seen = 0u64;
@@ -1247,60 +1233,11 @@ impl ShRunBuilder {
             if tx_fk.0 > max_fk_seen {
                 max_fk_seen = tx_fk.0;
             }
-            if cur_key != Some(sh) {
-                if let Some(prev) = cur_key {
-                    if !chain.is_empty() {
-                        unique_in = unique_in.saturating_add(1);
-                        session.put_chain(prev, &chain)?;
-                        chain.clear();
-                        long_seen = None;
-                        recs_this_key = 0;
-                        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                            return Err(StoreError::Cancelled("scripthash materialize stream"));
-                        }
-                        if materialize_status_should_emit(
-                            last_log,
-                            Instant::now(),
-                            MATERIALIZE_STATUS_INTERVAL,
-                            recs_this_key,
-                            true,
-                        ) {
-                            log_materialize_status(
-                                &mut last_log,
-                                session.keys_written(),
-                                session.creates_written(),
-                                0,
-                                session.shards_flushed(),
-                                n_shards,
-                                total_recs,
-                                session.body_flush_ns,
-                                session.head_fill_ns,
-                                t0,
-                            );
-                        }
-                    }
-                }
-                cur_key = Some(sh);
-            }
-            let is_dup = if let Some(ref set) = long_seen {
-                set.contains(&tx_fk.0)
-            } else {
-                chain_has_fk(&chain, tx_fk)
-            };
-            if !is_dup {
-                chain.push(ScriptHashEntry::new(tx_fk));
-                if let Some(ref mut set) = long_seen {
-                    set.insert(tx_fk.0);
-                } else if chain.len() >= CHAIN_SET_THRESHOLD {
-                    let mut set =
-                        U64Set::with_capacity_and_hasher(chain.len() * 2, Default::default());
-                    for e in &chain {
-                        set.insert(e.create_tx_fk.0);
-                    }
-                    long_seen = Some(set);
-                }
-            }
+            session.push_sorted_fk(sh, tx_fk)?;
             recs_this_key = recs_this_key.saturating_add(1);
+            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                return Err(StoreError::Cancelled("scripthash materialize stream"));
+            }
             // Clock only on the stride — Instant::now every rec would add ~4% at 2 M rec/s.
             if recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY)
                 && materialize_status_should_emit(
@@ -1311,11 +1248,14 @@ impl ShRunBuilder {
                     false,
                 )
             {
+                let pending = session
+                    .stream_creates_written()
+                    .saturating_sub(session.creates_written()) as usize;
                 log_materialize_status(
                     &mut last_log,
                     session.keys_written(),
                     session.creates_written(),
-                    chain.len(),
+                    pending,
                     session.shards_flushed(),
                     n_shards,
                     total_recs,
@@ -1335,12 +1275,8 @@ impl ShRunBuilder {
             return Err(StoreError::Cancelled(msg));
         }
         stream_result?;
-        if let Some(prev) = cur_key.take() {
-            if !chain.is_empty() {
-                unique_in = unique_in.saturating_add(1);
-                session.put_chain(prev, &chain)?;
-            }
-        }
+        session.finish_key()?;
+        let unique_in = session.keys_written();
         let stream_ns = t_stream.elapsed().as_nanos() as u64;
 
         let t_finish = Instant::now();
@@ -1815,7 +1751,7 @@ fn sh_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_store::Store;
+    use rbitcoin_store::{read_run_body, Store};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1847,6 +1783,53 @@ mod tests {
             155_568_193
         );
         assert_eq!(materialize_status_creates(u64::MAX, 8), u64::MAX);
+    }
+
+    #[test]
+    fn materialize_streams_megakey_without_full_chain_vec() {
+        let src = include_str!("sh_builder.rs");
+        let start = src
+            .find("let stream_result = for_each_merged_rec_opts")
+            .expect("materialize stream");
+        let body = src[start..].split("stream_result?;").next().unwrap();
+        assert!(
+            !body.contains("U64Set") && !body.contains("long_seen") && !body.contains("chain.push"),
+            "materialize must stream FKs, not collect a full-key Vec/U64Set"
+        );
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-stream-mega-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut sh = [0u8; 32];
+        sh[0] = 0x51;
+        let n_fks = 600u64;
+        let mut body = Vec::new();
+        for i in 1..=n_fks {
+            body.extend_from_slice(&encode_rec(&sh, Fk(i)));
+        }
+        write_sorted_run(
+            &next_run_path(&runs_dir, 1),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+        )
+        .unwrap();
+        let written = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert_eq!(written, n_fks);
+        assert_eq!(store.scripthash.entries(&sh).unwrap().len(), n_fks as usize);
+        match store.scripthash.head_value(&sh).unwrap().unwrap() {
+            rbitcoin_store::ShHeadValue::Paged { .. } => {}
+            other => panic!("expected paged megakey, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2273,7 +2256,8 @@ mod tests {
             for i in 0..1000u64 {
                 let mut sh = [0u8; 32];
                 sh[0] = seq as u8;
-                sh[1..9].copy_from_slice(&i.to_le_bytes());
+                // BE so 32-byte sh memcmp matches increasing i (LE would invert 255/256).
+                sh[1..9].copy_from_slice(&i.to_be_bytes());
                 body.extend_from_slice(&encode_rec(&sh, Fk(seq * 10_000 + i)));
             }
             let path = next_run_path(&runs_dir, seq);

@@ -2001,6 +2001,16 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.live_count
     }
 
+    /// Creates including the open key's accepted FKs (status while a megakey streams).
+    pub fn stream_creates_written(&self) -> u64 {
+        self.live_count.saturating_add(
+            self.open_key
+                .as_ref()
+                .map(|o| u64::from(o.n_total))
+                .unwrap_or(0),
+        )
+    }
+
     /// Unique keys packed so far.
     pub fn keys_written(&self) -> u64 {
         self.keys_written

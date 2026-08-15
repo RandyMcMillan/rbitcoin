@@ -232,8 +232,12 @@ backfill them. Scripthash is **not** progressively materialized into heads:
 confirm only enqueues sorted runs (background flush + merge). At tip the node
 **merges remaining runs and cold bulk-loads** durable SH tables before Electrum
 (the only deferred index work). Tip SH materialize **streams catalog runs with
-direct k-way merge** (up to ~4096 open files) into **sealed sorted+idx
-main shards** (no main fuse; no 0.5–1 GiB in-RAM OA image per shard). New keys after seal go
+direct k-way merge** (up to ~4096 open files; records unique on
+`(scripthash, create_fk)`, `key_len=40`) into **sealed sorted+idx
+main shards** (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
+megakey pages write as they fill — ≤510 FKs buffered). Schema-16
+`key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
+rematerialize). New keys after seal go
 to one **global ingest OA** (mainnet 2²² slots ≈ 128 MiB). Fan-in reduce is
 **fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
 only at ≥75% of target run size (default target **512 MiB**) and compacts tiny

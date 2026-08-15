@@ -2289,5 +2289,47 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
     );
     assert_eq!(st.ordered.len(), 1);
 
+    // Inflight getdata: announce again must not re-queue (tip storm).
+    st.ordered.clear();
+    st.ordered_set.clear();
+    st.inflight
+        .insert(hash, super::super::state::InflightReq::new(1));
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![hdr.clone()],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(
+        !st.ordered_set.contains(&hash),
+        "inflight hash must not re-enter ordered"
+    );
+    st.inflight.clear();
+
+    // Pending BQ wire: same.
+    st.body.mark_pending(hash);
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![hdr],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(
+        !st.ordered_set.contains(&hash),
+        "pending hash must not re-enter ordered"
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -34,6 +34,13 @@ before 1.0).
 
 ### Fixed
 
+- **IBD tip no longer storms getheaders / re-admits:** already-known 1-header
+  announces (inflight, BQ-pending, or height ≤ tip) stay off `ordered`. Empty
+  `ordered` near the peer horizon marks `headers_done` instead of fanning
+  getheaders to 4 peers every loop. That loop was ~1k INFO lines/s at mainnet
+  tip and blocked catch-up complete → SH → tip follow. Mid-sync 292k re-admit
+  of drained-but-still-needed headers is unchanged.
+
 - **Disconnecting a confirmed block logs `DisconnectTip` at warn:**
   `Query::disconnect_tip` (every reorg / tip restore) emits
   `DisconnectTip: hash=… height=… tx=…` so leaving the best chain is

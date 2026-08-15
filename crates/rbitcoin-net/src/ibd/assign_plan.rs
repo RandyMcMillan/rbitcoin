@@ -68,6 +68,11 @@ pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
 /// Only when the ordered path is **mostly claim-ready** (dense body-queue /
 /// Class A readiness) and the gap from max_ready to max_ordered is short —
 /// never for sparse far-only header floods without bodies.
+///
+/// `live == 0` is **not** “beyond soft cap.” Empty-path getheaders is a
+/// separate cadence (main loop / empty-headers lag). Treating empty as
+/// headroom made every already-known 1-header announce re-issue getheaders
+/// (mainnet tip: ~1k INFO lines/s).
 pub(crate) fn want_headers_beyond_soft_cap(
     live: usize,
     known_ready: usize,
@@ -75,10 +80,33 @@ pub(crate) fn want_headers_beyond_soft_cap(
     gap_need: u32,
 ) -> bool {
     if live == 0 {
-        return true;
+        return false;
     }
     let mostly_ready = known_ready >= live.saturating_mul(3) / 4;
     mostly_ready && ready_gap < gap_need
+}
+
+/// Admit a header onto `ordered` (first time or post-drain re-admit).
+///
+/// Re-admit after tip-drain/hygiene emptied `ordered` is required (mainnet
+/// 292k). Do not re-queue work that is already inflight, pending/BQ, rejected,
+/// confirmed, or at/below tip — those 1-header announces are tip chatter.
+pub(crate) fn should_enqueue_header(
+    in_ordered: bool,
+    inflight: bool,
+    pending: bool,
+    rejected: bool,
+    has_block: bool,
+    height: Option<u32>,
+    tip_h: Option<u32>,
+) -> bool {
+    if in_ordered || inflight || pending || rejected || has_block {
+        return false;
+    }
+    match (height, tip_h) {
+        (Some(ht), Some(tip)) if ht <= tip => false,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -106,8 +134,86 @@ mod tests {
         assert!(want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048));
         // Dense but long ready_gap → no need
         assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 10_000, 2048));
-        // Empty path
-        assert!(want_headers_beyond_soft_cap(0, 0, 0, 2048));
+        // Empty path is not soft-cap headroom (tip 1-header storm).
+        assert!(!want_headers_beyond_soft_cap(0, 0, 0, 2048));
+    }
+
+    /// 292k re-admit vs tip-chatter skip.
+    #[test]
+    fn enqueue_header_readmit_skips_inflight_pending_and_past_tip() {
+        // Known, drained, still needed above tip.
+        assert!(should_enqueue_header(
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            true,
+            false,
+            false,
+            false,
+            false,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            true,
+            false,
+            false,
+            false,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            false,
+            true,
+            false,
+            false,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            false,
+            false,
+            true,
+            false,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            false,
+            false,
+            false,
+            true,
+            Some(1),
+            Some(0),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(5),
+            Some(5),
+        ));
+        assert!(!should_enqueue_header(
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(4),
+            Some(5),
+        ));
     }
 
     /// ordered set remove + compact ghosts (one surface).

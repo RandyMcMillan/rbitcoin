@@ -1,10 +1,13 @@
 //! Peer / archive event drain and apply (IBD main loop).
 
 use super::assign::clear_hash_inflight;
-use super::assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
+use super::assign_plan::{
+    remove_from_ordered, should_enqueue_header, want_headers_beyond_soft_cap,
+};
 use super::dial::{release_peer_block_work, request_headers, request_headers_from};
 use super::exit::{
-    header_lag_behind_peers, should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
+    header_lag_behind_peers, should_advance_locator_after_known_batch,
+    should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
     should_reseed_work_path_on_empty_lag,
 };
 use super::path::work_path_tips;
@@ -207,11 +210,21 @@ pub(crate) fn apply_peer_event(
                 if !st.hash_height.contains_key(&hash) {
                     continue;
                 }
-                // Re-admit even when already known: tip drain + hygiene empty
-                // `ordered` while peers re-serve the same window; early-return without
-                // this froze mainnet at tip=292000 (ordered=0, known_hdr=4000, hole=0,
-                // bq=0, hard path reset every 180s).
+                // Re-admit known hashes after tip-drain/hygiene emptied `ordered`
+                // (mainnet 292k). Skip inflight / pending / at-or-below tip —
+                // those 1-header announces are tip chatter, not new work.
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {
+                    continue;
+                }
+                if !should_enqueue_header(
+                    st.ordered_set.contains(&hash),
+                    st.inflight.contains_key(&hash),
+                    st.body.is_pending(&hash),
+                    st.body.is_rejected(&hash),
+                    hub.has_block(&hash),
+                    st.hash_height.get(&hash).copied(),
+                    hub.tip_height(),
+                ) {
                     continue;
                 }
                 if st.ordered_set.insert(hash) {
@@ -222,13 +235,6 @@ pub(crate) fn apply_peer_event(
             if added > 0 {
                 if super::reorg::consider_disconnected_heavier(st, hub).unwrap_or(false) {
                     let _ = try_complete_awaiting_reorg(st, hub);
-                }
-                if st.ordered_set.len() == added {
-                    // First headers of this run (tip=0 cold start).
-                    info!(
-                        "ibd: first headers from peer[{peer}] batch={batch_len} added={added} ordered={}",
-                        st.ordered_set.len()
-                    );
                 }
                 st.empty_header_streak = 0;
                 st.headers_done = false;
@@ -301,11 +307,15 @@ pub(crate) fn apply_peer_event(
                     st.max_ordered_height.saturating_sub(st.max_ready_height),
                     4096,
                 );
+                let lag = header_lag_behind_peers(st, hub.tip_height().unwrap_or(0));
                 if live < MAX_ORDERED_HEADERS
                     && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
-                    && (batch_len >= MAX_HEADERS_RESULTS
-                        || header_lag_behind_peers(st, hub.tip_height().unwrap_or(0)) > 2
-                        || need_ready_headroom)
+                    && should_advance_locator_after_known_batch(
+                        live,
+                        lag,
+                        batch_len >= MAX_HEADERS_RESULTS,
+                        need_ready_headroom,
+                    )
                 {
                     let tips = work_path_tips(st);
                     let _ =

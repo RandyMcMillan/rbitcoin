@@ -44,8 +44,8 @@ use events::{
     drain_ready_peer_and_archive_events, try_complete_awaiting_reorg, update_confirm_lag,
 };
 use exit::{
-    all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
-    peer_caught_up, AllPeersDead,
+    all_peers_dead_action, catchup_complete_after_drain, empty_path_header_fan,
+    header_lag_behind_peers, path_drained, peer_caught_up, AllPeersDead,
 };
 use path::{seed_work_path_from_store, work_path_tips};
 use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
@@ -645,26 +645,30 @@ pub async fn ibd_cancellable(
             let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
             if !st.headers_done && under_hard && (under_soft || need_ready_headroom) {
                 let tip_h = hub.tip_height().unwrap_or(0);
+                let lag = header_lag_behind_peers(&st, tip_h);
                 let min_cache = window.saturating_mul(8).max(4096);
-                let want_more = live == 0
-                    || live < min_cache
-                    || header_lag_behind_peers(&st, tip_h) > 0
-                    || need_ready_headroom;
-                if want_more {
-                    let tips = work_path_tips(&st);
-                    // Cold start / empty path: fan getheaders to several peers so a
-                    // single silent zombie cannot stall ordered=0 forever.
-                    let fan = if live == 0 {
-                        st.slots.iter().filter(|s| s.alive).count().min(4).max(1)
+                let alive = st.slots.iter().filter(|s| s.alive).count();
+                if live == 0 {
+                    let fan = empty_path_header_fan(lag, st.inflight.len(), alive);
+                    if fan == 0 {
+                        // Near tip: remaining work is inflight/BQ/confirm, not
+                        // another locator walk. Let catch-up complete / SH / follow.
+                        st.headers_done = true;
                     } else {
-                        1
-                    };
-                    for _ in 0..fan {
-                        if !request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips)
-                            .unwrap_or(false)
-                        {
-                            break;
+                        let tips = work_path_tips(&st);
+                        for _ in 0..fan {
+                            if !request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips)
+                                .unwrap_or(false)
+                            {
+                                break;
+                            }
                         }
+                    }
+                } else {
+                    let want_more = live < min_cache || lag > 0 || need_ready_headroom;
+                    if want_more {
+                        let tips = work_path_tips(&st);
+                        let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
                     }
                 }
             }

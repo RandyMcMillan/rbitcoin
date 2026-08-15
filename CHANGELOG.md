@@ -71,6 +71,12 @@ before 1.0).
 
 ### Changed
 
+- **Schema 17 (in flight) — SH run catalogs are `key_len=40`:** leftover
+  schema-16 `scripthash.runs` (`key_len=32`) are refused (wipe
+  `store/scripthash.runs` and rematerialize). Empty/missing catalogs
+  soft-open; sealed SH head and Class A stay. More 17 layout changes may
+  follow before 18.
+
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
   external parents for at most **8** ready body-queue heights in one
   `get_fk_by_txid_batch` wave and attaches hits on the BQ record. Load claims

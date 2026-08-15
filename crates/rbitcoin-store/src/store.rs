@@ -234,7 +234,11 @@ impl Store {
             );
             let _ = std::fs::remove_file(&leftover_h);
         }
-        if meta_ver == 15 && SCHEMA_VERSION == 16 {
+        crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
+        if meta_ver == 15 && SCHEMA_VERSION >= 16 {
+            rewrite_meta_current(&path)?;
+        }
+        if meta_ver == 16 && SCHEMA_VERSION >= 17 {
             rewrite_meta_current(&path)?;
         }
         let inwit_dir = resolve_inwit_dir(&layout)?;
@@ -1758,7 +1762,6 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert!(!s.scripthash.has_durable_index());
         drop(s);
-        assert_eq!(SCHEMA_VERSION, 16);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
 
         let s = Store::open(&dir).unwrap();
@@ -1822,6 +1825,51 @@ mod tests {
         }
         // Meta left at 13 (no silent bump on refuse).
         assert_eq!(read_store_meta_ver(&dir), 13);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 16 leftover SH runs (`key_len=32`) cannot open under 17.
+    #[test]
+    fn open_schema16_legacy_sh_runs_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 16);
+        let runs = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let mut rec = [0u8; 40];
+        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+        crate::sorted_run::write_sorted_run(&runs.join("000001.run"), 32, 40, &rec).unwrap();
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for key_len=32 scripthash.runs"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(
+                    m,
+                    "schema 17 refuses key_len=32 scripthash.runs; wipe store/scripthash.runs and rematerialize"
+                );
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 16);
+        assert!(dir.join("scripthash.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 16 with no SH run catalog soft-opens to current meta.
+    #[test]
+    fn open_schema16_no_sh_runs_soft_opens() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 16);
+        let s = Store::open(&dir).unwrap();
+        drop(s);
+        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

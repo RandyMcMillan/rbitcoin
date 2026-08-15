@@ -31,7 +31,7 @@ use rbitcoin_store::{
     merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
     set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
     RunWritePolicy, ScriptHashEntry, ScriptHashRecord, SortedRunPath, Store, StoreError,
-    FANIN_TARGET_STREAM_RUNS,
+    FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -287,7 +287,7 @@ const CHAIN_SET_THRESHOLD: usize = 16;
 
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
-pub const SH_RUN_KEY_LEN: u32 = 32;
+pub const SH_RUN_KEY_LEN: u32 = SH_RUN_SORT_KEY_LEN;
 
 const DEFAULT_MEMTABLE_CAP: usize = 1_000_000;
 const HARD_MEMTABLE_MUL: usize = 2;

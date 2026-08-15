@@ -521,6 +521,30 @@ fn count_sh_head_shards(head_path: &Path) -> Result<Option<usize>, StoreError> {
     Ok(Some(names.len()))
 }
 
+/// Schema 17 SH run compare key is the full 40-byte `{scripthash\|create_fk}` record.
+pub const SH_RUN_SORT_KEY_LEN: u32 = 40;
+
+/// Refuse leftover schema-16 SH run catalogs (`key_len != 40`).
+///
+/// Empty / missing `scripthash.runs` is ok. A sealed SH head is not inspected.
+pub fn sh_run_catalog_key_len_ok(store_dir: &Path) -> Result<(), StoreError> {
+    let runs = store_dir.join("scripthash.runs");
+    if !runs.exists() {
+        return Ok(());
+    }
+    let mut found = Vec::new();
+    found.extend(list_runs(&runs)?);
+    found.extend(list_materialize_claims(&runs)?);
+    for r in found {
+        if r.key_len != SH_RUN_SORT_KEY_LEN {
+            return Err(StoreError::Corrupt(
+                "schema 17 refuses key_len=32 scripthash.runs; wipe store/scripthash.runs and rematerialize",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True when `scripthash.runs` (catalog, claims, merge CHECKPOINT/READY) can rebuild the head.
 pub fn has_sh_run_rebuild_source(store_dir: &Path) -> bool {
     let runs = store_dir.join("scripthash.runs");

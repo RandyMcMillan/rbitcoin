@@ -79,9 +79,9 @@ pub use io_backend::{
 };
 pub use point_table::PointRecord;
 pub use scripthash::{
-    has_sh_run_rebuild_source, load_include_hwm, script_hash, store_include_hwm, ColdProgress,
-    ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable, COLD_PROGRESS_NAME,
-    INCLUDE_HWM_NAME,
+    has_sh_run_rebuild_source, load_include_hwm, script_hash, sh_run_catalog_key_len_ok,
+    store_include_hwm, ColdProgress, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord,
+    ScriptHashTable, COLD_PROGRESS_NAME, INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,

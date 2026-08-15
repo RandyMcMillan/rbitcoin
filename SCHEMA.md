@@ -1,13 +1,18 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 16` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **in flight**
+(more 17 layout changes may follow before 18).  
 **Status:** unstable until 1.0 — most layout changes are reindex-only.  
-**13/14→16 open:** Empty Class A (no creates) + empty/missing SH may silently
-rewrite `meta` to 16. A packed `tx.body` **with creates**, or a durable page-era
+**13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
+rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
 `txout` + `inwit` + `spent` (not a single packed `tx.body`).  
-**15→16 open:** Soft migrate — Class A unchanged; leftover `tx_height.body` is
+**15→17 open:** Soft migrate — Class A unchanged; leftover `tx_height.body` is
 unlinked; create height is the RAM fence.  
+**16→17 open:** Soft migrate when `scripthash.runs` is missing/empty or every
+run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) are **refused**
+(wipe `store/scripthash.runs` and rematerialize). Sealed SH head/body kept.
+Class A unchanged.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -52,7 +57,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     archive_epoch
-    scripthash.runs              # SH sorted runs (Direct IBD; bulk-load at tip)
+    scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
     sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
   wire/                          # unused (opened, never filled)
 
@@ -77,7 +82,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **16** |
+| 4 | 2 | Schema version (u16) — **17** (in flight) |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -403,7 +408,9 @@ store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as s
 ### Query join
 
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
-IBD may stage creates in **sorted runs** and bulk-materialize durable SH at tip entry (slab/page packer).
+IBD may stage creates in **sorted runs** (`key_len=40`, unique
+`(scripthash, create_tx_fk)`) and bulk-materialize durable SH at tip
+entry (slab/page packer). Schema-16 `key_len=32` catalogs are refused.
 
 **Decision:** inline for 1–2-use scripts (~95 % of keys); geometric slabs for
 typical multi-use; page chains only for megakeys. Query cost for busy wallets is

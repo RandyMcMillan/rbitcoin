@@ -194,6 +194,7 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/sync-core-fixtures.test.sh
 ./scripts/core-functional/run.sh.test.sh
 ./scripts/core-functional/run.sh --list
+./scripts/core-functional/bitcoind.test.sh
 # cargo test stages Core JSON from the submodule:
 ./scripts/core-functional/init-submodule.sh
 ./scripts/core-functional/sync-core-fixtures.sh --check

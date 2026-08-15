@@ -2,8 +2,8 @@
 
 Pin: **Bitcoin Core v31.1** (`9be056a8a72b624dae9623b2f7bded92c2a21c91`).
 
-`scripts/core-functional/` holds the inventory, checkers, and (later) the
-bitcoind shim. Core’s Python tests and `src/test/data` live in the
+`scripts/core-functional/` holds the inventory, checkers, runner, and
+the test-only bitcoind shim. Core’s Python tests and `src/test/data` live in the
 **`third_party/bitcoin` submodule** (v31.1). We do **not** copy the 267
 `*.py` files into this repo.
 
@@ -29,6 +29,20 @@ A `skip` or unknown name fails with `not in run set` / `unknown test`.
 `--list` prints `run` names (none today). `--dry-run` prints the
 command and writes `config.ini` (wallet/zmq/ipc off) without starting
 a node. Default `cargo test` never calls this.
+
+`scripts/core-functional/bitcoind` is the TestNode binary: `-datadir=DIR`
+→ `--datadir DIR/regtest` (cookie + `bitcoind.pid` under `DIR/regtest`),
+`-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
+127.0.0.1, `--no-seeds`. Unknown Core flags are ignored. Operator CLI
+is unchanged.
+
+```bash
+./scripts/core-functional/bitcoind.test.sh
+# live cookie + getblockcount==0 (needs a built node):
+cargo build -p rbitcoin-node
+RBITCOIN_NODE=target/dev/debug/rbitcoin-node \
+  python3 scripts/core-functional/smoke_rpc_up.py
+```
 
 ```bash
 ./scripts/core-functional/run.sh --list

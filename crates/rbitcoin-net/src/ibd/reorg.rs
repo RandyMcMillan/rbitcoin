@@ -522,22 +522,19 @@ pub fn connecting_hashes_heavier_disconnected(
     if candidate == tip || hub.has_block(&candidate) {
         return Ok(None);
     }
-    let Some(prev) = parent_hash_of(hub, candidate)? else {
-        return Ok(None);
-    };
-    if prev == tip {
-        // Normal tip+1 extension — not a disconnected most-work chain.
-        return Ok(None);
-    }
     let path = header_hashes_to_best_ancestor(hub, candidate)?;
     if path.is_empty() {
         return Ok(None);
     }
-    // Did not reach a confirmed ancestor: still search the unknown join.
-    let Some(join_parent) = parent_hash_of(hub, path[0])? else {
+    // Join = parent of the first unconfirmed hash. If that is the tip, this
+    // is the best-chain extension (far header at h=8 while tip is 1) — not a fork.
+    let Some(join) = parent_hash_of(hub, path[0])? else {
         return Ok(Some(path));
     };
-    if !hub.has_block(&join_parent) && join_parent.to_byte_array() != [0u8; 32] {
+    if join == tip {
+        return Ok(None);
+    }
+    if !hub.has_block(&join) && join.to_byte_array() != [0u8; 32] {
         return Ok(Some(path));
     }
     if shortest_heavier_header_prefix(hub, &path)?.is_none() {
@@ -1391,6 +1388,47 @@ mod tests {
             need.contains(&w1.block_hash()) && need.contains(&w2.block_hash()),
             "live consider must search connecting mids without resume seed; need={need:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Linear headers ahead of tip are a normal extension, not a fork search.
+    /// (CI: two_node IBD hung at tip=1 after consider treated h=8 as disconnected.)
+    #[test]
+    fn linear_ahead_headers_are_not_a_disconnected_fork() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_500_070_100, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        let mut prev = b1.block_hash();
+        let mut time = 1_500_070_200u32;
+        let mut ahead = Vec::new();
+        for h in 2..=8u32 {
+            let b = mine(prev, time, h);
+            hub.ensure_header(&b.header).unwrap();
+            prev = b.block_hash();
+            time += 100;
+            ahead.push((h, prev));
+        }
+        let last = ahead.last().unwrap().1;
+        assert!(
+            connecting_hashes_heavier_disconnected(&hub, last)
+                .unwrap()
+                .is_none(),
+            "far header on the same chain as tip is not a disconnected fork"
+        );
+        let mut st =
+            super::super::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        for (h, hash) in &ahead {
+            st.record_height(*hash, *h);
+        }
+        st.max_ordered_height = 8;
+        assert!(
+            !consider_disconnected_heavier(&mut st, &hub).unwrap(),
+            "linear work-path must not register connecting search; need={:?}",
+            st.reorg.need_getdata()
+        );
+        assert!(st.reorg.need_getdata().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

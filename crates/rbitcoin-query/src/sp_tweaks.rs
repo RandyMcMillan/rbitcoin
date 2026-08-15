@@ -11,6 +11,27 @@ pub struct ThinTweakRow {
     pub p2tr: Vec<(u32, [u8; 32], u64)>,
 }
 
+/// Budgets for [`Query::load_thin_tweaks_range`] (serve-side multi-height wave).
+///
+/// Cost is eligible txs / Class A body, not height count alone — pair `max_heights`
+/// with `max_eligible` so busy post-taproot blocks do not explode RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinTweakRangeLimits {
+    /// Cap on contiguous heights in one wave (default 128).
+    pub max_heights: u32,
+    /// Cap on total eligible txs across the wave (default 8192).
+    pub max_eligible: usize,
+}
+
+impl Default for ThinTweakRangeLimits {
+    fn default() -> Self {
+        Self {
+            max_heights: 128,
+            max_eligible: 8192,
+        }
+    }
+}
+
 impl Query {
     pub fn sptweaks_enabled(&self) -> bool {
         self.sptweaks_enabled.load(AtomicOrdering::Acquire)
@@ -80,69 +101,136 @@ impl Query {
 
     /// Indexed height, or `None` if hole / no table / missing header.
     ///
-    /// Returns **only eligible** txs (`len=33`). Join is by `header_txs` order
-    /// (no txid search). Eligible create fks go through the confirm
-    /// [`IdxBodyMode::Full`] idx→body machine (page-coalesced idx, one body SQE
-    /// per eligible row). Txids are page-grouped from `txid.body`. Ineligible
-    /// packed neighbors are not read. No parent peeks.
+    /// Returns **only eligible** txs (`len=33`). See [`Self::load_thin_tweaks_range`].
     pub fn load_thin_tweaks(
         &self,
         height: Height,
     ) -> Result<Option<Vec<ThinTweakRow>>, QueryError> {
-        let header_fk = match self.store.confirmed.get(height)? {
-            Some(fk) => fk,
-            None => return Ok(None),
-        };
-        let Some((first_fk, n_tx)) = self.store.header_txs.get_range(header_fk)? else {
-            return Ok(None);
-        };
-        let elig = {
+        let mut batch = self.load_thin_tweaks_range(
+            height,
+            ThinTweakRangeLimits {
+                max_heights: 1,
+                max_eligible: usize::MAX,
+            },
+        )?;
+        Ok(batch.pop().map(|(_, rows)| rows))
+    }
+
+    /// Contiguous thin-index heights starting at `start`, stopped by tip hole,
+    /// index hole, or [`ThinTweakRangeLimits`].
+    ///
+    /// Empty `Ok(vec![])` means the first height is not indexed (caller falls
+    /// back per-height). One Class A [`IdxBodyMode::Full`] wave for all eligible
+    /// fks (existing pipeline / uring). `sp_tweaks` mutex is not held during
+    /// Class A IO.
+    pub fn load_thin_tweaks_range(
+        &self,
+        start: Height,
+        limits: ThinTweakRangeLimits,
+    ) -> Result<Vec<(Height, Vec<ThinTweakRow>)>, QueryError> {
+        if limits.max_heights == 0 {
+            return Ok(Vec::new());
+        }
+        // Plan under lock: copy eligible tweaks + create fks only.
+        struct HeightPlan {
+            height: Height,
+            first_id: u64,
+            /// (tx_index_in_block, tweak)
+            elig: Vec<(u32, [u8; 33])>,
+        }
+        let plans: Vec<HeightPlan> = {
             let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
             let Some(t) = g.as_ref() else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
-            match t.get_eligible(height, header_fk, n_tx)? {
-                Some(r) => r,
-                None => return Ok(None),
+            let mut plans = Vec::new();
+            let mut elig_total = 0usize;
+            for step in 0..limits.max_heights {
+                let h = Height(start.0.saturating_add(step));
+                let Some(header_fk) = self.store.confirmed.get(h)? else {
+                    break;
+                };
+                let Some((first_fk, n_tx)) = self.store.header_txs.get_range(header_fk)? else {
+                    break;
+                };
+                let Some(elig) = t.get_eligible(h, header_fk, n_tx)? else {
+                    break;
+                };
+                let add = elig.len();
+                if !plans.is_empty()
+                    && limits.max_eligible != usize::MAX
+                    && elig_total.saturating_add(add) > limits.max_eligible
+                {
+                    break;
+                }
+                let Some(first_id) = first_fk.get() else {
+                    return Err(StoreError::InvalidFk);
+                };
+                elig_total = elig_total.saturating_add(add);
+                plans.push(HeightPlan {
+                    height: h,
+                    first_id,
+                    elig,
+                });
             }
+            plans
         };
-        if elig.is_empty() {
-            return Ok(Some(Vec::new()));
+
+        if plans.is_empty() {
+            return Ok(Vec::new());
         }
-        let first_id = first_fk.get().ok_or(StoreError::InvalidFk)?;
-        let elig_fks: Vec<Fk> = elig
-            .iter()
-            .map(|&(i, _)| Fk(first_id.saturating_add(u64::from(i))))
-            .collect();
-        let txids = self.store.txs.txid_sidefile().get_many(&elig_fks)?;
-        let mut jobs: Vec<IdxBodyJob> = elig_fks
-            .iter()
-            .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
-            .collect();
-        self.store.idx_body_pipeline(&mut jobs, IdxBodyMode::Full)?;
-        let mut body_bytes = 0u64;
-        let mut rows = Vec::with_capacity(elig.len());
-        for (i, job) in jobs.iter().enumerate() {
-            if !job.ok {
-                return Err(StoreError::Corrupt(
-                    "invariant: thin tweak eligible body missing",
-                ));
+
+        // Flatten eligible create fks for one idx→body wave + txid batch.
+        let mut elig_fks: Vec<Fk> = Vec::new();
+        let mut tag: Vec<(usize, usize)> = Vec::new(); // (plan_i, elig_i)
+        for (pi, p) in plans.iter().enumerate() {
+            for (ei, &(tx_i, _)) in p.elig.iter().enumerate() {
+                elig_fks.push(Fk(p.first_id.saturating_add(u64::from(tx_i))));
+                tag.push((pi, ei));
             }
-            body_bytes = body_bytes.saturating_add(job.body.len() as u64);
-            let Some(txid) = txids.get(i).copied().flatten() else {
-                return Err(StoreError::Corrupt(
-                    "invariant: thin tweak eligible txid missing",
-                ));
-            };
-            let p2tr = self.store.txs.packed_p2tr_from_raw(&job.body)?;
-            rows.push(ThinTweakRow {
-                txid,
-                tweak: elig[i].1,
-                p2tr,
-            });
         }
-        self.note_thin_tweak_body_bytes(body_bytes);
-        Ok(Some(rows))
+
+        let mut out_rows: Vec<Vec<ThinTweakRow>> = plans
+            .iter()
+            .map(|p| Vec::with_capacity(p.elig.len()))
+            .collect();
+
+        if !elig_fks.is_empty() {
+            let txids = self.store.txs.txid_sidefile().get_many(&elig_fks)?;
+            let mut jobs: Vec<IdxBodyJob> = elig_fks
+                .iter()
+                .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
+                .collect();
+            self.store.idx_body_pipeline(&mut jobs, IdxBodyMode::Full)?;
+            let mut body_bytes = 0u64;
+            for (i, job) in jobs.iter().enumerate() {
+                if !job.ok {
+                    return Err(StoreError::Corrupt(
+                        "invariant: thin tweak eligible body missing",
+                    ));
+                }
+                body_bytes = body_bytes.saturating_add(job.body.len() as u64);
+                let Some(txid) = txids.get(i).copied().flatten() else {
+                    return Err(StoreError::Corrupt(
+                        "invariant: thin tweak eligible txid missing",
+                    ));
+                };
+                let (pi, ei) = tag[i];
+                let p2tr = self.store.txs.packed_p2tr_from_raw(&job.body)?;
+                out_rows[pi].push(ThinTweakRow {
+                    txid,
+                    tweak: plans[pi].elig[ei].1,
+                    p2tr,
+                });
+            }
+            self.note_thin_tweak_body_bytes(body_bytes);
+        }
+
+        Ok(plans
+            .into_iter()
+            .zip(out_rows.into_iter())
+            .map(|(p, rows)| (p.height, rows))
+            .collect())
     }
 }
 
@@ -358,6 +446,145 @@ mod tests {
             "read {read} must be smaller than the skipped fat row {}",
             fat.1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-height range load must match sequential single-height loads.
+    #[test]
+    fn load_thin_range_matches_singles_and_stops_on_hole() {
+        let (dir, q) = tmp_q();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let (p2wpkh, p2tr, ser) = p2wpkh_p2tr();
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: genesis_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 2,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![
+                        OutputRecord::unspent(25_0000_0000, p2wpkh.clone()),
+                        OutputRecord::unspent(25_0000_0000, p2wpkh),
+                    ],
+                }],
+            )
+            .unwrap();
+        q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let spend = |prev: u32, tid: u8, tw: [u8; 33]| {
+            let mut txid = [0u8; 32];
+            txid[0] = tid;
+            (
+                TxApply {
+                    tx: TxRecord {
+                        txid,
+                        version: 2,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord {
+                        prev_txid: genesis_txid,
+                        create_fk,
+                        prev_index: prev,
+                        sequence: u32::MAX,
+                        script_sig: vec![],
+                        witness: vec![vec![0u8; 64], ser.clone()],
+                    }],
+                    outputs: vec![OutputRecord::unspent(24_0000_0000, p2tr.clone())],
+                },
+                tw,
+                txid,
+            )
+        };
+        let mut tw1 = [0x02; 33];
+        tw1[0] = 0x02;
+        let mut tw2 = [0x03; 33];
+        tw2[0] = 0x03;
+        let (tx1, tw1, tid1) = spend(0, 0xa1, tw1);
+        let h1 = header(1, fk0, Some(h0.hash));
+        let fk1 = q.connect_block(Height(1), &h1, &[tx1]).unwrap();
+        q.put_sp_tweaks_block(Height(1), fk1, &[Some(tw1)]).unwrap();
+
+        let (tx2, tw2, tid2) = spend(1, 0xa2, tw2);
+        let h2 = header(2, fk1, Some(h1.hash));
+        let fk2 = q.connect_block(Height(2), &h2, &[tx2]).unwrap();
+        q.put_sp_tweaks_block(Height(2), fk2, &[Some(tw2)]).unwrap();
+
+        // Contiguous 0..=2: height 0 empty eligible, 1 and 2 one each.
+        let batch = q
+            .load_thin_tweaks_range(Height(0), ThinTweakRangeLimits::default())
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].0, Height(0));
+        assert!(batch[0].1.is_empty());
+        assert_eq!(batch[1].1.len(), 1);
+        assert_eq!(batch[1].1[0].txid, tid1);
+        assert_eq!(batch[1].1[0].tweak, tw1);
+        assert_eq!(batch[2].1[0].txid, tid2);
+        assert_eq!(batch[2].1[0].tweak, tw2);
+
+        for h in 0u32..=2 {
+            let single = q.load_thin_tweaks(Height(h)).unwrap().expect("indexed");
+            assert_eq!(single.len(), batch[h as usize].1.len());
+            for (a, b) in single.iter().zip(batch[h as usize].1.iter()) {
+                assert_eq!(a.txid, b.txid);
+                assert_eq!(a.tweak, b.tweak);
+                assert_eq!(a.p2tr, b.p2tr);
+            }
+        }
+
+        // max_heights=1
+        let one = q
+            .load_thin_tweaks_range(
+                Height(1),
+                ThinTweakRangeLimits {
+                    max_heights: 1,
+                    max_eligible: 8192,
+                },
+            )
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, Height(1));
+
+        // max_eligible=1 stops after first height that contributes elig (h1).
+        let budg = q
+            .load_thin_tweaks_range(
+                Height(1),
+                ThinTweakRangeLimits {
+                    max_heights: 10,
+                    max_eligible: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(budg.len(), 1);
+        assert_eq!(budg[0].0, Height(1));
+
+        // Hole: no height 3 index → start at 3 is empty; start at 2 is only h2.
+        assert!(q
+            .load_thin_tweaks_range(Height(3), ThinTweakRangeLimits::default())
+            .unwrap()
+            .is_empty());
+        let only2 = q
+            .load_thin_tweaks_range(Height(2), ThinTweakRangeLimits::default())
+            .unwrap();
+        assert_eq!(only2.len(), 1);
+        assert_eq!(only2[0].0, Height(2));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

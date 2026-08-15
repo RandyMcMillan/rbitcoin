@@ -611,26 +611,55 @@ where
         write_line(writer, &crate::tweaks::done_notify()).await?;
         return Ok(());
     };
+    // Remaining heights: budgeted multi-height thin load (one Class A idx→body
+    // wave per batch) then per-height Cake notifies. Hole / unindexed → single-height path.
     let mut next = req.start.saturating_add(1);
+    let limits = crate::tweaks::subscribe_range_limits();
     while next <= last {
-        tokio::select! {
+        let batch_start = next;
+        let batch_fut = {
+            let q = Arc::clone(query);
+            let c = Arc::clone(chain);
+            let lim = limits;
+            let last_h = last;
+            let start_h = batch_start;
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let thin = crate::tweaks::load_thin_batch(&q, start_h, last_h, lim)?;
+                    if thin.is_empty() {
+                        return Ok::<Vec<String>, String>(vec![crate::tweaks::height_notify_json(
+                            &q, &c, start_h,
+                        )?]);
+                    }
+                    Ok(thin
+                        .into_iter()
+                        .map(|(h, rows)| crate::tweaks::thin_height_notify_json(h, &rows))
+                        .collect())
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            }
+        };
+        let batch = tokio::select! {
             biased;
             line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
                 match line {
                     Ok(Ok(Some(l))) => {
-                        if l.trim().is_empty() {
-                            continue;
-                        }
-                        if let Ok(req) = serde_json::from_str::<Value>(&l) {
-                            let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
-                            if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
-                                write_line(
-                                    writer,
-                                    &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
-                                )
-                                .await?;
+                        if !l.trim().is_empty() {
+                            if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                                let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
+                                if req.get("method").and_then(|m| m.as_str()) == Some("server.ping")
+                                {
+                                    write_line(
+                                        writer,
+                                        &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
+                                    )
+                                    .await?;
+                                }
                             }
                         }
+                        // Re-poll load after handling ping (do not advance next).
+                        continue;
                     }
                     Ok(Ok(None)) => return Ok(()),
                     Ok(Err(e)) => return Err(e),
@@ -642,35 +671,28 @@ where
                     }
                 }
             }
-            map = {
-                let q = Arc::clone(query);
-                let c = Arc::clone(chain);
-                let h = next;
-                async move {
-                    tokio::task::spawn_blocking(move || crate::tweaks::height_notify_json(&q, &c, h))
-                        .await
-                        .unwrap_or_else(|e| Err(e.to_string()))
-                }
-            } => {
+            map = batch_fut => {
                 match map {
-                    Ok(v) => {
-                        write_raw_line(writer, &v).await?;
-                    }
+                    Ok(v) => v,
                     Err(e) => {
                         rbitcoin_log::api_call(
                             "electrum",
                             &peer.to_string(),
                             "blockchain.tweaks.subscribe",
-                            &format!("[{next},1]"),
+                            &format!("[{batch_start},batch]"),
                             0,
                             Some(&e),
                         );
                         break;
                     }
                 }
-                next = next.saturating_add(1);
             }
+        };
+        let n = batch.len() as u32;
+        for line in &batch {
+            write_raw_line(writer, line).await?;
         }
+        next = batch_start.saturating_add(n.max(1));
     }
     write_line(writer, &crate::tweaks::done_notify()).await?;
     Ok(())

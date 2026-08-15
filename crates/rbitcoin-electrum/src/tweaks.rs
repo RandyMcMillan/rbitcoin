@@ -4,7 +4,7 @@ use rbitcoin_consensus::{tweaks_for_height, ChainParams, TxTweak};
 #[cfg(test)]
 use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
+use rbitcoin_query::{Query, ThinTweakRangeLimits, ThinTweakRow};
 #[cfg(test)]
 use serde_json::Map;
 use serde_json::{json, Value};
@@ -65,11 +65,49 @@ pub fn height_map_json(query: &Query, chain: &ChainParams, h: u32) -> Result<Str
 /// Electrum notify line for one height (json-rpc wrapper + newline not included).
 pub fn height_notify_json(query: &Query, chain: &ChainParams, h: u32) -> Result<String, String> {
     let map = height_map_json(query, chain, h)?;
-    let mut s = String::with_capacity(map.len() + 80);
+    Ok(wrap_height_notify(&map))
+}
+
+fn wrap_height_notify(map_json: &str) -> String {
+    let mut s = String::with_capacity(map_json.len() + 80);
     s.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.tweaks.subscribe\",\"params\":[");
-    s.push_str(&map);
+    s.push_str(map_json);
     s.push_str("]}");
-    Ok(s)
+    s
+}
+
+/// Default multi-height load budgets for subscribe (max 128 heights, 8192 eligible).
+pub fn subscribe_range_limits() -> ThinTweakRangeLimits {
+    ThinTweakRangeLimits::default()
+}
+
+/// Load a budgeted contiguous thin-index batch starting at `start`.
+///
+/// Empty → first height not indexed (caller uses per-height naive/thin).
+/// Otherwise each entry is an indexed height (possibly zero eligible rows).
+pub fn load_thin_batch(
+    query: &Query,
+    start: u32,
+    last: u32,
+    limits: ThinTweakRangeLimits,
+) -> Result<Vec<(u32, Vec<ThinTweakRow>)>, String> {
+    if start > last {
+        return Ok(Vec::new());
+    }
+    let max_h = last.saturating_sub(start).saturating_add(1);
+    let limits = ThinTweakRangeLimits {
+        max_heights: limits.max_heights.min(max_h),
+        max_eligible: limits.max_eligible,
+    };
+    let batch = query
+        .load_thin_tweaks_range(Height(start), limits)
+        .map_err(|e| e.to_string())?;
+    Ok(batch.into_iter().map(|(h, rows)| (h.0, rows)).collect())
+}
+
+/// Notify JSON for one thin-index height map.
+pub fn thin_height_notify_json(h: u32, rows: &[ThinTweakRow]) -> String {
+    wrap_height_notify(&encode_thin_height_json(h, rows))
 }
 
 fn empty_height_json(h: u32) -> String {

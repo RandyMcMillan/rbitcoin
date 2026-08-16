@@ -159,6 +159,14 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
             "logsourcelocations",
             "nologratelimit",
             "print-cmd",
+            # Core TestNode / MiniWallet extras we do not implement as flags.
+            "whitelist",
+            "persistmempool",
+            "acceptnonstdtxn",
+            "minrelaytxfee",
+            "blocksonly",
+            "peerblockfilters",
+            "txindex",
         ):
             pass
         else:

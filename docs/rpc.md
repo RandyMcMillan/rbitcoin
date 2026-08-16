@@ -69,7 +69,11 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
-| `generatetoaddress` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
+| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. `generatetodescriptor` accepts `raw(HEX)` (MiniWallet) or an address. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
+| `scantxoutset` | `raw(HEX)` over Class A unspent outputs. Enough for MiniWallet. Not Core coins-DB / HD-range scan. |
+| `gettxout` | Class A + mempool. |
+| `getchaintips` | Active tip only (no parked-fork list yet). |
+| `waitforblock` / `waitforblockheight` / `waitfornewblock` | Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. |
 

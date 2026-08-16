@@ -16,6 +16,11 @@ before 1.0).
   (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
   required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
 
+- **MiniWallet harness RPCs:** `generatetodescriptor` (`raw(HEX)`),
+  `scantxoutset` over Class A for `raw()` scripts, `gettxout`,
+  `getchaintips` (active tip), and `waitforblock*`. Enough for Core's
+  wallet-less MiniWallet to construct, not a coins-DB product.
+
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
 

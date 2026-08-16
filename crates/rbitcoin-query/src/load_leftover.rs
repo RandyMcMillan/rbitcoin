@@ -1,17 +1,18 @@
 //! Load-thread leftover write-behind identity (`txid → create_fk`).
 //!
-//! Write is the sole sender on [`LoadInbox`]. Load is the sole receiver and
-//! the sole mutator of [`LoadLeftoverPending`]. No `RwLock<Arc<HashMap>>`
-//! snap — leftover bind is a plain map get after inbox ingest.
+//! Write is the sole sender on [`LoadInbox`] (**`Note` only**). Load is the
+//! sole receiver and the sole mutator of [`LoadLeftoverPending`]. Drain
+//! complete is a post-insert HWM load polls (not a queue). Header-cache GC
+//! polls `tip_height()`. Write still publishes pin layout on batch Arcs.
 //!
-//! Forget is load-only: fence covers **and** [`LoadInboxMsg::DrainDone`]
+//! Forget is load-only: fence covers **and** `height < drain_through_excl`
 //! **and** height strictly below the pack being stamped. Keep the previous
 //! pack (n−1 parent of tip+1). Last fk wins for a duplicate txid
 //! ([`docs/errata.md`](../../../docs/errata.md)).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeightFence;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Mutex;
 
@@ -19,36 +20,14 @@ use std::sync::Mutex;
 const LOAD_LEFTOVER_CAP: usize = 262_144;
 
 /// Write → load handoff. Write must not block on a full channel.
+///
+/// Only payload load cannot poll: Class A `txid → fk` before `tx.head` drain.
 #[derive(Debug, Clone)]
 pub enum LoadInboxMsg {
     /// Class A published `txid.body` / idx; `tx.head` may still be queued.
     Note {
         height: u32,
         entries: Vec<([u8; 32], Fk)>,
-    },
-    /// `head_insert_many` returned for this height's queued inserts.
-    DrainDone { height: u32 },
-    /// Class C tip advanced; load GCs header plans `<= tip`.
-    TipAdvanced { tip: u32 },
-    /// Write filled body/spent ranges on a **batch-local** pin. Load is the
-    /// only publisher into [`crate::PipelineParentStore`].
-    LayoutDone {
-        fk: Fk,
-        body_range: Option<(u64, u64)>,
-        spent_range: Option<(u64, u64)>,
-    },
-}
-
-/// Side effects from inbox ingest (applied by Query leftover, not the map).
-#[derive(Debug, Clone)]
-pub enum LoadInboxEffect {
-    TipAdvanced {
-        tip: u32,
-    },
-    LayoutDone {
-        fk: Fk,
-        body_range: Option<(u64, u64)>,
-        spent_range: Option<(u64, u64)>,
     },
 }
 
@@ -57,8 +36,7 @@ pub enum LoadInboxEffect {
 #[derive(Debug, Default)]
 pub struct LoadLeftoverPending {
     by_txid: HashMap<[u8; 32], Fk>,
-    by_height: BTreeMap<u32, Vec<[u8; 32]>>,
-    drain_done: BTreeSet<u32>,
+    by_height: BTreeMap<u32, Vec<([u8; 32], Fk)>>,
 }
 
 impl LoadLeftoverPending {
@@ -78,7 +56,8 @@ impl LoadLeftoverPending {
         self.by_txid.get(txid).copied()
     }
 
-    /// Last fk wins (errata one-fk-per-txid).
+    /// Last fk wins (errata one-fk-per-txid). Stale `(txid, old_fk)` stays on
+    /// the old height slot; forget only removes if `by_txid` still holds that fk.
     pub fn apply_note(&mut self, height: u32, entries: Vec<([u8; 32], Fk)>) {
         if entries.is_empty() {
             return;
@@ -88,47 +67,47 @@ impl LoadLeftoverPending {
         self.by_txid.reserve(entries.len());
         for (txid, fk) in entries {
             self.by_txid.insert(txid, fk);
-            slot.push(txid);
+            slot.push((txid, fk));
         }
-    }
-
-    pub fn apply_drain_done(&mut self, height: u32) {
-        self.drain_done.insert(height);
     }
 
     /// Disconnect / abandon: drop leftover identity for this height now.
     pub fn drop_height(&mut self, height: u32) {
-        if let Some(txids) = self.by_height.remove(&height) {
-            for t in txids {
-                self.by_txid.remove(&t);
+        if let Some(entries) = self.by_height.remove(&height) {
+            for (t, noted_fk) in entries {
+                if self.by_txid.get(&t) == Some(&noted_fk) {
+                    self.by_txid.remove(&t);
+                }
             }
         }
-        self.drain_done.remove(&height);
     }
 
-    /// Drop heights `< pack_lo` that have DrainDone and every remaining fk
-    /// is fence-connected. Call **after** leftover bind of this pack.
-    pub fn forget_ready(&mut self, fence: &HeightFence, pack_lo: u32) {
+    /// Drop heights `< pack_lo` whose inserts are visible (`height < drain_through_excl`)
+    /// and every remaining noted fk is fence-connected. After leftover bind.
+    ///
+    /// `drain_through_excl == 0` means insert has never completed (keep all).
+    pub fn forget_ready(&mut self, fence: &HeightFence, pack_lo: u32, drain_through_excl: u64) {
         let drop_h: Vec<u32> = self
             .by_height
             .range(..pack_lo)
-            .filter(|(h, txids)| {
-                self.drain_done.contains(h)
-                    && txids.iter().all(|t| {
+            .filter(|(h, entries)| {
+                (**h as u64) < drain_through_excl
+                    && entries.iter().all(|(t, noted_fk)| {
                         self.by_txid
                             .get(t)
-                            .is_none_or(|fk| fence.height_of(*fk).is_some())
+                            .is_none_or(|cur| *cur != *noted_fk || fence.height_of(*cur).is_some())
                     })
             })
             .map(|(h, _)| *h)
             .collect();
         for h in drop_h {
-            if let Some(txids) = self.by_height.remove(&h) {
-                for t in txids {
-                    self.by_txid.remove(&t);
+            if let Some(entries) = self.by_height.remove(&h) {
+                for (t, noted_fk) in entries {
+                    if self.by_txid.get(&t) == Some(&noted_fk) {
+                        self.by_txid.remove(&t);
+                    }
                 }
             }
-            self.drain_done.remove(&h);
         }
     }
 
@@ -165,32 +144,13 @@ impl LoadInbox {
         let _ = self.tx.send(msg);
     }
 
-    /// Ingest the channel. Notes/DrainDone update the map. Tip/layout are
-    /// returned for Query to apply (header GC, parent-store layout).
-    pub fn ingest(&self) -> Result<Vec<LoadInboxEffect>, rbitcoin_store::StoreError> {
+    /// Ingest Notes. Drain complete and tip are polled, not queued.
+    pub fn ingest(&self) -> Result<(), rbitcoin_store::StoreError> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut effects = Vec::new();
         loop {
             match g.rx.try_recv() {
                 Ok(LoadInboxMsg::Note { height, entries }) => {
                     g.pending.apply_note(height, entries);
-                }
-                Ok(LoadInboxMsg::DrainDone { height }) => {
-                    g.pending.apply_drain_done(height);
-                }
-                Ok(LoadInboxMsg::TipAdvanced { tip }) => {
-                    effects.push(LoadInboxEffect::TipAdvanced { tip });
-                }
-                Ok(LoadInboxMsg::LayoutDone {
-                    fk,
-                    body_range,
-                    spent_range,
-                }) => {
-                    effects.push(LoadInboxEffect::LayoutDone {
-                        fk,
-                        body_range,
-                        spent_range,
-                    });
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
@@ -201,7 +161,7 @@ impl LoadInbox {
                 "load leftover pending exceeded PENDING_HEAD_CAP",
             ));
         }
-        Ok(effects)
+        Ok(())
     }
 
     /// Load leftover walk + forget. Holds the inbox lock for the pack (write
@@ -257,13 +217,12 @@ mod tests {
         let mut p = LoadLeftoverPending::new();
         let parent = [0xAAu8; 32];
         p.apply_note(0, vec![(parent, Fk(1))]);
-        p.apply_drain_done(0);
         // Stamping height 1: pack_lo=1. Forget after bind may drop 0, so bind first.
         assert_eq!(p.fk(&parent), Some(Fk(1)), "bind height-1 child");
-        p.forget_ready(&fence, 1);
+        p.forget_ready(&fence, 1, 1);
         // After leftover of height 1, height 0 may drop.
         // Stamping height 2: pack_lo=2 drops 0.
-        p.forget_ready(&fence, 2);
+        p.forget_ready(&fence, 2, 1);
         assert!(
             p.fk(&parent).is_none(),
             "height 0 may drop once pack_lo is 2"
@@ -282,11 +241,11 @@ mod tests {
         let mut p = LoadLeftoverPending::new();
         let parent = [0xBBu8; 32];
         p.apply_note(0, vec![(parent, Fk(1))]);
-        p.forget_ready(&fence, 99);
+        p.forget_ready(&fence, 99, 0);
         assert_eq!(
             p.fk(&parent),
             Some(Fk(1)),
-            "no DrainDone ⇒ keep even if fence covers"
+            "drain_through 0 ⇒ keep even if fence covers"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -310,6 +269,26 @@ mod tests {
     }
 
     #[test]
+    fn leftover_forget_does_not_drop_clobbered_fk() {
+        let (dir, store) = temp_store("clobber-forget");
+        store.confirmed.set(Height(0), Fk(1)).unwrap();
+        store.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+        store.rebuild_height_fence().unwrap();
+        let fence = store.height_fence_snapshot();
+        let mut p = LoadLeftoverPending::new();
+        let txid = [0xCDu8; 32];
+        p.apply_note(0, vec![(txid, Fk(1))]);
+        p.apply_note(1, vec![(txid, Fk(2))]);
+        p.forget_ready(&fence, 1, 1);
+        assert_eq!(
+            p.fk(&txid),
+            Some(Fk(2)),
+            "forget of old height must not remove the newer fk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn inbox_ingest_note_then_bind() {
         let inbox = LoadInbox::new();
         let txid = [0xDDu8; 32];
@@ -317,8 +296,7 @@ mod tests {
             height: 3,
             entries: vec![(txid, Fk(9))],
         });
-        let effects = inbox.ingest().unwrap();
-        assert!(effects.is_empty());
+        inbox.ingest().unwrap();
         inbox.with_pending_mut(|p| {
             assert_eq!(p.fk(&txid), Some(Fk(9)));
         });

@@ -512,7 +512,7 @@ impl Query {
         self.store.confirmed.disconnect_tip(height)?;
         self.store.height_fence_pop_tip(height);
         // Ingest first so in-flight Notes for this height exist, then drop.
-        let _ = self.leftover_ingest_apply(None);
+        let _ = self.leftover_on_load_pack();
         self.leftover_drop_height(height.0);
         self.store.flush_confirmed_only()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());

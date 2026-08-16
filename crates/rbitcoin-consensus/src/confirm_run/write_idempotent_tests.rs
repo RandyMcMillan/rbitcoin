@@ -2166,7 +2166,7 @@ fn write_mtp_does_not_get_header_plan() {
         .expect("post_commit");
     assert!(
         !post.contains("advance_parent_cache_tip"),
-        "post_commit must not GC header cache; load applies TipAdvanced"
+        "post_commit must not GC header cache; load polls store tip"
     );
     let write = include_str!("write.rs");
     assert!(
@@ -2174,7 +2174,11 @@ fn write_mtp_does_not_get_header_plan() {
         "write must not call advance_parent_cache_tip"
     );
     assert!(
-        write.contains("TipAdvanced"),
-        "write signals header GC via TipAdvanced inbox"
+        write.contains("note_head_drain_through"),
+        "write publishes drain HWM after insert, not DrainDone messages"
+    );
+    assert!(
+        !write.contains("LoadInboxMsg"),
+        "write inbox is Note-only (from Class A); no DrainDone/Tip/Layout"
     );
 }

@@ -402,8 +402,8 @@ pub(super) fn post_commit(
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);
 
-    // Header-cache GC is load-owned (`TipAdvanced` inbox). Write does not
-    // lock ConfirmParentCache.
+    // Header-cache GC is load-owned (polls store tip each pack). Write does
+    // not lock ConfirmParentCache.
     let tip_gc_ns = 0u64;
     Ok((spend_ann_ns, tip_gc_ns))
 }

@@ -27,13 +27,14 @@ before 1.0).
 ### Changed
 
 - **Load-owned leftover pending:** write-behind `txid → create_fk` is a
-  plain map on the load thread. Write sends `Note` / `DrainDone` /
-  `TipAdvanced` / `LayoutDone` on an unbounded inbox (never stalls
-  Class A). Load forgets after leftover bind when fence covers **and**
-  DrainDone **and** height `< pack_lo` (keep previous pack). Store
-  `PendingHeadInserts` is a write-local drain `Vec` only — no
-  `RwLock<Arc<HashMap>>` snap. Write structural BIP68 uses assemble
-  `prev_mtp`; header-cache GC is load `TipAdvanced`. Not a leftover
+  plain map on the load thread. Inbox is **`Note` only** (Class A
+  identity). Drain complete is a post-insert HWM load polls (not tip or
+  fence — those advance during drain). Header-cache GC polls store tip
+  every load pack. Load forgets after bind when fence covers **and**
+  `height < drain_through` **and** height `< pack_lo` (keep previous
+  pack; do not drop a clobbered newer fk). Store `PendingHeadInserts`
+  is a write-local drain `Vec` only — no `RwLock<Arc<HashMap>>` snap.
+  Write structural BIP68 uses assemble `prev_mtp`. Not a leftover
   soft-requeue. Not a load-feed / `leftover_ms` win.
 
 - **`tx.head` insert has no mmap-era CPU fence:** `insert_many` / page

@@ -150,14 +150,9 @@ pub fn confirm_write_phase(
                     )));
                 }
             }
-            // Load forgets leftover identity. Write only signals drain+tip.
-            for p in &batch.prepared {
-                query.send_load_inbox(rbitcoin_query::LoadInboxMsg::DrainDone {
-                    height: p.height.0,
-                });
-            }
-            if let Some(tip) = batch.prepared.last().map(|p| p.height.0) {
-                query.send_load_inbox(rbitcoin_query::LoadInboxMsg::TipAdvanced { tip });
+            // Insert finished. Load polls this HWM (not tip/fence — 67438).
+            if let Some(h) = batch.prepared.last().map(|p| p.height.0) {
+                query.note_head_drain_through(h);
             }
 
             Ok((
@@ -258,22 +253,11 @@ pub(super) fn fill_planned_create_layout_after_commit(
         .zip(spent.into_iter())
         .zip(need_pin_i.iter())
     {
-        let mut body = None;
-        let mut spent = None;
         if let Some((off, len)) = range {
             batch_parents.set_body_range_only(fk, (off, len));
-            body = Some((off, len));
         }
         if let Some(sr) = spent_r {
             batch_parents.set_spent_range_only(fk, sr);
-            spent = Some(sr);
-        }
-        if body.is_some() || spent.is_some() {
-            query.send_load_inbox(rbitcoin_query::LoadInboxMsg::LayoutDone {
-                fk,
-                body_range: body,
-                spent_range: spent,
-            });
         }
     }
     Ok(())

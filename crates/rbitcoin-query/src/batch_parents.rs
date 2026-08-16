@@ -343,39 +343,6 @@ impl PipelineParentStore {
     /// Same Weak lifetime as outs share: last batch `Arc` drop → `None`.
     /// Zero txid is never indexed. Live pin without `body_range` is a miss
     /// (do not half-skip head).
-    /// Load-only: apply write `LayoutDone` onto a live store pin.
-    pub fn apply_layout(
-        &self,
-        fk: Fk,
-        body_range: Option<(u64, u64)>,
-        spent_range: Option<(u64, u64)>,
-    ) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(p) = g.by_fk.get(&id).and_then(|w| w.upgrade()) else {
-            return;
-        };
-        p.publish_layout(|cur| {
-            let mut next = cur.clone();
-            let mut changed = false;
-            if let Some(r) = body_range {
-                if next.body_range != Some(r) {
-                    next.body_range = Some(r);
-                    changed = true;
-                }
-            }
-            if let Some(r) = spent_range {
-                if next.spent_range != Some(r) {
-                    next.spent_range = Some(r);
-                    changed = true;
-                }
-            }
-            changed.then_some(next)
-        });
-    }
-
     pub fn lookup_txid(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
         if *txid == [0u8; 32] {
             return None;

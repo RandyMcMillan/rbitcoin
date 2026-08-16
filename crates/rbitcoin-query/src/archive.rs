@@ -393,7 +393,14 @@ impl Query {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
 
+        // Every plan/load pack: ingest Notes + header-cache GC from store tip.
+        self.leftover_on_load_pack()?;
         if need.is_empty() {
+            self.leftover_forget(
+                self.tip_height()
+                    .map(|h| h.0.saturating_add(1))
+                    .unwrap_or(0),
+            );
             return Ok(ArchiveWritePlan::empty());
         }
 
@@ -548,15 +555,14 @@ impl Query {
         }
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
         // Bind load-owned pending (no fence) then TipOnly (connected). Write
-        // notes the inbox at Class A; load forgets after bind when DrainDone
+        // notes the inbox at Class A; load forgets after bind when drain HWM
         // + fence + height < pack_lo (keep previous pack).
         let t_head = Instant::now();
+        let pack_lo = self
+            .tip_height()
+            .map(|h| h.0.saturating_add(1))
+            .unwrap_or(0);
         if !need_head.is_empty() {
-            self.leftover_ingest_apply(parent_store)?;
-            let pack_lo = self
-                .tip_height()
-                .map(|h| h.0.saturating_add(1))
-                .unwrap_or(0);
             let mut leftover_pend = 0u64;
             need_head = self.leftover_bind_then_forget(
                 &need_head,
@@ -599,6 +605,8 @@ impl Query {
                 }
             }
             crate::archive_phase_stats::note_leftover_mix(leftover_pend, age0, age3, age_n);
+        } else {
+            self.leftover_forget(pack_lo);
         }
         let head_fk_ns = t_head.elapsed().as_nanos() as u64;
         // Need/hit before stamp so a leftover miss still meters the fail pack.
@@ -775,9 +783,14 @@ impl Query {
     /// Drains write-behind `tx.head` before return. Confirm write uses
     /// [`Self::archive_commit_plan_defer_head`] to overlap drain with Class C.
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<bool, QueryError> {
+        let note_h = self
+            .tip_height()
+            .map(|h| h.0.saturating_add(1))
+            .unwrap_or(0);
         let committed = self.archive_commit_plan_defer_head(plan)?;
         if committed {
             let _ = self.drain_pending_tx_head()?;
+            self.note_head_drain_through(note_h);
         }
         Ok(committed)
     }
@@ -872,7 +885,7 @@ impl Query {
 
     /// Drain write-behind `tx.head` inserts (page-grouped).
     ///
-    /// Insert only. Load forgets leftover identity after DrainDone + fence.
+    /// Insert only. Load forgets leftover identity after drain HWM + fence.
     pub fn drain_pending_tx_head(&self) -> Result<u64, QueryError> {
         self.store.txs.head_drain_pending()
     }
@@ -881,8 +894,9 @@ impl Query {
     /// leftover bind forgets after each pack.
     pub fn leftover_forget(&self, pack_lo: u32) {
         let fence = self.store.height_fence_snapshot();
+        let drain = self.head_drain_through_excl();
         self.load_inbox
-            .with_pending_mut(|p| p.forget_ready(&fence, pack_lo));
+            .with_pending_mut(|p| p.forget_ready(&fence, pack_lo, drain));
     }
 
     /// Drop leftover notes for a disconnected height (not a forget-if-fenced).
@@ -1241,7 +1255,7 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        q.leftover_ingest_apply(None).unwrap();
+        q.leftover_on_load_pack().unwrap();
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xef;
@@ -1286,8 +1300,8 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.send_load_inbox(crate::LoadInboxMsg::DrainDone { height: 0 });
-        q.leftover_ingest_apply(None).unwrap();
+        q.note_head_drain_through(0);
+        q.leftover_on_load_pack().unwrap();
         // pack_lo=1 after leftover of a height-1 child: bind first (keep), then drop.
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xea;
@@ -1314,15 +1328,15 @@ mod tests {
         let mut need_b = vec![(Fk(2), vec![child])];
         let plan_b = q
             .archive_plan_batch_from(&mut need_b, 2, &empty)
-            .expect("height-1 child must bind prev pack after DrainDone");
+            .expect("height-1 child must bind prev pack after drain HWM");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         q.leftover_forget(2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_applies_tip_advanced() {
-        let (dir, q) = temp_query("tip-advanced");
+    fn load_gcs_header_plans_from_store_tip() {
+        let (dir, q) = temp_query("tip-gc");
         let rec = rbitcoin_store::HeaderRecord {
             prev_fk: Fk::NULL,
             version: 1,
@@ -1333,13 +1347,25 @@ mod tests {
             hash: [9u8; 32],
         };
         q.confirm_parent_cache()
-            .put_header_plan(1, Fk(1), rec, vec![Fk(1)], [0u8; 32]);
+            .put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
         assert!(q.confirm_parent_cache().get_header_plan(1).is_some());
-        q.send_load_inbox(crate::LoadInboxMsg::TipAdvanced { tip: 1 });
-        q.leftover_ingest_apply(None).unwrap();
+        q.leftover_on_load_pack().unwrap();
+        assert!(
+            q.confirm_parent_cache().get_header_plan(1).is_some(),
+            "store tip below the plan — do not GC height 1"
+        );
+        q.store()
+            .confirmed
+            .set(rbitcoin_primitives::Height(0), Fk(1))
+            .unwrap();
+        q.store()
+            .confirmed
+            .set(rbitcoin_primitives::Height(1), Fk(2))
+            .unwrap();
+        q.leftover_on_load_pack().unwrap();
         assert!(
             q.confirm_parent_cache().get_header_plan(1).is_none(),
-            "load ingest of TipAdvanced must GC header plans"
+            "load pack must GC header plans <= store tip"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1362,7 +1388,8 @@ mod tests {
             .height_fence_snapshot()
             .height_of(parent_fk)
             .is_none());
-        // Commit already drained tx.head. No DrainDone — load map keeps the create.
+        // Commit drained tx.head and published drain HWM. pack_lo is 0 (no
+        // tip) so forget does not drop the Note; leftover still binds.
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xee;
@@ -1409,8 +1436,8 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.send_load_inbox(crate::LoadInboxMsg::DrainDone { height: 0 });
-        q.leftover_ingest_apply(None).unwrap();
+        q.note_head_drain_through(0);
+        q.leftover_on_load_pack().unwrap();
         q.leftover_forget(1);
         // Load map dropped height 0; leftover must TipOnly the connected head.
 
@@ -1472,7 +1499,7 @@ mod tests {
                 .is_some(),
             "Class C fence covers the create before drain insert"
         );
-        // No DrainDone — load map keeps the create (67438).
+        // Defer-head: no drain HWM — load map keeps the create (67438).
         q.leftover_forget(99);
 
         let mut child_txid = [0u8; 32];

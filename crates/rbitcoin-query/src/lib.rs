@@ -131,7 +131,7 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
-pub use load_leftover::{LoadInboxEffect, LoadInboxMsg, LoadLeftoverPending};
+pub use load_leftover::{LoadInboxMsg, LoadLeftoverPending};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -986,8 +986,12 @@ pub struct Query {
     reconstruct_archived: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     thin_tweak_body_bytes: AtomicU64,
-    /// Write → load leftover inbox. Write sends; load ingests (sole map writer).
+    /// Write → load leftover inbox (`Note` only). Load ingests (sole map writer).
     load_inbox: load_leftover::LoadInbox,
+    /// Exclusive height HWM: `head_insert_many` has finished for notes with
+    /// `height < this`. 0 = never drained (do not forget). Write stores
+    /// `max_height + 1` after insert returns — not tip, not fence (67438).
+    head_drain_through: AtomicU64,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1064,6 +1068,7 @@ impl Query {
             reconstruct_archived: AtomicU64::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
             load_inbox: load_leftover::LoadInbox::new(),
+            head_drain_through: AtomicU64::new(0),
         };
         // Eager height index so first Esplora/P2P mid-chain lookup is hot.
         if let Some(tip) = q.tip_height() {
@@ -1074,33 +1079,28 @@ impl Query {
         Ok(q)
     }
 
-    /// Write-thread leftover / layout / tip-GC handoff. Never blocks.
+    /// Write-thread leftover handoff (`Note` only). Never blocks.
     pub fn send_load_inbox(&self, msg: LoadInboxMsg) {
         self.load_inbox.send(msg);
     }
 
-    /// Load-thread: drain the inbox, apply TipAdvanced / LayoutDone, then the
-    /// caller binds leftover from the load-owned map.
-    pub fn leftover_ingest_apply(
-        &self,
-        parent_store: Option<&crate::PipelineParentStore>,
-    ) -> Result<(), QueryError> {
-        let effects = self.load_inbox.ingest()?;
-        for e in effects {
-            match e {
-                LoadInboxEffect::TipAdvanced { tip } => {
-                    self.advance_parent_cache_tip(tip);
-                }
-                LoadInboxEffect::LayoutDone {
-                    fk,
-                    body_range,
-                    spent_range,
-                } => {
-                    if let Some(store) = parent_store {
-                        store.apply_layout(fk, body_range, spent_range);
-                    }
-                }
-            }
+    /// After `head_insert_many` returns for notes at `max_height` (inclusive).
+    pub fn note_head_drain_through(&self, max_height: u32) {
+        let through = u64::from(max_height).saturating_add(1);
+        self.head_drain_through
+            .fetch_max(through, AtomicOrdering::Release);
+    }
+
+    pub fn head_drain_through_excl(&self) -> u64 {
+        self.head_drain_through.load(AtomicOrdering::Acquire)
+    }
+
+    /// Every load pack: ingest Notes, GC header plans to store tip.
+    /// Does **not** forget leftover (that is after bind, or [`Self::leftover_forget`]).
+    pub fn leftover_on_load_pack(&self) -> Result<(), QueryError> {
+        self.load_inbox.ingest()?;
+        if let Some(tip) = self.tip_height() {
+            self.advance_parent_cache_tip(tip.0);
         }
         Ok(())
     }
@@ -1133,7 +1133,7 @@ impl Query {
                 }
                 still_need.push(*t);
             }
-            pending.forget_ready(&fence, pack_lo);
+            pending.forget_ready(&fence, pack_lo, self.head_drain_through_excl());
         });
         Ok(still_need)
     }

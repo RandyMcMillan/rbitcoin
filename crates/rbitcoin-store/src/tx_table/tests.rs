@@ -2851,3 +2851,50 @@ fn script_kind_v17_kind_ten_is_corrupt() {
         other => panic!("expected Corrupt, got {other:?}"),
     }
 }
+
+/// Fat inwit must not force a new `txout.idx` / `spent.idx` segment.
+#[test]
+fn idx_roll_independent_of_inwit_span() {
+    crate::tx_idx::test_with_soft_span_bytes(2048, || {
+        let dir = tempfile_dir("idx-indep");
+        let t = create_tiny(&dir);
+        let fat_script = vec![0x6au8; 1800];
+        for i in 0..6u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i.wrapping_add(1);
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord::coinbase(u32::MAX, fat_script.clone(), vec![])];
+            let outs = vec![OutputRecord::unspent(1, vec![0x51])];
+            t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
+                .unwrap();
+        }
+        assert!(
+            t.inwit.idx_segment_count() >= 2,
+            "inwit segs={}",
+            t.inwit.idx_segment_count()
+        );
+        assert_eq!(
+            t.body.idx_segment_count(),
+            1,
+            "txout.idx must not roll when only inwit crosses the soft span"
+        );
+        assert_eq!(
+            t.spent.idx_segment_count(),
+            1,
+            "spent.idx must not roll when only inwit crosses the soft span"
+        );
+        let last = t.get(Fk(6)).unwrap();
+        assert_eq!(last.output_count, 1);
+        let raw_in = t.inwit.get_raw(Fk(6)).unwrap();
+        assert!(raw_in.len() >= 1800, "len={}", raw_in.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

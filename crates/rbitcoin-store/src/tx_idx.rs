@@ -679,29 +679,6 @@ impl TxIdx {
         Ok(())
     }
 
-    pub(crate) fn would_roll(&self, first_new_fk: u64, abs_start: u64) -> bool {
-        let _ = first_new_fk;
-        let segs = self.segments_snapshot();
-        if segs.is_empty() {
-            return true;
-        }
-        let tail = segs.last().unwrap();
-        if abs_start < tail.body_base {
-            return true;
-        }
-        let delta = abs_start - tail.body_base;
-        if !delta.is_multiple_of(IDX_STRIDE) {
-            return true;
-        }
-        let rel = delta / IDX_STRIDE;
-        let soft = Self::soft_span();
-        rel > u32::MAX as u64 || (tail.count > 0 && delta > soft)
-    }
-
-    pub(crate) fn force_roll(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
-        self.roll_segment(first_fk, body_base)
-    }
-
     fn roll_segment(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
         if !body_base.is_multiple_of(IDX_STRIDE) {
             return Err(StoreError::Corrupt("tx.idx body_base unaligned"));

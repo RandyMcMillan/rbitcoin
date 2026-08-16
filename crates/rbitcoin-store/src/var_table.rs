@@ -405,16 +405,6 @@ impl VarTable {
         next_aligned_tx_start(start)
     }
 
-    /// True if appending at `abs_start` for `first_new_fk` would open a new idx segment.
-    pub fn idx_would_roll(&self, first_new_fk: u64, abs_start: u64) -> bool {
-        self.idx.would_roll(first_new_fk, abs_start)
-    }
-
-    /// Force an idx segment roll (coupled Class A stems).
-    pub fn force_idx_roll(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
-        self.idx.force_roll(first_fk, body_base)
-    }
-
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {

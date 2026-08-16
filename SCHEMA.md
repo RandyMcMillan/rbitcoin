@@ -167,7 +167,8 @@ Append-published with Class A body/idx on the sole Class A write path. Count mus
 
 ### Split bodies (schema 15)
 
-Each create_fk has three 8-aligned var records (coupled idx `first_fk` / `file_id`):
+Each create_fk has three 8-aligned var records (per-stem idx maps; rolls
+are independent when that stem’s next start would exceed the soft span):
 
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
@@ -202,7 +203,7 @@ Soft `TxRecord.txid` is filled from the sidefile on get paths.
 ### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
 
 ```text
-{txout,inwit,spent}.idx/meta     # segment map (coupled first_fk / file_id)
+{txout,inwit,spent}.idx/meta     # per-stem segment map (first_fk / file_id)
 {txout,inwit,spent}.idx/000000   # dense u32 LE stride units
 …
 ```

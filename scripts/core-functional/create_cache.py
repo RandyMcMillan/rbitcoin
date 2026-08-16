@@ -4,7 +4,8 @@
 Core's `_initialize_chain` mines 199 blocks then **deletes** everything except
 `blocks/` + `chainstate/` (LevelDB). We never consume that. Instead:
 
-1. This script mines 199 via `generate` into `scripts/core-functional/cache/store`.
+1. This script mines 199 via `generatetoaddress` (Core payee schedule:
+   PRIV_KEYS[0:3] + MiniWallet P2TR) into `scripts/core-functional/cache/store`.
 2. `run.sh` preseeds empty `test/cache/node0/regtest/{blocks,chainstate}` so Core
    skips remine, and passes `--keepcache` so test_runner does not wipe it.
 3. The bitcoind shim copies `RBITCOIN_CACHE/store` when the dest looks like a
@@ -58,12 +59,23 @@ def rpc_call(url: str, cookie: str, method: str, params=None, timeout: float = 3
         return json.loads(resp.read().decode())
 
 
+# Must match Core `_initialize_chain`: 199 blocks cycling TestNode.PRIV_KEYS[0:3]
+# plus MiniWallet's deterministic P2TR OP_TRUE (blocks 76–100).
+CACHE_MARK = "199-mw1"
+CACHE_ADDRS = [
+    "mjTkW3DjgyZck4KbiRusZsqTgaYTxdSz6z",
+    "msX6jQXvxiNhx3Q62PKeLPrhrqZQdSimTg",
+    "mnonCMyH9TmAsSj3M59DsbH8H63U3RKoFP",
+    "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka",
+]
+
+
 def cache_ready(cache: Path) -> bool:
     height = cache / "HEIGHT"
     store = cache / "store"
     return (
         height.is_file()
-        and height.read_text().strip() == "199"
+        and height.read_text().strip() == CACHE_MARK
         and store.is_dir()
         and any(store.iterdir())
     )
@@ -131,17 +143,23 @@ def build_cache(cache: Path) -> int:
             print(f"create_cache: RPC not up ({last_err})", file=sys.stderr)
             return 1
 
-        # 199 empty blocks after genesis → tip height 199 (Core cache contract).
+        # Same payee schedule as Core `_initialize_chain` (25×7 + 24).
         gen_deadline = time.time() + 180
+        hashes: list = []
         try:
-            resp = rpc_call(url, cookie, "generate", [199], timeout=180)
+            for i in range(8):
+                nblocks = 25 if i != 7 else 24
+                addr = CACHE_ADDRS[i % len(CACHE_ADDRS)]
+                resp = rpc_call(
+                    url, cookie, "generatetoaddress", [nblocks, addr], timeout=180
+                )
+                if resp.get("error"):
+                    print(f"create_cache: generatetoaddress: {resp['error']}", file=sys.stderr)
+                    return 1
+                hashes.extend(resp.get("result") or [])
         except Exception as e:  # noqa: BLE001
             print(f"create_cache: generate failed: {e}", file=sys.stderr)
             return 1
-        if resp.get("error"):
-            print(f"create_cache: generate error: {resp['error']}", file=sys.stderr)
-            return 1
-        hashes = resp.get("result") or []
         if len(hashes) != 199:
             print(f"create_cache: generate returned {len(hashes)} hashes", file=sys.stderr)
             return 1
@@ -177,9 +195,9 @@ def build_cache(cache: Path) -> int:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
-    (cache / "HEIGHT").write_text("199\n")
+    (cache / "HEIGHT").write_text(CACHE_MARK + "\n")
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"create_cache: wrote {dest} (height 199)")
+    print(f"create_cache: wrote {dest} ({CACHE_MARK})")
     return 0
 
 

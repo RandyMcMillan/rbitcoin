@@ -39,7 +39,7 @@ fi
 READY="$WORKDIR/ready"
 mkdir -p "$READY/store"
 echo x >"$READY/store/keep"
-echo 199 >"$READY/HEIGHT"
+echo 199-mw1 >"$READY/HEIGHT"
 if OUT="$(python3 "$PY" --ensure --cache "$READY" 2>&1)" \
   && printf '%s' "$OUT" | grep -q 'already ready' \
   && [[ -f "$READY/store/keep" ]]; then

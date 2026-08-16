@@ -1280,6 +1280,7 @@ fn generate_with_mempool(
 
 fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["nblocks", "address", "maxtries"])?;
+    let _miner = require_regtest_miner(ctx, "generatetoaddress")?;
     let nblocks = params.req_u64(0, "nblocks")? as u32;
     let addr = params.req_str(1, "address")?;
     let _maxtries = params.opt_u64(2, "maxtries")?;
@@ -1319,6 +1320,7 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["nblocks", "maxtries"])?;
+    let _miner = require_regtest_miner(ctx, "generate")?;
     let nblocks = params.req_u64(0, "nblocks")? as u32;
     let _maxtries = params.opt_u64(1, "maxtries")?;
     let script = ScriptBuf::from_bytes(vec![0x51]);
@@ -1327,6 +1329,7 @@ fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn generatetodescriptor(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["num_blocks", "descriptor", "maxtries"])?;
+    let _miner = require_regtest_miner(ctx, "generatetodescriptor")?;
     let nblocks = params.req_u64(0, "num_blocks")? as u32;
     let desc = params.req_str(1, "descriptor")?;
     let _maxtries = params.opt_u64(2, "maxtries")?;

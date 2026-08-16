@@ -28,8 +28,10 @@ backends are **external indexers** of another node. rbitcoin does neither:
 
 Operator-order facts (mainnet tip moves; treat as ballpark, not a warranty):
 
-- **~886 GiB** full archive including **txindex** and optional **Electrum scripthash**
-  (`--shindex`; fits ~1 TB-class disks) — see [`SCHEMA.md`](./SCHEMA.md)
+- **~200 GiB** hot pin/annotate set after schema 17 (`txout` + `spent` + idx +
+  `txid` + `tx.head`); **~700 GiB** if you keep cold `inwit` for reconstruct.
+  Optional `--shindex` is extra. Ballpark, not a warranty — census in
+  [`SCHEMA.md`](./SCHEMA.md)
 - **Core-class JSON-RPC subset** (default off): [`docs/rpc.md`](./docs/rpc.md)
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`** (full scripts)
 - **Modest RAM** during sync — no multi‑GiB `dbcache`, no long “flush the cache”

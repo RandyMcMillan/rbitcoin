@@ -59,7 +59,7 @@ still wait for durable SH when shindex is on.
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
 | `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
 | `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
-| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. **`getblockchaininfo` placeholders (not computed, not a plan to fill):** `chainwork` is `""`, `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. Use `blocks` / `initialblockdownload` / `difficulty`. |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table |

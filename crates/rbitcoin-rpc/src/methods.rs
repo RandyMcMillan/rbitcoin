@@ -462,9 +462,9 @@ fn method_help(m: &str) -> String {
              See docs/mempool-fee-estimation.md."
                 .into()
         }
-        "getblockchaininfo" => {
-            "getblockchaininfo\nReturns tip height, chain name, and IBD flag.".into()
-        }
+        "getblockchaininfo" => "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
+             chainwork, size_on_disk, and verificationprogress are placeholders."
+            .into(),
         "generatetoaddress" => "generatetoaddress nblocks address (maxtries)\n\
              Regtest harness only. Mines nblocks paying address via the P2P accept path."
             .into(),
@@ -1863,6 +1863,10 @@ mod tests {
         assert_eq!(info["chain"], "regtest");
         assert_eq!(info["blocks"], 0);
         assert_eq!(info["initialblockdownload"], false);
+        // Documented placeholders — not computed (Q-15).
+        assert_eq!(info["chainwork"], "");
+        assert_eq!(info["size_on_disk"], 0);
+        assert_eq!(info["verificationprogress"], 1.0);
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["size"], 0);
         assert_eq!(mem["loaded"], true);

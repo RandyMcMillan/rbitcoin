@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Tip-follow stale redial:** a persistent 60s interval plus the 5s
+  `tip: perf` wake now run the extra-outbound check. The previous one-shot
+  sleep in the same `select!` was reset by every perf/RPC tick, so a node
+  that lost its last follow peer (mainnet 962723) never redialed.
+
 - **Class A idx rolls:** each stem (`txout` / `inwit` / `spent`) rolls its
   own idx at the soft span. Inwit no longer forces hot idx splits.
 - **`strong_tx`:** always L2 (1 bit/fk). `RBITCOIN_CLASS_C_INRAM_MAX_MB`

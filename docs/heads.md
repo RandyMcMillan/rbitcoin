@@ -52,8 +52,8 @@ is retired ([`store-format.md`](./store-format.md)).
 | Stage | Head contact |
 |-------|----------------|
 | **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **2-wave** hot then cold). Hits live on the BQ record. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
-| **load** | Stamp from BQ hits + in-flight / pins, then leftover TipOnly (2-wave; open + ages ≤3). Pins `txout` by stamped range. In-flight holds planned creates leftover would not accept and is pruned when the fence **`covers_fk_span`** of the pack (not max height). Leftover accepts **pending without a fence**, then fence-connected head. |
+| **load** | Stamp from BQ hits + in-flight / pins, then leftover: **pending snap (no fence)** then TipOnly (connected head). Pins `txout` by stamped range. In-flight holds planned creates until `covers_fk_span`. |
 | **scripts** | No store. |
-| **write** | Sole Class A appender; `head_insert_many` write-behind. Drain may finish before `height_fence_extend` — unconfirmed packs stay in-flight until the **fence** covers them. |
+| **write** | Sole Class A appender; `head_insert_many` write-behind. Drain inserts head for probe but **does not forget pending** until `height_fence_extend` covers those fks. Drain may finish before the fence — leftover still binds the snap. |
 
 Roles and locks: [`concurrency.md`](./concurrency.md).

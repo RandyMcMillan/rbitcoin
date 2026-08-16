@@ -547,7 +547,8 @@ impl Query {
             external_parent_ranges.insert(id, range);
         }
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
-        // Cheap TipOnly (open head + ages ≤3 sealed). Never treat a leftover as Corrupt.
+        // Bind pending (no fence) then TipOnly (connected). Pending snap stays
+        // until the fence covers — drain must not forget first.
         let t_head = Instant::now();
         if !need_head.is_empty() {
             // Write-behind is Class A identity. Bind it here without a fence
@@ -867,7 +868,18 @@ impl Query {
 
     /// Drain write-behind `tx.head` inserts (page-grouped).
     pub fn drain_pending_tx_head(&self) -> Result<u64, QueryError> {
-        Ok(self.store.txs.head_drain_pending()?)
+        let n = self.store.txs.head_drain_pending()?;
+        self.forget_pending_if_fenced();
+        Ok(n)
+    }
+
+    /// Forget pending snap keys whose create fk is fence-connected.
+    ///
+    /// Drain inserts head first; leftover binds pending until this runs.
+    pub fn forget_pending_if_fenced(&self) {
+        self.store
+            .txs
+            .forget_pending_if_fenced(&self.store.height_fence_snapshot());
     }
 
     /// Resolve prev outpoint txid for an input.
@@ -1243,6 +1255,119 @@ mod tests {
         let plan_b = q
             .archive_plan_batch_from(&mut need_b, 2, &empty)
             .expect("pending leftover must stamp without fence");
+        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write drain inserts `tx.head` and used to `forget` pending before
+    /// `height_fence_extend`. Load leftover then sees neither pending nor a
+    /// connected TipOnly hit (327331-class n−1).
+    #[test]
+    fn leftover_binds_pending_after_drain_before_fence() {
+        let (dir, q) = temp_query("leftover-drain-before-fence");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        q.archive_commit_plan(plan_a).unwrap();
+        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
+        assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
+        assert!(q
+            .store()
+            .height_fence_snapshot()
+            .height_of(parent_fk)
+            .is_none());
+        assert_eq!(q.store().txs.head_drain_pending().unwrap(), 1);
+        assert!(
+            q.store().txs.pending_fk(&parent_txid).is_some(),
+            "pending snap must survive drain until the fence covers the fk"
+        );
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xee;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
+            .expect("leftover must bind pending after drain, before fence");
+        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the fence covers the parent, forget pending. Leftover must still
+    /// stamp via TipOnly (connected head), not the snap.
+    #[test]
+    fn leftover_tiponly_after_fence_clears_pending() {
+        let (dir, q) = temp_query("leftover-fence-clears-pending");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        let header_fk = plan_a.per_header_ranges[0].0;
+        q.archive_commit_plan(plan_a).unwrap();
+        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
+        assert_eq!(q.store().txs.head_drain_pending().unwrap(), 1);
+        q.forget_pending_if_fenced();
+        assert!(
+            q.store().txs.pending_fk(&parent_txid).is_some(),
+            "forget-if-fenced before extend must leave pending"
+        );
+        q.store()
+            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
+            .unwrap();
+        q.forget_pending_if_fenced();
+        assert!(
+            q.store().txs.pending_fk(&parent_txid).is_none(),
+            "pending must drop once the fence covers the fk"
+        );
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xed;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
+            .expect("leftover TipOnly must stamp after fence, without pending");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }

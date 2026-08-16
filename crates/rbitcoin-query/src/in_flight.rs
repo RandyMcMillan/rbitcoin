@@ -8,7 +8,7 @@
 //!
 //! **Prune:** drop a layer only when leftover TipOnly would accept those
 //! creates: fence `covers_fk_span` of the pack's fks (not max height alone).
-//! Pending write-behind is accepted without a fence. Mainnet 950545.
+//! Pending snap is a separate home until that same fence covers.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.

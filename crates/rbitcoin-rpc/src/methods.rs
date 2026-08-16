@@ -1472,44 +1472,23 @@ fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         String::new()
     };
 
-    let mut unspents = Vec::new();
+    let found = ctx
+        .query
+        .scan_unspent_scripts(&scripts)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let mut unspents = Vec::with_capacity(found.len());
     let mut total_sat = 0u64;
-    if ctx.query.tip_height().is_some() {
-        for h in 0..=tip.0 {
-            let block = ctx
-                .query
-                .reconstruct_block_at_height(Height(h))
-                .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-            for (ti, tx) in block.txdata.iter().enumerate() {
-                let txid = tx.compute_txid();
-                let txid_b = txid.to_byte_array();
-                let coinbase = ti == 0;
-                for (vout, out) in tx.output.iter().enumerate() {
-                    let spk = out.script_pubkey.as_bytes();
-                    if !scripts.iter().any(|s| s.as_slice() == spk) {
-                        continue;
-                    }
-                    let spent = ctx
-                        .query
-                        .is_outpoint_spent(&txid_b, vout as u32)
-                        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-                    if spent {
-                        continue;
-                    }
-                    let sat = out.value.to_sat();
-                    total_sat = total_sat.saturating_add(sat);
-                    unspents.push(json!({
-                        "txid": txid.to_string(),
-                        "vout": vout,
-                        "scriptPubKey": hex_encode(spk),
-                        "desc": format!("raw({})", hex_encode(spk)),
-                        "amount": out.value.to_btc(),
-                        "coinbase": coinbase,
-                        "height": h,
-                    }));
-                }
-            }
-        }
+    for u in found {
+        total_sat = total_sat.saturating_add(u.value);
+        unspents.push(json!({
+            "txid": hash_hex_display(&u.txid),
+            "vout": u.vout,
+            "scriptPubKey": hex_encode(&u.script),
+            "desc": format!("raw({})", hex_encode(&u.script)),
+            "amount": Amount::from_sat(u.value).to_btc(),
+            "coinbase": u.coinbase,
+            "height": u.height,
+        }));
     }
 
     Ok(json!({
@@ -2852,6 +2831,18 @@ mod tests {
     }
 
     #[test]
+    fn scantxoutset_txout_fallback_without_shindex() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        ctx.query.set_sh_index_enabled(false);
+        let desc = "raw(51)";
+        dispatch(&ctx, "generatetodescriptor", vec![json!(2), json!(desc)]).unwrap();
+        let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
+        assert_eq!(scan["success"], true);
+        assert_eq!(scan["unspents"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn generate_includes_mempool_and_maps_immature() {
         use bitcoin::absolute::LockTime;
         use bitcoin::consensus::encode::serialize;
@@ -2896,6 +2887,19 @@ mod tests {
         let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
         let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
         assert_eq!(mined["tx"].as_array().unwrap().len(), 2);
+
+        let scan = dispatch(
+            &ctx,
+            "scantxoutset",
+            vec![json!("start"), json!(["raw(51)"])],
+        )
+        .unwrap();
+        let uns = scan["unspents"].as_array().unwrap();
+        assert!(
+            uns.iter().all(|u| u["txid"] != json!(cb_txid)),
+            "spent coinbase must drop from scan: {scan}"
+        );
+        assert!(uns.iter().any(|u| u["coinbase"] == false));
 
         // At tip 102, coinbase N is mempool-mature when 102 >= N+99 → N<=3.
         let hash2 = dispatch(&ctx, "getblockhash", vec![json!(10)]).unwrap();

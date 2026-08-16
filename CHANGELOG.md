@@ -40,6 +40,10 @@ before 1.0).
   BIP68. Script-flag rejects emit Core `block-script-verify-flag-failed (…)`
   on the receive path (P2P / `submitblock`).
 
+- **`scantxoutset`:** `raw(script)` uses `--shindex` `scripthash_listunspent`
+  when the index is on; otherwise Class A txout + spent. Never reconstructs
+  every block.
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is

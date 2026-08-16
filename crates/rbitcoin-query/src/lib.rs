@@ -131,8 +131,8 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use scripthash::{
-    apply_history_filter, HistoryFilter, HistoryOrder, ScriptHashBalance, ScriptHashChainStats,
-    ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
+    apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
+    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
 pub use wave_prevout::ThinInput;
 

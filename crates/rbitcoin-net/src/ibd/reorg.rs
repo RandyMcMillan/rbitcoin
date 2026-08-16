@@ -361,6 +361,11 @@ pub fn try_apply_best_candidate(
     Ok(None)
 }
 
+/// Cap on prev-walks from a header-horizon candidate. Early IBD can have
+/// hundreds of thousands of headers above a low confirmed tip; walking the
+/// whole gap is CPU + RAM for no reorg.
+const ANCESTOR_WALK_MAX: usize = 10_000;
+
 /// Header hashes from `tip` back to (not including) a best-chain / confirmed
 /// ancestor, **oldest-first**. Used so BadPrev densify requests every mid-path
 /// body to the LCA (mainnet: d1e0 + 02022e + tip+1, not wire_prev alone).
@@ -371,10 +376,18 @@ pub fn header_hashes_to_best_ancestor(
     hub: &ChainHub,
     tip: BlockHash,
 ) -> Result<Vec<BlockHash>, NetError> {
+    header_hashes_to_best_ancestor_n(hub, tip, ANCESTOR_WALK_MAX)
+}
+
+fn header_hashes_to_best_ancestor_n(
+    hub: &ChainHub,
+    tip: BlockHash,
+    walk_max: usize,
+) -> Result<Vec<BlockHash>, NetError> {
     use bitcoin::hashes::Hash as _;
     let mut rev = Vec::new();
     let mut cur = tip;
-    for _ in 0..10_000 {
+    for _ in 0..walk_max {
         if hub.has_block(&cur) {
             break;
         }
@@ -512,9 +525,22 @@ pub fn shortest_heavier_header_prefix(
 /// Callers getdata these **connecting** hashes instead of waiting for a child
 /// of the losing tip (BIP110-class: majority 961632/33 while tip is the
 /// 2-block minority).
+///
+/// A walk that does not reach a **connected** LCA is not a fork: early IBD
+/// headers sit tens of thousands above tip, the walk hits [`ANCESTOR_WALK_MAX`],
+/// and the join is header-only. Treating that as connecting-search getdata
+/// storms `ibd: heavier chain does not connect at tip` on a linear chain.
 pub fn connecting_hashes_heavier_disconnected(
     hub: &ChainHub,
     candidate: BlockHash,
+) -> Result<Option<Vec<BlockHash>>, NetError> {
+    connecting_hashes_heavier_disconnected_n(hub, candidate, ANCESTOR_WALK_MAX)
+}
+
+fn connecting_hashes_heavier_disconnected_n(
+    hub: &ChainHub,
+    candidate: BlockHash,
+    walk_max: usize,
 ) -> Result<Option<Vec<BlockHash>>, NetError> {
     let Some(tip) = hub.tip_hash() else {
         return Ok(None);
@@ -522,7 +548,7 @@ pub fn connecting_hashes_heavier_disconnected(
     if candidate == tip || hub.has_block(&candidate) {
         return Ok(None);
     }
-    let path = header_hashes_to_best_ancestor(hub, candidate)?;
+    let path = header_hashes_to_best_ancestor_n(hub, candidate, walk_max)?;
     if path.is_empty() {
         return Ok(None);
     }
@@ -549,8 +575,12 @@ pub fn connecting_hashes_heavier_disconnected(
             }
         }
     }
-    if !hub.has_block(&join) && join.to_byte_array() != [0u8; 32] {
-        return Ok(Some(path));
+    // Join must be a connected LCA. `!has_block(join)` used to return Some
+    // here so a mid-path hole still densified — but a capped walk from a far
+    // *linear* header horizon also lands on a header-only mid. That is early
+    // IBD, not BIP110. Fork-start uses `is_connected`, not `has_block`.
+    if !hub.is_connected(&join) && join.to_byte_array() != [0u8; 32] {
+        return Ok(None);
     }
     if shortest_heavier_header_prefix(hub, &path)?.is_none() {
         return Ok(None);
@@ -1448,6 +1478,37 @@ mod tests {
             st.reorg.need_getdata()
         );
         assert!(st.reorg.need_getdata().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Early IBD: headers sit far above a low tip. The ancestor walk hits its
+    /// cap on a header-only mid, so join is not a confirmed LCA. That is still
+    /// a linear extension, not a BIP110 connecting search.
+    ///
+    /// Production walk is 10_000; a smaller cap plus ~20 headers hits the same
+    /// branch without mining a mainnet-scale horizon.
+    #[test]
+    fn capped_walk_on_linear_headers_is_not_a_disconnected_fork() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_500_080_100, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        let mut prev = b1.block_hash();
+        let mut time = 1_500_080_200u32;
+        let mut last = prev;
+        for h in 2..=20u32 {
+            let b = mine(prev, time, h);
+            hub.ensure_header(&b.header).unwrap();
+            prev = b.block_hash();
+            last = prev;
+            time += 100;
+        }
+        let path = connecting_hashes_heavier_disconnected_n(&hub, last, 8).unwrap();
+        assert!(
+            path.is_none(),
+            "capped walk whose join is header-only must not start connecting search; got {path:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

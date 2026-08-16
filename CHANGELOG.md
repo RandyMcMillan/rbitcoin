@@ -11,6 +11,12 @@ before 1.0).
 
 ### Changed
 
+- **IBD connecting search needs a connected LCA:** a capped ancestor walk
+  from a far header-only horizon (early IBD, tip at a few thousand, headers
+  at `max_ordered`) is not a disconnected fork. The old `!has_block(join)`
+  shortcut treated that mid as BIP110 and getdata-stormed 32 connecting
+  hashes. Real forks still search when the join is on the best chain.
+
 - **Tip-follow stale redial:** a persistent 60s interval plus the 5s
   `tip: perf` wake now run the extra-outbound check. The previous one-shot
   sleep in the same `select!` was reset by every perf/RPC tick, so a node

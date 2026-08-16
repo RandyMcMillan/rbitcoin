@@ -3288,7 +3288,7 @@ mod tests {
     }
 
     /// Confirmed tip on short loser; heavier sibling path under tip's parent must
-    /// still be returned (mainnet 961632 class exploration).
+    /// still be returned.
     #[test]
     fn resume_work_path_from_loser_tip_explores_heavier_sibling() {
         let (dir, q) = temp_query("resume-from-loser");

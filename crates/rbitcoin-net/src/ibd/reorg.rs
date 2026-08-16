@@ -523,8 +523,8 @@ pub fn shortest_heavier_header_prefix(
 /// heavier than our tip from the same LCA.
 ///
 /// Callers getdata these **connecting** hashes instead of waiting for a child
-/// of the losing tip (BIP110-class: majority 961632/33 while tip is the
-/// 2-block minority).
+/// of the losing tip (most-work: we followed a lighter fork; a heavier header
+/// path is already known).
 ///
 /// A walk that does not reach a **connected** LCA is not a fork: early IBD
 /// headers sit tens of thousands above tip, the walk hits [`ANCESTOR_WALK_MAX`],
@@ -578,7 +578,7 @@ fn connecting_hashes_heavier_disconnected_n(
     // Join must be a connected LCA. `!has_block(join)` used to return Some
     // here so a mid-path hole still densified — but a capped walk from a far
     // *linear* header horizon also lands on a header-only mid. That is early
-    // IBD, not BIP110. Fork-start uses `is_connected`, not `has_block`.
+    // IBD, not a competing fork. Fork-start uses `is_connected`, not `has_block`.
     if !hub.is_connected(&join) && join.to_byte_array() != [0u8; 32] {
         return Ok(None);
     }
@@ -614,8 +614,30 @@ pub fn note_disconnected_heavier(
     Ok(true)
 }
 
-/// Scan work-path candidates (tip+1 and the far header) for a heavier
-/// disconnected fork and register connecting getdata.
+/// Work-path hashes that may start a connecting search.
+///
+/// Only tip+1 when it is a **competing** child (parent ≠ current tip). A
+/// linear extension or a far `max_ordered` header is not a fork signal —
+/// walking the horizon is a multi-second assign tax on ordinary IBD.
+pub(crate) fn connecting_search_candidates(
+    st: &super::state::IbdWorkState,
+    hub: &ChainHub,
+) -> Result<Vec<BlockHash>, NetError> {
+    let Some(tip) = hub.tip_hash() else {
+        return Ok(Vec::new());
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let Some(&h) = st.height_to_hash.get(&tip_h.saturating_add(1)) else {
+        return Ok(Vec::new());
+    };
+    match parent_hash_of(hub, h)? {
+        Some(p) if p != tip => Ok(vec![h]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Scan a competing work-path tip+1 for a heavier disconnected fork and
+/// register connecting getdata.
 pub fn consider_disconnected_heavier(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
@@ -628,18 +650,8 @@ pub fn consider_disconnected_heavier(
     if super::progress::tip_fetch_hole(hub, &st.height_to_hash, &mut st.body) == 0 {
         return Ok(false);
     }
-    let tip_h = hub.tip_height().unwrap_or(0);
-    let mut cands = Vec::new();
-    if let Some(&h) = st.height_to_hash.get(&tip_h.saturating_add(1)) {
-        cands.push(h);
-    }
-    if let Some(&h) = st.height_to_hash.get(&st.max_ordered_height) {
-        if !cands.contains(&h) {
-            cands.push(h);
-        }
-    }
     let mut any = false;
-    for h in cands {
+    for h in connecting_search_candidates(st, hub)? {
         if note_disconnected_heavier(&mut st.reorg, hub, h)? {
             any = true;
             break;
@@ -1297,8 +1309,8 @@ mod tests {
         b
     }
 
-    /// BIP110-class: tip on a 2-block loser; heavier winner headers do not
-    /// connect at tip+1. Name the connecting hashes (not a dead-tip child).
+    /// Tip on a 2-block loser; heavier winner headers do not connect at
+    /// tip+1. Name the connecting hashes (not a dead-tip child).
     #[test]
     fn heavier_disconnected_path_names_connecting_hashes() {
         let (dir, hub) = tmp_hub();
@@ -1483,7 +1495,7 @@ mod tests {
 
     /// Early IBD: headers sit far above a low tip. The ancestor walk hits its
     /// cap on a header-only mid, so join is not a confirmed LCA. That is still
-    /// a linear extension, not a BIP110 connecting search.
+    /// a linear extension, not a connecting search.
     ///
     /// Production walk is 10_000; a smaller cap plus ~20 headers hits the same
     /// branch without mining a mainnet-scale horizon.
@@ -1508,6 +1520,111 @@ mod tests {
         assert!(
             path.is_none(),
             "capped walk whose join is header-only must not start connecting search; got {path:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connecting_search_skips_linear_tip_plus_one() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let mut prev = gen;
+        let mut time = 1_500_090_100u32;
+        let b1 = mine(prev, time, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        prev = b1.block_hash();
+        time += 100;
+        let b2 = mine(prev, time, 2);
+        hub.accept_block(b2.clone()).unwrap();
+        prev = b2.block_hash();
+        time += 100;
+        let mut st =
+            super::super::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        let mut last = prev;
+        for h in 3..=20u32 {
+            let b = mine(prev, time, h);
+            hub.ensure_header(&b.header).unwrap();
+            prev = b.block_hash();
+            last = prev;
+            time += 100;
+            st.record_height(prev, h);
+        }
+        st.max_ordered_height = 20;
+        assert!(
+            connecting_search_candidates(&st, &hub).unwrap().is_empty(),
+            "linear tip+1 must not be a connecting-search candidate (avoids a 10k max_ordered walk)"
+        );
+        assert!(
+            !consider_disconnected_heavier(&mut st, &hub).unwrap(),
+            "linear tip+1 + far headers must not register; last={last} need={:?}",
+            st.reorg.need_getdata()
+        );
+        assert!(st.reorg.need_getdata().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connecting_search_candidates_is_tip_plus_one_when_competing() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_091_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_091_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        let w1 = distinct_sib(mine(gen, 1_500_091_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_091_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_091_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_091_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+        let mut st =
+            super::super::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        st.record_height(w3.block_hash(), 3);
+        st.record_height(w4.block_hash(), 4);
+        st.max_ordered_height = 4;
+        assert_eq!(
+            connecting_search_candidates(&st, &hub).unwrap(),
+            vec![w3.block_hash()],
+            "competing tip+1 is the only candidate; far header is the same fork"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connecting_search_skips_when_tip_plus_one_is_own_child() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let l1 = mine(gen, 1_500_092_100, 1);
+        hub.accept_block(l1.clone()).unwrap();
+        let l2 = mine(l1.block_hash(), 1_500_092_200, 2);
+        hub.accept_block(l2.clone()).unwrap();
+        let l3 = mine(l2.block_hash(), 1_500_092_300, 3);
+        hub.ensure_header(&l3.header).unwrap();
+        let w1 = distinct_sib(mine(gen, 1_500_092_101, 1), l1.block_hash());
+        hub.ensure_header(&w1.header).unwrap();
+        let w2 = mine(w1.block_hash(), 1_500_092_201, 2);
+        hub.ensure_header(&w2.header).unwrap();
+        let w3 = mine(w2.block_hash(), 1_500_092_301, 3);
+        hub.ensure_header(&w3.header).unwrap();
+        let w4 = mine(w3.block_hash(), 1_500_092_401, 4);
+        hub.ensure_header(&w4.header).unwrap();
+        let mut st =
+            super::super::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        st.record_height(l3.block_hash(), 3);
+        st.record_height(w4.block_hash(), 4);
+        st.max_ordered_height = 4;
+        assert!(
+            connecting_search_candidates(&st, &hub).unwrap().is_empty(),
+            "own-child tip+1 is linear; heavier far header is not a consider candidate"
+        );
+        assert!(
+            !consider_disconnected_heavier(&mut st, &hub).unwrap(),
+            "accepted miss: heavier fork only at max_ordered while tip+1 is our child"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

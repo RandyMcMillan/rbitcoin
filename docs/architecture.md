@@ -127,7 +127,7 @@ headers / BQ / pending (download window)
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). A heavier header path that does not meet the tip **searches connecting hashes** (shortest work-winning prefix) only after the walk reaches a **connected** LCA — a capped walk through header-only mids is linear IBD, not a fork. Side-branch bodies are held **by hash** (BQ is height first-wins). |
+| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). A competing work-path tip+1 (parent ≠ tip) **searches connecting hashes** (shortest work-winning prefix) after the walk reaches a **connected** LCA. A far linear header horizon is not a fork. Side-branch bodies are held **by hash** (BQ is height first-wins). |
 | **Tip-follow** | Pending cap ≥128 (download window). Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | Prefer deeper/more-work header children; Class A body only tie-breaks. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). |

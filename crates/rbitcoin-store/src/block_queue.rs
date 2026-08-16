@@ -236,12 +236,7 @@ impl BlockQueue {
     /// Lowest distinct queued heights `≥ path_lo` that are not resolve-complete
     /// and not in `skip`, capped at `cap`. One pass over the index (no
     /// per-height `is_resolve_complete` scan). Sorted ascending.
-    pub fn unresolved_heights(
-        &self,
-        path_lo: u32,
-        skip: &HashSet<u32>,
-        cap: usize,
-    ) -> Vec<u32> {
+    pub fn unresolved_heights(&self, path_lo: u32, skip: &HashSet<u32>, cap: usize) -> Vec<u32> {
         if cap == 0 {
             return Vec::new();
         }

@@ -114,6 +114,20 @@ fi
 # Unknown flags abort like Core (feature_help.py -fakearg).
 assert_fail_msg "unknown flag parse error" "Error parsing command line arguments" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -notarealflag
+assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -fakearg
+
+# Common TestNode extras must be ignored (not parse-fail).
+OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
+  -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
+  -testactivationheight=bip34@1 -permitbaremultisig=0 2>/dev/null)" || OUTX=""
+if printf '%s' "$OUTX" | grep -q -- "--rpc-listen"; then
+  echo "ok - TestNode extras ignored"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - TestNode extras ignored (got: $OUTX)"
+  FAIL=$((FAIL + 1))
+fi
 
 # -h / -version exit 0 on stdout without starting the node.
 if OUTH="$("$SHIM" -datadir="$DATADIR" -h 2>/dev/null)" && printf '%s' "$OUTH" | grep -q Options; then

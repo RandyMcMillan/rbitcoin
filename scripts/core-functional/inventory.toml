@@ -138,9 +138,7 @@ reason = "core-log"
 
 [[test]]
 name = "feature_dirsymlinks.py"
-status = "skip"
-reason = "core-internal"
-analog = "none"
+status = "run"
 
 [[test]]
 name = "feature_discover.py"
@@ -166,8 +164,7 @@ analog = "second process refuses same datadir (TODO)"
 
 [[test]]
 name = "feature_framework_miniwallet.py"
-status = "skip"
-reason = "harness"
+status = "run"
 
 [[test]]
 name = "feature_framework_startup_failures.py"
@@ -191,7 +188,7 @@ status = "run"
 [[test]]
 name = "feature_includeconf.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "core-internal"
 analog = "none (Core includeconf)"
 
 [[test]]
@@ -510,9 +507,7 @@ analog = "follow-up: reorg + mempool"
 
 [[test]]
 name = "mempool_resurrect.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: disconnect re-accept"
+status = "run"
 
 [[test]]
 name = "mempool_sigoplimit.py"
@@ -522,9 +517,7 @@ analog = "follow-up: sigops"
 
 [[test]]
 name = "mempool_spend_coinbase.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: coinbase maturity + mempool"
+status = "run"
 
 [[test]]
 name = "mempool_truc.py"
@@ -603,9 +596,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_block_sync.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: headers/compact sync"
+status = "run"
 
 [[test]]
 name = "p2p_blockfilters.py"
@@ -875,8 +866,7 @@ reason = "core-log"
 [[test]]
 name = "rpc_bind.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: bind/rpcbind (core-net-policy-adjacent)"
+reason = "core-net-policy"
 
 [[test]]
 name = "rpc_blockchain.py"
@@ -898,7 +888,7 @@ analog = "follow-up: Core decodescript field parity (method exists)"
 [[test]]
 name = "rpc_deprecated.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "core-internal"
 analog = "none (Core deprecation surface)"
 
 [[test]]
@@ -926,7 +916,7 @@ reason = "no-wallet"
 [[test]]
 name = "rpc_getblockfilter.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "core-internal"
 analog = "none (no compact filters)"
 
 [[test]]
@@ -1060,7 +1050,7 @@ reason = "no-wallet"
 [[test]]
 name = "rpc_txoutproof.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "no-utxo-set"
 analog = "none (no utxo proofs product)"
 
 [[test]]
@@ -1081,8 +1071,7 @@ analog = "follow-up: validateaddress exists; Core error-text"
 [[test]]
 name = "rpc_whitelist.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "none (rpcwhitelist)"
+reason = "core-net-policy"
 
 [[test]]
 name = "test_runner.py"

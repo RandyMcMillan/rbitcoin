@@ -16,10 +16,19 @@ before 1.0).
   (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
   required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
 
-- **MiniWallet harness RPCs:** `generatetodescriptor` (`raw(HEX)`),
-  `scantxoutset` over Class A for `raw()` scripts, `gettxout`,
-  `getchaintips` (active tip), and `waitforblock*`. Enough for Core's
-  wallet-less MiniWallet to construct, not a coins-DB product.
+- **MiniWallet + receive-block path:** `generatetodescriptor` (`raw(HEX)`),
+  `scantxoutset` over Class A, `gettxout`, `getindexinfo` (Class A tx
+  lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
+  mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
+  rejects to Core `-26` strings. `submitblock` and P2P `block` share
+  `ChainHub::accept_received_block` (park side/orphan, `accept_branch` on
+  more work). Not a coins-DB / GBT product.
+
+- **Core functional `run` set:** unmodified `mempool_spend_coinbase.py`,
+  `mempool_resurrect.py`, `p2p_block_sync.py`,
+  `feature_framework_miniwallet.py`, `feature_dirsymlinks.py` (plus the
+  first-green CLI/UA/echo/uptime four). Cache payees match Core
+  `_initialize_chain` (PRIV_KEYS + MiniWallet P2TR).
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

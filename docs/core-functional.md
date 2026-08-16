@@ -27,8 +27,8 @@ python3 scripts/core-functional/check_inventory.py \
 `run` names, with `--v2transport`. A `skip` or unknown name fails with
 `not in run set` / `unknown test` (we do not `--exclude` every skip —
 Core exits if an exclude is not in the current test list).
-`--list` prints `run` names (`feature_help.py`, `feature_uacomment.py`,
-`rpc_uptime.py`, `rpc_named_arguments.py` today). `--dry-run` prints the command and writes `config.ini`
+`--list` prints `run` names (first-green CLI/UA/echo plus MiniWallet
+mempool and inbound block-sync scripts). `--dry-run` prints the command and writes `config.ini`
 (wallet/zmq/ipc off) without starting a node. Default `cargo test`
 never calls this.
 
@@ -166,7 +166,8 @@ Tests with `setup_clean_chain=False` (including `rpc_named_arguments.py`)
 assert height 199 then generate one more. Core’s cache is LevelDB + `blocks/`
 and would wipe our store after remine.
 
-`scripts/core-functional/create_cache.py` mines 199 via `generate` into
+`scripts/core-functional/create_cache.py` mines 199 via `generatetoaddress`
+(Core `_initialize_chain` payees: PRIV_KEYS[0:3] + MiniWallet P2TR) into
 `scripts/core-functional/cache/store` (gitignored). `run.sh` preseeds empty
 `test/cache/node0/regtest/{blocks,chainstate}` and passes `--keepcache`. The
 shim copies `RBITCOIN_CACHE/store` only when the dest has those two dirs and

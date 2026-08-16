@@ -102,10 +102,12 @@ pre-attempt tip hash (snapshot before disconnect).
 
 ## Tip-follow (≥99)
 
-- `MAX_PENDING_BLOCKS = 128`.
-- `try_reorg_from_pending` assembles fork branches, sorts by header work, applies
-  best via `accept_branch`.
-- Same invalid/restore policy as IBD.
+- `MAX_PENDING_BLOCKS = 128` (download window for incomplete / parent-unknown
+  bodies).
+- Complete bodies go through `ChainHub::accept_received_block`: hold by hash,
+  then `accept_branch` when a held (or archived) path has more work.
+- Same invalid/restore policy as IBD. No second most-work assembler in the
+  peer session.
 
 ## Resume / restart
 

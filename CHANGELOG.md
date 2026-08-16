@@ -11,6 +11,22 @@ before 1.0).
 
 ### Changed
 
+- **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
+  children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
+  is the best known header height. `invalidateblock` of an unknown hash is
+  Core `-5 Block not found`; after invalidate the next most-work fork is
+  applied. `preciousblock` breaks equal-work ties only (not less work).
+  `generatetodescriptor` accepts `addr(ADDRESS)#checksum`.
+
+- **`getchaintips`:** active tip plus losing `valid-fork` (archive after
+  reorg) and held never-confirmed `valid-headers`. Hashes only — not a
+  block index.
+
+- **Mempool RPC graph fields:** `getmempoolentry` / verbose `getrawmempool`
+  ancestor and descendant counts (and size/fee sums) come from the cluster
+  graph, not stub `1`. `getmempoolinfo.unbroadcastcount` and per-entry
+  `unbroadcast` track `sendrawtransaction` until a peer `getdata`s the tx.
+
 - **`rbitcoin-cli`:** cookie / `--rpcuser` HTTP client for the documented
   JSON-RPC subset (plain HTTP, same as the node).
 - **`--maxinbound`:** passed into `P2PNode` as a field. `RBITCOIN_P2P_MAX_INBOUND`
@@ -27,6 +43,17 @@ before 1.0).
 
 ### Added
 
+- **Core `-testactivationheight` overlay:** `name@height` (regtest) is parsed
+  on `rbitcoin-node` and applied in `ChainParams` (`csv` / `segwit` / `bip34`
+  / `dersig` / `cltv`). Script flags still follow the getters in a later
+  confirm step. Shim forwards consensus/mempool/peer flags
+  (`whitelist`, `blocksonly`, `minrelaytxfee`, `permitbaremultisig`,
+  `limitcluster*`, `peertimeout`, `maxconnections`, `persistmempool`,
+  `minimumchainwork`) instead of dropping them. `-minimumchainwork` keeps
+  the node in IBD (no relay) until tip work meets the hex floor. There is
+  no `-txindex` flag: Class A always looks up by txid. Core v31.1
+  ancestor/descendant limit flags stay ignored (they are no-ops there).
+
 - **Core functional coverage:** analog scenarios for `--milestone` skip-below /
   check-above, reconstruct after lost RAM head, and durable mempool reopen
   (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
@@ -37,14 +64,12 @@ before 1.0).
   lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
   mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
   rejects to Core `-26` strings. `submitblock` and P2P `block` share
-  `ChainHub::accept_received_block` (park side/orphan, `accept_branch` on
-  more work). Not a coins-DB / GBT product.
+  `ChainHub::accept_received_block` (hold never-confirmed side bodies,
+  `accept_branch` on more work). Once-confirmed losers stay in Class A.
+  Not a coins-DB / GBT product.
 
-- **Core functional `run` set:** unmodified `mempool_spend_coinbase.py`,
-  `mempool_resurrect.py`, `p2p_block_sync.py`,
-  `feature_framework_miniwallet.py`, `feature_dirsymlinks.py` (plus the
-  first-green CLI/UA/echo/uptime four). Cache payees match Core
-  `_initialize_chain` (PRIV_KEYS + MiniWallet P2TR).
+- **Core functional `run` set:** the first-green nine plus unmodified
+  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`.
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
@@ -55,8 +80,8 @@ before 1.0).
   cache-shaped dests only.
 
 - **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
-  and park via `ChainHub`; reconsider re-accepts; precious prefers an
-  equal-work sibling.
+  via `ChainHub`; reconsider reconstructs from Class A; precious prefers
+  an equal-work sibling (held or archive).
 
 - **Debug.log mapper:** `scripts/core-functional/debuglog_map.toml` plus
   shim line pump. First extra Core script: `rpc_uptime.py` (setmocktime

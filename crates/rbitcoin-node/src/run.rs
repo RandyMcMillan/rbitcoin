@@ -400,6 +400,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         catch_up_complete = true;
     }
 
+    if catch_up_complete && !tip_meets_min_work(&config, &node.hub) {
+        info!("ibd: tip work below -minimumchainwork — staying in IBD (no relay)");
+        catch_up_complete = false;
+    }
+
     // ── Steady state: tip tracking + block relay ────────────────────────────
     // After true catch-up: enter tip index mode (always), optionally SH bulk when
     // shindex, then long-lived follow peers. `tx.head` and spend annotations are
@@ -426,7 +431,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 );
             }
             // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
-            mempool.set_relay_enabled(true);
+            // `-blocksonly` keeps relay off (blocks still follow).
+            if !config.blocksonly {
+                mempool.set_relay_enabled(true);
+            }
             info!(
                 "node: catch-up complete tip={:?} — tip tracking + block/tx relay \
                  (mempool live={}, shindex={}, sh_tip_ready={})",
@@ -632,8 +640,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .await
             {
                 Ok(h) => {
-                    h.initial_block_download
-                        .store(!tip_follow_ready, Ordering::SeqCst);
+                    h.initial_block_download.store(
+                        !tip_follow_ready || !tip_meets_min_work(&config, &node.hub),
+                        Ordering::SeqCst,
+                    );
                     h.connections
                         .store(node.follow_live_count() as u64, Ordering::Relaxed);
                     info!(
@@ -728,7 +738,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
                 h.connections
                     .store(node.follow_live_count() as u64, Ordering::Relaxed);
-                h.initial_block_download.store(false, Ordering::SeqCst);
+                h.initial_block_download
+                    .store(!tip_meets_min_work(&config, &node.hub), Ordering::SeqCst);
             }
             if matches!(wake, Wake::Stop) {
                 break;
@@ -943,6 +954,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     node.shutdown().await;
     info!("node: clean exit");
     Ok(())
+}
+
+fn tip_meets_min_work(config: &NodeConfig, hub: &rbitcoin_net::ChainHub) -> bool {
+    match hub.chain_work() {
+        Ok(w) => config.meets_minimum_chain_work(w.to_be_bytes()),
+        Err(_) => config.minimum_chain_work.is_none(),
+    }
 }
 
 fn should_resolve_default_seeds(config: &NodeConfig) -> bool {

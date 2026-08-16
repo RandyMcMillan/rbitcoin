@@ -80,6 +80,26 @@ pub struct NodeConfig {
     pub api_log: Option<PathBuf>,
     /// Core `-uacomment` fragments (BIP14 parens in subversion).
     pub uacomments: Vec<String>,
+    /// Core `-testactivationheight=name@height` (regtest). Applied in [`Self::chain_params`].
+    pub test_activation_heights: Vec<(String, u32)>,
+    /// Core `-persistmempool` (default true — we already persist under datadir/mempool).
+    pub persist_mempool: bool,
+    /// Core `-whitelist=` permission strings (stored; noban honor follows PeerHub).
+    pub whitelist: Vec<String>,
+    /// Core `-blocksonly`: do not enable tx relay after catch-up.
+    pub blocksonly: bool,
+    /// Core `-minrelaytxfee` in BTC/kvB (None = Libre default).
+    pub min_relay_fee_btc: Option<String>,
+    /// Core `-permitbaremultisig` (default true).
+    pub permit_bare_multisig: bool,
+    /// Core `-limitclustercount` overlay (`None` = mempool default 64).
+    pub limit_cluster_count: Option<u32>,
+    /// Core `-limitclustersize` in kvB (`None` = mempool default 101).
+    pub limit_cluster_size_kvb: Option<u32>,
+    /// Core `-peertimeout` seconds (`None` = default).
+    pub peer_timeout_secs: Option<u64>,
+    /// Core `-minimumchainwork` (32-byte BE work). `None` = no extra IBD floor.
+    pub minimum_chain_work: Option<[u8; 32]>,
 }
 
 impl Default for NodeConfig {
@@ -112,6 +132,16 @@ impl Default for NodeConfig {
             conf_log_level: None,
             api_log: None,
             uacomments: Vec::new(),
+            test_activation_heights: Vec::new(),
+            persist_mempool: true,
+            whitelist: Vec::new(),
+            blocksonly: false,
+            min_relay_fee_btc: None,
+            permit_bare_multisig: true,
+            limit_cluster_count: None,
+            limit_cluster_size_kvb: None,
+            peer_timeout_secs: None,
+            minimum_chain_work: None,
         }
     }
 }
@@ -176,13 +206,21 @@ impl NodeConfig {
 
     /// Compose immutable consensus parameters from operator configuration.
     pub fn chain_params(&self) -> Result<ChainParams, NodeError> {
-        match self.signet_challenge.clone() {
+        let mut params = match self.signet_challenge.clone() {
             Some(challenge) => {
                 ChainParams::custom_signet(challenge, self.signet_block_time.unwrap_or(10 * 60))
-                    .map_err(|e| NodeError::Config(e.into()))
+                    .map_err(|e| NodeError::Config(e.into()))?
             }
-            None => Ok(ChainParams::for_network(self.network)),
+            None => ChainParams::for_network(self.network),
+        };
+        for (name, height) in &self.test_activation_heights {
+            params
+                .apply_test_activation_height(name, *height)
+                .map_err(|e| {
+                    NodeError::Config(format!("testactivationheight {name}@{height}: {e}"))
+                })?;
         }
+        Ok(params)
     }
 
     pub fn validate(&self) -> Result<(), NodeError> {
@@ -438,6 +476,61 @@ impl NodeConfig {
                 "uacomment" => {
                     self.uacomments.push(val.to_string());
                 }
+                "testactivationheight" | "test_activation_height" => {
+                    let (name, height) =
+                        ChainParams::parse_test_activation_height(val).map_err(|e| {
+                            NodeError::Config(format!("conf testactivationheight: {e}"))
+                        })?;
+                    self.test_activation_heights
+                        .push((name.to_string(), height));
+                }
+                "persistmempool" | "persist_mempool" => {
+                    self.persist_mempool = parse_conf_bool(val)
+                        .map_err(|e| NodeError::Config(format!("conf persistmempool: {e}")))?;
+                }
+                "whitelist" => {
+                    if !val.is_empty() {
+                        self.whitelist.push(val.to_string());
+                    }
+                }
+                "blocksonly" | "blocks_only" => {
+                    self.blocksonly = parse_conf_bool(val)
+                        .map_err(|e| NodeError::Config(format!("conf blocksonly: {e}")))?;
+                }
+                "minrelaytxfee" | "min_relay_txfee" => {
+                    if val.is_empty() {
+                        return Err(NodeError::Config(
+                            "conf minrelaytxfee requires a value".into(),
+                        ));
+                    }
+                    self.min_relay_fee_btc = Some(val.to_string());
+                }
+                "permitbaremultisig" | "permit_bare_multisig" => {
+                    self.permit_bare_multisig = parse_conf_bool(val)
+                        .map_err(|e| NodeError::Config(format!("conf permitbaremultisig: {e}")))?;
+                }
+                "limitclustercount" | "limit_cluster_count" => {
+                    self.limit_cluster_count =
+                        Some(val.parse().map_err(|e| {
+                            NodeError::Config(format!("conf limitclustercount: {e}"))
+                        })?);
+                }
+                "limitclustersize" | "limit_cluster_size" => {
+                    self.limit_cluster_size_kvb =
+                        Some(val.parse().map_err(|e| {
+                            NodeError::Config(format!("conf limitclustersize: {e}"))
+                        })?);
+                }
+                "peertimeout" | "peer_timeout" => {
+                    self.peer_timeout_secs = Some(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf peertimeout: {e}")))?,
+                    );
+                }
+                "minimumchainwork" | "minimum_chain_work" => {
+                    self.minimum_chain_work =
+                        Some(parse_minimum_chain_work(val).map_err(NodeError::Config)?);
+                }
                 "milestone" | "assumevalid_height" | "assumevalidheight" => {
                     self.milestone_height = val
                         .parse()
@@ -516,6 +609,37 @@ fn parse_conf_bool(val: &str) -> Result<bool, String> {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(format!("expected 0|1|true|false (got `{val}`)")),
+    }
+}
+
+/// Core `-minimumchainwork=<hex>` (optional `0x`, at most 64 hex digits).
+pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
+    let hex = spec
+        .strip_prefix("0x")
+        .or_else(|| spec.strip_prefix("0X"))
+        .unwrap_or(spec);
+    if hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid minimum work specified ({spec}), must be up to 64 hex digits"
+        ));
+    }
+    let mut padded = String::from("0").repeat(64 - hex.len());
+    padded.push_str(hex);
+    let raw = rbitcoin_primitives::hex_decode(&padded).map_err(|_| {
+        format!("Invalid minimum work specified ({spec}), must be up to 64 hex digits")
+    })?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+impl NodeConfig {
+    /// True when tip work meets `-minimumchainwork` (or the flag is unset).
+    pub fn meets_minimum_chain_work(&self, tip_work_be: [u8; 32]) -> bool {
+        match self.minimum_chain_work {
+            None => true,
+            Some(min) => tip_work_be >= min,
+        }
     }
 }
 
@@ -892,5 +1016,50 @@ mod tests {
         let cfg_f = NodeConfig::default().with_datadir(&file_dd);
         assert!(cfg_f.ensure_datadir().is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn testactivationheight_csv_overlay_on_chain_params() {
+        let mut cfg = NodeConfig::default();
+        cfg.network = Network::Regtest;
+        cfg.test_activation_heights.push(("csv".into(), 102));
+        let p = cfg.chain_params().unwrap();
+        assert_eq!(p.csv_height(), 102);
+        assert!(!p.csv_active_at(101));
+        assert!(p.csv_active_at(102));
+        // Libre defaults when the flag is absent.
+        let plain = NodeConfig::default();
+        assert!(plain.persist_mempool);
+        assert!(!plain.blocksonly);
+        assert!(plain.permit_bare_multisig);
+        assert!(plain.test_activation_heights.is_empty());
+        assert_eq!(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            }
+            .chain_params()
+            .unwrap()
+            .csv_height(),
+            1
+        );
+    }
+
+    #[test]
+    fn minimum_chain_work_hex_and_floor() {
+        let w = parse_minimum_chain_work("0x65").unwrap();
+        assert_eq!(w[31], 0x65);
+        assert!(parse_minimum_chain_work("test").is_err());
+        assert!(parse_minimum_chain_work(
+            "01234567890123456789012345678901234567890123456789012345678901234"
+        )
+        .is_err());
+        let mut cfg = NodeConfig::default();
+        assert!(cfg.meets_minimum_chain_work([0; 32]));
+        cfg.minimum_chain_work = Some(w);
+        assert!(!cfg.meets_minimum_chain_work([0; 32]));
+        let mut above = [0u8; 32];
+        above[31] = 0x66;
+        assert!(cfg.meets_minimum_chain_work(above));
     }
 }

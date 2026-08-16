@@ -95,6 +95,10 @@ pub fn rpc_error(code: i64, message: impl Into<String>) -> Value {
 }
 
 pub const ERR_MISC: i64 = -1;
+/// Core `RPC_INVALID_ADDRESS_OR_KEY`.
+pub const ERR_INVALID_ADDRESS_OR_KEY: i64 = -5;
+/// Core `RPC_DESERIALIZATION_ERROR`.
+pub const ERR_DESERIALIZATION: i64 = -22;
 /// Core `RPC_CLIENT_NODE_NOT_CONNECTED`.
 pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
@@ -317,6 +321,7 @@ pub fn dispatch(
         "generateblock" => generateblock(ctx, &params),
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
+        "submitheader" => submitheader(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
         "invalidateblock" => invalidateblock(ctx, &params),
         "reconsiderblock" => reconsiderblock(ctx, &params),
@@ -448,6 +453,7 @@ const METHOD_LIST: &[&str] = &[
     "waitforblockheight",
     "waitfornewblock",
     "submitblock",
+    "submitheader",
     "setmocktime",
     "invalidateblock",
     "reconsiderblock",
@@ -475,15 +481,18 @@ fn method_help(m: &str) -> String {
              Regtest harness only. Mines to OP_TRUE (no wallet)."
             .into(),
         "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
-             Regtest harness only. raw(HEX) descriptor or address."
+             Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
             .into(),
         "scantxoutset" => "scantxoutset action (scanobjects)\n\
              raw() scripts over Class A. MiniWallet support, not Core coins-DB."
             .into(),
         "gettxout" => "gettxout txid n (include_mempool) — Class A + mempool.".into(),
-        "getchaintips" => "getchaintips — active tip only.".into(),
+        "getchaintips" => "getchaintips — active + held/archive side tips + headers-only.".into(),
         "submitblock" => "submitblock hexdata (dummy)\n\
-             Regtest harness only. Accepts a serialized block via the P2P path."
+             All networks. Same receive path as a P2P block."
+            .into(),
+        "submitheader" => "submitheader hexdata\n\
+             All networks. Persist a header via the P2P header path (`ensure_header`)."
             .into(),
         "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
         "echo" => "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.".into(),
@@ -562,10 +571,15 @@ fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         String::new()
     };
     let ibd = ctx.initial_block_download.load(Ordering::Relaxed);
+    let headers = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.best_header_height())
+        .unwrap_or(tip);
     Ok(json!({
         "chain": chain_name(ctx.network),
         "blocks": tip,
-        "headers": tip,
+        "headers": headers,
         "bestblockhash": best,
         "difficulty": difficulty_at_tip(ctx).unwrap_or(0.0),
         "verificationprogress": if ibd { 0.5 } else { 1.0 },
@@ -891,9 +905,42 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
-        "unbroadcastcount": 0,
+        "unbroadcastcount": mp.unbroadcast_count(),
         "permitbaremultisig": true,
     }))
+}
+
+/// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
+fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
+    let vsize = weight / 4;
+    let fee_btc = (fee as f64) / 100_000_000.0;
+    let stats = mp.graph_stats(txid);
+    let (ac, asz, afee, dc, dsz, dfee) = match stats {
+        Some(s) => (
+            s.ancestorcount,
+            s.ancestorsize,
+            s.ancestorfees,
+            s.descendantcount,
+            s.descendantsize,
+            s.descendantfees,
+        ),
+        None => (1, vsize, fee, 1, vsize, fee),
+    };
+    json!({
+        "vsize": vsize,
+        "weight": weight,
+        "fee": fee_btc,
+        "modifiedfee": fee_btc,
+        "time": 0,
+        "height": 0,
+        "descendantcount": dc,
+        "descendantsize": dsz,
+        "descendantfees": dfee,
+        "ancestorcount": ac,
+        "ancestorsize": asz,
+        "ancestorfees": afee,
+        "unbroadcast": mp.is_unbroadcast(txid),
+    })
 }
 
 fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -912,23 +959,9 @@ fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
     let mut map = serde_json::Map::new();
     for (txid, fee, weight) in live {
-        let vsize = weight / 4;
         map.insert(
             hash_hex_display(&txid.to_byte_array()),
-            json!({
-                "vsize": vsize,
-                "weight": weight,
-                "fee": (fee as f64) / 100_000_000.0,
-                "modifiedfee": (fee as f64) / 100_000_000.0,
-                "time": 0,
-                "height": 0,
-                "descendantcount": 1,
-                "descendantsize": vsize,
-                "descendantfees": fee,
-                "ancestorcount": 1,
-                "ancestorsize": vsize,
-                "ancestorfees": fee,
-            }),
+            mempool_graph_json(mp, &txid, fee, weight),
         );
     }
     Ok(Value::Object(map))
@@ -944,22 +977,20 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let vsize = weight / 4;
         let fee_btc = (fee as f64) / 100_000_000.0;
         let wtxid = mp
             .get_tx(&tid)
             .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
             .unwrap_or_default();
-        return Ok(json!({
-            "vsize": vsize,
-            "weight": weight,
-            "wtxid": wtxid,
-            "fee": fee_btc,
-            "modifiedfee": fee_btc,
-            "fees": { "base": fee_btc, "modified": fee_btc },
-            "ancestorcount": 1,
-            "descendantcount": 1,
-        }));
+        let mut entry = mempool_graph_json(mp, &tid, fee, weight);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("wtxid".into(), json!(wtxid));
+            obj.insert(
+                "fees".into(),
+                json!({ "base": fee_btc, "modified": fee_btc }),
+            );
+        }
+        return Ok(entry);
     }
     Err(rpc_error(ERR_MISC, "Transaction not in mempool"))
 }
@@ -1016,7 +1047,10 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         ));
     }
     match mp.accept_tx(&tx) {
-        Ok(_) => Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array()))),
+        Ok(r) => {
+            mp.note_unbroadcast(r.txid);
+            Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
+        }
         Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),
     }
 }
@@ -1346,10 +1380,7 @@ fn generatetodescriptor(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
     let nblocks = params.req_u64(0, "num_blocks")? as u32;
     let desc = params.req_str(1, "descriptor")?;
     let _maxtries = params.opt_u64(2, "maxtries")?;
-    let script = match parse_raw_descriptor(desc) {
-        Some(s) => s,
-        None => decode_output_script(ctx, desc)?,
-    };
+    let script = parse_output_descriptor(ctx, desc)?;
     generate_with_mempool(ctx, nblocks, script)
 }
 
@@ -1359,6 +1390,23 @@ fn parse_raw_descriptor(desc: &str) -> Option<ScriptBuf> {
     let inner = bare.strip_prefix("raw(")?.strip_suffix(")")?;
     let bytes = hex_decode(inner).ok()?;
     Some(ScriptBuf::from_bytes(bytes))
+}
+
+/// `addr(bech32)#checksum` — same script as the bare address.
+fn parse_addr_descriptor(ctx: &RpcContext, desc: &str) -> Option<ScriptBuf> {
+    let bare = desc.split('#').next()?.trim();
+    let inner = bare.strip_prefix("addr(")?.strip_suffix(")")?;
+    decode_output_script(ctx, inner).ok()
+}
+
+fn parse_output_descriptor(ctx: &RpcContext, desc: &str) -> Result<ScriptBuf, Value> {
+    if let Some(s) = parse_raw_descriptor(desc) {
+        return Ok(s);
+    }
+    if let Some(s) = parse_addr_descriptor(ctx, desc) {
+        return Ok(s);
+    }
+    decode_output_script(ctx, desc)
 }
 
 /// Enough of Core `scantxoutset` for MiniWallet: `raw(script)` over Class A.
@@ -1558,6 +1606,21 @@ fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn getchaintips(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&[])?;
+    if let Some(chain) = ctx.chain.as_ref() {
+        let tips: Vec<Value> = chain
+            .chaintips()
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "height": t.height,
+                    "hash": hash_hex_display(&t.hash.to_byte_array()),
+                    "branchlen": t.branchlen,
+                    "status": t.status,
+                })
+            })
+            .collect();
+        return Ok(json!(tips));
+    }
     let Some(h) = ctx.query.tip_height() else {
         return Ok(json!([]));
     };
@@ -1698,9 +1761,41 @@ fn invalidateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
     params.reject_unknown(&["blockhash"])?;
     let hub = require_chain(ctx)?;
     let hash = parse_blockhash_param(params)?;
-    hub.invalidate_block(hash)
+    hub.invalidate_block(hash).map_err(|e| {
+        let s = e.to_string();
+        if s.contains("Block not found") {
+            rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found")
+        } else {
+            rpc_error(ERR_MISC, s)
+        }
+    })?;
+    Ok(Value::Null)
+}
+
+fn submitheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["hexdata"])?;
+    let hub = require_chain(ctx)?;
+    let hex = params.req_str(0, "hexdata")?;
+    let header = decode_header_hex(hex)?;
+    hub.ensure_header(&header)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     Ok(Value::Null)
+}
+
+fn decode_header_hex(hex: &str) -> Result<bitcoin::block::Header, Value> {
+    let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    if raw.len() >= 80 {
+        if let Ok(h) = deserialize::<bitcoin::block::Header>(&raw[..80]) {
+            return Ok(h);
+        }
+    }
+    let block: Block = deserialize(&raw).map_err(|e| {
+        rpc_error(
+            ERR_DESERIALIZATION,
+            format!("Block header decode failed: {e}"),
+        )
+    })?;
+    Ok(block.header)
 }
 
 fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2394,6 +2489,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Graph fields come from the cluster, not stub 1/0. Local sendraw is
+    /// unbroadcast until a peer getdata completes.
+    #[test]
+    fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (ctx, dir) = ctx_empty();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(
+            &ctx.query,
+            &params,
+            Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &ctx.query,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        let mp = ctx.mempool.as_ref().expect("mempool");
+        mp.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&parent).expect("parent");
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000 - 2_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&child).expect("child");
+
+        let parent_hex = hash_hex_display(&parent.compute_txid().to_byte_array());
+        let child_hex = hash_hex_display(&child.compute_txid().to_byte_array());
+        let parent_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(parent_hex.clone())]).unwrap();
+        let child_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(child_hex.clone())]).unwrap();
+        assert_eq!(parent_entry["ancestorcount"], 1);
+        assert_eq!(parent_entry["descendantcount"], 2);
+        assert_eq!(child_entry["ancestorcount"], 2);
+        assert_eq!(child_entry["descendantcount"], 1);
+        assert_eq!(parent_entry["unbroadcast"], false);
+        assert_eq!(child_entry["unbroadcast"], false);
+
+        let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
+        assert_eq!(verbose[&child_hex]["ancestorcount"], 2);
+        assert_eq!(verbose[&parent_hex]["descendantcount"], 2);
+
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            info["unbroadcastcount"], 0,
+            "P2P-style accept is not a local unbroadcast"
+        );
+
+        let local = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[1],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 3_000),
+                script_pubkey: spk,
+            }],
+        };
+        let local_hex_tx = serialize_hex(&local);
+        let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(local_hex_tx)]).unwrap();
+        let local_hex = hash_hex_display(&local.compute_txid().to_byte_array());
+        assert_eq!(sent, json!(local_hex.clone()));
+
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(info["unbroadcastcount"], 1);
+        let local_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(local_hex.clone())]).unwrap();
+        assert_eq!(local_entry["unbroadcast"], true);
+        assert_eq!(local_entry["ancestorcount"], 1);
+
+        mp.mark_broadcast(&local.compute_txid());
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            info["unbroadcastcount"], 0,
+            "getdata/serve must clear unbroadcast"
+        );
+        let local_entry = dispatch(&ctx, "getmempoolentry", vec![json!(local_hex)]).unwrap();
+        assert_eq!(local_entry["unbroadcast"], false);
+
+        let _ = mp.sample_reset_perf();
+        let _ = dispatch(&ctx, "getmempoolentry", vec![json!(child_hex)]).unwrap();
+        let s = mp.sample_reset_perf();
+        assert_eq!(s.list_live_meta, 0, "graph fields must not list_live_meta");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     struct TestMiner(Arc<rbitcoin_net::ChainHub>);
 
     impl RpcRegtest for TestMiner {
@@ -2697,6 +2936,35 @@ mod tests {
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
         dispatch(&ctx, "reconsiderblock", vec![json!(tip)]).unwrap();
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submitheader_child_is_headers_only() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let child = mine_regtest_paying(prev, time, 1, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&child));
+        let r = dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
+        assert!(r.is_null(), "{r}");
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["blocks"], 0);
+        assert_eq!(info["headers"], 1);
+        let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        let arr = tips.as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|t| t["status"] == "headers-only" && t["height"] == 1),
+            "{tips}"
+        );
+        let miss = dispatch(&ctx, "invalidateblock", vec![json!("00".repeat(32))]).unwrap_err();
+        assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(miss["message"], "Block not found");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

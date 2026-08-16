@@ -262,6 +262,8 @@ pub struct MempoolHub {
     meter_list_live_meta: AtomicU64,
     /// Live mempool txs by Electrum scripthash (updated on accept/remove).
     sh_index: Mutex<MempoolShIndex>,
+    /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
+    unbroadcast: Mutex<HashSet<Txid>>,
 }
 
 impl MempoolHub {
@@ -307,6 +309,7 @@ impl MempoolHub {
             meter_list_live: AtomicU64::new(0),
             meter_list_live_meta: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
+            unbroadcast: Mutex::new(HashSet::new()),
         };
         hub.reindex_live_scripthashes();
         Ok(Arc::new(hub))
@@ -364,6 +367,7 @@ impl MempoolHub {
 
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
+        self.unbroadcast.lock().unwrap().remove(txid);
     }
 
     /// Count peer inv of txs we do not already hold (want → getdata path).
@@ -980,6 +984,33 @@ impl MempoolHub {
             .graph
             .get(txid)
             .map(|e| (e.fee_sat, e.weight))
+    }
+
+    /// Ancestor/descendant counts and vsize/fee sums (no live-set scan).
+    pub fn graph_stats(&self, txid: &Txid) -> Option<crate::MempoolGraphStats> {
+        self.inner.read().unwrap().graph.graph_stats(txid)
+    }
+
+    /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
+    pub fn note_unbroadcast(&self, txid: Txid) {
+        if self.inner.read().unwrap().graph.contains(&txid) {
+            self.unbroadcast.lock().unwrap().insert(txid);
+        }
+    }
+
+    /// Peer getdata served this txid — it is no longer unbroadcast.
+    pub fn mark_broadcast(&self, txid: &Txid) {
+        self.unbroadcast.lock().unwrap().remove(txid);
+    }
+
+    /// How many locally submitted txs have not been requested by a peer.
+    pub fn unbroadcast_count(&self) -> u64 {
+        self.unbroadcast.lock().unwrap().len() as u64
+    }
+
+    /// Whether this live tx was submitted locally and is still unbroadcast.
+    pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
+        self.unbroadcast.lock().unwrap().contains(txid)
     }
 
     /// True if a live mempool tx spends `op` (RBF conflict map; no body load).

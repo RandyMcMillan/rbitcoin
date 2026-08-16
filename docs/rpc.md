@@ -69,22 +69,23 @@ still wait for durable SH when shindex is on.
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
 | `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
 | `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
-| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. **`getblockchaininfo` placeholders (not computed, not a plan to fill):** `chainwork` is `""`, `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. Use `blocks` / `initialblockdownload` / `difficulty`. |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). **Placeholders:** `chainwork` is `""`, `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `version` is rbitcoin semver as a Core integer (`0.1.0` → `100`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2` |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
-| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`) |
+| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. |
 | `getrawtransaction` | Class A + mempool |
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
-| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes current mempool (topo-sorted), then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)` (MiniWallet) or an address. Not a mining product (no GBT). |
-| `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or park + most-work `accept_branch`. |
+| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes current mempool (topo-sorted), then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. Not a mining product (no GBT). |
+| `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
 | `gettxout` | All networks. Class A + mempool. |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
-| `getchaintips` | All networks. Active tip only (parked-fork list still follows `accept_received_block` / invalidate). |
+| `getchaintips` | All networks. Active + archive `valid-fork` + held `valid-headers` + header-only (`submitheader` / P2P headers). Invalid body after a known header marks that branch `invalid`. |
+| `submitheader` | All networks. Same `ChainHub::ensure_header` as P2P `headers`. Hex may be an 80-byte header or a full block. |
 | `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. |

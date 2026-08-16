@@ -117,17 +117,30 @@ assert_fail_msg "unknown flag parse error" "Error parsing command line arguments
 assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -fakearg
 
-# Common TestNode extras must be ignored (not parse-fail).
+# Consensus/mempool/peer flags are forwarded; harness-only extras stay ignored.
 OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
-  -testactivationheight=bip34@1 -permitbaremultisig=0 2>/dev/null)" || OUTX=""
-if printf '%s' "$OUTX" | grep -q -- "--rpc-listen"; then
-  echo "ok - TestNode extras ignored"
+  -testactivationheight=csv@102 -permitbaremultisig=0 -maxconnections=8 \
+  -minimumchainwork=0x65 -limitancestorcount=5 \
+  2>/dev/null)" || OUTX=""
+if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
+  && printf '%s' "$OUTX" | grep -q -- "--whitelist=noban@127.0.0.1" \
+  && printf '%s' "$OUTX" | grep -q -- "--limitclustercount=10" \
+  && printf '%s' "$OUTX" | grep -q -- "--permitbaremultisig=0" \
+  && printf '%s' "$OUTX" | grep -q -- "--maxconnections=8" \
+  && printf '%s' "$OUTX" | grep -q -- "--minimumchainwork=0x65" \
+  && ! printf '%s' "$OUTX" | grep -q -- "limitancestor" \
+  && ! printf '%s' "$OUTX" | grep -q -- "txindex" \
+  && ! printf '%s' "$OUTX" | grep -q -- "fastprune"; then
+  echo "ok - consensus/mempool/peer flags forwarded"
   PASS=$((PASS + 1))
 else
-  echo "not ok - TestNode extras ignored (got: $OUTX)"
+  echo "not ok - consensus/mempool/peer flags forwarded (got: $OUTX)"
   FAIL=$((FAIL + 1))
 fi
+
+assert_fail_msg "txindex=0 cannot disable Class A lookup" "Error parsing command line arguments" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -txindex=0
 
 # -h / -version exit 0 on stdout without starting the node.
 if OUTH="$("$SHIM" -datadir="$DATADIR" -h 2>/dev/null)" && printf '%s' "$OUTH" | grep -q Options; then

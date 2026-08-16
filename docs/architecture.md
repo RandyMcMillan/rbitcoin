@@ -117,7 +117,7 @@ work** (Bitcoin rule). Header work only **ranks candidates**; full block
 connect decides the tip.
 
 ```text
-headers / BQ / pending
+headers / BQ / pending (download window)
     → MostWorkSelector (skip invalid-marked)
     → gather bodies (BQ · held-by-hash side bodies · Class A)
     → ChainHub::accept_branch (snapshot → disconnect → connect;
@@ -128,7 +128,7 @@ headers / BQ / pending
 | Path | Behavior |
 |------|----------|
 | **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). A heavier header path that does not meet the tip **searches connecting hashes** (shortest work-winning prefix) instead of waiting on the loser. Side-branch bodies are held **by hash** (BQ is height first-wins). |
-| **Tip-follow** | Pending cap ≥128; assemble max-work fork into `accept_branch`. |
+| **Tip-follow** | Pending cap ≥128 (download window). Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | Prefer deeper/more-work header children; Class A body only tie-breaks. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). |
 

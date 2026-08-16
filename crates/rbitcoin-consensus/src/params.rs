@@ -16,6 +16,10 @@ pub struct ChainParams {
     pub btc: BtcParams,
     /// BIP325 signet challenge script (`None` = not a signet).
     pub signet_challenge: Option<ScriptBuf>,
+    /// `-testactivationheight=csv@H` overlay (`None` = network default).
+    csv_height_overlay: Option<u32>,
+    /// `-testactivationheight=segwit@H` overlay (`None` = network default).
+    segwit_height_overlay: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +53,8 @@ impl ChainParams {
             checkpoints: vec![],
             btc,
             signet_challenge: None,
+            csv_height_overlay: None,
+            segwit_height_overlay: None,
         }
     }
 
@@ -61,6 +67,8 @@ impl ChainParams {
             checkpoints: mainnet_checkpoints(genesis.block_hash()),
             btc: BtcParams::new(Network::Bitcoin),
             signet_challenge: None,
+            csv_height_overlay: None,
+            segwit_height_overlay: None,
         }
     }
 
@@ -73,6 +81,8 @@ impl ChainParams {
             checkpoints: vec![],
             btc: BtcParams::new(Network::Testnet),
             signet_challenge: None,
+            csv_height_overlay: None,
+            segwit_height_overlay: None,
         }
     }
 
@@ -99,6 +109,8 @@ impl ChainParams {
             checkpoints: vec![],
             btc,
             signet_challenge: Some(challenge),
+            csv_height_overlay: None,
+            segwit_height_overlay: None,
         })
     }
 
@@ -185,6 +197,9 @@ impl ChainParams {
 
     /// Buried height for BIP68/112/113 (CSV package).
     pub fn csv_height(&self) -> u32 {
+        if let Some(h) = self.csv_height_overlay {
+            return h;
+        }
         match self.network {
             Network::Bitcoin => 419_328,
             Network::Testnet => 770_112,
@@ -205,12 +220,49 @@ impl ChainParams {
     }
 
     pub fn segwit_height(&self) -> u32 {
+        if let Some(h) = self.segwit_height_overlay {
+            return h;
+        }
         match self.network {
             Network::Bitcoin => 481_824,
             Network::Testnet => 834_624,
             Network::Signet | Network::Testnet4 => 1,
             Network::Regtest => 0,
         }
+    }
+
+    /// Core `-testactivationheight=name@height` (regtest only).
+    ///
+    /// Names match Core v31.1 `GetBuriedDeployment`: `segwit`, `bip34`,
+    /// `dersig`, `cltv`, `csv`. Script-flag wiring of the overlay is a later
+    /// confirm step; height getters here are the source of truth.
+    pub fn apply_test_activation_height(
+        &mut self,
+        name: &str,
+        height: u32,
+    ) -> Result<(), &'static str> {
+        if self.network != Network::Regtest {
+            return Err("testactivationheight is regtest only");
+        }
+        match name {
+            "bip34" => self.btc.bip34_height = height,
+            "dersig" => self.btc.bip66_height = height,
+            "cltv" => self.btc.bip65_height = height,
+            "csv" => self.csv_height_overlay = Some(height),
+            "segwit" => self.segwit_height_overlay = Some(height),
+            _ => return Err("invalid testactivationheight name"),
+        }
+        Ok(())
+    }
+
+    /// Parse one Core `name@height` token.
+    pub fn parse_test_activation_height(spec: &str) -> Result<(&str, u32), &'static str> {
+        let (name, rest) = spec.split_once('@').ok_or("invalid format (name@height)")?;
+        if name.is_empty() {
+            return Err("invalid format (name@height)");
+        }
+        let height: u32 = rest.parse().map_err(|_| "invalid height")?;
+        Ok((name, height))
     }
 
     /// BIP341/342 taproot active?
@@ -538,5 +590,21 @@ mod tests {
         assert!(rt.bip66_active_at(1));
         // Missing checkpoint → None.
         assert!(rt.checkpoint_at(Height(1)).is_none());
+    }
+
+    /// Core `-testactivationheight=csv@102` (regtest) must move the buried height.
+    #[test]
+    fn testactivationheight_csv_overlay() {
+        let mut p = ChainParams::regtest();
+        assert_eq!(p.csv_height(), 1);
+        p.apply_test_activation_height("csv", 102).unwrap();
+        assert_eq!(p.csv_height(), 102);
+        assert!(!p.csv_active_at(101));
+        assert!(p.csv_active_at(102));
+        p.apply_test_activation_height("dersig", 50).unwrap();
+        assert_eq!(p.btc.bip66_height, 50);
+        assert!(p.apply_test_activation_height("notadeployment", 1).is_err());
+        let mut main = ChainParams::mainnet();
+        assert!(main.apply_test_activation_height("csv", 102).is_err());
     }
 }

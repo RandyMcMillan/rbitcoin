@@ -54,10 +54,10 @@ pub const BAN_SCORE_THRESHOLD: u32 = 100;
 const MAX_PENDING_CMPCT: usize = 8;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
-/// Cap on full blocks waiting for in-order tip accept (DoS / process RAM).
-///
-/// Must be ≥99 so tip-follow can assemble a 99-block competing branch for
-/// most-work reorg (see `docs/design-ibd-most-work-reorg.md`).
+/// Cap on the per-peer download window and missing-parent getdata burst
+/// (DoS / process RAM). Must be ≥99 so tip-follow can *request* a 99-block
+/// competing branch; apply is `ChainHub::accept_received_block` (see
+/// `docs/design-ibd-most-work-reorg.md`).
 const MAX_PENDING_BLOCKS: usize = 128;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).
@@ -608,6 +608,7 @@ async fn handle_peer_frame(
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx(txid) {
+                                mp.mark_broadcast(txid);
                                 queue_out(out_tx, NetworkMessage::Tx(tx))?;
                             }
                         }
@@ -615,6 +616,7 @@ async fn handle_peer_frame(
                     Inventory::WTx(wtxid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
+                                mp.mark_broadcast(&tx.compute_txid());
                                 queue_out(out_tx, NetworkMessage::Tx(tx))?;
                             }
                         }
@@ -741,8 +743,9 @@ async fn handle_peer_frame(
         NetworkMessage::Block(block) => {
             let hash = block.block_hash();
             pending_cmpct.remove(&hash);
-            // Same receive path as RPC submitblock: tip-extend, or park +
-            // most-work reorg. Per-peer pending stays for IBD children.
+            // Same receive path as RPC submitblock: tip-extend, or hold +
+            // most-work `accept_branch`. Per-peer pending is a download window
+            // for bodies whose parent is still unknown — not a second assembler.
             match hub.accept_received_block(block.clone()) {
                 Ok(AcceptOutcome::Accepted { .. }) | Ok(AcceptOutcome::AlreadyHave) => {
                     pending_blocks.remove(&hash);
@@ -750,14 +753,9 @@ async fn handle_peer_frame(
                     drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 }
                 Ok(AcceptOutcome::IgnoredWeaker) => {
-                    if pending_blocks.len() >= MAX_PENDING_BLOCKS
-                        && !pending_blocks.contains_key(&hash)
-                    {
-                        *ban_score = ban_score.saturating_add(5);
-                    } else {
-                        pending_blocks.insert(hash, block.clone());
-                        drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
-                    }
+                    pending_blocks.remove(&hash);
+                    pending_headers.remove(&hash);
+                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 }
                 Err(e) if net_error_is_store_not_found(&e) => {
                     rbitcoin_log::warn!(
@@ -775,8 +773,7 @@ async fn handle_peer_frame(
             if hub.has_block(&hash) {
                 // already have
             } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
-                let _ = hub.accept_received_block(block.clone());
-                pending_blocks.insert(hash, block);
+                let _ = hub.accept_received_block(block);
                 drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
             } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
                 if missing.is_empty() {
@@ -821,8 +818,7 @@ async fn handle_peer_frame(
             if let Some(pc) = pending_cmpct.remove(&hash) {
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => {
-                        let _ = hub.accept_received_block(block.clone());
-                        pending_blocks.insert(hash, block);
+                        let _ = hub.accept_received_block(block);
                         drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                     }
                     Err(()) => {
@@ -922,156 +918,70 @@ fn drain_pending(
         }
     }
 
-    // Pending branch whose root parent is neither connected nor pending can
-    // never attach; the peer announces only its tip. Ask for that one hash.
-    let mut missing: Vec<BlockHash> = Vec::new();
+    // Download window + hub hold: ask for parents we still lack.
+    let mut missing: Vec<BlockHash> = hub.held_missing_parents();
     for b in pending_blocks.values() {
         let prev = b.header.prev_blockhash;
         if prev.to_byte_array() != [0u8; 32]
             && !hub.is_connected(&prev)
             && !pending_blocks.contains_key(&prev)
+            && hub.held_body(&prev).is_none()
             && !missing.contains(&prev)
         {
             missing.push(prev);
         }
     }
     if !missing.is_empty() {
+        missing.truncate(MAX_PENDING_BLOCKS);
         let want: Vec<Inventory> = missing.into_iter().map(Inventory::WitnessBlock).collect();
         queue_out(out, NetworkMessage::GetData(want))?;
     }
     Ok(())
 }
 
-/// One greedy-connect pass followed by a reorg attempt.
+/// Feed complete pending bodies into the hub receive path. Pending is a
+/// download window, not a second most-work assembler.
 fn drain_pending_once(
     hub: &ChainHub,
     pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
 ) -> Result<(), NetError> {
-    // First: greedily extend tip while we can.
     let mut progress = true;
     while progress {
         progress = false;
-        let tip = hub.tip_hash();
         let candidates: Vec<BlockHash> = pending_blocks.keys().copied().collect();
         for h in candidates {
-            let Some(block) = pending_blocks.get(&h) else {
+            let Some(block) = pending_blocks.remove(&h) else {
                 continue;
             };
-            let prev = block.header.prev_blockhash;
-            let connects = match tip {
-                None => prev.to_byte_array() == [0u8; 32],
-                Some(t) => prev == t,
-            };
-            if connects {
-                let block = pending_blocks.remove(&h).unwrap();
-                pending_headers.remove(&h);
-                match hub.accept_received_block(block) {
-                    Ok(AcceptOutcome::Accepted { .. })
-                    | Ok(AcceptOutcome::AlreadyHave)
-                    | Ok(AcceptOutcome::IgnoredWeaker) => {
-                        progress = true;
-                    }
-                    // Invalid or unconnectable body: reject the block, keep the
-                    // peer. BIP-152 high-bandwidth (and getdata we solicited) can
-                    // deliver PoW-valid-but-invalid blocks from honest Core peers
-                    // that have not validated yet — never disconnect or ban-score
-                    // for that (docs/external_findings/001-disconnect-on-invalid-block.md).
-                    Err(e) if net_error_is_store_not_found(&e) => {
-                        rbitcoin_log::warn!(
-                            "p2p: accept dropped {} (store not found — keep session): {e}",
-                            h
-                        );
-                    }
-                    Err(e) => {
-                        rbitcoin_log::warn!(
-                            "p2p: accept dropped {} (invalid/unconnectable — keep session): {e}",
-                            h
-                        );
-                    }
+            pending_headers.remove(&h);
+            match hub.accept_received_block(block) {
+                Ok(AcceptOutcome::Accepted { .. })
+                | Ok(AcceptOutcome::AlreadyHave)
+                | Ok(AcceptOutcome::IgnoredWeaker) => {
+                    progress = true;
+                }
+                // Invalid or unconnectable body: reject the block, keep the
+                // peer. BIP-152 high-bandwidth (and getdata we solicited) can
+                // deliver PoW-valid-but-invalid blocks from honest Core peers
+                // that have not validated yet — never disconnect or ban-score
+                // for that (docs/external_findings/001-disconnect-on-invalid-block.md).
+                Err(e) if net_error_is_store_not_found(&e) => {
+                    rbitcoin_log::warn!(
+                        "p2p: accept dropped {} (store not found — keep session): {e}",
+                        h
+                    );
+                }
+                Err(e) => {
+                    rbitcoin_log::warn!(
+                        "p2p: accept dropped {} (invalid/unconnectable — keep session): {e}",
+                        h
+                    );
                 }
             }
         }
     }
-
-    // Second: if we have a contiguous branch from a parent on-chain that is longer/more work, reorg.
-    try_reorg_from_pending(hub, pending_blocks, pending_headers)?;
     Ok(())
-}
-
-fn try_reorg_from_pending(
-    hub: &ChainHub,
-    pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
-    _pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
-) -> Result<(), NetError> {
-    if pending_blocks.is_empty() {
-        return Ok(());
-    }
-    // Find blocks whose parent is on our best chain (fork points).
-    let mut fork_starts: Vec<BlockHash> = Vec::new();
-    for (h, b) in pending_blocks.iter() {
-        let prev = b.header.prev_blockhash;
-        if hub.is_connected(&prev) || prev.to_byte_array() == [0u8; 32] {
-            // parent known
-            if hub.tip_hash() != Some(prev) {
-                fork_starts.push(*h);
-            }
-        }
-    }
-    // Assemble each fork; try **max-work** branch first (header work = length on
-    // equal-bits regtest / mainnet segments with similar bits).
-    let mut branches: Vec<Vec<bitcoin::Block>> = Vec::new();
-    for start in fork_starts {
-        if let Some(branch) = assemble_pending_branch(pending_blocks, start) {
-            if !branch.is_empty() {
-                branches.push(branch);
-            }
-        }
-    }
-    branches.sort_by(|a, b| {
-        let wa = crate::most_work::sum_work(a.iter().map(|blk| blk.header.work()));
-        let wb = crate::most_work::sum_work(b.iter().map(|blk| blk.header.work()));
-        wb.cmp(&wa)
-    });
-    for branch in branches {
-        match hub.accept_branch(&branch) {
-            Ok(AcceptOutcome::Accepted { .. }) => {
-                for b in &branch {
-                    pending_blocks.remove(&b.block_hash());
-                }
-                return Ok(());
-            }
-            Ok(AcceptOutcome::IgnoredWeaker) | Ok(AcceptOutcome::AlreadyHave) => {}
-            Err(_) => {}
-        }
-    }
-    Ok(())
-}
-
-/// Walk pending map from a fork-start hash following one child at a time.
-fn assemble_pending_branch(
-    pending_blocks: &HashMap<BlockHash, bitcoin::Block>,
-    start: BlockHash,
-) -> Option<Vec<bitcoin::Block>> {
-    let mut branch = Vec::new();
-    let mut cur = start;
-    loop {
-        let b = pending_blocks.get(&cur)?;
-        branch.push(b.clone());
-        let next = pending_blocks
-            .iter()
-            .find(|(_, blk)| blk.header.prev_blockhash == cur)
-            .map(|(h, _)| *h);
-        match next {
-            Some(n) => cur = n,
-            None => break,
-        }
-        // DoS: do not assemble past the pending-body cap.
-        if branch.len() >= MAX_PENDING_BLOCKS {
-            break;
-        }
-    }
-    Some(branch)
 }
 
 fn headers_for_peer(
@@ -1276,7 +1186,6 @@ mod tests {
         let mut ph = HashMap::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
-        try_reorg_from_pending(&hub, &mut pb, &mut ph).unwrap();
 
         // Invalid tip-extending body must not kill the session (001).
         use bitcoin::absolute::LockTime;
@@ -2126,9 +2035,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Tip-follow pending reorg: max-work fork assembled and applied via shipped path.
+    /// Tip-follow receive: max-work fork held then applied via `accept_received_block`.
     #[test]
-    fn try_reorg_from_pending_picks_max_work_branch() {
+    fn p2p_side_chain_reorgs_via_held_bodies() {
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version as BlockVersion};
         use bitcoin::script::ScriptBuf;
@@ -2202,22 +2111,20 @@ mod tests {
             p = b.block_hash();
             long.push(b);
         }
-        let mut pb = HashMap::new();
-        pb.insert(short.block_hash(), short);
+        // Short side first (held, weaker), then the longer fork one body at a time
+        // — same order a peer `block` message stream would deliver.
+        hub.accept_received_block(short).unwrap();
         for b in &long {
-            pb.insert(b.block_hash(), b.clone());
+            hub.accept_received_block(b.clone()).unwrap();
         }
-        let mut ph = HashMap::new();
-        assert!(MAX_PENDING_BLOCKS_FOR_TEST >= 128);
-        try_reorg_from_pending(&hub, &mut pb, &mut ph).unwrap();
         assert_eq!(
             hub.tip_height(),
             Some(4),
-            "must reorg onto longer pending branch"
+            "must reorg onto longer held branch"
         );
         assert_eq!(hub.tip_hash().unwrap(), long[3].block_hash());
-        // Winning branch removed from pending.
-        assert!(!pb.contains_key(&long[3].block_hash()));
+        assert!(hub.held_body(&long[3].block_hash()).is_none());
+        assert!(MAX_PENDING_BLOCKS_FOR_TEST >= 128);
         let _ = std::fs::remove_dir_all(dir);
     }
 

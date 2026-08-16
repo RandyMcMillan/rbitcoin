@@ -1669,6 +1669,11 @@ impl TxTable {
         self.pending_head.get(txid)
     }
 
+    /// Drop pending snap keys the fence already covers (leftover can TipOnly).
+    pub fn forget_pending_if_fenced(&self, fence: &crate::height_fence::HeightFence) {
+        self.pending_head.forget_if_fenced(fence);
+    }
+
     /// Drain the pending insert queue via page-grouped [`Self::head_insert_many`].
     ///
     /// Inserts durable `tx.head` for probe. Leaves the snap so leftover can

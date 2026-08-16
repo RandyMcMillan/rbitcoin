@@ -539,8 +539,7 @@ reason = "no-mining-product"
 
 [[test]]
 name = "mining_getblocktemplate_longpoll.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "mining_mainnet.py"

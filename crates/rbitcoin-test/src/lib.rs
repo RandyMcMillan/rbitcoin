@@ -81,17 +81,3 @@ impl TestDatadir {
         self.path().join("store")
     }
 }
-
-/// Touch all workspace crate identity symbols so placeholders stay reachable.
-pub fn smoke_crate_names() -> Vec<&'static str> {
-    vec![
-        rbitcoin_store::crate_name(),
-        rbitcoin_query::crate_name(),
-        rbitcoin_consensus::crate_name(),
-        rbitcoin_net::crate_name(),
-        rbitcoin_rpc::crate_name(),
-        rbitcoin_electrum::crate_name(),
-        rbitcoin_cli::crate_name(),
-        rbitcoin_node::crate_name(),
-    ]
-}

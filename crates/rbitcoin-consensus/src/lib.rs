@@ -133,10 +133,6 @@ pub use silent_payments::{
     tweaks_for_height, tweaks_from_thin_and_body, TaprootOut, TxTweak,
 };
 
-pub fn crate_name() -> &'static str {
-    "rbitcoin-consensus"
-}
-
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
@@ -867,8 +863,7 @@ mod coverage_tests {
     }
 
     #[test]
-    fn crate_name_and_phase_stats() {
-        assert_eq!(crate_name(), "rbitcoin-consensus");
+    fn last_write_phase_stats() {
         use confirm_phase_stats::*;
         note_last_write(LastWritePhases {
             n_blocks: 2,

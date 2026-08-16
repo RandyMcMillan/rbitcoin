@@ -8,10 +8,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-pub fn crate_name() -> &'static str {
-    "rbitcoin-cli"
-}
-
 fn usage() -> String {
     format!(
         "rbitcoin-cli {} — usage: rbitcoin-cli [OPTIONS] <COMMAND> [PARAMS...]\n\

@@ -55,15 +55,3 @@ pub use orphanage::{
     ORPHAN_PEER_BUDGET, ORPHAN_RESERVED_WEIGHT_PER_PEER,
 };
 pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA, PERSIST_COALESCE_OPS};
-
-pub fn crate_name() -> &'static str {
-    "rbitcoin-mempool"
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_stable() {
-        assert_eq!(crate::crate_name(), "rbitcoin-mempool");
-    }
-}

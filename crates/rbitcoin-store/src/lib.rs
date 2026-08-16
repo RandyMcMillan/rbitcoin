@@ -70,9 +70,7 @@ pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{
     merkle_root_from_txids, TipRevalidateReport, TipSeal, TIP_SEAL_NAME, VERIFY_TIP_BLOCKS,
 };
-pub use io_backend::{
-    read_io_backend, write_io_backend, ReadIoBackend, WriteIoBackend,
-};
+pub use io_backend::{read_io_backend, write_io_backend, ReadIoBackend, WriteIoBackend};
 pub use point_table::PointRecord;
 pub use scripthash::{
     has_sh_run_rebuild_source, load_include_hwm, script_hash, sh_run_catalog_key_len_ok,
@@ -127,8 +125,3 @@ pub use tx_table::{
 };
 pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_ENTRY_LEN};
 pub use uring_session::RWF_DONTCACHE;
-
-/// Crate identity for diagnostics and coverage scenarios.
-pub fn crate_name() -> &'static str {
-    "rbitcoin-store"
-}

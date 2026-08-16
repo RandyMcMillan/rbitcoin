@@ -52,6 +52,14 @@ before 1.0).
   every network. `rules` must include `segwit`. Proposal validates without
   connecting. No BIP9 testdummy version bit.
 
+- **`prioritisetransaction`:** additive i64 sat fee delta by txid (even if
+  not in the mempool). Dummy must be 0. Selector / generate / GBT rank by
+  modified fee; non-positive modified fee is not mined. Mined txs drop the
+  delta. `getprioritisedtransactions` reports the map.
+
+- **Mempool BIP68:** confirmed inputs use the parent create MTP (not 0).
+  `getblockheader.mediantime` is real MTP.
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is
@@ -111,10 +119,10 @@ before 1.0).
   `accept_branch` on more work). Once-confirmed losers stay in Class A.
   Not a coins-DB / GBT product.
 
-- **Core functional `run` set:** 13 unmodified scripts (first-green nine plus
+- **Core functional `run` set:** 14 unmodified scripts (first-green nine plus
   `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`,
-  `feature_csv_activation.py`). `feature_bip68_sequence.py` /
-  `feature_nulldummy.py` still skip (GBT / prioritise / raw-tx).
+  `feature_csv_activation.py`, `feature_bip68_sequence.py`).
+  `feature_nulldummy.py` still skip (raw-tx + `-addresstype`).
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

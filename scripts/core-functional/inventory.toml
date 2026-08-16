@@ -69,9 +69,7 @@ reason = "core-net-policy"
 
 [[test]]
 name = "feature_bip68_sequence.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: CSV/BIP68 RPC + generate"
+status = "run"
 
 [[test]]
 name = "feature_block.py"

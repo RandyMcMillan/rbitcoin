@@ -549,16 +549,48 @@ impl TxGraph {
     /// still-unselected in-mempool ancestors so the block is topological.
     /// A chunk (plus those ancestors) that would overflow drops the tail.
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
+        self.select_block_txids_delta(max_weight_wu, |_| 0)
+    }
+
+    /// Like [`Self::select_block_txids`], ranking by `base_fee + delta(txid)`.
+    /// Chunks whose modified fee is ≤ 0 are skipped (not mined).
+    pub fn select_block_txids_delta(
+        &self,
+        max_weight_wu: u64,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Vec<Txid> {
         if max_weight_wu == 0 {
             return Vec::new();
         }
+        let mut scored: Vec<(u64, u64, Chunk)> = Vec::new();
+        for ch in self.mining_chunks_best_first() {
+            let mut mf = 0i128;
+            for t in &ch.txids {
+                let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
+                mf = mf.saturating_add(base.saturating_add(i128::from(delta(*t))));
+            }
+            if mf <= 0 {
+                continue;
+            }
+            let fee = mf as u64;
+            let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, ch.weight);
+            scored.push((rate, fee, ch));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
         let mut selected = HashSet::new();
         let mut out = Vec::new();
         let mut used = 0u64;
-        for ch in self.mining_chunks_best_first() {
+        for (_, _, ch) in scored {
             let mut add = Vec::new();
             for t in &ch.txids {
+                let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
+                if base.saturating_add(i128::from(delta(*t))) <= 0 {
+                    continue;
+                }
                 self.collect_selected_with_ancestors(*t, &selected, &mut add);
+            }
+            if add.is_empty() {
+                continue;
             }
             let extra: u64 = add
                 .iter()
@@ -822,6 +854,58 @@ mod tests {
         let both = g.select_block_txids(wh.saturating_add(wl));
         assert_eq!(both, vec![hi.compute_txid(), lo.compute_txid()]);
         assert!(g.select_block_txids(wh.saturating_sub(1)).is_empty());
+
+        let hid = hi.compute_txid();
+        let lid = lo.compute_txid();
+        let depri = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+            if id == hid {
+                -10_000
+            } else {
+                0
+            }
+        });
+        assert_eq!(depri, vec![lid], "zero modified fee is not mined");
+        let bump = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+            if id == lid {
+                86 * 100_000_000
+            } else {
+                0
+            }
+        });
+        assert_eq!(bump[0], lid, "i64-sized delta reorders selection");
+
+        // Child deprioritised to 0 stays out even when it shares a package with parent.
+        let mut g = TxGraph::new();
+        let parent = spend_op([4u8; 32], 50_000, 40_000);
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(30_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        g.insert(entry_for(&parent, 10_000, 0), &parent);
+        g.insert(entry_for(&child, 1_000, 1), &child);
+        let cid = child.compute_txid();
+        let pid = parent.compute_txid();
+        let only_p = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+            if id == cid {
+                -1_000
+            } else {
+                0
+            }
+        });
+        assert_eq!(only_p, vec![pid], "zero-modified child is not mined with parent");
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

@@ -95,6 +95,8 @@ pub fn rpc_error(code: i64, message: impl Into<String>) -> Value {
 }
 
 pub const ERR_MISC: i64 = -1;
+/// Core `RPC_TYPE_ERROR`.
+pub const ERR_TYPE_ERROR: i64 = -3;
 /// Core `RPC_INVALID_ADDRESS_OR_KEY`.
 pub const ERR_INVALID_ADDRESS_OR_KEY: i64 = -5;
 /// Core `RPC_DESERIALIZATION_ERROR`.
@@ -214,6 +216,11 @@ impl RpcParams {
 fn json_u64(v: &Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+}
+
+fn json_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
 }
 
 /// Core `getblock` verbosity: integer, or bool (`false` → 0, `true` → 1).
@@ -336,6 +343,8 @@ pub fn dispatch(
         "waitfornewblock" => waitfornewblock(ctx, &params),
         "getblocktemplate" => getblocktemplate(ctx, &params),
         "getmininginfo" => getmininginfo(ctx),
+        "prioritisetransaction" => prioritisetransaction(ctx, &params),
+        "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
         "createrawtransaction" | "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
@@ -455,6 +464,8 @@ const METHOD_LIST: &[&str] = &[
     "waitfornewblock",
     "getblocktemplate",
     "getmininginfo",
+    "prioritisetransaction",
+    "getprioritisedtransactions",
     "submitblock",
     "submitheader",
     "setmocktime",
@@ -499,6 +510,14 @@ fn method_help(m: &str) -> String {
              without connecting. rules must include segwit. No BIP9 testdummy."
             .into(),
         "getmininginfo" => "getmininginfo\nTip height, difficulty, pooledtx. All networks.".into(),
+        "prioritisetransaction" => {
+            "prioritisetransaction txid dummy fee_delta\nLocal mining fee delta (sat). dummy must be 0."
+                .into()
+        }
+        "getprioritisedtransactions" => {
+            "getprioritisedtransactions\nMap of txid → fee_delta / in_mempool / modified_fee."
+                .into()
+        }
         "submitblock" => "submitblock hexdata (dummy)\n\
              All networks. Same receive path as a P2P block."
             .into(),
@@ -678,7 +697,8 @@ fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
         "versionHex": format!("{:08x}", rec.version),
         "merkleroot": hash_hex_display(&rec.merkle_root),
         "time": rec.timestamp,
-        "mediantime": rec.timestamp,
+        "mediantime": rbitcoin_consensus::median_time_past(ctx.query.as_ref(), height)
+            .unwrap_or(rec.timestamp),
         "nonce": rec.nonce,
         "bits": format!("{:08x}", rec.bits),
         "difficulty": difficulty_from_bits(rec.bits),
@@ -2024,6 +2044,83 @@ fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
     }))
 }
 
+fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid", "dummy", "fee_delta"])?;
+    let txid_s = params.req_str(0, "txid")?;
+    if txid_s.len() != 64 {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!(
+                "txid must be of length 64 (not {}, for '{txid_s}')",
+                txid_s.len()
+            ),
+        ));
+    }
+    if !txid_s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("txid must be hexadecimal string (not '{txid_s}')"),
+        ));
+    }
+    if let Some(dummy) = params.get(1, "dummy") {
+        if dummy.as_i64() != Some(0) && dummy.as_u64() != Some(0) {
+            if dummy.as_i64().is_none() && dummy.as_u64().is_none() {
+                return Err(rpc_error(
+                    ERR_TYPE_ERROR,
+                    "JSON value of type string is not of expected type number",
+                ));
+            }
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.",
+            ));
+        }
+    }
+    let fee_delta = params
+        .get(2, "fee_delta")
+        .and_then(json_i64)
+        .ok_or_else(|| {
+            if params.get(2, "fee_delta").is_some() {
+                rpc_error(
+                    ERR_TYPE_ERROR,
+                    "JSON value of type string is not of expected type number",
+                )
+            } else {
+                rpc_error(ERR_INVALID_PARAMS, "fee_delta required")
+            }
+        })?;
+    let txid = Txid::from_byte_array(parse_hash32_display(txid_s)?);
+    let mp = ctx
+        .mempool
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "no mempool"))?;
+    mp.prioritise_tx(txid, fee_delta);
+    Ok(json!(true))
+}
+
+fn getprioritisedtransactions(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&[])?;
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return Ok(json!({}));
+    };
+    let mut out = serde_json::Map::new();
+    for (txid, delta) in mp.prioritised_txs() {
+        let in_mempool = mp.contains(&txid);
+        let mut row = json!({
+            "fee_delta": delta,
+            "in_mempool": in_mempool,
+        });
+        if in_mempool {
+            if let Some((base, _)) = mp.get_live_meta(&txid) {
+                let modified = (base as i128).saturating_add(i128::from(delta));
+                row["modified_fee"] = json!(modified);
+            }
+        }
+        out.insert(txid.to_string(), row);
+    }
+    Ok(Value::Object(out))
+}
+
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexdata", "dummy"])?;
     let miner = require_regtest_miner(ctx, "submitblock")?;
@@ -3232,6 +3329,70 @@ mod tests {
         let txs = tmpl["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0]["txid"], tid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prioritisetransaction_dummy_and_deprioritise_skips_generate() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let e = dispatch(
+            &ctx,
+            "prioritisetransaction",
+            vec![json!("11".repeat(32)), json!(1), json!(0)],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(e["message"]
+            .as_str()
+            .unwrap()
+            .contains("Priority is no longer supported"));
+
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let cb_val =
+            (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let tid = dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(&spend)))],
+        )
+        .unwrap();
+        let fee = 1_000i64;
+        dispatch(
+            &ctx,
+            "prioritisetransaction",
+            vec![tid.clone(), json!(0), json!(-fee)],
+        )
+        .unwrap();
+        let pri = dispatch(&ctx, "getprioritisedtransactions", vec![]).unwrap();
+        assert_eq!(pri[tid.as_str().unwrap()]["fee_delta"], -fee);
+        assert_eq!(pri[tid.as_str().unwrap()]["in_mempool"], true);
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let pool = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
+        assert_eq!(pool, json!([tid]), "deprioritised tx must stay unmined");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

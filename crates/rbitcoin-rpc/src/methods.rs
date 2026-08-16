@@ -1263,11 +1263,10 @@ fn hashes_json(hashes: &[BlockHash]) -> Value {
 }
 
 fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
-    let Some(mp) = ctx.mempool.as_ref() else {
-        return Vec::new();
-    };
-    let txs: Vec<Transaction> = mp.list_live().into_iter().map(|(_, _, _, tx)| tx).collect();
-    topo_sort_txs(&txs)
+    ctx.mempool
+        .as_ref()
+        .map(|mp| mp.select_block_txs())
+        .unwrap_or_default()
 }
 
 fn drain_mempool(ctx: &RpcContext, txs: &[Transaction]) {
@@ -1276,44 +1275,6 @@ fn drain_mempool(ctx: &RpcContext, txs: &[Transaction]) {
     };
     let ids: Vec<Txid> = txs.iter().map(Transaction::compute_txid).collect();
     let _ = mp.remove_for_block(&ids);
-}
-
-fn topo_sort_txs(txs: &[Transaction]) -> Vec<Transaction> {
-    use std::collections::{HashMap, VecDeque};
-    if txs.len() <= 1 {
-        return txs.to_vec();
-    }
-    let id_of: HashMap<Txid, usize> = txs
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.compute_txid(), i))
-        .collect();
-    let mut indeg = vec![0usize; txs.len()];
-    let mut children = vec![Vec::new(); txs.len()];
-    for (i, t) in txs.iter().enumerate() {
-        for inp in &t.input {
-            if let Some(&p) = id_of.get(&inp.previous_output.txid) {
-                children[p].push(i);
-                indeg[i] += 1;
-            }
-        }
-    }
-    let mut q: VecDeque<usize> = (0..txs.len()).filter(|&i| indeg[i] == 0).collect();
-    let mut out = Vec::with_capacity(txs.len());
-    while let Some(i) = q.pop_front() {
-        out.push(txs[i].clone());
-        for &c in &children[i] {
-            indeg[c] -= 1;
-            if indeg[c] == 0 {
-                q.push_back(c);
-            }
-        }
-    }
-    if out.len() == txs.len() {
-        out
-    } else {
-        txs.to_vec()
-    }
 }
 
 fn generate_with_mempool(
@@ -2933,6 +2894,73 @@ mod tests {
         assert_eq!(e["code"], ERR_VERIFY_REJECTED);
         assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_selects_chained_mempool_parent_first() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let cb_val =
+            (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 2_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let parent_hex = hex_encode(serialize(&parent));
+        let parent_id = dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 3_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child_id = dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(&child)))],
+        )
+        .unwrap();
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
+        let txids = mined["tx"].as_array().unwrap();
+        assert_eq!(txids.len(), 3, "coinbase + parent + child: {mined}");
+        assert_eq!(txids[1], parent_id);
+        assert_eq!(txids[2], child_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

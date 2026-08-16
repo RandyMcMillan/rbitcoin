@@ -44,6 +44,10 @@ before 1.0).
   when the index is on; otherwise Class A txout + spent. Never reconstructs
   every block.
 
+- **Block selector:** `generate*` includes mempool txs via
+  `TxGraph::select_block_txids` (best-chunk order, parent-before-child,
+  block-weight cap). Same helper will feed `getblocktemplate`.
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is

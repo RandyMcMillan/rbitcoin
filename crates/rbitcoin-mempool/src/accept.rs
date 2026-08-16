@@ -978,6 +978,15 @@ impl ActiveMempool {
     pub fn get_tx(&self, txid: &Txid) -> Option<&Transaction> {
         self.bodies.get(txid)
     }
+
+    /// Mining-order live txs that fit in `max_weight_wu` (best chunks first).
+    pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<Transaction> {
+        self.graph
+            .select_block_txids(max_weight_wu)
+            .into_iter()
+            .filter_map(|id| self.get_tx(&id).cloned())
+            .collect()
+    }
 }
 
 /// BIP125-style full-RBF fee check (no signaling required — Libre full RBF).

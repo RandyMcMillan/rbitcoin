@@ -533,6 +533,69 @@ impl TxGraph {
         chunks
     }
 
+    /// Consensus max block weight (WU).
+    pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+    /// Core `DEFAULT_BLOCK_RESERVED_WEIGHT` (coinbase / witness reserved).
+    pub const DEFAULT_BLOCK_RESERVED_WEIGHT: u64 = 8_000;
+
+    /// Weight available for mempool txs in a template / generate block.
+    pub const fn template_tx_weight() -> u64 {
+        Self::MAX_BLOCK_WEIGHT.saturating_sub(Self::DEFAULT_BLOCK_RESERVED_WEIGHT)
+    }
+
+    /// Mining-order txids that fit in `max_weight_wu` (best chunks first).
+    ///
+    /// Empty pool or zero cap → `[]`. A high-feerate child chunk pulls in
+    /// still-unselected in-mempool ancestors so the block is topological.
+    /// A chunk (plus those ancestors) that would overflow drops the tail.
+    pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
+        if max_weight_wu == 0 {
+            return Vec::new();
+        }
+        let mut selected = HashSet::new();
+        let mut out = Vec::new();
+        let mut used = 0u64;
+        for ch in self.mining_chunks_best_first() {
+            let mut add = Vec::new();
+            for t in &ch.txids {
+                self.collect_selected_with_ancestors(*t, &selected, &mut add);
+            }
+            let extra: u64 = add
+                .iter()
+                .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
+                .sum();
+            if used.saturating_add(extra) > max_weight_wu {
+                break;
+            }
+            for t in add {
+                if selected.insert(t) {
+                    used = used.saturating_add(self.entries.get(&t).map(|e| e.weight).unwrap_or(0));
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_selected_with_ancestors(
+        &self,
+        txid: Txid,
+        already: &HashSet<Txid>,
+        out: &mut Vec<Txid>,
+    ) {
+        if already.contains(&txid) || out.contains(&txid) {
+            return;
+        }
+        if let Some(e) = self.entries.get(&txid) {
+            for p in &e.parents {
+                if self.entries.contains_key(p) {
+                    self.collect_selected_with_ancestors(*p, already, out);
+                }
+            }
+        }
+        out.push(txid);
+    }
+
     /// Feerate (sat/kvB) of the chunk that fills cumulative weight `target_wu`
     /// walking best-first. `None` if the pool is empty.
     ///
@@ -708,6 +771,57 @@ mod tests {
         g.insert(entry_for(&extra, 2_000, 2), &extra);
         let _ = g.mining_chunks_best_first();
         assert_eq!(g.take_chunks_rebuilds(), 1);
+    }
+
+    #[test]
+    fn select_block_txids_empty_parent_before_child_and_weight_cap() {
+        let g = TxGraph::new();
+        assert!(g
+            .select_block_txids(TxGraph::template_tx_weight())
+            .is_empty());
+        assert!(g.select_block_txids(0).is_empty());
+
+        let mut g = TxGraph::new();
+        let parent = spend_op([1u8; 32], 50_000, 40_000);
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(30_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        // Child pays more than parent so its chunk ranks first — still emit parent first.
+        g.insert(entry_for(&parent, 1_000, 0), &parent);
+        g.insert(entry_for(&child, 10_000, 1), &child);
+        let order = g.select_block_txids(TxGraph::template_tx_weight());
+        assert_eq!(
+            order,
+            vec![parent.compute_txid(), child.compute_txid()],
+            "parent before child even if child chunk is hotter: {order:?}"
+        );
+
+        let mut g = TxGraph::new();
+        let hi = spend_op([2u8; 32], 50_000, 40_000);
+        let lo = spend_op([3u8; 32], 50_000, 49_000);
+        let wh = hi.weight().to_wu();
+        let wl = lo.weight().to_wu();
+        g.insert(entry_for(&hi, 10_000, 0), &hi);
+        g.insert(entry_for(&lo, 1_000, 1), &lo);
+        let only_hi = g.select_block_txids(wh);
+        assert_eq!(only_hi, vec![hi.compute_txid()]);
+        let both = g.select_block_txids(wh.saturating_add(wl));
+        assert_eq!(both, vec![hi.compute_txid(), lo.compute_txid()]);
+        assert!(g.select_block_txids(wh.saturating_sub(1)).is_empty());
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

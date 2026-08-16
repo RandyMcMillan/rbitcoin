@@ -947,6 +947,13 @@ impl MempoolHub {
             .count()
     }
 
+    /// Block template / generate selection: mining-order live txs that fit
+    /// in a block (best chunks first). Same helper GBT will use.
+    pub fn select_block_txs(&self) -> Vec<Transaction> {
+        let g = self.inner.read().unwrap();
+        g.select_block_txs(rbitcoin_mempool::TxGraph::template_tx_weight())
+    }
+
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
         self.meter_list_live.fetch_add(1, Ordering::Relaxed);

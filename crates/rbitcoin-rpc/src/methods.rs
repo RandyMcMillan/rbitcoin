@@ -95,6 +95,10 @@ pub fn rpc_error(code: i64, message: impl Into<String>) -> Value {
 }
 
 pub const ERR_MISC: i64 = -1;
+/// Core `RPC_INVALID_ADDRESS_OR_KEY`.
+pub const ERR_INVALID_ADDRESS_OR_KEY: i64 = -5;
+/// Core `RPC_DESERIALIZATION_ERROR`.
+pub const ERR_DESERIALIZATION: i64 = -22;
 /// Core `RPC_CLIENT_NODE_NOT_CONNECTED`.
 pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
@@ -317,6 +321,7 @@ pub fn dispatch(
         "generateblock" => generateblock(ctx, &params),
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
+        "submitheader" => submitheader(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
         "invalidateblock" => invalidateblock(ctx, &params),
         "reconsiderblock" => reconsiderblock(ctx, &params),
@@ -448,6 +453,7 @@ const METHOD_LIST: &[&str] = &[
     "waitforblockheight",
     "waitfornewblock",
     "submitblock",
+    "submitheader",
     "setmocktime",
     "invalidateblock",
     "reconsiderblock",
@@ -475,15 +481,18 @@ fn method_help(m: &str) -> String {
              Regtest harness only. Mines to OP_TRUE (no wallet)."
             .into(),
         "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
-             Regtest harness only. raw(HEX) descriptor or address."
+             Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
             .into(),
         "scantxoutset" => "scantxoutset action (scanobjects)\n\
              raw() scripts over Class A. MiniWallet support, not Core coins-DB."
             .into(),
         "gettxout" => "gettxout txid n (include_mempool) — Class A + mempool.".into(),
-        "getchaintips" => "getchaintips — active + held/archive side tips.".into(),
+        "getchaintips" => "getchaintips — active + held/archive side tips + headers-only.".into(),
         "submitblock" => "submitblock hexdata (dummy)\n\
-             Regtest harness only. Accepts a serialized block via the P2P path."
+             All networks. Same receive path as a P2P block."
+            .into(),
+        "submitheader" => "submitheader hexdata\n\
+             All networks. Persist a header via the P2P header path (`ensure_header`)."
             .into(),
         "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
         "echo" => "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.".into(),
@@ -562,10 +571,15 @@ fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         String::new()
     };
     let ibd = ctx.initial_block_download.load(Ordering::Relaxed);
+    let headers = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.best_header_height())
+        .unwrap_or(tip);
     Ok(json!({
         "chain": chain_name(ctx.network),
         "blocks": tip,
-        "headers": tip,
+        "headers": headers,
         "bestblockhash": best,
         "difficulty": difficulty_at_tip(ctx).unwrap_or(0.0),
         "verificationprogress": if ibd { 0.5 } else { 1.0 },
@@ -1366,10 +1380,7 @@ fn generatetodescriptor(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
     let nblocks = params.req_u64(0, "num_blocks")? as u32;
     let desc = params.req_str(1, "descriptor")?;
     let _maxtries = params.opt_u64(2, "maxtries")?;
-    let script = match parse_raw_descriptor(desc) {
-        Some(s) => s,
-        None => decode_output_script(ctx, desc)?,
-    };
+    let script = parse_output_descriptor(ctx, desc)?;
     generate_with_mempool(ctx, nblocks, script)
 }
 
@@ -1379,6 +1390,23 @@ fn parse_raw_descriptor(desc: &str) -> Option<ScriptBuf> {
     let inner = bare.strip_prefix("raw(")?.strip_suffix(")")?;
     let bytes = hex_decode(inner).ok()?;
     Some(ScriptBuf::from_bytes(bytes))
+}
+
+/// `addr(bech32)#checksum` — same script as the bare address.
+fn parse_addr_descriptor(ctx: &RpcContext, desc: &str) -> Option<ScriptBuf> {
+    let bare = desc.split('#').next()?.trim();
+    let inner = bare.strip_prefix("addr(")?.strip_suffix(")")?;
+    decode_output_script(ctx, inner).ok()
+}
+
+fn parse_output_descriptor(ctx: &RpcContext, desc: &str) -> Result<ScriptBuf, Value> {
+    if let Some(s) = parse_raw_descriptor(desc) {
+        return Ok(s);
+    }
+    if let Some(s) = parse_addr_descriptor(ctx, desc) {
+        return Ok(s);
+    }
+    decode_output_script(ctx, desc)
 }
 
 /// Enough of Core `scantxoutset` for MiniWallet: `raw(script)` over Class A.
@@ -1733,9 +1761,41 @@ fn invalidateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
     params.reject_unknown(&["blockhash"])?;
     let hub = require_chain(ctx)?;
     let hash = parse_blockhash_param(params)?;
-    hub.invalidate_block(hash)
+    hub.invalidate_block(hash).map_err(|e| {
+        let s = e.to_string();
+        if s.contains("Block not found") {
+            rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found")
+        } else {
+            rpc_error(ERR_MISC, s)
+        }
+    })?;
+    Ok(Value::Null)
+}
+
+fn submitheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["hexdata"])?;
+    let hub = require_chain(ctx)?;
+    let hex = params.req_str(0, "hexdata")?;
+    let header = decode_header_hex(hex)?;
+    hub.ensure_header(&header)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     Ok(Value::Null)
+}
+
+fn decode_header_hex(hex: &str) -> Result<bitcoin::block::Header, Value> {
+    let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    if raw.len() >= 80 {
+        if let Ok(h) = deserialize::<bitcoin::block::Header>(&raw[..80]) {
+            return Ok(h);
+        }
+    }
+    let block: Block = deserialize(&raw).map_err(|e| {
+        rpc_error(
+            ERR_DESERIALIZATION,
+            format!("Block header decode failed: {e}"),
+        )
+    })?;
+    Ok(block.header)
 }
 
 fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2876,6 +2936,35 @@ mod tests {
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
         dispatch(&ctx, "reconsiderblock", vec![json!(tip)]).unwrap();
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submitheader_child_is_headers_only() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let child = mine_regtest_paying(prev, time, 1, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&child));
+        let r = dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
+        assert!(r.is_null(), "{r}");
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["blocks"], 0);
+        assert_eq!(info["headers"], 1);
+        let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        let arr = tips.as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|t| t["status"] == "headers-only" && t["height"] == 1),
+            "{tips}"
+        );
+        let miss = dispatch(&ctx, "invalidateblock", vec![json!("00".repeat(32))]).unwrap_err();
+        assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(miss["message"], "Block not found");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

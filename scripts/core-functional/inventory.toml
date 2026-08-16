@@ -933,9 +933,7 @@ analog = "follow-up: getblockstats"
 
 [[test]]
 name = "rpc_getchaintips.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: getchaintips"
+status = "run"
 
 [[test]]
 name = "rpc_getdescriptoractivity.py"
@@ -967,9 +965,7 @@ analog = "follow-up: validateaddress error text"
 
 [[test]]
 name = "rpc_invalidateblock.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: invalidateblock exists; test needs more RPC/P2P"
+status = "run"
 
 [[test]]
 name = "rpc_misc.py"
@@ -1000,9 +996,7 @@ analog = "follow-up: submitpackage"
 
 [[test]]
 name = "rpc_preciousblock.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: preciousblock exists; test needs fork setup"
+status = "run"
 
 [[test]]
 name = "rpc_psbt.py"

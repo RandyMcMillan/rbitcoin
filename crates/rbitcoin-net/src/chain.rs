@@ -65,6 +65,9 @@ pub struct ChainHub {
     precious: RwLock<Option<BlockHash>>,
     /// Losing tips after a most-work reorg (hashes only). Bodies via archive.
     fork_tips: RwLock<HashSet<BlockHash>>,
+    /// Header-only tips (`submitheader` / P2P headers): hash → (prev, height).
+    /// Not a block index — no bodies, no status machine.
+    header_tips: RwLock<HashMap<BlockHash, (BlockHash, u32)>>,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -101,6 +104,7 @@ impl ChainHub {
             held_bodies: RwLock::new(HashMap::new()),
             precious: RwLock::new(None),
             fork_tips: RwLock::new(HashSet::new()),
+            header_tips: RwLock::new(HashMap::new()),
         }
     }
 
@@ -253,6 +257,17 @@ impl ChainHub {
             record(&mut out, h, "valid-fork");
         }
         {
+            let headers = self.header_tips.read().unwrap();
+            for hash in headers.keys().copied() {
+                let status = if self.header_ancestry_invalid(hash) {
+                    "invalid"
+                } else {
+                    "headers-only"
+                };
+                record(&mut out, hash, status);
+            }
+        }
+        {
             let held = self.held_bodies.read().unwrap();
             let parents: HashSet<BlockHash> =
                 held.values().map(|b| b.header.prev_blockhash).collect();
@@ -278,14 +293,53 @@ impl ChainHub {
         tips
     }
 
+    /// Prev hash from a held/archive body or the header store (no extra index).
+    fn prev_of(&self, hash: &BlockHash) -> Option<BlockHash> {
+        if let Some(b) = self.load_side_body(hash) {
+            return Some(b.header.prev_blockhash);
+        }
+        let (_, rec) = self
+            .query
+            .get_header_by_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()?;
+        if rec.prev_fk.is_null() {
+            return Some(BlockHash::from_byte_array([0u8; 32]));
+        }
+        self.query
+            .get_header(rec.prev_fk)
+            .ok()
+            .map(|p| BlockHash::from_byte_array(p.hash))
+    }
+
+    fn header_ancestry_invalid(&self, tip: BlockHash) -> bool {
+        let inv = self.invalidated.read().unwrap();
+        if inv.contains(&tip) {
+            return true;
+        }
+        let mut h = tip;
+        for _ in 0..10_000 {
+            let Some(prev) = self.prev_of(&h) else {
+                return false;
+            };
+            if prev.to_byte_array() == [0u8; 32] || self.is_connected(&prev) {
+                return false;
+            }
+            if inv.contains(&prev) {
+                return true;
+            }
+            h = prev;
+        }
+        false
+    }
+
     /// Height of a non-active tip and the length of the branch to the best chain.
     fn side_height_and_branchlen(&self, tip: BlockHash) -> Option<(u32, u32)> {
         let mut h = tip;
         let mut branchlen = 0u32;
         for _ in 0..10_000 {
-            let b = self.load_side_body(&h)?;
+            let prev = self.prev_of(&h)?;
             branchlen = branchlen.saturating_add(1);
-            let prev = b.header.prev_blockhash;
             if prev.to_byte_array() == [0u8; 32] {
                 return Some((branchlen.saturating_sub(1), branchlen));
             }
@@ -301,6 +355,52 @@ impl ChainHub {
             h = prev;
         }
         None
+    }
+
+    /// Best known header height (may lead `blocks` after `submitheader`).
+    pub fn best_header_height(&self) -> u32 {
+        let mut best = self.tip_height().unwrap_or(0);
+        let headers = self.header_tips.read().unwrap();
+        for (hash, (_, h)) in headers.iter() {
+            if self.header_ancestry_invalid(*hash) {
+                continue;
+            }
+            best = best.max(*h);
+        }
+        best
+    }
+
+    fn note_header_tip(&self, header: &Header) {
+        let hash = header.block_hash();
+        if self.is_connected(&hash) {
+            self.header_tips.write().unwrap().remove(&hash);
+            return;
+        }
+        let prev = header.prev_blockhash;
+        let height = if self.is_connected(&prev) {
+            self.query
+                .height_of_hash(&prev.to_byte_array())
+                .ok()
+                .flatten()
+                .map(|h| h.0.saturating_add(1))
+        } else {
+            self.header_tips
+                .read()
+                .unwrap()
+                .get(&prev)
+                .map(|(_, h)| h.saturating_add(1))
+        };
+        let Some(height) = height else {
+            return;
+        };
+        let mut tips = self.header_tips.write().unwrap();
+        tips.remove(&prev);
+        if tips.len() >= 128 && !tips.contains_key(&hash) {
+            if let Some(k) = tips.keys().next().copied() {
+                tips.remove(&k);
+            }
+        }
+        tips.insert(hash, (prev, height));
     }
 
     /// Persist a header row only (for header-sync → out-of-order body archive).
@@ -333,9 +433,12 @@ impl ChainHub {
             }
         };
         let rec = header_to_record(prev_fk, header);
-        self.query
+        let fk = self
+            .query
             .ensure_header(&rec)
-            .map_err(|e| NetError::Consensus(e.to_string()))
+            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        self.note_header_tip(header);
+        Ok(fk)
     }
 
     /// Contiguous tip-extension slice for one-shot load (owned Block).
@@ -536,14 +639,16 @@ impl ChainHub {
     }
 
     /// Disconnect `hash` and descendants from the tip. Remember hashes only;
-    /// [`Self::reconsider_block`] reconstructs from Class A.
+    /// [`Self::reconsider_block`] reconstructs from Class A. Then apply the
+    /// next most-work non-invalid fork (production: invalidate is not "stay
+    /// on the stump").
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), NetError> {
         let Some(h) = self
             .query
             .height_of_hash(&hash.to_byte_array())
             .map_err(|e| NetError::Consensus(e.to_string()))?
         else {
-            return Err(NetError::Consensus("block not found".into()));
+            return Err(NetError::Consensus("Block not found".into()));
         };
         let tip = self.tip_height().unwrap_or(0);
         if h.0 > tip {
@@ -563,36 +668,160 @@ impl ChainHub {
         }
         let keep = h.0.saturating_sub(1);
         self.disconnect_to(keep)?;
+        drop(_guard);
+        let _ = self.try_apply_after_invalidate()?;
         Ok(())
     }
 
-    /// Clear the invalid mark and re-apply the disconnected path from archive.
-    pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), NetError> {
-        self.invalidated.write().unwrap().remove(&hash);
-        let path = {
-            let mut paths = self.invalidated_paths.write().unwrap();
-            paths
-                .iter()
-                .position(|p| p.contains(&hash))
-                .map(|i| paths.remove(i))
+    /// After invalidate, activate the best remaining fork (held or archive).
+    fn try_apply_after_invalidate(&self) -> Result<Option<AcceptOutcome>, NetError> {
+        let inv = self.invalidated.read().unwrap().clone();
+        let mut starts: Vec<BlockHash> = self.fork_tips.read().unwrap().iter().copied().collect();
+        starts.extend(self.held_bodies.read().unwrap().keys().copied());
+        if let Some(p) = *self.precious.read().unwrap() {
+            if !starts.contains(&p) {
+                starts.push(p);
+            }
+        }
+        let mut best: Option<(bitcoin::Work, Vec<Block>)> = None;
+        for start in starts {
+            if inv.contains(&start) {
+                continue;
+            }
+            let Some(branch) = self.assemble_side_branch(start) else {
+                continue;
+            };
+            if branch.iter().any(|b| inv.contains(&b.block_hash())) {
+                continue;
+            }
+            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let take = match &best {
+                None => true,
+                Some((bw, _)) => work_better(w, *bw),
+            };
+            if take {
+                best = Some((w, branch));
+            }
+        }
+        let Some((_, branch)) = best else {
+            return Ok(None);
         };
-        if let Some(hashes) = path {
-            let start = hashes.iter().position(|h| *h == hash).unwrap_or(0);
+        match self.accept_branch(&branch) {
+            Ok(AcceptOutcome::Accepted { height }) => Ok(Some(AcceptOutcome::Accepted { height })),
+            Ok(AcceptOutcome::IgnoredWeaker) => Ok(None),
+            Ok(other) => Ok(Some(other)),
+            Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Clear the invalid mark on `hash`, its invalidated path, and ancestors;
+    /// re-apply bodies from archive. Header-only descendants stay header tips.
+    pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), NetError> {
+        let known = self.is_connected(&hash)
+            || self.load_side_body(&hash).is_some()
+            || self.header_tips.read().unwrap().contains_key(&hash)
+            || self
+                .query
+                .get_header_by_hash(&hash.to_byte_array())
+                .ok()
+                .flatten()
+                .is_some()
+            || self
+                .invalidated_paths
+                .read()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains(&hash));
+        if !known {
+            return Err(NetError::Consensus("Block not found".into()));
+        }
+
+        let mut related: HashSet<BlockHash> = HashSet::new();
+        related.insert(hash);
+        let mut walk = hash;
+        for _ in 0..10_000 {
+            let Some(prev) = self.prev_of(&walk) else {
+                break;
+            };
+            if prev.to_byte_array() == [0u8; 32] {
+                break;
+            }
+            related.insert(prev);
+            if self.is_connected(&prev) {
+                break;
+            }
+            walk = prev;
+        }
+
+        self.invalidated.write().unwrap().remove(&hash);
+        let paths: Vec<Vec<BlockHash>> = {
+            let mut g = self.invalidated_paths.write().unwrap();
+            let mut taken = Vec::new();
+            let mut seeds = related.clone();
+            seeds.insert(hash);
+            loop {
+                let before = taken.len();
+                g.retain(|p| {
+                    let hit = p.iter().any(|h| seeds.contains(h))
+                        || p.first().is_some_and(|h| {
+                            self.prev_of(h).is_some_and(|prev| seeds.contains(&prev))
+                        });
+                    if hit {
+                        for h in p {
+                            seeds.insert(*h);
+                        }
+                        taken.push(p.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if taken.len() == before {
+                    break;
+                }
+            }
+            taken
+        };
+        {
+            let mut inv = self.invalidated.write().unwrap();
+            for path in &paths {
+                for h in path {
+                    inv.remove(h);
+                }
+            }
+            for h in &related {
+                inv.remove(h);
+            }
+        }
+
+        for path in paths {
             let mut branch = Vec::new();
-            for h in &hashes[start..] {
-                self.invalidated.write().unwrap().remove(h);
+            for h in &path {
+                if self.is_connected(h) {
+                    continue;
+                }
                 let Some(b) = self.load_side_body(h) else {
-                    return Err(NetError::Consensus(
-                        "invalidated block missing from archive".into(),
-                    ));
+                    break;
                 };
                 branch.push(b);
             }
             if !branch.is_empty() {
-                let _ = self.accept_branch(&branch)?;
+                match self.accept_branch(&branch) {
+                    Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => {}
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
             }
-        } else if let Some(b) = self.load_side_body(&hash) {
-            let _ = self.accept_received_block(b)?;
+        }
+        if !self.is_connected(&hash) {
+            if let Some(branch) = self.assemble_side_branch(hash) {
+                match self.accept_branch(&branch) {
+                    Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => {}
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
+            }
         }
         Ok(())
     }
@@ -601,7 +830,11 @@ impl ChainHub {
     pub fn precious_block(&self, hash: BlockHash) -> Result<(), NetError> {
         *self.precious.write().unwrap() = Some(hash);
         if let Some(branch) = self.assemble_side_branch(hash) {
-            let _ = self.accept_branch(&branch)?;
+            match self.accept_branch(&branch) {
+                Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => {}
+                Err(e) => return Err(e),
+                Ok(_) => {}
+            }
         } else {
             let _ = self.try_apply_held()?;
         }
@@ -727,7 +960,12 @@ impl ChainHub {
 
         let branch_tip = blocks.last().map(Block::block_hash);
         let precious = *self.precious.read().unwrap() == branch_tip;
-        if self.tip_height().is_some() && !work_better(new_work, our_work) && !precious {
+        // Precious may break an equal-work tie. It must not activate less work.
+        let equal_work = !work_better(new_work, our_work) && !work_better(our_work, new_work);
+        if self.tip_height().is_some()
+            && !work_better(new_work, our_work)
+            && !(precious && equal_work)
+        {
             return Ok(AcceptOutcome::IgnoredWeaker);
         }
 
@@ -838,7 +1076,18 @@ impl ChainHub {
                     None => Ok(AcceptOutcome::IgnoredWeaker),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if self
+                    .query
+                    .get_header_by_hash(&hash.to_byte_array())
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    self.invalidated.write().unwrap().insert(hash);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1003,6 +1252,7 @@ impl ChainHub {
             )
         })
         .map_err(|e| NetError::Consensus(e.to_string()))?;
+        self.header_tips.write().unwrap().remove(&hash);
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
         // Tip-mode only: remove_for_block no-ops while relay is off (IBD).
         if let Some(mp) = self.mempool() {
@@ -1803,13 +2053,44 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
 
         // invalidate / reconsider use archive hashes, not a RAM clone.
+        // After invalidate, the next most-work fork (eq) becomes tip.
         let tip = hub.tip_hash().unwrap();
         hub.invalidate_block(fork[1].block_hash()).unwrap();
-        assert_eq!(hub.tip_height(), Some(1));
+        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
         assert!(hub.held_body(&tip).is_none());
+        assert!(hub
+            .query
+            .reconstruct_archived_block(&tip.to_byte_array())
+            .unwrap()
+            .is_some());
         hub.reconsider_block(fork[1].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), tip);
+        assert!(
+            hub.held_body(&tip).is_none(),
+            "reconsider must not park the old tip"
+        );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submit_header_child_is_headers_only_tip() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_020_000, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        let child = mine(b1.block_hash(), 1_300_020_100, 2);
+        hub.ensure_header(&child.header).unwrap();
+        let tips = hub.chaintips();
+        let ho = tips
+            .iter()
+            .find(|t| t.status == "headers-only")
+            .expect("headers-only child");
+        assert_eq!(ho.hash, child.block_hash());
+        assert_eq!(ho.height, 2);
+        assert_eq!(ho.branchlen, 1);
+        assert_eq!(hub.best_header_height(), 2);
+        assert_eq!(hub.tip_height(), Some(1));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -11,6 +11,13 @@ before 1.0).
 
 ### Changed
 
+- **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
+  children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
+  is the best known header height. `invalidateblock` of an unknown hash is
+  Core `-5 Block not found`; after invalidate the next most-work fork is
+  applied. `preciousblock` breaks equal-work ties only (not less work).
+  `generatetodescriptor` accepts `addr(ADDRESS)#checksum`.
+
 - **`getchaintips`:** active tip plus losing `valid-fork` (archive after
   reorg) and held never-confirmed `valid-headers`. Hashes only — not a
   block index.
@@ -61,11 +68,8 @@ before 1.0).
   `accept_branch` on more work). Once-confirmed losers stay in Class A.
   Not a coins-DB / GBT product.
 
-- **Core functional `run` set:** unmodified `mempool_spend_coinbase.py`,
-  `mempool_resurrect.py`, `p2p_block_sync.py`,
-  `feature_framework_miniwallet.py`, `feature_dirsymlinks.py` (plus the
-  first-green CLI/UA/echo/uptime four). Cache payees match Core
-  `_initialize_chain` (PRIV_KEYS + MiniWallet P2TR).
+- **Core functional `run` set:** the first-green nine plus unmodified
+  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`.
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

@@ -227,7 +227,7 @@ impl VarTable {
 
         let starts = self
             .idx
-            .record_starts_batch_bulk(&start_ids, crate::io_backend::pin_io_backend())?;
+            .record_starts_batch_bulk(&start_ids, crate::io_backend::read_io_backend())?;
         let mut start_map: crate::U64Map<u64> =
             crate::U64Map::with_capacity_and_hasher(start_ids.len(), Default::default());
         for (id, s) in start_ids.iter().zip(starts.iter()) {

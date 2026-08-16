@@ -59,7 +59,7 @@ fn resolve_fk_and_range_batch_opts(
     if txids.is_empty() {
         return Ok(Vec::new());
     }
-    match io_backend::head_resolve_io_backend() {
+    match io_backend::read_io_backend() {
         ReadIoBackend::Uring => match resolve_fk_and_range_uring(table, txids, heights, tip_only) {
             Ok(v) => Ok(v),
             // Ring open fail (agent 9p / disabled): sync depth-first fallback.

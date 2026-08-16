@@ -34,7 +34,7 @@ enum Phase {
 struct Slot {
     edge_i: usize,
     phase: Phase,
-    /// Read buffer / write payload (9 bytes).
+    /// Read buffer / write payload (8-byte spent slot).
     buf: [u8; META_LEN],
 }
 
@@ -352,7 +352,7 @@ pub enum SpendAnnBackend {
 /// Resolve pure-write annotate backend from env hierarchy.
 #[inline]
 pub fn spend_ann_backend() -> SpendAnnBackend {
-    match crate::io_backend::spend_ann_io_backend() {
+    match crate::io_backend::write_io_backend() {
         crate::io_backend::WriteIoBackend::Uring => SpendAnnBackend::Uring,
         crate::io_backend::WriteIoBackend::Pwrite => SpendAnnBackend::Pwrite,
     }

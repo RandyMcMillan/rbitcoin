@@ -71,8 +71,7 @@ pub use integrity::{
     merkle_root_from_txids, TipRevalidateReport, TipSeal, TIP_SEAL_NAME, VERIFY_TIP_BLOCKS,
 };
 pub use io_backend::{
-    class_a_append_uses_pwrite, class_c_io_backend, head_resolve_io_backend, pin_io_backend,
-    spend_ann_io_backend, spend_meta_io_backend, ReadIoBackend, WriteIoBackend,
+    read_io_backend, write_io_backend, ReadIoBackend, WriteIoBackend,
 };
 pub use point_table::PointRecord;
 pub use scripthash::{

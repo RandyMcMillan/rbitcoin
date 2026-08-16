@@ -115,56 +115,37 @@ fn default_write() -> WriteIoBackend {
 }
 
 /// Global bulk read backend (`RBITCOIN_IO` only — no path overrides).
-pub(crate) fn resolve_read(_path_env: &str) -> ReadIoBackend {
+pub(crate) fn resolve_read() -> ReadIoBackend {
     let selected = global_read_from_env().unwrap_or_else(default_read);
     effective_read(selected)
 }
 
 /// Global bulk write backend (`RBITCOIN_IO` only — no path overrides).
-pub(crate) fn resolve_write(_path_env: &str) -> WriteIoBackend {
+pub(crate) fn resolve_write() -> WriteIoBackend {
     let selected = global_write_from_env().unwrap_or_else(default_write);
     effective_write(selected)
 }
 
 fn global_read_cached() -> ReadIoBackend {
     static B: OnceLock<ReadIoBackend> = OnceLock::new();
-    *B.get_or_init(|| resolve_read(""))
+    *B.get_or_init(resolve_read)
 }
 
 fn global_write_cached() -> WriteIoBackend {
     static B: OnceLock<WriteIoBackend> = OnceLock::new();
-    *B.get_or_init(|| resolve_write(""))
+    *B.get_or_init(resolve_write)
 }
 
+/// Bulk read backend for every path (pin, head-resolve, spend-meta, Class C).
 #[inline]
-pub fn pin_io_backend() -> ReadIoBackend {
+pub fn read_io_backend() -> ReadIoBackend {
     global_read_cached()
 }
 
+/// Bulk write backend (spend annotate).
 #[inline]
-pub fn head_resolve_io_backend() -> ReadIoBackend {
-    global_read_cached()
-}
-
-#[inline]
-pub fn spend_meta_io_backend() -> ReadIoBackend {
-    global_read_cached()
-}
-
-#[inline]
-pub fn class_c_io_backend() -> ReadIoBackend {
-    global_read_cached()
-}
-
-#[inline]
-pub fn spend_ann_io_backend() -> WriteIoBackend {
+pub fn write_io_backend() -> WriteIoBackend {
     global_write_cached()
-}
-
-/// Class A body/idx linear appends always use **pwrite** (no mmap body append).
-#[inline]
-pub fn class_a_append_uses_pwrite() -> bool {
-    true
 }
 
 #[cfg(test)]
@@ -203,10 +184,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "uring");
-        assert_eq!(resolve_read("unused"), effective_read(ReadIoBackend::Uring));
+        assert_eq!(resolve_read(), effective_read(ReadIoBackend::Uring));
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "pread");
-        assert_eq!(resolve_read("unused"), ReadIoBackend::Pread);
+        assert_eq!(resolve_read(), ReadIoBackend::Pread);
         clear_io_envs();
     }
 
@@ -240,11 +221,20 @@ mod tests {
         let _ = effective_read(ReadIoBackend::Uring);
         let _ = effective_write(WriteIoBackend::Pwrite);
         let _ = effective_write(WriteIoBackend::Uring);
-        assert!(class_a_append_uses_pwrite());
     }
 
     #[test]
-    fn class_a_append_always_pwrite() {
-        assert!(class_a_append_uses_pwrite());
+    fn public_surface_is_two_getters() {
+        let src = include_str!("io_backend.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(prod.contains("pub fn read_io_backend"));
+        assert!(prod.contains("pub fn write_io_backend"));
+        assert!(!prod.contains("pub fn pin_io_backend"));
+        assert!(!prod.contains("pub fn head_resolve_io_backend"));
+        assert!(!prod.contains("pub fn spend_meta_io_backend"));
+        assert!(!prod.contains("pub fn class_c_io_backend"));
+        assert!(!prod.contains("pub fn spend_ann_io_backend"));
+        assert!(!prod.contains("class_a_append_uses_pwrite"));
+        assert!(!prod.contains("_path_env"));
     }
 }

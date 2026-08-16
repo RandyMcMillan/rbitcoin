@@ -560,8 +560,8 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.mempool_max_weight = mb.saturating_mul(1_000_000);
     }
 
-    // Publish only explicit CLI/conf knobs (preserves pre-set advanced envs).
-    config.apply_operator_env();
+    // Unstable env is an input when CLI/conf omitted inbound — never set_var.
+    config.absorb_inbound_env();
 
     // Hold for process lifetime; drop after run_node / run_p2p returns.
     let _suspend_inhibit = if config.inhibit_suspend {
@@ -760,8 +760,6 @@ mod tests {
         ]);
         assert_exit(code, ExitCode::SUCCESS);
         assert!(dir.join("store").is_dir());
-        // CLI published operator envs for library readers.
-        assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "10");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -847,7 +845,6 @@ mod tests {
             "--noseeds",
         ]);
         assert_exit(code, ExitCode::SUCCESS);
-        assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "5");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -877,8 +874,6 @@ mod tests {
             "0",
         ]);
         assert_exit(code, ExitCode::SUCCESS);
-        // conf maxinbound applied (CLI did not override inbound)
-        assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").unwrap(), "33");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

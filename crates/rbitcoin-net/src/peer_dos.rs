@@ -31,15 +31,6 @@ pub fn inbound_semaphore(max: usize) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(max.max(1)))
 }
 
-/// Env override `RBITCOIN_P2P_MAX_INBOUND` (default [`DEFAULT_MAX_INBOUND`]).
-pub fn max_inbound_from_env() -> usize {
-    std::env::var("RBITCOIN_P2P_MAX_INBOUND")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_INBOUND)
-}
-
 /// Per-session sliding-window message and byte counters.
 #[derive(Debug, Clone)]
 pub struct PeerRateLimiter {

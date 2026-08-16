@@ -29,8 +29,8 @@ pub use most_work::{
 };
 pub use peer::local_service_flags;
 pub use peer_dos::{
-    inbound_semaphore, max_inbound_from_env, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC,
-    DEFAULT_MAX_INBOUND, DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
+    inbound_semaphore, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC, DEFAULT_MAX_INBOUND,
+    DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
 };
 pub use peers::{parse_peer_addr, DialRequest, LivePeer, PeerConnType, PeerHub, PeerInfo};
 pub use seeds::{

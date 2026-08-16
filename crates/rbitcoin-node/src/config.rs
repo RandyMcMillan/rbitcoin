@@ -15,10 +15,8 @@ pub const DEFAULT_MAX_INBOUND: u32 = 125;
 /// set via `RBITCOIN_*` env vars (documented as advanced); normal signet/mainnet
 /// sync does not require any env export.
 ///
-/// **Env publish:** [`Self::apply_operator_env`] only writes process env for knobs
-/// that were **explicitly** set via CLI or conf (`*_explicit` flags). Omitting a
-/// flag leaves a pre-set advanced env (e.g. `RBITCOIN_P2P_MAX_INBOUND`) intact
-/// for library `from_env` readers.
+/// **Env input:** [`Self::absorb_inbound_env`] reads `RBITCOIN_P2P_MAX_INBOUND`
+/// once when inbound was not set on CLI/conf. It never writes process env.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub datadir: PathBuf,
@@ -309,13 +307,19 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Push **explicit** operator knobs into process env for library `from_env` readers.
+    /// If inbound was not explicit on CLI/conf, honor `RBITCOIN_P2P_MAX_INBOUND`.
     ///
-    /// Does **not** overwrite advanced envs when CLI/conf left a knob at the
-    /// structural default (user may have exported `RBITCOIN_P2P_MAX_INBOUND` etc.).
-    pub fn apply_operator_env(&self) {
+    /// Input only — does not publish process env.
+    pub fn absorb_inbound_env(&mut self) {
         if self.max_inbound_explicit {
-            std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", self.max_inbound.to_string());
+            return;
+        }
+        if let Some(n) = std::env::var("RBITCOIN_P2P_MAX_INBOUND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u32| n > 0)
+        {
+            self.max_inbound = n;
         }
     }
 
@@ -605,33 +609,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression: apply must not clobber pre-set advanced envs when knobs were
-    /// not explicit on CLI/conf.
+    /// Env is an input when inbound was not explicit; never published back.
     #[test]
-    fn apply_operator_env_preserves_unset_advanced_env() {
+    fn absorb_inbound_env_reads_but_does_not_write() {
         let _g = OPERATOR_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_in = std::env::var_os("RBITCOIN_P2P_MAX_INBOUND");
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "99");
-        let cfg = NodeConfig::default(); // no explicit flags
+        let mut cfg = NodeConfig::default();
         assert!(!cfg.max_inbound_explicit);
-        cfg.apply_operator_env();
+        cfg.absorb_inbound_env();
+        assert_eq!(cfg.max_inbound, 99);
         assert_eq!(
             std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
             Ok("99"),
-            "must not overwrite advanced inbound env when CLI/conf omitted knob"
+            "absorb must not rewrite process env"
         );
-        // Explicit knobs do publish.
         let mut explicit = NodeConfig::default();
         explicit.max_inbound = 12;
         explicit.max_inbound_explicit = true;
-        explicit.apply_operator_env();
-        assert_eq!(
-            std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
-            Ok("12")
-        );
-        // Restore prior process env (do not leave blank for parallel CLI tests).
+        explicit.absorb_inbound_env();
+        assert_eq!(explicit.max_inbound, 12, "explicit CLI/conf wins over env");
         match prev_in {
             Some(v) => std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", v),
             None => std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND"),

@@ -5,7 +5,7 @@ use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
 use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
-use crate::peer_dos::{inbound_semaphore, max_inbound_from_env};
+use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
 use crate::peers::{DialRequest, PeerConnType, PeerHub};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
@@ -57,6 +57,8 @@ pub struct P2PNode {
     /// Live sessions for RPC getpeerinfo / addnode / disconnectnode.
     pub peers: Arc<PeerHub>,
     user_agent: String,
+    /// Inbound session cap used by the accept loop (not process env).
+    pub max_inbound: usize,
 }
 
 pub struct P2PHandle {
@@ -73,16 +75,26 @@ impl P2PNode {
         params: ChainParams,
         milestone: Milestone,
     ) -> Result<Self, NetError> {
-        Self::start_with_agent(listen, query, params, milestone, default_user_agent()).await
+        Self::start_with_agent(
+            listen,
+            query,
+            params,
+            milestone,
+            default_user_agent(),
+            DEFAULT_MAX_INBOUND,
+        )
+        .await
     }
 
-    /// Like [`Self::start`] with an explicit BIP14 user-agent (RPC `subversion`).
+    /// Like [`Self::start`] with an explicit BIP14 user-agent (RPC `subversion`)
+    /// and inbound session cap.
     pub async fn start_with_agent(
         listen: SocketAddr,
         query: Query,
         params: ChainParams,
         milestone: Milestone,
         user_agent: String,
+        max_inbound: usize,
     ) -> Result<Self, NetError> {
         let magic = magic_for_params(&params);
         let hub = Arc::new(ChainHub::new(query, params, milestone));
@@ -102,7 +114,7 @@ impl P2PNode {
         let magic_c = magic;
         let peers_in = peers.clone();
         let ua_in = user_agent.clone();
-        let max_inbound = max_inbound_from_env();
+        let max_inbound = max_inbound.max(1);
         let inbound_sem = inbound_semaphore(max_inbound);
         let accept_task = tokio::spawn(async move {
             loop {
@@ -201,6 +213,7 @@ impl P2PNode {
             tasks: vec![accept_task, dial_task],
             peers,
             user_agent,
+            max_inbound,
         })
     }
 
@@ -417,6 +430,25 @@ mod tests {
         assert_eq!(
             magic_for_params(&params),
             Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd])
+        );
+    }
+
+    #[test]
+    fn start_with_agent_does_not_read_inbound_env() {
+        let src = include_str!("service.rs");
+        let start = src
+            .split("pub async fn start_with_agent")
+            .nth(1)
+            .expect("start_with_agent");
+        // Function body only (next inherent method), not this test module.
+        let start = start.split("    /// BIP14").next().unwrap_or(start);
+        assert!(
+            !start.contains("max_inbound_from_env"),
+            "inbound cap is a start argument, not RBITCOIN_P2P_MAX_INBOUND"
+        );
+        assert!(
+            start.contains("max_inbound: usize"),
+            "start_with_agent takes the inbound cap"
         );
     }
 }

@@ -2824,6 +2824,7 @@ mod tests {
             params.clone(),
             Milestone::NONE,
             "/rbitcoin:0.1.0(testnode0)/".into(),
+            rbitcoin_net::DEFAULT_MAX_INBOUND,
         )
         .await
         .unwrap();
@@ -2833,6 +2834,7 @@ mod tests {
             params,
             Milestone::NONE,
             "/rbitcoin:0.1.0(testnode1)/".into(),
+            rbitcoin_net::DEFAULT_MAX_INBOUND,
         )
         .await
         .unwrap();

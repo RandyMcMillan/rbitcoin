@@ -19,14 +19,19 @@ before 1.0).
   (modified fees) from the live graph.
 - **Test RPC proxy** (Core functional suite only): utility RPCs
   (`createrawtransaction`, `signrawtransactionwithkey`, `createmultisig`,
-  `combinerawtransaction`, decode helpers) live in the bitcoind shim, not
-  on `rbitcoin-node`.
+  `combinerawtransaction`, decode helpers) and an Esplora-backed wallet
+  façade (`createwallet`, `importdescriptors`, `send`, `listunspent`, …)
+  live in the bitcoind shim, not on `rbitcoin-node`.
 - **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
   `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
   and into min-relay admission (free tx + delta can enter).
 
 ### Changed
+
+- **Mempool block connect evicts conflicts:** a confirmed block that
+  spends a mempool tx's inputs (without including that tx) drops the
+  conflict and its descendants. `wallet_txn_*` reorgs need this.
 
 - **Load-owned leftover pending:** write-behind `txid → create_fk` is a
   plain map on the load thread. Inbox is notes only. Drain complete is

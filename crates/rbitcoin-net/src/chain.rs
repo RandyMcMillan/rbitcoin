@@ -562,7 +562,13 @@ impl ChainHub {
                         self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                     {
                         let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
-                        let n = mp.remove_for_block(&ids);
+                        let spent: Vec<_> = block
+                            .txdata
+                            .iter()
+                            .filter(|t| !t.is_coinbase())
+                            .flat_map(|t| t.input.iter().map(|i| i.previous_output))
+                            .collect();
+                        let n = mp.remove_for_block_spent(&ids, &spent);
                         if n > 0 {
                             rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ {hash}");
                         }
@@ -1261,7 +1267,13 @@ impl ChainHub {
         // Tip-mode only: remove_for_block no-ops while relay is off (IBD).
         if let Some(mp) = self.mempool() {
             let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
-            let n = mp.remove_for_block(&ids);
+            let spent: Vec<_> = block
+                .txdata
+                .iter()
+                .filter(|t| !t.is_coinbase())
+                .flat_map(|t| t.input.iter().map(|i| i.previous_output))
+                .collect();
+            let n = mp.remove_for_block_spent(&ids, &spent);
             if n > 0 {
                 rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
             }

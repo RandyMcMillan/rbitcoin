@@ -978,6 +978,34 @@ impl ActiveMempool {
         Ok(n)
     }
 
+    /// Drop live txs (and their descendants) that spend `spent` outpoints.
+    ///
+    /// A confirmed block that double-spends mempool txs does not list those
+    /// txs in `txdata`; `remove_for_block` alone would leave them hanging.
+    pub fn evict_conflicts_with(&mut self, spent: &[OutPoint]) -> Vec<Txid> {
+        let mut direct = Vec::new();
+        for op in spent {
+            if let Some(c) = self.graph.conflict_txid(op) {
+                direct.push(c);
+            }
+        }
+        if direct.is_empty() {
+            return Vec::new();
+        }
+        let set = self.graph.conflict_set(&direct);
+        let mut out = Vec::new();
+        for id in set {
+            if self.remove_txid(&id).is_ok() {
+                out.push(id);
+            }
+        }
+        if !out.is_empty() {
+            let _ = self.maybe_compact();
+            let _ = self.store.persist_if_dirty();
+        }
+        out
+    }
+
     pub fn orphan_count(&self) -> usize {
         self.orphanage.len()
     }
@@ -1627,6 +1655,38 @@ mod tests {
         assert_eq!(mp.live_count(), 0);
         mp.flush().unwrap();
         let mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_evicts_conflicting_mempool_txs() {
+        let dir = tmp_dir();
+        let op_a = OutPoint {
+            txid: Txid::from_byte_array([0xa1; 32]),
+            vout: 0,
+        };
+        let op_b = OutPoint {
+            txid: Txid::from_byte_array([0xb2; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        let out = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        map.insert(op_a, coin(out.clone()));
+        map.insert(op_b, coin(out));
+        let utxos = MapUtxoProvider { map };
+        let tx_a = spend_tx(op_a, 90_000);
+        let tx_b = spend_tx(op_b, 90_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx_a, &utxos, TIP_OK).unwrap();
+        mp.accept_tx(&tx_b, &utxos, TIP_OK).unwrap();
+        assert_eq!(mp.live_count(), 2);
+        // Confirmed block spends both coins (the doublespend is not in the pool).
+        let gone = mp.evict_conflicts_with(&[op_a, op_b]);
+        assert_eq!(gone.len(), 2);
         assert_eq!(mp.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

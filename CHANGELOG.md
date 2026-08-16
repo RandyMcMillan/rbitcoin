@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **`getchaintips`:** active tip plus losing `valid-fork` (archive after
+  reorg) and held never-confirmed `valid-headers`. Hashes only — not a
+  block index.
+
 - **Mempool RPC graph fields:** `getmempoolentry` / verbose `getrawmempool`
   ancestor and descendant counts (and size/fee sums) come from the cluster
   graph, not stub `1`. `getmempoolinfo.unbroadcastcount` and per-entry

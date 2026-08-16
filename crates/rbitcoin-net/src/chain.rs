@@ -63,6 +63,18 @@ pub struct ChainHub {
     /// Not a block index: once-confirmed losers stay in Class A.
     held_bodies: RwLock<HashMap<BlockHash, Block>>,
     precious: RwLock<Option<BlockHash>>,
+    /// Losing tips after a most-work reorg (hashes only). Bodies via archive.
+    fork_tips: RwLock<HashSet<BlockHash>>,
+}
+
+/// One `getchaintips` row. Status is a Core-shaped string (`active`,
+/// `valid-fork`, `valid-headers`, `headers-only`, `invalid`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainTipInfo {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub branchlen: u32,
+    pub status: &'static str,
 }
 
 impl ChainHub {
@@ -88,6 +100,7 @@ impl ChainHub {
             invalidated_paths: RwLock::new(Vec::new()),
             held_bodies: RwLock::new(HashMap::new()),
             precious: RwLock::new(None),
+            fork_tips: RwLock::new(HashSet::new()),
         }
     }
 
@@ -182,6 +195,112 @@ impl ChainHub {
             .ok()
             .flatten()
             .is_some()
+    }
+
+    /// Active tip plus known side tips (held / archive losers / invalidate).
+    ///
+    /// Losing tips are hashes only; bodies come from hold or
+    /// [`Query::reconstruct_archived_block`]. Not a Core block index.
+    pub fn chaintips(&self) -> Vec<ChainTipInfo> {
+        let mut out: HashMap<BlockHash, ChainTipInfo> = HashMap::new();
+        if let (Some(height), Some(hash)) = (self.tip_height(), self.tip_hash()) {
+            out.insert(
+                hash,
+                ChainTipInfo {
+                    height,
+                    hash,
+                    branchlen: 0,
+                    status: "active",
+                },
+            );
+        }
+
+        let record =
+            |map: &mut HashMap<BlockHash, ChainTipInfo>, hash: BlockHash, status: &'static str| {
+                if map.get(&hash).map(|t| t.status) == Some("active") {
+                    return;
+                }
+                if self.is_connected(&hash) {
+                    return;
+                }
+                let Some((height, branchlen)) = self.side_height_and_branchlen(hash) else {
+                    return;
+                };
+                let rank = |s: &str| match s {
+                    "invalid" => 3,
+                    "valid-fork" => 2,
+                    "valid-headers" => 1,
+                    "headers-only" => 0,
+                    _ => 0,
+                };
+                match map.get(&hash) {
+                    Some(prev) if rank(prev.status) >= rank(status) => {}
+                    _ => {
+                        map.insert(
+                            hash,
+                            ChainTipInfo {
+                                height,
+                                hash,
+                                branchlen,
+                                status,
+                            },
+                        );
+                    }
+                }
+            };
+
+        for h in self.fork_tips.read().unwrap().iter().copied() {
+            record(&mut out, h, "valid-fork");
+        }
+        {
+            let held = self.held_bodies.read().unwrap();
+            let parents: HashSet<BlockHash> =
+                held.values().map(|b| b.header.prev_blockhash).collect();
+            for hash in held.keys().copied() {
+                if parents.contains(&hash) {
+                    continue;
+                }
+                record(&mut out, hash, "valid-headers");
+            }
+        }
+        for path in self.invalidated_paths.read().unwrap().iter() {
+            if let Some(h) = path.last().copied() {
+                record(&mut out, h, "invalid");
+            }
+        }
+
+        let mut tips: Vec<ChainTipInfo> = out.into_values().collect();
+        tips.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| a.hash.to_byte_array().cmp(&b.hash.to_byte_array()))
+        });
+        tips
+    }
+
+    /// Height of a non-active tip and the length of the branch to the best chain.
+    fn side_height_and_branchlen(&self, tip: BlockHash) -> Option<(u32, u32)> {
+        let mut h = tip;
+        let mut branchlen = 0u32;
+        for _ in 0..10_000 {
+            let b = self.load_side_body(&h)?;
+            branchlen = branchlen.saturating_add(1);
+            let prev = b.header.prev_blockhash;
+            if prev.to_byte_array() == [0u8; 32] {
+                return Some((branchlen.saturating_sub(1), branchlen));
+            }
+            if self.is_connected(&prev) {
+                let parent_h = self
+                    .query
+                    .height_of_hash(&prev.to_byte_array())
+                    .ok()
+                    .flatten()?
+                    .0;
+                return Some((parent_h.saturating_add(branchlen), branchlen));
+            }
+            h = prev;
+        }
+        None
     }
 
     /// Persist a header row only (for header-sync → out-of-order body archive).
@@ -671,6 +790,15 @@ impl ChainHub {
             let mut held = self.held_bodies.write().unwrap();
             for b in blocks {
                 held.remove(&b.block_hash());
+            }
+        }
+        {
+            let mut forks = self.fork_tips.write().unwrap();
+            if let Some(old) = old_path.last() {
+                forks.insert(old.block_hash());
+            }
+            for b in blocks {
+                forks.remove(&b.block_hash());
             }
         }
         Ok(AcceptOutcome::Accepted { height })
@@ -1614,6 +1742,23 @@ mod tests {
         }
         assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
         assert_eq!(hub.tip_height(), Some(3));
+
+        let tips = hub.chaintips();
+        assert_eq!(
+            tips.len(),
+            2,
+            "active + losing valid-fork after held-then-applied reorg: {tips:?}"
+        );
+        assert_eq!(tips[0].status, "active");
+        assert_eq!(tips[0].hash, fork[2].block_hash());
+        assert_eq!(tips[0].branchlen, 0);
+        let fork_tip = tips
+            .iter()
+            .find(|t| t.status == "valid-fork")
+            .expect("loser");
+        assert_eq!(fork_tip.hash, a2.block_hash());
+        assert_eq!(fork_tip.height, 2);
+        assert_eq!(fork_tip.branchlen, 2);
 
         // Once-confirmed loser is archive-reconstructable, not a RAM block index.
         assert!(

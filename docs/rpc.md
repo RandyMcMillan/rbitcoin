@@ -84,7 +84,7 @@ still wait for durable SH when shindex is on.
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
 | `gettxout` | All networks. Class A + mempool. |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
-| `getchaintips` | All networks. Active tip only (held / archive side tips still follow `accept_received_block` / invalidate). |
+| `getchaintips` | All networks. Active tip plus losing `valid-fork` (archive) and held `valid-headers`. `headers-only` needs `submitheader` (later). |
 | `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. |

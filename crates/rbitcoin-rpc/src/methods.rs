@@ -481,7 +481,7 @@ fn method_help(m: &str) -> String {
              raw() scripts over Class A. MiniWallet support, not Core coins-DB."
             .into(),
         "gettxout" => "gettxout txid n (include_mempool) — Class A + mempool.".into(),
-        "getchaintips" => "getchaintips — active tip only.".into(),
+        "getchaintips" => "getchaintips — active + held/archive side tips.".into(),
         "submitblock" => "submitblock hexdata (dummy)\n\
              Regtest harness only. Accepts a serialized block via the P2P path."
             .into(),
@@ -1578,6 +1578,21 @@ fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn getchaintips(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&[])?;
+    if let Some(chain) = ctx.chain.as_ref() {
+        let tips: Vec<Value> = chain
+            .chaintips()
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "height": t.height,
+                    "hash": hash_hex_display(&t.hash.to_byte_array()),
+                    "branchlen": t.branchlen,
+                    "status": t.status,
+                })
+            })
+            .collect();
+        return Ok(json!(tips));
+    }
     let Some(h) = ctx.query.tip_height() else {
         return Ok(json!([]));
     };

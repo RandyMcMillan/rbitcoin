@@ -17,7 +17,7 @@ mod tx_relay;
 mod v2;
 
 pub use cache::BlockCache;
-pub use chain::{log_update_tip, AcceptOutcome, ChainHub, TipEvent};
+pub use chain::{log_update_tip, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH};
 pub use error::NetError;
 pub use ibd::{

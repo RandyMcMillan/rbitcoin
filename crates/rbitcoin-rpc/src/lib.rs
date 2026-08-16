@@ -4,7 +4,6 @@
 
 mod auth;
 mod methods;
-mod rawtx;
 mod server;
 
 pub use auth::{parse_basic_auth, read_cookie_file, resolve_rpc_auth, write_cookie_file, RpcAuth};

@@ -182,4 +182,13 @@ class RpcProxy:
 
 def node_rpc_port(public_rpc: int) -> int:
     """Internal node RPC. Public port stays on the proxy."""
-    return public_rpc + 10_000
+    p = public_rpc + 10_000
+    return p if p <= 65535 else public_rpc - 10_000
+
+
+def esplora_port(public_rpc: int) -> int:
+    """Esplora listen for the test wallet shim (Step 18)."""
+    p = node_rpc_port(public_rpc) + 1
+    if p == public_rpc or p > 65535 or p < 1:
+        p = max(1, public_rpc - 1)
+    return p

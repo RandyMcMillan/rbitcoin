@@ -136,7 +136,10 @@ def register_utility(proxy) -> None:
         lambda p: signrawtransactionwithkey(p, lookup=_lookup),
     )
     proxy.register("createmultisig", createmultisig)
-    proxy.register("combinerawtransaction", combinerawtransaction)
+    proxy.register(
+        "combinerawtransaction",
+        lambda p: combinerawtransaction(p, lookup=_lookup),
+    )
     proxy.register("decoderawtransaction", decoderawtransaction)
     proxy.register("decodescript", decodescript)
     proxy.register("validateaddress", validateaddress)
@@ -336,6 +339,10 @@ def signrawtransactionwithkey(params: Any, lookup=None) -> dict[str, Any]:
         filled = _sign_one(unsigned, i, info, keys)
         if not filled:
             complete = False
+    if unsigned.wit.vtxinwit and all(
+        not w.scriptWitness.stack for w in unsigned.wit.vtxinwit
+    ):
+        unsigned.wit.vtxinwit = []
     return {"hex": unsigned.serialize().hex(), "complete": complete}
 
 
@@ -399,7 +406,7 @@ def _parse_prevtxs(prevtxs: Any) -> dict[tuple[int, int], dict[str, Any]]:
 def _check_prev_scripts(spk: bytes, info: dict[str, Any]) -> None:
     is_p2sh = len(spk) == 23 and spk[0] == OP_HASH160 and spk[-1] == OP_EQUAL
     is_p2wsh = len(spk) == 34 and spk[0] == 0 and spk[1] == 32
-    if is_p2sh and info["redeemScript"] is None and info["witnessScript"] is None:
+    if (is_p2sh or is_p2wsh) and info["redeemScript"] is None and info["witnessScript"] is None:
         raise RpcError(ERR_INVALID_PARAMETER, "Missing redeemScript/witnessScript")
     r, w = info["redeemScript"], info["witnessScript"]
     if r is not None and w is not None:
@@ -413,14 +420,36 @@ def _check_prev_scripts(spk: bytes, info: dict[str, Any]) -> None:
     if is_p2sh:
         redeem = r
         if redeem is None and w is not None:
-            redeem = bytes(script_to_p2wsh_script(w))
+            wrapped = bytes(script_to_p2wsh_script(w))
+            if bytes(script_to_p2sh_script_bytes(wrapped)) == spk:
+                redeem = wrapped
+            elif bytes(script_to_p2sh_script_bytes(w)) == spk:
+                redeem = w
+        elif redeem is not None and w is not None and redeem == w:
+            wrapped = bytes(script_to_p2wsh_script(w))
+            if bytes(script_to_p2sh_script_bytes(wrapped)) == spk:
+                redeem = wrapped
+        elif (
+            redeem is not None
+            and w is None
+            and bytes(script_to_p2sh_script_bytes(redeem)) != spk
+        ):
+            wrapped = bytes(script_to_p2wsh_script(redeem))
+            if bytes(script_to_p2sh_script_bytes(wrapped)) == spk:
+                redeem = wrapped
         if redeem is not None and bytes(script_to_p2sh_script_bytes(redeem)) != spk:
             raise RpcError(
                 ERR_INVALID_PARAMETER,
                 "redeemScript/witnessScript does not match scriptPubKey",
             )
-    if is_p2wsh and w is not None:
-        if bytes(script_to_p2wsh_script(w)) != spk:
+        if redeem is None and (r is not None or w is not None):
+            raise RpcError(
+                ERR_INVALID_PARAMETER,
+                "redeemScript/witnessScript does not match scriptPubKey",
+            )
+    if is_p2wsh:
+        inner = w if w is not None else r
+        if inner is not None and bytes(script_to_p2wsh_script(inner)) != spk:
             raise RpcError(
                 ERR_INVALID_PARAMETER,
                 "redeemScript/witnessScript does not match scriptPubKey",
@@ -447,22 +476,31 @@ def _sign_one(tx: CTransaction, i: int, info: dict[str, Any], keys: list[ECKey])
     ws = info["witnessScript"]
     redeem = info["redeemScript"]
     if _is_p2sh(spk):
-        if redeem is None and ws is not None:
-            redeem = bytes(script_to_p2wsh_script(ws))
-        if redeem is None:
-            return False
-        if _is_p2wsh(redeem):
-            if ws is None:
-                return False
-            ok = _sign_p2wsh(tx, i, ws, sats, keys)
-            if ok:
-                tx.vin[i].scriptSig = bytes(CScript([redeem]))
+        inner = ws
+        if inner is None and redeem is not None and not _is_p2wsh(redeem):
+            inner = redeem
+        wrapped = None
+        if redeem is not None and _is_p2wsh(redeem):
+            wrapped = redeem
+        elif inner is not None:
+            wrapped = bytes(script_to_p2wsh_script(inner))
+        if (
+            inner is not None
+            and wrapped is not None
+            and bytes(script_to_p2sh_script_bytes(wrapped)) == spk
+        ):
+            ok = _sign_p2wsh(tx, i, inner, sats, keys)
+            tx.vin[i].scriptSig = bytes(CScript([wrapped]))
             return ok
-        return _sign_p2sh_multisig(tx, i, redeem, keys)
-    if _is_p2wsh(spk):
-        if ws is None:
+        legacy = redeem if redeem is not None and not _is_p2wsh(redeem) else inner
+        if legacy is None:
             return False
-        return _sign_p2wsh(tx, i, ws, sats, keys)
+        return _sign_p2sh_multisig(tx, i, legacy, keys)
+    if _is_p2wsh(spk):
+        inner = ws if ws is not None else redeem
+        if inner is None:
+            return False
+        return _sign_p2wsh(tx, i, inner, sats, keys)
     return False
 
 
@@ -478,39 +516,86 @@ def _is_p2wsh(spk: bytes) -> bool:
     return len(spk) == 34 and spk[0] == 0 and spk[1] == 32
 
 
+def _parse_multisig(script: bytes) -> tuple[int, list[bytes]] | None:
+    try:
+        ops = list(CScript(script))
+    except Exception:
+        return None
+    if not ops or ops[-1] != OP_CHECKMULTISIG:
+        return None
+
+    def small_int(op) -> int | None:
+        if isinstance(op, int) and 0 <= op <= 16:
+            return op
+        if isinstance(op, (bytes, bytearray)):
+            if len(op) == 0:
+                return 0
+            if len(op) == 1:
+                return op[0]
+        return None
+
+    nreq = small_int(ops[0])
+    nkeys = small_int(ops[-2])
+    if nreq is None or nkeys is None:
+        return None
+    pubs = ops[1:-2]
+    if len(pubs) != nkeys:
+        return None
+    out: list[bytes] = []
+    for p in pubs:
+        if not isinstance(p, (bytes, bytearray)):
+            return None
+        out.append(bytes(p))
+    return nreq, out
+
+
 def _sign_p2sh_multisig(tx: CTransaction, i: int, redeem: bytes, keys: list[ECKey]) -> bool:
-    signers = _multisig_signers(redeem, keys)
-    if signers is None:
+    parsed = _parse_multisig(redeem)
+    if parsed is None:
         return False
+    nreq, pubs = parsed
     script = CScript(redeem)
+    (sighash, err) = __import__(
+        "test_framework.script", fromlist=["LegacySignatureHash"]
+    ).LegacySignatureHash(script, tx, i, SIGHASH_ALL)
+    if err is not None:
+        return False
+    by_pub = {k.get_pubkey().get_bytes(): k for k in keys}
     pushes = [b""]
-    for k in signers:
-        (sighash, err) = __import__(
-            "test_framework.script", fromlist=["LegacySignatureHash"]
-        ).LegacySignatureHash(script, tx, i, SIGHASH_ALL)
-        if err is not None:
-            return False
+    got = 0
+    for p in pubs:
+        k = by_pub.get(p)
+        if k is None:
+            continue
         der = k.sign_ecdsa(sighash)
         pushes.append(der + bytes([SIGHASH_ALL]))
+        got += 1
     pushes.append(redeem)
     tx.vin[i].scriptSig = bytes(CScript(pushes))
-    return True
+    return got >= nreq
 
 
 def _sign_p2wsh(tx: CTransaction, i: int, ws: bytes, amount: int, keys: list[ECKey]) -> bool:
     script = CScript(ws)
-    signers = _multisig_signers(ws, keys)
-    if signers is not None:
+    parsed = _parse_multisig(ws)
+    if parsed is not None:
+        nreq, pubs = parsed
+        sh = __import__(
+            "test_framework.script", fromlist=["SegwitV0SignatureHash"]
+        ).SegwitV0SignatureHash(script, tx, i, SIGHASH_ALL, amount)
+        by_pub = {k.get_pubkey().get_bytes(): k for k in keys}
         stack = [b""]
-        for k in signers:
-            sh = __import__(
-                "test_framework.script", fromlist=["SegwitV0SignatureHash"]
-            ).SegwitV0SignatureHash(script, tx, i, SIGHASH_ALL, amount)
+        got = 0
+        for p in pubs:
+            k = by_pub.get(p)
+            if k is None:
+                continue
             der = k.sign_ecdsa(sh)
             stack.append(der + bytes([SIGHASH_ALL]))
+            got += 1
         stack.append(ws)
         tx.wit.vtxinwit[i].scriptWitness.stack = stack
-        return True
+        return got >= nreq
     pk = _p2pk_key(ws, keys)
     if pk is not None:
         sh = __import__(
@@ -536,39 +621,6 @@ def _sign_p2wsh(tx: CTransaction, i: int, ws: bytes, amount: int, keys: list[ECK
     return False
 
 
-def _multisig_signers(script: bytes, keys: list[ECKey]) -> list[ECKey] | None:
-    try:
-        ops = list(CScript(script))
-    except Exception:
-        return None
-    if not ops or ops[-1] != OP_CHECKMULTISIG:
-        return None
-    # OP_n ... OP_m CHECKMULTISIG
-    def small_int(op) -> int | None:
-        if isinstance(op, int) and 0 <= op <= 16:
-            return op
-        return None
-
-    nreq = small_int(ops[0])
-    nkeys = small_int(ops[-2])
-    if nreq is None or nkeys is None:
-        return None
-    pubs = ops[1:-2]
-    if len(pubs) != nkeys:
-        return None
-    by_pub = {k.get_pubkey().get_bytes(): k for k in keys}
-    out: list[ECKey] = []
-    for p in pubs:
-        if not isinstance(p, (bytes, bytearray)):
-            return None
-        k = by_pub.get(bytes(p))
-        if k is not None:
-            out.append(k)
-        if len(out) == nreq:
-            return out
-    return None
-
-
 def _p2pk_key(script: bytes, keys: list[ECKey]) -> ECKey | None:
     try:
         ops = list(CScript(script))
@@ -585,7 +637,54 @@ def _p2pk_key(script: bytes, keys: list[ECKey]) -> ECKey | None:
     return None
 
 
-def combinerawtransaction(params: Any) -> str:
+def _merge_stack(a: list, b: list) -> list:
+    """Merge partial CHECKMULTISIG witnesses: dummy + sigs + script."""
+    if not a:
+        return list(b)
+    if not b:
+        return list(a)
+    script = a[-1] if a else b[-1]
+    sigs = []
+    for stack in (a, b):
+        body = stack[1:-1] if len(stack) >= 2 else stack
+        for item in body:
+            if item and item not in sigs and item != script:
+                sigs.append(item)
+    return [b""] + sigs + [script]
+
+
+def _scriptsig_is_redeem_only(ss: bytes) -> bool:
+    try:
+        ops = list(CScript(ss))
+    except Exception:
+        return False
+    return len(ops) == 1 and isinstance(ops[0], (bytes, bytearray))
+
+
+def _merge_scriptsig(a: bytes, b: bytes) -> bytes:
+    try:
+        pa = list(CScript(a))
+        pb = list(CScript(b))
+    except Exception:
+        return a or b
+    if not pa:
+        return b
+    if not pb:
+        return a
+    script = pa[-1] if pa else pb[-1]
+    sigs = []
+    for ops in (pa, pb):
+        body = ops[1:-1] if len(ops) >= 2 else ops
+        for item in body:
+            if item not in (None, b"", 0) and item != script and item not in sigs:
+                sigs.append(item)
+    try:
+        return bytes(CScript([b""] + sigs + [script]))
+    except Exception:
+        return a or b
+
+
+def combinerawtransaction(params: Any, lookup=None) -> str:
     txs = pget(params, 0, "txs")
     if not isinstance(txs, list):
         raise RpcError(ERR_INVALID_PARAMS, "txs must be an array")
@@ -604,8 +703,6 @@ def combinerawtransaction(params: Any) -> str:
         decoded.append(tx)
     base = decoded[0]
     for other in decoded[1:]:
-        if other.txid_hex != base.txid_hex:
-            pass
         if len(other.vin) != len(base.vin):
             raise RpcError(ERR_DESER, "TX decode failed")
         if not base.wit.vtxinwit:
@@ -615,11 +712,25 @@ def combinerawtransaction(params: Any) -> str:
         for i, vin in enumerate(base.vin):
             if not vin.scriptSig and other.vin[i].scriptSig:
                 vin.scriptSig = other.vin[i].scriptSig
-            if (
-                not base.wit.vtxinwit[i].scriptWitness.stack
-                and other.wit.vtxinwit[i].scriptWitness.stack
-            ):
-                base.wit.vtxinwit[i] = other.wit.vtxinwit[i]
+            elif vin.scriptSig and other.vin[i].scriptSig:
+                sa, sb = vin.scriptSig, other.vin[i].scriptSig
+                if _scriptsig_is_redeem_only(sa) or _scriptsig_is_redeem_only(sb):
+                    vin.scriptSig = sa if len(sa) >= len(sb) else sb
+                else:
+                    vin.scriptSig = _merge_scriptsig(sa, sb)
+            a = base.wit.vtxinwit[i].scriptWitness.stack
+            b = other.wit.vtxinwit[i].scriptWitness.stack
+            if not a and b:
+                base.wit.vtxinwit[i].scriptWitness.stack = list(b)
+            elif a and b:
+                base.wit.vtxinwit[i].scriptWitness.stack = _merge_stack(a, b)
+    if lookup is not None:
+        for vin in base.vin:
+            txid_hex = "%064x" % vin.prevout.hash
+            if lookup(txid_hex, vin.prevout.n) is None:
+                raise RpcError(ERR_VERIFY, "Input not found or already spent")
+    if base.wit.vtxinwit and all(not w.scriptWitness.stack for w in base.wit.vtxinwit):
+        base.wit.vtxinwit = []
     return base.serialize().hex()
 
 

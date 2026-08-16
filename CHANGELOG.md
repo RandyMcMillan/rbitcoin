@@ -17,8 +17,10 @@ before 1.0).
 
 - **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
   (modified fees) from the live graph.
-- **Stateless raw-tx:** `createrawtransaction`, `signrawtransactionwithkey`,
-  `createmultisig` (legacy / p2sh-segwit / bech32). No keystore.
+- **Test RPC proxy** (Core functional suite only): utility RPCs
+  (`createrawtransaction`, `signrawtransactionwithkey`, `createmultisig`,
+  `combinerawtransaction`, decode helpers) live in the bitcoind shim, not
+  on `rbitcoin-node`.
 - **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
   `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk

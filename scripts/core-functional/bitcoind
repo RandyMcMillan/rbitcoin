@@ -20,7 +20,7 @@ import threading
 from pathlib import Path
 
 from map_debuglog import apply_line, load_rules
-from rpc_proxy import RpcProxy, node_rpc_port
+from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
 from rpc_util import register_utility
 
 HERE = Path(__file__).resolve().parent
@@ -298,6 +298,9 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
         "--listen",
         f"127.0.0.1:{p2pport}",
         "--no-seeds",
+        "--shindex",
+        "--esplora-listen",
+        f"127.0.0.1:{esplora_port(int(rpcport))}",
     ]
     if debug:
         cmd += ["--log-level", "debug"]

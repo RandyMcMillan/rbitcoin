@@ -223,10 +223,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .await
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
 
-    let mempool = MempoolHub::open_with_weight(
+    let mempool = MempoolHub::open_with_weight_persist(
         config.mempool_path(),
         node.hub.query.clone(),
         config.mempool_max_weight,
+        config.persist_mempool,
     )
     .map_err(|e| NodeError::Config(e))?;
     node.hub

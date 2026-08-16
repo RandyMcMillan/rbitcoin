@@ -289,7 +289,17 @@ impl MempoolHub {
         query: Arc<Query>,
         max_weight_wu: u64,
     ) -> Result<Arc<Self>, String> {
-        let mp = ActiveMempool::open_or_create_with_limit(dir.as_ref(), max_weight_wu)
+        Self::open_with_weight_persist(dir, query, max_weight_wu, true)
+    }
+
+    /// `persist=false` starts with an empty live set (Core `-persistmempool=0`).
+    pub fn open_with_weight_persist(
+        dir: impl AsRef<Path>,
+        query: Arc<Query>,
+        max_weight_wu: u64,
+        persist: bool,
+    ) -> Result<Arc<Self>, String> {
+        let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         let hub = Self {
@@ -654,7 +664,8 @@ impl MempoolHub {
             let t_lock = Instant::now();
             let mut g = self.inner.write().unwrap();
             g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
-            let r = g.prepare_admit(tx, &utxo, tip);
+            let delta = self.fee_delta(&tx.compute_txid());
+            let r = g.prepare_admit(tx, &utxo, tip, delta);
             stages.utxo_us = g.last_accept_stages.utxo_us;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -987,6 +998,15 @@ impl MempoolHub {
         self.fee_deltas.lock().unwrap().clone()
     }
 
+    pub fn fee_delta(&self, txid: &Txid) -> i64 {
+        self.fee_deltas
+            .lock()
+            .unwrap()
+            .get(txid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
     pub fn list_live(&self) -> Vec<(Txid, u64, u64, Transaction)> {
         self.meter_list_live.fetch_add(1, Ordering::Relaxed);
@@ -1029,6 +1049,39 @@ impl MempoolHub {
     /// Ancestor/descendant counts and vsize/fee sums (no live-set scan).
     pub fn graph_stats(&self, txid: &Txid) -> Option<crate::MempoolGraphStats> {
         self.inner.read().unwrap().graph.graph_stats(txid)
+    }
+
+    /// Graph stats plus modified ancestor/descendant/chunk fees (sat).
+    pub fn graph_fees_modified(
+        &self,
+        txid: &Txid,
+    ) -> Option<(crate::MempoolGraphStats, i64, i64, i64, u64)> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
+        let g = self.inner.read().unwrap();
+        let (stats, a_mod, d_mod) = g.graph.graph_stats_delta(txid, d)?;
+        let (chunk_fee, chunk_w, _) = g.graph.chunk_of(txid, d)?;
+        Some((stats, a_mod, d_mod, chunk_fee, chunk_w))
+    }
+
+    /// `getmempoolcluster` payload from the live graph.
+    pub fn cluster_rpc(&self, txid: &Txid) -> Option<(u64, usize, Vec<(i64, u64, Vec<Txid>)>)> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
+        let g = self.inner.read().unwrap();
+        let c = g.graph.cluster_of(txid)?;
+        let chunks = c
+            .chunks
+            .iter()
+            .map(|ch| {
+                let fee = ch.txids.iter().fold(0i64, |acc, t| {
+                    let base = g.graph.get(t).map(|e| e.fee_sat as i64).unwrap_or(0);
+                    acc.saturating_add(base.saturating_add(d(*t)))
+                });
+                (fee, ch.weight, ch.txids.clone())
+            })
+            .collect();
+        Some((c.total_weight, c.members.len(), chunks))
     }
 
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.

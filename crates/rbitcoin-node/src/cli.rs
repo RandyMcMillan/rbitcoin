@@ -931,6 +931,9 @@ mod tests {
 
     #[test]
     fn testactivationheight_cli_smoke_regtest() {
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -944,7 +947,6 @@ mod tests {
             "--whitelist=noban@127.0.0.1",
             "--permitbaremultisig=0",
             "--limitclustercount=10",
-            "--maxconnections=8",
             "--minimumchainwork=0x65",
             "--no-seeds",
             "--log-level",

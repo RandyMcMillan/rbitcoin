@@ -139,6 +139,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+OUTNO="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
+  -nopersistmempool -printpriority=1 2>/dev/null)" || OUTNO=""
+if printf '%s' "$OUTNO" | grep -q -- "--persistmempool=0" \
+  && ! printf '%s' "$OUTNO" | grep -q -- "printpriority"; then
+  echo "ok - -nopersistmempool forwarded, printpriority ignored"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -nofoo / printpriority (got: $OUTNO)"
+  FAIL=$((FAIL + 1))
+fi
+
 assert_fail_msg "txindex=0 cannot disable Class A lookup" "Error parsing command line arguments" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -txindex=0
 

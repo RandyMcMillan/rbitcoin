@@ -549,8 +549,7 @@ reason = "no-mining-product"
 
 [[test]]
 name = "mining_prioritisetransaction.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "mining_template_verification.py"

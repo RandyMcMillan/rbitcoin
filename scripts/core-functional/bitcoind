@@ -87,6 +87,7 @@ IGNORE_FLAGS = frozenset(
         "shrinkdebugfile",
         "daemon",
         "logtimestamps",
+        "printpriority",
     }
 )
 
@@ -178,6 +179,16 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
             i += 1
             continue
         key, val = parse_kv(a)
+        # Core `-nofoo` / `-nofoo=1` is foo=false; `-nofoo=0` is foo=true.
+        no_bases = FORWARD_FLAGS | IGNORE_FLAGS | {"txindex", "maxconnections"}
+        if key.startswith("no") and key[2:] in no_bases:
+            base = key[2:]
+            if val is None or str(val).lower() in ("1", "true", "yes", "on"):
+                key, val = base, "0"
+            elif str(val).lower() in ("0", "false", "no", "off"):
+                key, val = base, "1"
+            else:
+                key, val = base, "0"
         if val is None and key in (
             "datadir",
             "rpcport",

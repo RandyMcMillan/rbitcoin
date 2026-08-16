@@ -6,7 +6,8 @@ Maps Core TestNode argv + bitcoin.conf onto rbitcoin-node flags.
 `DIR/regtest/.cookie` (what BitcoinTestFramework tails).
 
 Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
-`rpcport+10000` so wallet/utility methods can stay out of rbitcoin-rpc.
+`rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
+gives consecutive rpcports, so that collided across nodes).
 """
 
 from __future__ import annotations

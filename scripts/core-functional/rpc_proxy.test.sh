@@ -11,9 +11,23 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from rpc_proxy import RpcProxy, node_rpc_port
+from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
 
 assert node_rpc_port(18443) == 28443
+assert esplora_port(18443) == 38443
+# Consecutive Core rpcports must not share node-RPC / Esplora binds.
+for base in (16000, 18443, 20000, 45535):
+    seen = set()
+    for n in range(12):
+        pub = base + n
+        ports = {pub, node_rpc_port(pub), esplora_port(pub)}
+        assert len(ports) == 3, ports
+        assert ports.isdisjoint(seen), (pub, ports & seen)
+        seen |= ports
+# Wrap stays in range and still misses the public port.
+assert node_rpc_port(60000) == 50000
+assert esplora_port(50000) == 30000
+assert 1 <= esplora_port(56000) <= 65535
 
 COOKIE = "__cookie__:secret"
 

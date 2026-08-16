@@ -76,6 +76,7 @@ OUT="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -debug 2>/dev/null)"
 if printf '%s' "$OUT" | grep -q -- "--network regtest" \
   && printf '%s' "$OUT" | grep -q -- "--datadir ${DATADIR}/regtest" \
   && printf '%s' "$OUT" | grep -q -- "--rpc-listen 127.0.0.1:28443" \
+  && printf '%s' "$OUT" | grep -q -- "--esplora-listen 127.0.0.1:38443" \
   && printf '%s' "$OUT" | grep -q -- "--listen 127.0.0.1:18444" \
   && printf '%s' "$OUT" | grep -q -- "--no-seeds" \
   && printf '%s' "$OUT" | grep -q -- "--log-level debug"; then
@@ -91,6 +92,7 @@ OUT2="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -rpcport=19111 -port=19222 -v2transport=0 -disablewallet -server \
   -uacomment=testnode0 2>/dev/null)"
 if printf '%s' "$OUT2" | grep -q -- "--rpc-listen 127.0.0.1:29111" \
+  && printf '%s' "$OUT2" | grep -q -- "--esplora-listen 127.0.0.1:39111" \
   && printf '%s' "$OUT2" | grep -q -- "--listen 127.0.0.1:19222"; then
   echo "ok - CLI ports override conf"
   PASS=$((PASS + 1))

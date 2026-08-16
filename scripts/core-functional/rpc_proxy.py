@@ -180,15 +180,28 @@ class RpcProxy:
         }
 
 
+def _offset_port(public_rpc: int, offset: int) -> int:
+    """Shift a Core-assigned RPC port; wrap instead of overflowing 65535."""
+    p = public_rpc + offset
+    if p <= 65535:
+        return p
+    p = public_rpc - offset
+    if p >= 1:
+        return p
+    return max(1, public_rpc - 1)
+
+
 def node_rpc_port(public_rpc: int) -> int:
     """Internal node RPC. Public port stays on the proxy."""
-    p = public_rpc + 10_000
-    return p if p <= 65535 else public_rpc - 10_000
+    return _offset_port(public_rpc, 10_000)
 
 
 def esplora_port(public_rpc: int) -> int:
-    """Esplora listen for the test wallet shim (Step 18)."""
-    p = node_rpc_port(public_rpc) + 1
-    if p == public_rpc or p > 65535 or p < 1:
-        p = max(1, public_rpc - 1)
-    return p
+    """Esplora listen for the test wallet shim (Step 18).
+
+    Must not sit next to ``node_rpc_port``: Core assigns consecutive
+    ``-rpcport`` values, so ``node_rpc(n) + 1 == node_rpc(n + 1)``. That
+    collision made the next node's proxy POST ``getblockcount`` at the
+    previous node's Esplora (HTTP 404).
+    """
+    return _offset_port(public_rpc, 20_000)

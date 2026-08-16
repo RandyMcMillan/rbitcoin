@@ -140,6 +140,13 @@ before 1.0).
 - Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
 - `crate_name()` / `smoke_crate_names` coverage theater.
 
+### Fixed
+
+- **Core functional proxy ports:** Esplora binds `rpcport+20000`, not
+  `node_rpc+1`. Consecutive Core `-rpcport` values made the next node's
+  internal RPC land on the previous node's Esplora (`HTTP 404` on
+  `getblockcount` in multi-node tests).
+
 ### Added
 
 - **Core `-testactivationheight` overlay:** `name@height` (regtest) is parsed

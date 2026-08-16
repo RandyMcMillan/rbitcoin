@@ -1030,8 +1030,7 @@ reason = "no-wallet"
 
 [[test]]
 name = "rpc_signrawtransactionwithkey.py"
-status = "skip"
-reason = "no-wallet"
+status = "run"
 
 [[test]]
 name = "rpc_txoutproof.py"

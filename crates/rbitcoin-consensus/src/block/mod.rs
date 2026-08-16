@@ -1196,7 +1196,7 @@ fn assemble_block_prevouts_mode(
             // BIP113 absolute finality (uses block-level lock_time_cutoff).
             let t_fin = Instant::now();
             if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
-                return Err(ConsensusError::BadTx("not final"));
+                return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
             }
             // BIP68 relative locks need per-input create heights (fence).
             // Optimistic/confirm defers that IO to structural write; Full does it here.

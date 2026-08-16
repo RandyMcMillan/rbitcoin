@@ -121,9 +121,7 @@ reason = "core-log"
 
 [[test]]
 name = "feature_csv_activation.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: CSV activation + generate"
+status = "run"
 
 [[test]]
 name = "feature_dbcrash.py"

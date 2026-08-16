@@ -53,6 +53,33 @@ impl From<StoreError> for ConsensusError {
     }
 }
 
+/// Core `BlockValidationState` / `debug.log` reject needle for a confirm error.
+///
+/// P2P `assert_debug_log` and `submitblock` share this. Script messages keep
+/// our internal tokens (`CSV negative`); only this helper speaks Core English.
+pub fn block_reject_reason(err: &ConsensusError) -> String {
+    match err {
+        ConsensusError::BadTx("not final" | "bad-txns-nonfinal") => "bad-txns-nonfinal".into(),
+        ConsensusError::BadTx(s) => (*s).into(),
+        ConsensusError::BadBlock(s) => (*s).into(),
+        ConsensusError::BadHeader(s) => (*s).into(),
+        ConsensusError::Script(s) => {
+            let inner = s.split(" txid=").next().unwrap_or(s.as_str());
+            let paren = match inner {
+                "CSV negative" | "CLTV negative" => "Negative locktime",
+                "CSV" | "CSV version" | "CLTV" | "CLTV type" | "CLTV final sequence" => {
+                    "Locktime requirement not satisfied"
+                }
+                "stack empty" | "stack size" => "Operation not valid with the current stack size",
+                "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
+                other => other,
+            };
+            format!("block-script-verify-flag-failed ({paren})")
+        }
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +126,33 @@ mod tests {
     fn from_store_error() {
         let e: ConsensusError = StoreError::NotFound.into();
         assert!(matches!(e, ConsensusError::Store(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn block_reject_reason_bip113_and_bip112_needles() {
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadTx("not final")),
+            "bad-txns-nonfinal"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadTx("bad-txns-nonfinal")),
+            "bad-txns-nonfinal"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::Script("CSV negative".into())),
+            "block-script-verify-flag-failed (Negative locktime)"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::Script("CSV negative txid=ab vin=0".into())),
+            "block-script-verify-flag-failed (Negative locktime)"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::Script("stack empty".into())),
+            "block-script-verify-flag-failed (Operation not valid with the current stack size)"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::Script("CSV".into())),
+            "block-script-verify-flag-failed (Locktime requirement not satisfied)"
+        );
     }
 }

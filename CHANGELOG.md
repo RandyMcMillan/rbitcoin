@@ -36,6 +36,10 @@ before 1.0).
 - **Confirm overlay:** `-testactivationheight` changes BIP68/CSV/CLTV/DERSIG
   and BIP147/WITNESS (with `segwit`) on the same `ChainParams` confirm uses.
 
+- **Confirm reject log:** BIP113 uses the same `bad-txns-nonfinal` needle as
+  BIP68. Script-flag rejects emit Core `block-script-verify-flag-failed (…)`
+  on the receive path (P2P / `submitblock`).
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is
@@ -95,9 +99,10 @@ before 1.0).
   `accept_branch` on more work). Once-confirmed losers stay in Class A.
   Not a coins-DB / GBT product.
 
-- **Core functional `run` set:** 12 unmodified scripts (first-green nine plus
-  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`).
-  Activation scripts still skip (`core-log` / extra RPCs), not flipped.
+- **Core functional `run` set:** 13 unmodified scripts (first-green nine plus
+  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`,
+  `feature_csv_activation.py`). `feature_bip68_sequence.py` /
+  `feature_nulldummy.py` still skip (GBT / prioritise / raw-tx).
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

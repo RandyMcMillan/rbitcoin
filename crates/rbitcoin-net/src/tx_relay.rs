@@ -1106,7 +1106,10 @@ impl MempoolHub {
 
     /// Core `-limitclustercount` / `-limitclustersize` overlay (None = keep default).
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
-        self.inner.write().unwrap().set_cluster_limits(count, size_kvb);
+        self.inner
+            .write()
+            .unwrap()
+            .set_cluster_limits(count, size_kvb);
     }
 
     /// In-mempool ancestors of `txid`, **excluding** itself (Core RPC).

@@ -472,11 +472,7 @@ impl TxGraph {
     }
 
     /// Same as [`Self::cluster_of`] ranking/chunking by `base_fee + delta(txid)`.
-    pub fn cluster_of_delta(
-        &self,
-        txid: &Txid,
-        delta: impl Fn(Txid) -> i64,
-    ) -> Option<Cluster> {
+    pub fn cluster_of_delta(&self, txid: &Txid, delta: impl Fn(Txid) -> i64) -> Option<Cluster> {
         let c = self.cluster_of(txid)?;
         let total_weight = c.total_weight;
         self.cluster_from_members(c.members, total_weight, delta)

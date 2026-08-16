@@ -103,6 +103,7 @@ reason = "no-wallet"
 name = "p2p_ping.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none"
 EOF
 
 # --- skip cannot be invoked ---
@@ -130,6 +131,7 @@ DRY_OUT="$("$RUN" --dry-run --inventory "$INV" --tests-dir "$TESTS" \
   --config-out "$WORKDIR/config.ini" feature_help.py 2>/dev/null || true)"
 if printf '%s' "$DRY_OUT" | grep -q -- '--v2transport' \
   && printf '%s' "$DRY_OUT" | grep -q -- '--jobs' \
+  && printf '%s' "$DRY_OUT" | grep -q -- '--keepcache' \
   && printf '%s' "$DRY_OUT" | grep -q 'feature_help.py'; then
   echo "ok - dry-run run name"
   PASS=$((PASS + 1))
@@ -167,13 +169,17 @@ assert_stdout "real inventory --list includes feature_uacomment" "feature_uacomm
   "$RUN" --list
 assert_stdout "real inventory --list includes rpc_uptime" "rpc_uptime.py" \
   "$RUN" --list
+assert_stdout "real inventory --list includes rpc_named_arguments" "rpc_named_arguments.py" \
+  "$RUN" --list
 assert_fail_msg "real inventory skip refused" "not in run set: wallet_basic.py" \
   "$RUN" --dry-run wallet_basic.py
 DRY_REAL="$("$RUN" --dry-run 2>/dev/null || true)"
 if printf '%s' "$DRY_REAL" | grep -q 'feature_help.py' \
   && printf '%s' "$DRY_REAL" | grep -q 'feature_uacomment.py' \
   && printf '%s' "$DRY_REAL" | grep -q 'rpc_uptime.py' \
-  && printf '%s' "$DRY_REAL" | grep -q -- '--v2transport'; then
+  && printf '%s' "$DRY_REAL" | grep -q 'rpc_named_arguments.py' \
+  && printf '%s' "$DRY_REAL" | grep -q -- '--v2transport' \
+  && printf '%s' "$DRY_REAL" | grep -q -- '--keepcache'; then
   echo "ok - real inventory dry-run first-green set"
   PASS=$((PASS + 1))
 else

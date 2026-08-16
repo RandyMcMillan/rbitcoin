@@ -143,6 +143,34 @@ fi
 assert_fail_msg "datadir required" "datadir is required" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -regtest
 
+# Cache seed: dest looks like a Core cache copy (blocks+chainstate, no store).
+CACHE="$WORKDIR/rbcache"
+mkdir -p "$CACHE/store"
+echo seeded >"$CACHE/store/marker"
+CACHED="$WORKDIR/cached-node"
+mkdir -p "$CACHED/regtest/blocks" "$CACHED/regtest/chainstate"
+if RBITCOIN_CACHE="$CACHE" "$SHIM" --print-cmd -datadir="$CACHED" -regtest >/dev/null \
+  && [[ -f "$CACHED/regtest/store/marker" ]] \
+  && grep -q seeded "$CACHED/regtest/store/marker"; then
+  echo "ok - cache store copied into cache-shaped dest"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - cache store copied into cache-shaped dest"
+  FAIL=$((FAIL + 1))
+fi
+
+# Clean chain (no blocks/chainstate) must not receive the 199-block store.
+CLEAN="$WORKDIR/clean-node"
+mkdir -p "$CLEAN"
+if RBITCOIN_CACHE="$CACHE" "$SHIM" --print-cmd -datadir="$CLEAN" -regtest >/dev/null \
+  && [[ ! -e "$CLEAN/regtest/store" ]]; then
+  echo "ok - clean chain is not seeded from cache"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - clean chain is not seeded from cache"
+  FAIL=$((FAIL + 1))
+fi
+
 # Live smoke when a real node binary is on disk (optional in this script).
 REAL=""
 if [[ -n "${RBITCOIN_NODE_REAL:-}" && -x "${RBITCOIN_NODE_REAL}" ]]; then

@@ -511,6 +511,9 @@ impl Query {
         // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
         self.store.height_fence_pop_tip(height);
+        // Ingest first so in-flight Notes for this height exist, then drop.
+        let _ = self.leftover_ingest_apply(None);
+        self.leftover_drop_height(height.0);
         self.store.flush_confirmed_only()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
         // Height index: tip−1 remove when map was current; else rebuild on next ensure.

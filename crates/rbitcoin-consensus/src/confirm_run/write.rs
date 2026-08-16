@@ -111,7 +111,8 @@ pub fn confirm_write_phase(
     // Drain write-behind tx.head overlapping structural + Class C (one inserter).
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns, tip_gc_ns) =
         std::thread::scope(|scope| -> Result<_, ConsensusError> {
-            let drain = scope.spawn(|| query.drain_pending_tx_head());
+            let queued = query.store().txs.take_pending_queued();
+            let drain = scope.spawn(move || query.store().txs.head_insert_queued(&queued));
 
             // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
             // Structural fills meta_by_abs for pure-write annotate (no second body pread).
@@ -149,9 +150,15 @@ pub fn confirm_write_phase(
                     )));
                 }
             }
-            // Happens-after insert *and* fence (Class C already ran). Snap
-            // stays through the ∥ so leftover has a home (67438).
-            query.forget_pending_if_fenced();
+            // Load forgets leftover identity. Write only signals drain+tip.
+            for p in &batch.prepared {
+                query.send_load_inbox(rbitcoin_query::LoadInboxMsg::DrainDone {
+                    height: p.height.0,
+                });
+            }
+            if let Some(tip) = batch.prepared.last().map(|p| p.height.0) {
+                query.send_load_inbox(rbitcoin_query::LoadInboxMsg::TipAdvanced { tip });
+            }
 
             Ok((
                 out,
@@ -251,11 +258,22 @@ pub(super) fn fill_planned_create_layout_after_commit(
         .zip(spent.into_iter())
         .zip(need_pin_i.iter())
     {
+        let mut body = None;
+        let mut spent = None;
         if let Some((off, len)) = range {
             batch_parents.set_body_range_only(fk, (off, len));
+            body = Some((off, len));
         }
         if let Some(sr) = spent_r {
             batch_parents.set_spent_range_only(fk, sr);
+            spent = Some(sr);
+        }
+        if body.is_some() || spent.is_some() {
+            query.send_load_inbox(rbitcoin_query::LoadInboxMsg::LayoutDone {
+                fk,
+                body_range: body,
+                spent_range: spent,
+            });
         }
     }
     Ok(())
@@ -448,6 +466,7 @@ mod records_from_wire_tests {
             time: 0,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             hash: [0u8; 32],
+            prev_mtp: 0,
         }
     }
 

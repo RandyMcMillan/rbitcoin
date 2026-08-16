@@ -22,6 +22,7 @@ fn script_ok_append_contiguous_and_gap() {
             time: 0,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             hash: [hash_byte; 32],
+            prev_mtp: 0,
         }
     }
     fn batch_one(h: u32) -> ScriptOkBatch {
@@ -733,6 +734,7 @@ fn script_wave_skips_preverified_txids() {
         time: 1,
         bits: CompactTarget::from_consensus(0x207f_ffff),
         hash: [1u8; 32],
+        prev_mtp: 0,
     };
     let batch = LoadedBatch {
         prepared: vec![prepared],
@@ -1665,6 +1667,7 @@ fn post_commit_missing_denserels_is_invariant_error() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [2u8; 32],
+        prev_mtp: 0,
     }];
     // Empty BatchParents → get_spender_abs is None.
     let bp = BatchParents::new();
@@ -1752,6 +1755,7 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [4u8; 32],
+        prev_mtp: 0,
     }];
 
     let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
@@ -1875,6 +1879,7 @@ fn load_pin_stamps_spent_range_for_archived_parent() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [4u8; 32],
+        prev_mtp: 0,
     }];
     let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
     ensure_spend_abs_layouts(&q, &mut parents, &prepared).expect("ensure pin-hit");
@@ -2009,6 +2014,7 @@ fn ensure_spend_abs_incomplete_is_invariant_error() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [3u8; 32],
+        prev_mtp: 0,
     }];
     let mut bp = BatchParents::new();
     let err = ensure_spend_abs_layouts(&q, &mut bp, &prepared)
@@ -2138,4 +2144,37 @@ fn structural_pinned_without_abs_is_invariant_error() {
         "unexpected err: {msg}"
     );
     let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn write_mtp_does_not_get_header_plan() {
+    let mtp = include_str!("../block/mod.rs");
+    let start = mtp.find("fn mtp_at(").expect("mtp_at");
+    let body = &mtp[start..start + 600];
+    assert!(
+        body.contains("median_time_past_store"),
+        "write mtp_at must use store+carried, not header-cache median_time_past"
+    );
+    assert!(
+        !body.contains("median_time_past(query"),
+        "write mtp_at must not call get_header_plan via median_time_past"
+    );
+    let phases = include_str!("phases.rs");
+    let post = phases
+        .split("pub(super) fn post_commit")
+        .nth(1)
+        .expect("post_commit");
+    assert!(
+        !post.contains("advance_parent_cache_tip"),
+        "post_commit must not GC header cache; load applies TipAdvanced"
+    );
+    let write = include_str!("write.rs");
+    assert!(
+        !write.contains("advance_parent_cache_tip"),
+        "write must not call advance_parent_cache_tip"
+    );
+    assert!(
+        write.contains("TipAdvanced"),
+        "write signals header GC via TipAdvanced inbox"
+    );
 }

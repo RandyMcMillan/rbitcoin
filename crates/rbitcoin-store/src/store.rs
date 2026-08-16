@@ -541,11 +541,14 @@ impl Store {
         spending_tx_fk: Fk,
         _spending_input_index: u32,
     ) -> Result<Fk, StoreError> {
-        let create_fk = self
-            .txs
-            .get_by_txid(out_txid)?
-            .map(|(fk, _)| fk)
-            .ok_or(StoreError::NotFound)?;
+        let create_fk = if let Some(fk) = self.txs.queued_pending_fk(out_txid) {
+            fk
+        } else {
+            self.txs
+                .get_by_txid(out_txid)?
+                .map(|(fk, _)| fk)
+                .ok_or(StoreError::NotFound)?
+        };
         self.put_spend_create(create_fk, out_index, spending_tx_fk)?;
         Ok(spending_tx_fk)
     }
@@ -2145,7 +2148,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Write-behind: TipOnly resolve hits the pending map before `tx.head` drain.
+    /// RPC TipOnly misses write-behind until drain. Confirm leftover is load-owned.
     #[test]
     fn get_fk_by_txid_tip_hits_pending_before_head_drain() {
         let dir = tmp();
@@ -2159,7 +2162,11 @@ mod tests {
             .unwrap();
         s.txs.head_note_pending(&[([0x51; 32], fks[0])]);
         s.rebuild_height_fence().unwrap();
-        assert_eq!(s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(), Some(fks[0]));
+        assert_eq!(
+            s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(),
+            None,
+            "pre-drain TipOnly is durable head only"
+        );
         assert_eq!(s.txs.head_drain_pending().unwrap(), 1);
         assert_eq!(s.get_fk_by_txid_tip(&[0x51; 32]).unwrap(), Some(fks[0]));
         let _ = std::fs::remove_dir_all(&dir);

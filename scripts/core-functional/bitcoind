@@ -21,6 +21,7 @@ from pathlib import Path
 
 from map_debuglog import apply_line, load_rules
 from rpc_proxy import RpcProxy, node_rpc_port
+from rpc_util import register_utility
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -361,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
         return line or None
 
     proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
+    register_utility(proxy)
     try:
         proxy.start()
     except OSError as e:

@@ -21,6 +21,13 @@ from typing import Any, Callable
 FORWARD_TIMEOUT_S = 180.0
 
 
+class RpcError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class RpcProxy:
     """HTTP JSON-RPC server that forwards to an internal rbitcoin-node."""
 
@@ -106,6 +113,12 @@ class RpcProxy:
         if local is not None:
             try:
                 result = local(params)
+            except RpcError as e:
+                return {
+                    "result": None,
+                    "error": {"code": e.code, "message": e.message},
+                    "id": req_id,
+                }
             except Exception as e:  # noqa: BLE001 — surface as RPC error
                 return {
                     "result": None,

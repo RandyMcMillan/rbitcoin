@@ -196,11 +196,6 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     let _ = stderr.flush();
 }
 
-/// Crate identity for diagnostics and coverage scenarios.
-pub fn crate_name() -> &'static str {
-    "rbitcoin-log"
-}
-
 /// Log an error-level line.
 #[macro_export]
 macro_rules! error {
@@ -313,11 +308,6 @@ mod tests {
     #[test]
     fn style_default_is_plain() {
         assert_eq!(Style::default(), Style::Plain);
-    }
-
-    #[test]
-    fn crate_name_stable() {
-        assert_eq!(crate_name(), "rbitcoin-log");
     }
 
     #[test]

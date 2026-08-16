@@ -125,17 +125,13 @@ pub use error::ConsensusError;
 pub use header::{expected_next_bits, median_time_past, validate_header};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
-pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
+pub use policy::PolicyResult;
 pub use regtest_pad::{mine_empty_regtest, mine_regtest_paying, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{
     backfill_sp_tweaks, backfill_sp_tweaks_cancellable, tweak_from_tx, tweaks_at_height,
     tweaks_for_height, tweaks_from_thin_and_body, TaprootOut, TxTweak,
 };
-
-pub fn crate_name() -> &'static str {
-    "rbitcoin-consensus"
-}
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
@@ -867,8 +863,7 @@ mod coverage_tests {
     }
 
     #[test]
-    fn crate_name_and_phase_stats() {
-        assert_eq!(crate_name(), "rbitcoin-consensus");
+    fn last_write_phase_stats() {
         use confirm_phase_stats::*;
         note_last_write(LastWritePhases {
             n_blocks: 2,

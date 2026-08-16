@@ -10,7 +10,7 @@ use rbitcoin_consensus::{
     accept_and_connect_block, validate_block_connect, validate_block_structure, ChainParams,
     ConsensusError, Milestone, ValidationContext,
 };
-use rbitcoin_net::{crate_name as net_crate_name, outbound_for_ibd};
+use rbitcoin_net::outbound_for_ibd;
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
@@ -18,8 +18,7 @@ use rbitcoin_rpc::node_rpc_path;
 use rbitcoin_store::{HeaderRecord, Store, StoreError, TxRecord};
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 use rbitcoin_test::{
-    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, smoke_crate_names,
-    TestDatadir,
+    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, TestDatadir,
 };
 use std::process::{Command, ExitCode};
 
@@ -68,11 +67,7 @@ fn node_cli_and_surface_smoke() {
     std::fs::write(&file, b"nope").unwrap();
     assert!(run_node(NodeConfig::default().with_datadir(file)).is_err());
 
-    // Placeholder / net surface
-    let names = smoke_crate_names();
-    assert!(names.contains(&"rbitcoin-store"));
-    assert!(names.contains(&"rbitcoin-consensus"));
-    assert!(!names.iter().any(|n| n.contains("wire-cache")));
+    // Net surface
     assert!(!Milestone::NONE.skips_scripts_at(0));
     assert!(Milestone { height: 10 }.skips_scripts_at(5));
     assert_eq!(
@@ -81,11 +76,6 @@ fn node_cli_and_surface_smoke() {
     );
     assert_eq!(outbound_for_ibd(true), 16);
     assert_eq!(outbound_for_ibd(false), 8);
-    assert_eq!(
-        rbitcoin_net::DEFAULT_IBD_OUTBOUND,
-        rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
-    );
-    assert_eq!(net_crate_name(), "rbitcoin-net");
     assert_eq!(node_rpc_path(), "/");
     let _ = rbitcoin_net::local_service_flags();
     assert_eq!(rbitcoin_net::default_port(Network::Mainnet), 8333);

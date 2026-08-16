@@ -13,15 +13,3 @@ pub use server::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_SCRIPTHASH_SUBS,
 };
-
-pub fn crate_name() -> &'static str {
-    "rbitcoin-electrum"
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_stable() {
-        assert_eq!(crate::crate_name(), "rbitcoin-electrum");
-    }
-}

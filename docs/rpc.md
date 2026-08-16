@@ -40,6 +40,16 @@ curl --user u:p --data-binary \
   -H 'content-type: application/json' http://127.0.0.1:8332/
 ```
 
+### rbitcoin-cli
+
+Same datadir cookie, or `--rpcuser` / `--rpcpassword`. Default
+`127.0.0.1:8332`. Prints the JSON-RPC `result` (strings unquoted).
+
+```bash
+rbitcoin-cli --datadir datadir getblockcount
+rbitcoin-cli --rpcuser u --rpcpassword p --rpcport 8332 getblockchaininfo
+```
+
 ## shindex matrix
 
 | Capability | `shindex=0` (default) | `shindex=1` |
@@ -62,9 +72,9 @@ still wait for durable SH when shindex is on.
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. **`getblockchaininfo` placeholders (not computed, not a plan to fill):** `chainwork` is `""`, `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. Use `blocks` / `initialblockdownload` / `difficulty`. |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
 | `getdifficulty` | From tip bits |
-| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table |
+| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `version` is rbitcoin semver as a Core integer (`0.1.0` → `100`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2` |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
-| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub |
+| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`) |
 | `getrawtransaction` | Class A + mempool |
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |

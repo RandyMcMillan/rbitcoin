@@ -3,12 +3,12 @@
 //! Policy checks may reject mempool acceptance. They must **never** be invoked
 //! from block connect / confirm paths.
 //!
-//! # Libre-relay-class admission (plan §3.1)
+//! # Libre-relay-class admission
 //!
-//! Reject only consensus failure, DoS resource limits, and reserved upgrade hooks.
-//! Defaults: **0.1 sat/vB** min relay, **no dust limit**, full RBF, Libre annex.
+//! This is the only mempool admit policy. Reject consensus failure, DoS
+//! resource limits, and reserved upgrade hooks. Defaults: **0.1 sat/vB**
+//! min relay, **no dust limit**, full RBF, Libre annex.
 
-use bitcoin::script::Script;
 use bitcoin::Transaction;
 
 /// Minimum relay feerate: **0.1 sat/vB** = 100 sat/kvB.
@@ -34,67 +34,7 @@ impl PolicyResult {
     }
 }
 
-/// True if `script` is push-only (BIP62 / IsPushOnly).
-pub fn is_push_only(script: &Script) -> bool {
-    use bitcoin::script::Instruction;
-    for ins in script.instructions() {
-        match ins {
-            Ok(Instruction::PushBytes(_)) => {}
-            Ok(Instruction::Op(op)) => {
-                let n = op.to_u8();
-                // OP_0 and OP_1..OP_16 are push-like.
-                if n == 0x00 || (0x4f..=0x60).contains(&n) {
-                    continue;
-                }
-                return false;
-            }
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
-/// Coarse **Core-style** standardness of a scriptPubKey (not used for Libre admit).
-pub fn is_standard_script_pubkey(script: &Script) -> PolicyResult {
-    let b = script.as_bytes();
-    if b.is_empty() {
-        return PolicyResult::NonStandard("empty scriptPubKey");
-    }
-    if b == [0x51] {
-        return PolicyResult::NonStandard("op_true");
-    }
-    if (b.len() == 22 && b[0] == 0x00 && b[1] == 0x14)
-        || (b.len() == 34 && b[0] == 0x00 && b[1] == 0x20)
-        || (b.len() == 34 && b[0] == 0x51 && b[1] == 0x20)
-        || (b.len() == 25 && b[0] == 0x76 && b[1] == 0xa9)
-        || (b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14)
-    {
-        return PolicyResult::Standard;
-    }
-    PolicyResult::NonStandard("nonstandard scriptPubKey")
-}
-
-/// Lightweight whole-tx **Core-style** standardness stub.
-pub fn check_tx_standard(tx: &Transaction) -> PolicyResult {
-    for inp in &tx.input {
-        if !inp.previous_output.is_null() && !is_push_only(inp.script_sig.as_script()) {
-            return PolicyResult::NonStandard("scriptSig not push-only");
-        }
-    }
-    for out in &tx.output {
-        let r = is_standard_script_pubkey(out.script_pubkey.as_script());
-        if !r.is_standard() {
-            let b = out.script_pubkey.as_bytes();
-            if !b.is_empty() && b[0] == 0x6a {
-                continue;
-            }
-            return r;
-        }
-    }
-    PolicyResult::Standard
-}
-
-// ── Libre-relay-class admission ─────────────────────────────────────────────
+// ── Libre-relay-class admission (the only mempool admit policy) ─────────────
 
 /// Virtual size in vbytes: `(weight + 3) / 4`.
 #[inline]
@@ -195,23 +135,6 @@ mod tests {
     use bitcoin::{OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
     #[test]
-    fn push_only_and_templates() {
-        let mut push = vec![0x00, 0x14];
-        push.extend_from_slice(&[0u8; 20]);
-        assert!(is_push_only(ScriptBuf::from_bytes(push).as_script()));
-        assert!(!is_push_only(ScriptBuf::from_bytes(vec![0x76]).as_script()));
-        let p2wpkh = {
-            let mut v = vec![0x00, 0x14];
-            v.extend_from_slice(&[0u8; 20]);
-            ScriptBuf::from_bytes(v)
-        };
-        assert!(is_standard_script_pubkey(p2wpkh.as_script()).is_standard());
-        assert!(
-            !is_standard_script_pubkey(ScriptBuf::from_bytes(vec![0x51]).as_script()).is_standard()
-        );
-    }
-
-    #[test]
     fn min_relay_fee_point_one_sat_vb() {
         // 1000 vB → weight 4000; 0.1 sat/vB → 100 sat min.
         assert!(meets_min_relay_fee(100, 4000));
@@ -284,69 +207,6 @@ mod tests {
     fn policy_result_is_ok_alias() {
         assert!(PolicyResult::Standard.is_ok());
         assert!(!PolicyResult::NonStandard("x").is_ok());
-    }
-
-    #[test]
-    fn push_only_allows_op_n_and_rejects_decode_error() {
-        // OP_1NEGATE (0x4f) and OP_1 (0x51) are push-like.
-        assert!(is_push_only(
-            ScriptBuf::from_bytes(vec![0x4f, 0x51]).as_script()
-        ));
-        // Truncated push: instruction decode fails → not push-only.
-        assert!(!is_push_only(
-            ScriptBuf::from_bytes(vec![0x02, 0xaa]).as_script()
-        ));
-        // OP_CHECKSIG is not push-only.
-        assert!(!is_push_only(ScriptBuf::from_bytes(vec![0xac]).as_script()));
-    }
-
-    #[test]
-    fn standard_script_pubkey_templates_and_rejects() {
-        assert_eq!(
-            is_standard_script_pubkey(ScriptBuf::new().as_script()),
-            PolicyResult::NonStandard("empty scriptPubKey")
-        );
-        // P2WSH
-        let mut p2wsh = vec![0x00, 0x20];
-        p2wsh.extend([0u8; 32]);
-        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2wsh).as_script()).is_standard());
-        // P2TR
-        let mut p2tr = vec![0x51, 0x20];
-        p2tr.extend([0u8; 32]);
-        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2tr).as_script()).is_standard());
-        // P2PKH
-        let mut p2pkh = vec![0x76, 0xa9, 0x14];
-        p2pkh.extend([0u8; 20]);
-        p2pkh.extend([0x88, 0xac]);
-        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2pkh).as_script()).is_standard());
-        // P2SH
-        let mut p2sh = vec![0xa9, 0x14];
-        p2sh.extend([0u8; 20]);
-        p2sh.push(0x87);
-        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2sh).as_script()).is_standard());
-        // Bare OP_NOP
-        assert_eq!(
-            is_standard_script_pubkey(ScriptBuf::from_bytes(vec![0x61]).as_script()),
-            PolicyResult::NonStandard("nonstandard scriptPubKey")
-        );
-    }
-
-    #[test]
-    fn check_tx_standard_scriptsig_and_op_return() {
-        // Non-push scriptSig on non-coinbase → NonStandard.
-        let mut tx = bare_tx(1);
-        tx.input[0].script_sig = ScriptBuf::from_bytes(vec![0xac]);
-        assert_eq!(
-            check_tx_standard(&tx),
-            PolicyResult::NonStandard("scriptSig not push-only")
-        );
-        // OP_RETURN outputs allowed even when nonstandard template.
-        let mut ok = bare_tx(1);
-        ok.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0xff]);
-        assert!(check_tx_standard(&ok).is_standard());
-        // Empty OP_TRUE was already nonstandard under Core-style; OP_TRUE alone rejected.
-        let bad = bare_tx(1);
-        assert!(!check_tx_standard(&bad).is_standard());
     }
 
     #[test]

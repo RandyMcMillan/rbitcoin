@@ -2004,10 +2004,6 @@ pub struct MerkleProof {
     pub merkle: Vec<[u8; 32]>,
 }
 
-pub fn crate_name() -> &'static str {
-    "rbitcoin-query"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2103,9 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn crate_name_and_sampler_stats() {
-        assert_eq!(crate_name(), "rbitcoin-query");
-
+    fn sampler_stats() {
         // Process-global IBD samplers race under parallel `cargo test`. Prefer
         // last-writer overwrite checks and accumulate lower-bounds over exact
         // equality on counters other tests may also bump.

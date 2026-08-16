@@ -9,6 +9,22 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **`rbitcoin-cli`:** cookie / `--rpcuser` HTTP client for the documented
+  JSON-RPC subset (plain HTTP, same as the node).
+- **`--maxinbound`:** passed into `P2PNode` as a field. `RBITCOIN_P2P_MAX_INBOUND`
+  is parse-time input only (no `set_var`).
+- **`getnetworkinfo` / `getmempoolinfo`:** `version` is rbitcoin (`0.1.0` →
+  `100`); `localservices` match advertised flags; `maxmempool` is the hub
+  weight budget.
+
+### Removed
+
+- Unused Core-style `check_tx_standard` (admit is Libre only).
+- Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
+- `crate_name()` / `smoke_crate_names` coverage theater.
+
 ### Added
 
 - **Core functional coverage:** analog scenarios for `--milestone` skip-below /

@@ -17,15 +17,3 @@ pub use server::{
     DEFAULT_MAX_TRACK_TXS, DEFAULT_MAX_WS_CONNECTIONS, DEFAULT_MAX_WS_MESSAGE_BYTES,
 };
 pub use tx_json::{build_tx_json, tx_status_json};
-
-pub fn crate_name() -> &'static str {
-    "rbitcoin-esplora"
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_stable() {
-        assert_eq!(crate::crate_name(), "rbitcoin-esplora");
-    }
-}

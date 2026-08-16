@@ -212,9 +212,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let p2p_ua =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
             .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let mut node = P2PNode::start_with_agent(listen, query, params.clone(), milestone, p2p_ua)
-        .await
-        .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    let mut node = P2PNode::start_with_agent(
+        listen,
+        query,
+        params.clone(),
+        milestone,
+        p2p_ua,
+        config.max_inbound as usize,
+    )
+    .await
+    .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
 
     let mempool = MempoolHub::open_with_weight(
         config.mempool_path(),

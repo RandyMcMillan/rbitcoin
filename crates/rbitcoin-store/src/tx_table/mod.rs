@@ -343,7 +343,7 @@ pub enum SpendMetaBackend {
 
 /// Structural-meta backend from env hierarchy.
 pub fn spend_meta_backend() -> SpendMetaBackend {
-    match crate::io_backend::spend_meta_io_backend() {
+    match crate::io_backend::read_io_backend() {
         crate::io_backend::ReadIoBackend::Uring => SpendMetaBackend::Uring,
         crate::io_backend::ReadIoBackend::Pread => SpendMetaBackend::Pread,
     }
@@ -851,7 +851,7 @@ impl TxTable {
             &self.body,
             &mut jobs,
             BodyMode::Outs,
-            crate::io_backend::pin_io_backend(),
+            crate::io_backend::read_io_backend(),
         )?;
         let body_ns = t_body.elapsed().as_nanos() as u64;
         let secret = self.store_secret();

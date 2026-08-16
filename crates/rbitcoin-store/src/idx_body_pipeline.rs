@@ -2,7 +2,7 @@
 //!
 //! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
 //! fd pread). Body backend from
-//! [`crate::io_backend::pin_io_backend`] (global
+//! [`crate::io_backend::read_io_backend`] (global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!
 //! **Concurrency:** read-only on published ranges; prep + confirm-load may run
@@ -81,7 +81,7 @@ pub fn run_idx_body_pipeline(
     jobs: &mut [IdxBodyJob],
     mode: BodyMode,
 ) -> Result<(), StoreError> {
-    run_idx_body_pipeline_backend(table, jobs, mode, io_backend::pin_io_backend())
+    run_idx_body_pipeline_backend(table, jobs, mode, io_backend::read_io_backend())
 }
 
 /// Like [`run_idx_body_pipeline`] with an explicit body backend (tests / tools).

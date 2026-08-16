@@ -513,7 +513,8 @@ fn method_help(m: &str) -> String {
         }
         "getblocktemplate" => "getblocktemplate (template_request)\n\
              All networks. Template from select_block_txs; proposal validates \
-             without connecting. rules must include segwit. No BIP9 testdummy."
+             without connecting. rules must include segwit. longpollid waits \
+             for a new tip or mempool/priority change. No BIP9 testdummy."
             .into(),
         "getmininginfo" => "getmininginfo\nTip height, difficulty, pooledtx. All networks.".into(),
         "prioritisetransaction" => {
@@ -1907,13 +1908,57 @@ fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         .and_then(Value::as_str)
         .unwrap_or("template");
     match mode {
-        "template" | "" => gbt_template(ctx),
+        "template" | "" => {
+            if let Some(lp) = req
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("longpollid"))
+                .and_then(Value::as_str)
+            {
+                gbt_longpoll_wait(ctx, lp);
+            }
+            gbt_template(ctx)
+        }
         "proposal" => gbt_proposal(ctx, req),
         other => Err(rpc_error(
             ERR_INVALID_PARAMETER,
             format!("Invalid mode: {other}"),
         )),
     }
+}
+
+/// Core GBT longpoll: block while `longpollid` still matches the live tip +
+/// mempool update counter. Tip change (P2P / generate) wakes within one poll
+/// tick. A new mempool tx or `prioritisetransaction` does too.
+fn gbt_longpoll_wait(ctx: &RpcContext, want: &str) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+    loop {
+        if ctx.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if gbt_longpoll_id(ctx) != want {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
+fn gbt_longpoll_id(ctx: &RpcContext) -> String {
+    let tip = if let Some(h) = ctx.query.tip_height() {
+        ctx.query
+            .header_at_height(h)
+            .ok()
+            .flatten()
+            .map(|(_, rec)| hash_hex_display(&rec.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let updates = ctx
+        .mempool
+        .as_ref()
+        .map(|m| m.template_updates())
+        .unwrap_or(0);
+    format!("{tip}{updates}")
 }
 
 fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
@@ -1992,12 +2037,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         }));
     }
     let subsidy = rbitcoin_consensus::block_subsidy(next_h, &params) as u64;
-    let pooled = ctx
-        .mempool
-        .as_ref()
-        .map(|m| m.list_live_meta().len())
-        .unwrap_or(0);
-    let longpollid = format!("{prev_hex}{pooled}");
+    let longpollid = gbt_longpoll_id(ctx);
     let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
     Ok(json!({
         "capabilities": ["proposal"],
@@ -3402,6 +3442,16 @@ mod tests {
         let txs = tmpl["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0]["txid"], tid);
+        let lp1 = tmpl["longpollid"].as_str().unwrap().to_string();
+        let tmpl2 = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+        assert_eq!(tmpl2["longpollid"], lp1);
+        let stale = dispatch(
+            &ctx,
+            "getblocktemplate",
+            vec![json!({"rules": ["segwit"], "longpollid": "not-this-id"})],
+        )
+        .unwrap();
+        assert_eq!(stale["longpollid"], lp1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -80,7 +80,8 @@ before 1.0).
 
 - **`getblocktemplate` / `getmininginfo`:** template from the selector on
   every network. `rules` must include `segwit`. Proposal validates without
-  connecting. No BIP9 testdummy version bit.
+  connecting. No BIP9 testdummy version bit. `longpollid` waits for a new
+  tip or a mempool/priority update (same production template).
 
 - **`prioritisetransaction`:** additive i64 sat fee delta by txid (even if
   not in the mempool). Dummy must be 0. Selector / generate / GBT rank by

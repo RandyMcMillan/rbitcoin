@@ -276,6 +276,8 @@ pub struct MempoolHub {
     unbroadcast: Mutex<HashSet<Txid>>,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
     fee_deltas: Mutex<HashMap<Txid, i64>>,
+    /// Monotonic template generation (admit / remove / prioritise). GBT longpoll.
+    template_updates: AtomicU64,
 }
 
 impl MempoolHub {
@@ -333,6 +335,7 @@ impl MempoolHub {
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(HashSet::new()),
             fee_deltas: Mutex::new(HashMap::new()),
+            template_updates: AtomicU64::new(0),
         };
         hub.reindex_live_scripthashes();
         Ok(Arc::new(hub))
@@ -728,6 +731,7 @@ impl MempoolHub {
                     .cloned()
                     .unwrap_or_default();
                 self.publish_announce(&r, shs);
+                self.note_template_update();
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -946,6 +950,7 @@ impl MempoolHub {
         let n = g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0);
         drop(g);
         if n > 0 {
+            self.note_template_update();
             let mut deltas = self.fee_deltas.lock().unwrap();
             for tid in txids {
                 self.unindex_txid(tid);
@@ -991,6 +996,17 @@ impl MempoolHub {
         if *e == 0 {
             m.remove(&txid);
         }
+        drop(m);
+        self.note_template_update();
+    }
+
+    fn note_template_update(&self) {
+        self.template_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Generation for `getblocktemplate.longpollid` (Core `nTransactionsUpdated`).
+    pub fn template_updates(&self) -> u64 {
+        self.template_updates.load(Ordering::Relaxed)
     }
 
     /// Snapshot of non-zero deltas for `getprioritisedtransactions`.

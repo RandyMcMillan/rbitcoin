@@ -54,6 +54,6 @@ is retired ([`store-format.md`](./store-format.md)).
 | **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **2-wave** hot then cold). Hits live on the BQ record. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
 | **load** | Stamp from BQ hits + in-flight / pins, then leftover: **load-owned pending (no fence)** then TipOnly (connected head). Pins `txout` by stamped range. In-flight holds planned creates until `covers_fk_span`. |
 | **scripts** | No store. |
-| **write** | Sole Class A appender; `head_insert_many` write-behind. Drain ∥ Class C. Write queued is insert-only. Leftover home is the load `Note` map until drain HWM + fence + height `< pack_lo`. Write never forgets leftover identity (`67438` / n−1). RPC `get_fk_by_txid` hits durable head only until drain. |
+| **write** | Sole Class A appender; `head_insert_many` write-behind. Drain ∥ Class C. Write queued is insert-only. Leftover home is load `txid → fk` until insert-fk HWM + fence + `height < tip+1`. Write never forgets leftover identity (`67438` / n−1). RPC `get_fk_by_txid` hits durable head only until drain. |
 
 Roles and locks: [`concurrency.md`](./concurrency.md).

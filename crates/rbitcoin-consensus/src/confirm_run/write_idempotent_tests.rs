@@ -2174,11 +2174,11 @@ fn write_mtp_does_not_get_header_plan() {
         "write must not call advance_parent_cache_tip"
     );
     assert!(
-        write.contains("note_head_drain_through"),
-        "write publishes drain HWM after insert, not DrainDone messages"
+        write.contains("note_head_drain_fk"),
+        "write publishes drain-fk HWM after insert"
     );
     assert!(
-        !write.contains("LoadInboxMsg"),
-        "write inbox is Note-only (from Class A); no DrainDone/Tip/Layout"
+        !write.contains("send_leftover_notes"),
+        "write does not send leftover notes (Class A does)"
     );
 }

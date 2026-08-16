@@ -112,6 +112,7 @@ pub fn confirm_write_phase(
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns, tip_gc_ns) =
         std::thread::scope(|scope| -> Result<_, ConsensusError> {
             let queued = query.store().txs.take_pending_queued();
+            let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
             let drain = scope.spawn(move || query.store().txs.head_insert_queued(&queued));
 
             // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
@@ -150,9 +151,9 @@ pub fn confirm_write_phase(
                     )));
                 }
             }
-            // Insert finished. Load polls this HWM (not tip/fence — 67438).
-            if let Some(h) = batch.prepared.last().map(|p| p.height.0) {
-                query.note_head_drain_through(h);
+            // Insert finished. Load polls this fk HWM (not tip/fence — 67438).
+            if let Some(fk) = drain_max_fk {
+                query.note_head_drain_fk(fk);
             }
 
             Ok((

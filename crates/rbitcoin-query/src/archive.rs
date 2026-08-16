@@ -783,14 +783,9 @@ impl Query {
     /// Drains write-behind `tx.head` before return. Confirm write uses
     /// [`Self::archive_commit_plan_defer_head`] to overlap drain with Class C.
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<bool, QueryError> {
-        let note_h = self
-            .tip_height()
-            .map(|h| h.0.saturating_add(1))
-            .unwrap_or(0);
         let committed = self.archive_commit_plan_defer_head(plan)?;
         if committed {
             let _ = self.drain_pending_tx_head()?;
-            self.note_head_drain_through(note_h);
         }
         Ok(committed)
     }
@@ -842,17 +837,9 @@ impl Query {
                 .zip(got_tx_fks.iter())
                 .map(|((pin, _), fk)| (pin.0.txid, *fk))
                 .collect();
-            self.store.txs.head_drain_pending_if_full()?;
+            self.drain_pending_tx_head_if_full()?;
             self.store.txs.head_note_pending(&heads);
-            // Load leftover home is the inbox map, not the store snap.
-            let height = self
-                .tip_height()
-                .map(|h| h.0.saturating_add(1))
-                .unwrap_or(0);
-            self.send_load_inbox(crate::LoadInboxMsg::Note {
-                height,
-                entries: heads,
-            });
+            self.send_leftover_notes(heads);
         }
         let head_ns = t.elapsed().as_nanos() as u64;
 
@@ -885,23 +872,35 @@ impl Query {
 
     /// Drain write-behind `tx.head` inserts (page-grouped).
     ///
-    /// Insert only. Load forgets leftover identity after drain HWM + fence.
+    /// Insert queued `tx.head` and publish drain-fk HWM.
     pub fn drain_pending_tx_head(&self) -> Result<u64, QueryError> {
-        self.store.txs.head_drain_pending()
+        let batch = self.store.txs.take_pending_queued();
+        let n = self.store.txs.head_insert_queued(&batch)?;
+        if let Some(max_fk) = batch.iter().filter_map(|(_, fk)| fk.get()).max() {
+            self.note_head_drain_fk(max_fk);
+        }
+        Ok(n)
+    }
+
+    fn drain_pending_tx_head_if_full(&self) -> Result<(), QueryError> {
+        if self.store.txs.pending_head_is_full() {
+            self.drain_pending_tx_head()?;
+        }
+        Ok(())
     }
 
     /// Load-owned leftover forget helper (tests / tip-follow). Production
     /// leftover bind forgets after each pack.
     pub fn leftover_forget(&self, pack_lo: u32) {
         let fence = self.store.height_fence_snapshot();
-        let drain = self.head_drain_through_excl();
+        let drain = self.head_drain_fk();
         self.load_inbox
             .with_pending_mut(|p| p.forget_ready(&fence, pack_lo, drain));
     }
 
-    /// Drop leftover notes for a disconnected height (not a forget-if-fenced).
-    pub fn leftover_drop_height(&self, height: u32) {
-        self.load_inbox.with_pending_mut(|p| p.drop_height(height));
+    /// Disconnect: evict leftover notes for these create txids.
+    pub fn leftover_drop_txids(&self, txids: impl IntoIterator<Item = [u8; 32]>) {
+        self.load_inbox.with_pending_mut(|p| p.drop_txids(txids));
     }
 
     /// Resolve prev outpoint txid for an input.
@@ -1240,13 +1239,6 @@ mod tests {
     /// stamps without height_of and without `head_note_pending` (950545).
     #[test]
     fn leftover_binds_load_owned_pending() {
-        leftover_stamps_pending_parent_without_fence();
-    }
-
-    /// After commit, parent is pending (not fence-connected). Leftover must
-    /// stamp from pending without height_of (950545).
-    #[test]
-    fn leftover_stamps_pending_parent_without_fence() {
         let (dir, q) = temp_query("leftover-pending");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let empty = crate::InFlightView::empty();
@@ -1288,6 +1280,45 @@ mod tests {
     }
 
     #[test]
+    fn leftover_noted_fk_without_body_is_corrupt() {
+        let (dir, q) = temp_query("leftover-note-nobody");
+        let empty = crate::InFlightView::empty();
+        let parent_txid = [0xABu8; 32];
+        q.send_leftover_notes(vec![(parent_txid, Fk(9_999_999))]);
+        q.leftover_on_load_pack().unwrap();
+        let child = TxApply {
+            tx: TxRecord {
+                txid: [0xCDu8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(Fk(1), vec![child])];
+        let err = q
+            .archive_plan_batch_from(&mut need, 1, &empty)
+            .expect_err("noted fk without body");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leftover note has no body_range"),
+            "got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn leftover_keeps_prev_pack_after_drain_done() {
         let (dir, q) = temp_query("leftover-keep-prev");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
@@ -1300,9 +1331,8 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.note_head_drain_through(0);
         q.leftover_on_load_pack().unwrap();
-        // pack_lo=1 after leftover of a height-1 child: bind first (keep), then drop.
+        // Commit published drain-fk HWM. pack_lo of a height-1 child is tip+1.
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xea;
         let child = TxApply {
@@ -1436,7 +1466,6 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.note_head_drain_through(0);
         q.leftover_on_load_pack().unwrap();
         q.leftover_forget(1);
         // Load map dropped height 0; leftover must TipOnly the connected head.

@@ -1680,9 +1680,13 @@ impl TxTable {
         self.pending_head.len()
     }
 
+    pub fn pending_head_is_full(&self) -> bool {
+        self.pending_head.len() >= PENDING_HEAD_CAP
+    }
+
     /// Bound write-behind: drain if the queue is at/over [`PENDING_HEAD_CAP`].
     pub fn head_drain_pending_if_full(&self) -> Result<(), StoreError> {
-        if self.pending_head.len() >= PENDING_HEAD_CAP {
+        if self.pending_head_is_full() {
             self.head_drain_pending()?;
         }
         Ok(())

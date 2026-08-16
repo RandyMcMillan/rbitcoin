@@ -483,8 +483,10 @@ impl Query {
 
         // 1. Scripthash unlink only — do **not** clear strong yet.
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
+        let mut leftover_txids = Vec::with_capacity(tx_fks.len());
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
+            leftover_txids.push(tx.txid);
             if tx.output_count > 0 {
                 let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
                 for (i, o) in outputs.iter().enumerate() {
@@ -511,9 +513,9 @@ impl Query {
         // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
         self.store.height_fence_pop_tip(height);
-        // Ingest first so in-flight Notes for this height exist, then drop.
+        // Ingest first so in-flight Notes exist, then drop this block's txids.
         let _ = self.leftover_on_load_pack();
-        self.leftover_drop_height(height.0);
+        self.leftover_drop_txids(leftover_txids);
         self.store.flush_confirmed_only()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
         // Height index: tip−1 remove when map was current; else rebuild on next ensure.

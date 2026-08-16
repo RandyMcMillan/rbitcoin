@@ -1140,8 +1140,6 @@ impl TxTable {
                 offset: abs_offs[i],
                 buf: slice,
                 result: i32::MIN,
-                // Confirm write-stage meta: same pages as load pin — do not DONTCACHE.
-                dontcache: false,
             });
         }
         bulk_io::pread_batch_backend(&mut ops, backend);

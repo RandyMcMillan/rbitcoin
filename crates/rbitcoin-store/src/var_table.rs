@@ -309,8 +309,8 @@ impl VarTable {
         self.write_body_abs(abs_offset, data)
     }
 
-    /// Class A body payload write via bulk `WriteOp` (no RWF_DONTCACHE — permanent
-    /// spend-only policy). Falls back to plain pwrite when uring is unavailable.
+    /// Class A body payload write via bulk `WriteOp`. Falls back to plain pwrite
+    /// when uring is unavailable.
     pub(crate) fn write_body_blob_bulk(
         &self,
         start: u64,
@@ -328,7 +328,6 @@ impl VarTable {
             offset: start,
             buf: body_blob,
             result: i32::MIN,
-            dontcache: false,
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
@@ -375,7 +374,6 @@ pub(crate) fn write_prepared_bodies_one_wave(
             offset: prep.start,
             buf: prep.body_blob.as_slice(),
             result: i32::MIN,
-            dontcache: false,
         });
     }
     if !ops.is_empty() {
@@ -626,12 +624,12 @@ impl VarTable {
         Ok(n)
     }
 
-    /// Class A body pread via bulk_io (never RWF_DONTCACHE — permanent spend-only policy).
+    /// Class A body pread via bulk_io.
     fn read_body_bulk(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         if buf.is_empty() {
             return Ok(());
         }
-        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf, false);
+        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf);
         if rc < 0 {
             return Err(StoreError::io(
                 self.body.path(),

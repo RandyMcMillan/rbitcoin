@@ -139,7 +139,7 @@ impl TxidBody {
         Ok(())
     }
 
-    /// Read txid for create_fk (bulk pread; no RWF_DONTCACHE).
+    /// Read txid for create_fk (bulk pread).
     pub fn get(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let n = self.count();
@@ -148,7 +148,7 @@ impl TxidBody {
         }
         let off = Self::entry_offset(id)?;
         let mut buf = [0u8; 32];
-        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut buf, false);
+        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut buf);
         if rc < 0 {
             return Err(StoreError::io(
                 self.file.path(),
@@ -174,7 +174,7 @@ impl TxidBody {
         let count = (last - first + 1) as usize;
         let off = Self::entry_offset(first)?;
         let mut blob = vec![0u8; count * 32];
-        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob, false);
+        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob);
         if rc < 0 {
             return Err(StoreError::io(
                 self.file.path(),
@@ -307,7 +307,6 @@ impl TxidBody {
                         offset: off,
                         buf: slice,
                         result: i32::MIN,
-                        dontcache: false,
                     });
                 }
                 used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);

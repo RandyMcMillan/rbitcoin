@@ -395,12 +395,8 @@ impl TxIdx {
                 continue;
             }
             page_buf[..want].fill(0);
-            let rc = crate::bulk_io::pread_single(
-                seg.file.read_fd(),
-                page_off,
-                &mut page_buf[..want],
-                false,
-            );
+            let rc =
+                crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page_buf[..want]);
             if rc < 0 {
                 return Err(StoreError::io(
                     seg.file.path(),
@@ -510,7 +506,6 @@ impl TxIdx {
                     offset: *page_off,
                     buf: slice,
                     result: i32::MIN,
-                    dontcache: false,
                 });
             }
             bulk_io::pread_batch_backend(&mut ops, backend);
@@ -1011,7 +1006,6 @@ fn read_start(seg: &Segment, i: u64) -> Result<u64, StoreError> {
 }
 
 /// Read slots `[i0..=i1]` via OS-page-aligned preads (one read per page).
-/// Idx peeks never set RWF_DONTCACHE (spend-pwrite only).
 fn read_starts_page_aligned(
     seg: &Segment,
     i0: u64,
@@ -1031,7 +1025,7 @@ fn read_starts_page_aligned(
             break;
         }
         let mut page = vec![0u8; want];
-        let rc = crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page, false);
+        let rc = crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page);
         if rc < 0 {
             return Err(StoreError::io(
                 seg.file.path(),
@@ -1039,7 +1033,7 @@ fn read_starts_page_aligned(
             ));
         }
         if (rc as usize) < want {
-            // Short read — complete via plain pread (no RWF flags).
+            // Short read — complete via plain pread.
             seg.file.read_at(page_off, &mut page)?;
         }
         // Extract slots that fall in this page and in [slot..=i1].
@@ -1423,49 +1417,6 @@ mod tests {
         // New layout lives under tx.idx/
         assert!(dir.join("tx.idx").join("meta").is_file());
         assert!(!dir.join("tx.idx.meta").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Serial `record_start` page loads never set DONTCACHE (permanent spend-only).
-    ///
-    /// Single segment is enough. Soft-span env is locked to avoid parallel races.
-    #[test]
-    fn serial_record_start_never_dontcache() {
-        use crate::bulk_io;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("rbitcoin-txidx-dc-{id}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let _env = tests_soft_span_env_lock();
-        std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "32");
-        let idx = TxIdx::create(&dir, "tx").unwrap();
-        // A few starts; policy does not depend on multi-segment age.
-        idx.append_starts(0, &[16u64, 24, 32, 40]).unwrap();
-        assert!(idx.slot_count() >= 4);
-
-        let _ = bulk_io::test_take_last_read_dontcache();
-        let _ = idx.record_start(1).unwrap();
-        let flags = bulk_io::test_take_last_read_dontcache();
-        assert!(!flags.is_empty(), "record_start must issue bulk page load");
-        assert!(
-            flags.iter().all(|&d| !d),
-            "idx segment reads must not DONTCACHE; got {flags:?}"
-        );
-
-        let _ = bulk_io::test_take_last_read_dontcache();
-        let _ = idx.record_start(4).unwrap();
-        let flags = bulk_io::test_take_last_read_dontcache();
-        assert!(!flags.is_empty());
-        assert!(
-            flags.iter().all(|&d| !d),
-            "tip-adjacent idx slot must not DONTCACHE; got {flags:?}"
-        );
-
-        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
-        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

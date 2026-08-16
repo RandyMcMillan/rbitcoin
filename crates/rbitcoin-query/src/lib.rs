@@ -9,7 +9,6 @@ mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
 mod in_flight;
-mod load_leftover;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -131,7 +130,6 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
-pub use load_leftover::LoadLeftoverPending;
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -986,11 +984,13 @@ pub struct Query {
     reconstruct_archived: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     thin_tweak_body_bytes: AtomicU64,
-    /// Write → load leftover inbox (`Note` only). Load ingests (sole map writer).
-    load_inbox: load_leftover::LoadInbox,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
-    /// — not tip, not fence (those advance during drain; 67438).
+    /// with the fence to prune in-flight **after** bind.
     head_drain_fk: AtomicU64,
+    /// Disconnect height (valid when [`Self::disconnect_gen`] > 0).
+    disconnect_height: AtomicU32,
+    /// Bumped on each [`Self::disconnect_tip`]. Load drops in-flight layers.
+    disconnect_gen: AtomicU64,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1066,8 +1066,9 @@ impl Query {
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
             reconstruct_archived: AtomicU64::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
-            load_inbox: load_leftover::LoadInbox::new(),
             head_drain_fk: AtomicU64::new(0),
+            disconnect_height: AtomicU32::new(0),
+            disconnect_gen: AtomicU64::new(0),
         };
         // Eager height index so first Esplora/P2P mid-chain lookup is hot.
         if let Some(tip) = q.tip_height() {
@@ -1076,11 +1077,6 @@ impl Query {
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
-    }
-
-    /// Write-thread leftover handoff. Never blocks.
-    pub(crate) fn send_leftover_notes(&self, entries: Vec<([u8; 32], Fk)>) {
-        self.load_inbox.send_notes(entries);
     }
 
     /// After `head_insert_many` returned these fks (inclusive max).
@@ -1096,60 +1092,29 @@ impl Query {
         self.head_drain_fk.load(AtomicOrdering::Acquire)
     }
 
-    /// Every load pack: ingest notes, GC header plans to store tip.
-    /// Does **not** forget leftover (that is after bind, or [`Self::leftover_forget`]).
-    pub fn leftover_on_load_pack(&self) -> Result<(), QueryError> {
-        self.load_inbox.ingest()?;
+    /// Record a tip shrink so load can drop in-flight layers for that height.
+    pub(crate) fn note_disconnect_height(&self, height: u32) {
+        self.disconnect_height
+            .store(height, AtomicOrdering::Release);
+        self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
+    }
+
+    /// If `seen_gen` is stale, update it and return the disconnect height.
+    pub fn take_disconnect(&self, seen_gen: &mut u64) -> Option<u32> {
+        let g = self.disconnect_gen.load(AtomicOrdering::Acquire);
+        if g <= *seen_gen {
+            return None;
+        }
+        *seen_gen = g;
+        Some(self.disconnect_height.load(AtomicOrdering::Acquire))
+    }
+
+    /// Every load pack: GC header plans to store tip.
+    pub fn on_load_pack(&self) -> Result<(), QueryError> {
         if let Some(tip) = self.tip_height() {
             self.advance_parent_cache_tip(tip.0);
         }
         Ok(())
-    }
-
-    pub(crate) fn leftover_bind_then_forget(
-        &self,
-        need_head: &[[u8; 32]],
-        pack_lo: u32,
-        resolved: &mut HashMap<[u8; 32], Fk>,
-        leftover_pend: &mut u64,
-        head_hit_n: &mut u64,
-        external_parent_ranges: &mut crate::U64Map<(u64, u64)>,
-        external_parent_txids: &mut crate::U64Map<[u8; 32]>,
-    ) -> Result<Vec<[u8; 32]>, QueryError> {
-        let fence = self.store.height_fence_snapshot();
-        let drain_fk = self.head_drain_fk();
-        let mut still_need = Vec::with_capacity(need_head.len());
-        let mut first_err: Option<QueryError> = None;
-        self.load_inbox.with_pending_mut(|pending| {
-            for t in need_head {
-                if let Some(fk) = pending.fk(t) {
-                    match self.store.txs.body_range(fk) {
-                        Ok(range) => {
-                            *leftover_pend = leftover_pend.saturating_add(1);
-                            resolved.insert(*t, fk);
-                            *head_hit_n = head_hit_n.saturating_add(1);
-                            if let Some(id) = fk.get() {
-                                external_parent_ranges.insert(id, range);
-                                external_parent_txids.insert(id, *t);
-                            }
-                            continue;
-                        }
-                        Err(_) => {
-                            first_err = Some(StoreError::Corrupt(
-                                "invariant: leftover note has no body_range",
-                            ));
-                            return;
-                        }
-                    }
-                }
-                still_need.push(*t);
-            }
-            pending.forget_ready(&fence, pack_lo, drain_fk);
-        });
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        Ok(still_need)
     }
 
     /// Request in-flight confirm to abort cooperative load (IBD SIGINT).

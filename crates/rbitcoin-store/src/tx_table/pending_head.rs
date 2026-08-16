@@ -2,7 +2,7 @@
 //!
 //! Sole Class A appender notes txid→fk after body/idx publish. Drain uses
 //! [`crate::tx_table::TxTable::head_insert_many`]. Leftover identity is
-//! **not** here — load owns that map (`LoadLeftoverPending`).
+//! **not** here — confirm identity is in-flight until drain+fence after bind.
 
 use rbitcoin_primitives::Fk;
 use std::sync::Mutex;

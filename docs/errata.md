@@ -7,8 +7,8 @@ Durable confirm still uses TipOnly (connected instance). See
 
 ## RAM leftover maps: one fk per txid
 
-Pending snap, in-flight `creates`, BQ `parent_hits`, and pipeline pin
-`by_txid` are `txid → one fk` (last write / newest layer). A second
+In-flight `creates`, BQ `parent_hits`, and pipeline pin `by_txid` are
+`txid → one fk` (last write / newest layer). A second
 `create_fk` for the same txid **clobbers** the first in that map. Do
 not stall the pipeline on a second fk (forget cannot run).
 
@@ -19,11 +19,9 @@ acceptable single identity; durable TipOnly still prefers connected.
 **Post-BIP30:** a second *connected* create of the same txid is invalid.
 The only realistic overlap is a **disconnected** Class A sibling (reorg,
 same tx on the new tip) still sitting in a RAM map while the new fk is
-noted. Last-write could hide one of them — a *possible* leftover
+noted. Last-write could hide one of them — a *possible* identity
 visibility hole. Unlikely: both rows stay on disk; TipOnly still picks
-connected; the repeating n−1 `create_fk unresolved` miss is pending
-dropped before open-head TipOnly sees the just-written row, not this
-clobber.
+connected; n−1 is held in in-flight until after the child bind.
 
 Do not grow these maps to `Vec<Fk>` unless a mainnet miss is shown to
 be this case.

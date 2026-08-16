@@ -95,7 +95,7 @@ def check(inventory_path: Path, disk_names: list[str]) -> list[str]:
                 errors.append(f"illegal reason: unknown ({name})")
             elif reason not in VALID_REASONS:
                 errors.append(f"illegal reason: {reason} ({name})")
-            elif reason in ("no-prune", "core-internal", "no-utxo-set"):
+            elif reason in ("no-prune", "core-internal", "no-utxo-set", "rpc-missing"):
                 analog = row.get("analog")
                 if not analog or not str(analog).strip():
                     errors.append(f"missing analog: {name}")

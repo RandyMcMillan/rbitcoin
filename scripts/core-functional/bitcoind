@@ -48,6 +48,25 @@ def read_conf(path: Path) -> dict[str, str]:
     return out
 
 
+def maybe_seed_store(node_dir: Path) -> None:
+    """Copy the rbitcoin 199-block store into a Core cache-shaped datadir.
+
+    Core `_initialize_chain` copies `blocks/` + `chainstate/` then starts the
+    node. Those empty dirs are the signal that this is a cached start, not a
+    clean chain. We never copy Core LevelDB; only our `store/`.
+    """
+    cache = os.environ.get("RBITCOIN_CACHE")
+    if not cache:
+        return
+    src = Path(cache) / "store"
+    dest = node_dir / "store"
+    if dest.exists() or not src.is_dir():
+        return
+    if not ((node_dir / "blocks").is_dir() and (node_dir / "chainstate").is_dir()):
+        return
+    shutil.copytree(src, dest)
+
+
 def find_node() -> Path:
     env = os.environ.get("RBITCOIN_NODE")
     if env:
@@ -140,6 +159,42 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
             "logsourcelocations",
             "nologratelimit",
             "print-cmd",
+            # Core TestNode / MiniWallet extras we do not implement as flags.
+            "whitelist",
+            "persistmempool",
+            "acceptnonstdtxn",
+            "minrelaytxfee",
+            "blocksonly",
+            "peerblockfilters",
+            "txindex",
+            "permitbaremultisig",
+            "testactivationheight",
+            "limitclustercount",
+            "limitclustersize",
+            "limitdescendantcount",
+            "limitancestorcount",
+            "limitdescendantsize",
+            "limitancestorsize",
+            "fastprune",
+            "prune",
+            "minimumchainwork",
+            "txospenderindex",
+            "datacarrier",
+            "datacarriersize",
+            "blockreconstructionextratxn",
+            "maxconnections",
+            "maxuploadtarget",
+            "peertimeout",
+            "rest",
+            "discover",
+            "listenonion",
+            "dnsseed",
+            "forcednsseed",
+            "upnp",
+            "natpmp",
+            "shrinkdebugfile",
+            "daemon",
+            "logtimestamps",
         ):
             pass
         else:
@@ -172,6 +227,7 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
 
     node_dir = datadir / network
     node_dir.mkdir(parents=True, exist_ok=True)
+    maybe_seed_store(node_dir)
 
     node = find_node()
     cmd = [

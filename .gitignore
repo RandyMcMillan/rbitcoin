@@ -24,3 +24,6 @@ mainnet*.log
 signet*.log
 # Live Electrum dump if a node is started in the repo root
 /api.jsonl
+# Generated rbitcoin 199-block store (not Core LevelDB)
+/scripts/core-functional/cache/store/
+/scripts/core-functional/cache/HEIGHT

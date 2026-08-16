@@ -741,12 +741,32 @@ async fn handle_peer_frame(
         NetworkMessage::Block(block) => {
             let hash = block.block_hash();
             pending_cmpct.remove(&hash);
-            if pending_blocks.len() >= MAX_PENDING_BLOCKS && !pending_blocks.contains_key(&hash) {
-                // Bound process RAM for out-of-order tip bodies.
-                *ban_score = ban_score.saturating_add(5);
-            } else {
-                pending_blocks.insert(hash, block.clone());
-                drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+            // Same receive path as RPC submitblock: tip-extend, or park +
+            // most-work reorg. Per-peer pending stays for IBD children.
+            match hub.accept_received_block(block.clone()) {
+                Ok(AcceptOutcome::Accepted { .. }) | Ok(AcceptOutcome::AlreadyHave) => {
+                    pending_blocks.remove(&hash);
+                    pending_headers.remove(&hash);
+                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                }
+                Ok(AcceptOutcome::IgnoredWeaker) => {
+                    if pending_blocks.len() >= MAX_PENDING_BLOCKS
+                        && !pending_blocks.contains_key(&hash)
+                    {
+                        *ban_score = ban_score.saturating_add(5);
+                    } else {
+                        pending_blocks.insert(hash, block.clone());
+                        drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                    }
+                }
+                Err(e) if net_error_is_store_not_found(&e) => {
+                    rbitcoin_log::warn!(
+                        "p2p: accept dropped {hash} (store not found — keep session): {e}"
+                    );
+                }
+                Err(e) => {
+                    rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
+                }
             }
         }
         NetworkMessage::CmpctBlock(cb) => {
@@ -755,6 +775,7 @@ async fn handle_peer_frame(
             if hub.has_block(&hash) {
                 // already have
             } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
+                let _ = hub.accept_received_block(block.clone());
                 pending_blocks.insert(hash, block);
                 drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
             } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
@@ -800,6 +821,7 @@ async fn handle_peer_frame(
             if let Some(pc) = pending_cmpct.remove(&hash) {
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => {
+                        let _ = hub.accept_received_block(block.clone());
                         pending_blocks.insert(hash, block);
                         drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                     }
@@ -944,7 +966,7 @@ fn drain_pending_once(
             if connects {
                 let block = pending_blocks.remove(&h).unwrap();
                 pending_headers.remove(&h);
-                match hub.accept_block(block) {
+                match hub.accept_received_block(block) {
                     Ok(AcceptOutcome::Accepted { .. })
                     | Ok(AcceptOutcome::AlreadyHave)
                     | Ok(AcceptOutcome::IgnoredWeaker) => {

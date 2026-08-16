@@ -86,25 +86,36 @@ if [[ ${#NORM[@]} -eq 0 ]]; then
 fi
 
 # test_runner joins BUILDDIR/test/functional. Both dirs are the Core tree.
-CORE_SRC="$(cd "$TESTS_DIR/../.." && pwd)"
+if [[ -d "$TESTS_DIR/../.." ]]; then
+  CORE_SRC="$(cd "$TESTS_DIR/../.." && pwd)"
+else
+  CORE_SRC="$(dirname "$(dirname "$TESTS_DIR")")"
+fi
 if [[ -z "$CONFIG_OUT" ]]; then
   CONFIG_OUT="${TESTS_DIR}/../config.ini"
 fi
 
+mkdir -p "$(dirname "$CONFIG_OUT")"
 sed \
   -e "s|@SRCDIR@|${CORE_SRC}|g" \
   -e "s|@BUILDDIR@|${CORE_SRC}|g" \
   "$HERE/config.ini.template" >"$CONFIG_OUT"
 
 SHIM="${HERE}/bitcoind"
-# --jobs 1: test_runner only runs create_cache.py when jobs>1 and N>1.
-# That cache is Core blocks/ + LevelDB + setmocktime (step 9); we never
-# consume it. Sequential is fine for the first-green pair.
+# Dummy Core cache dirs so `_initialize_chain` does not remine 199 then
+# delete our store. Real blocks live in RBITCOIN_CACHE (our store/).
+# --keepcache: test_runner would otherwise rmtree BUILDDIR/test/cache.
+# --jobs 1: Core create_cache.py only runs when jobs>1; we still skip it.
+export RBITCOIN_CACHE="${RBITCOIN_CACHE:-$HERE/cache}"
+if [[ -f "${TESTS_DIR}/test_runner.py" ]]; then
+  python3 "$HERE/create_cache.py" --preseed-core "$CORE_SRC"
+fi
 CMD=(
   python3 "${TESTS_DIR}/test_runner.py"
   --v2transport
   --jobs
   1
+  --keepcache
   "${NORM[@]}"
 )
 
@@ -117,6 +128,10 @@ fi
 if [[ ! -f "${TESTS_DIR}/test_runner.py" ]]; then
   echo "missing ${TESTS_DIR}/test_runner.py (run ./scripts/core-functional/init-submodule.sh)" >&2
   exit 1
+fi
+
+if [[ ! -d "${RBITCOIN_CACHE}/store" ]]; then
+  python3 "$HERE/create_cache.py" --cache "$RBITCOIN_CACHE" --ensure
 fi
 
 export BITCOIND="$SHIM"

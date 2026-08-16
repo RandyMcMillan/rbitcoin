@@ -2,7 +2,9 @@
 
 use bitcoin::consensus::{deserialize, encode::serialize_hex, Encodable};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
+use bitcoin::{
+    Address, Amount, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid,
+};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{hex_decode, hex_encode, Height, Network};
 use rbitcoin_query::Query;
@@ -97,6 +99,8 @@ pub const ERR_MISC: i64 = -1;
 pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
 pub const ERR_INVALID_PARAMETER: i64 = -8;
+/// Core `RPC_VERIFY_REJECTED` (sendrawtransaction / testmempoolaccept).
+pub const ERR_VERIFY_REJECTED: i64 = -26;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 pub const ERR_INVALID_REQUEST: i64 = -32600;
@@ -117,16 +121,32 @@ impl RpcParams {
         Self { pos, named: None }
     }
 
-    pub fn named(named: serde_json::Map<String, Value>) -> Self {
+    pub fn named(mut named: serde_json::Map<String, Value>) -> Self {
+        // AuthServiceProxy mixed call: `{args: [...], argN: ...}`.
+        let pos = match named.remove("args") {
+            Some(Value::Array(a)) => a,
+            Some(other) => {
+                named.insert("args".into(), other);
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         Self {
-            pos: Vec::new(),
+            pos,
             named: Some(named),
         }
     }
 
     pub fn get(&self, index: usize, name: &str) -> Option<&Value> {
         if let Some(m) = &self.named {
-            return m.get(name);
+            if let Some(v) = m.get(name) {
+                return Some(v);
+            }
+            // Mixed object: named miss falls through to the peeled `args` array.
+            if !self.pos.is_empty() {
+                return self.pos.get(index);
+            }
+            return None;
         }
         self.pos.get(index)
     }
@@ -192,6 +212,18 @@ fn json_u64(v: &Value) -> Option<u64> {
         .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
+/// Core `getblock` verbosity: integer, or bool (`false` → 0, `true` → 1).
+fn opt_verbosity(params: &RpcParams, index: usize, name: &str) -> Result<u32, Value> {
+    match params.get(index, name) {
+        None | Some(Value::Null) => Ok(1),
+        Some(Value::Bool(false)) => Ok(0),
+        Some(Value::Bool(true)) => Ok(1),
+        Some(v) => json_u64(v)
+            .map(|n| n as u32)
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be an integer"))),
+    }
+}
+
 impl From<Vec<Value>> for RpcParams {
     fn from(pos: Vec<Value>) -> Self {
         Self::positional(pos)
@@ -213,6 +245,7 @@ pub fn dispatch(
     let params = params.into();
     match method {
         "help" => help(&params),
+        "echo" => echo(&params),
         "getrpcinfo" => {
             params.reject_unknown(&[])?;
             Ok(getrpcinfo(ctx))
@@ -280,6 +313,7 @@ pub fn dispatch(
         "validateaddress" => validateaddress(ctx, &params),
         "estimatesmartfee" => estimatesmartfee(ctx, &params),
         "generatetoaddress" => generatetoaddress(ctx, &params),
+        "generatetodescriptor" => generatetodescriptor(ctx, &params),
         "generateblock" => generateblock(ctx, &params),
         "generate" => generate(ctx, &params),
         "submitblock" => submitblock(ctx, &params),
@@ -287,9 +321,15 @@ pub fn dispatch(
         "invalidateblock" => invalidateblock(ctx, &params),
         "reconsiderblock" => reconsiderblock(ctx, &params),
         "preciousblock" => preciousblock(ctx, &params),
+        "scantxoutset" => scantxoutset(ctx, &params),
+        "gettxout" => gettxout(ctx, &params),
+        "getindexinfo" => getindexinfo(ctx, &params),
+        "getchaintips" => getchaintips(ctx, &params),
+        "waitforblock" => waitforblock(ctx, &params),
+        "waitforblockheight" => waitforblockheight(ctx, &params),
+        "waitfornewblock" => waitfornewblock(ctx, &params),
         "createrawtransaction"
         | "combinerawtransaction"
-        | "scantxoutset"
         | "getblocktemplate"
         | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
@@ -313,8 +353,62 @@ fn help(params: &RpcParams) -> Result<Value, Value> {
     Ok(json!(METHOD_LIST.join("\n")))
 }
 
+/// Core `echo` names (`rpc_named_arguments.py`).
+const ECHO_NAMES: [&str; 10] = [
+    "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
+];
+
+/// Return params as a positional array (Core testing RPC).
+///
+/// Mixed AuthServiceProxy: `{args: [0, 1], arg3: 3}` → `[0, 1, null, 3]`.
+/// Named-only `arg9` sizes the array to 10 with null holes.
+fn echo(params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&ECHO_NAMES)?;
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if m.contains_key(*name) && i < params.pos.len() {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMETER,
+                    format!(
+                        "Parameter {name} specified twice both as positional and named argument"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut max_idx: Option<usize> = if params.pos.is_empty() {
+        None
+    } else {
+        Some(params.pos.len() - 1)
+    };
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if m.contains_key(*name) {
+                max_idx = Some(max_idx.map(|cur| cur.max(i)).unwrap_or(i));
+            }
+        }
+    }
+    let Some(max) = max_idx else {
+        return Ok(json!([]));
+    };
+    let mut out = vec![Value::Null; max + 1];
+    for (i, v) in params.pos.iter().enumerate() {
+        out[i] = v.clone();
+    }
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if let Some(v) = m.get(*name) {
+                out[i] = v.clone();
+            }
+        }
+    }
+    Ok(Value::Array(out))
+}
+
 const METHOD_LIST: &[&str] = &[
     "help",
+    "echo",
     "getrpcinfo",
     "uptime",
     "stop",
@@ -343,8 +437,16 @@ const METHOD_LIST: &[&str] = &[
     "validateaddress",
     "estimatesmartfee",
     "generatetoaddress",
+    "generatetodescriptor",
     "generateblock",
     "generate",
+    "scantxoutset",
+    "gettxout",
+    "getindexinfo",
+    "getchaintips",
+    "waitforblock",
+    "waitforblockheight",
+    "waitfornewblock",
     "submitblock",
     "setmocktime",
     "invalidateblock",
@@ -372,10 +474,19 @@ fn method_help(m: &str) -> String {
         "generate" => "generate nblocks (maxtries)\n\
              Regtest harness only. Mines to OP_TRUE (no wallet)."
             .into(),
+        "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
+             Regtest harness only. raw(HEX) descriptor or address."
+            .into(),
+        "scantxoutset" => "scantxoutset action (scanobjects)\n\
+             raw() scripts over Class A. MiniWallet support, not Core coins-DB."
+            .into(),
+        "gettxout" => "gettxout txid n (include_mempool) — Class A + mempool.".into(),
+        "getchaintips" => "getchaintips — active tip only.".into(),
         "submitblock" => "submitblock hexdata (dummy)\n\
              Regtest harness only. Accepts a serialized block via the P2P path."
             .into(),
         "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
+        "echo" => "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.".into(),
         other if METHOD_LIST.contains(&other) => format!("{other} — see docs/rpc.md"),
         other => format!("unknown method {other}"),
     }
@@ -543,7 +654,7 @@ fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
 fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash", "verbosity"])?;
     let hash_hex = params.req_str(0, "blockhash")?;
-    let verbosity = params.opt_u64(1, "verbosity")?.unwrap_or(1) as u32;
+    let verbosity = opt_verbosity(params, 1, "verbosity")?;
     let hash = parse_hash32_display(hash_hex)?;
     let height = ctx
         .query
@@ -706,6 +817,14 @@ fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 }
 
 fn getnetworkinfo(ctx: &RpcContext) -> Value {
+    let (cin, cout) = if let Some(hub) = ctx.peers.as_ref() {
+        let rows = hub.snapshot();
+        let cin = rows.iter().filter(|p| p.inbound).count() as u64;
+        let cout = rows.iter().filter(|p| !p.inbound).count() as u64;
+        (cin, cout)
+    } else {
+        (0, ctx.connections.load(Ordering::Relaxed))
+    };
     json!({
         "version": 270000,
         "subversion": ctx.subversion,
@@ -715,9 +834,9 @@ fn getnetworkinfo(ctx: &RpcContext) -> Value {
         "localrelay": true,
         "timeoffset": 0,
         "networkactive": true,
-        "connections": ctx.connections.load(Ordering::Relaxed),
-        "connections_in": 0,
-        "connections_out": ctx.connections.load(Ordering::Relaxed),
+        "connections": cin + cout,
+        "connections_in": cin,
+        "connections_out": cout,
         "networks": [],
         "relayfee": MempoolHub::relay_fee_btc_per_kb(),
         "incrementalfee": MempoolHub::relay_fee_btc_per_kb(),
@@ -737,6 +856,8 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "maxmempool": 0,
             "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
             "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
+            "unbroadcastcount": 0,
+            "permitbaremultisig": true,
         }));
     };
     let live = mp.list_live_meta();
@@ -757,6 +878,8 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
+        "unbroadcastcount": 0,
+        "permitbaremultisig": true,
     }))
 }
 
@@ -809,11 +932,20 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
         let vsize = weight / 4;
+        let fee_btc = (fee as f64) / 100_000_000.0;
+        let wtxid = mp
+            .get_tx(&tid)
+            .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
+            .unwrap_or_default();
         return Ok(json!({
             "vsize": vsize,
             "weight": weight,
-            "fee": (fee as f64) / 100_000_000.0,
-            "modifiedfee": (fee as f64) / 100_000_000.0,
+            "wtxid": wtxid,
+            "fee": fee_btc,
+            "modifiedfee": fee_btc,
+            "fees": { "base": fee_btc, "modified": fee_btc },
+            "ancestorcount": 1,
+            "descendantcount": 1,
         }));
     }
     Err(rpc_error(ERR_MISC, "Transaction not in mempool"))
@@ -822,7 +954,13 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
 fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "verbose"])?;
     let hex = params.req_str(0, "txid")?;
-    let verbose = params.opt_bool(1, "verbose")?.unwrap_or(false);
+    let verbose = match params.get(1, "verbose") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(v) => json_u64(v)
+            .map(|n| n != 0)
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "verbose must be a bool"))?,
+    };
     let want = parse_hash32_display(hex)?;
 
     if let Some(mp) = ctx.mempool.as_ref() {
@@ -866,8 +1004,40 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     }
     match mp.accept_tx(&tx) {
         Ok(_) => Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array()))),
-        Err(e) => Err(rpc_error(ERR_MISC, e.to_string())),
+        Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),
     }
+}
+
+fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    if s == "coinbase immature" {
+        return "bad-txns-premature-spend-of-coinbase".into();
+    }
+    if s == "coinbase" {
+        return "bad-txns-is-coinbase".into();
+    }
+    if s.starts_with("missing prevout") {
+        return "bad-txns-inputs-missingorspent".into();
+    }
+    if s.starts_with("duplicate ") {
+        return "txn-already-in-mempool".into();
+    }
+    if s == "inputs-duplicate" {
+        return "bad-txns-inputs-duplicate".into();
+    }
+    if s == "not final" {
+        return "bad-txns-nonfinal".into();
+    }
+    if s == "non-BIP68-final" {
+        return "non-BIP68-final".into();
+    }
+    if s == "rbf insufficient fee" {
+        return "insufficient fee".into();
+    }
+    if let Some(rest) = s.strip_prefix("script: ") {
+        return format!("mempool-script-verify-flag-failed ({rest})");
+    }
+    s
 }
 
 fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -891,16 +1061,20 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         match mp.accept_tx(&tx) {
             Ok(_) => {
                 let _ = mp.remove_for_block(&[tx.compute_txid()]);
+                let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,
+                    "wtxid": wtxid,
                     "allowed": true,
                 }));
             }
             Err(e) => {
+                let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,
+                    "wtxid": wtxid,
                     "allowed": false,
-                    "reject-reason": e.to_string(),
+                    "reject-reason": accept_reject_reason(&e),
                 }));
             }
         }
@@ -1036,17 +1210,82 @@ fn hashes_json(hashes: &[BlockHash]) -> Value {
     json!(hashes.iter().map(|h| h.to_string()).collect::<Vec<_>>())
 }
 
+fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return Vec::new();
+    };
+    let txs: Vec<Transaction> = mp.list_live().into_iter().map(|(_, _, _, tx)| tx).collect();
+    topo_sort_txs(&txs)
+}
+
+fn drain_mempool(ctx: &RpcContext, txs: &[Transaction]) {
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return;
+    };
+    let ids: Vec<Txid> = txs.iter().map(Transaction::compute_txid).collect();
+    let _ = mp.remove_for_block(&ids);
+}
+
+fn topo_sort_txs(txs: &[Transaction]) -> Vec<Transaction> {
+    use std::collections::{HashMap, VecDeque};
+    if txs.len() <= 1 {
+        return txs.to_vec();
+    }
+    let id_of: HashMap<Txid, usize> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.compute_txid(), i))
+        .collect();
+    let mut indeg = vec![0usize; txs.len()];
+    let mut children = vec![Vec::new(); txs.len()];
+    for (i, t) in txs.iter().enumerate() {
+        for inp in &t.input {
+            if let Some(&p) = id_of.get(&inp.previous_output.txid) {
+                children[p].push(i);
+                indeg[i] += 1;
+            }
+        }
+    }
+    let mut q: VecDeque<usize> = (0..txs.len()).filter(|&i| indeg[i] == 0).collect();
+    let mut out = Vec::with_capacity(txs.len());
+    while let Some(i) = q.pop_front() {
+        out.push(txs[i].clone());
+        for &c in &children[i] {
+            indeg[c] -= 1;
+            if indeg[c] == 0 {
+                q.push_back(c);
+            }
+        }
+    }
+    if out.len() == txs.len() {
+        out
+    } else {
+        txs.to_vec()
+    }
+}
+
+fn generate_with_mempool(
+    ctx: &RpcContext,
+    nblocks: u32,
+    script: ScriptBuf,
+) -> Result<Value, Value> {
+    let miner = require_regtest_miner(ctx, "generate")?;
+    let extras = mempool_block_txs(ctx);
+    let hashes = miner
+        .generate_to_script(nblocks, script, extras.clone())
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    drain_mempool(ctx, &extras);
+    Ok(hashes_json(&hashes))
+}
+
 fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["nblocks", "address", "maxtries"])?;
-    let miner = require_regtest_miner(ctx, "generatetoaddress")?;
+    let _miner = require_regtest_miner(ctx, "generatetoaddress")?;
     let nblocks = params.req_u64(0, "nblocks")? as u32;
     let addr = params.req_str(1, "address")?;
     let _maxtries = params.opt_u64(2, "maxtries")?;
     let script = decode_output_script(ctx, addr)?;
-    let hashes = miner
-        .generate_to_script(nblocks, script, Vec::new())
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
-    Ok(hashes_json(&hashes))
+    generate_with_mempool(ctx, nblocks, script)
 }
 
 fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1081,14 +1320,313 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 
 fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["nblocks", "maxtries"])?;
-    let miner = require_regtest_miner(ctx, "generate")?;
+    let _miner = require_regtest_miner(ctx, "generate")?;
     let nblocks = params.req_u64(0, "nblocks")? as u32;
     let _maxtries = params.opt_u64(1, "maxtries")?;
     let script = ScriptBuf::from_bytes(vec![0x51]);
-    let hashes = miner
-        .generate_to_script(nblocks, script, Vec::new())
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
-    Ok(hashes_json(&hashes))
+    generate_with_mempool(ctx, nblocks, script)
+}
+
+fn generatetodescriptor(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["num_blocks", "descriptor", "maxtries"])?;
+    let _miner = require_regtest_miner(ctx, "generatetodescriptor")?;
+    let nblocks = params.req_u64(0, "num_blocks")? as u32;
+    let desc = params.req_str(1, "descriptor")?;
+    let _maxtries = params.opt_u64(2, "maxtries")?;
+    let script = match parse_raw_descriptor(desc) {
+        Some(s) => s,
+        None => decode_output_script(ctx, desc)?,
+    };
+    generate_with_mempool(ctx, nblocks, script)
+}
+
+/// MiniWallet uses `raw(HEX)#checksum`. Not a full descriptor language.
+fn parse_raw_descriptor(desc: &str) -> Option<ScriptBuf> {
+    let bare = desc.split('#').next()?.trim();
+    let inner = bare.strip_prefix("raw(")?.strip_suffix(")")?;
+    let bytes = hex_decode(inner).ok()?;
+    Some(ScriptBuf::from_bytes(bytes))
+}
+
+/// Enough of Core `scantxoutset` for MiniWallet: `raw(script)` over Class A.
+/// Not a coins-DB product (no HD range / combo / addr expansion).
+fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["action", "scanobjects"])?;
+    let action = params.req_str(0, "action")?;
+    match action {
+        "status" => return Ok(Value::Null),
+        "abort" => return Ok(json!(false)),
+        "start" => {}
+        other => {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!("Invalid action '{other}'"),
+            ));
+        }
+    }
+    let objs = params.get_array(1, "scanobjects").ok_or_else(|| {
+        rpc_error(
+            ERR_MISC,
+            "scanobjects argument is required for the start action",
+        )
+    })?;
+    let mut scripts: Vec<Vec<u8>> = Vec::new();
+    for o in objs {
+        let desc = match o {
+            Value::String(s) => s.as_str(),
+            Value::Object(m) => m
+                .get("desc")
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "scanobject desc required"))?,
+            _ => {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMS,
+                    "scanobjects entries must be descriptor strings",
+                ));
+            }
+        };
+        let Some(script) = parse_raw_descriptor(desc) else {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMS,
+                format!("only raw() descriptors are supported (got {desc})"),
+            ));
+        };
+        scripts.push(script.to_bytes());
+    }
+
+    let tip = ctx.query.tip_height().unwrap_or(Height(0));
+    let best = if let Some(h) = ctx.query.tip_height() {
+        ctx.query
+            .header_at_height(h)
+            .ok()
+            .flatten()
+            .map(|(_, rec)| hash_hex_display(&rec.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut unspents = Vec::new();
+    let mut total_sat = 0u64;
+    if ctx.query.tip_height().is_some() {
+        for h in 0..=tip.0 {
+            let block = ctx
+                .query
+                .reconstruct_block_at_height(Height(h))
+                .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+            for (ti, tx) in block.txdata.iter().enumerate() {
+                let txid = tx.compute_txid();
+                let txid_b = txid.to_byte_array();
+                let coinbase = ti == 0;
+                for (vout, out) in tx.output.iter().enumerate() {
+                    let spk = out.script_pubkey.as_bytes();
+                    if !scripts.iter().any(|s| s.as_slice() == spk) {
+                        continue;
+                    }
+                    let spent = ctx
+                        .query
+                        .is_outpoint_spent(&txid_b, vout as u32)
+                        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+                    if spent {
+                        continue;
+                    }
+                    let sat = out.value.to_sat();
+                    total_sat = total_sat.saturating_add(sat);
+                    unspents.push(json!({
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "scriptPubKey": hex_encode(spk),
+                        "desc": format!("raw({})", hex_encode(spk)),
+                        "amount": out.value.to_btc(),
+                        "coinbase": coinbase,
+                        "height": h,
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "success": true,
+        "txouts": unspents.len(),
+        "height": tip.0,
+        "bestblock": best,
+        "unspents": unspents,
+        "total_amount": Amount::from_sat(total_sat).to_btc(),
+    }))
+}
+
+fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid", "n", "include_mempool"])?;
+    let hex = params.req_str(0, "txid")?;
+    let n = params.req_u64(1, "n")? as u32;
+    let include_mempool = params.opt_bool(2, "include_mempool")?.unwrap_or(true);
+    let want = parse_hash32_display(hex)?;
+
+    if include_mempool {
+        if let Some(mp) = ctx.mempool.as_ref() {
+            let tid = Txid::from_byte_array(want);
+            if let Some(tx) = mp.get_tx(&tid) {
+                if let Some(out) = tx.output.get(n as usize) {
+                    return Ok(json!({
+                        "bestblock": getbestblockhash(ctx)?,
+                        "confirmations": 0,
+                        "value": out.value.to_btc(),
+                        "scriptPubKey": {
+                            "hex": hex_encode(out.script_pubkey.as_bytes()),
+                            "asm": out.script_pubkey.to_asm_string(),
+                        },
+                        "coinbase": false,
+                    }));
+                }
+            }
+        }
+    }
+
+    let (fk, rec) = match ctx
+        .query
+        .get_tx_by_txid(&want)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    {
+        Some(v) => v,
+        None => return Ok(Value::Null),
+    };
+    if ctx
+        .query
+        .is_outpoint_spent(&want, n)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    {
+        return Ok(Value::Null);
+    }
+    let out = ctx
+        .query
+        .tx_output_at_fk(fk, &rec, n)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let height = ctx
+        .query
+        .store()
+        .tx_height_get(fk)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .unwrap_or(0);
+    let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
+    let confs = tip.saturating_sub(height).saturating_add(1);
+    let coinbase = rec.input_count == 1
+        && ctx
+            .query
+            .tx_input_at_fk(fk, &rec, 0)
+            .map(|inp| inp.is_coinbase())
+            .unwrap_or(false);
+    Ok(json!({
+        "bestblock": getbestblockhash(ctx)?,
+        "confirmations": confs,
+        "value": Amount::from_sat(out.value as u64).to_btc(),
+        "scriptPubKey": {
+            "hex": hex_encode(&out.script),
+            "asm": ScriptBuf::from_bytes(out.script.clone()).to_asm_string(),
+        },
+        "coinbase": coinbase,
+    }))
+}
+
+fn getindexinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["index_name"])?;
+    let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
+    let txindex = json!({
+        "synced": true,
+        "best_block_height": tip,
+    });
+    match params.get(0, "index_name") {
+        None | Some(Value::Null) => Ok(json!({ "txindex": txindex })),
+        Some(Value::String(s)) if s == "txindex" => Ok(json!({ "txindex": txindex })),
+        Some(Value::String(_)) => Ok(json!({})),
+        Some(_) => Err(rpc_error(ERR_INVALID_PARAMS, "index_name must be a string")),
+    }
+}
+
+fn getchaintips(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&[])?;
+    let Some(h) = ctx.query.tip_height() else {
+        return Ok(json!([]));
+    };
+    let (_, rec) = ctx
+        .query
+        .header_at_height(h)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| rpc_error(ERR_MISC, "tip header missing"))?;
+    Ok(json!([{
+        "height": h.0,
+        "hash": hash_hex_display(&rec.hash),
+        "branchlen": 0,
+        "status": "active",
+    }]))
+}
+
+fn wait_timeout_ms(params: &RpcParams, idx: usize, name: &str) -> Result<u64, Value> {
+    Ok(params.opt_u64(idx, name)?.unwrap_or(30_000))
+}
+
+fn tip_hash_height(ctx: &RpcContext) -> Result<(String, u32), Value> {
+    let h = ctx
+        .query
+        .tip_height()
+        .ok_or_else(|| rpc_error(ERR_MISC, "no tip"))?;
+    let (_, rec) = ctx
+        .query
+        .header_at_height(h)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| rpc_error(ERR_MISC, "tip header missing"))?;
+    Ok((hash_hex_display(&rec.hash), h.0))
+}
+
+fn waitforblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash", "timeout"])?;
+    let want = params.req_str(0, "blockhash")?.to_string();
+    let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let (hash, height) = tip_hash_height(ctx)?;
+        if hash == want {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn waitforblockheight(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["height", "timeout"])?;
+    let want = params.req_u64(0, "height")? as u32;
+    let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let (hash, height) = tip_hash_height(ctx)?;
+        if height >= want {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["timeout"])?;
+    let timeout_ms = wait_timeout_ms(params, 0, "timeout")?;
+    let (start_hash, _) = tip_hash_height(ctx)?;
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let (hash, height) = tip_hash_height(ctx)?;
+        if hash != start_hash {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({ "hash": hash, "height": height }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1365,7 +1903,7 @@ mod tests {
     #[test]
     fn unsupported_methods_error() {
         let (ctx, dir) = ctx_empty();
-        let e = dispatch(&ctx, "scantxoutset", vec![]).unwrap_err();
+        let e = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
         assert_eq!(e["code"], ERR_METHOD_NOT_FOUND);
         let e2 = dispatch(&ctx, "createrawtransaction", vec![]).unwrap_err();
         assert_eq!(e2["code"], ERR_METHOD_NOT_FOUND);
@@ -1424,6 +1962,71 @@ mod tests {
 
         let missing = handle_request(&ctx, &json!({"method":"getblock","params":{}}));
         assert_eq!(missing["error"]["code"], ERR_INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn echo_positional_named_and_mixed_args() {
+        let (ctx, dir) = ctx_empty();
+
+        let empty = handle_request(&ctx, &json!({"id":1,"method":"echo","params":[]}));
+        assert!(empty["error"].is_null(), "{empty}");
+        assert_eq!(empty["result"], json!([]));
+
+        let named = handle_request(&ctx, &json!({"method":"echo","params":{"arg0":0,"arg9":9}}));
+        assert!(named["error"].is_null(), "{named}");
+        let mut want = vec![Value::Null; 10];
+        want[0] = json!(0);
+        want[9] = json!(9);
+        assert_eq!(named["result"], Value::Array(want));
+
+        let arg1 = handle_request(&ctx, &json!({"method":"echo","params":{"arg1":1}}));
+        assert_eq!(arg1["result"], json!([Value::Null, 1]));
+
+        let arg9_null = handle_request(&ctx, &json!({"method":"echo","params":{"arg9":null}}));
+        assert_eq!(arg9_null["result"], json!(vec![Value::Null; 10]));
+
+        // AuthServiceProxy mixed: echo(0, 1, arg3=3, arg5=5)
+        let mixed = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,1],"arg3":3,"arg5":5}}),
+        );
+        assert!(mixed["error"].is_null(), "{mixed}");
+        assert_eq!(
+            mixed["result"],
+            json!([0, 1, Value::Null, 3, Value::Null, 5])
+        );
+
+        let twice = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,1],"arg1":1}}),
+        );
+        assert_eq!(twice["error"]["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            twice["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("specified twice"),
+            "{twice}"
+        );
+
+        let twice_null = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,null,2],"arg1":1}}),
+        );
+        assert_eq!(twice_null["error"]["code"], ERR_INVALID_PARAMETER);
+
+        // Mixed positional `args` must feed getblockhash(height).
+        let gh = handle_request(
+            &ctx,
+            &json!({"method":"getblockhash","params":{"args":[0]}}),
+        );
+        assert_ne!(
+            gh["error"]["message"].as_str().unwrap_or(""),
+            "height required"
+        );
+        assert_eq!(gh["error"]["code"], ERR_MISC);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1789,7 +2392,7 @@ mod tests {
         }
 
         fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
-            match self.0.accept_block(block) {
+            match self.0.accept_received_block(block) {
                 Ok(rbitcoin_net::AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
                 Ok(rbitcoin_net::AcceptOutcome::AlreadyHave) => SubmitBlockOutcome::Duplicate,
                 Ok(rbitcoin_net::AcceptOutcome::IgnoredWeaker) => SubmitBlockOutcome::IgnoredWeaker,
@@ -1885,11 +2488,139 @@ mod tests {
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(1));
         let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
         assert_eq!(best, arr[0]);
-        let blk = dispatch(&ctx, "getblock", vec![best, json!(2)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![best.clone(), json!(2)]).unwrap();
         let hex = blk["tx"][0]["vout"][0]["scriptPubKey"]["hex"]
             .as_str()
             .unwrap();
         assert_eq!(hex, rbitcoin_primitives::hex_encode(script.as_bytes()));
+        // Core getblock(hash, False) is verbosity 0 (raw hex).
+        let raw = dispatch(&ctx, "getblock", vec![best.clone(), json!(false)]).unwrap();
+        assert!(raw.as_str().unwrap().len() > 160);
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let raw_tx = dispatch(&ctx, "getrawtransaction", vec![json!(cb_txid), json!(0)]).unwrap();
+        assert!(raw_tx.as_str().unwrap().len() > 20);
+        let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        assert_eq!(net["connections_in"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn miniwallet_raw_scan_and_gettxout() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let desc = "raw(51)";
+        let hashes = dispatch(&ctx, "generatetodescriptor", vec![json!(2), json!(desc)]).unwrap();
+        assert_eq!(hashes.as_array().unwrap().len(), 2);
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
+
+        let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
+        assert_eq!(scan["success"], true);
+        assert_eq!(scan["height"], 2);
+        let uns = scan["unspents"].as_array().unwrap();
+        assert_eq!(uns.len(), 2, "two generated OP_TRUE coinbases: {scan}");
+        assert!(uns.iter().all(|u| u["coinbase"] == true));
+
+        let txid = uns[1]["txid"].as_str().unwrap();
+        let utxo = dispatch(&ctx, "gettxout", vec![json!(txid), json!(0)]).unwrap();
+        assert!(utxo["confirmations"].as_u64().unwrap() >= 1);
+        assert_eq!(utxo["coinbase"], true);
+        assert_eq!(utxo["scriptPubKey"]["hex"], "51");
+
+        let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        assert_eq!(tips[0]["status"], "active");
+        assert_eq!(tips[0]["height"], 2);
+
+        let waited = dispatch(&ctx, "waitforblockheight", vec![json!(2), json!(100)]).unwrap();
+        assert_eq!(waited["height"], 2);
+
+        let idx = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
+        assert_eq!(idx["txindex"]["synced"], true);
+        assert_eq!(idx["txindex"]["best_block_height"], 2);
+        let only = dispatch(&ctx, "getindexinfo", vec![json!("txindex")]).unwrap();
+        assert_eq!(only["txindex"]["synced"], true);
+        let empty = dispatch(&ctx, "getindexinfo", vec![json!("coinstatsindex")]).unwrap();
+        assert_eq!(empty, json!({}));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_includes_mempool_and_maps_immature() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(101));
+
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let cb_val =
+            (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let hex = hex_encode(serialize(&spend));
+        let tid = dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+        let pool = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
+        assert_eq!(pool, json!([tid]));
+
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let empty = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
+        assert_eq!(empty, json!([]));
+        let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
+        assert_eq!(mined["tx"].as_array().unwrap().len(), 2);
+
+        // At tip 102, coinbase N is mempool-mature when 102 >= N+99 → N<=3.
+        let hash2 = dispatch(&ctx, "getblockhash", vec![json!(10)]).unwrap();
+        let blk2 = dispatch(&ctx, "getblock", vec![hash2, json!(2)]).unwrap();
+        let immature_txid = blk2["tx"][0]["txid"].as_str().unwrap();
+        let immature_val =
+            (blk2["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+        let bad = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(immature_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(immature_val - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let e = dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(&bad)))],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_VERIFY_REJECTED);
+        assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2047,6 +2778,10 @@ mod tests {
         assert_eq!(arr[0]["inbound"], false);
         assert_eq!(arr[0]["addr"], "127.0.0.1:18444");
         assert!(arr[0]["bytesrecv_per_msg"]["pong"].as_u64().unwrap() >= 29);
+        let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        assert_eq!(net["connections_in"], 0);
+        assert_eq!(net["connections_out"], 1);
+        assert_eq!(net["connections"], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

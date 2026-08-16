@@ -441,7 +441,7 @@ impl ChainHub {
         self.invalidated.write().unwrap().remove(&hash);
         let parked = self.parked.write().unwrap().remove(&hash);
         if let Some(b) = parked {
-            self.accept_block(b)?;
+            self.accept_received_block(b)?;
             // Descendants parked with the same invalidate.
             let mut more: Vec<Block> = self
                 .parked
@@ -453,7 +453,7 @@ impl ChainHub {
             more.sort_by_key(|b| b.header.time);
             for b in more {
                 self.invalidated.write().unwrap().remove(&b.block_hash());
-                let _ = self.accept_block(b);
+                let _ = self.accept_received_block(b);
             }
         }
         Ok(())
@@ -462,8 +462,12 @@ impl ChainHub {
     /// Prefer this hash among equal-work competing tips.
     pub fn precious_block(&self, hash: BlockHash) -> Result<(), NetError> {
         *self.precious.write().unwrap() = Some(hash);
-        if let Some(b) = self.parked.read().unwrap().get(&hash).cloned() {
-            let _ = self.accept_block(b);
+        // Clone out of the read guard *before* submit/accept takes parked write.
+        let parked_block = self.parked.read().unwrap().get(&hash).cloned();
+        if let Some(b) = parked_block {
+            let _ = self.accept_received_block(b);
+        } else {
+            let _ = self.try_received_parked();
         }
         Ok(())
     }
@@ -585,7 +589,9 @@ impl ChainHub {
         // Work on our path from fork+1..=tip (wire headers; no full body load).
         let our_work = self.work_from_fork_to_tip(fork_height)?;
 
-        if self.tip_height().is_some() && !work_better(new_work, our_work) {
+        let branch_tip = blocks.last().map(Block::block_hash);
+        let precious = *self.precious.read().unwrap() == branch_tip;
+        if self.tip_height().is_some() && !work_better(new_work, our_work) && !precious {
             return Ok(AcceptOutcome::IgnoredWeaker);
         }
 
@@ -600,6 +606,14 @@ impl ChainHub {
                         old_path.push(b);
                     }
                 }
+            }
+        }
+
+        // Keep the old path so preciousblock can switch back (Core block index).
+        {
+            let mut p = self.parked.write().unwrap();
+            for b in &old_path {
+                p.insert(b.block_hash(), b.clone());
             }
         }
 
@@ -641,7 +655,135 @@ impl ChainHub {
             }
         }
         let height = base + (blocks.len() as u32) - 1;
+        {
+            let mut p = self.parked.write().unwrap();
+            for b in blocks {
+                p.remove(&b.block_hash());
+            }
+        }
         Ok(AcceptOutcome::Accepted { height })
+    }
+
+    /// Production "we received a block" entry (P2P `block` / compact, RPC
+    /// `submitblock`). Same confirm path as [`Self::accept_block`] when the
+    /// block extends the tip; otherwise park and [`Self::accept_branch`] if a
+    /// parked chain has more work (or is precious at equal work).
+    ///
+    /// [`Self::accept_block`] stays the tip-extend / competing-tip hot path
+    /// (generate, IBD planned windows). Do not add a second confirm pipeline.
+    pub fn accept_received_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
+        match self.accept_block(block.clone()) {
+            Ok(AcceptOutcome::Accepted { height }) => Ok(AcceptOutcome::Accepted { height }),
+            Ok(AcceptOutcome::AlreadyHave) => Ok(AcceptOutcome::AlreadyHave),
+            Ok(AcceptOutcome::IgnoredWeaker) => {
+                self.park_block(block);
+                match self.try_received_parked()? {
+                    Some(o) => Ok(o),
+                    None => Ok(AcceptOutcome::IgnoredWeaker),
+                }
+            }
+            Err(NetError::Protocol(s))
+                if s.contains("side block") || s.contains("unknown parent") =>
+            {
+                self.park_block(block);
+                match self.try_received_parked()? {
+                    Some(o) => Ok(o),
+                    None => Ok(AcceptOutcome::IgnoredWeaker),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn park_block(&self, block: Block) {
+        const MAX_PARKED: usize = 256;
+        let hash = block.block_hash();
+        let evict = {
+            let p = self.parked.read().unwrap();
+            if p.contains_key(&hash) {
+                return;
+            }
+            if p.len() < MAX_PARKED {
+                None
+            } else {
+                let inv = self.invalidated.read().unwrap();
+                p.keys().copied().find(|k| !inv.contains(k))
+            }
+        };
+        let mut p = self.parked.write().unwrap();
+        if let Some(k) = evict {
+            p.remove(&k);
+        }
+        p.insert(hash, block);
+    }
+
+    fn assemble_parked_branch(
+        &self,
+        tip: BlockHash,
+        parked: &HashMap<BlockHash, Block>,
+    ) -> Option<Vec<Block>> {
+        let mut rev = Vec::new();
+        let mut h = tip;
+        for _ in 0..10_000 {
+            let b = parked.get(&h)?;
+            let prev = b.header.prev_blockhash;
+            rev.push(b.clone());
+            if prev.to_byte_array() == [0u8; 32] {
+                rev.reverse();
+                return Some(rev);
+            }
+            if self
+                .query
+                .height_of_hash(&prev.to_byte_array())
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                rev.reverse();
+                return Some(rev);
+            }
+            h = prev;
+        }
+        None
+    }
+
+    fn try_received_parked(&self) -> Result<Option<AcceptOutcome>, NetError> {
+        let parked = {
+            let g = self.parked.read().unwrap();
+            g.clone()
+        };
+        if parked.is_empty() {
+            return Ok(None);
+        }
+        let precious = *self.precious.read().unwrap();
+        let mut best: Option<(Work, Vec<Block>, bool)> = None;
+        for start in parked.keys().copied() {
+            let Some(branch) = self.assemble_parked_branch(start, &parked) else {
+                continue;
+            };
+            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let tip = branch.last().map(Block::block_hash);
+            let is_p = tip == precious;
+            let take = match &best {
+                None => true,
+                Some((bw, _, was_p)) => {
+                    work_better(w, *bw) || (!work_better(*bw, w) && is_p && !*was_p)
+                }
+            };
+            if take {
+                best = Some((w, branch, is_p));
+            }
+        }
+        let Some((_, branch, _)) = best else {
+            return Ok(None);
+        };
+        match self.accept_branch(&branch) {
+            Ok(AcceptOutcome::Accepted { height }) => Ok(Some(AcceptOutcome::Accepted { height })),
+            Ok(AcceptOutcome::IgnoredWeaker) => Ok(None),
+            Ok(other) => Ok(Some(other)),
+            Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn connect_at(&self, height: u32, block: Block) -> Result<(), NetError> {
@@ -1367,6 +1509,52 @@ mod tests {
             hub.accept_block(orphan).unwrap_err(),
             NetError::Protocol(_)
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submit_block_parks_and_reorgs_longer_fork() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let a1 = mine(gen, 1_300_010_000, 1);
+        hub.accept_block(a1.clone()).unwrap();
+        let a2 = mine(a1.block_hash(), 1_300_010_100, 2);
+        hub.accept_block(a2.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(2));
+
+        let mut prev = gen;
+        let mut fork = Vec::new();
+        for i in 0..3u32 {
+            let b = mine(prev, 1_300_011_000 + i, i + 1);
+            prev = b.block_hash();
+            fork.push(b);
+        }
+        for b in &fork {
+            hub.accept_received_block(b.clone()).unwrap();
+        }
+        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
+        assert_eq!(hub.tip_height(), Some(3));
+
+        // Equal-work sibling branch: park, do not reorg until precious.
+        let mut prev = gen;
+        let mut eq = Vec::new();
+        for i in 0..3u32 {
+            let b = mine(prev, 1_300_012_000 + i, i + 1);
+            prev = b.block_hash();
+            eq.push(b);
+        }
+        for b in &eq {
+            let out = hub.accept_received_block(b.clone()).unwrap();
+            assert!(matches!(
+                out,
+                AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave
+            ));
+        }
+        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
+        hub.precious_block(eq[2].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

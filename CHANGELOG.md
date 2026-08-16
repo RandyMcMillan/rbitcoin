@@ -11,6 +11,33 @@ before 1.0).
 
 ### Added
 
+- **Core functional coverage:** analog scenarios for `--milestone` skip-below /
+  check-above, reconstruct after lost RAM head, and durable mempool reopen
+  (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
+  required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
+
+- **MiniWallet + receive-block path:** `generatetodescriptor` (`raw(HEX)`),
+  `scantxoutset` over Class A, `gettxout`, `getindexinfo` (Class A tx
+  lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
+  mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
+  rejects to Core `-26` strings. `submitblock` and P2P `block` share
+  `ChainHub::accept_received_block` (park side/orphan, `accept_branch` on
+  more work). Not a coins-DB / GBT product.
+
+- **Core functional `run` set:** unmodified `mempool_spend_coinbase.py`,
+  `mempool_resurrect.py`, `p2p_block_sync.py`,
+  `feature_framework_miniwallet.py`, `feature_dirsymlinks.py` (plus the
+  first-green CLI/UA/echo/uptime four). Cache payees match Core
+  `_initialize_chain` (PRIV_KEYS + MiniWallet P2TR).
+
+- **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
+  mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
+
+- **rbitcoin 199-block cache:** `create_cache.py` mines 199 via `generate`
+  into `scripts/core-functional/cache/store`. `run.sh` preseeds empty Core
+  `blocks/`+`chainstate/` and `--keepcache`; the shim copies our store into
+  cache-shaped dests only.
+
 - **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
   and park via `ChainHub`; reconsider re-accepts; precious prefers an
   equal-work sibling.

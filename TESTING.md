@@ -183,8 +183,8 @@ Inventory for Bitcoin Core **v31.1** functional tests lives in
 [`scripts/core-functional/`](scripts/core-functional/)
 ([`docs/core-functional.md`](docs/core-functional.md)).
 `python3 scripts/core-functional/check_inventory.py` is the completeness
-gate. `run.sh` may only invoke inventory `run` names (`feature_help.py`,
-`feature_uacomment.py`, `rpc_uptime.py` today).
+gate. `run.sh` may only invoke inventory `run` names (see
+`./scripts/core-functional/run.sh --list`).
 The nightly job (`.github/workflows/core-functional.yml` →
 `scripts/core-functional/nightly.sh`) warns — it does not fail — when a
 newer Bitcoin Core release exists than the inventory pin. Label
@@ -199,6 +199,7 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/run.sh --list
 ./scripts/core-functional/run.sh feature_help.py feature_uacomment.py
 ./scripts/core-functional/bitcoind.test.sh
+./scripts/core-functional/create_cache.test.sh
 ./scripts/core-functional/check_core_release.test.sh
 # cargo test stages Core JSON from the submodule:
 ./scripts/core-functional/init-submodule.sh

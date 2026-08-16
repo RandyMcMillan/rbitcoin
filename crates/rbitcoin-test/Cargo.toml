@@ -38,5 +38,9 @@ path = "tests/electrum_protocol.rs"
 name = "consensus_rules"
 path = "tests/consensus_rules.rs"
 
+[[test]]
+name = "core_analogs"
+path = "tests/core_analogs.rs"
+
 [lints]
 workspace = true

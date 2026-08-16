@@ -57,6 +57,7 @@ still wait for durable SH when shindex is on.
 | Method | Notes |
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
+| `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
 | `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
@@ -68,7 +69,13 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
-| `generatetoaddress` / `generateblock` / `generate` / `submitblock` | **Regtest harness only.** Same `ChainHub::accept_block` path as P2P. Not a mining product (no GBT). Refused on mainnet / signet / testnet. |
+| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes current mempool (topo-sorted), then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)` (MiniWallet) or an address. Not a mining product (no GBT). |
+| `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or park + most-work `accept_branch`. |
+| `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
+| `gettxout` | All networks. Class A + mempool. |
+| `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
+| `getchaintips` | All networks. Active tip only (parked-fork list still follows `accept_received_block` / invalidate). |
+| `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | All networks. Disconnect/re-accept via `ChainHub`; precious prefers equal-work siblings. |
 
@@ -77,9 +84,9 @@ still wait for durable SH when shindex is on.
 | Method / area | Why |
 |---------------|-----|
 | Wallet RPC | No keystore |
-| Mining / GBT | Non-goal. Regtest `generate*` / `submitblock` are harness-only (see above). |
+| Mining / GBT | Non-goal. Regtest `generate*` is harness-only. `submitblock` is the same receive path as P2P. |
 | `createrawtransaction` / `combinerawtransaction` | Wallet-adjacent footgun; use external tools |
-| `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate |
+| Full `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate. `raw()` Class A walk is the MiniWallet subset only. |
 | Address history via Core method names | Use Electrum/Esplora with `--shindex` |
 | Exact Core JSON field-for-field | Best-effort |
 | Multi-user `rpcauth` / method whitelist | Future |

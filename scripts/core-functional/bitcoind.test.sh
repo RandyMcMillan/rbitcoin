@@ -114,6 +114,20 @@ fi
 # Unknown flags abort like Core (feature_help.py -fakearg).
 assert_fail_msg "unknown flag parse error" "Error parsing command line arguments" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -notarealflag
+assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -fakearg
+
+# Common TestNode extras must be ignored (not parse-fail).
+OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
+  -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
+  -testactivationheight=bip34@1 -permitbaremultisig=0 2>/dev/null)" || OUTX=""
+if printf '%s' "$OUTX" | grep -q -- "--rpc-listen"; then
+  echo "ok - TestNode extras ignored"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - TestNode extras ignored (got: $OUTX)"
+  FAIL=$((FAIL + 1))
+fi
 
 # -h / -version exit 0 on stdout without starting the node.
 if OUTH="$("$SHIM" -datadir="$DATADIR" -h 2>/dev/null)" && printf '%s' "$OUTH" | grep -q Options; then
@@ -142,6 +156,34 @@ fi
 
 assert_fail_msg "datadir required" "datadir is required" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -regtest
+
+# Cache seed: dest looks like a Core cache copy (blocks+chainstate, no store).
+CACHE="$WORKDIR/rbcache"
+mkdir -p "$CACHE/store"
+echo seeded >"$CACHE/store/marker"
+CACHED="$WORKDIR/cached-node"
+mkdir -p "$CACHED/regtest/blocks" "$CACHED/regtest/chainstate"
+if RBITCOIN_CACHE="$CACHE" "$SHIM" --print-cmd -datadir="$CACHED" -regtest >/dev/null \
+  && [[ -f "$CACHED/regtest/store/marker" ]] \
+  && grep -q seeded "$CACHED/regtest/store/marker"; then
+  echo "ok - cache store copied into cache-shaped dest"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - cache store copied into cache-shaped dest"
+  FAIL=$((FAIL + 1))
+fi
+
+# Clean chain (no blocks/chainstate) must not receive the 199-block store.
+CLEAN="$WORKDIR/clean-node"
+mkdir -p "$CLEAN"
+if RBITCOIN_CACHE="$CACHE" "$SHIM" --print-cmd -datadir="$CLEAN" -regtest >/dev/null \
+  && [[ ! -e "$CLEAN/regtest/store" ]]; then
+  echo "ok - clean chain is not seeded from cache"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - clean chain is not seeded from cache"
+  FAIL=$((FAIL + 1))
+fi
 
 # Live smoke when a real node binary is on disk (optional in this script).
 REAL=""

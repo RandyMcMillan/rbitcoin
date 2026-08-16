@@ -127,6 +127,10 @@ impl RpcParams {
         Self { pos, named: None }
     }
 
+    pub fn pos_len(&self) -> usize {
+        self.pos.len()
+    }
+
     pub fn named(mut named: serde_json::Map<String, Value>) -> Self {
         // AuthServiceProxy mixed call: `{args: [...], argN: ...}`.
         let pos = match named.remove("args") {
@@ -345,6 +349,7 @@ pub fn dispatch(
         "getmininginfo" => getmininginfo(ctx),
         "prioritisetransaction" => prioritisetransaction(ctx, &params),
         "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
+        "getmempoolcluster" => getmempoolcluster(ctx, &params),
         "createrawtransaction" | "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
@@ -466,6 +471,7 @@ const METHOD_LIST: &[&str] = &[
     "getmininginfo",
     "prioritisetransaction",
     "getprioritisedtransactions",
+    "getmempoolcluster",
     "submitblock",
     "submitheader",
     "setmocktime",
@@ -941,27 +947,45 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
     }))
 }
 
+/// Exact 8-decimal BTC JSON number (Core `ValueFromAmount`). Avoids f64 drift
+/// against `Decimal` comparisons in the functional suite.
+fn sat_btc_json(sat: i64) -> Value {
+    let sign = if sat < 0 { "-" } else { "" };
+    let abs = sat.unsigned_abs();
+    let s = format!("{sign}{}.{:08}", abs / 100_000_000, abs % 100_000_000);
+    Value::Number(s.parse().expect("sat/BTC decimal"))
+}
+
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
     let vsize = weight / 4;
-    let fee_btc = (fee as f64) / 100_000_000.0;
-    let stats = mp.graph_stats(txid);
-    let (ac, asz, afee, dc, dsz, dfee) = match stats {
-        Some(s) => (
-            s.ancestorcount,
-            s.ancestorsize,
-            s.ancestorfees,
-            s.descendantcount,
-            s.descendantsize,
-            s.descendantfees,
-        ),
-        None => (1, vsize, fee, 1, vsize, fee),
-    };
+    let delta = mp.fee_delta(txid);
+    let modified = (fee as i64).saturating_add(delta);
+    let (ac, asz, afee, dc, dsz, dfee, a_mod, d_mod, chunk_fee, chunk_w) =
+        match mp.graph_fees_modified(txid) {
+            Some((s, am, dm, cf, cw)) => (
+                s.ancestorcount,
+                s.ancestorsize,
+                s.ancestorfees,
+                s.descendantcount,
+                s.descendantsize,
+                s.descendantfees,
+                am,
+                dm,
+                cf,
+                cw,
+            ),
+            None => (
+                1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight,
+            ),
+        };
     json!({
         "vsize": vsize,
         "weight": weight,
-        "fee": fee_btc,
-        "modifiedfee": fee_btc,
+        "fee": sat_btc_json(fee as i64),
+        // Top-level `modifiedfee` stays the base fee (same pattern as
+        // ancestorfees/descendantfees). Real modified value is `fees.modified`.
+        "modifiedfee": sat_btc_json(fee as i64),
         "time": 0,
         "height": 0,
         "descendantcount": dc,
@@ -970,7 +994,15 @@ fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Va
         "ancestorcount": ac,
         "ancestorsize": asz,
         "ancestorfees": afee,
+        "chunkweight": chunk_w,
         "unbroadcast": mp.is_unbroadcast(txid),
+        "fees": {
+            "base": sat_btc_json(fee as i64),
+            "modified": sat_btc_json(modified),
+            "ancestor": sat_btc_json(a_mod),
+            "descendant": sat_btc_json(d_mod),
+            "chunk": sat_btc_json(chunk_fee),
+        },
     })
 }
 
@@ -1008,7 +1040,6 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let fee_btc = (fee as f64) / 100_000_000.0;
         let wtxid = mp
             .get_tx(&tid)
             .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
@@ -1016,10 +1047,7 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         let mut entry = mempool_graph_json(mp, &tid, fee, weight);
         if let Some(obj) = entry.as_object_mut() {
             obj.insert("wtxid".into(), json!(wtxid));
-            obj.insert(
-                "fees".into(),
-                json!({ "base": fee_btc, "modified": fee_btc }),
-            );
+            // `fees` already set by mempool_graph_json (includes modified/chunk).
         }
         return Ok(entry);
     }
@@ -1087,7 +1115,8 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
 }
 
 fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
-    let s = e.to_string();
+    let owned = e.to_string();
+    let s = owned.strip_prefix("policy: ").unwrap_or(owned.as_str());
     if s == "coinbase immature" {
         return "bad-txns-premature-spend-of-coinbase".into();
     }
@@ -1112,10 +1141,13 @@ fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     if s == "rbf insufficient fee" {
         return "insufficient fee".into();
     }
+    if s == "min relay fee" {
+        return "min relay fee not met".into();
+    }
     if let Some(rest) = s.strip_prefix("script: ") {
         return format!("mempool-script-verify-flag-failed ({rest})");
     }
-    s
+    s.to_string()
 }
 
 fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1137,13 +1169,15 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         // Dry-run: accept then remove if we admitted (best-effort). Prefer not
         // mutating — use accept and if ok, remove_for_block to roll back.
         match mp.accept_tx(&tx) {
-            Ok(_) => {
+            Ok(r) => {
                 let _ = mp.remove_for_block(&[tx.compute_txid()]);
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": true,
+                    "vsize": r.weight / 4,
+                    "fees": { "base": sat_btc_json(r.fee_sat as i64) },
                 }));
             }
             Err(e) => {
@@ -2046,6 +2080,11 @@ fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
 
 fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "dummy", "fee_delta"])?;
+    let missing = params.get(0, "txid").is_none() || params.get(2, "fee_delta").is_none();
+    let extra_pos = params.pos_len() > 3;
+    if missing || extra_pos {
+        return Err(rpc_error(ERR_MISC, "prioritisetransaction"));
+    }
     let txid_s = params.req_str(0, "txid")?;
     if txid_s.len() != 64 {
         return Err(rpc_error(
@@ -2100,6 +2139,9 @@ fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
 
 fn getprioritisedtransactions(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&[])?;
+    if params.pos_len() != 0 {
+        return Err(rpc_error(ERR_MISC, "getprioritisedtransactions"));
+    }
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(json!({}));
     };
@@ -2112,13 +2154,44 @@ fn getprioritisedtransactions(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         });
         if in_mempool {
             if let Some((base, _)) = mp.get_live_meta(&txid) {
-                let modified = (base as i128).saturating_add(i128::from(delta));
+                let modified = (base as i64).saturating_add(delta);
                 row["modified_fee"] = json!(modified);
             }
         }
         out.insert(txid.to_string(), row);
     }
     Ok(Value::Object(out))
+}
+
+fn getmempoolcluster(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid"])?;
+    let hex = params.req_str(0, "txid")?;
+    let tid = Txid::from_byte_array(parse_hash32_display(hex)?);
+    let mp = ctx
+        .mempool
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let Some((weight, count, chunks)) = mp.cluster_rpc(&tid) else {
+        return Err(rpc_error(
+            ERR_INVALID_ADDRESS_OR_KEY,
+            "Transaction not in mempool",
+        ));
+    };
+    let chunks_json: Vec<Value> = chunks
+        .into_iter()
+        .map(|(fee, w, txs)| {
+            json!({
+                "chunkfee": sat_btc_json(fee),
+                "chunkweight": w,
+                "txs": txs.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "clusterweight": weight,
+        "txcount": count,
+        "chunks": chunks_json,
+    }))
 }
 
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -3393,6 +3466,22 @@ mod tests {
         dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
         let pool = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
         assert_eq!(pool, json!([tid]), "deprioritised tx must stay unmined");
+
+        let missing = dispatch(&ctx, "prioritisetransaction", vec![]).unwrap_err();
+        assert_eq!(missing["code"], ERR_MISC);
+        assert_eq!(missing["message"], "prioritisetransaction");
+        let extra = dispatch(&ctx, "getprioritisedtransactions", vec![json!(true)]).unwrap_err();
+        assert_eq!(extra["code"], ERR_MISC);
+
+        let entry = dispatch(&ctx, "getmempoolentry", vec![tid.clone()]).unwrap();
+        assert!(entry["fees"]["chunk"].is_number());
+        assert_eq!(entry["chunkweight"], entry["weight"]);
+        let cluster = dispatch(&ctx, "getmempoolcluster", vec![tid.clone()]).unwrap();
+        assert_eq!(cluster["txcount"], 1);
+        assert_eq!(cluster["chunks"][0]["txs"], json!([tid]));
+        let missing_cl =
+            dispatch(&ctx, "getmempoolcluster", vec![json!("11".repeat(32))]).unwrap_err();
+        assert_eq!(missing_cl["code"], ERR_INVALID_ADDRESS_OR_KEY);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

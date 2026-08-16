@@ -9,6 +9,15 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
+  (modified fees) from the live graph.
+- **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
+  `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
+  `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
+  and into min-relay admission (free tx + delta can enter).
+
 ### Changed
 
 - **Pending `tx.head` snap lives until insert and fence:** drain
@@ -66,6 +75,8 @@ before 1.0).
 - **Block selector:** `generate*` includes mempool txs via
   `TxGraph::select_block_txids` (best-chunk order, parent-before-child,
   block-weight cap). Same helper will feed `getblocktemplate`.
+  Chunks are prefix-maximal feerate (cheap parent + hot children stay
+  together; a cheap descendant does not dilute a hotter prefix).
 
 - **`getblocktemplate` / `getmininginfo`:** template from the selector on
   every network. `rules` must include `segwit`. Proposal validates without
@@ -73,8 +84,12 @@ before 1.0).
 
 - **`prioritisetransaction`:** additive i64 sat fee delta by txid (even if
   not in the mempool). Dummy must be 0. Selector / generate / GBT rank by
-  modified fee; non-positive modified fee is not mined. Mined txs drop the
-  delta. `getprioritisedtransactions` reports the map.
+  modified fee; non-positive modified fee is not mined. Min-relay and RBF
+  use the incoming modified fee. Mined txs drop the delta.
+  `getprioritisedtransactions` reports the map.
+
+- **`-persistmempool=0`:** start with an empty live set (do not reload the
+  durable sidecar). The flag was already parsed; it now takes effect.
 
 - **Mempool BIP68:** confirmed inputs use the parent create MTP (not 0).
   `getblockheader.mediantime` is real MTP.

@@ -56,7 +56,12 @@ pub struct ChainHub {
     /// Regtest `setmocktime` / generate timestamps. Default is wall clock.
     pub clock: Arc<rbitcoin_consensus::NodeClock>,
     invalidated: RwLock<HashSet<BlockHash>>,
-    parked: RwLock<HashMap<BlockHash, Block>>,
+    /// Operator-invalidated best-chain paths (hashes only, height order).
+    /// Bodies come back via [`Query::reconstruct_archived_block`].
+    invalidated_paths: RwLock<Vec<Vec<BlockHash>>>,
+    /// Never-confirmed side-branch bodies, keyed by hash. Small cap.
+    /// Not a block index: once-confirmed losers stay in Class A.
+    held_bodies: RwLock<HashMap<BlockHash, Block>>,
     precious: RwLock<Option<BlockHash>>,
 }
 
@@ -80,7 +85,8 @@ impl ChainHub {
             mempool: std::sync::OnceLock::new(),
             clock: rbitcoin_consensus::NodeClock::new(),
             invalidated: RwLock::new(HashSet::new()),
-            parked: RwLock::new(HashMap::new()),
+            invalidated_paths: RwLock::new(Vec::new()),
+            held_bodies: RwLock::new(HashMap::new()),
             precious: RwLock::new(None),
         }
     }
@@ -410,7 +416,8 @@ impl ChainHub {
         Ok(hashes)
     }
 
-    /// Disconnect `hash` and descendants from the tip. Parked for reconsider.
+    /// Disconnect `hash` and descendants from the tip. Remember hashes only;
+    /// [`Self::reconsider_block`] reconstructs from Class A.
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), NetError> {
         let Some(h) = self
             .query
@@ -424,37 +431,49 @@ impl ChainHub {
             return Err(NetError::Consensus("block not on tip path".into()));
         }
         let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
-        for ht in (h.0..=tip).rev() {
+        let mut path = Vec::new();
+        for ht in h.0..=tip {
             if let Some(b) = self.block_at_height(ht)? {
                 let bh = b.block_hash();
                 self.invalidated.write().unwrap().insert(bh);
-                self.parked.write().unwrap().insert(bh, b);
+                path.push(bh);
             }
+        }
+        if !path.is_empty() {
+            self.invalidated_paths.write().unwrap().push(path);
         }
         let keep = h.0.saturating_sub(1);
         self.disconnect_to(keep)?;
         Ok(())
     }
 
-    /// Allow `hash` again and try to accept parked blocks starting at it.
+    /// Clear the invalid mark and re-apply the disconnected path from archive.
     pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), NetError> {
         self.invalidated.write().unwrap().remove(&hash);
-        let parked = self.parked.write().unwrap().remove(&hash);
-        if let Some(b) = parked {
-            self.accept_received_block(b)?;
-            // Descendants parked with the same invalidate.
-            let mut more: Vec<Block> = self
-                .parked
-                .write()
-                .unwrap()
-                .drain()
-                .map(|(_, b)| b)
-                .collect();
-            more.sort_by_key(|b| b.header.time);
-            for b in more {
-                self.invalidated.write().unwrap().remove(&b.block_hash());
-                let _ = self.accept_received_block(b);
+        let path = {
+            let mut paths = self.invalidated_paths.write().unwrap();
+            paths
+                .iter()
+                .position(|p| p.contains(&hash))
+                .map(|i| paths.remove(i))
+        };
+        if let Some(hashes) = path {
+            let start = hashes.iter().position(|h| *h == hash).unwrap_or(0);
+            let mut branch = Vec::new();
+            for h in &hashes[start..] {
+                self.invalidated.write().unwrap().remove(h);
+                let Some(b) = self.load_side_body(h) else {
+                    return Err(NetError::Consensus(
+                        "invalidated block missing from archive".into(),
+                    ));
+                };
+                branch.push(b);
             }
+            if !branch.is_empty() {
+                let _ = self.accept_branch(&branch)?;
+            }
+        } else if let Some(b) = self.load_side_body(&hash) {
+            let _ = self.accept_received_block(b)?;
         }
         Ok(())
     }
@@ -462,12 +481,10 @@ impl ChainHub {
     /// Prefer this hash among equal-work competing tips.
     pub fn precious_block(&self, hash: BlockHash) -> Result<(), NetError> {
         *self.precious.write().unwrap() = Some(hash);
-        // Clone out of the read guard *before* submit/accept takes parked write.
-        let parked_block = self.parked.read().unwrap().get(&hash).cloned();
-        if let Some(b) = parked_block {
-            let _ = self.accept_received_block(b);
+        if let Some(branch) = self.assemble_side_branch(hash) {
+            let _ = self.accept_branch(&branch)?;
         } else {
-            let _ = self.try_received_parked();
+            let _ = self.try_apply_held()?;
         }
         Ok(())
     }
@@ -609,13 +626,8 @@ impl ChainHub {
             }
         }
 
-        // Keep the old path so preciousblock can switch back (Core block index).
-        {
-            let mut p = self.parked.write().unwrap();
-            for b in &old_path {
-                p.insert(b.block_hash(), b.clone());
-            }
-        }
+        // Once-confirmed losers stay in Class A (`reconstruct_archived_block`).
+        // Do not copy `old_path` into the held-body map (that is a block index).
 
         // Reorg: disconnect down to fork, then connect branch.
         if let Some(fh) = fork_height {
@@ -656,28 +668,35 @@ impl ChainHub {
         }
         let height = base + (blocks.len() as u32) - 1;
         {
-            let mut p = self.parked.write().unwrap();
+            let mut held = self.held_bodies.write().unwrap();
             for b in blocks {
-                p.remove(&b.block_hash());
+                held.remove(&b.block_hash());
             }
         }
         Ok(AcceptOutcome::Accepted { height })
     }
 
-    /// Production "we received a block" entry (P2P `block` / compact, RPC
-    /// `submitblock`). Same confirm path as [`Self::accept_block`] when the
-    /// block extends the tip; otherwise park and [`Self::accept_branch`] if a
-    /// parked chain has more work (or is precious at equal work).
+    /// Production "we received a full block" (P2P `block` / compact, RPC
+    /// `submitblock`). Tip-extend via [`Self::accept_block`]; otherwise hold
+    /// the body by hash and [`Self::accept_branch`] when a held (or archived)
+    /// path has more work — or is precious at equal work.
     ///
     /// [`Self::accept_block`] stays the tip-extend / competing-tip hot path
     /// (generate, IBD planned windows). Do not add a second confirm pipeline.
     pub fn accept_received_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
+        let hash = block.block_hash();
         match self.accept_block(block.clone()) {
-            Ok(AcceptOutcome::Accepted { height }) => Ok(AcceptOutcome::Accepted { height }),
-            Ok(AcceptOutcome::AlreadyHave) => Ok(AcceptOutcome::AlreadyHave),
+            Ok(AcceptOutcome::Accepted { height }) => {
+                self.held_bodies.write().unwrap().remove(&hash);
+                Ok(AcceptOutcome::Accepted { height })
+            }
+            Ok(AcceptOutcome::AlreadyHave) => {
+                self.held_bodies.write().unwrap().remove(&hash);
+                Ok(AcceptOutcome::AlreadyHave)
+            }
             Ok(AcceptOutcome::IgnoredWeaker) => {
-                self.park_block(block);
-                match self.try_received_parked()? {
+                self.hold_body(block);
+                match self.try_apply_held()? {
                     Some(o) => Ok(o),
                     None => Ok(AcceptOutcome::IgnoredWeaker),
                 }
@@ -685,8 +704,8 @@ impl ChainHub {
             Err(NetError::Protocol(s))
                 if s.contains("side block") || s.contains("unknown parent") =>
             {
-                self.park_block(block);
-                match self.try_received_parked()? {
+                self.hold_body(block);
+                match self.try_apply_held()? {
                     Some(o) => Ok(o),
                     None => Ok(AcceptOutcome::IgnoredWeaker),
                 }
@@ -695,50 +714,94 @@ impl ChainHub {
         }
     }
 
-    fn park_block(&self, block: Block) {
-        const MAX_PARKED: usize = 256;
+    /// Cap matches tip-follow pending (`MAX_PENDING_BLOCKS = 128`): enough for
+    /// a ≥99-block side path, not an unbounded index.
+    const HELD_BODIES_CAP: usize = 128;
+
+    fn hold_body(&self, block: Block) {
         let hash = block.block_hash();
+        if self.is_connected(&hash) {
+            return;
+        }
         let evict = {
-            let p = self.parked.read().unwrap();
-            if p.contains_key(&hash) {
+            let held = self.held_bodies.read().unwrap();
+            if held.contains_key(&hash) {
                 return;
             }
-            if p.len() < MAX_PARKED {
+            if held.len() < Self::HELD_BODIES_CAP {
                 None
             } else {
-                let inv = self.invalidated.read().unwrap();
-                p.keys().copied().find(|k| !inv.contains(k))
+                held.keys().next().copied()
             }
         };
-        let mut p = self.parked.write().unwrap();
+        let mut held = self.held_bodies.write().unwrap();
         if let Some(k) = evict {
-            p.remove(&k);
+            held.remove(&k);
         }
-        p.insert(hash, block);
+        held.insert(hash, block);
     }
 
-    fn assemble_parked_branch(
-        &self,
-        tip: BlockHash,
-        parked: &HashMap<BlockHash, Block>,
-    ) -> Option<Vec<Block>> {
-        let mut rev = Vec::new();
-        let mut h = tip;
-        for _ in 0..10_000 {
-            let b = parked.get(&h)?;
+    /// Never-confirmed side-branch body in RAM. Once-confirmed disconnected
+    /// blocks are reconstructed from Class A — they are not held here.
+    pub fn held_body(&self, hash: &BlockHash) -> Option<Block> {
+        self.held_bodies.read().unwrap().get(hash).cloned()
+    }
+
+    /// Parents of held bodies that are neither on the best chain nor held
+    /// (nor reconstructable from archive). Peer download window uses this.
+    pub fn held_missing_parents(&self) -> Vec<BlockHash> {
+        let held = self.held_bodies.read().unwrap();
+        let mut missing = Vec::new();
+        for b in held.values() {
             let prev = b.header.prev_blockhash;
-            rev.push(b.clone());
             if prev.to_byte_array() == [0u8; 32] {
-                rev.reverse();
-                return Some(rev);
+                continue;
+            }
+            if self.is_connected(&prev) || held.contains_key(&prev) {
+                continue;
             }
             if self
                 .query
-                .height_of_hash(&prev.to_byte_array())
+                .reconstruct_archived_block(&prev.to_byte_array())
                 .ok()
                 .flatten()
                 .is_some()
             {
+                continue;
+            }
+            if !missing.contains(&prev) {
+                missing.push(prev);
+            }
+        }
+        missing
+    }
+
+    fn load_side_body(&self, hash: &BlockHash) -> Option<Block> {
+        if let Some(b) = self.held_body(hash) {
+            return Some(b);
+        }
+        self.query
+            .reconstruct_archived_block(&hash.to_byte_array())
+            .ok()
+            .flatten()
+    }
+
+    /// Walk hold + archive from `tip` back to a best-chain parent.
+    fn assemble_side_branch(&self, tip: BlockHash) -> Option<Vec<Block>> {
+        if self.is_connected(&tip) {
+            return None;
+        }
+        let mut rev = Vec::new();
+        let mut h = tip;
+        for _ in 0..10_000 {
+            let b = self.load_side_body(&h)?;
+            let prev = b.header.prev_blockhash;
+            rev.push(b);
+            if prev.to_byte_array() == [0u8; 32] {
+                rev.reverse();
+                return Some(rev);
+            }
+            if self.is_connected(&prev) {
                 rev.reverse();
                 return Some(rev);
             }
@@ -747,18 +810,20 @@ impl ChainHub {
         None
     }
 
-    fn try_received_parked(&self) -> Result<Option<AcceptOutcome>, NetError> {
-        let parked = {
-            let g = self.parked.read().unwrap();
-            g.clone()
-        };
-        if parked.is_empty() {
+    fn try_apply_held(&self) -> Result<Option<AcceptOutcome>, NetError> {
+        let mut starts: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().copied().collect();
+        if let Some(p) = *self.precious.read().unwrap() {
+            if !starts.contains(&p) {
+                starts.push(p);
+            }
+        }
+        if starts.is_empty() {
             return Ok(None);
         }
         let precious = *self.precious.read().unwrap();
         let mut best: Option<(Work, Vec<Block>, bool)> = None;
-        for start in parked.keys().copied() {
-            let Some(branch) = self.assemble_parked_branch(start, &parked) else {
+        for start in starts {
+            let Some(branch) = self.assemble_side_branch(start) else {
                 continue;
             };
             let w = sum_work(branch.iter().map(|b| b.header.work()));
@@ -1512,8 +1577,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Receive path holds never-confirmed side bodies; it is not a block index.
     #[test]
-    fn submit_block_parks_and_reorgs_longer_fork() {
+    fn receive_path_holds_by_hash_not_block_index() {
+        let src = include_str!("chain.rs");
+        assert!(
+            src.contains("held_bodies") && src.contains("fn hold_body"),
+            "side bodies are held by hash"
+        );
+        assert!(
+            src.contains("reconstruct_archived_block"),
+            "once-confirmed losers come from Class A"
+        );
+    }
+
+    #[test]
+    fn accept_received_reorgs_to_longer_held_fork() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
@@ -1536,7 +1615,20 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
         assert_eq!(hub.tip_height(), Some(3));
 
-        // Equal-work sibling branch: park, do not reorg until precious.
+        // Once-confirmed loser is archive-reconstructable, not a RAM block index.
+        assert!(
+            hub.query
+                .reconstruct_archived_block(&a2.block_hash().to_byte_array())
+                .unwrap()
+                .is_some(),
+            "disconnected best-chain body must stay in Class A"
+        );
+        assert!(
+            hub.held_body(&a2.block_hash()).is_none(),
+            "hold is never-confirmed side bodies only — not a CBlockIndex clone of the old path"
+        );
+
+        // Equal-work never-confirmed sibling: stay held, do not reorg until precious.
         let mut prev = gen;
         let mut eq = Vec::new();
         for i in 0..3u32 {
@@ -1554,6 +1646,24 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
         hub.precious_block(eq[2].block_hash()).unwrap();
         assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
+
+        // Switch back to the once-confirmed fork via archive, not a held clone.
+        assert!(hub.held_body(&fork[2].block_hash()).is_none());
+        assert!(hub
+            .query
+            .reconstruct_archived_block(&fork[2].block_hash().to_byte_array())
+            .unwrap()
+            .is_some());
+        hub.precious_block(fork[2].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
+
+        // invalidate / reconsider use archive hashes, not a RAM clone.
+        let tip = hub.tip_hash().unwrap();
+        hub.invalidate_block(fork[1].block_hash()).unwrap();
+        assert_eq!(hub.tip_height(), Some(1));
+        assert!(hub.held_body(&tip).is_none());
+        hub.reconsider_block(fork[1].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), tip);
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -8,10 +8,11 @@
 
 ## Summary
 
-`drain_pending` runs greedy tip-extend then `try_reorg_from_pending` **once**.
-After the reorg, a pending block whose parent is now the tip is not attached
-unless another peer message arrives. We can hold that block in RAM and sit one
-behind forever.
+`drain_pending` used to run greedy tip-extend then `try_reorg_from_pending`
+**once**. After the reorg, a pending block whose parent is now the tip was
+not attached unless another peer message arrived. We could hold that block
+in RAM and sit one behind forever. (The peer assembler is gone; drain now
+feeds `accept_received_block` in a loop until the tip is stable.)
 
 ## Fix
 

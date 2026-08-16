@@ -37,8 +37,9 @@ before 1.0).
   lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
   mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
   rejects to Core `-26` strings. `submitblock` and P2P `block` share
-  `ChainHub::accept_received_block` (park side/orphan, `accept_branch` on
-  more work). Not a coins-DB / GBT product.
+  `ChainHub::accept_received_block` (hold never-confirmed side bodies,
+  `accept_branch` on more work). Once-confirmed losers stay in Class A.
+  Not a coins-DB / GBT product.
 
 - **Core functional `run` set:** unmodified `mempool_spend_coinbase.py`,
   `mempool_resurrect.py`, `p2p_block_sync.py`,
@@ -55,8 +56,8 @@ before 1.0).
   cache-shaped dests only.
 
 - **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
-  and park via `ChainHub`; reconsider re-accepts; precious prefers an
-  equal-work sibling.
+  via `ChainHub`; reconsider reconstructs from Class A; precious prefers
+  an equal-work sibling (held or archive).
 
 - **Debug.log mapper:** `scripts/core-functional/debuglog_map.toml` plus
   shim line pump. First extra Core script: `rpc_uptime.py` (setmocktime

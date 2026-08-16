@@ -69,6 +69,26 @@ fn prune_committed_uses_drain_and_fence() {
     );
 }
 
+/// n−1: bind (stamp) must run before drain+fence prune.
+#[test]
+fn prune_committed_runs_after_stamp() {
+    let src = include_str!("mod.rs");
+    let stamp = src
+        .find("confirm_wire_lookup_stamp_with_hits")
+        .expect("stamp");
+    let prune = src
+        .rfind("lookup_ahead.prune_committed")
+        .expect("prune after stamp");
+    assert!(
+        stamp < prune,
+        "prune_committed must run after leftover bind"
+    );
+    assert!(
+        src.contains("apply_disconnect"),
+        "reorg drop is before bind, not leftover_drop_txids"
+    );
+}
+
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.
 #[test]
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {

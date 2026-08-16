@@ -61,7 +61,7 @@ wire / body-queue
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
-| Leftover parent union | A committed create is leftover-visible via **in-flight** until drain inserted its fk span **and** `fence.covers_fk_span` (TipOnly is connected), then **load-owned pending** (`txid → fk` notes, no fence) until insert-fk HWM **and** fence **and** `height < tip+1`, then **TipOnly head**. Write queued is insert-only. Forget is per-fk, after bind. Disconnect evicts that block’s txids. Noted fk without `body_range` is `Corrupt`. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent) |
+| Parent create_fk union | **in-flight** (prune **after** bind: drain inserted fk span **and** `fence.covers_fk_span`) → pin_txid → BQ hits → **TipOnly** (connected). No leftover pending map. Disconnect drops in-flight layers at that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent) |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `inwit` on pin |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
@@ -76,30 +76,18 @@ RPC, Electrum, and standalone tools may still use store cold paths.
 `validate_block_connect` remains a no-write unit-test helper only (empty pin →
 structural cold spentness).
 
-## Why leftover is not in-flight
+## Why there is no leftover pending map
 
-In-flight and leftover are both RAM `txid → create_fk` (plus in-flight outs).
-They are **not** the same lifetime or prune.
+In-flight is the only RAM `txid → create_fk` cache for planned creates
+(plus `CreatePin` outs). Load prunes it **after** bind, when drain has
+inserted the layer (seal is inside that insert) **and** the fence covers
+the span. n−1 binds from in-flight before that prune. TipOnly is the
+home once the layer is gone.
 
-| | In-flight | Leftover pending |
-|-|-----------|------------------|
-| **When** | Pack planned, not yet in a TipOnly home | Class A published; `tx.head` may still be queued |
-| **Who writes** | Load `InFlightLog::note` / `prune` | Write sends notes; load applies / forgets |
-| **Prune** | **Layer:** drain `fk_hi` **and** `fence.covers_fk_span` | **Per fk**: fence **and** insert HWM **and** `height < tip+1` |
-| **Payload** | Creates **and** `CreatePin` outs for tip-ahead pin | Identity only (`txid → fk`) |
-
-In-flight stays until leftover TipOnly can actually see the creates: drain
-has inserted the layer (including any `tx.head` seal inside that insert)
-**and** the fence covers the span. Fence alone is Class C during drain
-(67438 / 269204 seal). Drain alone is an unconnected head hit TipOnly drops.
-
-Leftover pending is still the thin `txid → fk` home across the n−1 pack
-(`height < tip+1`) after in-flight has dropped. Two maps, two prunes, one
-union order.
-
-**`pack_lo = tip+1`:** leftover holds creates at height ≥ tip until the next
-leftover bind (n−1 insurance). Forget after bind. `plan=None` does not forget
-before bind.
+Fence alone during drain/seal (67438 / 269204) does not drop the layer.
+Drain alone does not drop it (TipOnly would reject unconnected).
+Disconnect drops layers at/above the leaving height **before** the next
+bind.
 
 ## Related code
 

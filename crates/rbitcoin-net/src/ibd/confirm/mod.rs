@@ -25,6 +25,8 @@ struct LoadAheadState {
     parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
     /// Last height successfully loaded (still in pipeline or already committed).
     last_loaded: Option<(u32, [u8; 32])>,
+    /// Last applied [`Query::take_disconnect`] generation.
+    disconnect_gen_seen: u64,
 }
 
 impl LoadAheadState {
@@ -35,13 +37,22 @@ impl LoadAheadState {
             in_flight: rbitcoin_query::InFlightLog::new(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             last_loaded: None,
+            disconnect_gen_seen: 0,
         }
     }
 
-    /// Drop packs leftover TipOnly can see: drain inserted **and** fence covers.
+    /// Drop reorged layers **before** bind so disconnected creates cannot stamp.
+    fn apply_disconnect(&mut self, hub: &ChainHub) {
+        if let Some(h) = hub.query.take_disconnect(&mut self.disconnect_gen_seen) {
+            self.in_flight.drop_from_height(h);
+            self.publish_mem_stats();
+        }
+    }
+
+    /// Drop packs TipOnly can see: drain inserted **and** fence covers.
     ///
-    /// Either signal alone keeps the layer. Class C extends the fence during
-    /// drain (including a multi-second `tx.head` seal).
+    /// Call **after** stamp/bind so n−1 still hits this map. Either signal
+    /// alone keeps the layer.
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
@@ -835,7 +846,7 @@ pub(crate) mod confirm_thr_stats {
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
-/// from BQ hits + leftover TipOnly `tx.head` + pin + assemble) → scriptq →
+/// from BQ hits + in-flight + TipOnly `tx.head` + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
@@ -1200,7 +1211,7 @@ pub(crate) fn spawn_confirm_engine(
                 if load_ahead_reset_load.swap(false, Ordering::AcqRel) {
                     lookup_ahead.clear_all(&hub_load);
                 }
-                lookup_ahead.prune_committed(&hub_load);
+                lookup_ahead.apply_disconnect(&hub_load);
                 let batch: (Vec<(u32, BlockHash, bitcoin::Block)>, u32) = {
                     let mut g = feed_load.inner.lock().unwrap();
                     let found: Option<(Vec<(u32, BlockHash, bitcoin::Block)>, u32)> = loop {
@@ -1449,6 +1460,7 @@ pub(crate) fn spawn_confirm_engine(
                         .collect();
                     lookup_ahead.note_archived_creates(&hub_load, &hh);
                 }
+                lookup_ahead.prune_committed(&hub_load);
                 let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
                 let plan_ns = stamped.work_ns;
                 let heights_hashes: Vec<(u32, BlockHash)> = wire_batch

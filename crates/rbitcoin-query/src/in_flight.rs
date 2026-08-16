@@ -126,8 +126,21 @@ impl InFlightLog {
         self.layers.push(Arc::new(layer));
     }
 
+    /// Drop layers at or above a disconnected height (reorg). Untagged stay.
+    pub fn drop_from_height(&mut self, height: u32) {
+        if self.layers.is_empty() {
+            return;
+        }
+        self.layers.retain(|layer| match layer.max_height {
+            Some(h) => h < height,
+            None => true,
+        });
+        self.layers.shrink_to_fit();
+    }
+
     /// Drop layers visible to leftover TipOnly: inserted **and** fenced.
     ///
+    /// Call **after** leftover bind so n−1 still resolves from this map.
     /// `drain_fk == 0` keeps every layer. Empty-span layers stay.
     pub fn prune_if_head_ready(&mut self, fence: &rbitcoin_store::HeightFence, drain_fk: u64) {
         if self.layers.is_empty() || drain_fk == 0 {
@@ -400,6 +413,22 @@ mod tests {
             log.snapshot().get_create_fk(&p.0.txid).is_none(),
             "inserted and fenced"
         );
+    }
+
+    #[test]
+    fn drop_from_height_keeps_lower_and_untagged() {
+        let mut log = InFlightLog::new();
+        let a = pin(10);
+        let b = pin(20);
+        let c = pin(30);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(20), &b)]).with_max_height(3));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(30), &c)]));
+        log.drop_from_height(3);
+        let v = log.snapshot();
+        assert!(v.get_create_fk(&a.0.txid).is_some());
+        assert!(v.get_create_fk(&b.0.txid).is_none());
+        assert!(v.get_create_fk(&c.0.txid).is_some(), "untagged stays");
     }
 
     #[test]

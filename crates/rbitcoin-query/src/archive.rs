@@ -873,9 +873,11 @@ impl Query {
         Ok(n)
     }
 
-    /// Forget pending snap keys whose create fk is fence-connected.
+    /// Forget pending snap keys that are fence-connected and no longer queued.
     ///
-    /// Drain inserts head first; leftover binds pending until this runs.
+    /// Still-queued keys stay (insert not published). Call after
+    /// [`Self::drain_pending_tx_head`] and after fence extend — not from
+    /// Class C while drain is in flight.
     pub fn forget_pending_if_fenced(&self) {
         self.store
             .txs
@@ -1368,6 +1370,74 @@ mod tests {
         let plan_b = q
             .archive_plan_batch_from(&mut need_b, 2, &empty)
             .expect("leftover TipOnly must stamp after fence, without pending");
+        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Class C `height_fence_extend` + `forget_pending_if_fenced` can finish
+    /// before `head_insert_many` publishes (67438 leftover_n=11 hit=4).
+    /// Snap is the leftover home until insert *and* fence; forget must not
+    /// drop still-queued keys.
+    #[test]
+    fn leftover_binds_pending_after_fence_before_drain() {
+        let (dir, q) = temp_query("leftover-fence-before-drain");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        let header_fk = plan_a.per_header_ranges[0].0;
+        q.archive_commit_plan_defer_head(plan_a).unwrap();
+        assert!(
+            q.store().txs.pending_fk(&parent_txid).is_some(),
+            "defer-head must leave the create in the pending snap"
+        );
+        assert!(
+            q.store().txs.pending_head_len() >= 1,
+            "create must still be queued — drain has not inserted tx.head"
+        );
+        q.store()
+            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
+            .unwrap();
+        assert!(
+            q.store()
+                .height_fence_snapshot()
+                .height_of(parent_fk)
+                .is_some(),
+            "Class C fence covers the create before drain insert"
+        );
+        q.forget_pending_if_fenced();
+        assert!(
+            q.store().txs.pending_fk(&parent_txid).is_some(),
+            "forget-if-fenced must not drop keys still queued for insert"
+        );
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xec;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
+            .expect("leftover must bind pending after fence, before drain insert");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }

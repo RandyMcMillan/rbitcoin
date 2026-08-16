@@ -4,12 +4,14 @@
 //! read a published snapshot (brief lock to clone the Arc). Drain uses the same
 //! page-grouped [`crate::tx_table::TxTable::head_insert_many`].
 //!
-//! Snap = Class A committed, **not leftover-visible via the height fence**.
-//! Drain inserts `tx.head` for lookup probe; do **not** forget until
-//! `height_of(fk)` is Some. Not a process pin FIFO — no outs / spent_range.
+//! Snap = leftover home until **insert published and fence covers**.
+//! Drain inserts `tx.head` for probe; do **not** forget still-queued keys
+//! (Class C may extend the fence first). Forget only after
+//! `head_insert_many` returns *and* `height_of(fk)` is Some. Not a
+//! process pin FIFO — no outs / spent_range.
 
 use rbitcoin_primitives::Fk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Soft cap on queued inserts. Writer must drain before enqueueing more.
@@ -57,13 +59,18 @@ impl PendingHeadInserts {
         std::mem::take(&mut *q)
     }
 
-    /// Drop snap keys whose create fk is fence-connected. Unfenced keys stay
-    /// for leftover `pending_fk` (drain must not wipe them).
+    /// Drop snap keys that are fence-connected **and** no longer queued.
+    /// Still-queued keys stay: drain has not published `tx.head` yet, so
+    /// leftover has no TipOnly home (67438).
     pub fn forget_if_fenced(&self, fence: &crate::height_fence::HeightFence) {
+        let queued: HashSet<[u8; 32]> = {
+            let q = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            q.iter().map(|(txid, _)| *txid).collect()
+        };
         let covered: Vec<([u8; 32], Fk)> = {
             let g = self.snap.read().unwrap_or_else(|e| e.into_inner());
             g.iter()
-                .filter(|(_, fk)| fence.height_of(**fk).is_some())
+                .filter(|(txid, fk)| !queued.contains(*txid) && fence.height_of(**fk).is_some())
                 .map(|(txid, fk)| (*txid, *fk))
                 .collect()
         };

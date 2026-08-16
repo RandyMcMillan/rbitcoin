@@ -149,6 +149,9 @@ pub fn confirm_write_phase(
                     )));
                 }
             }
+            // Happens-after insert *and* fence (Class C already ran). Snap
+            // stays through the ∥ so leftover has a home (67438).
+            query.forget_pending_if_fenced();
 
             Ok((
                 out,

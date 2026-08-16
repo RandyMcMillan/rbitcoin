@@ -1497,10 +1497,16 @@ fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
                 ));
             }
         };
-        let Some(script) = parse_raw_descriptor(desc) else {
+        let script = if let Some(s) = parse_raw_descriptor(desc) {
+            s
+        } else if let Some(s) = parse_addr_descriptor(ctx, desc) {
+            s
+        } else if let Some(s) = crate::rawtx::parse_wrapped_multi(desc) {
+            s
+        } else {
             return Err(rpc_error(
                 ERR_INVALID_PARAMS,
-                format!("only raw() descriptors are supported (got {desc})"),
+                format!("unsupported descriptor (got {desc})"),
             ));
         };
         scripts.push(script.to_bytes());
@@ -1531,7 +1537,7 @@ fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
             "vout": u.vout,
             "scriptPubKey": hex_encode(&u.script),
             "desc": format!("raw({})", hex_encode(&u.script)),
-            "amount": Amount::from_sat(u.value).to_btc(),
+            "amount": sat_btc_json(u.value as i64),
             "coinbase": u.coinbase,
             "height": u.height,
         }));
@@ -2442,6 +2448,227 @@ mod tests {
         assert!(sub.ends_with("(testnode0)/"), "{sub}");
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["loaded"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rawtx_createmultisig_descriptor_and_sign_p2pkh() {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::PrivateKey;
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let secp = Secp256k1::new();
+        let wif = "cVpF924EspNh8KjYsfhgY96mmxvT6DgdWiTYMtMjuM74hJaU5psW";
+        let pk = PrivateKey::from_wif(wif).unwrap();
+        let addr = bitcoin::Address::p2pkh(pk.public_key(&secp), BtcNetwork::Regtest).to_string();
+        dispatch(
+            &ctx,
+            "generatetoaddress",
+            vec![json!(101), json!(addr.clone())],
+        )
+        .unwrap();
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb = blk["tx"][0]["txid"].as_str().unwrap().to_string();
+        let raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": cb, "vout": 0}]),
+                json!({addr.clone(): 49.0}),
+            ],
+        )
+        .unwrap();
+        let signed = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!([wif])],
+        )
+        .unwrap();
+        assert_eq!(signed["complete"], true);
+        let hex = signed["hex"].as_str().unwrap();
+        assert_ne!(hex, raw.as_str().unwrap());
+
+        let ms = dispatch(
+            &ctx,
+            "createmultisig",
+            vec![
+                json!(1),
+                json!([pk.public_key(&secp).to_string()]),
+                json!("p2sh-segwit"),
+            ],
+        )
+        .unwrap();
+        assert!(ms["descriptor"]
+            .as_str()
+            .unwrap()
+            .starts_with("sh(wsh(multi(1,"));
+        assert!(ms["descriptor"].as_str().unwrap().contains('#'));
+
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!(["123"])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!([wif]), json!([]), json!("all")],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        let extra = format!("{}00", raw.as_str().unwrap());
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![json!(extra), json!([wif])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION);
+
+        // Array-shaped outputs (Core createrawtransaction since 0.17).
+        let raw_arr = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": cb, "vout": 0}]),
+                json!([{addr.clone(): 49.0}]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(raw_arr, raw);
+
+        // P2A prevout: keyless no-op (scriptPubKey 51024e73).
+        let p2a_raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": "00".repeat(32), "vout": 0}]),
+                json!([{addr.clone(): 1.0}]),
+            ],
+        )
+        .unwrap();
+        let p2a_signed = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![
+                p2a_raw.clone(),
+                json!([]),
+                json!([{
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "scriptPubKey": "51024e73",
+                    "amount": 1.0
+                }]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(p2a_signed["complete"], true);
+        assert_eq!(p2a_signed["hex"], p2a_raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rawtx_descsum_and_wrapped_multi() {
+        assert_eq!(
+            crate::rawtx::descsum_create("raw(deadbeef)"),
+            "raw(deadbeef)#89f8spxm"
+        );
+        let pk = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let desc = format!("sh(wsh(multi(1,{pk})))");
+        let spk = crate::rawtx::parse_wrapped_multi(&desc).expect("wrapped multi");
+        assert!(spk.is_p2sh());
+        let wsh = crate::rawtx::parse_wrapped_multi(&format!("wsh(multi(1,{pk}))")).unwrap();
+        assert!(wsh.is_p2wsh());
+        let sh = crate::rawtx::parse_wrapped_multi(&format!("sh(multi(1,{pk}))")).unwrap();
+        assert!(sh.is_p2sh());
+    }
+
+    #[test]
+    fn rawtx_sign_p2sh_p2wsh_and_p2wsh() {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::PrivateKey;
+        use rbitcoin_primitives::hex_encode;
+        let (ctx, dir) = ctx_empty();
+        let secp = Secp256k1::new();
+        let wif = "cVpF924EspNh8KjYsfhgY96mmxvT6DgdWiTYMtMjuM74hJaU5psW";
+        let pk = PrivateKey::from_wif(wif)
+            .unwrap()
+            .public_key(&secp)
+            .to_string();
+        let dest = "mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB";
+        let dummy = "11".repeat(32);
+
+        let too_many = vec![pk.clone(); 21];
+        let e = dispatch(&ctx, "createmultisig", vec![json!(1), json!(too_many)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+
+        for (addr_type, wrap) in [("p2sh-segwit", "sh(wsh("), ("bech32", "wsh(")] {
+            let ms = dispatch(
+                &ctx,
+                "createmultisig",
+                vec![json!(1), json!([pk.clone()]), json!(addr_type)],
+            )
+            .unwrap();
+            assert!(ms["descriptor"].as_str().unwrap().starts_with(wrap));
+            let ws_hex = ms["redeemScript"].as_str().unwrap().to_string();
+            let desc = ms["descriptor"].as_str().unwrap();
+            let spk = crate::rawtx::parse_wrapped_multi(desc).unwrap();
+            let ws =
+                bitcoin::ScriptBuf::from_bytes(rbitcoin_primitives::hex_decode(&ws_hex).unwrap());
+            let redeem_hex = hex_encode(ws.as_script().to_p2wsh().as_bytes());
+            let raw = dispatch(
+                &ctx,
+                "createrawtransaction",
+                vec![json!([{"txid": dummy, "vout": 0}]), json!({dest: 1.0})],
+            )
+            .unwrap();
+            let mut prev = serde_json::Map::new();
+            prev.insert("txid".into(), json!(dummy));
+            prev.insert("vout".into(), json!(0));
+            prev.insert("scriptPubKey".into(), json!(hex_encode(spk.as_bytes())));
+            prev.insert("witnessScript".into(), json!(ws_hex.clone()));
+            prev.insert("amount".into(), json!(1.0));
+            if addr_type == "p2sh-segwit" {
+                prev.insert("redeemScript".into(), json!(redeem_hex));
+            }
+            let signed = dispatch(
+                &ctx,
+                "signrawtransactionwithkey",
+                vec![raw, json!([wif]), json!([prev])],
+            )
+            .unwrap();
+            assert_eq!(signed["complete"], true, "{addr_type}: {signed}");
+        }
+
+        let raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![json!([{"txid": dummy, "vout": 0}]), json!({dest: 1.0})],
+        )
+        .unwrap();
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![
+                raw,
+                json!([wif]),
+                json!([{
+                    "txid": dummy,
+                    "vout": 0,
+                    "scriptPubKey": "a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa87",
+                    "amount": 1.0
+                }]),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(e["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing redeemScript"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

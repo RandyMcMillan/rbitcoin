@@ -2,8 +2,9 @@
 //! `createmultisig`. No keystore — keys come in on the call.
 
 use crate::methods::{
-    parse_hash32_display, rpc_error, RpcContext, RpcParams, ERR_INVALID_ADDRESS_OR_KEY,
-    ERR_INVALID_PARAMETER, ERR_INVALID_PARAMS, ERR_MISC, ERR_TYPE_ERROR,
+    parse_hash32_display, rpc_error, RpcContext, RpcParams, ERR_DESERIALIZATION,
+    ERR_INVALID_ADDRESS_OR_KEY, ERR_INVALID_PARAMETER, ERR_INVALID_PARAMS, ERR_MISC,
+    ERR_TYPE_ERROR,
 };
 use bitcoin::absolute::LockTime;
 use bitcoin::address::KnownHrp;
@@ -27,10 +28,7 @@ pub(crate) fn createrawtransaction(params: &RpcParams) -> Result<Value, Value> {
     let ins = params
         .get_array(0, "inputs")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "inputs must be an array"))?;
-    let outs = params
-        .get(1, "outputs")
-        .and_then(Value::as_object)
-        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "outputs must be an object"))?;
+    let outs = parse_create_outputs(params.get(1, "outputs"))?;
     let locktime = params.opt_u64(2, "locktime")?.unwrap_or(0) as u32;
     let replaceable = params.opt_bool(3, "replaceable")?.unwrap_or(false);
     let seq = if replaceable {
@@ -70,7 +68,7 @@ pub(crate) fn createrawtransaction(params: &RpcParams) -> Result<Value, Value> {
     }
 
     let mut output = Vec::new();
-    for (k, v) in outs {
+    for (k, v) in &outs {
         if k == "data" {
             let hex = v
                 .as_str()
@@ -124,6 +122,12 @@ pub(crate) fn createmultisig(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             "createmultisig cannot create bech32m multisig addresses",
         ));
     }
+    if keys.len() > 20 {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "Number of keys involved in the multisignature address creation > 20",
+        ));
+    }
     if nrequired == 0 || nrequired > keys.len() {
         return Err(rpc_error(
             ERR_INVALID_PARAMETER,
@@ -160,6 +164,19 @@ pub(crate) fn createmultisig(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             ));
         }
     };
+    let mut inner = format!("multi({nrequired}");
+    for pk in &pks {
+        inner.push(',');
+        inner.push_str(&pk.to_string());
+    }
+    inner.push(')');
+    let desc_body = match addr_type {
+        "legacy" => format!("sh({inner})"),
+        "p2sh-segwit" => format!("sh(wsh({inner}))"),
+        "bech32" => format!("wsh({inner})"),
+        _ => inner,
+    };
+    let descriptor = descsum_create(&desc_body);
     Ok(Value::Object(
         [
             ("address".into(), Value::String(address)),
@@ -167,6 +184,7 @@ pub(crate) fn createmultisig(ctx: &RpcContext, params: &RpcParams) -> Result<Val
                 "redeemScript".into(),
                 Value::String(hex_encode(redeem.as_bytes())),
             ),
+            ("descriptor".into(), Value::String(descriptor)),
         ]
         .into_iter()
         .collect(),
@@ -178,8 +196,16 @@ pub(crate) fn signrawtransactionwithkey(
     params: &RpcParams,
 ) -> Result<Value, Value> {
     params.reject_unknown(&["hexstring", "privkeys", "prevtxs", "sighashtype"])?;
+    if let Some(s) = params.opt_str(3, "sighashtype")? {
+        if !valid_sighash(s) {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!("'{s}' is not a valid sighash parameter."),
+            ));
+        }
+    }
     let hex = params.req_str(0, "hexstring")?;
-    let mut tx = crate::methods::decode_tx_hex(hex)?;
+    let mut tx = decode_tx_hex_strict(hex)?;
     let keys_v = params
         .get_array(1, "privkeys")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "privkeys must be an array"))?;
@@ -191,7 +217,7 @@ pub(crate) fn signrawtransactionwithkey(
             .as_str()
             .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "privkey must be a string"))?;
         let pk = PrivateKey::from_wif(wif)
-            .map_err(|e| rpc_error(ERR_INVALID_PARAMETER, format!("Invalid private key: {e}")))?;
+            .map_err(|_| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Invalid private key"))?;
         let full = pk.public_key(&secp);
         match full.to_bytes().as_slice() {
             b if b.len() == 33 => {
@@ -258,6 +284,7 @@ enum FilledInput {
         script_sig: ScriptBuf,
         witness: Witness,
     },
+    Unchanged,
 }
 
 fn apply_input(vin: &mut TxIn, filled: FilledInput) {
@@ -270,7 +297,39 @@ fn apply_input(vin: &mut TxIn, filled: FilledInput) {
             vin.script_sig = script_sig;
             vin.witness = witness;
         }
+        FilledInput::Unchanged => {}
     }
+}
+
+fn decode_tx_hex_strict(hex: &str) -> Result<Transaction, Value> {
+    let b = hex_decode(hex).map_err(|_| tx_decode_failed())?;
+    let mut sl = b.as_slice();
+    let tx =
+        bitcoin::consensus::Decodable::consensus_decode(&mut sl).map_err(|_| tx_decode_failed())?;
+    if !sl.is_empty() {
+        return Err(tx_decode_failed());
+    }
+    Ok(tx)
+}
+
+fn tx_decode_failed() -> Value {
+    rpc_error(
+        ERR_DESERIALIZATION,
+        "TX decode failed. Make sure the tx has at least one input.",
+    )
+}
+
+fn valid_sighash(s: &str) -> bool {
+    matches!(
+        s,
+        "DEFAULT"
+            | "ALL"
+            | "NONE"
+            | "SINGLE"
+            | "ALL|ANYONECANPAY"
+            | "NONE|ANYONECANPAY"
+            | "SINGLE|ANYONECANPAY"
+    )
 }
 
 fn parse_prevtxs(v: Option<&Value>) -> Result<HashMap<OutPoint, PrevInfo>, Value> {
@@ -383,6 +442,12 @@ fn sign_input(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
 ) -> Result<Option<FilledInput>, Value> {
     let (spk, amount) = prev;
+    if is_p2a(spk) {
+        return Ok(Some(FilledInput::Unchanged));
+    }
+    if let Some(info) = info {
+        check_prev_scripts(spk, info)?;
+    }
     if spk.is_p2pkh() {
         return sign_p2pkh(cache, index, spk, keys, keys65, secp);
     }
@@ -398,9 +463,7 @@ fn sign_input(
             let Some(ws) = witness_script else {
                 return Ok(None);
             };
-            return sign_p2sh_p2wsh_multisig(
-                cache, index, &redeem, &ws, *amount, keys, keys65, secp,
-            );
+            return sign_p2sh_p2wsh(cache, index, &redeem, &ws, *amount, keys, keys65, secp);
         }
         return sign_p2sh_multisig(cache, index, &redeem, keys, keys65, secp);
     }
@@ -408,9 +471,56 @@ fn sign_input(
         let Some(ws) = witness_script else {
             return Ok(None);
         };
-        return sign_p2wsh_multisig(cache, index, &ws, *amount, keys, keys65, secp);
+        return sign_p2wsh(cache, index, &ws, *amount, keys, keys65, secp);
     }
     Ok(None)
+}
+
+fn check_prev_scripts(spk: &Script, info: &PrevInfo) -> Result<(), Value> {
+    if spk.is_p2sh() && info.redeem_script.is_none() && info.witness_script.is_none() {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "Missing redeemScript/witnessScript",
+        ));
+    }
+    if let (Some(r), Some(w)) = (&info.redeem_script, &info.witness_script) {
+        if r.as_script() != w.as_script().to_p2wsh().as_script() {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "redeemScript does not correspond to witnessScript",
+            ));
+        }
+    }
+    if spk.is_p2sh() {
+        let redeem = info.redeem_script.clone().or_else(|| {
+            info.witness_script
+                .as_ref()
+                .map(|w| w.as_script().to_p2wsh())
+        });
+        if let Some(r) = redeem {
+            if r.as_script().to_p2sh().as_script() != spk {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMETER,
+                    "redeemScript/witnessScript does not match scriptPubKey",
+                ));
+            }
+        }
+    }
+    if spk.is_p2wsh() {
+        if let Some(w) = &info.witness_script {
+            if w.as_script().to_p2wsh().as_script() != spk {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMETER,
+                    "redeemScript/witnessScript does not match scriptPubKey",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_p2a(s: &Script) -> bool {
+    s.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
 }
 
 fn sign_p2pkh(
@@ -459,7 +569,7 @@ fn sign_p2sh_multisig(
     Ok(Some(FilledInput::Legacy(b.into_script())))
 }
 
-fn sign_p2wsh_multisig(
+fn sign_p2wsh(
     cache: &mut SighashCache<&Transaction>,
     index: usize,
     witness_script: &Script,
@@ -468,26 +578,56 @@ fn sign_p2wsh_multisig(
     keys65: &HashMap<[u8; 65], PrivateKey>,
     secp: &Secp256k1<bitcoin::secp256k1::All>,
 ) -> Result<Option<FilledInput>, Value> {
-    let Some(pks) = multisig_signers(witness_script, keys, keys65, secp) else {
-        return Ok(None);
-    };
-    let sighash = cache
-        .p2wsh_signature_hash(index, witness_script, amount, EcdsaSighashType::All)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    let mut wit = Witness::new();
-    wit.push([]);
-    for pk in pks {
-        let sigv = ecdsa_sig(secp, &pk, sighash.to_byte_array())?;
-        wit.push(&sigv);
+    if let Some(pks) = multisig_signers(witness_script, keys, keys65, secp) {
+        let sighash = cache
+            .p2wsh_signature_hash(index, witness_script, amount, EcdsaSighashType::All)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        let mut wit = Witness::new();
+        wit.push([]);
+        for pk in pks {
+            let sigv = ecdsa_sig(secp, &pk, sighash.to_byte_array())?;
+            wit.push(&sigv);
+        }
+        wit.push(witness_script.as_bytes());
+        return Ok(Some(FilledInput::Witness {
+            script_sig: ScriptBuf::new(),
+            witness: wit,
+        }));
     }
-    wit.push(witness_script.as_bytes());
-    Ok(Some(FilledInput::Witness {
-        script_sig: ScriptBuf::new(),
-        witness: wit,
-    }))
+    if let Some(pk) = p2pk_key(witness_script, keys, keys65, secp) {
+        let sighash = cache
+            .p2wsh_signature_hash(index, witness_script, amount, EcdsaSighashType::All)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        let sigv = ecdsa_sig(secp, &pk, sighash.to_byte_array())?;
+        let mut wit = Witness::new();
+        wit.push(&sigv);
+        wit.push(witness_script.as_bytes());
+        return Ok(Some(FilledInput::Witness {
+            script_sig: ScriptBuf::new(),
+            witness: wit,
+        }));
+    }
+    if witness_script.is_p2pkh() {
+        if let Some(pk) = find_p2pkh_key(witness_script, keys, keys65, secp) {
+            let sighash = cache
+                .p2wsh_signature_hash(index, witness_script, amount, EcdsaSighashType::All)
+                .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+            let sigv = ecdsa_sig(secp, &pk, sighash.to_byte_array())?;
+            let full = pk.public_key(secp);
+            let mut wit = Witness::new();
+            wit.push(&sigv);
+            wit.push(full.to_bytes());
+            wit.push(witness_script.as_bytes());
+            return Ok(Some(FilledInput::Witness {
+                script_sig: ScriptBuf::new(),
+                witness: wit,
+            }));
+        }
+    }
+    Ok(None)
 }
 
-fn sign_p2sh_p2wsh_multisig(
+fn sign_p2sh_p2wsh(
     cache: &mut SighashCache<&Transaction>,
     index: usize,
     redeem: &Script,
@@ -497,7 +637,7 @@ fn sign_p2sh_p2wsh_multisig(
     keys65: &HashMap<[u8; 65], PrivateKey>,
     secp: &Secp256k1<bitcoin::secp256k1::All>,
 ) -> Result<Option<FilledInput>, Value> {
-    let inner = sign_p2wsh_multisig(cache, index, witness_script, amount, keys, keys65, secp)?;
+    let inner = sign_p2wsh(cache, index, witness_script, amount, keys, keys65, secp)?;
     let Some(FilledInput::Witness { witness, .. }) = inner else {
         return Ok(None);
     };
@@ -508,6 +648,38 @@ fn sign_p2sh_p2wsh_multisig(
         script_sig,
         witness,
     }))
+}
+
+fn p2pk_key(
+    script: &Script,
+    keys: &HashMap<[u8; 33], PrivateKey>,
+    keys65: &HashMap<[u8; 65], PrivateKey>,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Option<PrivateKey> {
+    let _ = secp;
+    let mut ins = script.instructions();
+    let first = ins.next()?.ok()?;
+    let bytes = first.push_bytes()?.as_bytes();
+    let last = ins.next()?.ok()?;
+    if last.opcode()? != bitcoin::opcodes::all::OP_CHECKSIG {
+        return None;
+    }
+    if ins.next().is_some() {
+        return None;
+    }
+    match bytes.len() {
+        33 => {
+            let mut a = [0u8; 33];
+            a.copy_from_slice(bytes);
+            keys.get(&a).copied()
+        }
+        65 => {
+            let mut a = [0u8; 65];
+            a.copy_from_slice(bytes);
+            keys65.get(&a).copied()
+        }
+        _ => None,
+    }
 }
 
 fn find_p2pkh_key(
@@ -651,6 +823,38 @@ fn push_bytes(b: &[u8]) -> Result<PushBytesBuf, Value> {
     PushBytesBuf::try_from(b.to_vec()).map_err(|_| rpc_error(ERR_MISC, "push overflow"))
 }
 
+/// Core `createrawtransaction` outputs: object `{addr: amt}` or ordered
+/// array `[{addr: amt}, …]` (single-key objects, including `data`).
+fn parse_create_outputs(v: Option<&Value>) -> Result<Vec<(String, Value)>, Value> {
+    match v {
+        Some(Value::Object(m)) => Ok(m.iter().map(|(k, val)| (k.clone(), val.clone())).collect()),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let o = item.as_object().ok_or_else(|| {
+                    rpc_error(
+                        ERR_INVALID_PARAMETER,
+                        "Invalid parameter, key-value pair not an object as expected",
+                    )
+                })?;
+                if o.len() != 1 {
+                    return Err(rpc_error(
+                        ERR_INVALID_PARAMETER,
+                        "Invalid parameter, key-value pair must contain exactly one key",
+                    ));
+                }
+                let (k, val) = o.iter().next().expect("len==1");
+                out.push((k.clone(), val.clone()));
+            }
+            Ok(out)
+        }
+        _ => Err(rpc_error(
+            ERR_INVALID_PARAMS,
+            "outputs must be an object or array",
+        )),
+    }
+}
+
 fn json_btc_sats(v: &Value) -> Result<u64, Value> {
     match v {
         Value::Number(n) => parse_btc_sats(&n.to_string()),
@@ -699,4 +903,86 @@ fn btc_net(ctx: &RpcContext) -> BtcNetwork {
         rbitcoin_primitives::Network::Signet => BtcNetwork::Signet,
         rbitcoin_primitives::Network::Regtest => BtcNetwork::Regtest,
     }
+}
+
+/// BIP380 descriptor checksum (`#` + 8 bech32 chars).
+pub(crate) fn descsum_create(s: &str) -> String {
+    const INPUT: &[u8] =
+        b"0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+    const CHECK: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const GEN: [u64; 5] = [
+        0xf5dee51989,
+        0xa9fdca3312,
+        0x1bab10e32d,
+        0x3706b1677a,
+        0x644d626ffd,
+    ];
+    let mut symbols = Vec::new();
+    let mut groups = Vec::new();
+    for c in s.bytes() {
+        let v = match INPUT.iter().position(|&x| x == c) {
+            Some(i) => i as u64,
+            None => return s.to_string(),
+        };
+        symbols.push(v & 31);
+        groups.push(v >> 5);
+        if groups.len() == 3 {
+            symbols.push(groups[0] * 9 + groups[1] * 3 + groups[2]);
+            groups.clear();
+        }
+    }
+    if groups.len() == 1 {
+        symbols.push(groups[0]);
+    } else if groups.len() == 2 {
+        symbols.push(groups[0] * 3 + groups[1]);
+    }
+    symbols.extend_from_slice(&[0; 8]);
+    let mut chk = 1u64;
+    for value in symbols {
+        let top = chk >> 35;
+        chk = ((chk & 0x7ffffffff) << 5) ^ value;
+        for (i, g) in GEN.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk ^= 1;
+    let mut out = String::from(s);
+    out.push('#');
+    for i in 0..8 {
+        let idx = ((chk >> (5 * (7 - i))) & 31) as usize;
+        out.push(CHECK[idx] as char);
+    }
+    out
+}
+
+/// `sh(multi(...))` / `wsh(multi(...))` / `sh(wsh(multi(...)))` → scriptPubKey.
+pub(crate) fn parse_wrapped_multi(desc: &str) -> Option<ScriptBuf> {
+    let bare = desc.split('#').next()?.trim();
+    let (wrap_sh, wrap_wsh, inner) = if let Some(rest) = bare.strip_prefix("sh(wsh(") {
+        (true, true, rest.strip_suffix("))")?)
+    } else if let Some(rest) = bare.strip_prefix("sh(") {
+        (true, false, rest.strip_suffix(")")?)
+    } else if let Some(rest) = bare.strip_prefix("wsh(") {
+        (false, true, rest.strip_suffix(")")?)
+    } else {
+        return None;
+    };
+    let multi = inner.strip_prefix("multi(")?.strip_suffix(")")?;
+    let mut parts = multi.split(',');
+    let nrequired: usize = parts.next()?.parse().ok()?;
+    let mut pks = Vec::new();
+    for p in parts {
+        pks.push(PublicKey::from_str(p).ok()?);
+    }
+    let redeem = build_multisig(&pks, nrequired).ok()?;
+    let spk = if wrap_sh && wrap_wsh {
+        redeem.as_script().to_p2wsh().as_script().to_p2sh()
+    } else if wrap_sh {
+        redeem.as_script().to_p2sh()
+    } else {
+        redeem.as_script().to_p2wsh()
+    };
+    Some(spk)
 }

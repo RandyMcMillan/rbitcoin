@@ -11,6 +11,10 @@ before 1.0).
 
 ### Added
 
+- **`docs/errata.md`:** RAM leftover maps are one fk per txid. Pre-BIP30
+  clobber is correct enough; post-BIP30 a disconnected sibling in those
+  maps is an unlikely visibility hole, not the n−1 leftover miss.
+
 - **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
   (modified fees) from the live graph.
 - **Stateless raw-tx:** `createrawtransaction`, `signrawtransactionwithkey`,

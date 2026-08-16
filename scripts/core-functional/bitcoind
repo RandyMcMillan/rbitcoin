@@ -4,6 +4,10 @@
 Maps Core TestNode argv + bitcoin.conf onto rbitcoin-node flags.
 `-datadir=DIR` becomes `--datadir DIR/regtest` so the cookie lands at
 `DIR/regtest/.cookie` (what BitcoinTestFramework tails).
+
+Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
+`rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
+gives consecutive rpcports, so that collided across nodes).
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ import threading
 from pathlib import Path
 
 from map_debuglog import apply_line, load_rules
+from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
+from rpc_util import register_utility
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -162,8 +168,8 @@ def find_node() -> Path:
     )
 
 
-def translate(argv: list[str]) -> tuple[list[str], Path]:
-    """Return (rbitcoin-node argv including binary, node datadir)."""
+def translate(argv: list[str]) -> tuple[list[str], Path, int]:
+    """Return (rbitcoin-node argv, node datadir, public RPC port)."""
     datadir: Path | None = None
     rpcport: str | None = None
     p2pport: str | None = None
@@ -289,23 +295,26 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
         "--datadir",
         str(node_dir),
         "--rpc-listen",
-        f"127.0.0.1:{rpcport}",
+        f"127.0.0.1:{node_rpc_port(int(rpcport))}",
         "--listen",
         f"127.0.0.1:{p2pport}",
         "--no-seeds",
+        "--shindex",
+        "--esplora-listen",
+        f"127.0.0.1:{esplora_port(int(rpcport))}",
     ]
     if debug:
         cmd += ["--log-level", "debug"]
     for c in uacomments:
         cmd += [f"--uacomment={c}"]
     cmd += extra_node_args
-    return cmd, node_dir
+    return cmd, node_dir, int(rpcport)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     print_cmd = "--print-cmd" in argv
-    cmd, node_dir = translate(argv)
+    cmd, node_dir, public_rpc = translate(argv)
     pid_path = node_dir / "bitcoind.pid"
     if print_cmd:
         print(" ".join(cmd))
@@ -345,6 +354,28 @@ def main(argv: list[str] | None = None) -> int:
     pump = threading.Thread(target=_pump, daemon=True)
     pump.start()
 
+    cookie_path = node_dir / ".cookie"
+    node_url = f"http://127.0.0.1:{node_rpc_port(public_rpc)}"
+
+    def _cookie() -> str | None:
+        try:
+            text = cookie_path.read_text()
+        except OSError:
+            return None
+        line = text.strip()
+        return line or None
+
+    proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
+    register_utility(proxy)
+    try:
+        proxy.start()
+    except OSError as e:
+        child.terminate()
+        child.wait(timeout=5)
+        log_f.close()
+        print(f"bitcoind: proxy listen 127.0.0.1:{public_rpc}: {e}", file=sys.stderr)
+        return 1
+
     def _forward(signum: int, _frame: object) -> None:
         try:
             child.send_signal(signum)
@@ -354,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _forward)
     signal.signal(signal.SIGINT, _forward)
     rc = child.wait()
+    proxy.shutdown()
     pump.join(timeout=2)
     log_f.close()
     if rc:

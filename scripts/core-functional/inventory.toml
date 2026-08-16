@@ -868,8 +868,7 @@ analog = "follow-up: waitforblock*/gettxout/getchaintxstats; getblock exists"
 
 [[test]]
 name = "rpc_createmultisig.py"
-status = "skip"
-reason = "no-wallet"
+status = "run"
 
 [[test]]
 name = "rpc_decodescript.py"

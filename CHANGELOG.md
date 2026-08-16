@@ -17,8 +17,10 @@ before 1.0).
 
 - **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
   (modified fees) from the live graph.
-- **Stateless raw-tx:** `createrawtransaction`, `signrawtransactionwithkey`,
-  `createmultisig` (legacy / p2sh-segwit / bech32). No keystore.
+- **Test RPC proxy** (Core functional suite only): utility RPCs
+  (`createrawtransaction`, `signrawtransactionwithkey`, `createmultisig`,
+  `combinerawtransaction`, decode helpers) live in the bitcoind shim, not
+  on `rbitcoin-node`.
 - **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
   `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
@@ -137,6 +139,13 @@ before 1.0).
 - Unused Core-style `check_tx_standard` (admit is Libre only).
 - Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
 - `crate_name()` / `smoke_crate_names` coverage theater.
+
+### Fixed
+
+- **Core functional proxy ports:** Esplora binds `rpcport+20000`, not
+  `node_rpc+1`. Consecutive Core `-rpcport` values made the next node's
+  internal RPC land on the previous node's Esplora (`HTTP 404` on
+  `getblockcount` in multi-node tests).
 
 ### Added
 

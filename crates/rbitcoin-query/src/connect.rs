@@ -282,7 +282,8 @@ impl Query {
             self.store
                 .height_fence_extend(item.height, item.header_fk)?;
         }
-        self.forget_pending_if_fenced();
+        // Do not forget pending here: drain may still be inserting tx.head
+        // (67438). Write forgets after drain.join() *and* this extend.
         // L2 write-behind barrier: complete-or-fail Class C image to disk **before**
         // callers dequeue the body queue. Kill after this returns → tip durable;
         // kill before → BQ still holds blocks for re-drive.

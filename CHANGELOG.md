@@ -11,12 +11,13 @@ before 1.0).
 
 ### Changed
 
-- **Pending `tx.head` snap lives until the fence:** drain inserts head
-  for lookup probe but does not `forget` unfenced keys. Write forgets
-  only after `height_fence_extend`. Load leftover checks pending (no
-  fence) then TipOnly (connected). Forgetting at insert raced Class C
-  and dropped the only home for a just-committed parent (`327331`
-  leftover_n−1). No leftover soft-requeue — union miss stays Corrupt.
+- **Pending `tx.head` snap lives until insert and fence:** drain
+  inserts head for probe; `forget_if_fenced` skips still-queued keys.
+  Write forgets after `drain.join()` *and* `height_fence_extend` — not
+  from Class C while insert is in flight. Fence-first (early IBD huge
+  packs) dropped pending before `tx.head` published (`67438`
+  leftover_n=11 hit=4). Drain-first hole was `327331` leftover_n−1.
+  No leftover soft-requeue — union miss stays Corrupt.
 
 - **IBD lookup wave select is one BQ lock:** unresolved heights come from
   `block_queue_unresolved_heights` (in-entry `resolve_complete`, capped).

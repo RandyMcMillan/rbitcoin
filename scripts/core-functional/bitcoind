@@ -32,6 +32,71 @@ def parse_kv(arg: str) -> tuple[str, str | None]:
     return a, None
 
 
+# Flags that change consensus / mempool / peers: forward to rbitcoin-node.
+# Silently dropping these is a test-only lie.
+FORWARD_FLAGS = frozenset(
+    {
+        "testactivationheight",
+        "persistmempool",
+        "whitelist",
+        "blocksonly",
+        "minrelaytxfee",
+        "permitbaremultisig",
+        "limitclustercount",
+        "limitclustersize",
+        "peertimeout",
+        "minimumchainwork",
+    }
+)
+
+# Harness / wallet / onion / prune extras we do not implement.
+IGNORE_FLAGS = frozenset(
+    {
+        "server",
+        "disablewallet",
+        "v2transport",
+        "logtimemicros",
+        "debugexclude",
+        "logthreadnames",
+        "logsourcelocations",
+        "nologratelimit",
+        "print-cmd",
+        "acceptnonstdtxn",
+        "peerblockfilters",
+        # Core v31.1: ancestor/descendant limits are deprecated no-ops
+        # (cluster limits replaced them). Match that — do not invent a second
+        # mempool graph policy.
+        "limitdescendantcount",
+        "limitancestorcount",
+        "limitdescendantsize",
+        "limitancestorsize",
+        "fastprune",
+        "prune",
+        "txospenderindex",
+        "datacarrier",
+        "datacarriersize",
+        "blockreconstructionextratxn",
+        "maxuploadtarget",
+        "rest",
+        "discover",
+        "listenonion",
+        "dnsseed",
+        "forcednsseed",
+        "upnp",
+        "natpmp",
+        "shrinkdebugfile",
+        "daemon",
+        "logtimestamps",
+    }
+)
+
+
+def forward_flag(key: str, val: str | None) -> str:
+    if val is None:
+        return f"--{key}"
+    return f"--{key}={val}"
+
+
 def read_conf(path: Path) -> dict[str, str]:
     """Read bitcoin.conf. Later [section] keys override earlier ones."""
     out: dict[str, str] = {}
@@ -105,6 +170,7 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
     want_help = False
     want_version = False
     uacomments: list[str] = []
+    extra_node_args: list[str] = []
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -120,6 +186,14 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
             "uacomment",
             "loglevel",
             "conf",
+            "testactivationheight",
+            "whitelist",
+            "minrelaytxfee",
+            "limitclustercount",
+            "limitclustersize",
+            "peertimeout",
+            "maxconnections",
+            "minimumchainwork",
         ):
             i += 1
             if i >= len(argv):
@@ -149,54 +223,20 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
             want_version = True
         elif key in ("debug",) or (key == "loglevel" and val):
             debug = True
-        elif key in (
-            "server",
-            "disablewallet",
-            "v2transport",
-            "logtimemicros",
-            "debugexclude",
-            "logthreadnames",
-            "logsourcelocations",
-            "nologratelimit",
-            "print-cmd",
-            # Core TestNode / MiniWallet extras we do not implement as flags.
-            "whitelist",
-            "persistmempool",
-            "acceptnonstdtxn",
-            "minrelaytxfee",
-            "blocksonly",
-            "peerblockfilters",
-            "txindex",
-            "permitbaremultisig",
-            "testactivationheight",
-            "limitclustercount",
-            "limitclustersize",
-            "limitdescendantcount",
-            "limitancestorcount",
-            "limitdescendantsize",
-            "limitancestorsize",
-            "fastprune",
-            "prune",
-            "minimumchainwork",
-            "txospenderindex",
-            "datacarrier",
-            "datacarriersize",
-            "blockreconstructionextratxn",
-            "maxconnections",
-            "maxuploadtarget",
-            "peertimeout",
-            "rest",
-            "discover",
-            "listenonion",
-            "dnsseed",
-            "forcednsseed",
-            "upnp",
-            "natpmp",
-            "shrinkdebugfile",
-            "daemon",
-            "logtimestamps",
-        ):
+        elif key == "txindex":
+            # Class A always looks up by txid. `-txindex` / `=1` is already true.
+            # `-txindex=0` cannot be honored.
+            if val is not None and val.lower() in ("0", "false", "off", "no"):
+                print("Error parsing command line arguments", file=sys.stderr)
+                raise SystemExit(1)
+        elif key in IGNORE_FLAGS:
             pass
+        elif key in FORWARD_FLAGS:
+            extra_node_args.append(forward_flag(key, val))
+        elif key == "maxconnections":
+            extra_node_args.append(
+                f"--maxconnections={val}" if val is not None else "--maxconnections"
+            )
         else:
             print("Error parsing command line arguments", file=sys.stderr)
             raise SystemExit(1)
@@ -246,6 +286,7 @@ def translate(argv: list[str]) -> tuple[list[str], Path]:
         cmd += ["--log-level", "debug"]
     for c in uacomments:
         cmd += [f"--uacomment={c}"]
+    cmd += extra_node_args
     return cmd, node_dir
 
 

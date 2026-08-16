@@ -1,7 +1,7 @@
 use crate::config::NodeConfig;
 use crate::inhibit::SuspendInhibit;
 use crate::run::{run_node, run_p2p};
-use rbitcoin_consensus::default_milestone_height;
+use rbitcoin_consensus::{default_milestone_height, ChainParams};
 use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_primitives::Network;
 use std::ffi::OsString;
@@ -53,6 +53,16 @@ where
     let mut log_level_cli: Option<Option<Level>> = None;
     let mut api_log: Option<PathBuf> = None;
     let mut uacomments: Vec<String> = Vec::new();
+    let mut test_activation_heights: Vec<(String, u32)> = Vec::new();
+    let mut persist_mempool: Option<bool> = None;
+    let mut whitelist: Vec<String> = Vec::new();
+    let mut blocksonly: Option<bool> = None;
+    let mut min_relay_fee_btc: Option<String> = None;
+    let mut permit_bare_multisig: Option<bool> = None;
+    let mut limit_cluster_count: Option<u32> = None;
+    let mut limit_cluster_size_kvb: Option<u32> = None;
+    let mut peer_timeout_secs: Option<u64> = None;
+    let mut minimum_chain_work: Option<[u8; 32]> = None;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -66,6 +76,10 @@ where
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound|--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
+    [--testactivationheight name@height] [--persistmempool[=0|1]] [--whitelist SPEC] \\\n\
+    [--blocksonly] [--minrelaytxfee BTC] [--permitbaremultisig[=0|1]] \\\n\
+    [--limitclustercount N] [--limitclustersize KVB] [--peertimeout SECS] \\\n\
+    [--minimumchainwork HEX] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--uacomment STR] \\\n\
     [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
@@ -398,6 +412,222 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 uacomments.push(other["--uacomment=".len()..].to_string());
                 i += 1;
             }
+            "--testactivationheight" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --testactivationheight requires name@height");
+                    return ExitCode::from(2);
+                }
+                let spec = args[i].to_string_lossy();
+                match ChainParams::parse_test_activation_height(&spec) {
+                    Ok((n, h)) => test_activation_heights.push((n.to_string(), h)),
+                    Err(e) => {
+                        eprintln!("error: --testactivationheight: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--testactivationheight=") => {
+                let spec = &other["--testactivationheight=".len()..];
+                match ChainParams::parse_test_activation_height(spec) {
+                    Ok((n, h)) => test_activation_heights.push((n.to_string(), h)),
+                    Err(e) => {
+                        eprintln!("error: --testactivationheight: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--blocksonly" => {
+                blocksonly = Some(true);
+                i += 1;
+            }
+            other if other.starts_with("--blocksonly=") => {
+                match parse_cli_bool(&other["--blocksonly=".len()..]) {
+                    Some(b) => blocksonly = Some(b),
+                    None => {
+                        eprintln!("error: bad --blocksonly value");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--persistmempool" => {
+                persist_mempool = Some(true);
+                i += 1;
+            }
+            other if other.starts_with("--persistmempool=") => {
+                match parse_cli_bool(&other["--persistmempool=".len()..]) {
+                    Some(b) => persist_mempool = Some(b),
+                    None => {
+                        eprintln!("error: bad --persistmempool value");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--permitbaremultisig" => {
+                permit_bare_multisig = Some(true);
+                i += 1;
+            }
+            other if other.starts_with("--permitbaremultisig=") => {
+                match parse_cli_bool(&other["--permitbaremultisig=".len()..]) {
+                    Some(b) => permit_bare_multisig = Some(b),
+                    None => {
+                        eprintln!("error: bad --permitbaremultisig value");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--whitelist=") => {
+                let v = &other["--whitelist=".len()..];
+                if !v.is_empty() {
+                    whitelist.push(v.to_string());
+                }
+                i += 1;
+            }
+            "--whitelist" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --whitelist requires a value");
+                    return ExitCode::from(2);
+                }
+                whitelist.push(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
+            other if other.starts_with("--minrelaytxfee=") => {
+                min_relay_fee_btc = Some(other["--minrelaytxfee=".len()..].to_string());
+                i += 1;
+            }
+            "--minrelaytxfee" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --minrelaytxfee requires a value");
+                    return ExitCode::from(2);
+                }
+                min_relay_fee_btc = Some(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
+            other if other.starts_with("--limitclustercount=") => {
+                match other["--limitclustercount=".len()..].parse() {
+                    Ok(n) => limit_cluster_count = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --limitclustercount: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--limitclustercount" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --limitclustercount requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse() {
+                    Ok(n) => limit_cluster_count = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --limitclustercount: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--limitclustersize=") => {
+                match other["--limitclustersize=".len()..].parse() {
+                    Ok(n) => limit_cluster_size_kvb = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --limitclustersize: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--limitclustersize" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --limitclustersize requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse() {
+                    Ok(n) => limit_cluster_size_kvb = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --limitclustersize: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--peertimeout=") => {
+                match other["--peertimeout=".len()..].parse() {
+                    Ok(n) => peer_timeout_secs = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --peertimeout: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--peertimeout" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --peertimeout requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse() {
+                    Ok(n) => peer_timeout_secs = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --peertimeout: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--minimumchainwork=") => {
+                match crate::config::parse_minimum_chain_work(&other["--minimumchainwork=".len()..])
+                {
+                    Ok(w) => minimum_chain_work = Some(w),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 1;
+            }
+            "--minimumchainwork" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --minimumchainwork requires a hex value");
+                    return ExitCode::from(2);
+                }
+                match crate::config::parse_minimum_chain_work(&args[i].to_string_lossy()) {
+                    Ok(w) => minimum_chain_work = Some(w),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--maxconnections=") => {
+                match other["--maxconnections=".len()..].parse::<u32>() {
+                    Ok(n) if n > 0 => {
+                        max_inbound = n;
+                        max_inbound_set = true;
+                    }
+                    Ok(_) => {
+                        eprintln!("error: --maxinbound must be >= 1");
+                        return ExitCode::from(2);
+                    }
+                    Err(e) => {
+                        eprintln!("error: bad --maxconnections: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
             "--api-log" => {
                 i += 1;
                 if i >= args.len() {
@@ -559,6 +789,38 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     if let Some(mb) = mempool_size_mb {
         config.mempool_max_weight = mb.saturating_mul(1_000_000);
     }
+    if !test_activation_heights.is_empty() {
+        config
+            .test_activation_heights
+            .extend(test_activation_heights);
+    }
+    if let Some(b) = persist_mempool {
+        config.persist_mempool = b;
+    }
+    if !whitelist.is_empty() {
+        config.whitelist.extend(whitelist);
+    }
+    if let Some(b) = blocksonly {
+        config.blocksonly = b;
+    }
+    if let Some(s) = min_relay_fee_btc {
+        config.min_relay_fee_btc = Some(s);
+    }
+    if let Some(b) = permit_bare_multisig {
+        config.permit_bare_multisig = b;
+    }
+    if let Some(n) = limit_cluster_count {
+        config.limit_cluster_count = Some(n);
+    }
+    if let Some(n) = limit_cluster_size_kvb {
+        config.limit_cluster_size_kvb = Some(n);
+    }
+    if let Some(n) = peer_timeout_secs {
+        config.peer_timeout_secs = Some(n);
+    }
+    if let Some(w) = minimum_chain_work {
+        config.minimum_chain_work = Some(w);
+    }
 
     // Unstable env is an input when CLI/conf omitted inbound — never set_var.
     config.absorb_inbound_env();
@@ -630,6 +892,14 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
 }
 
+fn parse_cli_bool(v: &str) -> Option<bool> {
+    match v {
+        "" | "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +927,51 @@ mod tests {
     fn help_and_version_exit_success() {
         assert_exit(cli_main(["rbitcoin-node", "--help"]), ExitCode::SUCCESS);
         assert_exit(cli_main(["rbitcoin-node", "-V"]), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn testactivationheight_cli_smoke_regtest() {
+        let dir = tmp_datadir();
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--testactivationheight=csv@102",
+            "--testactivationheight=dersig@50",
+            "--whitelist=noban@127.0.0.1",
+            "--permitbaremultisig=0",
+            "--limitclustercount=10",
+            "--maxconnections=8",
+            "--minimumchainwork=0x65",
+            "--no-seeds",
+            "--log-level",
+            "error",
+            "--milestone",
+            "0",
+        ]);
+        assert_exit(code, ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn minimumchainwork_rejects_non_hex() {
+        let dir = tmp_datadir();
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--minimumchainwork=test",
+            "--log-level",
+            "error",
+        ]);
+        assert_exit(code, ExitCode::from(1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

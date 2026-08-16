@@ -27,6 +27,17 @@ before 1.0).
 
 ### Added
 
+- **Core `-testactivationheight` overlay:** `name@height` (regtest) is parsed
+  on `rbitcoin-node` and applied in `ChainParams` (`csv` / `segwit` / `bip34`
+  / `dersig` / `cltv`). Script flags still follow the getters in a later
+  confirm step. Shim forwards consensus/mempool/peer flags
+  (`whitelist`, `blocksonly`, `minrelaytxfee`, `permitbaremultisig`,
+  `limitcluster*`, `peertimeout`, `maxconnections`, `persistmempool`,
+  `minimumchainwork`) instead of dropping them. `-minimumchainwork` keeps
+  the node in IBD (no relay) until tip work meets the hex floor. There is
+  no `-txindex` flag: Class A always looks up by txid. Core v31.1
+  ancestor/descendant limit flags stay ignored (they are no-ops there).
+
 - **Core functional coverage:** analog scenarios for `--milestone` skip-below /
   check-above, reconstruct after lost RAM head, and durable mempool reopen
   (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is

@@ -50,6 +50,8 @@ pub struct QueuedBlockMeta {
     pub hash: [u8; 32],
     pub header_fk: u64,
     pub payload_len: u64,
+    /// Lookup finished TipOnly for this height (load may still leftover-stamp).
+    pub resolve_complete: bool,
 }
 
 /// Process-local FIFO of block payloads (append + delete-by-id).
@@ -241,6 +243,7 @@ impl BlockQueue {
                 hash: e.hash,
                 header_fk: e.header_fk,
                 payload_len: e.payload.len() as u64,
+                resolve_complete: e.resolve_complete,
             })
             .collect()
     }
@@ -487,6 +490,32 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].payload_len, 5);
         assert_eq!(m[0].height, 5);
+        assert!(!m[0].resolve_complete, "enqueue starts unresolved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_meta_reports_resolve_complete() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(3, [3u8; 32], 1, b"a").unwrap();
+        q.enqueue(4, [4u8; 32], 2, b"b").unwrap();
+        q.mark_resolve_complete(4).unwrap();
+        let m = q.list_meta();
+        assert_eq!(m.len(), 2);
+        let h3 = m.iter().find(|e| e.height == 3).unwrap();
+        let h4 = m.iter().find(|e| e.height == 4).unwrap();
+        assert!(!h3.resolve_complete);
+        assert!(h4.resolve_complete);
+        assert!(q.is_resolve_complete(4));
+        assert!(!q.is_resolve_complete(3));
+        let id4 = q.id_for_height(4).unwrap();
+        assert!(q.dequeue(id4).unwrap());
+        let m = q.list_meta();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].height, 3);
+        assert!(!m[0].resolve_complete);
+        assert!(!q.is_resolve_complete(4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

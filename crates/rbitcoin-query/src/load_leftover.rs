@@ -9,8 +9,8 @@
 //! pack_lo (`tip+1`), or `fk > drain_fk` (insert not done). Last fk wins
 //! ([`docs/errata.md`](../../../docs/errata.md)).
 //!
-//! In-flight is a different prune (`covers_fk_span` of a layer) and is not
-//! this map — see [`crate::in_flight`] and `docs/invariants.md`.
+//! In-flight is a different prune (drain-fk **and** `covers_fk_span` of a
+//! layer) and is not this map — see [`crate::in_flight`] and `docs/invariants.md`.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeightFence;

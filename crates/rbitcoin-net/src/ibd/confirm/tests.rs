@@ -43,10 +43,10 @@ fn prune_inflight_keeps_until_tip_covers_height() {
     assert_eq!(log.layer_count(), 0);
 }
 
-/// Production prune_committed must drop only when leftover would accept the
-/// pack's fks (`covers_fk_span`), not fence max height alone (950545).
+/// Production prune_committed requires drain HWM **and** fence (TipOnly).
+/// Fence alone is the 269204 seal hole; drain alone is an unconnected TipOnly miss.
 #[test]
-fn prune_committed_uses_leftover_ready_not_fence_tip() {
+fn prune_committed_uses_drain_and_fence() {
     let src = include_str!("mod.rs");
     let prune = src
         .split("fn prune_committed")
@@ -54,12 +54,18 @@ fn prune_committed_uses_leftover_ready_not_fence_tip() {
         .and_then(|s| s.split("fn publish_mem_stats").next())
         .expect("prune_committed");
     assert!(
-        prune.contains("prune_if_leftover_ready"),
-        "prune must use leftover-ready (fk span), not fence_tip alone: {prune}"
+        prune.contains("prune_if_head_ready")
+            && prune.contains("head_drain_fk")
+            && prune.contains("height_fence_snapshot"),
+        "prune must check drain and fence: {prune}"
+    );
+    assert!(
+        !prune.contains("prune_if_leftover_ready") && !prune.contains("prune_if_drained("),
+        "old single-signal prune: {prune}"
     );
     assert!(
         !prune.contains("prune_through_tip"),
-        "height-only prune is not leftover-ready: {prune}"
+        "height-only prune is not head-visible: {prune}"
     );
 }
 

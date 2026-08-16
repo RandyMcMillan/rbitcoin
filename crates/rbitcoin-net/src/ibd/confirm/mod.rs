@@ -38,17 +38,18 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs leftover TipOnly would accept (`covers_fk_span`).
+    /// Drop packs leftover TipOnly can see: drain inserted **and** fence covers.
     ///
-    /// Pending write-behind is accepted without a fence. Prune still waits
-    /// until the fence covers the pack's fks so drain-forget cannot miss
-    /// (mainnet 950545 leftover 1752/1751 after PR #37).
+    /// Either signal alone keeps the layer. Class C extends the fence during
+    /// drain (including a multi-second `tx.head` seal).
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        self.in_flight
-            .prune_if_leftover_ready(&hub.query.store().height_fence_snapshot());
+        self.in_flight.prune_if_head_ready(
+            &hub.query.store().height_fence_snapshot(),
+            hub.query.head_drain_fk(),
+        );
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);

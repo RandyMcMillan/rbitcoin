@@ -316,15 +316,15 @@ impl Store {
         self.fence().max_connected_fk()
     }
 
-    /// Clone of the RAM fence (leftover / in-flight prune).
+    /// Clone of the RAM fence (leftover TipOnly / in-flight prune with drain).
     pub fn height_fence_snapshot(&self) -> crate::height_fence::HeightFence {
         self.fence().clone()
     }
 
     /// Highest height whose Class A run is on the RAM fence (`None` if empty).
     ///
-    /// Max height on the fence. In-flight prune also requires
-    /// [`HeightFence::covers_fk_span`] of the pack's fks.
+    /// Max height on the fence. In-flight prune requires this span **and**
+    /// drain-fk (`Query::head_drain_fk`).
     pub fn fence_tip_height(&self) -> Option<u32> {
         self.fence().max_height()
     }

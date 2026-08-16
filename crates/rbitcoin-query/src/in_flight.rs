@@ -6,9 +6,10 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop a layer only when leftover TipOnly would accept those
-//! creates: fence `covers_fk_span` of the pack's fks (not max height alone).
-//! Pending snap is a separate home until that same fence covers.
+//! **Prune:** drop a layer only when **both** drain has inserted its create-fk
+//! span (`fk_hi <= drain_fk`) **and** the fence covers that span. TipOnly
+//! leftover is fence-connected; drain alone is not a home. Either signal
+//! alone keeps the layer (Class C ∥ drain/seal).
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -26,7 +27,7 @@ pub struct InFlightLayer {
     outs: U64Map<CreatePin>,
     /// Highest block height in this pack. [`None`] = untagged (tip prune keeps it).
     max_height: Option<u32>,
-    /// Inclusive create-fk span (leftover-ready prune).
+    /// Inclusive create-fk span (drain + fence prune).
     fk_lo: Option<u64>,
     fk_hi: Option<u64>,
 }
@@ -86,12 +87,12 @@ impl InFlightLayer {
         }
     }
 
-    /// Leftover TipOnly would accept every create in this layer.
-    fn leftover_would_accept(&self, fence: &rbitcoin_store::HeightFence) -> bool {
+    /// Drain inserted the span **and** TipOnly would accept it (fence).
+    fn head_ready(&self, fence: &rbitcoin_store::HeightFence, drain_fk: u64) -> bool {
         let (Some(lo), Some(hi)) = (self.fk_lo, self.fk_hi) else {
             return false;
         };
-        fence.covers_fk_span(lo, hi)
+        drain_fk > 0 && hi <= drain_fk && fence.covers_fk_span(lo, hi)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -125,16 +126,15 @@ impl InFlightLog {
         self.layers.push(Arc::new(layer));
     }
 
-    /// Drop layers leftover TipOnly would accept (`covers_fk_span`).
+    /// Drop layers visible to leftover TipOnly: inserted **and** fenced.
     ///
-    /// Max fence height alone is not enough (hole / past last run). Untagged
-    /// or empty-span layers stay.
-    pub fn prune_if_leftover_ready(&mut self, fence: &rbitcoin_store::HeightFence) {
-        if self.layers.is_empty() {
+    /// `drain_fk == 0` keeps every layer. Empty-span layers stay.
+    pub fn prune_if_head_ready(&mut self, fence: &rbitcoin_store::HeightFence, drain_fk: u64) {
+        if self.layers.is_empty() || drain_fk == 0 {
             return;
         }
         self.layers
-            .retain(|layer| !layer.leftover_would_accept(fence));
+            .retain(|layer| !layer.head_ready(fence, drain_fk));
         self.layers.shrink_to_fit();
     }
 
@@ -361,40 +361,61 @@ mod tests {
         assert!(log.snapshot().is_empty());
     }
 
-    /// fence_tip >= max_height is not leftover-ready when the pack's fks sit
-    /// in a hole / past the last run (mainnet 950545 leftover 1752/1751).
-    #[test]
-    fn prune_keeps_layer_when_fence_tip_covers_height_not_fks() {
+    fn fence_covering(lo: u64, count: u32, height: u32) -> rbitcoin_store::HeightFence {
         use rbitcoin_store::{FenceRun, HeightFence};
+        HeightFence::from_runs(vec![FenceRun {
+            first_fk: lo,
+            count,
+            height,
+        }])
+    }
+
+    /// TipOnly is fence-connected. Drain or fence alone is not a home
+    /// (269204 leftover_n=1121 hit=1120 during first segment seal).
+    #[test]
+    fn prune_keeps_until_drain_and_fence() {
         let mut log = InFlightLog::new();
         let p = pin(10);
         log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2));
-        let fence = HeightFence::from_runs(vec![
-            FenceRun {
-                first_fk: 1,
-                count: 2,
-                height: 0,
-            },
-            FenceRun {
-                first_fk: 20,
-                count: 3,
-                height: 2,
-            },
-        ]);
-        assert_eq!(fence.max_height(), Some(2));
-        assert!(!fence.covers_fk_span(10, 10));
-        log.prune_if_leftover_ready(&fence);
+        let covered = fence_covering(10, 1, 2);
+        let empty = rbitcoin_store::HeightFence::empty();
+
+        log.prune_if_head_ready(&covered, 0);
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "must not prune until leftover TipOnly would accept these fks"
+            "drain_fk 0: insert never completed"
         );
-        let covered = HeightFence::from_runs(vec![FenceRun {
-            first_fk: 10,
-            count: 1,
-            height: 2,
-        }]);
-        log.prune_if_leftover_ready(&covered);
-        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
+        log.prune_if_head_ready(&covered, 9);
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "fence covers, drain still mid-seal"
+        );
+        log.prune_if_head_ready(&empty, 10);
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "drain done, fence not connected — TipOnly would drop"
+        );
+        log.prune_if_head_ready(&covered, 10);
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_none(),
+            "inserted and fenced"
+        );
+    }
+
+    #[test]
+    fn prune_if_head_ready_keeps_higher_layer() {
+        let mut log = InFlightLog::new();
+        let a = pin(10);
+        let b = pin(50);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]));
+        log.prune_if_head_ready(&fence_covering(1, 50, 2), 10);
+        let v = log.snapshot();
+        assert!(v.get_create_fk(&a.0.txid).is_none());
+        assert!(
+            v.get_create_fk(&b.0.txid).is_some(),
+            "later pack still mid-insert"
+        );
     }
 
     #[test]

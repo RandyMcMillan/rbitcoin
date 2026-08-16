@@ -393,12 +393,12 @@ is safe: `next_height` is the last complete put; restart in Tip (or after
 the next Direct catch-up reaches tip) resumes the walker. Electrum during
 the hole uses the naive path.
 
-On disk (schema 14 side files, no `SCHEMA_VERSION` bump):
+On disk (schema 17 dirs; leftover single files are unlinked on startup):
 
 | File | Contents |
 |------|----------|
-| `store/sp_tweaks.idx` | Per height from taproot activation: `header_fk` + `u32` body off (~3 MiB at today’s tip) |
-| `store/sp_tweaks.body` | Per tx: `len=0` or `len=33` + compressed `A_tweak` (~3–6 GiB mainnet) |
+| `store/sp_tweaks.idx/` | `meta` (`origin` + fmt 3) + `NNNNNN` tip-only `u32` start offs (no `header_fk`) |
+| `store/sp_tweaks.body/` | Matching `NNNNNN` files: per tx `len=0` or `len=33` + compressed `A_tweak`. New pair when the next start would exceed 4 GiB. |
 
 **Not stored:** txids, Taproot outs, values, parent scripts. Cake
 `output_pubkeys` are joined from this block’s **`txout`** body (~12 ms

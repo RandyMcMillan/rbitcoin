@@ -203,6 +203,12 @@ impl Store {
             let _ = std::fs::remove_dir_all(&leftover_wire);
             let _ = std::fs::remove_file(&leftover_wire);
         }
+        if crate::sp_tweaks::SpTweaksTable::discard_legacy_files(&path) {
+            eprintln!(
+                "store: dropping leftover sp_tweaks.idx/body files \
+                 (schema 17 uses segmented dirs; --sptweaks backfill regenerates)"
+            );
+        }
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open(&path)?
@@ -2660,9 +2666,13 @@ mod tests {
         std::fs::write(dir.join("archive_epoch"), b"junk").unwrap();
         std::fs::create_dir_all(dir.join("wire")).unwrap();
         std::fs::write(dir.join("wire").join("leftover"), b"x").unwrap();
+        std::fs::write(dir.join("sp_tweaks.idx"), b"old-idx").unwrap();
+        std::fs::write(dir.join("sp_tweaks.body"), b"old-body").unwrap();
         let s = Store::open(&dir).unwrap();
         assert!(!dir.join("archive_epoch").exists());
         assert!(!dir.join("wire").exists());
+        assert!(!dir.join("sp_tweaks.idx").is_file());
+        assert!(!dir.join("sp_tweaks.body").is_file());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

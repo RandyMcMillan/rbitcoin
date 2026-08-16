@@ -112,7 +112,7 @@ pub use sorted_run::{
     write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult, RunWritePolicy,
     SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME, FANIN_TARGET_STREAM_RUNS,
 };
-pub use sp_tweaks::{SpTweaksSlot, SpTweaksTable, TWEAK_LEN};
+pub use sp_tweaks::{SpTweaksTable, TWEAK_LEN};
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
 pub use store::{Store, StoreLayout, TxidResolveMode, INWIT_RELOC_NAME};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};

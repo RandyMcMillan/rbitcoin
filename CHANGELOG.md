@@ -100,7 +100,10 @@ before 1.0).
   uleb fk0+deltas; thin LAYOUT17 `txout` meta; script kinds 0–9; 8-byte
   spent slots; overflow is `spent.ovf`; reserved inwit bits 4–7 and
   spent flags other than `MULTI_SPENDER` are Corrupt. Leftover
-  `archive_epoch` and `store/wire` are unlinked on open.
+  `archive_epoch`, `store/wire`, and single-file `sp_tweaks.idx` /
+  `sp_tweaks.body` are unlinked on open. Tweaks (when `--sptweaks`) are
+  segmented dirs: tip-only `off:u32` (no `header_fk`), original `0`/`33`
+  body, new `NNNNNN` pair when the next body start would exceed `u32`.
 
 - **IBD lookup is BQ-ahead TipOnly `head_fk`:** the lookup thread resolves
   external parents for at most **8** ready body-queue heights in one
@@ -115,6 +118,14 @@ before 1.0).
   lookup wave wall is `lookup_thr wave=`.
 
 ### Fixed
+
+- **`sp_tweaks` rolls a new 4 GiB body instead of dying at `u32` off:**
+  mainnet backfill hit `store: corrupt record: sp_tweaks body exceeds u32
+  off` once a single body crossed 4 GiB. Schema 17 keeps the original
+  `0`/`33` records and stores only a per-segment `u32` start (no
+  `header_fk`). The next put whose start would exceed `u32::MAX` opens
+  `sp_tweaks.{idx,body}/NNNNNN`. Leftover single files are dropped;
+  backfill regenerates.
 
 - **SH bulk materialize heartbeats during a megakey:** status INFO only ran after
   `put_chain` (unique-key boundary). One scripthash can absorb tens of millions

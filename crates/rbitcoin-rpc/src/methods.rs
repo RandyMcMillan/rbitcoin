@@ -117,16 +117,32 @@ impl RpcParams {
         Self { pos, named: None }
     }
 
-    pub fn named(named: serde_json::Map<String, Value>) -> Self {
+    pub fn named(mut named: serde_json::Map<String, Value>) -> Self {
+        // AuthServiceProxy mixed call: `{args: [...], argN: ...}`.
+        let pos = match named.remove("args") {
+            Some(Value::Array(a)) => a,
+            Some(other) => {
+                named.insert("args".into(), other);
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         Self {
-            pos: Vec::new(),
+            pos,
             named: Some(named),
         }
     }
 
     pub fn get(&self, index: usize, name: &str) -> Option<&Value> {
         if let Some(m) = &self.named {
-            return m.get(name);
+            if let Some(v) = m.get(name) {
+                return Some(v);
+            }
+            // Mixed object: named miss falls through to the peeled `args` array.
+            if !self.pos.is_empty() {
+                return self.pos.get(index);
+            }
+            return None;
         }
         self.pos.get(index)
     }
@@ -213,6 +229,7 @@ pub fn dispatch(
     let params = params.into();
     match method {
         "help" => help(&params),
+        "echo" => echo(&params),
         "getrpcinfo" => {
             params.reject_unknown(&[])?;
             Ok(getrpcinfo(ctx))
@@ -313,8 +330,62 @@ fn help(params: &RpcParams) -> Result<Value, Value> {
     Ok(json!(METHOD_LIST.join("\n")))
 }
 
+/// Core `echo` names (`rpc_named_arguments.py`).
+const ECHO_NAMES: [&str; 10] = [
+    "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
+];
+
+/// Return params as a positional array (Core testing RPC).
+///
+/// Mixed AuthServiceProxy: `{args: [0, 1], arg3: 3}` → `[0, 1, null, 3]`.
+/// Named-only `arg9` sizes the array to 10 with null holes.
+fn echo(params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&ECHO_NAMES)?;
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if m.contains_key(*name) && i < params.pos.len() {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMETER,
+                    format!(
+                        "Parameter {name} specified twice both as positional and named argument"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut max_idx: Option<usize> = if params.pos.is_empty() {
+        None
+    } else {
+        Some(params.pos.len() - 1)
+    };
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if m.contains_key(*name) {
+                max_idx = Some(max_idx.map(|cur| cur.max(i)).unwrap_or(i));
+            }
+        }
+    }
+    let Some(max) = max_idx else {
+        return Ok(json!([]));
+    };
+    let mut out = vec![Value::Null; max + 1];
+    for (i, v) in params.pos.iter().enumerate() {
+        out[i] = v.clone();
+    }
+    if let Some(m) = &params.named {
+        for (i, name) in ECHO_NAMES.iter().enumerate() {
+            if let Some(v) = m.get(*name) {
+                out[i] = v.clone();
+            }
+        }
+    }
+    Ok(Value::Array(out))
+}
+
 const METHOD_LIST: &[&str] = &[
     "help",
+    "echo",
     "getrpcinfo",
     "uptime",
     "stop",
@@ -376,6 +447,7 @@ fn method_help(m: &str) -> String {
              Regtest harness only. Accepts a serialized block via the P2P path."
             .into(),
         "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
+        "echo" => "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.".into(),
         other if METHOD_LIST.contains(&other) => format!("{other} — see docs/rpc.md"),
         other => format!("unknown method {other}"),
     }
@@ -1424,6 +1496,71 @@ mod tests {
 
         let missing = handle_request(&ctx, &json!({"method":"getblock","params":{}}));
         assert_eq!(missing["error"]["code"], ERR_INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn echo_positional_named_and_mixed_args() {
+        let (ctx, dir) = ctx_empty();
+
+        let empty = handle_request(&ctx, &json!({"id":1,"method":"echo","params":[]}));
+        assert!(empty["error"].is_null(), "{empty}");
+        assert_eq!(empty["result"], json!([]));
+
+        let named = handle_request(&ctx, &json!({"method":"echo","params":{"arg0":0,"arg9":9}}));
+        assert!(named["error"].is_null(), "{named}");
+        let mut want = vec![Value::Null; 10];
+        want[0] = json!(0);
+        want[9] = json!(9);
+        assert_eq!(named["result"], Value::Array(want));
+
+        let arg1 = handle_request(&ctx, &json!({"method":"echo","params":{"arg1":1}}));
+        assert_eq!(arg1["result"], json!([Value::Null, 1]));
+
+        let arg9_null = handle_request(&ctx, &json!({"method":"echo","params":{"arg9":null}}));
+        assert_eq!(arg9_null["result"], json!(vec![Value::Null; 10]));
+
+        // AuthServiceProxy mixed: echo(0, 1, arg3=3, arg5=5)
+        let mixed = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,1],"arg3":3,"arg5":5}}),
+        );
+        assert!(mixed["error"].is_null(), "{mixed}");
+        assert_eq!(
+            mixed["result"],
+            json!([0, 1, Value::Null, 3, Value::Null, 5])
+        );
+
+        let twice = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,1],"arg1":1}}),
+        );
+        assert_eq!(twice["error"]["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            twice["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("specified twice"),
+            "{twice}"
+        );
+
+        let twice_null = handle_request(
+            &ctx,
+            &json!({"method":"echo","params":{"args":[0,null,2],"arg1":1}}),
+        );
+        assert_eq!(twice_null["error"]["code"], ERR_INVALID_PARAMETER);
+
+        // Mixed positional `args` must feed getblockhash(height).
+        let gh = handle_request(
+            &ctx,
+            &json!({"method":"getblockhash","params":{"args":[0]}}),
+        );
+        assert_ne!(
+            gh["error"]["message"].as_str().unwrap_or(""),
+            "height required"
+        );
+        assert_eq!(gh["error"]["code"], ERR_MISC);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

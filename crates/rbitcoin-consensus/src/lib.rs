@@ -125,7 +125,7 @@ pub use error::ConsensusError;
 pub use header::{expected_next_bits, median_time_past, validate_header};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
-pub use policy::{check_tx_standard, is_push_only, is_standard_script_pubkey, PolicyResult};
+pub use policy::PolicyResult;
 pub use regtest_pad::{mine_empty_regtest, mine_regtest_paying, pad_empty_from};
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{

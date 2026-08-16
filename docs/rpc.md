@@ -6,8 +6,8 @@ required keys are `-32602`; unknown named keys are `-8`.
 
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
 This is **not** full Core parity: no wallet, no `createrawtransaction` /
-`signrawtransactionwithkey` / `createmultisig` (those live only on the
-Core-functional test proxy). `getblocktemplate` / `getmininginfo` are a
+`signrawtransactionwithkey` / `createmultisig` / `sendtoaddress` (those
+live only on the Core-functional test proxy, backed by Esplora). `getblocktemplate` / `getmininginfo` are a
 miner-backend (no stratum, no BIP9 testdummy). `scantxoutset` supports `raw(script)` via the scripthash
 index (when `--shindex`) or Class A txout + spent. Prefer **Electrum /
 Esplora** (with `--shindex`) for address/script history.

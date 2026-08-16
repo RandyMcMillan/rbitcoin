@@ -23,6 +23,7 @@ from pathlib import Path
 from map_debuglog import apply_line, load_rules
 from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
 from rpc_util import register_utility
+from rpc_wallet import register_wallet
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -367,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
 
     proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
     register_utility(proxy)
+    register_wallet(proxy, f"http://127.0.0.1:{esplora_port(public_rpc)}")
     try:
         proxy.start()
     except OSError as e:

@@ -152,7 +152,6 @@ pub fn run_idx_body_pipeline_backend(
             offset: off,
             buf: slice,
             result: i32::MIN,
-            dontcache: false,
         });
     }
     bulk_io::pread_batch_backend(&mut read_ops, backend);
@@ -220,7 +219,6 @@ fn extend_truncated_txout_jobs(
             offset: off,
             buf: slice,
             result: i32::MIN,
-            dontcache: false,
         });
     }
     bulk_io::pread_batch_backend(&mut ops, backend);

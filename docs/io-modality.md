@@ -28,7 +28,10 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 | **L1** | 4 KiB head pages / 3–4 KiB SH chunks (working-set caches) | Write-back dirty page/chunk with one pwrite |
 | **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full `Vec` in process | **Write-behind:** RAM mutate during commit; complete-or-fail body image on `flush_class_c_tip` **before** body-queue dequeue |
 
-**Never L2:** `txout` / `inwit` / `spent`, full `tx.head` / `*.idx`. Cap: `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256). Create height is a RAM fence (~15 MiB at 1M blocks), not a file.
+**Never L2:** `txout` / `inwit` / `spent`, full `tx.head` / `*.idx`.
+`RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) caps **`confirmed`** and
+**`header_txs_*` only**. `strong_tx` stays L2 (1 bit/fk). Create height is a
+RAM fence (~15 MiB at 1M blocks), not a file.
 
 ---
 

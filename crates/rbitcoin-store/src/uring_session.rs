@@ -22,14 +22,6 @@ use std::path::Path;
 /// if a caller requests more (none currently do).
 pub const DEFAULT_ENTRIES: u32 = 128;
 
-/// Linux `RWF_DONTCACHE` — drop pages after IO (kernel 6.14+; ignored if unsupported).
-///
-/// Set on SQE `rw_flags` for Class A body and cold head/idx/sidefile peeks.
-#[cfg(target_os = "linux")]
-pub const RWF_DONTCACHE: i32 = 0x0000_0080;
-#[cfg(not(target_os = "linux"))]
-pub const RWF_DONTCACHE: i32 = 0;
-
 /// Owned io_uring for multi-stage submit/complete loops.
 pub struct UringSession {
     #[cfg(target_os = "linux")]
@@ -101,7 +93,7 @@ impl UringSession {
         self.push_pread_flags(fd, offset, buf, user_data, 0)
     }
 
-    /// Like [`push_pread`] with optional `rw_flags` (e.g. [`RWF_DONTCACHE`]).
+    /// Like [`push_pread`] with optional `rw_flags`.
     pub fn push_pread_flags(
         &mut self,
         fd: RawFd,
@@ -155,7 +147,7 @@ impl UringSession {
         self.push_pwrite_flags(fd, offset, buf, user_data, 0)
     }
 
-    /// Like [`push_pwrite`] with optional `rw_flags` (e.g. [`RWF_DONTCACHE`]).
+    /// Like [`push_pwrite`] with optional `rw_flags`.
     pub fn push_pwrite_flags(
         &mut self,
         fd: RawFd,

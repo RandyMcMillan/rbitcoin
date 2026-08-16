@@ -704,7 +704,6 @@ impl AddressHead {
     ///
     /// Returns bytes filled (multiple of entry size). Callers must pass the
     /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
-    /// Head probe pages are never RWF_DONTCACHE (spend-pwrite only).
     fn load_page_slots(
         &self,
         page_base: u64,
@@ -738,7 +737,6 @@ impl AddressHead {
                 offset: off,
                 buf: slice,
                 result: i32::MIN,
-                dontcache: false,
             }];
             bulk_io::pread_batch(&mut ops);
             if ops[0].result < 0 {
@@ -807,7 +805,6 @@ impl AddressHead {
                 j += 1;
             }
 
-            // Open-segment insert: never DONTCACHE (hot write path).
             let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
             if n < es_u {
                 note_probe_exhausted();
@@ -1035,17 +1032,6 @@ impl AddressHead {
                     let need = self.probe_page_need(page_base, page_slots);
 
                     if res < 0 {
-                        if res == -95 && rw_flags != 0 && crate::bulk_io::rwf_dontcache_ok() {
-                            crate::bulk_io::note_rwf_dontcache_unsupported();
-                            // Retry this page without DONTCACHE (re-arm same slot).
-                            let off = self.entry_off(page_base);
-                            let buf = &mut bufs[slot][..need];
-                            buf.fill(0);
-                            session.push_pread_flags(fd, off, buf, slot as u64, 0)?;
-                            slot_page[slot] = Some(pi);
-                            in_flight += 1;
-                            continue;
-                        }
                         return Err(StoreError::io(
                             path,
                             std::io::Error::from_raw_os_error(-res),
@@ -1496,27 +1482,6 @@ mod tests {
             same_page.push(t);
         }
         let _ = h.probe_fks_batch(&same_page).unwrap();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(meta_path(&path));
-    }
-
-    /// Head probe pages never request RWF_DONTCACHE (spend-pwrite only).
-    #[test]
-    fn probe_fks_batch_never_sets_dontcache() {
-        let path = tmp("probe-no-dc");
-        let h = AddressHead::create_with_bits(&path, 10).unwrap();
-        let mut txid = [0u8; 32];
-        txid[0] = 0x11;
-        h.insert_many(&[(txid, Fk(1))]).unwrap();
-        let _ = crate::bulk_io::test_take_last_read_dontcache();
-        let got = h.probe_fks_batch(&[txid]).unwrap();
-        assert!(got[0].contains(&Fk(1)));
-        let flags = crate::bulk_io::test_take_last_read_dontcache();
-        assert!(!flags.is_empty(), "probe must issue a page load");
-        assert!(
-            flags.iter().all(|&d| !d),
-            "head probe must not DONTCACHE; got {flags:?}"
-        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }

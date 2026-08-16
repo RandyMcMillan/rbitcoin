@@ -517,8 +517,6 @@ impl SegmentedTxHead {
 }
 
 /// Wave-1 sealed-age cap: open (age 0) + sealed ages `1..=` this.
-///
-/// Independent of spend-annotate RWF_DONTCACHE (pwrite only; never head probe).
 pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
 
 /// Which head segments to probe (two-wave resolve vs full baseline).

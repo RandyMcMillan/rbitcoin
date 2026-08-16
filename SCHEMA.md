@@ -2,7 +2,9 @@
 
 **Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
 **Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
-byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).  
+byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).
+Freeze rationale (hot set, widths, kinds without wipe, writer policy):
+[`docs/store-format.md`](docs/store-format.md).  
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
@@ -163,11 +165,10 @@ offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
 
 Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `inwit` / `spent` / `txid.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
 
-**IO policy (RWF_DONTCACHE):** sidefile peeks do **not** set `RWF_DONTCACHE` (permanent spend-annotate body pwrite only).
-
 ### Split bodies (schema 15)
 
-Each create_fk has three 8-aligned var records (coupled idx `first_fk` / `file_id`):
+Each create_fk has three 8-aligned var records (per-stem idx maps; rolls
+are independent when that stem’s next start would exceed the soft span):
 
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
@@ -197,12 +198,10 @@ v2+locktime 0 is **3 B**. Schema-15 16-byte prefixes (v1 starts `01 00 00 00`)
 are not accepted. `input_start_fk` / `output_start_fk` stay null in RAM.
 Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-**IO policy (RWF_DONTCACHE):** permanent **spend-annotate `spent.body` pwrites only** (fd-only drop after spender meta write — not `madvise`). Class A append, confirm/load body reads, generic body reads, and head/idx/sidefile peeks do **not** set the flag. Kernel ENOTSUP demotes capability for the process.
-
 ### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
 
 ```text
-{txout,inwit,spent}.idx/meta     # segment map (coupled first_fk / file_id)
+{txout,inwit,spent}.idx/meta     # per-stem segment map (first_fk / file_id)
 {txout,inwit,spent}.idx/000000   # dense u32 LE stride units
 …
 ```
@@ -221,7 +220,7 @@ i = fk - first_fk
 | `body_base` | absolute body base (8-aligned) for relatives |
 | `file_id` | maps to `{stem}.idx/{file_id:06}` |
 
-Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
+Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). **Each stem rolls independently** when that stem’s next start would exceed the soft span (`inwit` no longer forces `txout`/`spent` idx splits). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
 
 ### Input encoding (embedded)
 
@@ -258,7 +257,9 @@ kind payload:
 
 Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
 covers hash/data only. Spender flags live only on `spent`. A new consensus
-script type with a new implicit width is **schema 18**.
+script type does **not** wipe a 17 datadir: encode it as kind 0 **RAW**, or
+introduce an implicit-width nibble as **soft-18** (18 reads 17; this 17
+binary refuses 18 / unknown kind). See [`docs/store-format.md`](docs/store-format.md).
 
 ### Sole-spender slot (`spent.body`)
 
@@ -452,6 +453,10 @@ Dense u64 array: index = height → header_fk. Length = tip_height + 1 when non-
 ### `strong_tx.body`
 
 Bitset: bit `(tx_fk − 1)` set ⇒ tx is strong on the best chain.
+
+Always **L2** (full `Vec` in process), even when `RBITCOIN_CLASS_C_INRAM_MAX_MB`
+demotes `confirmed` / `header_txs_*`. One bit per create; confirm/reorg/Electrum
+must not pread the bitset.
 
 ### Create height (schema 16: RAM fence, no `tx_height.body`)
 

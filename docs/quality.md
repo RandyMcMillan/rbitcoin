@@ -134,7 +134,7 @@ audit closures. Do not reopen without new evidence.
 | **—** | SH megakey heartbeats | Status INFO every 10 s mid-key (`#44`) |
 | **—** | `DisconnectTip` warn | Every confirmed disconnect (`#42`) |
 | **Q-23** | Optional musl CI | `.github/workflows/musl.yml` after green master `ci` (`nix build .#rbitcoin-musl`, artifact upload; not a required PR check) |
-| **Q-14** | Head-module glossary | [`docs/heads.md`](./heads.md): which file/module; lookup 2-wave; DONTCACHE ≠ wave split; confirm stages point at concurrency |
+| **Q-14** | Head-module glossary | [`docs/heads.md`](./heads.md): which file/module; lookup 2-wave; confirm stages point at concurrency |
 | **Q-40** | Host `rust-toolchain` pin | Root `rust-toolchain.toml` channel **1.95.0** |
 | **Q-21** | SBOM for musl release | `scripts/sbom.sh` / `scripts/sbom.py` emit CycloneDX 1.5 from `Cargo.lock` |
 | **Q-39** | Operator/docs vs shipped model | OPERATOR body-queue → confirm; README crate map; COVERAGE workspace members; findings 001–021; CONTRIBUTING lists deny/multinode |

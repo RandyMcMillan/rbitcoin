@@ -1469,7 +1469,7 @@ pub(crate) fn structural_validate_spends(
 
     // Hot path: bulk 8-byte spender meta at pin offsets (on-disk authority).
     // Serial with create_h heights below — combined multi-fd wave was measured
-    // neutral/worse (body DONTCACHE peeks + height slots).
+    // neutral/worse (body peeks + height slots).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();

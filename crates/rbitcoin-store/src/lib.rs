@@ -10,7 +10,6 @@ mod block_queue;
 mod bulk_io;
 mod chain;
 mod compact;
-mod dontcache_policy;
 mod error;
 mod file;
 mod fuse8_filter;
@@ -124,4 +123,3 @@ pub use tx_table::{
     OutputRecord, SpendMetaBackend, TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
 pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_ENTRY_LEN};
-pub use uring_session::RWF_DONTCACHE;

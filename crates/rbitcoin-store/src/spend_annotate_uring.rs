@@ -114,10 +114,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 });
                 {
                     let s = slots[slot].as_mut().unwrap();
-                    // RMW fallback pread: Full mode may DONTCACHE; spend-write mode keeps
-                    // pages for the following pwrite (drop only on write).
-                    let flags = crate::dontcache_policy::body_sqe_read_flags();
-                    session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
+                    session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, 0)?;
                 }
                 *in_flight += 1;
             }
@@ -160,23 +157,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 match st.phase {
                     Phase::Reading => {
                         if res < 0 {
-                            // ENOTSUP on RWF_DONTCACHE: demote and retry read once.
-                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                                crate::bulk_io::note_rwf_dontcache_unsupported();
-                                slots[slot] = Some(st);
-                                {
-                                    let s = slots[slot].as_mut().unwrap();
-                                    session.push_pread_flags(
-                                        body_fd,
-                                        abs,
-                                        &mut s.buf,
-                                        slot as u64,
-                                        0,
-                                    )?;
-                                }
-                                in_flight += 1;
-                                continue;
-                            }
                             free_slots.push(slot);
                             abs_busy.remove(&abs);
                             return Err(StoreError::io(
@@ -235,31 +215,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         slots[slot] = Some(st);
                         {
                             let s = slots[slot].as_mut().unwrap();
-                            // Spend-annotate body pwrite: DONTCACHE under Full or spend mode.
-                            let flags = crate::dontcache_policy::body_sqe_write_flags();
-                            session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, flags)?;
+                            session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, 0)?;
                         }
                         in_flight += 1;
                     }
                     Phase::Writing => {
                         if res < 0 {
-                            // ENOTSUP on RWF_DONTCACHE: demote and retry write once.
-                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                                crate::bulk_io::note_rwf_dontcache_unsupported();
-                                slots[slot] = Some(st);
-                                {
-                                    let s = slots[slot].as_mut().unwrap();
-                                    session.push_pwrite_flags(
-                                        body_fd,
-                                        abs,
-                                        &s.buf,
-                                        slot as u64,
-                                        0,
-                                    )?;
-                                }
-                                in_flight += 1;
-                                continue;
-                            }
                             free_slots.push(slot);
                             abs_busy.remove(&abs);
                             return Err(StoreError::io(
@@ -627,14 +588,12 @@ fn put_spend_batch_pure_write_uring(
                 });
                 {
                     let s = slots[slot].as_mut().unwrap();
-                    // Page stays cached for the following pwrite.
-                    let flags = crate::dontcache_policy::body_sqe_read_flags();
                     session.push_pread_flags(
                         body_fd,
                         groups[gi].off,
                         &mut s.buf,
                         slot as u64,
-                        flags,
+                        0,
                     )?;
                 }
                 *in_flight += 1;
@@ -673,22 +632,6 @@ fn put_spend_batch_pure_write_uring(
                 match st.phase {
                     Phase::Reading => {
                         if res < 0 {
-                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                                crate::bulk_io::note_rwf_dontcache_unsupported();
-                                slots[slot] = Some(st);
-                                {
-                                    let s = slots[slot].as_mut().unwrap();
-                                    session.push_pread_flags(
-                                        body_fd,
-                                        groups[gi].off,
-                                        &mut s.buf,
-                                        slot as u64,
-                                        0,
-                                    )?;
-                                }
-                                in_flight += 1;
-                                continue;
-                            }
                             free_slots.push(slot);
                             return Err(StoreError::io(
                                 &body_path,
@@ -705,35 +648,12 @@ fn put_spend_batch_pure_write_uring(
                         slots[slot] = Some(st);
                         {
                             let s = slots[slot].as_mut().unwrap();
-                            let flags = crate::dontcache_policy::body_sqe_write_flags();
-                            session.push_pwrite_flags(
-                                body_fd,
-                                groups[gi].off,
-                                &s.buf,
-                                slot as u64,
-                                flags,
-                            )?;
+                            session.push_pwrite(body_fd, groups[gi].off, &s.buf, slot as u64)?;
                         }
                         in_flight += 1;
                     }
                     Phase::Writing => {
                         if res < 0 {
-                            if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
-                                crate::bulk_io::note_rwf_dontcache_unsupported();
-                                slots[slot] = Some(st);
-                                {
-                                    let s = slots[slot].as_mut().unwrap();
-                                    session.push_pwrite_flags(
-                                        body_fd,
-                                        groups[gi].off,
-                                        &s.buf,
-                                        slot as u64,
-                                        0,
-                                    )?;
-                                }
-                                in_flight += 1;
-                                continue;
-                            }
                             free_slots.push(slot);
                             return Err(StoreError::io(
                                 &body_path,
@@ -856,14 +776,11 @@ mod tests {
         }
     }
 
-    /// Shipped uring spend path must push body **write** SQEs with RWF_DONTCACHE
-    /// when capability allows (permanent spend-only policy).
+    /// Shipped uring spend path must not set RWF_DONTCACHE (`spent.body` is its
+    /// own file; evicting those pages does not protect `txout`).
     #[test]
-    fn uring_rmw_body_sqe_sets_rwf_dontcache() {
+    fn uring_rmw_body_sqe_sets_no_dontcache() {
         if !crate::bulk_io::io_uring_enabled() {
-            if crate::bulk_io::rwf_dontcache_ok() {
-                assert!(crate::dontcache_policy::body_write_spend());
-            }
             return;
         }
         let (dir, t, spenders) = temp_table();
@@ -887,17 +804,10 @@ mod tests {
             !sqe_flags.is_empty(),
             "uring spend annotate must push at least one SQE"
         );
-        let expect = crate::dontcache_policy::body_sqe_write_flags();
         assert!(
-            sqe_flags.iter().any(|&f| f == expect),
-            "body write SQE rw_flags must match body_sqe_write_flags()={expect:#x}; got {sqe_flags:?}"
+            sqe_flags.iter().all(|&f| f == 0),
+            "annotate SQEs must not set RWF_DONTCACHE; got {sqe_flags:?}"
         );
-        if crate::bulk_io::rwf_dontcache_ok() {
-            assert!(
-                sqe_flags.iter().any(|&f| f == uring_session::RWF_DONTCACHE),
-                "expected RWF_DONTCACHE on body write SQEs; got {sqe_flags:?}"
-            );
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

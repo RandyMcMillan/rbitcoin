@@ -4,8 +4,10 @@
 //!
 //! # L2 write-behind (phase 6)
 //!
-//! Compact tables (body ≤ [`class_c_inram_max_bytes`]) load fully into process
-//! RAM on open. Mutates update the `Vec` only and mark dirty. Disk is updated on
+//! Compact **array** tables (`confirmed`, `header_txs_*`; body ≤
+//! [`class_c_inram_max_bytes`]) load fully into process RAM on open.
+//! `strong_tx` is always L2 (see [`crate::chain::StrongTxTable`]).
+//! Mutates update the `Vec` only and mark dirty. Disk is updated on
 //! [`Self::flush`] / barrier:
 //!
 //! - **Append-only** (dirty only at indices ≥ last flushed len): write the new

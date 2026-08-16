@@ -41,12 +41,11 @@ spk hash    ──► scripthash.head/     ScriptHashHead shards (64-way mainnet
 `TipThenAny` / `TipOnly` still run wave 2 after an unconnected hot hit so a
 connected sibling in a cold age can win.
 
-## Two policies that are not the same
+## Two-wave probe (not page-cache)
 
-| Policy | What it is | What it is not |
-|--------|------------|----------------|
-| **2-wave probe** | `sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) | Page-cache |
-| **RWF_DONTCACHE** | Spend-annotate **`spent.body` pwrite** only | Head/idx/load/append |
+`sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) decides which
+`tx.head` segments are probed first. It is not an IO flag. `RWF_DONTCACHE`
+is retired ([`store-format.md`](./store-format.md)).
 
 ## Confirm stages (pointer)
 

@@ -1140,8 +1140,6 @@ impl TxTable {
                 offset: abs_offs[i],
                 buf: slice,
                 result: i32::MIN,
-                // Confirm write-stage meta: same pages as load pin — do not DONTCACHE.
-                dontcache: false,
             });
         }
         bulk_io::pread_batch_backend(&mut ops, backend);
@@ -1322,7 +1320,6 @@ impl TxTable {
         if self.inwit.count() != base || self.spent.count() != base {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
-        self.maybe_coupled_roll(items.len() as u64)?;
         let fks = self.append_stems_one_wave(
             items.len(),
             est_out,
@@ -1383,7 +1380,6 @@ impl TxTable {
         if self.inwit.count() != base || self.spent.count() != base {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
-        self.maybe_coupled_roll(items.len() as u64)?;
         let fks = self.append_stems_one_wave(
             items.len(),
             est_out,
@@ -1449,27 +1445,6 @@ impl TxTable {
             ));
         }
         Ok(fks)
-    }
-
-    /// Roll all three idx stems together when any body would exceed the soft span.
-    fn maybe_coupled_roll(&self, _n_records: u64) -> Result<(), StoreError> {
-        // Independent idx append already rolls per-stem on soft span. Coupled
-        // first_fk is preserved when we roll all three at the same next fk
-        // before the batch if *any* tail would roll on its next start.
-        let next_fk = self.body.count().saturating_add(1);
-        let next_out = self.body.next_aligned_start();
-        let next_in = self.inwit.next_aligned_start();
-        let next_sp = self.spent.next_aligned_start();
-        let roll = self.body.idx_would_roll(next_fk, next_out)
-            || self.inwit.idx_would_roll(next_fk, next_in)
-            || self.spent.idx_would_roll(next_fk, next_sp);
-        if !roll {
-            return Ok(());
-        }
-        self.body.force_idx_roll(next_fk, next_out)?;
-        self.inwit.force_idx_roll(next_fk, next_in)?;
-        self.spent.force_idx_roll(next_fk, next_sp)?;
-        Ok(())
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {

@@ -309,8 +309,8 @@ impl VarTable {
         self.write_body_abs(abs_offset, data)
     }
 
-    /// Class A body payload write via bulk `WriteOp` (no RWF_DONTCACHE — permanent
-    /// spend-only policy). Falls back to plain pwrite when uring is unavailable.
+    /// Class A body payload write via bulk `WriteOp`. Falls back to plain pwrite
+    /// when uring is unavailable.
     pub(crate) fn write_body_blob_bulk(
         &self,
         start: u64,
@@ -328,7 +328,6 @@ impl VarTable {
             offset: start,
             buf: body_blob,
             result: i32::MIN,
-            dontcache: false,
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
@@ -375,7 +374,6 @@ pub(crate) fn write_prepared_bodies_one_wave(
             offset: prep.start,
             buf: prep.body_blob.as_slice(),
             result: i32::MIN,
-            dontcache: false,
         });
     }
     if !ops.is_empty() {
@@ -403,16 +401,6 @@ impl VarTable {
     pub fn next_aligned_start(&self) -> u64 {
         let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
         next_aligned_tx_start(start)
-    }
-
-    /// True if appending at `abs_start` for `first_new_fk` would open a new idx segment.
-    pub fn idx_would_roll(&self, first_new_fk: u64, abs_start: u64) -> bool {
-        self.idx.would_roll(first_new_fk, abs_start)
-    }
-
-    /// Force an idx segment roll (coupled Class A stems).
-    pub fn force_idx_roll(&self, first_fk: u64, body_base: u64) -> Result<(), StoreError> {
-        self.idx.force_roll(first_fk, body_base)
     }
 
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
@@ -636,12 +624,12 @@ impl VarTable {
         Ok(n)
     }
 
-    /// Class A body pread via bulk_io (never RWF_DONTCACHE — permanent spend-only policy).
+    /// Class A body pread via bulk_io.
     fn read_body_bulk(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         if buf.is_empty() {
             return Ok(());
         }
-        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf, false);
+        let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf);
         if rc < 0 {
             return Err(StoreError::io(
                 self.body.path(),

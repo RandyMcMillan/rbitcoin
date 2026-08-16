@@ -43,7 +43,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Pruning / GUI / mining | Not supported | Supported |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
-| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass | Full Core RPC |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli` | Full Core RPC |
 
 ## Core-class JSON-RPC (subset)
 
@@ -51,8 +51,8 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`) | done | Archive reconstruct. `chainwork` / `size_on_disk` / `verificationprogress` are placeholders (see [`docs/rpc.md`](./docs/rpc.md)) |
-| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table |
-| Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire |
+| Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `maxmempool` is the hub weight budget |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan |
 | Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done | `txindex` means Class A reconstruct; `getchaintips` is the active tip |
 | Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |

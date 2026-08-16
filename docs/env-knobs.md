@@ -11,13 +11,8 @@ below. Do not grow env surface without a damn-good reason.
 | **`RBITCOIN_LOG`** / **`RUST_LOG`** | Bootstrap logging before conf parse; CLI `--log-level` wins when set |
 | **`RBITCOIN_IO`** | Field escape hatch: force `pread` when io_uring is broken (`mmap` demotes to pread). **Single** bulk switch for all paths |
 
-CLI still sets process env for library readers where needed today:
-
-| CLI / conf | Env bridge (transitional) |
-|------------|---------------------------|
-| `--maxinbound` / `--maxconnections` | `RBITCOIN_P2P_MAX_INBOUND` via `NodeConfig::apply_operator_env` |
-
-Long term: pass config structs; drop `set_var` bridges.
+`RBITCOIN_P2P_MAX_INBOUND` is an **input** when CLI/conf omit `--maxinbound`
+(`NodeConfig::absorb_inbound_env`). The node does not `set_var` it.
 
 ## Unstable (honored, not advertised)
 
@@ -42,6 +37,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
 | `RBITCOIN_SH_MEMTABLE_CAP` | default | SH memtable cap |
 | `RBITCOIN_SH_MERGE_WORKERS` | default | SH merge workers |
+| `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--maxinbound` / conf omitted |
 
 ## Hardcoded (no env)
 
@@ -61,6 +57,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_TEST_*` | Node/store test fixtures (`TEST_DROP_STORE`, `TEST_NO_SUCH_CAP`) |
 | `RBITCOIN_DIAG_DATADIR` | Offline diagnostic tests |
 | `RBITCOIN_CAND_FK_FIXTURE` | Store fixture |
+| `RBITCOIN_CORE_DATA` | Directory of Core JSON corpora for consensus tests |
 
 ## Deleted / do not reintroduce
 

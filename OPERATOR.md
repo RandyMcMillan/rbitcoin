@@ -515,6 +515,8 @@ and [`COMPAT.md`](./COMPAT.md).
   --network mainnet \
   --rpc-listen 127.0.0.1:8332 \
   --log-level info
+# same datadir cookie:
+rbitcoin-cli --datadir ./datadir-mainnet getblockcount
 ```
 
 | Feature | Behavior |

@@ -342,6 +342,9 @@ pub fn confirm_wire_lookup_stamp_with_hits(
     pre_resolved: Option<&rbitcoin_store::BqParentHits>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
+    query
+        .leftover_on_load_pack()
+        .map_err(ConsensusError::from)?;
     let (plan, metas, wire_blocks, plan_ns) =
         wire_lookup_phase(query, params, milestone, blocks, pipeline, pre_resolved)?;
     let ifo = pipeline.map(|p| &p.in_flight);

@@ -111,7 +111,9 @@ pub fn confirm_write_phase(
     // Drain write-behind tx.head overlapping structural + Class C (one inserter).
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns, tip_gc_ns) =
         std::thread::scope(|scope| -> Result<_, ConsensusError> {
-            let drain = scope.spawn(|| query.drain_pending_tx_head());
+            let queued = query.store().txs.take_pending_queued();
+            let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
+            let drain = scope.spawn(move || query.store().txs.head_insert_queued(&queued));
 
             // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
             // Structural fills meta_by_abs for pure-write annotate (no second body pread).
@@ -149,9 +151,10 @@ pub fn confirm_write_phase(
                     )));
                 }
             }
-            // Happens-after insert *and* fence (Class C already ran). Snap
-            // stays through the ∥ so leftover has a home (67438).
-            query.forget_pending_if_fenced();
+            // Insert finished. Load polls this fk HWM (not tip/fence — 67438).
+            if let Some(fk) = drain_max_fk {
+                query.note_head_drain_fk(fk);
+            }
 
             Ok((
                 out,
@@ -448,6 +451,7 @@ mod records_from_wire_tests {
             time: 0,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             hash: [0u8; 32],
+            prev_mtp: 0,
         }
     }
 

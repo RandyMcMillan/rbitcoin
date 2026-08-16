@@ -96,6 +96,23 @@ pub fn median_time_past(query: &Query, height: Height) -> Result<u32, ConsensusE
     Ok(median_time_past_times(&times))
 }
 
+/// MTP from the confirmed chain only (write structural). Tip-ahead heights
+/// must be carried on [`crate::confirm_run`] `Prepared::prev_mtp`.
+pub fn median_time_past_store(query: &Query, height: Height) -> Result<u32, ConsensusError> {
+    let mut times = Vec::with_capacity(11);
+    let start = height.0.saturating_sub(10);
+    for h in start..=height.0 {
+        if let Some((_fk, rec)) = query.header_at_height(Height(h))? {
+            times.push(rec.timestamp);
+            continue;
+        }
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "confirm: write MTP missing confirmed header (carry prev_mtp)",
+        )));
+    }
+    Ok(median_time_past_times(&times))
+}
+
 /// Median of an already-collected timestamp window (unsorted OK).
 pub fn median_time_past_times(times: &[u32]) -> u32 {
     debug_assert!(!times.is_empty());

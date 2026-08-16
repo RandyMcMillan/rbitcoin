@@ -190,10 +190,13 @@ fn pending_head_resolve_before_drain() {
         .unwrap();
     assert!(
         t.get_fk_by_txid(&txid).unwrap().is_none(),
-        "durable head must miss before note"
+        "durable head must miss before drain"
     );
     t.head_note_pending(&[(txid, fks[0])]);
-    assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fks[0]));
+    assert!(
+        t.get_fk_by_txid(&txid).unwrap().is_none(),
+        "queued drain list is not a leftover home"
+    );
     assert_eq!(t.head_drain_pending().unwrap(), 1);
     assert_eq!(t.pending_head_len(), 0);
     assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fks[0]));

@@ -393,7 +393,14 @@ impl Query {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
 
+        // Every plan/load pack: ingest Notes + header-cache GC from store tip.
+        self.leftover_on_load_pack()?;
         if need.is_empty() {
+            self.leftover_forget(
+                self.tip_height()
+                    .map(|h| h.0.saturating_add(1))
+                    .unwrap_or(0),
+            );
             return Ok(ArchiveWritePlan::empty());
         }
 
@@ -547,31 +554,25 @@ impl Query {
             external_parent_ranges.insert(id, range);
         }
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
-        // Bind pending (no fence) then TipOnly (connected). Pending snap stays
-        // until the fence covers — drain must not forget first.
+        // Bind load-owned pending (no fence) then TipOnly (connected). Write
+        // notes the inbox at Class A; load forgets after bind when drain HWM
+        // + fence + height < pack_lo (keep previous pack).
         let t_head = Instant::now();
+        let pack_lo = self
+            .tip_height()
+            .map(|h| h.0.saturating_add(1))
+            .unwrap_or(0);
         if !need_head.is_empty() {
-            // Write-behind is Class A identity. Bind it here without a fence
-            // so drain ∥ Class C cannot miss after in-flight prune (950545).
-            // TipOnly batch below still fence-gates pending (BIP30).
             let mut leftover_pend = 0u64;
-            let mut still_need: Vec<[u8; 32]> = Vec::with_capacity(need_head.len());
-            for t in need_head {
-                if let Some(fk) = self.store.txs.pending_fk(&t) {
-                    if let Ok(range) = self.store.txs.body_range(fk) {
-                        leftover_pend = leftover_pend.saturating_add(1);
-                        resolved.insert(t, fk);
-                        head_hit_n = head_hit_n.saturating_add(1);
-                        if let Some(id) = fk.get() {
-                            external_parent_ranges.insert(id, range);
-                            external_parent_txids.insert(id, t);
-                        }
-                        continue;
-                    }
-                }
-                still_need.push(t);
-            }
-            need_head = still_need;
+            need_head = self.leftover_bind_then_forget(
+                &need_head,
+                pack_lo,
+                &mut resolved,
+                &mut leftover_pend,
+                &mut head_hit_n,
+                &mut external_parent_ranges,
+                &mut external_parent_txids,
+            )?;
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = if need_head.is_empty() {
                 Vec::new()
@@ -604,6 +605,8 @@ impl Query {
                 }
             }
             crate::archive_phase_stats::note_leftover_mix(leftover_pend, age0, age3, age_n);
+        } else {
+            self.leftover_forget(pack_lo);
         }
         let head_fk_ns = t_head.elapsed().as_nanos() as u64;
         // Need/hit before stamp so a leftover miss still meters the fail pack.
@@ -834,8 +837,9 @@ impl Query {
                 .zip(got_tx_fks.iter())
                 .map(|((pin, _), fk)| (pin.0.txid, *fk))
                 .collect();
-            self.store.txs.head_drain_pending_if_full()?;
+            self.drain_pending_tx_head_if_full()?;
             self.store.txs.head_note_pending(&heads);
+            self.send_leftover_notes(heads);
         }
         let head_ns = t.elapsed().as_nanos() as u64;
 
@@ -867,21 +871,36 @@ impl Query {
     }
 
     /// Drain write-behind `tx.head` inserts (page-grouped).
+    ///
+    /// Insert queued `tx.head` and publish drain-fk HWM.
     pub fn drain_pending_tx_head(&self) -> Result<u64, QueryError> {
-        let n = self.store.txs.head_drain_pending()?;
-        self.forget_pending_if_fenced();
+        let batch = self.store.txs.take_pending_queued();
+        let n = self.store.txs.head_insert_queued(&batch)?;
+        if let Some(max_fk) = batch.iter().filter_map(|(_, fk)| fk.get()).max() {
+            self.note_head_drain_fk(max_fk);
+        }
         Ok(n)
     }
 
-    /// Forget pending snap keys that are fence-connected and no longer queued.
-    ///
-    /// Still-queued keys stay (insert not published). Call after
-    /// [`Self::drain_pending_tx_head`] and after fence extend — not from
-    /// Class C while drain is in flight.
-    pub fn forget_pending_if_fenced(&self) {
-        self.store
-            .txs
-            .forget_pending_if_fenced(&self.store.height_fence_snapshot());
+    fn drain_pending_tx_head_if_full(&self) -> Result<(), QueryError> {
+        if self.store.txs.pending_head_is_full() {
+            self.drain_pending_tx_head()?;
+        }
+        Ok(())
+    }
+
+    /// Load-owned leftover forget helper (tests / tip-follow). Production
+    /// leftover bind forgets after each pack.
+    pub fn leftover_forget(&self, pack_lo: u32) {
+        let fence = self.store.height_fence_snapshot();
+        let drain = self.head_drain_fk();
+        self.load_inbox
+            .with_pending_mut(|p| p.forget_ready(&fence, pack_lo, drain));
+    }
+
+    /// Disconnect: evict leftover notes for these create txids.
+    pub fn leftover_drop_txids(&self, txids: impl IntoIterator<Item = [u8; 32]>) {
+        self.load_inbox.with_pending_mut(|p| p.drop_txids(txids));
     }
 
     /// Resolve prev outpoint txid for an input.
@@ -993,10 +1012,10 @@ mod tests {
             "plan stamp must not last-chance-fill leftovers"
         );
         assert!(
-            prod.contains("pending_fk")
-                && prod.find("pending_fk").unwrap()
+            prod.contains("leftover_bind_then_forget")
+                && prod.find("leftover_bind_then_forget").unwrap()
                     < prod.find("get_fk_by_txid_batch(&need_head)").unwrap(),
-            "leftover must bind pending without fence before TipOnly batch"
+            "leftover must bind load-owned pending without fence before TipOnly batch"
         );
         assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
@@ -1216,10 +1235,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After commit, parent is pending (not fence-connected). Leftover must
-    /// stamp from pending without height_of (950545).
+    /// After commit, parent is in the load inbox (not store snap). Leftover
+    /// stamps without height_of and without `head_note_pending` (950545).
     #[test]
-    fn leftover_stamps_pending_parent_without_fence() {
+    fn leftover_binds_load_owned_pending() {
         let (dir, q) = temp_query("leftover-pending");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let empty = crate::InFlightView::empty();
@@ -1227,9 +1246,8 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        assert!(q.store().txs.pending_fk(&parent_txid).is_some());
+        q.leftover_on_load_pack().unwrap();
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xef;
@@ -1261,6 +1279,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn leftover_noted_fk_without_body_is_corrupt() {
+        let (dir, q) = temp_query("leftover-note-nobody");
+        let empty = crate::InFlightView::empty();
+        let parent_txid = [0xABu8; 32];
+        q.send_leftover_notes(vec![(parent_txid, Fk(9_999_999))]);
+        q.leftover_on_load_pack().unwrap();
+        let child = TxApply {
+            tx: TxRecord {
+                txid: [0xCDu8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(Fk(1), vec![child])];
+        let err = q
+            .archive_plan_batch_from(&mut need, 1, &empty)
+            .expect_err("noted fk without body");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leftover note has no body_range"),
+            "got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftover_keeps_prev_pack_after_drain_done() {
+        let (dir, q) = temp_query("leftover-keep-prev");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        let header_fk = plan_a.per_header_ranges[0].0;
+        q.archive_commit_plan(plan_a).unwrap();
+        q.store()
+            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
+            .unwrap();
+        q.leftover_on_load_pack().unwrap();
+        // Commit published drain-fk HWM. pack_lo of a height-1 child is tip+1.
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xea;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let plan_b = q
+            .archive_plan_batch_from(&mut need_b, 2, &empty)
+            .expect("height-1 child must bind prev pack after drain HWM");
+        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        q.leftover_forget(2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_gcs_header_plans_from_store_tip() {
+        let (dir, q) = temp_query("tip-gc");
+        let rec = rbitcoin_store::HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [9u8; 32],
+        };
+        q.confirm_parent_cache()
+            .put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
+        assert!(q.confirm_parent_cache().get_header_plan(1).is_some());
+        q.leftover_on_load_pack().unwrap();
+        assert!(
+            q.confirm_parent_cache().get_header_plan(1).is_some(),
+            "store tip below the plan — do not GC height 1"
+        );
+        q.store()
+            .confirmed
+            .set(rbitcoin_primitives::Height(0), Fk(1))
+            .unwrap();
+        q.store()
+            .confirmed
+            .set(rbitcoin_primitives::Height(1), Fk(2))
+            .unwrap();
+        q.leftover_on_load_pack().unwrap();
+        assert!(
+            q.confirm_parent_cache().get_header_plan(1).is_none(),
+            "load pack must GC header plans <= store tip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Write drain inserts `tx.head` and used to `forget` pending before
     /// `height_fence_extend`. Load leftover then sees neither pending nor a
     /// connected TipOnly hit (327331-class n−1).
@@ -1273,18 +1412,14 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
         assert!(q
             .store()
             .height_fence_snapshot()
             .height_of(parent_fk)
             .is_none());
-        assert_eq!(q.store().txs.head_drain_pending().unwrap(), 1);
-        assert!(
-            q.store().txs.pending_fk(&parent_txid).is_some(),
-            "pending snap must survive drain until the fence covers the fk"
-        );
+        // Commit drained tx.head and published drain HWM. pack_lo is 0 (no
+        // tip) so forget does not drop the Note; leftover still binds.
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xee;
@@ -1328,21 +1463,12 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
-        assert_eq!(q.store().txs.head_drain_pending().unwrap(), 1);
-        q.forget_pending_if_fenced();
-        assert!(
-            q.store().txs.pending_fk(&parent_txid).is_some(),
-            "forget-if-fenced before extend must leave pending"
-        );
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.forget_pending_if_fenced();
-        assert!(
-            q.store().txs.pending_fk(&parent_txid).is_none(),
-            "pending must drop once the fence covers the fk"
-        );
+        q.leftover_on_load_pack().unwrap();
+        q.leftover_forget(1);
+        // Load map dropped height 0; leftover must TipOnly the connected head.
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xed;
@@ -1389,10 +1515,6 @@ mod tests {
         let header_fk = plan_a.per_header_ranges[0].0;
         q.archive_commit_plan_defer_head(plan_a).unwrap();
         assert!(
-            q.store().txs.pending_fk(&parent_txid).is_some(),
-            "defer-head must leave the create in the pending snap"
-        );
-        assert!(
             q.store().txs.pending_head_len() >= 1,
             "create must still be queued — drain has not inserted tx.head"
         );
@@ -1406,11 +1528,8 @@ mod tests {
                 .is_some(),
             "Class C fence covers the create before drain insert"
         );
-        q.forget_pending_if_fenced();
-        assert!(
-            q.store().txs.pending_fk(&parent_txid).is_some(),
-            "forget-if-fenced must not drop keys still queued for insert"
-        );
+        // Defer-head: no drain HWM — load map keeps the create (67438).
+        q.leftover_forget(99);
 
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xec;

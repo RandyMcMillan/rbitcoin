@@ -1745,12 +1745,13 @@ pub(crate) fn structural_validate_spends(
     })
 }
 
-/// [`crate::header::median_time_past`] with a write-run cache keyed by end height.
+/// MTP for write structural. Prefers assemble-carried `prev_mtp` (seeded into
+/// `cache`). Misses go to durable headers only — never `get_header_plan`.
 fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32, ConsensusError> {
     if let Some(&t) = cache.get(&height.0) {
         return Ok(t);
     }
-    let t = crate::header::median_time_past(query, height)?;
+    let t = crate::header::median_time_past_store(query, height)?;
     cache.insert(height.0, t);
     Ok(t)
 }

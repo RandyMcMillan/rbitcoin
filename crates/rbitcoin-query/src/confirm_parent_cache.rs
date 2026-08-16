@@ -56,7 +56,8 @@ impl ConfirmParentCache {
 
     /// Advance tip: drop headers at/below tip.
     ///
-    /// Thin edges / sparse pins are batch-local. Called from write `post_commit`.
+    /// Thin edges / sparse pins are batch-local. Called from load
+    /// `leftover_on_load_pack` (polls store tip; write does not lock this cache).
     pub fn advance_tip(&self, tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;

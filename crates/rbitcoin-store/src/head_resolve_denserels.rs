@@ -92,7 +92,7 @@ fn resolve_fk_and_range_pread(
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
 
-    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
+    // Leftover write-behind is load-owned; TipOnly is durable head only.
 
     // Wave 1: hot (cacheable) head segments.
     let t_probe = Instant::now();
@@ -402,42 +402,6 @@ fn key_done(
     }
 }
 
-/// Write-behind map: txid.body is published, tx.head may still be draining.
-///
-/// Uses serial [`VarTable::record_range`] (may open TLS `pread_batch`). Must
-/// run **outside** the plan `with_thread_local` machine.
-fn apply_pending_hits(
-    table: &TxTable,
-    txids: &[[u8; 32]],
-    heights: Option<&HeightFence>,
-    winner: &mut [Option<(Fk, (u64, u64))>],
-    connected: &mut [bool],
-) -> Result<usize, StoreError> {
-    let mut hits = 0usize;
-    for (i, txid) in txids.iter().enumerate() {
-        let Some(fk) = table.pending_fk(txid) else {
-            continue;
-        };
-        // Confirm leftover binds pending *before* this TipOnly machine
-        // (archive.rs). Here fence still applies so BIP30 / connected
-        // resolve does not treat write-behind as a confirmed instance.
-        if let Some(h) = heights {
-            if h.height_of(fk).is_none() {
-                continue;
-            }
-        }
-        let range = table.body.record_range(fk)?;
-        winner[i] = Some((fk, range));
-        if heights.is_some() {
-            connected[i] = true;
-        }
-        hits += 1;
-        crate::head_resolve_stats::add_pending_hit(1);
-        crate::head_resolve_stats::add_hit_rank(1);
-    }
-    Ok(hits)
-}
-
 fn id_idx_wave(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -554,11 +518,8 @@ fn resolve_fk_and_range_uring(
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-    // Pending hits use serial record_range (TLS pread_batch). Do that before
-    // the plan machine holds the ring — otherwise record_range nests.
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut connected = vec![false; txids.len()];
-    apply_pending_hits(table, txids, heights, &mut winner, &mut connected)?;
 
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
         resolve_fk_and_range_uring_on(
@@ -805,9 +766,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Write-behind pending hit must not nest TLS: apply_pending_hits runs
-    /// *before* the plan `with_thread_local` (mainnet 2026-08-14 lookup panic
-    /// while drain sealed `tx.head` file_id=47).
+    /// After drain, TipOnly hits durable head (write-behind is load-owned).
     #[test]
     fn uring_pending_write_behind_does_not_nest_tls() {
         let dir = tmp("pending-uring");
@@ -834,11 +793,12 @@ mod tests {
             )
             .unwrap();
         t.head_note_pending(&[(tid, fks[0])]);
+        t.head_drain_pending().unwrap();
         let via = resolve_fk_and_range_batch(&t, &[tid]).unwrap();
         assert_eq!(via.len(), 1);
         let (got_tid, row) = &via[0];
         assert_eq!(*got_tid, tid);
-        let (fk, range) = row.expect("pending write-behind must stamp fk+range");
+        let (fk, range) = row.expect("drained head must stamp fk+range");
         assert_eq!(fk, fks[0]);
         assert_eq!(t.body.record_range(fk).unwrap(), range);
         assert!(range.1 > 0);

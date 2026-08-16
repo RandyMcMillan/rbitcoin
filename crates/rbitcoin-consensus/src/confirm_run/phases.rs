@@ -200,6 +200,7 @@ pub(super) fn assemble_run(
             time: block.header.time,
             bits: block.header.bits,
             hash: block_hash,
+            prev_mtp,
         });
     }
     Ok(prepared)
@@ -220,6 +221,11 @@ pub(super) fn structural_run(
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
     // MTP of height H reused across blocks/spends in this write run.
     let mut mtp_cache: U32Map<u32> = U32Map::default();
+    for p in prepared {
+        if p.height.0 > 0 {
+            mtp_cache.insert(p.height.0 - 1, p.prev_mtp);
+        }
+    }
     let mut tot = StructuralPhaseNs::default();
     let mut run_create_height: FkMap<u32> = FkMap::default();
     for p in prepared {
@@ -396,14 +402,9 @@ pub(super) fn post_commit(
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);
 
-    // Prune confirm-parent cache for heights at/below new tip.
-    let mut tip_gc_ns = 0u64;
-    if let Some(tip) = prepared.last().map(|p| p.height.0) {
-        let t_tip = Instant::now();
-        query.advance_parent_cache_tip(tip);
-        tip_gc_ns = t_tip.elapsed().as_nanos() as u64;
-        confirm_phase_stats::CACHE_TIP_NS.fetch_add(tip_gc_ns, Ordering::Relaxed);
-    }
+    // Header-cache GC is load-owned (polls store tip each pack). Write does
+    // not lock ConfirmParentCache.
+    let tip_gc_ns = 0u64;
     Ok((spend_ann_ns, tip_gc_ns))
 }
 

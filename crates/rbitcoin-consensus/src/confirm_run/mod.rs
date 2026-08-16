@@ -109,6 +109,9 @@ struct Prepared {
     bits: bitcoin::CompactTarget,
     /// Header hash of this block (prev-link for the next height in the run).
     hash: [u8; 32],
+    /// Prev-block MTP from assemble (`mtp_at(height-1)`). Write BIP68 uses this
+    /// instead of `ConfirmParentCache::get_header_plan`.
+    prev_mtp: u32,
 }
 
 /// Txids already consensus-script-verified under tip-era softforks (live mempool

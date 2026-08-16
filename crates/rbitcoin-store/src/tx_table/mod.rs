@@ -761,14 +761,6 @@ impl TxTable {
     /// order prefers deeper probe slots (newest BIP30-shaped create).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         use std::time::Instant;
-        if let Some(fk) = self.pending_fk(txid) {
-            if self.body_txid(fk)? == *txid {
-                crate::head_resolve_stats::add_pending_hit(1);
-                crate::head_resolve_stats::add_keys(1);
-                crate::head_resolve_stats::add_hit_rank(1);
-                return Ok(Some(fk));
-            }
-        }
         let mixed = self.secret.mix_txid(txid);
         let t_probe = Instant::now();
         let cands = self.head.probe_candidates(&mixed)?;
@@ -1460,12 +1452,7 @@ impl TxTable {
     /// Order is **newest-first** (deepest probe match first), matching
     /// [`Self::get_fk_by_txid`].
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
-        let mut out = Vec::new();
-        if let Some(fk) = self.pending_fk(txid) {
-            if self.body_txid(fk)? == *txid {
-                out.push((fk, self.get(fk)?));
-            }
-        }
+        let mut out: Vec<(Fk, TxRecord)> = Vec::new();
         let mixed = self.secret.mix_txid(txid);
         // probe_candidates already open-first then sealed newest→oldest, deep-first within.
         let cands = self.head.probe_candidates(&mixed)?;
@@ -1659,43 +1646,47 @@ impl TxTable {
         self.head.segment_count()
     }
 
-    /// Publish txid→fk for resolve before durable `tx.head` drain.
+    /// Queue txid→fk for durable `tx.head` drain (write-local list only).
     pub fn head_note_pending(&self, entries: &[([u8; 32], Fk)]) {
         self.pending_head.note(entries);
     }
 
-    /// Resolve a create that is in `txid.body` but not yet in `tx.head`.
-    pub fn pending_fk(&self, txid: &[u8; 32]) -> Option<Fk> {
-        self.pending_head.get(txid)
+    /// Write-local drain list lookup (same-batch spend annotate before insert).
+    pub fn queued_pending_fk(&self, txid: &[u8; 32]) -> Option<Fk> {
+        self.pending_head.queued_fk(txid)
     }
 
-    /// Drop pending snap keys the fence already covers (leftover can TipOnly).
-    pub fn forget_pending_if_fenced(&self, fence: &crate::height_fence::HeightFence) {
-        self.pending_head.forget_if_fenced(fence);
+    /// Take the drain list on the write thread (drain receives an owned Vec).
+    pub fn take_pending_queued(&self) -> Vec<([u8; 32], Fk)> {
+        self.pending_head.take_queued()
     }
 
-    /// Drain the pending insert queue via page-grouped [`Self::head_insert_many`].
-    ///
-    /// Inserts durable `tx.head` for probe. Leaves the snap so leftover can
-    /// bind `pending_fk` until the fence covers those fks. Caller forgets
-    /// after this returns (insert published); do not forget from Class C
-    /// while drain is still in flight.
-    pub fn head_drain_pending(&self) -> Result<u64, StoreError> {
-        let batch = self.pending_head.take_queued();
+    /// Insert a taken drain list. Leftover identity is load-owned, not here.
+    pub fn head_insert_queued(&self, batch: &[([u8; 32], Fk)]) -> Result<u64, StoreError> {
         if batch.is_empty() {
             return Ok(0);
         }
-        self.head_insert_many(&batch)?;
+        self.head_insert_many(batch)?;
         Ok(batch.len() as u64)
+    }
+
+    /// Drain the pending insert queue via page-grouped [`Self::head_insert_many`].
+    pub fn head_drain_pending(&self) -> Result<u64, StoreError> {
+        let batch = self.take_pending_queued();
+        self.head_insert_queued(&batch)
     }
 
     pub fn pending_head_len(&self) -> usize {
         self.pending_head.len()
     }
 
+    pub fn pending_head_is_full(&self) -> bool {
+        self.pending_head.len() >= PENDING_HEAD_CAP
+    }
+
     /// Bound write-behind: drain if the queue is at/over [`PENDING_HEAD_CAP`].
     pub fn head_drain_pending_if_full(&self) -> Result<(), StoreError> {
-        if self.pending_head.len() >= PENDING_HEAD_CAP {
+        if self.pending_head_is_full() {
             self.head_drain_pending()?;
         }
         Ok(())

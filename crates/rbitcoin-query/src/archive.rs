@@ -547,7 +547,8 @@ impl Query {
             external_parent_ranges.insert(id, range);
         }
         // Leftovers after in-flight / live pins / BQ-ahead hits are expected.
-        // Cheap TipOnly (open head + ages ≤3 sealed). Never treat a leftover as Corrupt.
+        // Bind pending (no fence) then TipOnly (connected). Pending snap stays
+        // until the fence covers — drain must not forget first.
         let t_head = Instant::now();
         if !need_head.is_empty() {
             // Write-behind is Class A identity. Bind it here without a fence
@@ -1272,7 +1273,11 @@ mod tests {
         q.archive_commit_plan(plan_a).unwrap();
         q.store().txs.head_note_pending(&[(parent_txid, parent_fk)]);
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        assert!(q.store().height_fence_snapshot().height_of(parent_fk).is_none());
+        assert!(q
+            .store()
+            .height_fence_snapshot()
+            .height_of(parent_fk)
+            .is_none());
         assert_eq!(q.store().txs.head_drain_pending().unwrap(), 1);
         assert!(
             q.store().txs.pending_fk(&parent_txid).is_some(),

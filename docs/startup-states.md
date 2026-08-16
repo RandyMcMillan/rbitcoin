@@ -41,7 +41,7 @@ pipeline (not on lookup). Lookup hands load: create_fk stamps + `txout` /
 |-------|-------|------|-----|
 | `lookup stage miss (load cold denserels forbidden)` @961466 | S0/S3 | Load Forbid + parents without plan range (in_flight / last-chance head without idx range fill); outs body was incorrectly gated | Lookup always fills `external_parent_ranges` for every stamped external create_fk; load outs by `txout` range only; never idx cold on load |
 | `put_full_batch fk mismatch` @961468 | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
-| `parent create_fk unresolved` | S2 | Creates-only in_flight lag | Keep soft requeue + creates-only publish |
+| `parent create_fk unresolved` | S2 | Leftover union miss (pending forgotten before fence, or TipOnly miss after fence) | **Permanent.** Fix publish order (pending until fence). Do not soft-requeue. |
 | false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup txid.body only |
 
 ## Dual soft paths to collapse

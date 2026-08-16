@@ -11,6 +11,13 @@ before 1.0).
 
 ### Changed
 
+- **Pending `tx.head` snap lives until the fence:** drain inserts head
+  for lookup probe but does not `forget` unfenced keys. Write forgets
+  only after `height_fence_extend`. Load leftover checks pending (no
+  fence) then TipOnly (connected). Forgetting at insert raced Class C
+  and dropped the only home for a just-committed parent (`327331`
+  leftover_n−1). No leftover soft-requeue — union miss stays Corrupt.
+
 - **IBD lookup wave select is one BQ lock:** unresolved heights come from
   `block_queue_unresolved_heights` (in-entry `resolve_complete`, capped).
   The old `list_meta` + per-height `is_resolve_complete` scan was O(n²)

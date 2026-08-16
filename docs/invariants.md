@@ -61,6 +61,7 @@ wire / body-queue
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
+| Leftover parent union | A committed create is leftover-visible via **in-flight** until `fence.covers_fk_span`, **pending snap** until `height_of` is Some, then **TipOnly head**. Write may insert `tx.head` and forget pending **only after** fence extend. Drain ∥ Class C must not drop pending before the fence. | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent) |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `inwit` on pin |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |

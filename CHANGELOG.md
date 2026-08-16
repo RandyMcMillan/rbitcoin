@@ -11,6 +11,13 @@ before 1.0).
 
 ### Changed
 
+- **Class A idx rolls:** each stem (`txout` / `inwit` / `spent`) rolls its
+  own idx at the soft span. Inwit no longer forces hot idx splits.
+- **`strong_tx`:** always L2 (1 bit/fk). `RBITCOIN_CLASS_C_INRAM_MAX_MB`
+  still caps `confirmed` / `header_txs_*` only.
+- **Schema 17 freeze note:** [`docs/store-format.md`](docs/store-format.md)
+  (hot set, widths, kinds without wipe, what forces 18).
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is
@@ -26,7 +33,6 @@ before 1.0).
   ancestor and descendant counts (and size/fee sums) come from the cluster
   graph, not stub `1`. `getmempoolinfo.unbroadcastcount` and per-entry
   `unbroadcast` track `sendrawtransaction` until a peer `getdata`s the tx.
-
 - **`rbitcoin-cli`:** cookie / `--rpcuser` HTTP client for the documented
   JSON-RPC subset (plain HTTP, same as the node).
 - **`--maxinbound`:** passed into `P2PNode` as a field. `RBITCOIN_P2P_MAX_INBOUND`
@@ -37,6 +43,9 @@ before 1.0).
 
 ### Removed
 
+- **`RWF_DONTCACHE`:** first-party flag, capability probe, and
+  `dontcache_policy`. `spent.body` is its own file; evicting those pages
+  does not protect `txout`. Uring machines stay.
 - Unused Core-style `check_tx_standard` (admit is Libre only).
 - Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
 - `crate_name()` / `smoke_crate_names` coverage theater.

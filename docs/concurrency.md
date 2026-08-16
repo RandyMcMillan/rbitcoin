@@ -29,7 +29,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **tx.head (segmented):** see [`heads.md`](./heads.md). Lookup: live pin by
 txid → hot (open + ages ≤3) → ID/idx → cold (ages ≥4) if needed.
-RWF_DONTCACHE is spend-annotate pwrite only, not the wave split.
+The 2-wave split is sealed age, not an IO flag.
 
 **Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 

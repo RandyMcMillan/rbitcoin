@@ -24,9 +24,9 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_BLOCK_QUEUE_GB` | unlimited | Absolute in-RAM body-queue ceiling (GiB) |
 | `RBITCOIN_BLOCK_QUEUE_BYTES` | unlimited | Same ceiling in bytes (wins over GB) |
 | `RBITCOIN_BULK_IO_WORKERS` | backend default | pread worker count when `RBITCOIN_IO=pread` |
-| `RBITCOIN_CLASS_C_INRAM_MAX_MB` | 256 | L2 Class C image cap; over → fd L0 |
+| `RBITCOIN_CLASS_C_INRAM_MAX_MB` | 256 | L2 cap for `confirmed` / `header_txs_*`; over → fd L0. `strong_tx` always L2 |
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
-| `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Idx segment soft rollover (bytes) |
+| `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Per-stem idx soft rollover (do not set above 32 GiB hard span) |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots |
 | `RBITCOIN_HEAD_SLOTS_SCRIPTHASH` | scale default | SH hash-head initial slots |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |

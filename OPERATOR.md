@@ -187,7 +187,9 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 
-**RWF_DONTCACHE (fixed):** only spend-annotate **`spent.body` pwrites** set the flag when the kernel supports it. Class A append and load body reads do not.
+**RWF_DONTCACHE:** not used. `spent.body` is its own file; evicting those
+pages after annotate does not protect `txout`. See
+[`docs/store-format.md`](docs/store-format.md).
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO.

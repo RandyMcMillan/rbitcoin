@@ -224,6 +224,7 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | Doc | Contents |
 |-----|----------|
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
+| [`docs/store-format.md`](./store-format.md) | Schema 17 freeze: hot set, widths, kinds, what forces 18 |
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
 | [`docs/heads.md`](./heads.md) | Which head file / module (tx / header / SH) |

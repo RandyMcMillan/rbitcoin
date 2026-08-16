@@ -5,7 +5,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::PublicKey;
 use bitcoin::script::Builder;
 use bitcoin::{
-    Address, Amount, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid,
+    Address, Amount, Block, BlockHash, Network as BtcNetwork, OutPoint, ScriptBuf, Transaction,
+    Txid,
 };
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{hex_decode, hex_encode, Height, Network};
@@ -360,6 +361,11 @@ pub fn dispatch(
         "prioritisetransaction" => prioritisetransaction(ctx, &params),
         "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
         "getmempoolcluster" => getmempoolcluster(ctx, &params),
+        "getmempoolancestors" => getmempoolancestors(ctx, &params),
+        "getmempooldescendants" => getmempooldescendants(ctx, &params),
+        "getmempoolfeeratediagram" => getmempoolfeeratediagram(ctx, &params),
+        "submitpackage" => submitpackage(ctx, &params),
+        "gettxspendingprevout" => gettxspendingprevout(ctx, &params),
         "createrawtransaction"
         | "signrawtransactionwithkey"
         | "createmultisig"
@@ -487,6 +493,11 @@ const METHOD_LIST: &[&str] = &[
     "prioritisetransaction",
     "getprioritisedtransactions",
     "getmempoolcluster",
+    "getmempoolancestors",
+    "getmempooldescendants",
+    "getmempoolfeeratediagram",
+    "submitpackage",
+    "gettxspendingprevout",
     "submitblock",
     "submitheader",
     "setmocktime",
@@ -938,6 +949,7 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
             "unbroadcastcount": 0,
             "permitbaremultisig": true,
+            "optimal": true,
         }));
     };
     let live = mp.list_live_meta();
@@ -960,6 +972,7 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "relay_enabled": mp.relay_enabled(),
         "unbroadcastcount": mp.unbroadcast_count(),
         "permitbaremultisig": true,
+        "optimal": true,
     }))
 }
 
@@ -2249,6 +2262,186 @@ fn getmempoolcluster(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     }))
 }
 
+fn getmempoolancestors(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid", "verbose"])?;
+    let hex = params.req_str(0, "txid")?;
+    let verbose = params.opt_bool(1, "verbose")?.unwrap_or(false);
+    mempool_relatives(ctx, hex, verbose, true)
+}
+
+fn getmempooldescendants(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid", "verbose"])?;
+    let hex = params.req_str(0, "txid")?;
+    let verbose = params.opt_bool(1, "verbose")?.unwrap_or(false);
+    mempool_relatives(ctx, hex, verbose, false)
+}
+
+fn mempool_relatives(
+    ctx: &RpcContext,
+    hex: &str,
+    verbose: bool,
+    ancestors: bool,
+) -> Result<Value, Value> {
+    let tid = Txid::from_byte_array(parse_hash32_display(hex)?);
+    let mp = ctx
+        .mempool
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let ids = if ancestors {
+        mp.ancestor_txids(&tid)
+    } else {
+        mp.descendant_txids(&tid)
+    };
+    let Some(ids) = ids else {
+        return Err(rpc_error(
+            ERR_INVALID_ADDRESS_OR_KEY,
+            "Transaction not in mempool",
+        ));
+    };
+    if !verbose {
+        let hexes: Vec<String> = ids
+            .iter()
+            .map(|t| hash_hex_display(&t.to_byte_array()))
+            .collect();
+        return Ok(json!(hexes));
+    }
+    let live = mp.list_live_meta();
+    let mut map = serde_json::Map::new();
+    for id in ids {
+        if let Some((_, fee, weight)) = live.iter().find(|(t, _, _)| *t == id) {
+            map.insert(
+                hash_hex_display(&id.to_byte_array()),
+                mempool_graph_json(mp, &id, *fee, *weight),
+            );
+        }
+    }
+    Ok(Value::Object(map))
+}
+
+fn getmempoolfeeratediagram(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&[])?;
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return Ok(json!([]));
+    };
+    let pts: Vec<Value> = mp
+        .feerate_diagram()
+        .into_iter()
+        .map(|(weight, fee)| {
+            json!({
+                "weight": weight,
+                "fee": sat_btc_json(fee),
+            })
+        })
+        .collect();
+    Ok(json!(pts))
+}
+
+fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["package", "maxfeerate", "maxburnamount"])?;
+    let arr = params
+        .get_array(0, "package")
+        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package array required"))?;
+    let mp = ctx
+        .mempool
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    if !mp.relay_enabled() {
+        return Err(rpc_error(
+            ERR_MISC,
+            "mempool relay disabled (still in IBD or tip not ready)",
+        ));
+    }
+    let mut txs = Vec::with_capacity(arr.len());
+    for v in arr {
+        let hex = v
+            .as_str()
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package hex required"))?;
+        txs.push(decode_tx_hex(hex)?);
+    }
+    let results = mp.submit_package_rpc(&txs);
+    let mut tx_results = serde_json::Map::new();
+    let mut replaced = Vec::new();
+    let mut all_ok = true;
+    for (tx, r) in txs.iter().zip(results.iter()) {
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+        match r {
+            Ok(ok) => {
+                mp.note_unbroadcast(ok.txid);
+                for old in &ok.replaced {
+                    replaced.push(hash_hex_display(&old.to_byte_array()));
+                }
+                tx_results.insert(
+                    wtxid,
+                    json!({
+                        "txid": txid,
+                        "vsize": ok.weight / 4,
+                        "fees": { "base": sat_btc_json(ok.fee_sat as i64) },
+                    }),
+                );
+            }
+            Err(e) => {
+                let reason = accept_reject_reason(e);
+                if reason == "txn-already-in-mempool" {
+                    tx_results.insert(wtxid, json!({ "txid": txid }));
+                    continue;
+                }
+                all_ok = false;
+                tx_results.insert(
+                    wtxid,
+                    json!({
+                        "txid": txid,
+                        "error": reason,
+                    }),
+                );
+            }
+        }
+    }
+    Ok(json!({
+        "package_msg": if all_ok { "success" } else { "transaction failed" },
+        "tx-results": tx_results,
+        "replaced-transactions": replaced,
+    }))
+}
+
+fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["outputs"])?;
+    let arr = params
+        .get_array(0, "outputs")
+        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "outputs array required"))?;
+    let mp = ctx.mempool.as_ref();
+    let mut out = Vec::new();
+    for v in arr {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "output must be an object"))?;
+        let txid = obj
+            .get("txid")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
+        let vout = obj
+            .get("vout")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))? as u32;
+        let want = parse_hash32_display(txid)?;
+        let op = OutPoint {
+            txid: Txid::from_byte_array(want),
+            vout,
+        };
+        let mut row = json!({
+            "txid": txid,
+            "vout": vout,
+        });
+        if let Some(mp) = mp {
+            if let Some(sp) = mp.spending_txid(&op) {
+                row["spendingtxid"] = json!(hash_hex_display(&sp.to_byte_array()));
+            }
+        }
+        out.push(row);
+    }
+    Ok(json!(out))
+}
+
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexdata", "dummy"])?;
     let miner = require_regtest_miner(ctx, "submitblock")?;
@@ -3535,6 +3728,23 @@ mod tests {
         let missing_cl =
             dispatch(&ctx, "getmempoolcluster", vec![json!("11".repeat(32))]).unwrap_err();
         assert_eq!(missing_cl["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        let ancs = dispatch(&ctx, "getmempoolancestors", vec![tid.clone()]).unwrap();
+        assert_eq!(ancs, json!([]));
+        let desc = dispatch(&ctx, "getmempooldescendants", vec![tid.clone()]).unwrap();
+        assert_eq!(desc, json!([]));
+        let diagram = dispatch(&ctx, "getmempoolfeeratediagram", vec![]).unwrap();
+        // This test deprioritises the only live tx (modified fee ≤ 0), so the
+        // diagram may be empty — still a JSON array.
+        assert!(diagram.is_array(), "{diagram}");
+        let spend = dispatch(
+            &ctx,
+            "gettxspendingprevout",
+            vec![json!([{ "txid": cb_txid, "vout": 0 }])],
+        )
+        .unwrap();
+        assert_eq!(spend[0]["spendingtxid"], tid);
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(info["optimal"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -32,6 +32,11 @@ before 1.0).
 - **Mempool block connect evicts conflicts:** a confirmed block that
   spends a mempool tx's inputs (without including that tx) drops the
   conflict and its descendants. `wallet_txn_*` reorgs need this.
+- **Mempool accessors:** `getmempoolancestors` / `getmempooldescendants` /
+  `getmempoolfeeratediagram` / `submitpackage` / `gettxspendingprevout`.
+  `-limitclustercount` / `-limitclustersize` overlay the live graph.
+  Cluster overflow is `too-large-cluster`. `getmempoolinfo.optimal` is
+  true (we linearize on insert).
 
 - **No leftover pending map.** Parent identity is in-flight until
   drain-fk **and** fence after pin + scripts handoff (n−1 outs).

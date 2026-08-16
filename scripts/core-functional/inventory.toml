@@ -435,7 +435,7 @@ analog = "follow-up: wtxid accept"
 name = "mempool_cluster.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: cluster limits"
+analog = "ancestors/submitpackage/limits shipped; merge-size still over-admits"
 
 [[test]]
 name = "mempool_compatibility.py"

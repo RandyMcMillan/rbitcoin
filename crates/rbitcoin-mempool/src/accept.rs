@@ -1,7 +1,7 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+use crate::graph::{TxEntry, TxGraph};
 use crate::orphanage::Orphanage;
 use crate::store::Mempool;
 use bitcoin::consensus::encode::serialize;
@@ -160,9 +160,7 @@ impl std::fmt::Display for AcceptError {
             AcceptError::MissingPrevout(op) => write!(f, "missing prevout {op}"),
             AcceptError::Orphaned(t) => write!(f, "orphaned {t}"),
             AcceptError::Duplicate(t) => write!(f, "duplicate {t}"),
-            AcceptError::ClusterTooLarge { count, weight } => {
-                write!(f, "cluster too large count={count} weight={weight}")
-            }
+            AcceptError::ClusterTooLarge { .. } => f.write_str("too-large-cluster"),
             AcceptError::PackageTooLarge { count, weight } => {
                 write!(f, "package too large count={count} weight={weight}")
             }
@@ -297,6 +295,11 @@ impl ActiveMempool {
         max_weight: u64,
     ) -> Result<Self, MempoolError> {
         Self::open_with_limit_persist(dir, max_weight, true)
+    }
+
+    /// Overlay Core `-limitclustercount` / `-limitclustersize`.
+    pub fn set_cluster_limits(&mut self, count: Option<u32>, size_kvb: Option<u32>) {
+        self.graph.set_cluster_limits(count, size_kvb);
     }
 
     /// `persist=false` abandons any on-disk live set (Core `-persistmempool=0`).
@@ -644,18 +647,24 @@ impl ActiveMempool {
             .filter(|p| !conflict_set.contains(p))
             .collect();
 
-        if self.graph.cluster_would_exceed(&parent_txids, 1, weight) {
-            let mut members = BTreeSet::new();
-            for p in &parent_txids {
-                if let Some(c) = self.graph.cluster_of(p) {
-                    members.extend(c.members);
-                }
+        // Size the cluster *after* RBF: replaced txs do not count.
+        let mut members = BTreeSet::new();
+        for p in &parent_txids {
+            if let Some(c) = self.graph.cluster_of(p) {
+                members.extend(c.members);
             }
-            members.retain(|m| !conflict_set.contains(m));
-            let base_w: u64 = members
-                .iter()
-                .filter_map(|t| self.graph.get(t).map(|e| e.weight))
-                .sum();
+        }
+        members.retain(|m| !conflict_set.contains(m));
+        let base_w: u64 = members
+            .iter()
+            .filter_map(|t| self.graph.get(t).map(|e| e.weight))
+            .sum();
+        // Core `-limitclustersize` is kvB of (Σ weight + 3) / 4 — same as
+        // the functional test's `weight_to_vsize(clusterweight)`.
+        let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
+        if members.len() + 1 > self.graph.cluster_count_limit()
+            || combined_vsize > self.graph.cluster_vsize_limit()
+        {
             return Err(AcceptError::ClusterTooLarge {
                 count: members.len() + 1,
                 weight: base_w.saturating_add(weight),
@@ -701,7 +710,9 @@ impl ActiveMempool {
         self.bodies.insert(txid, tx.clone());
 
         if let Some(c) = self.graph.cluster_of(&txid) {
-            if c.members.len() > MAX_CLUSTER_COUNT || c.total_weight > MAX_CLUSTER_WEIGHT {
+            if c.members.len() > self.graph.cluster_count_limit()
+                || c.total_weight.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
+            {
                 self.graph.remove(&txid, tx);
                 self.bodies.remove(&txid);
                 let _ = self.store.mark_slot_dead(slot);
@@ -1149,6 +1160,7 @@ pub fn rbf_allows_replacement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
@@ -1688,6 +1700,69 @@ mod tests {
         let gone = mp.evict_conflicts_with(&[op_a, op_b]);
         assert_eq!(gone.len(), 2);
         assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rbf_cluster_count_excludes_replaced() {
+        let dir = tmp_dir();
+        let mut map = HashMap::new();
+        let mut parents = Vec::new();
+        let mut children = Vec::new();
+        for i in 0u8..3 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i; 32]),
+                vout: 0,
+            };
+            let out = TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            map.insert(op, coin(out));
+            parents.push(op);
+        }
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(Some(4), None);
+        let mut parent_outs = Vec::new();
+        for op in &parents {
+            let p = spend_tx(*op, 90_000);
+            mp.accept_tx(&p, &utxos, TIP_OK).unwrap();
+            let pout = OutPoint {
+                txid: p.compute_txid(),
+                vout: 0,
+            };
+            parent_outs.push(pout);
+            let c = spend_tx(pout, 80_000);
+            mp.accept_tx(&c, &utxos, TIP_OK).unwrap();
+            children.push(c.compute_txid());
+        }
+        assert_eq!(mp.live_count(), 6);
+        // Merger spends the three parent outputs (replaces the three children).
+        // After RBF: 3 parents + 1 merger = 4, at the cap.
+        let merger = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: parent_outs
+                .iter()
+                .map(|op| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&merger, &utxos, TIP_OK)
+            .expect("RBF must not count replaced children toward the cluster cap");
+        assert_eq!(mp.live_count(), 4);
+        for id in &children {
+            assert!(!mp.graph.contains(id));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

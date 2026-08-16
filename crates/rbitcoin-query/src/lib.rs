@@ -37,7 +37,7 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -1322,6 +1322,20 @@ impl Query {
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         let g = self.block_queue.lock().unwrap();
         g.list_meta()
+    }
+
+    /// Lowest unresolved BQ heights `≥ path_lo` not in `skip`, capped at `cap`.
+    ///
+    /// One queue lock. Lookup wave select must use this instead of
+    /// `list_meta` + per-height `is_resolve_complete`.
+    pub fn block_queue_unresolved_heights(
+        &self,
+        path_lo: u32,
+        skip: &HashSet<u32>,
+        cap: usize,
+    ) -> Vec<u32> {
+        let g = self.block_queue.lock().unwrap();
+        g.unresolved_heights(path_lo, skip, cap)
     }
 
     /// Load all queued blocks **with full payloads** (tests / tools).

@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **IBD lookup wave select is one BQ lock:** unresolved heights come from
+  `block_queue_unresolved_heights` (in-entry `resolve_complete`, capped).
+  The old `list_meta` + per-height `is_resolve_complete` scan was O(n²)
+  at a few thousand queued bodies (`lookup_thr other=` pegged at ~140k).
+
 - **IBD connecting search needs a connected LCA:** a capped ancestor walk
   from a far header-only horizon (early IBD, tip at a few thousand, headers
   at `max_ordered`) is not a disconnected fork. The old `!has_block(join)`

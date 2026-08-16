@@ -48,6 +48,10 @@ before 1.0).
   `TxGraph::select_block_txids` (best-chunk order, parent-before-child,
   block-weight cap). Same helper will feed `getblocktemplate`.
 
+- **`getblocktemplate` / `getmininginfo`:** template from the selector on
+  every network. `rules` must include `segwit`. Proposal validates without
+  connecting. No BIP9 testdummy version bit.
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is

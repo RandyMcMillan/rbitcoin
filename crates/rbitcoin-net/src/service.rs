@@ -229,7 +229,7 @@ impl P2PNode {
     /// Push a validated block into cache + store.
     pub fn ingest_block(&self, height: u32, block: Block) -> Result<(), NetError> {
         let _ = height;
-        match self.hub.accept_block(block)? {
+        match self.hub.accept_received_block(block)? {
             AcceptOutcome::Accepted { .. } | AcceptOutcome::AlreadyHave => Ok(()),
             AcceptOutcome::IgnoredWeaker => Err(NetError::Protocol("weaker tip ignored")),
         }

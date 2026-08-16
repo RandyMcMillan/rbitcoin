@@ -121,7 +121,7 @@ pub use block::{
 };
 pub use clock::{current_now, wall_now, with_now, NodeClock};
 pub use convert::{block_to_apply, block_to_apply_with_txids, header_to_record};
-pub use error::ConsensusError;
+pub use error::{block_reject_reason, ConsensusError};
 pub use header::{expected_next_bits, median_time_past, validate_header};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};

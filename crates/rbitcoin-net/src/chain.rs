@@ -1251,7 +1251,11 @@ impl ChainHub {
                 &preverified,
             )
         })
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
+        .map_err(|e| {
+            let reason = rbitcoin_consensus::block_reject_reason(&e);
+            rbitcoin_log::debug!("{reason}");
+            NetError::Consensus(reason)
+        })?;
         self.header_tips.write().unwrap().remove(&hash);
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
         // Tip-mode only: remove_for_block no-ops while relay is off (IBD).

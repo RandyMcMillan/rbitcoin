@@ -32,6 +32,8 @@ pub struct Coin {
     pub txout: TxOut,
     /// Class C create height; `0` if unknown (BIP68 fail-closed when needed).
     pub create_height: u32,
+    /// MTP of the block *before* the create block (BIP68 time locks). `0` if unknown.
+    pub create_mtp: u32,
     pub is_coinbase: bool,
 }
 
@@ -73,6 +75,7 @@ impl MapUtxoProvider {
                         Coin {
                             txout,
                             create_height: 0,
+                            create_mtp: 0,
                             is_coinbase: false,
                         },
                     )
@@ -217,7 +220,7 @@ fn check_mempool_structural(
                         return Err(AcceptError::NonBip68Final);
                     }
                     prev_heights.push(c.create_height);
-                    prev_mtps.push(0);
+                    prev_mtps.push(c.create_mtp);
                 }
                 None => {
                     // Mempool parent: treat as created at next_height (unconfirmed).
@@ -968,15 +971,67 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Vec<Result<AcceptResult, AcceptError>> {
-        txs.iter()
+        let out: Vec<Result<AcceptResult, AcceptError>> = txs
+            .iter()
             .filter(|t| !t.is_coinbase())
             .map(|t| self.accept_tx(t, utxos, tip))
-            .collect()
+            .collect();
+        self.evict_nonfinal(utxos, tip);
+        out
+    }
+
+    /// Drop live txs whose BIP68 / finality no longer holds (reorg: parent
+    /// went from confirmed to mempool).
+    pub fn evict_nonfinal(&mut self, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
+        loop {
+            let ids: Vec<Txid> = self.graph.iter().map(|(t, _)| *t).collect();
+            let mut removed = false;
+            for id in ids {
+                let Some(tx) = self.get_tx(&id).cloned() else {
+                    continue;
+                };
+                let mut chain_coins = Vec::with_capacity(tx.input.len());
+                for inp in &tx.input {
+                    if self.graph.creator(&inp.previous_output).is_some() {
+                        chain_coins.push(None);
+                    } else if let Some(c) = utxos.get_coin(&inp.previous_output) {
+                        chain_coins.push(Some(c));
+                    } else {
+                        chain_coins.push(None);
+                    }
+                }
+                if check_mempool_structural(&tx, &chain_coins, tip).is_err() {
+                    let _ = self.remove_txid(&id);
+                    removed = true;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
     }
 
     /// Lookup a live body (for tests / Electrum unconf).
     pub fn get_tx(&self, txid: &Txid) -> Option<&Transaction> {
         self.bodies.get(txid)
+    }
+
+    /// Mining-order live txs that fit in `max_weight_wu` (best chunks first).
+    pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<Transaction> {
+        self.select_block_txs_delta(max_weight_wu, |_| 0)
+    }
+
+    /// Like [`Self::select_block_txs`] with `prioritisetransaction` fee deltas.
+    pub fn select_block_txs_delta(
+        &self,
+        max_weight_wu: u64,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Vec<Transaction> {
+        self.graph
+            .select_block_txids_delta(max_weight_wu, delta)
+            .into_iter()
+            .filter_map(|id| self.get_tx(&id).cloned())
+            .collect()
     }
 }
 
@@ -1089,6 +1144,7 @@ mod tests {
         Coin {
             txout,
             create_height: 0,
+            create_mtp: 0,
             is_coinbase: false,
         }
     }
@@ -1183,6 +1239,7 @@ mod tests {
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 },
                 create_height: 50,
+                create_mtp: 0,
                 is_coinbase: true,
             },
         );
@@ -1202,6 +1259,108 @@ mod tests {
         };
         mp.accept_tx(&tx, &utxos, tip2)
             .expect("mature at tip 149 (next=150)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bip68_time_lock_uses_coin_create_mtp() {
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        map.insert(
+            op,
+            Coin {
+                txout: TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                create_height: 10,
+                create_mtp: 1_000_000,
+                is_coinbase: false,
+            },
+        );
+        let utxos = MapUtxoProvider { map };
+        let mut tx = spend_tx(op, 49_000);
+        tx.version = Version::TWO;
+        // Time-type relative lock of 2 units (2 << 9 = 1024 seconds).
+        tx.input[0].sequence = Sequence::from_consensus((1 << 22) | 2);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        // prev MTP 1_000_000 + 1024 - 1 = 1_001_023; tip MTP 1_001_000 → not final.
+        let err = mp
+            .accept_tx(
+                &tx,
+                &utxos,
+                ChainTipCtx {
+                    height: 20,
+                    mtp: 1_001_000,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, AcceptError::NonBip68Final), "got {err}");
+        mp.accept_tx(
+            &tx,
+            &utxos,
+            ChainTipCtx {
+                height: 20,
+                mtp: 1_002_000,
+            },
+        )
+        .expect("time lock satisfied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_nonfinal_after_parent_unconfirmed() {
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x33; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        map.insert(
+            op,
+            Coin {
+                txout: TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                create_height: 10,
+                create_mtp: 1,
+                is_coinbase: false,
+            },
+        );
+        let utxos = MapUtxoProvider { map };
+        let mut tx = spend_tx(op, 49_000);
+        tx.version = Version::TWO;
+        tx.input[0].sequence = Sequence::from_consensus(1);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(
+            &tx,
+            &utxos,
+            ChainTipCtx {
+                height: 20,
+                mtp: u32::MAX,
+            },
+        )
+        .expect("seq=1 ok vs confirmed parent");
+        assert_eq!(mp.graph.len(), 1);
+        mp.evict_nonfinal(
+            &MapUtxoProvider {
+                map: HashMap::new(),
+            },
+            ChainTipCtx {
+                height: 19,
+                mtp: u32::MAX,
+            },
+        );
+        assert_eq!(
+            mp.graph.len(),
+            0,
+            "seq=1 child evicted when parent is unconfirmed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

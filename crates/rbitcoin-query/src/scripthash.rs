@@ -159,6 +159,17 @@ pub struct ScriptHashUtxo {
     pub value: i64,
 }
 
+/// One confirmed unspent from [`Query::scan_unspent_scripts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanUtxo {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub height: u32,
+    pub value: u64,
+    pub script: Vec<u8>,
+    pub coinbase: bool,
+}
+
 /// Esplora-style confirmed chain stats for a scripthash.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScriptHashChainStats {
@@ -321,6 +332,81 @@ impl Query {
             }
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
+        Ok(out)
+    }
+
+    /// Confirmed unspents whose `scriptPubKey` is in `scripts`.
+    ///
+    /// With `--shindex`, this is [`Self::scripthash_listunspent`]. Without, it
+    /// walks Class A `txout` + spentness per confirmed height — never
+    /// [`Self::reconstruct_block_at_height`].
+    pub fn scan_unspent_scripts(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
+        if self.sh_index_enabled() {
+            self.scan_unspent_via_shindex(scripts)
+        } else {
+            self.scan_unspent_via_txout(scripts)
+        }
+    }
+
+    fn scan_unspent_via_shindex(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
+        let mut out = Vec::new();
+        for spk in scripts {
+            let sh = script_hash(spk);
+            for u in self.scripthash_listunspent(&sh)? {
+                let coinbase = match self.get_tx_by_txid(&u.tx_hash)? {
+                    Some((fk, _)) => {
+                        let (_, ins, _) = self.store.get_tx_full(fk)?;
+                        ins.first().is_some_and(|i| i.is_coinbase())
+                    }
+                    None => false,
+                };
+                if u.value < 0 {
+                    continue;
+                }
+                out.push(ScanUtxo {
+                    txid: u.tx_hash,
+                    vout: u.tx_pos,
+                    height: u.height,
+                    value: u.value as u64,
+                    script: spk.clone(),
+                    coinbase,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn scan_unspent_via_txout(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for h in 0..=tip.0 {
+            let fks = self.block_tx_fks(Height(h))?;
+            for (ti, fk) in fks.into_iter().enumerate() {
+                let (tx, _ins, outs) = self.store.get_tx_full(fk)?;
+                let coinbase = ti == 0;
+                for (vout, o) in outs.iter().enumerate() {
+                    if !scripts.iter().any(|s| s.as_slice() == o.script.as_slice()) {
+                        continue;
+                    }
+                    if self.is_outpoint_spent(&tx.txid, vout as u32)? {
+                        continue;
+                    }
+                    if o.value < 0 {
+                        continue;
+                    }
+                    out.push(ScanUtxo {
+                        txid: tx.txid,
+                        vout: vout as u32,
+                        height: h,
+                        value: o.value as u64,
+                        script: o.script.clone(),
+                        coinbase,
+                    });
+                }
+            }
+        }
         Ok(out)
     }
 

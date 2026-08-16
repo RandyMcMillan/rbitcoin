@@ -5,9 +5,11 @@ keys such as `blockhash`, `verbosity`, `txid`, `hexstring`). Missing
 required keys are `-32602`; unknown named keys are `-8`.
 
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
-This is **not** full Core parity: no wallet, no mining GBT, no `scantxoutset`,
-no `createrawtransaction`. Prefer **Electrum / Esplora** (with `--shindex`) for
-address/script history.
+This is **not** full Core parity: no wallet, no `createrawtransaction`.
+`getblocktemplate` / `getmininginfo` are a miner-backend (no stratum, no
+BIP9 testdummy). `scantxoutset` supports `raw(script)` via the scripthash
+index (when `--shindex`) or Class A txout + spent. Prefer **Electrum /
+Esplora** (with `--shindex`) for address/script history.
 
 ## Operator knobs
 
@@ -79,12 +81,15 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
-| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes current mempool (topo-sorted), then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. Not a mining product (no GBT). |
+| `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes `select_block_txs`, then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. |
+| `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting. Version is `VERSIONBITS_TOP_BITS` only (no testdummy). Longpoll wait is later. |
+| `prioritisetransaction` / `getprioritisedtransactions` | All networks. Local mining fee delta (sat). Dummy must be 0. Selector honors modified fee. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
 | `gettxout` | All networks. Class A + mempool. |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
 | `getchaintips` | All networks. Active + archive `valid-fork` + held `valid-headers` + header-only (`submitheader` / P2P headers). Invalid body after a known header marks that branch `invalid`. |
+| `getdeploymentinfo` | All networks. Buried deployments from `ChainParams` including `-testactivationheight`. `active` follows Core `DeploymentActiveAfter` (true for the *next* block). No BIP9 / testdummy. |
 | `submitheader` | All networks. Same `ChainHub::ensure_header` as P2P `headers`. Hex may be an 80-byte header or a full block. |
 | `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |

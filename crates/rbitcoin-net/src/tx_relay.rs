@@ -107,12 +107,22 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .ok()
             .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
             .unwrap_or(false);
+        let create_mtp = if create_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(
+                self.query,
+                rbitcoin_primitives::Height(create_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
+        };
         Some(Coin {
             txout: TxOut {
                 value,
                 script_pubkey: ScriptBuf::from_bytes(out.script),
             },
             create_height,
+            create_mtp,
             is_coinbase,
         })
     }
@@ -264,6 +274,8 @@ pub struct MempoolHub {
     sh_index: Mutex<MempoolShIndex>,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
+    /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
+    fee_deltas: Mutex<HashMap<Txid, i64>>,
 }
 
 impl MempoolHub {
@@ -310,6 +322,7 @@ impl MempoolHub {
             meter_list_live_meta: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(HashSet::new()),
+            fee_deltas: Mutex::new(HashMap::new()),
         };
         hub.reindex_live_scripthashes();
         Ok(Arc::new(hub))
@@ -922,8 +935,10 @@ impl MempoolHub {
         let n = g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0);
         drop(g);
         if n > 0 {
+            let mut deltas = self.fee_deltas.lock().unwrap();
             for tid in txids {
                 self.unindex_txid(tid);
+                deltas.remove(tid);
             }
         }
         n
@@ -945,6 +960,31 @@ impl MempoolHub {
             .into_iter()
             .filter(|r| r.is_ok())
             .count()
+    }
+
+    /// Block template / generate selection: mining-order live txs that fit
+    /// in a block (best chunks first). Same helper GBT will use.
+    pub fn select_block_txs(&self) -> Vec<Transaction> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let g = self.inner.read().unwrap();
+        g.select_block_txs_delta(rbitcoin_mempool::TxGraph::template_tx_weight(), |id| {
+            deltas.get(&id).copied().unwrap_or(0)
+        })
+    }
+
+    /// Additive `prioritisetransaction` delta (sat). Zero total drops the entry.
+    pub fn prioritise_tx(&self, txid: Txid, fee_delta: i64) {
+        let mut m = self.fee_deltas.lock().unwrap();
+        let e = m.entry(txid).or_insert(0);
+        *e = e.saturating_add(fee_delta);
+        if *e == 0 {
+            m.remove(&txid);
+        }
+    }
+
+    /// Snapshot of non-zero deltas for `getprioritisedtransactions`.
+    pub fn prioritised_txs(&self) -> HashMap<Txid, i64> {
+        self.fee_deltas.lock().unwrap().clone()
     }
 
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.

@@ -85,7 +85,7 @@ still wait for durable SH when shindex is on.
 | `gettxout` | All networks. Class A + mempool. |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
 | `getchaintips` | All networks. Active + archive `valid-fork` + held `valid-headers` + header-only (`submitheader` / P2P headers). Invalid body after a known header marks that branch `invalid`. |
-| `getdeploymentinfo` | All networks. Buried deployments (`bip34`/`bip66`/`bip65`/`csv`/`segwit`/`taproot`) from `ChainParams` including `-testactivationheight` overlay. `active` iff the queried height ≥ buried height. No BIP9 / testdummy. |
+| `getdeploymentinfo` | All networks. Buried deployments from `ChainParams` including `-testactivationheight`. `active` follows Core `DeploymentActiveAfter` (true for the *next* block). No BIP9 / testdummy. |
 | `submitheader` | All networks. Same `ChainHub::ensure_header` as P2P `headers`. Hex may be an 80-byte header or a full block. |
 | `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |

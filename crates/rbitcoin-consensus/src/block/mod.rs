@@ -873,16 +873,23 @@ impl ScriptCheckJob {
             nullfail: false,
             low_s: false,
             strictenc: false,
-            // BIP147 co-activated with CSV on mainnet (bip112 height).
-            null_dummy: bip112_active,
+            // BIP147 / WITNESS co-activate with segwit. Confirm overwrites via
+            // [`Self::with_segwit`] from `ChainParams::segwit_active_at`.
+            null_dummy: true,
             minimal_data: false,
             witness_pubkeytype: false,
-            // Production post-segwit path always has witness rules; pre-segwit
-            // txs have empty witnesses so checks are no-ops.
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
         }
+    }
+
+    /// BIP141/147: NULLDUMMY + WITNESS rules follow `segwit` (not CSV).
+    #[inline]
+    pub(crate) fn with_segwit(mut self, segwit_active: bool) -> Self {
+        self.null_dummy = segwit_active;
+        self.witness_active = segwit_active;
+        self
     }
 }
 
@@ -1256,6 +1263,7 @@ fn assemble_block_prevouts_mode(
                         bip16_for_jobs,
                         ctx.params.taproot_active_at(ctx.height.0),
                     )
+                    .with_segwit(ctx.params.segwit_active_at(ctx.height.0))
                 } else {
                     ScriptCheckJob::with_txid(
                         txid,
@@ -1267,6 +1275,7 @@ fn assemble_block_prevouts_mode(
                         bip16_for_jobs,
                         ctx.params.taproot_active_at(ctx.height.0),
                     )
+                    .with_segwit(ctx.params.segwit_active_at(ctx.height.0))
                 };
                 script_jobs.push(job);
                 confirm_phase_stats::ASM_JOB_NS

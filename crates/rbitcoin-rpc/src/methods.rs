@@ -1660,10 +1660,11 @@ fn tip_hash_height(ctx: &RpcContext) -> Result<(String, u32), Value> {
 }
 
 fn buried_row(height: u32, at: u32) -> Value {
+    // Core `DeploymentActiveAfter`: active for the *next* block after `at`.
     json!({
         "type": "buried",
         "height": height,
-        "active": at >= height,
+        "active": at.saturating_add(1) >= height,
     })
 }
 
@@ -3043,7 +3044,8 @@ mod tests {
         let d = &info["deployments"];
         assert_eq!(d["csv"]["type"], "buried");
         assert_eq!(d["csv"]["height"], hub.params.csv_height());
-        assert_eq!(d["csv"]["active"], false);
+        // Next block is height 1 ≥ csv@1 → already active for the next block.
+        assert_eq!(d["csv"]["active"], true);
         assert_eq!(d["segwit"]["type"], "buried");
         assert_eq!(d["segwit"]["height"], hub.params.segwit_height());
         assert_eq!(d["segwit"]["active"], true, "regtest segwit height 0");
@@ -3060,10 +3062,14 @@ mod tests {
 
         let mut over = rbitcoin_consensus::ChainParams::regtest();
         over.apply_test_activation_height("csv", 102).unwrap();
-        let d = buried_deployments(&over, 101);
+        let d = buried_deployments(&over, 100);
         assert_eq!(d["csv"]["height"], 102);
-        assert_eq!(d["csv"]["active"], false);
-        assert_eq!(buried_deployments(&over, 102)["csv"]["active"], true);
+        assert_eq!(d["csv"]["active"], false, "next block 101 < 102");
+        assert_eq!(
+            buried_deployments(&over, 101)["csv"]["active"],
+            true,
+            "next block 102 ≥ 102"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -31,7 +31,10 @@ before 1.0).
 
 - **`getdeploymentinfo`:** buried `bip34` / `bip66` / `bip65` / `csv` /
   `segwit` / `taproot` from `ChainParams` (including the activation-height
-  overlay). `active` is tip ≥ height. No BIP9 / testdummy.
+  overlay). `active` is Core `DeploymentActiveAfter` (next block). No BIP9.
+
+- **Confirm overlay:** `-testactivationheight` changes BIP68/CSV/CLTV/DERSIG
+  and BIP147/WITNESS (with `segwit`) on the same `ChainParams` confirm uses.
 
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
@@ -92,8 +95,9 @@ before 1.0).
   `accept_branch` on more work). Once-confirmed losers stay in Class A.
   Not a coins-DB / GBT product.
 
-- **Core functional `run` set:** the first-green nine plus unmodified
-  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`.
+- **Core functional `run` set:** 12 unmodified scripts (first-green nine plus
+  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`).
+  Activation scripts still skip (`core-log` / extra RPCs), not flipped.
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

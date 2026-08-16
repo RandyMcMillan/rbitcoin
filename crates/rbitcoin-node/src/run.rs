@@ -691,6 +691,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let mut rpc_stop_tick = tokio::time::interval(Duration::from_millis(50));
         rpc_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         rpc_stop_tick.tick().await;
+        // Persistent — a one-shot sleep in the select is reset by perf/RPC ticks.
+        let mut stale_poll = tokio::time::interval(Duration::from_secs(STALE_POLL_SECS));
+        stale_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        stale_poll.tick().await;
         let mut window_blocks: u64 = 0;
 
         loop {
@@ -703,32 +707,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }
 
-            enum Wake {
-                Tip(TipEvent),
-                Poll,
-                Perf,
-                RpcStop,
-                Stop,
-            }
             // Prefer shutdown, then the 5s perf tick when both ready. Do **not**
             // put tip_rx ahead of perf under `biased` — multi-block catch-up can
             // keep tip events always ready and starve meters (no tip: perf lines).
             let rpc_live = rpc_handle.is_some();
-            let wake = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => Wake::Stop,
-                _ = rpc_stop_tick.tick(), if rpc_live => Wake::RpcStop,
-                _ = perf_tick.tick() => Wake::Perf,
-                ev = tip_rx.recv() => match ev {
-                    Ok(e) => Wake::Tip(e),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed events — poll tip height below.
-                        Wake::Poll
-                    }
-                    Err(broadcast::error::RecvError::Closed) => Wake::Stop,
-                },
-                _ = tokio::time::sleep(Duration::from_secs(STALE_POLL_SECS)) => Wake::Poll,
-            };
+            let wake = tip_follow_next_wake(
+                shutdown.cancelled(),
+                rpc_live.then_some(&mut rpc_stop_tick),
+                &mut perf_tick,
+                &mut tip_rx,
+                &mut stale_poll,
+            )
+            .await;
             // RPC `stop` method.
             if let Some(ref h) = rpc_handle {
                 if h.stop.load(Ordering::SeqCst) {
@@ -741,14 +731,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 h.initial_block_download
                     .store(!tip_meets_min_work(&config, &node.hub), Ordering::SeqCst);
             }
-            if matches!(wake, Wake::Stop) {
+            if matches!(wake, TipFollowWake::Stop) {
                 break;
             }
-            if matches!(wake, Wake::RpcStop) {
-                continue;
-            }
 
-            if matches!(wake, Wake::Perf) {
+            if matches!(wake, TipFollowWake::Perf) {
                 // Always sample-and-reset so DEBUG-off windows do not accumulate.
                 let mp = mempool.sample_reset_perf();
                 let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
@@ -786,7 +773,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         mp.announce
                     );
                 }
-                continue;
             }
 
             let tip = node.tip_height().unwrap_or(0);
@@ -794,7 +780,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             let delta = tip.saturating_sub(start_tip);
 
             let follow_live = node.follow_live_count();
-            if let Wake::Tip(ev) = &wake {
+            let kind = tip_follow_wake_kind(&wake, last_tip);
+            if let TipFollowWake::Tip(ev) = &wake {
                 // Prefer event height when present (same as store tip after accept).
                 let h = ev.height;
                 if h != last_tip {
@@ -806,6 +793,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     last_tip = h;
                     last_tip_change = Instant::now();
                 }
+            }
+            if !tip_follow_checks_stale(kind) {
                 continue;
             }
 
@@ -1127,10 +1116,149 @@ fn catch_up_retry_config(peers: std::sync::Arc<std::sync::Mutex<AddrMan>>) -> Ib
     }
 }
 
+/// Tip-follow supervisor wake. A 5s perf tick or 50ms RPC-stop tick must not
+/// skip the stale-tip extra-outbound check (mainnet 962723 sat 3h after the
+/// last follow peer died because a one-shot 60s sleep was reset every wake).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TipFollowWakeKind {
+    TipChanged,
+    TipSame,
+    Perf,
+    Poll,
+    RpcStop,
+    Stop,
+}
+
+/// One `select!` result from [`tip_follow_next_wake`].
+pub(crate) enum TipFollowWake {
+    Tip(TipEvent),
+    Poll,
+    Perf,
+    RpcStop,
+    Stop,
+}
+
+/// Classify a wake against the last logged tip height.
+pub(crate) fn tip_follow_wake_kind(wake: &TipFollowWake, last_tip: u32) -> TipFollowWakeKind {
+    match wake {
+        TipFollowWake::Stop => TipFollowWakeKind::Stop,
+        TipFollowWake::Perf => TipFollowWakeKind::Perf,
+        TipFollowWake::Poll => TipFollowWakeKind::Poll,
+        TipFollowWake::RpcStop => TipFollowWakeKind::RpcStop,
+        TipFollowWake::Tip(ev) => {
+            if ev.height != last_tip {
+                TipFollowWakeKind::TipChanged
+            } else {
+                TipFollowWakeKind::TipSame
+            }
+        }
+    }
+}
+
+/// Whether this wake should run the stale-tip redial check.
+///
+/// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale. A one-shot
+/// `sleep` in the same `select!` is reset on every such wake and never fires.
+pub(crate) fn tip_follow_checks_stale(kind: TipFollowWakeKind) -> bool {
+    matches!(
+        kind,
+        TipFollowWakeKind::Perf
+            | TipFollowWakeKind::Poll
+            | TipFollowWakeKind::RpcStop
+            | TipFollowWakeKind::TipSame
+    )
+}
+
+/// One supervisor wake. `stale` must be a **persistent** interval, not a
+/// one-shot sleep created inside the loop (that sleep restarts on every
+/// faster tick and never completes).
+pub(crate) async fn tip_follow_next_wake(
+    shutdown: impl std::future::Future<Output = ()>,
+    rpc_stop: Option<&mut tokio::time::Interval>,
+    perf: &mut tokio::time::Interval,
+    tip_rx: &mut broadcast::Receiver<TipEvent>,
+    stale: &mut tokio::time::Interval,
+) -> TipFollowWake {
+    tokio::select! {
+        biased;
+        _ = shutdown => TipFollowWake::Stop,
+        _ = async {
+            match rpc_stop {
+                Some(tick) => {
+                    tick.tick().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => TipFollowWake::RpcStop,
+        _ = perf.tick() => TipFollowWake::Perf,
+        ev = tip_rx.recv() => match ev {
+            Ok(e) => TipFollowWake::Tip(e),
+            Err(broadcast::error::RecvError::Lagged(_)) => TipFollowWake::Poll,
+            Err(broadcast::error::RecvError::Closed) => TipFollowWake::Stop,
+        },
+        _ = stale.tick() => TipFollowWake::Poll,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale redial.
+    /// A one-shot sleep in the same `select!` is reset on every such wake.
+    #[test]
+    fn tip_follow_checks_stale_on_perf_and_rpc_stop() {
+        assert!(
+            tip_follow_checks_stale(TipFollowWakeKind::Perf),
+            "5s tip:perf tick must still consider a stale extra outbound"
+        );
+        assert!(
+            tip_follow_checks_stale(TipFollowWakeKind::RpcStop),
+            "RPC-stop tick must still consider a stale extra outbound"
+        );
+        assert!(tip_follow_checks_stale(TipFollowWakeKind::Poll));
+        assert!(tip_follow_checks_stale(TipFollowWakeKind::TipSame));
+        assert!(!tip_follow_checks_stale(TipFollowWakeKind::TipChanged));
+        assert!(!tip_follow_checks_stale(TipFollowWakeKind::Stop));
+    }
+
+    /// Persistent stale interval must complete even when a faster perf tick
+    /// is in the same biased `select!` (the old one-shot sleep never did).
+    #[tokio::test]
+    async fn stale_interval_fires_alongside_faster_perf_tick() {
+        let mut perf = tokio::time::interval(Duration::from_millis(15));
+        perf.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        perf.tick().await;
+        let mut stale = tokio::time::interval(Duration::from_millis(50));
+        stale.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        stale.tick().await;
+        let (_tx, mut tip_rx) = broadcast::channel::<TipEvent>(8);
+        let start = Instant::now();
+        let mut saw_poll = false;
+        while start.elapsed() < Duration::from_millis(200) {
+            let w = tokio::time::timeout(
+                Duration::from_millis(250),
+                tip_follow_next_wake(
+                    std::future::pending(),
+                    None,
+                    &mut perf,
+                    &mut tip_rx,
+                    &mut stale,
+                ),
+            )
+            .await
+            .expect("supervisor wake");
+            if matches!(w, TipFollowWake::Poll) {
+                saw_poll = true;
+                break;
+            }
+        }
+        assert!(
+            saw_poll,
+            "stale interval must produce Poll while perf ticks every 15ms"
+        );
+    }
 
     #[test]
     fn catch_up_retry_config_uses_production_not_for_test() {

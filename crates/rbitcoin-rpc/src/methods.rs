@@ -1072,7 +1072,7 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
 }
 
 fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["txid", "verbose"])?;
+    params.reject_unknown(&["txid", "verbose", "blockhash"])?;
     let hex = params.req_str(0, "txid")?;
     let verbose = match params.get(1, "verbose") {
         None | Some(Value::Null) => false,
@@ -3424,6 +3424,14 @@ mod tests {
         let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
         let raw_tx = dispatch(&ctx, "getrawtransaction", vec![json!(cb_txid), json!(0)]).unwrap();
         assert!(raw_tx.as_str().unwrap().len() > 20);
+        // Core third arg is a blockhash; we always have Class A — ignore it.
+        let same = dispatch(
+            &ctx,
+            "getrawtransaction",
+            vec![json!(cb_txid), json!(0), json!(best)],
+        )
+        .unwrap();
+        assert_eq!(same, raw_tx);
         let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
         assert_eq!(net["connections_in"], 0);
         let _ = std::fs::remove_dir_all(&dir);

@@ -94,6 +94,17 @@ pub struct Cluster {
     pub chunks: Vec<Chunk>,
 }
 
+/// Inclusive ancestor/descendant aggregates for RPC (self counts as 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MempoolGraphStats {
+    pub ancestorcount: u64,
+    pub ancestorsize: u64,
+    pub ancestorfees: u64,
+    pub descendantcount: u64,
+    pub descendantsize: u64,
+    pub descendantfees: u64,
+}
+
 /// Live-set graph. Proportional to mempool size, not file size.
 #[derive(Debug, Default)]
 pub struct TxGraph {
@@ -194,6 +205,58 @@ impl TxGraph {
             }
         }
         set
+    }
+
+    /// Inclusive walk of in-mempool parents (the tx itself is always in the set).
+    pub fn ancestor_set(&self, txid: &Txid) -> Option<BTreeSet<Txid>> {
+        self.directed_set(txid, true)
+    }
+
+    /// Inclusive walk of in-mempool children (the tx itself is always in the set).
+    pub fn descendant_set(&self, txid: &Txid) -> Option<BTreeSet<Txid>> {
+        self.directed_set(txid, false)
+    }
+
+    fn directed_set(&self, txid: &Txid, parents: bool) -> Option<BTreeSet<Txid>> {
+        if !self.entries.contains_key(txid) {
+            return None;
+        }
+        let mut set = BTreeSet::new();
+        let mut q = VecDeque::new();
+        set.insert(*txid);
+        q.push_back(*txid);
+        while let Some(cur) = q.pop_front() {
+            let Some(e) = self.entries.get(&cur) else {
+                continue;
+            };
+            let next = if parents {
+                e.parents.iter()
+            } else {
+                e.children.iter()
+            };
+            for n in next {
+                if set.insert(*n) {
+                    q.push_back(*n);
+                }
+            }
+        }
+        Some(set)
+    }
+
+    /// Ancestor/descendant counts and vsize/fee sums, or `None` if `txid` is not live.
+    pub fn graph_stats(&self, txid: &Txid) -> Option<MempoolGraphStats> {
+        let anc = self.ancestor_set(txid)?;
+        let desc = self.descendant_set(txid)?;
+        let (a_fee, a_w) = self.set_fee_weight(&anc);
+        let (d_fee, d_w) = self.set_fee_weight(&desc);
+        Some(MempoolGraphStats {
+            ancestorcount: anc.len() as u64,
+            ancestorsize: a_w / 4,
+            ancestorfees: a_fee,
+            descendantcount: desc.len() as u64,
+            descendantsize: d_w / 4,
+            descendantfees: d_fee,
+        })
     }
 
     /// Aggregate fee/weight of a set of live txs.
@@ -684,6 +747,15 @@ mod tests {
         assert_eq!(c.members.len(), 2);
         // Parent must come before child.
         assert_eq!(c.linearization, vec![pid, cid]);
+
+        let ps = g.graph_stats(&pid).unwrap();
+        let cs = g.graph_stats(&cid).unwrap();
+        assert_eq!(ps.ancestorcount, 1);
+        assert_eq!(ps.descendantcount, 2);
+        assert_eq!(cs.ancestorcount, 2);
+        assert_eq!(cs.descendantcount, 1);
+        assert_eq!(cs.ancestorfees, 500 + 5000);
+        assert_eq!(ps.descendantfees, 500 + 5000);
     }
 
     #[test]

@@ -891,9 +891,42 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
-        "unbroadcastcount": 0,
+        "unbroadcastcount": mp.unbroadcast_count(),
         "permitbaremultisig": true,
     }))
+}
+
+/// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
+fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
+    let vsize = weight / 4;
+    let fee_btc = (fee as f64) / 100_000_000.0;
+    let stats = mp.graph_stats(txid);
+    let (ac, asz, afee, dc, dsz, dfee) = match stats {
+        Some(s) => (
+            s.ancestorcount,
+            s.ancestorsize,
+            s.ancestorfees,
+            s.descendantcount,
+            s.descendantsize,
+            s.descendantfees,
+        ),
+        None => (1, vsize, fee, 1, vsize, fee),
+    };
+    json!({
+        "vsize": vsize,
+        "weight": weight,
+        "fee": fee_btc,
+        "modifiedfee": fee_btc,
+        "time": 0,
+        "height": 0,
+        "descendantcount": dc,
+        "descendantsize": dsz,
+        "descendantfees": dfee,
+        "ancestorcount": ac,
+        "ancestorsize": asz,
+        "ancestorfees": afee,
+        "unbroadcast": mp.is_unbroadcast(txid),
+    })
 }
 
 fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -912,23 +945,9 @@ fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
     let mut map = serde_json::Map::new();
     for (txid, fee, weight) in live {
-        let vsize = weight / 4;
         map.insert(
             hash_hex_display(&txid.to_byte_array()),
-            json!({
-                "vsize": vsize,
-                "weight": weight,
-                "fee": (fee as f64) / 100_000_000.0,
-                "modifiedfee": (fee as f64) / 100_000_000.0,
-                "time": 0,
-                "height": 0,
-                "descendantcount": 1,
-                "descendantsize": vsize,
-                "descendantfees": fee,
-                "ancestorcount": 1,
-                "ancestorsize": vsize,
-                "ancestorfees": fee,
-            }),
+            mempool_graph_json(mp, &txid, fee, weight),
         );
     }
     Ok(Value::Object(map))
@@ -944,22 +963,20 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let vsize = weight / 4;
         let fee_btc = (fee as f64) / 100_000_000.0;
         let wtxid = mp
             .get_tx(&tid)
             .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
             .unwrap_or_default();
-        return Ok(json!({
-            "vsize": vsize,
-            "weight": weight,
-            "wtxid": wtxid,
-            "fee": fee_btc,
-            "modifiedfee": fee_btc,
-            "fees": { "base": fee_btc, "modified": fee_btc },
-            "ancestorcount": 1,
-            "descendantcount": 1,
-        }));
+        let mut entry = mempool_graph_json(mp, &tid, fee, weight);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("wtxid".into(), json!(wtxid));
+            obj.insert(
+                "fees".into(),
+                json!({ "base": fee_btc, "modified": fee_btc }),
+            );
+        }
+        return Ok(entry);
     }
     Err(rpc_error(ERR_MISC, "Transaction not in mempool"))
 }
@@ -1016,7 +1033,10 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         ));
     }
     match mp.accept_tx(&tx) {
-        Ok(_) => Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array()))),
+        Ok(r) => {
+            mp.note_unbroadcast(r.txid);
+            Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
+        }
         Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),
     }
 }
@@ -2391,6 +2411,150 @@ mod tests {
             miss_raw["message"],
             "No such mempool or blockchain transaction"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Graph fields come from the cluster, not stub 1/0. Local sendraw is
+    /// unbroadcast until a peer getdata completes.
+    #[test]
+    fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (ctx, dir) = ctx_empty();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(
+            &ctx.query,
+            &params,
+            Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &ctx.query,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        let mp = ctx.mempool.as_ref().expect("mempool");
+        mp.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&parent).expect("parent");
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000 - 2_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&child).expect("child");
+
+        let parent_hex = hash_hex_display(&parent.compute_txid().to_byte_array());
+        let child_hex = hash_hex_display(&child.compute_txid().to_byte_array());
+        let parent_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(parent_hex.clone())]).unwrap();
+        let child_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(child_hex.clone())]).unwrap();
+        assert_eq!(parent_entry["ancestorcount"], 1);
+        assert_eq!(parent_entry["descendantcount"], 2);
+        assert_eq!(child_entry["ancestorcount"], 2);
+        assert_eq!(child_entry["descendantcount"], 1);
+        assert_eq!(parent_entry["unbroadcast"], false);
+        assert_eq!(child_entry["unbroadcast"], false);
+
+        let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
+        assert_eq!(verbose[&child_hex]["ancestorcount"], 2);
+        assert_eq!(verbose[&parent_hex]["descendantcount"], 2);
+
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            info["unbroadcastcount"], 0,
+            "P2P-style accept is not a local unbroadcast"
+        );
+
+        let local = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[1],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 3_000),
+                script_pubkey: spk,
+            }],
+        };
+        let local_hex_tx = serialize_hex(&local);
+        let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(local_hex_tx)]).unwrap();
+        let local_hex = hash_hex_display(&local.compute_txid().to_byte_array());
+        assert_eq!(sent, json!(local_hex.clone()));
+
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(info["unbroadcastcount"], 1);
+        let local_entry =
+            dispatch(&ctx, "getmempoolentry", vec![json!(local_hex.clone())]).unwrap();
+        assert_eq!(local_entry["unbroadcast"], true);
+        assert_eq!(local_entry["ancestorcount"], 1);
+
+        mp.mark_broadcast(&local.compute_txid());
+        let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            info["unbroadcastcount"], 0,
+            "getdata/serve must clear unbroadcast"
+        );
+        let local_entry = dispatch(&ctx, "getmempoolentry", vec![json!(local_hex)]).unwrap();
+        assert_eq!(local_entry["unbroadcast"], false);
+
+        let _ = mp.sample_reset_perf();
+        let _ = dispatch(&ctx, "getmempoolentry", vec![json!(child_hex)]).unwrap();
+        let s = mp.sample_reset_perf();
+        assert_eq!(s.list_live_meta, 0, "graph fields must not list_live_meta");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

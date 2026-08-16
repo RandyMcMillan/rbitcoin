@@ -608,6 +608,7 @@ async fn handle_peer_frame(
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx(txid) {
+                                mp.mark_broadcast(txid);
                                 queue_out(out_tx, NetworkMessage::Tx(tx))?;
                             }
                         }
@@ -615,6 +616,7 @@ async fn handle_peer_frame(
                     Inventory::WTx(wtxid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
+                                mp.mark_broadcast(&tx.compute_txid());
                                 queue_out(out_tx, NetworkMessage::Tx(tx))?;
                             }
                         }

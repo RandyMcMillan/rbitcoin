@@ -74,7 +74,7 @@ still wait for durable SH when shindex is on.
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `version` is rbitcoin semver as a Core integer (`0.1.0` → `100`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2` |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
-| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`) |
+| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. |
 | `getrawtransaction` | Class A + mempool |
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |

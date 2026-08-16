@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Mempool RPC graph fields:** `getmempoolentry` / verbose `getrawmempool`
+  ancestor and descendant counts (and size/fee sums) come from the cluster
+  graph, not stub `1`. `getmempoolinfo.unbroadcastcount` and per-entry
+  `unbroadcast` track `sendrawtransaction` until a peer `getdata`s the tx.
+
 - **`rbitcoin-cli`:** cookie / `--rpcuser` HTTP client for the documented
   JSON-RPC subset (plain HTTP, same as the node).
 - **`--maxinbound`:** passed into `P2PNode` as a field. `RBITCOIN_P2P_MAX_INBOUND`

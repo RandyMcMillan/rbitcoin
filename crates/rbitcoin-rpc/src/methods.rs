@@ -501,6 +501,17 @@ fn getrpcinfo(ctx: &RpcContext) -> Value {
     })
 }
 
+/// Core-shaped version integer: major*10000 + minor*100 + patch.
+fn rpc_client_version(semver: &str) -> u64 {
+    let mut it = semver.split('.');
+    let maj: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let pat: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    maj.saturating_mul(10_000)
+        .saturating_add(min.saturating_mul(100))
+        .saturating_add(pat)
+}
+
 fn chain_name(n: Network) -> &'static str {
     match n {
         Network::Mainnet => "main",
@@ -825,12 +836,14 @@ fn getnetworkinfo(ctx: &RpcContext) -> Value {
     } else {
         (0, ctx.connections.load(Ordering::Relaxed))
     };
+    let flags = rbitcoin_net::local_service_flags();
+    let svc_bits = flags.to_u64();
     json!({
-        "version": 270000,
+        "version": rpc_client_version(env!("CARGO_PKG_VERSION")),
         "subversion": ctx.subversion,
         "protocolversion": 70016,
-        "localservices": "0000000000000409",
-        "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED", "P2P_V2"],
+        "localservices": format!("{svc_bits:016x}"),
+        "localservicesnames": services_names(svc_bits),
         "localrelay": true,
         "timeoffset": 0,
         "networkactive": true,
@@ -874,7 +887,7 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "bytes": bytes,
         "usage": bytes,
         "total_fee": (total_fee as f64) / 100_000_000.0,
-        "maxmempool": 300_000_000u64,
+        "maxmempool": mp.max_weight(),
         "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
@@ -2871,5 +2884,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(_d0);
         let _ = std::fs::remove_dir_all(_d1);
+    }
+
+    #[test]
+    fn rpc_honesty_mempool_budget_and_network_identity() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-honest-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Arc::new(Query::open_or_create(dir.join("store")).unwrap());
+        let mp =
+            MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 50_000_000).unwrap();
+        let ctx = RpcContext {
+            query: q,
+            mempool: Some(mp),
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(0)),
+            initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: "/rbitcoin:0.1.0/".into(),
+            regtest: None,
+            peers: None,
+            chain: None,
+        };
+        let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            mem["maxmempool"].as_u64(),
+            Some(50_000_000),
+            "maxmempool must be the hub weight budget, not a hardcoded 300M"
+        );
+        let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        assert_ne!(
+            net["version"].as_u64(),
+            Some(270000),
+            "must not impersonate Bitcoin Core 27.0"
+        );
+        assert_eq!(
+            net["version"].as_u64(),
+            Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),
+        );
+        assert_eq!(
+            rpc_client_version("0.1.0"),
+            100,
+            "0.1.0 is major*10000+minor*100+patch (not 10000, which is 1.0.0)"
+        );
+        let flags = rbitcoin_net::local_service_flags();
+        let bits = flags.to_u64();
+        let hex = format!("{bits:016x}");
+        assert_eq!(net["localservices"].as_str(), Some(hex.as_str()));
+        let names = net["localservicesnames"].as_array().unwrap();
+        let names: Vec<&str> = names.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"NETWORK"));
+        assert!(names.contains(&"WITNESS"));
+        assert!(names.contains(&"P2P_V2"));
+        assert!(
+            !names.contains(&"NETWORK_LIMITED"),
+            "we do not advertise NETWORK_LIMITED: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

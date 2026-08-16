@@ -957,6 +957,11 @@ impl MempoolHub {
             .collect()
     }
 
+    /// Weight budget used for chunk eviction (WU). RPC `maxmempool`.
+    pub fn max_weight(&self) -> u64 {
+        self.inner.read().unwrap().max_weight
+    }
+
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
     pub fn list_live_meta(&self) -> Vec<(Txid, u64, u64)> {
         self.meter_list_live_meta.fetch_add(1, Ordering::Relaxed);

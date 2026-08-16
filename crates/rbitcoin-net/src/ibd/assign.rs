@@ -107,7 +107,7 @@ pub(crate) fn assign_work_ordered(
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
     // Heavier header path that does not meet tip: getdata the connecting
-    // prefix (BIP110-class) instead of waiting on a dead tip+1.
+    // prefix instead of waiting on a dead tip+1.
     let _ = super::reorg::consider_disconnected_heavier(st, hub);
 
     let tip = hub.tip_height().unwrap_or(0);
@@ -555,7 +555,7 @@ pub(crate) fn cover_tip_holes(
         // does not re-walk the whole band; tip-hole race must still re-get.
         //
         // Exception: tip+1 held for incomplete reorg mid gather — re-get would
-        // re-BadPrev forever while mids starve (mainnet 961633 livelock).
+        // re-BadPrev forever while mids starve.
         if st.reorg.is_awaiting_held_tip(&h) {
             continue;
         }

@@ -11,11 +11,22 @@ before 1.0).
 
 ### Changed
 
+- **IBD lookup wave select is one BQ lock:** unresolved heights come from
+  `block_queue_unresolved_heights` (in-entry `resolve_complete`, capped).
+  The old `list_meta` + per-height `is_resolve_complete` scan was O(n²)
+  at a few thousand queued bodies (`lookup_thr other=` pegged at ~140k).
+
+- **IBD connecting search only from a competing tip+1:** `consider` no
+  longer walks `max_ordered`. A linear tip+1 (parent is the tip) is a
+  download hole, not a fork. Most-work search still runs when tip+1's
+  parent is some other known header.
+
 - **IBD connecting search needs a connected LCA:** a capped ancestor walk
   from a far header-only horizon (early IBD, tip at a few thousand, headers
   at `max_ordered`) is not a disconnected fork. The old `!has_block(join)`
-  shortcut treated that mid as BIP110 and getdata-stormed 32 connecting
-  hashes. Real forks still search when the join is on the best chain.
+  shortcut treated that mid as a disconnected fork and getdata-stormed
+  32 connecting hashes. Real forks still search when the join is on the
+  best chain.
 
 - **Tip-follow stale redial:** a persistent 60s interval plus the 5s
   `tip: perf` wake now run the extra-outbound check. The previous one-shot
@@ -268,10 +279,9 @@ before 1.0).
   never silent.
 
 - **IBD searches connecting blocks for a heavier disconnected header chain:**
-  if tip+1 / the far work-path header does not meet the current tip, walk
-  prev to the best-chain LCA and getdata the shortest prefix whose work beats
-  the losing tip (then `accept_branch`). Do not wait for the dead fork to
-  grow (BIP110-class stall at 961633).
+  if competing tip+1 does not meet the current tip, walk prev to the
+  best-chain LCA and getdata the shortest prefix whose work beats the
+  losing tip (then `accept_branch`). Do not wait for the dead fork to grow.
 - **Leftover pending needs no fence; in-flight prune waits for fk span:**
   write-behind `pending_fk` is already a Class A identity — TipOnly leftover
   no longer requires `height_of`. In-flight drops a layer only when

@@ -94,11 +94,11 @@ pre-attempt tip hash (snapshot before disconnect).
    try sibling/winning path reorg before soft re-get.
 2. Headers extend a side branch with tip work > best and bodies complete.
 3. Selector + gather when candidate tips are ready.
-4. **Disconnected most-work headers** (tip+1 / far work-path hash whose prev
-   is not the tip): walk prev to the best-chain LCA, **getdata the shortest
+4. **Disconnected most-work headers** (work-path tip+1 whose prev is not
+   the tip): walk prev to the best-chain LCA, **getdata the shortest
    connecting prefix** that strictly beats tip work, then `accept_branch`.
-   Do not wait for a child of the losing tip (BIP110-class: tip 961633, majority
-   961632+). Explore tip is that prefix, not the header horizon.
+   Do not wait for a child of the losing tip. A far linear header horizon
+   is not a fork signal. Explore tip is that prefix, not the header horizon.
 
 ## Tip-follow (≥99)
 

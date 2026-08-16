@@ -152,7 +152,7 @@ Stages overlap on OS threads. Rank by `lookup_thr busy=` / `thr load/script/writ
 
 | Stage | Tokens | What must stay visible |
 |-------|--------|------------------------|
-| **Lookup** | `lookup=` / `lookup_thr` / `wave=` | BQ-ahead TipOnly `head_fk` (≤8 heights). `lookup_thr wave=` is the resolve wave. Does **not** claim. |
+| **Lookup** | `lookup=` / `lookup_thr` / `wave=` | BQ-ahead TipOnly `head_fk` (≤8 heights). `lookup_thr other=` is one-lock unresolved-height select; `wave=` is the resolve wave. Does **not** claim. |
 | **Load** | `load=` / `load_budget` / `pin(` / `assemble=` / stamp_sub / leftover_ | claim resolve-complete + stamp from BQ hits + leftover TipOnly (`leftover_n/hit/ms/pend/cdf`) + pin + assemble |
 | **Scripts** | `script=` (`SCRIPT_NS`) | `rbtc-scripts-*` steal verify. Milestone skip is still this stage (near-zero when `check_scripts` is false). |
 | **Write** | `write=` = `write_stage_ms` | table below |

@@ -523,7 +523,7 @@ pub(crate) fn apply_confirm_reject(
     // - Wire-only: wrong/corrupt body (`unexpected previous header`) — drop
     //   payload and densify. Mainnet tip freeze at 125653 blacklisted this.
     // - **Competing path BadPrev** (wire prev is a known non-tip header): try
-    //   most-work reorg before soft re-get (mainnet 961632 class livelock).
+    //   most-work reorg before soft re-get.
     // - Header window: `missing retarget first header` can race when a large
     //   pack needs a retarget base that is not yet visible to `header_at_height`
     //   (or was briefly absent). Permanent blacklist freezes tip+1 forever

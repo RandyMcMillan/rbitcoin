@@ -414,6 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn block_queue_unresolved_heights_via_query() {
+        use std::collections::HashSet;
+        let (dir, q) = temp_query();
+        for h in 10..18u32 {
+            q.block_queue_enqueue(h, [h as u8; 32], 1, b"w").unwrap();
+        }
+        q.block_queue_mark_resolve_complete(10).unwrap();
+        q.block_queue_mark_resolve_complete(11).unwrap();
+        let skip: HashSet<u32> = [12].into_iter().collect();
+        let got = q.block_queue_unresolved_heights(10, &skip, 8);
+        assert_eq!(got, vec![13, 14, 15, 16, 17]);
+        assert_eq!(q.block_queue_unresolved_heights(10, &skip, 2), vec![13, 14]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn obfuscation_on_disk_via_store_put() {
         let (dir, q) = temp_query();
         let script = vec![0x76, 0xa9, 0x14, 0x11, 0x22, 0x33];

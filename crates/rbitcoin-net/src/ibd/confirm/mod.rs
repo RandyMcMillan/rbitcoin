@@ -416,11 +416,7 @@ pub(crate) fn confirm_ready_count(
     query
         .block_queue_list_meta()
         .into_iter()
-        .filter(|m| {
-            m.height >= path_lo
-                && !inflight.contains(&m.height)
-                && query.block_queue_is_resolve_complete(m.height)
-        })
+        .filter(|m| m.height >= path_lo && !inflight.contains(&m.height) && m.resolve_complete)
         .count()
 }
 
@@ -1589,22 +1585,11 @@ pub(crate) fn spawn_confirm_engine(
                 } else {
                     tip.unwrap_or(0).saturating_add(1)
                 };
-                let mut wave_h: Vec<u32> = hub
-                    .query
-                    .block_queue_list_meta()
-                    .into_iter()
-                    .map(|m| m.height)
-                    .filter(|h| {
-                        *h >= path_lo
-                            && !skip.contains(h)
-                            && !hub.query.block_queue_is_resolve_complete(*h)
-                    })
-                    .collect();
-                wave_h.sort_unstable();
-                wave_h.dedup();
-                if wave_h.len() > rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS {
-                    wave_h.truncate(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
-                }
+                let wave_h = hub.query.block_queue_unresolved_heights(
+                    path_lo,
+                    &skip,
+                    rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS,
+                );
                 confirm_thr_stats::add_lookup_other(t_sel.elapsed());
                 let mut did = false;
                 if !wave_h.is_empty() {

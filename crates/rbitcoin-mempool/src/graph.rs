@@ -905,7 +905,11 @@ mod tests {
                 0
             }
         });
-        assert_eq!(only_p, vec![pid], "zero-modified child is not mined with parent");
+        assert_eq!(
+            only_p,
+            vec![pid],
+            "zero-modified child is not mined with parent"
+        );
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

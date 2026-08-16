@@ -1356,7 +1356,11 @@ mod tests {
                 mtp: u32::MAX,
             },
         );
-        assert_eq!(mp.graph.len(), 0, "seq=1 child evicted when parent is unconfirmed");
+        assert_eq!(
+            mp.graph.len(),
+            0,
+            "seq=1 child evicted when parent is unconfirmed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

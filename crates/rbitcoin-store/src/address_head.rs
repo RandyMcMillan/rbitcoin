@@ -699,8 +699,7 @@ impl AddressHead {
     /// Load a full probe page starting at global `page_base` into `buf`.
     ///
     /// **One** bulk pread of up to `n_slots × entry_bytes` (4 KiB @ 4 B / 1024
-    /// slots). Caps to the slot data region (excludes trailing footer). Acquire
-    /// fence so concurrent probes observe prior sole-writer Release stores.
+    /// slots). Caps to the slot data region (excludes trailing footer).
     ///
     /// Returns bytes filled (multiple of entry size). Callers must pass the
     /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
@@ -750,8 +749,6 @@ impl AddressHead {
                 self.file.read_at(off, &mut buf[..need])?;
             }
         }
-        // Pair with sole-writer stores + SeqCst fence after insert_many.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         Ok(need)
     }
 
@@ -770,8 +767,7 @@ impl AddressHead {
     /// page for rare same-batch duplicate txids).
     ///
     /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`] in
-    /// RAM, then **one page write-back** if dirty (not per-slot pwrite). **SeqCst
-    /// fence** once at end.
+    /// RAM, then **one page write-back** if dirty (not per-slot pwrite).
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -833,7 +829,6 @@ impl AddressHead {
             i = j;
         }
 
-        std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
 
@@ -1183,6 +1178,16 @@ mod tests {
         assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
         assert_eq!(s.depth_end, 2);
         assert_eq!(s.empty_local, 2);
+    }
+
+    #[test]
+    fn address_head_has_no_cpu_fence() {
+        let src = include_str!("address_head.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            !prod.contains("atomic::fence") && !prod.contains("fence(Ordering"),
+            "fd-only head pages: pwrite/pread publish; no mmap-era CPU fence"
+        );
     }
 
     #[test]

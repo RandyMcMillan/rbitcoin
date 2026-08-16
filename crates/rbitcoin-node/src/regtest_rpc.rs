@@ -26,7 +26,11 @@ impl RpcRegtest for HubRegtest {
             Ok(AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
             Ok(AcceptOutcome::AlreadyHave) => SubmitBlockOutcome::Duplicate,
             Ok(AcceptOutcome::IgnoredWeaker) => SubmitBlockOutcome::IgnoredWeaker,
-            Err(e) => SubmitBlockOutcome::Rejected(e.to_string()),
+            Err(e) => {
+                let s = e.to_string();
+                let s = s.strip_prefix("consensus: ").unwrap_or(s.as_str());
+                SubmitBlockOutcome::Rejected(s.to_string())
+            }
         }
     }
 

@@ -24,7 +24,7 @@ fn hash_hex_display(h: &[u8; 32]) -> String {
 }
 
 /// Parse Core display-order 32-byte hex → internal byte order.
-fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
+pub(crate) fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
     let mut b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     if b.len() != 32 {
         return Err(rpc_error(
@@ -183,6 +183,16 @@ impl RpcParams {
             Some(v) => json_u64(v)
                 .map(Some)
                 .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be an integer"))),
+        }
+    }
+
+    pub fn opt_str(&self, index: usize, name: &str) -> Result<Option<&str>, Value> {
+        match self.get(index, name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be a string"))),
         }
     }
 
@@ -350,7 +360,10 @@ pub fn dispatch(
         "prioritisetransaction" => prioritisetransaction(ctx, &params),
         "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
         "getmempoolcluster" => getmempoolcluster(ctx, &params),
-        "createrawtransaction" | "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
+        "createrawtransaction" => crate::rawtx::createrawtransaction(&params),
+        "signrawtransactionwithkey" => crate::rawtx::signrawtransactionwithkey(ctx, &params),
+        "createmultisig" => crate::rawtx::createmultisig(ctx, &params),
+        "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
         )),
@@ -472,6 +485,9 @@ const METHOD_LIST: &[&str] = &[
     "prioritisetransaction",
     "getprioritisedtransactions",
     "getmempoolcluster",
+    "createrawtransaction",
+    "signrawtransactionwithkey",
+    "createmultisig",
     "submitblock",
     "submitheader",
     "setmocktime",
@@ -1146,7 +1162,15 @@ fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
         return "min relay fee not met".into();
     }
     if let Some(rest) = s.strip_prefix("script: ") {
-        return format!("mempool-script-verify-flag-failed ({rest})");
+        let rest = rest
+            .strip_prefix("script verification failed: ")
+            .unwrap_or(rest);
+        let token = rest.split(" txid=").next().unwrap_or(rest);
+        let paren = match token {
+            "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
+            other => other,
+        };
+        return format!("mempool-script-verify-flag-failed ({paren})");
     }
     s.to_string()
 }
@@ -2249,7 +2273,7 @@ fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
 }
 
-fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
+pub(crate) fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
     let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
 }
@@ -2435,7 +2459,7 @@ mod tests {
         let (ctx, dir) = ctx_empty();
         let e = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
         assert_eq!(e["code"], ERR_METHOD_NOT_FOUND);
-        let e2 = dispatch(&ctx, "createrawtransaction", vec![]).unwrap_err();
+        let e2 = dispatch(&ctx, "combinerawtransaction", vec![]).unwrap_err();
         assert_eq!(e2["code"], ERR_METHOD_NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }

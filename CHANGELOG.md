@@ -13,6 +13,8 @@ before 1.0).
 
 - **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
   (modified fees) from the live graph.
+- **Stateless raw-tx:** `createrawtransaction`, `signrawtransactionwithkey`,
+  `createmultisig` (legacy / p2sh-segwit / bech32). No keystore.
 - **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
   `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
@@ -157,7 +159,7 @@ before 1.0).
 - **Core functional `run` set:** 14 unmodified scripts (first-green nine plus
   `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`,
   `feature_csv_activation.py`, `feature_bip68_sequence.py`).
-  `feature_nulldummy.py` still skip (raw-tx + `-addresstype`).
+  `feature_nulldummy.py` is run (stateless raw-tx + ignored `-addresstype`).
 
 - **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
   mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.

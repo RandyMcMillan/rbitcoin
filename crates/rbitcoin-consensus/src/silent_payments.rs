@@ -1049,6 +1049,11 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         assert!(q.load_thin_tweaks(Height(1)).unwrap().is_none());
+
+        let b1b = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 601, 2);
+        crate::accept_and_connect_block(&q, &params, Height(1), &b1b, Milestone::NONE).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
+        assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,7 +14,9 @@ with creates in the 16-byte-meta / 9-byte-spent layout is **refused**
 run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) and leftover
 raw-u64 megakey pages are **refused** (wipe `store/scripthash.runs` and
 rematerialize). Sealed SH head/body kept only if pages are already delta
-(`ver=1`). Class A with 16-layout creates is refused the same as 15→17.  
+(`ver=1`). Class A with 16-layout creates is refused the same as 15→17.
+Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
+(schema 17 uses directories; `--sptweaks` backfill regenerates).  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -59,7 +61,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
-    sp_tweaks.idx / sp_tweaks.body  # optional BIP-352 thin tweaks (schema 14 side)
+    sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -289,24 +291,28 @@ Contiguous assignment required: block membership is an arithmetic range.
 
 ### Optional BIP-352 thin tweaks (`sp_tweaks.*`)
 
-Schema **14** side product — **no** `SCHEMA_VERSION` bump. Soft-open: missing
-files are empty (not `Corrupt`, not a head recreate). Created when `--sptweaks`
-is on.
+Schema **17** side product. Soft-open: missing dirs are empty (not `Corrupt`,
+not a head recreate). Created when `--sptweaks` is on.
 
-`sp_tweaks.idx` (kind array_link): after the 16-byte header, `origin_height:u32`
-+ 4-byte pad, then dense slots from `origin` (`ChainParams::taproot_height`):
+**Tip / strong height only** — no `header_fk` in the idx. A reorg truncates
+above the new tip and those heights are written again. `put` requires
+`confirmed[h]` to be the header being indexed.
 
 ```text
-slot[i] = block_fk:u64  ‖  off:u32
-          header_fk        absolute start in sp_tweaks.body
+sp_tweaks.idx/meta       origin:u32 ‖ fmt:u32=3
+sp_tweaks.idx/NNNNNN     slot[i] = off:u32     // start in that body file
+sp_tweaks.body/NNNNNN    u8 len ‖ [u8; len]    // 0 = none; 33 + A_tweak
 ```
 
-`n_tx` is **not** stored (`header_txs_count[block_fk]`). `block_fk` must match
-`confirmed[h]` or the slot is a hole (naive fallback).
+Body encoding is the original variable-width `0` / `33`. Each body file’s
+published start offs stay in `u32`. When the next record’s **start** would
+exceed `u32::MAX`, open a new `NNNNNN` pair (lookup is still this slot + next
+slot in that file, or that file’s HWM). `n_tx` comes from
+`header_txs_count[confirmed[h]]`.
 
-`sp_tweaks.body` (kind 15): per tx in `header_txs` order, `u8 len` then `len`
-bytes. `len=0` = no tweak; `len=33` = compressed `A_tweak`. No txids, outs, or
-parent scripts.
+Leftover **files** `store/sp_tweaks.idx` and `store/sp_tweaks.body` (schema 14
+single-file, `header_fk` + absolute off) are unlinked on store open.
+`--sptweaks` backfill regenerates. Not a Class A wipe.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 

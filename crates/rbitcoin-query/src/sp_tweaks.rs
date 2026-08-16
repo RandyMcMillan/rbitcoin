@@ -71,7 +71,9 @@ impl Query {
 
     /// Write one height of aligned per-tx tweaks (`None` = ineligible).
     ///
-    /// No-op when the flag is off, the table is missing, or `height` is not next.
+    /// No-op when the flag is off, the table is missing, `height` is not next,
+    /// or `height` is not yet confirmed. `header_fk` must be the confirmed tip
+    /// header at `height` (the idx does not store it).
     pub fn put_sp_tweaks_block(
         &self,
         height: Height,
@@ -88,7 +90,16 @@ impl Query {
         if height != t.next_height() {
             return Ok(());
         }
-        t.put_block(height, header_fk, records)
+        match self.store.confirmed.get(height)? {
+            None => return Ok(()),
+            Some(fk) if fk != header_fk => {
+                return Err(
+                    StoreError::Corrupt("sp_tweaks put header is not confirmed tip").into(),
+                );
+            }
+            Some(_) => {}
+        }
+        t.put_block(height, records)
     }
 
     pub fn truncate_sp_tweaks_through_tip(&self, tip: Option<Height>) -> Result<(), QueryError> {
@@ -153,7 +164,7 @@ impl Query {
                 let Some((first_fk, n_tx)) = self.store.header_txs.get_range(header_fk)? else {
                     break;
                 };
-                let Some(elig) = t.get_eligible(h, header_fk, n_tx)? else {
+                let Some(elig) = t.get_eligible(h, n_tx)? else {
                     break;
                 };
                 let add = elig.len();
@@ -346,6 +357,13 @@ mod tests {
                 }],
             )
             .unwrap();
+        let err = q
+            .put_sp_tweaks_block(Height(0), Fk(99), &[None])
+            .unwrap_err();
+        assert!(
+            matches!(err, QueryError::Corrupt(m) if m.contains("not confirmed tip")),
+            "{err:?}"
+        );
         q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
         let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
         let mut tid_a = [0u8; 32];

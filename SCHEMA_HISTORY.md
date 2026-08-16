@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **17** | **Durable.** SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`. Refuse leftover `key_len=32` runs, raw-u64 SH pages, and 16-layout Class A. | **Current** |
+| **17** | **Durable.** SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. Refuse leftover `key_len=32` runs, raw-u64 SH pages, and 16-layout Class A. | **Current** |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
@@ -46,7 +46,18 @@ Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
 pages (`ver=0`, `n>0`) rematerialize.
 
 `archive_epoch` is gone. Create does not plant `wire/` or packed
-`tx.body`. Open unlinks leftover `archive_epoch` and `store/wire`.
+`tx.body`. Open unlinks leftover `archive_epoch`, `store/wire`, and
+single-file `sp_tweaks.idx` / `sp_tweaks.body` (schema 17 tweaks are
+`sp_tweaks.idx/` + `sp_tweaks.body/` directories: tip-only `off:u32`
+slots, original `0`/`33` body, new segment when the next start would
+exceed `u32::MAX`). `--sptweaks` backfill regenerates the index.
+
+### Side product: `sp_tweaks.*` (schema 17 dirs)
+
+Optional. Missing dirs are empty. **fmt 3:** tip / strong height only (no
+`header_fk`). Body is the original `len=0` / `len=33` stream. Pair
+`NNNNNN` idx+body files; roll when the next start off would not fit in
+`u32`. Leftover schema-14 **files** are unlinked on open.
 
 ## v16
 

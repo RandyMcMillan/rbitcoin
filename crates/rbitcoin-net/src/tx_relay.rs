@@ -960,6 +960,30 @@ impl MempoolHub {
         n
     }
 
+    /// Remove confirmed txids, then evict mempool txs that spend `spent`
+    /// (block inputs that conflicted with the live set).
+    pub fn remove_for_block_spent(&self, txids: &[Txid], spent: &[OutPoint]) -> usize {
+        if !self.relay_enabled() {
+            return 0;
+        }
+        let n = self.remove_for_block(txids);
+        if spent.is_empty() {
+            return n;
+        }
+        let mut g = self.inner.write().unwrap();
+        let gone = g.evict_conflicts_with(spent);
+        drop(g);
+        if !gone.is_empty() {
+            self.note_template_update();
+            let mut deltas = self.fee_deltas.lock().unwrap();
+            for tid in &gone {
+                self.unindex_txid(tid);
+                deltas.remove(tid);
+            }
+        }
+        n + gone.len()
+    }
+
     /// Unique txs parked waiting on missing parents (Core-class orphanage).
     pub fn orphan_count(&self) -> usize {
         self.inner.read().unwrap().orphan_count()

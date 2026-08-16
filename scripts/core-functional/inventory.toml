@@ -920,7 +920,7 @@ analog = "IBD hole-fill / tip-follow getdata"
 name = "rpc_getblockstats.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: getblockstats"
+analog = "node field-parity: getblockstats (default path is submitblock, not wallet)"
 
 [[test]]
 name = "rpc_getchaintips.py"
@@ -1404,13 +1404,11 @@ reason = "no-wallet"
 
 [[test]]
 name = "wallet_txn_clone.py"
-status = "skip"
-reason = "no-wallet"
+status = "run"
 
 [[test]]
 name = "wallet_txn_doublespend.py"
-status = "skip"
-reason = "no-wallet"
+status = "run"
 
 [[test]]
 name = "wallet_v3_txs.py"

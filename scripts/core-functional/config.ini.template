@@ -10,7 +10,7 @@ EXEEXT=
 RPCAUTH=
 
 [components]
-ENABLE_WALLET=false
+ENABLE_WALLET=true
 BUILD_BENCH=false
 ENABLE_CLI=false
 ENABLE_BITCOIN_TX=false

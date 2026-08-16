@@ -323,8 +323,8 @@ def signrawtransactionwithkey(params: Any, lookup=None) -> dict[str, Any]:
                 info = {
                     "scriptPubKey": looked["scriptPubKey"],
                     "amount": looked.get("amount"),
-                    "redeemScript": None,
-                    "witnessScript": None,
+                    "redeemScript": looked.get("redeemScript"),
+                    "witnessScript": looked.get("witnessScript"),
                 }
         if info is None:
             complete = False
@@ -473,9 +473,16 @@ def _sign_one(tx: CTransaction, i: int, info: dict[str, Any], keys: list[ECKey])
                 sign_input_legacy(tx, i, CScript(spk), k)
                 return True
         return False
+    if _is_p2wpkh(spk):
+        return _sign_p2wpkh(tx, i, spk[2:], sats, keys, scriptsig=None)
     ws = info["witnessScript"]
     redeem = info["redeemScript"]
     if _is_p2sh(spk):
+        for k in keys:
+            pub = k.get_pubkey().get_bytes()
+            wp = bytes(CScript([OP_0, hash160(pub)]))
+            if bytes(script_to_p2sh_script_bytes(wp)) == spk:
+                return _sign_p2wpkh(tx, i, hash160(pub), sats, keys, scriptsig=wp)
         inner = ws
         if inner is None and redeem is not None and not _is_p2wsh(redeem):
             inner = redeem
@@ -514,6 +521,38 @@ def _is_p2sh(spk: bytes) -> bool:
 
 def _is_p2wsh(spk: bytes) -> bool:
     return len(spk) == 34 and spk[0] == 0 and spk[1] == 32
+
+
+def _is_p2wpkh(spk: bytes) -> bool:
+    return len(spk) == 22 and spk[0] == 0 and spk[1] == 20
+
+
+def _sign_p2wpkh(
+    tx: CTransaction,
+    i: int,
+    keyhash: bytes,
+    amount: int,
+    keys: list[ECKey],
+    scriptsig: bytes | None,
+) -> bool:
+    for k in keys:
+        pub = k.get_pubkey().get_bytes()
+        if hash160(pub) != keyhash:
+            continue
+        scriptcode = CScript(
+            [OP_DUP, OP_HASH160, keyhash, OP_EQUALVERIFY, OP_CHECKSIG]
+        )
+        sh = __import__(
+            "test_framework.script", fromlist=["SegwitV0SignatureHash"]
+        ).SegwitV0SignatureHash(scriptcode, tx, i, SIGHASH_ALL, amount)
+        der = k.sign_ecdsa(sh)
+        if not tx.wit.vtxinwit:
+            tx.wit.vtxinwit = [CTxInWitness() for _ in tx.vin]
+        tx.wit.vtxinwit[i].scriptWitness.stack = [der + bytes([SIGHASH_ALL]), pub]
+        if scriptsig is not None:
+            tx.vin[i].scriptSig = bytes(CScript([scriptsig]))
+        return True
+    return False
 
 
 def _parse_multisig(script: bytes) -> tuple[int, list[bytes]] | None:

@@ -5,7 +5,7 @@
 //!
 //! 1. Submit pread of 8 B  
 //! 2. On read: decide sole / multi / promote / idempotent  
-//!    - multi or promote: **inline** mmap [`SpenderTable::append`] (needs read
+//!    - multi or promote: **inline** [`SpenderTable::append`] (needs read
 //!      result; same-outpoint edges are serialized so list order is stable)  
 //! 3. Submit pwrite of updated 8 B  
 //! 4. On write: free the slot and arm more work  

@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **`tx.head` insert has no mmap-era CPU fence:** `insert_many` / page
+  probe no longer `SeqCst`/`Acquire` fence. Tables are fd `pwrite`/`pread`;
+  visibility is the syscall and `published_len` Release. VarTable seqlock
+  and Class C `sync_data` are unchanged. Not a leftover-prevout fix.
+
 - **Pending `tx.head` snap lives until insert and fence:** drain
   inserts head for probe; `forget_if_fenced` skips still-queued keys.
   Write forgets after `drain.join()` *and* `height_fence_extend` — not

@@ -5,15 +5,15 @@
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
 //! **Insert (sole writer):** probe until the **same fk** is already present
-//! (idempotent) or an **empty** slot — plain mmap store `0 → fk` (no CAS, no
+//! (idempotent) or an **empty** slot — `pwrite` the slot (`0 → fk`; no CAS, no
 //! per-slot atomics). **No body_txid** on insert (no BIP30 displacement on write).
 //! Foreigners and older same-txid creates are skipped blindly; a second Class A
 //! row for the same txid lands at the next empty slot (deeper on the probe chain).
 //!
 //! **`insert_many` batching:** stable-sort by probe **page** then original index
 //! (preserves call order within a page for rare same-batch duplicate txids). One
-//! page load + multi-insert in RAM + plain slot stores per dirty slot, then a
-//! **SeqCst fence** so concurrent page loads + Acquire fence observe the batch.
+//! page load + multi-insert in RAM + one `pwrite` per dirty page. Visibility is
+//! the syscall plus `published_len` Release — not a CPU fence.
 //!
 //! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are

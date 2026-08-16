@@ -983,10 +983,10 @@ impl TxTable {
     ///
     /// Prefer io_uring RMW ([`crate::spend_annotate_uring`]): pread 8 B → decide
     /// sole / multi / promote → pwrite; `spent.ovf` appends run **inline** on
-    /// the read completion (mmap). Same abs serialized. Fallback: mmap RMW.
+    /// the read completion. Same abs serialized. Fallback: serial `pwrite` RMW.
     ///
     /// Returns edges that still need a full cold path (OOB abs / deferred).
-    /// Multi-list cases are handled here when uring/mmap succeed (not returned).
+    /// Multi-list cases are handled here when uring/`pwrite` succeed (not returned).
     pub fn put_spend_batch_by_abs_meta(
         &self,
         spenders: &crate::spender_table::SpenderTable,
@@ -1008,12 +1008,12 @@ impl TxTable {
                 Ok(cold) => return Ok(cold),
                 Err(e) => {
                     rbitcoin_log::debug!(
-                        "store: spend annotate uring unavailable ({e}); mmap fallback"
+                        "store: spend annotate uring unavailable ({e}); pwrite fallback"
                     );
                 }
             }
         }
-        // --- mmap fallback (same sole/multi semantics) ---
+        // --- pwrite fallback (same sole/multi semantics) ---
         let body_pub = self.spent.body_published_len();
         let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
         for &(abs, create_fk, vout, spend_fk) in abs_edges {
@@ -1167,7 +1167,7 @@ impl TxTable {
     /// Pure-write spend annotate using structural-known meta (no body pread).
     ///
     /// `known[i]` is `(field, flags)` at `abs_edges[i].0` from structural spentness.
-    /// Backend: `mmap` (map store) or `uring` (pwrite-only). Returns cold edges
+    /// Backend: `pwrite` or `uring`. Returns cold edges
     /// (OOB) — production callers must treat non-empty as hard error.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,

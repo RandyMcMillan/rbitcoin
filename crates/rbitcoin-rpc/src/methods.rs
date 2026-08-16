@@ -330,6 +330,7 @@ pub fn dispatch(
         "gettxout" => gettxout(ctx, &params),
         "getindexinfo" => getindexinfo(ctx, &params),
         "getchaintips" => getchaintips(ctx, &params),
+        "getdeploymentinfo" => getdeploymentinfo(ctx, &params),
         "waitforblock" => waitforblock(ctx, &params),
         "waitforblockheight" => waitforblockheight(ctx, &params),
         "waitfornewblock" => waitfornewblock(ctx, &params),
@@ -449,6 +450,7 @@ const METHOD_LIST: &[&str] = &[
     "gettxout",
     "getindexinfo",
     "getchaintips",
+    "getdeploymentinfo",
     "waitforblock",
     "waitforblockheight",
     "waitfornewblock",
@@ -488,6 +490,9 @@ fn method_help(m: &str) -> String {
             .into(),
         "gettxout" => "gettxout txid n (include_mempool) — Class A + mempool.".into(),
         "getchaintips" => "getchaintips — active + held/archive side tips + headers-only.".into(),
+        "getdeploymentinfo" => {
+            "getdeploymentinfo (blockhash)\nBuried deployments from ChainParams. No BIP9.".into()
+        }
         "submitblock" => "submitblock hexdata (dummy)\n\
              All networks. Same receive path as a P2P block."
             .into(),
@@ -1652,6 +1657,52 @@ fn tip_hash_height(ctx: &RpcContext) -> Result<(String, u32), Value> {
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_MISC, "tip header missing"))?;
     Ok((hash_hex_display(&rec.hash), h.0))
+}
+
+fn buried_row(height: u32, at: u32) -> Value {
+    json!({
+        "type": "buried",
+        "height": height,
+        "active": at >= height,
+    })
+}
+
+/// Buried deployments from the node's `ChainParams` (overlay heights included).
+/// No BIP9 / testdummy / versionbits invention.
+fn buried_deployments(params: &rbitcoin_consensus::ChainParams, at: u32) -> Value {
+    json!({
+        "bip34": buried_row(params.btc.bip34_height, at),
+        "bip66": buried_row(params.btc.bip66_height, at),
+        "bip65": buried_row(params.btc.bip65_height, at),
+        "csv": buried_row(params.csv_height(), at),
+        "segwit": buried_row(params.segwit_height(), at),
+        "taproot": buried_row(params.taproot_height(), at),
+    })
+}
+
+fn getdeploymentinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash"])?;
+    let cp = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.params.clone())
+        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network));
+    let (hash, height) = if let Some(hex) = params.get(0, "blockhash").and_then(Value::as_str) {
+        let want = parse_hash32_display(hex)?;
+        let h = ctx
+            .query
+            .height_of_hash(&want)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+            .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+        (hash_hex_display(&want), h.0)
+    } else {
+        tip_hash_height(ctx)?
+    };
+    Ok(json!({
+        "hash": hash,
+        "height": height,
+        "deployments": buried_deployments(&cp, height),
+    }))
 }
 
 fn waitforblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2980,6 +3031,40 @@ mod tests {
                 .contains("Mocktime must be in the range [0, 9223372036], not -1."),
             "{e}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Buried deployments from ChainParams. No invented BIP9.
+    #[test]
+    fn getdeploymentinfo_buried_from_params() {
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let info = dispatch(&ctx, "getdeploymentinfo", vec![]).unwrap();
+        assert_eq!(info["height"], 0);
+        let d = &info["deployments"];
+        assert_eq!(d["csv"]["type"], "buried");
+        assert_eq!(d["csv"]["height"], hub.params.csv_height());
+        assert_eq!(d["csv"]["active"], false);
+        assert_eq!(d["segwit"]["type"], "buried");
+        assert_eq!(d["segwit"]["height"], hub.params.segwit_height());
+        assert_eq!(d["segwit"]["active"], true, "regtest segwit height 0");
+        assert!(d.get("testdummy").is_none(), "no invented BIP9");
+
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        let info = dispatch(&ctx, "getdeploymentinfo", vec![]).unwrap();
+        assert_eq!(info["height"], 1);
+        assert_eq!(info["deployments"]["csv"]["active"], true);
+        assert_eq!(info["deployments"]["bip65"]["active"], true);
+        assert_eq!(info["deployments"]["bip66"]["active"], true);
+        assert_eq!(info["deployments"]["bip34"]["active"], false);
+
+        let mut over = rbitcoin_consensus::ChainParams::regtest();
+        over.apply_test_activation_height("csv", 102).unwrap();
+        let d = buried_deployments(&over, 101);
+        assert_eq!(d["csv"]["height"], 102);
+        assert_eq!(d["csv"]["active"], false);
+        assert_eq!(buried_deployments(&over, 102)["csv"]["active"], true);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

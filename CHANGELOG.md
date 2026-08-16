@@ -29,6 +29,10 @@ before 1.0).
 - **Schema 17 freeze note:** [`docs/store-format.md`](docs/store-format.md)
   (hot set, widths, kinds without wipe, what forces 18).
 
+- **`getdeploymentinfo`:** buried `bip34` / `bip66` / `bip65` / `csv` /
+  `segwit` / `taproot` from `ChainParams` (including the activation-height
+  overlay). `active` is tip ≥ height. No BIP9 / testdummy.
+
 - **`submitheader`:** same `ensure_header` path as P2P headers. Header-only
   children show up in `getchaintips` as `headers-only`. `getblockchaininfo.headers`
   is the best known header height. `invalidateblock` of an unknown hash is

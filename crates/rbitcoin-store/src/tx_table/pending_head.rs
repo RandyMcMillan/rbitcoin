@@ -2,8 +2,11 @@
 //!
 //! Sole Class A appender notes txid→fk after body/idx publish. Resolve/stamp
 //! read a published snapshot (brief lock to clone the Arc). Drain uses the same
-//! page-grouped [`crate::tx_table::TxTable::head_insert_many`]. Not a process
-//! pin FIFO — no outs / spent_range.
+//! page-grouped [`crate::tx_table::TxTable::head_insert_many`].
+//!
+//! Snap = Class A committed, **not leftover-visible via the height fence**.
+//! Drain inserts `tx.head` for lookup probe; do **not** forget until
+//! `height_of(fk)` is Some. Not a process pin FIFO — no outs / spent_range.
 
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
@@ -52,6 +55,22 @@ impl PendingHeadInserts {
     pub fn take_queued(&self) -> Vec<([u8; 32], Fk)> {
         let mut q = self.queued.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *q)
+    }
+
+    /// Drop snap keys whose create fk is fence-connected. Unfenced keys stay
+    /// for leftover `pending_fk` (drain must not wipe them).
+    pub fn forget_if_fenced(&self, fence: &crate::height_fence::HeightFence) {
+        let covered: Vec<([u8; 32], Fk)> = {
+            let g = self.snap.read().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .filter(|(_, fk)| fence.height_of(**fk).is_some())
+                .map(|(txid, fk)| (*txid, *fk))
+                .collect()
+        };
+        if covered.is_empty() {
+            return;
+        }
+        self.forget(&covered);
     }
 
     pub fn forget(&self, entries: &[([u8; 32], Fk)]) {

@@ -1670,13 +1670,19 @@ impl TxTable {
     }
 
     /// Drain the pending insert queue via page-grouped [`Self::head_insert_many`].
+    ///
+    /// Inserts durable `tx.head` for probe. Leaves the snap so leftover can
+    /// bind `pending_fk` until the fence covers those fks (write forgets later).
     pub fn head_drain_pending(&self) -> Result<u64, StoreError> {
         let batch = self.pending_head.take_queued();
         if batch.is_empty() {
             return Ok(0);
         }
         self.head_insert_many(&batch)?;
-        self.pending_head.forget(&batch);
+        // Empty fence: nothing is leftover-visible yet. Write forgets after
+        // height_fence_extend. Do not wipe the snap here.
+        self.pending_head
+            .forget_if_fenced(&crate::height_fence::HeightFence::empty());
         Ok(batch.len() as u64)
     }
 

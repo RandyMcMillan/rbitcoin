@@ -20,7 +20,7 @@
 
 use crate::error::StoreError;
 use rbitcoin_primitives::Fk;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -231,6 +231,33 @@ impl BlockQueue {
             }
         }
         Ok(n)
+    }
+
+    /// Lowest distinct queued heights `≥ path_lo` that are not resolve-complete
+    /// and not in `skip`, capped at `cap`. One pass over the index (no
+    /// per-height `is_resolve_complete` scan). Sorted ascending.
+    pub fn unresolved_heights(
+        &self,
+        path_lo: u32,
+        skip: &HashSet<u32>,
+        cap: usize,
+    ) -> Vec<u32> {
+        if cap == 0 {
+            return Vec::new();
+        }
+        let mut seen = HashSet::new();
+        let mut out: Vec<u32> = Vec::new();
+        for e in self.index.values() {
+            if e.height < path_lo || e.resolve_complete || skip.contains(&e.height) {
+                continue;
+            }
+            if seen.insert(e.height) {
+                out.push(e.height);
+            }
+        }
+        out.sort_unstable();
+        out.truncate(cap);
+        out
     }
 
     /// Index-only listing (ascending id).
@@ -516,6 +543,25 @@ mod tests {
         assert_eq!(m[0].height, 3);
         assert!(!m[0].resolve_complete);
         assert!(!q.is_resolve_complete(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolved_heights_skips_complete_and_respects_cap() {
+        use std::collections::HashSet;
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        for h in 0..24u32 {
+            q.enqueue(h, [h as u8; 32], 1, b"x").unwrap();
+        }
+        for h in 0..16u32 {
+            q.mark_resolve_complete(h).unwrap();
+        }
+        let skip: HashSet<u32> = [16, 17].into_iter().collect();
+        let got = q.unresolved_heights(10, &skip, 8);
+        assert_eq!(got, vec![18, 19, 20, 21, 22, 23]);
+        assert_eq!(q.unresolved_heights(10, &skip, 3), vec![18, 19, 20]);
+        assert!(q.unresolved_heights(10, &skip, 0).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

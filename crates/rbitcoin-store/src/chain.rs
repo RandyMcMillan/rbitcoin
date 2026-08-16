@@ -124,7 +124,8 @@ impl ConfirmedTable {
 /// ~64× smaller than u64-per-tx; call sites only need `is_strong`. Header fk is
 /// not stored (derived from confirmed range when needed).
 ///
-/// Compact images use L2 write-behind (same cap as [`crate::array_table::class_c_inram_max_bytes`]).
+/// Always L2 write-behind (unlike [`crate::array_table::class_c_inram_max_bytes`],
+/// which still caps `confirmed` / `header_txs_*`). 1 bit/tx stays in RAM.
 pub struct StrongTxTable {
     bits: crate::file::TableFile,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
@@ -159,15 +160,11 @@ impl StrongTxTable {
             .logical_len()
             .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
         let n_bits = body.saturating_mul(8);
-        let data = if body <= crate::array_table::class_c_inram_max_bytes() {
-            let mut v = vec![0u8; body as usize];
-            if body > 0 {
-                bits.read_at(crate::file::FILE_HEADER_LEN as u64, &mut v)?;
-            }
-            Some(v)
-        } else {
-            None
-        };
+        let mut v = vec![0u8; body as usize];
+        if body > 0 {
+            bits.read_at(crate::file::FILE_HEADER_LEN as u64, &mut v)?;
+        }
+        let data = Some(v);
         Ok(Self {
             bits,
             n_bits: std::sync::atomic::AtomicU64::new(n_bits),
@@ -683,6 +680,40 @@ mod strong_tests {
         let t = StrongTxTable::open(&dir).unwrap();
         assert!(t.is_strong(Fk(1)).unwrap());
         assert!(!t.is_strong(Fk(5)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `strong_tx` stays L2 even when the Class C array cap would demote it.
+    #[test]
+    fn strong_tx_always_l2_above_class_c_cap() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+        std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "1");
+        let dir = tmp();
+        // 1 MiB + 1 byte of bits → body > class_c_inram_max_bytes() (1 MiB).
+        let fk = Fk(8_388_608 + 8);
+        {
+            let t = StrongTxTable::create(&dir).unwrap();
+            t.set_strong(fk, Fk(1)).unwrap();
+            t.flush().unwrap();
+            assert!(
+                t.l2_resident_bytes() > 1024 * 1024,
+                "create path L2={}",
+                t.l2_resident_bytes()
+            );
+        }
+        let t = StrongTxTable::open(&dir).unwrap();
+        assert!(
+            t.l2_resident_bytes() > 1024 * 1024,
+            "reopen must keep L2 under a 1 MiB Class C cap; got {}",
+            t.l2_resident_bytes()
+        );
+        assert!(t.is_strong(fk).unwrap());
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+            None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

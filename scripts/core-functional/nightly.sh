@@ -15,7 +15,7 @@ python3 "$HERE/check_inventory.py" \
   --tests-dir "$ROOT/third_party/bitcoin/test/functional"
 # Warn-only: a newer Core release must not red the job.
 python3 "$HERE/check_core_release.py"
-# Inventory `run` set (feature_help + feature_uacomment today). Needs a node.
+# Inventory `run` set (help / uacomment / uptime / named_arguments). Needs a node.
 abs_node() {
   local p="$1"
   if [[ "$p" = /* ]]; then

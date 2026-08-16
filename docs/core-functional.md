@@ -28,7 +28,7 @@ python3 scripts/core-functional/check_inventory.py \
 `not in run set` / `unknown test` (we do not `--exclude` every skip —
 Core exits if an exclude is not in the current test list).
 `--list` prints `run` names (`feature_help.py`, `feature_uacomment.py`,
-`rpc_uptime.py` today). `--dry-run` prints the command and writes `config.ini`
+`rpc_uptime.py`, `rpc_named_arguments.py` today). `--dry-run` prints the command and writes `config.ini`
 (wallet/zmq/ipc off) without starting a node. Default `cargo test`
 never calls this.
 
@@ -52,6 +52,7 @@ RBITCOIN_NODE=target/dev/debug/rbitcoin-node \
 ./scripts/core-functional/run.sh --list
 ./scripts/core-functional/run.sh --dry-run
 ./scripts/core-functional/run.sh.test.sh
+./scripts/core-functional/create_cache.test.sh
 ```
 
 ## Check the inventory
@@ -74,7 +75,7 @@ Without it, the checker uses `scripts/core-functional/v31.1-tests.txt`
 | `name` | `*.py` basename, unique |
 | `status` | `run` or `skip` |
 | `reason` | required on `skip`; **forbidden** on `run`; never `unknown` |
-| `analog` | required when `reason` is `no-prune`, `core-internal`, or `no-utxo-set` (`none` if we will not re-home) |
+| `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, or `rpc-missing` (`none` if we will not re-home; otherwise a scenario name or follow-up) |
 | `log_map` | optional; later `debuglog_map.toml` keys |
 
 A file on disk (or in `v31.1-tests.txt`) that is missing from the inventory,
@@ -101,7 +102,7 @@ to `run` only in the PR that makes that script pass. First green pair:
 | `core-internal` | LevelDB / LoadExternalBlockFile / USDT / rw_settings |
 | `core-net-policy` | banlist format, tor, anchors.dat, asmap |
 | `policy-libre` | assertion *is* Core standardness |
-| `rpc-missing` | method/harness not implemented yet (shrinks) |
+| `rpc-missing` | method/harness not implemented yet (shrinks; requires `analog` follow-up) |
 | `core-cpp-unit` | Boost units — never in this runner |
 | `prev-release` | previous-release binaries |
 | `harness` | `test_runner.py`, `combine_logs.py`, framework self-tests |
@@ -148,3 +149,30 @@ LevelDB / `blocks/blk*.dat` tests cannot pass unmodified. `analog` names
 the rbitcoin scenario (or `none`) so we do not drop the behavior. See the
 design plan for the first-pass mapping (`--datadir-cold`, reconstruct,
 `--milestone`, durable mempool).
+
+Named scenarios in `crates/rbitcoin-test/tests/core_analogs.rs`:
+
+| Core skip | Analog |
+|-----------|--------|
+| `feature_assumevalid.py` | `analog_milestone_skip_below_check_above` |
+| `feature_reindex*.py` | `analog_reconstruct_after_lost_head` |
+| `mempool_persist.py` | `analog_mempool_persist_reopen` |
+
+`rpc-missing` also requires `analog` (a follow-up row or `none`).
+
+## 199-block cache
+
+Tests with `setup_clean_chain=False` (including `rpc_named_arguments.py`)
+assert height 199 then generate one more. Core’s cache is LevelDB + `blocks/`
+and would wipe our store after remine.
+
+`scripts/core-functional/create_cache.py` mines 199 via `generate` into
+`scripts/core-functional/cache/store` (gitignored). `run.sh` preseeds empty
+`test/cache/node0/regtest/{blocks,chainstate}` and passes `--keepcache`. The
+shim copies `RBITCOIN_CACHE/store` only when the dest has those two dirs and
+no `store/` (clean-chain starts stay empty).
+
+```bash
+python3 scripts/core-functional/create_cache.py --ensure
+./scripts/core-functional/create_cache.test.sh
+```

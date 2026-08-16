@@ -11,6 +11,19 @@ before 1.0).
 
 ### Added
 
+- **Core functional coverage:** analog scenarios for `--milestone` skip-below /
+  check-above, reconstruct after lost RAM head, and durable mempool reopen
+  (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
+  required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
+
+- **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
+  mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
+
+- **rbitcoin 199-block cache:** `create_cache.py` mines 199 via `generate`
+  into `scripts/core-functional/cache/store`. `run.sh` preseeds empty Core
+  `blocks/`+`chainstate/` and `--keepcache`; the shim copies our store into
+  cache-shaped dests only.
+
 - **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
   and park via `ChainHub`; reconsider re-accepts; precious prefers an
   equal-work sibling.

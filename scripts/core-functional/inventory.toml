@@ -236,9 +236,7 @@ analog = "none (wallet/ZMQ notify)"
 
 [[test]]
 name = "feature_nulldummy.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: nulldummy + generate"
+status = "run"
 
 [[test]]
 name = "feature_port.py"

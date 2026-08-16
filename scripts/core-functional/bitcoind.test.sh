@@ -140,10 +140,11 @@ else
 fi
 
 OUTNO="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
-  -nopersistmempool -printpriority=1 2>/dev/null)" || OUTNO=""
+  -nopersistmempool -printpriority=1 -addresstype=legacy 2>/dev/null)" || OUTNO=""
 if printf '%s' "$OUTNO" | grep -q -- "--persistmempool=0" \
-  && ! printf '%s' "$OUTNO" | grep -q -- "printpriority"; then
-  echo "ok - -nopersistmempool forwarded, printpriority ignored"
+  && ! printf '%s' "$OUTNO" | grep -q -- "printpriority" \
+  && ! printf '%s' "$OUTNO" | grep -q -- "addresstype"; then
+  echo "ok - -nopersistmempool forwarded, printpriority/addresstype ignored"
   PASS=$((PASS + 1))
 else
   echo "not ok - -nofoo / printpriority (got: $OUTNO)"

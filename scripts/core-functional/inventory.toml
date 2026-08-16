@@ -236,9 +236,7 @@ analog = "none (wallet/ZMQ notify)"
 
 [[test]]
 name = "feature_nulldummy.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: nulldummy + generate"
+status = "run"
 
 [[test]]
 name = "feature_port.py"
@@ -539,8 +537,7 @@ reason = "no-mining-product"
 
 [[test]]
 name = "mining_getblocktemplate_longpoll.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "mining_mainnet.py"
@@ -549,8 +546,7 @@ reason = "no-mining-product"
 
 [[test]]
 name = "mining_prioritisetransaction.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "mining_template_verification.py"
@@ -1034,8 +1030,7 @@ reason = "no-wallet"
 
 [[test]]
 name = "rpc_signrawtransactionwithkey.py"
-status = "skip"
-reason = "no-wallet"
+status = "run"
 
 [[test]]
 name = "rpc_txoutproof.py"

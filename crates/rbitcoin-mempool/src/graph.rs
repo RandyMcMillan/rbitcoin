@@ -259,6 +259,59 @@ impl TxGraph {
         })
     }
 
+    /// Same as [`Self::graph_stats`] with `prioritisetransaction` deltas in the fee sums.
+    pub fn graph_stats_delta(
+        &self,
+        txid: &Txid,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Option<(MempoolGraphStats, i64, i64)> {
+        let anc = self.ancestor_set(txid)?;
+        let desc = self.descendant_set(txid)?;
+        let (a_fee, a_w) = self.set_fee_weight(&anc);
+        let (d_fee, d_w) = self.set_fee_weight(&desc);
+        let a_mod = self.set_modified_fee(&anc, &delta);
+        let d_mod = self.set_modified_fee(&desc, &delta);
+        Some((
+            MempoolGraphStats {
+                ancestorcount: anc.len() as u64,
+                ancestorsize: a_w / 4,
+                ancestorfees: a_fee,
+                descendantcount: desc.len() as u64,
+                descendantsize: d_w / 4,
+                descendantfees: d_fee,
+            },
+            a_mod,
+            d_mod,
+        ))
+    }
+
+    fn set_modified_fee(&self, set: &BTreeSet<Txid>, delta: &impl Fn(Txid) -> i64) -> i64 {
+        let mut fee = 0i128;
+        for t in set {
+            if let Some(e) = self.entries.get(t) {
+                fee =
+                    fee.saturating_add(i128::from(e.fee_sat).saturating_add(i128::from(delta(*t))));
+            }
+        }
+        fee.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    /// Chunk containing `txid` (mining linearization), with modified chunk fee.
+    pub fn chunk_of(
+        &self,
+        txid: &Txid,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Option<(i64, u64, Vec<Txid>)> {
+        let c = self.cluster_of(txid)?;
+        for ch in c.chunks {
+            if ch.txids.contains(txid) {
+                let fee = self.set_modified_fee(&ch.txids.iter().copied().collect(), &delta);
+                return Some((fee, ch.weight, ch.txids));
+            }
+        }
+        None
+    }
+
     /// Aggregate fee/weight of a set of live txs.
     pub fn set_fee_weight(&self, set: &BTreeSet<Txid>) -> (u64, u64) {
         let mut fee = 0u64;
@@ -454,46 +507,42 @@ impl TxGraph {
         out
     }
 
-    /// Split linearization into chunks where fee rates are non-increasing;
-    /// a new chunk starts when the next tx has a strictly higher fee rate than
-    /// the running chunk average would allow — simplified: group while fee rate
-    /// is ≤ previous tx fee rate (Core-style diagram uses more; this is enough
-    /// for eviction ordering foundations).
+    /// Split a linearization into prefix-maximal-feerate chunks (Core diagram).
+    ///
+    /// Each chunk is the longest remaining prefix whose combined feerate is
+    /// maximal. A cheap parent plus hot children is one chunk (CPFP); a hot
+    /// parent plus a cheap descendant stays split so the parent is not diluted.
     fn chunkify(&self, lin: &[Txid]) -> Vec<Chunk> {
         let mut chunks = Vec::new();
-        if lin.is_empty() {
-            return chunks;
-        }
-        let mut cur_txids = Vec::new();
-        let mut cur_fee = 0u64;
-        let mut cur_weight = 0u64;
-        let mut prev_rate = u64::MAX;
-        for t in lin {
-            let e = match self.entries.get(t) {
-                Some(e) => e,
-                None => continue,
-            };
-            let rate = e.fee_rate_sat_per_kvb();
-            if !cur_txids.is_empty() && rate > prev_rate {
-                chunks.push(Chunk {
-                    txids: std::mem::take(&mut cur_txids),
-                    fee_sat: cur_fee,
-                    weight: cur_weight,
-                });
-                cur_fee = 0;
-                cur_weight = 0;
+        let mut i = 0;
+        while i < lin.len() {
+            let mut acc_fee = 0u64;
+            let mut acc_w = 0u64;
+            let mut best_end = i;
+            let mut best_fee = 0u64;
+            let mut best_w = 0u64;
+            for (j, t) in lin.iter().enumerate().skip(i) {
+                let Some(e) = self.entries.get(t) else {
+                    continue;
+                };
+                acc_fee = acc_fee.saturating_add(e.fee_sat);
+                acc_w = acc_w.saturating_add(e.weight);
+                // acc/acc_w >= best/best_w  (longest prefix on a tie).
+                let better = best_w == 0
+                    || (acc_fee as u128).saturating_mul(best_w as u128)
+                        >= (best_fee as u128).saturating_mul(acc_w as u128);
+                if better {
+                    best_end = j;
+                    best_fee = acc_fee;
+                    best_w = acc_w;
+                }
             }
-            cur_txids.push(*t);
-            cur_fee = cur_fee.saturating_add(e.fee_sat);
-            cur_weight = cur_weight.saturating_add(e.weight);
-            prev_rate = rate;
-        }
-        if !cur_txids.is_empty() {
             chunks.push(Chunk {
-                txids: cur_txids,
-                fee_sat: cur_fee,
-                weight: cur_weight,
+                txids: lin[i..=best_end].to_vec(),
+                fee_sat: best_fee,
+                weight: best_w,
             });
+            i = best_end + 1;
         }
         chunks
     }
@@ -958,6 +1007,66 @@ mod tests {
         assert_eq!(cs.descendantcount, 1);
         assert_eq!(cs.ancestorfees, 500 + 5000);
         assert_eq!(ps.descendantfees, 500 + 5000);
+        // Hot child pulls the cheap parent into one chunk (CPFP).
+        assert_eq!(c.chunks.len(), 1);
+        assert_eq!(c.chunks[0].txids, vec![pid, cid]);
+    }
+
+    #[test]
+    fn diamond_cheap_parent_hot_children_cheap_sink_two_chunks() {
+        // a (cheap, 2 outs) → b,c (hot) → d (cheap). Prefix-maximal: [a,b,c] then [d].
+        let mut g = TxGraph::new();
+        let a = make_tx(None, 2, 1);
+        let ae = entry_for(&a, 2_000, 0);
+        let aid = ae.txid;
+        g.insert(ae, &a);
+        let b = make_tx(Some((aid, 0)), 1, 2);
+        let be = entry_for(&b, 31_200, 1);
+        let bid = be.txid;
+        g.insert(be, &b);
+        let c = make_tx(Some((aid, 1)), 1, 3);
+        let ce = entry_for(&c, 31_200, 2);
+        let cid = ce.txid;
+        g.insert(ce, &c);
+        let d = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: bid, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint { txid: cid, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        g.insert(entry_for(&d, 1_000, 3), &d);
+        let did = d.compute_txid();
+        let cl = g.cluster_of(&aid).unwrap();
+        assert_eq!(cl.members.len(), 4);
+        assert_eq!(cl.chunks.len(), 2, "chunks: {:?}", cl.chunks);
+        let first: BTreeSet<Txid> = cl.chunks[0].txids.iter().copied().collect();
+        assert_eq!(first, [aid, bid, cid].into_iter().collect());
+        assert_eq!(cl.chunks[1].txids, vec![did]);
+        let (fee, w, txs) = g.chunk_of(&aid, |_| 0).unwrap();
+        assert_eq!(fee, 2_000 + 31_200 + 31_200);
+        assert_eq!(w, cl.chunks[0].weight);
+        assert_eq!(txs.len(), 3);
+        let (d_fee, _, d_txs) = g
+            .chunk_of(&did, |id| if id == bid { 9_999 } else { 0 })
+            .unwrap();
+        assert_eq!(d_txs, vec![did]);
+        assert_eq!(d_fee, 1_000, "d's chunk fee ignores sibling deltas");
     }
 
     #[test]

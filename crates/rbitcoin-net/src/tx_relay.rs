@@ -276,6 +276,8 @@ pub struct MempoolHub {
     unbroadcast: Mutex<HashSet<Txid>>,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
     fee_deltas: Mutex<HashMap<Txid, i64>>,
+    /// Monotonic template generation (admit / remove / prioritise). GBT longpoll.
+    template_updates: AtomicU64,
 }
 
 impl MempoolHub {
@@ -289,7 +291,17 @@ impl MempoolHub {
         query: Arc<Query>,
         max_weight_wu: u64,
     ) -> Result<Arc<Self>, String> {
-        let mp = ActiveMempool::open_or_create_with_limit(dir.as_ref(), max_weight_wu)
+        Self::open_with_weight_persist(dir, query, max_weight_wu, true)
+    }
+
+    /// `persist=false` starts with an empty live set (Core `-persistmempool=0`).
+    pub fn open_with_weight_persist(
+        dir: impl AsRef<Path>,
+        query: Arc<Query>,
+        max_weight_wu: u64,
+        persist: bool,
+    ) -> Result<Arc<Self>, String> {
+        let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         let hub = Self {
@@ -323,6 +335,7 @@ impl MempoolHub {
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(HashSet::new()),
             fee_deltas: Mutex::new(HashMap::new()),
+            template_updates: AtomicU64::new(0),
         };
         hub.reindex_live_scripthashes();
         Ok(Arc::new(hub))
@@ -654,7 +667,8 @@ impl MempoolHub {
             let t_lock = Instant::now();
             let mut g = self.inner.write().unwrap();
             g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
-            let r = g.prepare_admit(tx, &utxo, tip);
+            let delta = self.fee_delta(&tx.compute_txid());
+            let r = g.prepare_admit(tx, &utxo, tip, delta);
             stages.utxo_us = g.last_accept_stages.utxo_us;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -717,6 +731,7 @@ impl MempoolHub {
                     .cloned()
                     .unwrap_or_default();
                 self.publish_announce(&r, shs);
+                self.note_template_update();
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -935,6 +950,7 @@ impl MempoolHub {
         let n = g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0);
         drop(g);
         if n > 0 {
+            self.note_template_update();
             let mut deltas = self.fee_deltas.lock().unwrap();
             for tid in txids {
                 self.unindex_txid(tid);
@@ -980,11 +996,31 @@ impl MempoolHub {
         if *e == 0 {
             m.remove(&txid);
         }
+        drop(m);
+        self.note_template_update();
+    }
+
+    fn note_template_update(&self) {
+        self.template_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Generation for `getblocktemplate.longpollid` (Core `nTransactionsUpdated`).
+    pub fn template_updates(&self) -> u64 {
+        self.template_updates.load(Ordering::Relaxed)
     }
 
     /// Snapshot of non-zero deltas for `getprioritisedtransactions`.
     pub fn prioritised_txs(&self) -> HashMap<Txid, i64> {
         self.fee_deltas.lock().unwrap().clone()
+    }
+
+    pub fn fee_delta(&self, txid: &Txid) -> i64 {
+        self.fee_deltas
+            .lock()
+            .unwrap()
+            .get(txid)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
@@ -1029,6 +1065,39 @@ impl MempoolHub {
     /// Ancestor/descendant counts and vsize/fee sums (no live-set scan).
     pub fn graph_stats(&self, txid: &Txid) -> Option<crate::MempoolGraphStats> {
         self.inner.read().unwrap().graph.graph_stats(txid)
+    }
+
+    /// Graph stats plus modified ancestor/descendant/chunk fees (sat).
+    pub fn graph_fees_modified(
+        &self,
+        txid: &Txid,
+    ) -> Option<(crate::MempoolGraphStats, i64, i64, i64, u64)> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
+        let g = self.inner.read().unwrap();
+        let (stats, a_mod, d_mod) = g.graph.graph_stats_delta(txid, d)?;
+        let (chunk_fee, chunk_w, _) = g.graph.chunk_of(txid, d)?;
+        Some((stats, a_mod, d_mod, chunk_fee, chunk_w))
+    }
+
+    /// `getmempoolcluster` payload from the live graph.
+    pub fn cluster_rpc(&self, txid: &Txid) -> Option<(u64, usize, Vec<(i64, u64, Vec<Txid>)>)> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
+        let g = self.inner.read().unwrap();
+        let c = g.graph.cluster_of(txid)?;
+        let chunks = c
+            .chunks
+            .iter()
+            .map(|ch| {
+                let fee = ch.txids.iter().fold(0i64, |acc, t| {
+                    let base = g.graph.get(t).map(|e| e.fee_sat as i64).unwrap_or(0);
+                    acc.saturating_add(base.saturating_add(d(*t)))
+                });
+                (fee, ch.weight, ch.txids.clone())
+            })
+            .collect();
+        Some((c.total_weight, c.members.len(), chunks))
     }
 
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.

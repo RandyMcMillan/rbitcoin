@@ -24,7 +24,7 @@ fn hash_hex_display(h: &[u8; 32]) -> String {
 }
 
 /// Parse Core display-order 32-byte hex → internal byte order.
-fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
+pub(crate) fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
     let mut b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     if b.len() != 32 {
         return Err(rpc_error(
@@ -127,6 +127,10 @@ impl RpcParams {
         Self { pos, named: None }
     }
 
+    pub fn pos_len(&self) -> usize {
+        self.pos.len()
+    }
+
     pub fn named(mut named: serde_json::Map<String, Value>) -> Self {
         // AuthServiceProxy mixed call: `{args: [...], argN: ...}`.
         let pos = match named.remove("args") {
@@ -179,6 +183,16 @@ impl RpcParams {
             Some(v) => json_u64(v)
                 .map(Some)
                 .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be an integer"))),
+        }
+    }
+
+    pub fn opt_str(&self, index: usize, name: &str) -> Result<Option<&str>, Value> {
+        match self.get(index, name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, format!("{name} must be a string"))),
         }
     }
 
@@ -345,7 +359,11 @@ pub fn dispatch(
         "getmininginfo" => getmininginfo(ctx),
         "prioritisetransaction" => prioritisetransaction(ctx, &params),
         "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
-        "createrawtransaction" | "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
+        "getmempoolcluster" => getmempoolcluster(ctx, &params),
+        "createrawtransaction" => crate::rawtx::createrawtransaction(&params),
+        "signrawtransactionwithkey" => crate::rawtx::signrawtransactionwithkey(ctx, &params),
+        "createmultisig" => crate::rawtx::createmultisig(ctx, &params),
+        "combinerawtransaction" | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
         )),
@@ -466,6 +484,10 @@ const METHOD_LIST: &[&str] = &[
     "getmininginfo",
     "prioritisetransaction",
     "getprioritisedtransactions",
+    "getmempoolcluster",
+    "createrawtransaction",
+    "signrawtransactionwithkey",
+    "createmultisig",
     "submitblock",
     "submitheader",
     "setmocktime",
@@ -507,7 +529,8 @@ fn method_help(m: &str) -> String {
         }
         "getblocktemplate" => "getblocktemplate (template_request)\n\
              All networks. Template from select_block_txs; proposal validates \
-             without connecting. rules must include segwit. No BIP9 testdummy."
+             without connecting. rules must include segwit. longpollid waits \
+             for a new tip or mempool/priority change. No BIP9 testdummy."
             .into(),
         "getmininginfo" => "getmininginfo\nTip height, difficulty, pooledtx. All networks.".into(),
         "prioritisetransaction" => {
@@ -941,27 +964,45 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
     }))
 }
 
+/// Exact 8-decimal BTC JSON number (Core `ValueFromAmount`). Avoids f64 drift
+/// against `Decimal` comparisons in the functional suite.
+fn sat_btc_json(sat: i64) -> Value {
+    let sign = if sat < 0 { "-" } else { "" };
+    let abs = sat.unsigned_abs();
+    let s = format!("{sign}{}.{:08}", abs / 100_000_000, abs % 100_000_000);
+    Value::Number(s.parse().expect("sat/BTC decimal"))
+}
+
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
     let vsize = weight / 4;
-    let fee_btc = (fee as f64) / 100_000_000.0;
-    let stats = mp.graph_stats(txid);
-    let (ac, asz, afee, dc, dsz, dfee) = match stats {
-        Some(s) => (
-            s.ancestorcount,
-            s.ancestorsize,
-            s.ancestorfees,
-            s.descendantcount,
-            s.descendantsize,
-            s.descendantfees,
-        ),
-        None => (1, vsize, fee, 1, vsize, fee),
-    };
+    let delta = mp.fee_delta(txid);
+    let modified = (fee as i64).saturating_add(delta);
+    let (ac, asz, afee, dc, dsz, dfee, a_mod, d_mod, chunk_fee, chunk_w) =
+        match mp.graph_fees_modified(txid) {
+            Some((s, am, dm, cf, cw)) => (
+                s.ancestorcount,
+                s.ancestorsize,
+                s.ancestorfees,
+                s.descendantcount,
+                s.descendantsize,
+                s.descendantfees,
+                am,
+                dm,
+                cf,
+                cw,
+            ),
+            None => (
+                1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight,
+            ),
+        };
     json!({
         "vsize": vsize,
         "weight": weight,
-        "fee": fee_btc,
-        "modifiedfee": fee_btc,
+        "fee": sat_btc_json(fee as i64),
+        // Top-level `modifiedfee` stays the base fee (same pattern as
+        // ancestorfees/descendantfees). Real modified value is `fees.modified`.
+        "modifiedfee": sat_btc_json(fee as i64),
         "time": 0,
         "height": 0,
         "descendantcount": dc,
@@ -970,7 +1011,15 @@ fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Va
         "ancestorcount": ac,
         "ancestorsize": asz,
         "ancestorfees": afee,
+        "chunkweight": chunk_w,
         "unbroadcast": mp.is_unbroadcast(txid),
+        "fees": {
+            "base": sat_btc_json(fee as i64),
+            "modified": sat_btc_json(modified),
+            "ancestor": sat_btc_json(a_mod),
+            "descendant": sat_btc_json(d_mod),
+            "chunk": sat_btc_json(chunk_fee),
+        },
     })
 }
 
@@ -1008,7 +1057,6 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let fee_btc = (fee as f64) / 100_000_000.0;
         let wtxid = mp
             .get_tx(&tid)
             .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
@@ -1016,10 +1064,7 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         let mut entry = mempool_graph_json(mp, &tid, fee, weight);
         if let Some(obj) = entry.as_object_mut() {
             obj.insert("wtxid".into(), json!(wtxid));
-            obj.insert(
-                "fees".into(),
-                json!({ "base": fee_btc, "modified": fee_btc }),
-            );
+            // `fees` already set by mempool_graph_json (includes modified/chunk).
         }
         return Ok(entry);
     }
@@ -1087,7 +1132,8 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
 }
 
 fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
-    let s = e.to_string();
+    let owned = e.to_string();
+    let s = owned.strip_prefix("policy: ").unwrap_or(owned.as_str());
     if s == "coinbase immature" {
         return "bad-txns-premature-spend-of-coinbase".into();
     }
@@ -1112,10 +1158,21 @@ fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     if s == "rbf insufficient fee" {
         return "insufficient fee".into();
     }
-    if let Some(rest) = s.strip_prefix("script: ") {
-        return format!("mempool-script-verify-flag-failed ({rest})");
+    if s == "min relay fee" {
+        return "min relay fee not met".into();
     }
-    s
+    if let Some(rest) = s.strip_prefix("script: ") {
+        let rest = rest
+            .strip_prefix("script verification failed: ")
+            .unwrap_or(rest);
+        let token = rest.split(" txid=").next().unwrap_or(rest);
+        let paren = match token {
+            "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
+            other => other,
+        };
+        return format!("mempool-script-verify-flag-failed ({paren})");
+    }
+    s.to_string()
 }
 
 fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1137,13 +1194,15 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         // Dry-run: accept then remove if we admitted (best-effort). Prefer not
         // mutating — use accept and if ok, remove_for_block to roll back.
         match mp.accept_tx(&tx) {
-            Ok(_) => {
+            Ok(r) => {
                 let _ = mp.remove_for_block(&[tx.compute_txid()]);
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": true,
+                    "vsize": r.weight / 4,
+                    "fees": { "base": sat_btc_json(r.fee_sat as i64) },
                 }));
             }
             Err(e) => {
@@ -1438,10 +1497,16 @@ fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
                 ));
             }
         };
-        let Some(script) = parse_raw_descriptor(desc) else {
+        let script = if let Some(s) = parse_raw_descriptor(desc) {
+            s
+        } else if let Some(s) = parse_addr_descriptor(ctx, desc) {
+            s
+        } else if let Some(s) = crate::rawtx::parse_wrapped_multi(desc) {
+            s
+        } else {
             return Err(rpc_error(
                 ERR_INVALID_PARAMS,
-                format!("only raw() descriptors are supported (got {desc})"),
+                format!("unsupported descriptor (got {desc})"),
             ));
         };
         scripts.push(script.to_bytes());
@@ -1472,7 +1537,7 @@ fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
             "vout": u.vout,
             "scriptPubKey": hex_encode(&u.script),
             "desc": format!("raw({})", hex_encode(&u.script)),
-            "amount": Amount::from_sat(u.value).to_btc(),
+            "amount": sat_btc_json(u.value as i64),
             "coinbase": u.coinbase,
             "height": u.height,
         }));
@@ -1873,13 +1938,57 @@ fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         .and_then(Value::as_str)
         .unwrap_or("template");
     match mode {
-        "template" | "" => gbt_template(ctx),
+        "template" | "" => {
+            if let Some(lp) = req
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("longpollid"))
+                .and_then(Value::as_str)
+            {
+                gbt_longpoll_wait(ctx, lp);
+            }
+            gbt_template(ctx)
+        }
         "proposal" => gbt_proposal(ctx, req),
         other => Err(rpc_error(
             ERR_INVALID_PARAMETER,
             format!("Invalid mode: {other}"),
         )),
     }
+}
+
+/// Core GBT longpoll: block while `longpollid` still matches the live tip +
+/// mempool update counter. Tip change (P2P / generate) wakes within one poll
+/// tick. A new mempool tx or `prioritisetransaction` does too.
+fn gbt_longpoll_wait(ctx: &RpcContext, want: &str) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+    loop {
+        if ctx.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if gbt_longpoll_id(ctx) != want {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+}
+
+fn gbt_longpoll_id(ctx: &RpcContext) -> String {
+    let tip = if let Some(h) = ctx.query.tip_height() {
+        ctx.query
+            .header_at_height(h)
+            .ok()
+            .flatten()
+            .map(|(_, rec)| hash_hex_display(&rec.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let updates = ctx
+        .mempool
+        .as_ref()
+        .map(|m| m.template_updates())
+        .unwrap_or(0);
+    format!("{tip}{updates}")
 }
 
 fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
@@ -1958,12 +2067,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         }));
     }
     let subsidy = rbitcoin_consensus::block_subsidy(next_h, &params) as u64;
-    let pooled = ctx
-        .mempool
-        .as_ref()
-        .map(|m| m.list_live_meta().len())
-        .unwrap_or(0);
-    let longpollid = format!("{prev_hex}{pooled}");
+    let longpollid = gbt_longpoll_id(ctx);
     let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
     Ok(json!({
         "capabilities": ["proposal"],
@@ -2046,6 +2150,11 @@ fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
 
 fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "dummy", "fee_delta"])?;
+    let missing = params.get(0, "txid").is_none() || params.get(2, "fee_delta").is_none();
+    let extra_pos = params.pos_len() > 3;
+    if missing || extra_pos {
+        return Err(rpc_error(ERR_MISC, "prioritisetransaction"));
+    }
     let txid_s = params.req_str(0, "txid")?;
     if txid_s.len() != 64 {
         return Err(rpc_error(
@@ -2100,6 +2209,9 @@ fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
 
 fn getprioritisedtransactions(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&[])?;
+    if params.pos_len() != 0 {
+        return Err(rpc_error(ERR_MISC, "getprioritisedtransactions"));
+    }
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(json!({}));
     };
@@ -2112,13 +2224,44 @@ fn getprioritisedtransactions(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         });
         if in_mempool {
             if let Some((base, _)) = mp.get_live_meta(&txid) {
-                let modified = (base as i128).saturating_add(i128::from(delta));
+                let modified = (base as i64).saturating_add(delta);
                 row["modified_fee"] = json!(modified);
             }
         }
         out.insert(txid.to_string(), row);
     }
     Ok(Value::Object(out))
+}
+
+fn getmempoolcluster(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["txid"])?;
+    let hex = params.req_str(0, "txid")?;
+    let tid = Txid::from_byte_array(parse_hash32_display(hex)?);
+    let mp = ctx
+        .mempool
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let Some((weight, count, chunks)) = mp.cluster_rpc(&tid) else {
+        return Err(rpc_error(
+            ERR_INVALID_ADDRESS_OR_KEY,
+            "Transaction not in mempool",
+        ));
+    };
+    let chunks_json: Vec<Value> = chunks
+        .into_iter()
+        .map(|(fee, w, txs)| {
+            json!({
+                "chunkfee": sat_btc_json(fee),
+                "chunkweight": w,
+                "txs": txs.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "clusterweight": weight,
+        "txcount": count,
+        "chunks": chunks_json,
+    }))
 }
 
 fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2136,7 +2279,7 @@ fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
 }
 
-fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
+pub(crate) fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
     let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
 }
@@ -2309,6 +2452,227 @@ mod tests {
     }
 
     #[test]
+    fn rawtx_createmultisig_descriptor_and_sign_p2pkh() {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::PrivateKey;
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let secp = Secp256k1::new();
+        let wif = "cVpF924EspNh8KjYsfhgY96mmxvT6DgdWiTYMtMjuM74hJaU5psW";
+        let pk = PrivateKey::from_wif(wif).unwrap();
+        let addr = bitcoin::Address::p2pkh(pk.public_key(&secp), BtcNetwork::Regtest).to_string();
+        dispatch(
+            &ctx,
+            "generatetoaddress",
+            vec![json!(101), json!(addr.clone())],
+        )
+        .unwrap();
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb = blk["tx"][0]["txid"].as_str().unwrap().to_string();
+        let raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": cb, "vout": 0}]),
+                json!({addr.clone(): 49.0}),
+            ],
+        )
+        .unwrap();
+        let signed = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!([wif])],
+        )
+        .unwrap();
+        assert_eq!(signed["complete"], true);
+        let hex = signed["hex"].as_str().unwrap();
+        assert_ne!(hex, raw.as_str().unwrap());
+
+        let ms = dispatch(
+            &ctx,
+            "createmultisig",
+            vec![
+                json!(1),
+                json!([pk.public_key(&secp).to_string()]),
+                json!("p2sh-segwit"),
+            ],
+        )
+        .unwrap();
+        assert!(ms["descriptor"]
+            .as_str()
+            .unwrap()
+            .starts_with("sh(wsh(multi(1,"));
+        assert!(ms["descriptor"].as_str().unwrap().contains('#'));
+
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!(["123"])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![raw.clone(), json!([wif]), json!([]), json!("all")],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        let extra = format!("{}00", raw.as_str().unwrap());
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![json!(extra), json!([wif])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION);
+
+        // Array-shaped outputs (Core createrawtransaction since 0.17).
+        let raw_arr = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": cb, "vout": 0}]),
+                json!([{addr.clone(): 49.0}]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(raw_arr, raw);
+
+        // P2A prevout: keyless no-op (scriptPubKey 51024e73).
+        let p2a_raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![
+                json!([{"txid": "00".repeat(32), "vout": 0}]),
+                json!([{addr.clone(): 1.0}]),
+            ],
+        )
+        .unwrap();
+        let p2a_signed = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![
+                p2a_raw.clone(),
+                json!([]),
+                json!([{
+                    "txid": "00".repeat(32),
+                    "vout": 0,
+                    "scriptPubKey": "51024e73",
+                    "amount": 1.0
+                }]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(p2a_signed["complete"], true);
+        assert_eq!(p2a_signed["hex"], p2a_raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rawtx_descsum_and_wrapped_multi() {
+        assert_eq!(
+            crate::rawtx::descsum_create("raw(deadbeef)"),
+            "raw(deadbeef)#89f8spxm"
+        );
+        let pk = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let desc = format!("sh(wsh(multi(1,{pk})))");
+        let spk = crate::rawtx::parse_wrapped_multi(&desc).expect("wrapped multi");
+        assert!(spk.is_p2sh());
+        let wsh = crate::rawtx::parse_wrapped_multi(&format!("wsh(multi(1,{pk}))")).unwrap();
+        assert!(wsh.is_p2wsh());
+        let sh = crate::rawtx::parse_wrapped_multi(&format!("sh(multi(1,{pk}))")).unwrap();
+        assert!(sh.is_p2sh());
+    }
+
+    #[test]
+    fn rawtx_sign_p2sh_p2wsh_and_p2wsh() {
+        use bitcoin::secp256k1::Secp256k1;
+        use bitcoin::PrivateKey;
+        use rbitcoin_primitives::hex_encode;
+        let (ctx, dir) = ctx_empty();
+        let secp = Secp256k1::new();
+        let wif = "cVpF924EspNh8KjYsfhgY96mmxvT6DgdWiTYMtMjuM74hJaU5psW";
+        let pk = PrivateKey::from_wif(wif)
+            .unwrap()
+            .public_key(&secp)
+            .to_string();
+        let dest = "mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB";
+        let dummy = "11".repeat(32);
+
+        let too_many = vec![pk.clone(); 21];
+        let e = dispatch(&ctx, "createmultisig", vec![json!(1), json!(too_many)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+
+        for (addr_type, wrap) in [("p2sh-segwit", "sh(wsh("), ("bech32", "wsh(")] {
+            let ms = dispatch(
+                &ctx,
+                "createmultisig",
+                vec![json!(1), json!([pk.clone()]), json!(addr_type)],
+            )
+            .unwrap();
+            assert!(ms["descriptor"].as_str().unwrap().starts_with(wrap));
+            let ws_hex = ms["redeemScript"].as_str().unwrap().to_string();
+            let desc = ms["descriptor"].as_str().unwrap();
+            let spk = crate::rawtx::parse_wrapped_multi(desc).unwrap();
+            let ws =
+                bitcoin::ScriptBuf::from_bytes(rbitcoin_primitives::hex_decode(&ws_hex).unwrap());
+            let redeem_hex = hex_encode(ws.as_script().to_p2wsh().as_bytes());
+            let raw = dispatch(
+                &ctx,
+                "createrawtransaction",
+                vec![json!([{"txid": dummy, "vout": 0}]), json!({dest: 1.0})],
+            )
+            .unwrap();
+            let mut prev = serde_json::Map::new();
+            prev.insert("txid".into(), json!(dummy));
+            prev.insert("vout".into(), json!(0));
+            prev.insert("scriptPubKey".into(), json!(hex_encode(spk.as_bytes())));
+            prev.insert("witnessScript".into(), json!(ws_hex.clone()));
+            prev.insert("amount".into(), json!(1.0));
+            if addr_type == "p2sh-segwit" {
+                prev.insert("redeemScript".into(), json!(redeem_hex));
+            }
+            let signed = dispatch(
+                &ctx,
+                "signrawtransactionwithkey",
+                vec![raw, json!([wif]), json!([prev])],
+            )
+            .unwrap();
+            assert_eq!(signed["complete"], true, "{addr_type}: {signed}");
+        }
+
+        let raw = dispatch(
+            &ctx,
+            "createrawtransaction",
+            vec![json!([{"txid": dummy, "vout": 0}]), json!({dest: 1.0})],
+        )
+        .unwrap();
+        let e = dispatch(
+            &ctx,
+            "signrawtransactionwithkey",
+            vec![
+                raw,
+                json!([wif]),
+                json!([{
+                    "txid": dummy,
+                    "vout": 0,
+                    "scriptPubKey": "a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa87",
+                    "amount": 1.0
+                }]),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(e["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing redeemScript"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stop_sets_flag() {
         let (ctx, dir) = ctx_empty();
         assert!(!ctx.stop.load(Ordering::SeqCst));
@@ -2322,7 +2686,7 @@ mod tests {
         let (ctx, dir) = ctx_empty();
         let e = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
         assert_eq!(e["code"], ERR_METHOD_NOT_FOUND);
-        let e2 = dispatch(&ctx, "createrawtransaction", vec![]).unwrap_err();
+        let e2 = dispatch(&ctx, "combinerawtransaction", vec![]).unwrap_err();
         assert_eq!(e2["code"], ERR_METHOD_NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3329,6 +3693,16 @@ mod tests {
         let txs = tmpl["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0]["txid"], tid);
+        let lp1 = tmpl["longpollid"].as_str().unwrap().to_string();
+        let tmpl2 = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+        assert_eq!(tmpl2["longpollid"], lp1);
+        let stale = dispatch(
+            &ctx,
+            "getblocktemplate",
+            vec![json!({"rules": ["segwit"], "longpollid": "not-this-id"})],
+        )
+        .unwrap();
+        assert_eq!(stale["longpollid"], lp1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3393,6 +3767,22 @@ mod tests {
         dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
         let pool = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
         assert_eq!(pool, json!([tid]), "deprioritised tx must stay unmined");
+
+        let missing = dispatch(&ctx, "prioritisetransaction", vec![]).unwrap_err();
+        assert_eq!(missing["code"], ERR_MISC);
+        assert_eq!(missing["message"], "prioritisetransaction");
+        let extra = dispatch(&ctx, "getprioritisedtransactions", vec![json!(true)]).unwrap_err();
+        assert_eq!(extra["code"], ERR_MISC);
+
+        let entry = dispatch(&ctx, "getmempoolentry", vec![tid.clone()]).unwrap();
+        assert!(entry["fees"]["chunk"].is_number());
+        assert_eq!(entry["chunkweight"], entry["weight"]);
+        let cluster = dispatch(&ctx, "getmempoolcluster", vec![tid.clone()]).unwrap();
+        assert_eq!(cluster["txcount"], 1);
+        assert_eq!(cluster["chunks"][0]["txs"], json!([tid]));
+        let missing_cl =
+            dispatch(&ctx, "getmempoolcluster", vec![json!("11".repeat(32))]).unwrap_err();
+        assert_eq!(missing_cl["code"], ERR_INVALID_ADDRESS_OR_KEY);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

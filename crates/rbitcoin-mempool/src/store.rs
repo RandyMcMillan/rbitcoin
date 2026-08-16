@@ -201,6 +201,23 @@ impl Mempool {
         Ok(slot)
     }
 
+    /// Drop every LIVE slot (Core `-persistmempool=0` start: do not reload).
+    pub fn abandon_live(&mut self) -> Result<u32, MempoolError> {
+        let mut n = 0u32;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] == SLOT_LIVE {
+                self.slots[off] = SLOT_DEAD;
+                n = n.saturating_add(1);
+            }
+        }
+        if n > 0 {
+            self.live_count = 0;
+            self.flush()?;
+        }
+        Ok(n)
+    }
+
     /// Mark slot DEAD and decrement live_count (rollback path).
     pub fn mark_slot_dead(&mut self, slot: u32) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
@@ -661,6 +678,23 @@ mod tests {
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
         assert_eq!(mp.generation(), 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandon_live_clears_reopen() {
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let tid = Txid::from_byte_array([0x22; 32]);
+        mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+            .unwrap();
+        mp.flush().unwrap();
+        assert_eq!(mp.live_count(), 1);
+        assert_eq!(mp.abandon_live().unwrap(), 1);
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        assert!(mp.load_live_txs().unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -263,6 +263,8 @@ fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), Accep
 #[derive(Debug, Clone)]
 pub struct PreparedAdmit {
     pub fee_sat: u64,
+    /// `prioritisetransaction` delta applied at prepare (min-relay / RBF).
+    pub fee_delta: i64,
     pub weight: u64,
     pub prevouts: Vec<TxOut>,
     pub chain_coins: Vec<Option<Coin>>,
@@ -294,7 +296,19 @@ impl ActiveMempool {
         dir: impl Into<std::path::PathBuf>,
         max_weight: u64,
     ) -> Result<Self, MempoolError> {
+        Self::open_with_limit_persist(dir, max_weight, true)
+    }
+
+    /// `persist=false` abandons any on-disk live set (Core `-persistmempool=0`).
+    pub fn open_with_limit_persist(
+        dir: impl Into<std::path::PathBuf>,
+        max_weight: u64,
+        persist: bool,
+    ) -> Result<Self, MempoolError> {
         let mut store = Mempool::open_or_create(dir)?;
+        if !persist {
+            store.abandon_live()?;
+        }
         let loaded = store.load_live_txs()?;
         let mut graph = TxGraph::new();
         let mut bodies = std::collections::HashMap::new();
@@ -403,7 +417,7 @@ impl ActiveMempool {
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
         self.last_accept_stages = AcceptStageUs::default();
-        let prep = self.prepare_admit(tx, utxos, tip)?;
+        let prep = self.prepare_admit(tx, utxos, tip, 0)?;
         let t_script = Instant::now();
         let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
         self.last_accept_stages.script_us = self
@@ -427,6 +441,7 @@ impl ActiveMempool {
         tx: &Transaction,
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
+        fee_delta: i64,
     ) -> Result<PreparedAdmit, AcceptError> {
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
@@ -525,14 +540,16 @@ impl ActiveMempool {
         }
         let fee_sat = input_value - output_value;
         let weight = tx.weight().to_wu();
+        let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
-        match policy::check_libre_admission(tx, fee_sat, weight) {
+        match policy::check_libre_admission(tx, admit_fee, weight) {
             PolicyResult::Standard => {}
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
         }
 
         Ok(PreparedAdmit {
             fee_sat,
+            fee_delta,
             weight,
             prevouts,
             chain_coins,
@@ -595,8 +612,11 @@ impl ActiveMempool {
 
         let fee_sat = prep.fee_sat;
         let weight = prep.weight;
+        let admit_fee =
+            (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
 
         // Full RBF (Libre): BIP125-style absolute fee **or** pure replace-by-fee-rate.
+        // Incoming modified fee (base + prioritisetransaction) vs incumbent base.
         let conflict_set = if !direct_conflicts.is_empty() {
             let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
             let set = self.graph.conflict_set(&direct);
@@ -605,7 +625,7 @@ impl ActiveMempool {
                 .graph
                 .set_fee_weight(&direct.iter().copied().collect::<BTreeSet<_>>());
             if !rbf_allows_replacement(
-                fee_sat,
+                admit_fee,
                 weight,
                 old_fee,
                 old_weight,
@@ -711,7 +731,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let prep = self.prepare_admit(tx, utxos, tip)?;
+        let prep = self.prepare_admit(tx, utxos, tip, 0)?;
         let t_script = Instant::now();
         let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
         self.last_accept_stages.script_us = self

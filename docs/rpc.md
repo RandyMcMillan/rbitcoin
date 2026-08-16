@@ -5,9 +5,10 @@ keys such as `blockhash`, `verbosity`, `txid`, `hexstring`). Missing
 required keys are `-32602`; unknown named keys are `-8`.
 
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
-This is **not** full Core parity: no wallet, no `createrawtransaction`.
-`getblocktemplate` / `getmininginfo` are a miner-backend (no stratum, no
-BIP9 testdummy). `scantxoutset` supports `raw(script)` via the scripthash
+This is **not** full Core parity: no wallet. Stateless
+`createrawtransaction` / `signrawtransactionwithkey` / `createmultisig`
+take keys on the call. `getblocktemplate` / `getmininginfo` are a
+miner-backend (no stratum, no BIP9 testdummy). `scantxoutset` supports `raw(script)` via the scripthash
 index (when `--shindex`) or Class A txout + spent. Prefer **Electrum /
 Esplora** (with `--shindex`) for address/script history.
 
@@ -76,14 +77,18 @@ still wait for durable SH when shindex is on.
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `version` is rbitcoin semver as a Core integer (`0.1.0` → `100`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2` |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
-| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. |
+| `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. Verbose `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight` include `prioritisetransaction` deltas; top-level `ancestorfees` / `descendantfees` stay base satoshis. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. |
 | `getrawtransaction` | Class A + mempool |
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `decoderawtransaction` / `decodescript` / `validateaddress` | Pure decode |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
 | `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes `select_block_txs`, then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. |
-| `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting. Version is `VERSIONBITS_TOP_BITS` only (no testdummy). Longpoll wait is later. |
+| `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting. Version is `VERSIONBITS_TOP_BITS` only (no testdummy). `longpollid` waits until the tip or mempool update counter changes. |
 | `prioritisetransaction` / `getprioritisedtransactions` | All networks. Local mining fee delta (sat). Dummy must be 0. Selector honors modified fee. |
+| `getmempoolcluster` | All networks. Cluster weight / chunks from the live graph (modified fees). Same prefix-maximal chunks as mining selection. |
+| `createrawtransaction` | All networks. Unsigned tx from inputs + `{address:amount}` / `data` outputs. |
+| `signrawtransactionwithkey` | All networks. Sign with provided WIFs. Looks up prevouts from the chain/mempool when `prevtxs` is omitted. P2PKH, P2SH-multisig, P2WSH / P2SH-P2WSH. |
+| `createmultisig` | All networks. `legacy` (default) / `p2sh-segwit` / `bech32`. No keystore. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
 | `gettxout` | All networks. Class A + mempool. |
@@ -101,7 +106,7 @@ still wait for durable SH when shindex is on.
 |---------------|-----|
 | Wallet RPC | No keystore |
 | Mining / GBT | Non-goal. Regtest `generate*` is harness-only. `submitblock` is the same receive path as P2P. |
-| `createrawtransaction` / `combinerawtransaction` | Wallet-adjacent footgun; use external tools |
+| `combinerawtransaction` | Not implemented |
 | Full `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate. `raw()` Class A walk is the MiniWallet subset only. |
 | Address history via Core method names | Use Electrum/Esplora with `--shindex` |
 | Exact Core JSON field-for-field | Best-effort |

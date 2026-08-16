@@ -140,9 +140,9 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# --- dry-run writes config.ini with wallet off / bitcoind on ---
+# --- dry-run writes config.ini with wallet on (shim) / bitcoind on ---
 if [[ -f "$WORKDIR/config.ini" ]] \
-  && grep -q 'ENABLE_WALLET=false' "$WORKDIR/config.ini" \
+  && grep -q 'ENABLE_WALLET=true' "$WORKDIR/config.ini" \
   && grep -q 'ENABLE_BITCOIND=true' "$WORKDIR/config.ini" \
   && grep -q 'ENABLE_ZMQ=false' "$WORKDIR/config.ini" \
   && grep -q 'ENABLE_IPC=false' "$WORKDIR/config.ini"; then

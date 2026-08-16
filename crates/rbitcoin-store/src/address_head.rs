@@ -5,15 +5,15 @@
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
 //! **Insert (sole writer):** probe until the **same fk** is already present
-//! (idempotent) or an **empty** slot — plain mmap store `0 → fk` (no CAS, no
+//! (idempotent) or an **empty** slot — `pwrite` the slot (`0 → fk`; no CAS, no
 //! per-slot atomics). **No body_txid** on insert (no BIP30 displacement on write).
 //! Foreigners and older same-txid creates are skipped blindly; a second Class A
 //! row for the same txid lands at the next empty slot (deeper on the probe chain).
 //!
 //! **`insert_many` batching:** stable-sort by probe **page** then original index
 //! (preserves call order within a page for rare same-batch duplicate txids). One
-//! page load + multi-insert in RAM + plain slot stores per dirty slot, then a
-//! **SeqCst fence** so concurrent page loads + Acquire fence observe the batch.
+//! page load + multi-insert in RAM + one `pwrite` per dirty page. Visibility is
+//! the syscall plus `published_len` Release — not a CPU fence.
 //!
 //! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
@@ -699,8 +699,7 @@ impl AddressHead {
     /// Load a full probe page starting at global `page_base` into `buf`.
     ///
     /// **One** bulk pread of up to `n_slots × entry_bytes` (4 KiB @ 4 B / 1024
-    /// slots). Caps to the slot data region (excludes trailing footer). Acquire
-    /// fence so concurrent probes observe prior sole-writer Release stores.
+    /// slots). Caps to the slot data region (excludes trailing footer).
     ///
     /// Returns bytes filled (multiple of entry size). Callers must pass the
     /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
@@ -750,8 +749,6 @@ impl AddressHead {
                 self.file.read_at(off, &mut buf[..need])?;
             }
         }
-        // Pair with sole-writer stores + SeqCst fence after insert_many.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         Ok(need)
     }
 
@@ -770,8 +767,7 @@ impl AddressHead {
     /// page for rare same-batch duplicate txids).
     ///
     /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`] in
-    /// RAM, then **one page write-back** if dirty (not per-slot pwrite). **SeqCst
-    /// fence** once at end.
+    /// RAM, then **one page write-back** if dirty (not per-slot pwrite).
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -833,7 +829,6 @@ impl AddressHead {
             i = j;
         }
 
-        std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
 
@@ -1183,6 +1178,16 @@ mod tests {
         assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
         assert_eq!(s.depth_end, 2);
         assert_eq!(s.empty_local, 2);
+    }
+
+    #[test]
+    fn address_head_has_no_cpu_fence() {
+        let src = include_str!("address_head.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            !prod.contains("atomic::fence") && !prod.contains("fence(Ordering"),
+            "fd-only head pages: pwrite/pread publish; no mmap-era CPU fence"
+        );
     }
 
     #[test]

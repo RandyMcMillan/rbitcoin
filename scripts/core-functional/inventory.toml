@@ -50,7 +50,7 @@ analog = "none (no UTXO snapshot)"
 name = "feature_assumevalid.py"
 status = "skip"
 reason = "core-log"
-analog = "rbitcoin-test --milestone skip-below / check-above (TODO)"
+analog = "core_analogs::analog_milestone_skip_below_check_above"
 
 [[test]]
 name = "feature_bind_extra.py"
@@ -71,11 +71,13 @@ reason = "core-net-policy"
 name = "feature_bip68_sequence.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: CSV/BIP68 RPC + generate"
 
 [[test]]
 name = "feature_block.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: large P2P block / RPC surface"
 
 [[test]]
 name = "feature_blocksdir.py"
@@ -93,6 +95,7 @@ analog = "none"
 name = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: equal-work tip choice (preciousblock exists)"
 
 [[test]]
 name = "feature_cltv.py"
@@ -120,6 +123,7 @@ reason = "core-log"
 name = "feature_csv_activation.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: CSV activation + generate"
 
 [[test]]
 name = "feature_dbcrash.py"
@@ -188,6 +192,7 @@ status = "run"
 name = "feature_includeconf.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (Core includeconf)"
 
 [[test]]
 name = "feature_index_prune.py"
@@ -217,6 +222,7 @@ analog = "none"
 name = "feature_maxtipage.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: IBD tip-age / maxtipage"
 
 [[test]]
 name = "feature_maxuploadtarget.py"
@@ -227,16 +233,19 @@ reason = "core-log"
 name = "feature_minchainwork.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: minchainwork"
 
 [[test]]
 name = "feature_notifications.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (wallet/ZMQ notify)"
 
 [[test]]
 name = "feature_nulldummy.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: nulldummy + generate"
 
 [[test]]
 name = "feature_port.py"
@@ -275,19 +284,19 @@ reason = "policy-libre"
 name = "feature_reindex.py"
 status = "skip"
 reason = "core-internal"
-analog = "archive reconstruct / reopen after lost head"
+analog = "core_analogs::analog_reconstruct_after_lost_head"
 
 [[test]]
 name = "feature_reindex_init.py"
 status = "skip"
 reason = "core-internal"
-analog = "archive reconstruct / reopen after lost head"
+analog = "core_analogs::analog_reconstruct_after_lost_head"
 
 [[test]]
 name = "feature_reindex_readonly.py"
 status = "skip"
 reason = "core-internal"
-analog = "archive reconstruct / reopen after lost head"
+analog = "core_analogs::analog_reconstruct_after_lost_head"
 
 [[test]]
 name = "feature_remove_pruned_files_on_startup.py"
@@ -299,6 +308,7 @@ analog = "none"
 name = "feature_segwit.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: large segwit activation"
 
 [[test]]
 name = "feature_settings.py"
@@ -310,6 +320,7 @@ analog = "none"
 name = "feature_shutdown.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: shutdown RPC / interrupt"
 
 [[test]]
 name = "feature_signet.py"
@@ -320,11 +331,13 @@ reason = "core-log"
 name = "feature_startupnotify.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (startupnotify)"
 
 [[test]]
 name = "feature_taproot.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: taproot activation + generate"
 
 [[test]]
 name = "feature_uacomment.py"
@@ -346,6 +359,7 @@ analog = "none"
 name = "feature_versionbits_warning.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: versionbits warning"
 
 [[test]]
 name = "interface_bitcoin_cli.py"
@@ -356,6 +370,7 @@ reason = "no-wallet"
 name = "interface_http.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: HTTP REST-adjacent RPC"
 
 [[test]]
 name = "interface_ipc.py"
@@ -376,6 +391,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: batch/http error-shape parity"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -416,21 +432,25 @@ reason = "no-zmq"
 name = "mempool_accept.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: MiniWallet + testmempoolaccept field parity"
 
 [[test]]
 name = "mempool_accept_wtxid.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: wtxid accept"
 
 [[test]]
 name = "mempool_cluster.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: cluster limits"
 
 [[test]]
 name = "mempool_compatibility.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (Core mempool.dat bytes)"
 
 [[test]]
 name = "mempool_datacarrier.py"
@@ -451,6 +471,7 @@ reason = "policy-libre"
 name = "mempool_expiry.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: expiry"
 
 [[test]]
 name = "mempool_limit.py"
@@ -461,47 +482,55 @@ reason = "core-log"
 name = "mempool_package_limits.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: accept_package limits"
 
 [[test]]
 name = "mempool_package_rbf.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: package RBF"
 
 [[test]]
 name = "mempool_packages.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: accept_package"
 
 [[test]]
 name = "mempool_persist.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "durable mempool/ reopen (TODO pin)"
+analog = "core_analogs::analog_mempool_persist_reopen"
 
 [[test]]
 name = "mempool_reorg.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: reorg + mempool"
 
 [[test]]
 name = "mempool_resurrect.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: disconnect re-accept"
 
 [[test]]
 name = "mempool_sigoplimit.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: sigops"
 
 [[test]]
 name = "mempool_spend_coinbase.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: coinbase maturity + mempool"
 
 [[test]]
 name = "mempool_truc.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: TRUC/v3"
 
 [[test]]
 name = "mempool_unbroadcast.py"
@@ -512,6 +541,7 @@ reason = "core-log"
 name = "mempool_updatefromblock.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: reorg package"
 
 [[test]]
 name = "mining_basic.py"
@@ -542,11 +572,13 @@ reason = "no-mining-product"
 name = "p2p_1p1c_network.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: 1p1c + generate + addconnection"
 
 [[test]]
 name = "p2p_add_connections.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: addconnection types (RPC exists)"
 
 [[test]]
 name = "p2p_addr_relay.py"
@@ -562,6 +594,7 @@ reason = "core-log"
 name = "p2p_addrfetch.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: addr-fetch + mapped logs"
 
 [[test]]
 name = "p2p_addrv2_relay.py"
@@ -572,6 +605,7 @@ reason = "core-log"
 name = "p2p_block_sync.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: headers/compact sync"
 
 [[test]]
 name = "p2p_blockfilters.py"
@@ -592,11 +626,13 @@ reason = "core-log"
 name = "p2p_compactblocks_blocksonly.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: compact + blocksonly"
 
 [[test]]
 name = "p2p_compactblocks_hb.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: compact high-bandwidth"
 
 [[test]]
 name = "p2p_disconnect_ban.py"
@@ -612,11 +648,13 @@ reason = "core-net-policy"
 name = "p2p_eviction.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: inbound eviction"
 
 [[test]]
 name = "p2p_feefilter.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: feefilter"
 
 [[test]]
 name = "p2p_filter.py"
@@ -627,16 +665,19 @@ reason = "core-log"
 name = "p2p_fingerprint.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: stale-tip serve"
 
 [[test]]
 name = "p2p_getaddr_caching.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: getaddr"
 
 [[test]]
 name = "p2p_getdata.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: getdata + reconstruct serve"
 
 [[test]]
 name = "p2p_handshake.py"
@@ -677,11 +718,13 @@ reason = "core-log"
 name = "p2p_invalid_block.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: invalid block reject + map"
 
 [[test]]
 name = "p2p_invalid_locator.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: locator bounds"
 
 [[test]]
 name = "p2p_invalid_messages.py"
@@ -702,6 +745,7 @@ reason = "core-log"
 name = "p2p_leak_tx.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: tx leak / inv"
 
 [[test]]
 name = "p2p_message_capture.py"
@@ -718,11 +762,13 @@ reason = "core-log"
 name = "p2p_net_deadlock.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: net deadlock harness"
 
 [[test]]
 name = "p2p_nobloomfilter_messages.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: bloom disabled"
 
 [[test]]
 name = "p2p_node_network_limited.py"
@@ -734,6 +780,7 @@ analog = "historical reconstruct serve (no prune)"
 name = "p2p_opportunistic_1p1c.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: opportunistic 1p1c"
 
 [[test]]
 name = "p2p_orphan_handling.py"
@@ -744,6 +791,7 @@ reason = "core-log"
 name = "p2p_outbound_eviction.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: outbound eviction"
 
 [[test]]
 name = "p2p_permissions.py"
@@ -779,6 +827,7 @@ reason = "core-log"
 name = "p2p_sendheaders.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: sendheaders"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"
@@ -794,11 +843,13 @@ reason = "core-log"
 name = "p2p_tx_download.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: tx download"
 
 [[test]]
 name = "p2p_tx_privacy.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: tx privacy"
 
 [[test]]
 name = "p2p_unrequested_blocks.py"
@@ -809,6 +860,7 @@ reason = "core-log"
 name = "p2p_v2_encrypted.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: v2 encrypted (we force v2)"
 
 [[test]]
 name = "p2p_v2_misbehaving.py"
@@ -824,11 +876,13 @@ reason = "core-log"
 name = "rpc_bind.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: bind/rpcbind (core-net-policy-adjacent)"
 
 [[test]]
 name = "rpc_blockchain.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: waitforblock*/gettxout/getchaintxstats; getblock exists"
 
 [[test]]
 name = "rpc_createmultisig.py"
@@ -839,11 +893,13 @@ reason = "no-wallet"
 name = "rpc_decodescript.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: Core decodescript field parity (method exists)"
 
 [[test]]
 name = "rpc_deprecated.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (Core deprecation surface)"
 
 [[test]]
 name = "rpc_deriveaddresses.py"
@@ -860,6 +916,7 @@ analog = "none"
 name = "rpc_estimatefee.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: estimatesmartfee exists; Core multi-horizon text"
 
 [[test]]
 name = "rpc_generate.py"
@@ -870,6 +927,7 @@ reason = "no-wallet"
 name = "rpc_getblockfilter.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (no compact filters)"
 
 [[test]]
 name = "rpc_getblockfrompeer.py"
@@ -881,11 +939,13 @@ analog = "IBD hole-fill / tip-follow getdata"
 name = "rpc_getblockstats.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: getblockstats"
 
 [[test]]
 name = "rpc_getchaintips.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: getchaintips"
 
 [[test]]
 name = "rpc_getdescriptoractivity.py"
@@ -901,31 +961,35 @@ reason = "no-wallet"
 name = "rpc_gettxspendingprevout.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: gettxspendingprevout"
 
 [[test]]
 name = "rpc_help.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: Core help categories / converthelp"
 
 [[test]]
 name = "rpc_invalid_address_message.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: validateaddress error text"
 
 [[test]]
 name = "rpc_invalidateblock.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: invalidateblock exists; test needs more RPC/P2P"
 
 [[test]]
 name = "rpc_misc.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: echojson/getmemoryinfo/getindexinfo"
 
 [[test]]
 name = "rpc_named_arguments.py"
-status = "skip"
-reason = "rpc-missing"
+status = "run"
 
 [[test]]
 name = "rpc_net.py"
@@ -936,16 +1000,19 @@ reason = "core-log"
 name = "rpc_orphans.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: orphan RPCs"
 
 [[test]]
 name = "rpc_packages.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: submitpackage"
 
 [[test]]
 name = "rpc_preciousblock.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: preciousblock exists; test needs fork setup"
 
 [[test]]
 name = "rpc_psbt.py"
@@ -956,6 +1023,7 @@ reason = "no-wallet"
 name = "rpc_rawtransaction.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: gettxout / createraw / fundraw"
 
 [[test]]
 name = "rpc_scanblocks.py"
@@ -993,6 +1061,7 @@ reason = "no-wallet"
 name = "rpc_txoutproof.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (no utxo proofs product)"
 
 [[test]]
 name = "rpc_uptime.py"
@@ -1007,11 +1076,13 @@ reason = "core-log"
 name = "rpc_validateaddress.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "follow-up: validateaddress exists; Core error-text"
 
 [[test]]
 name = "rpc_whitelist.py"
 status = "skip"
 reason = "rpc-missing"
+analog = "none (rpcwhitelist)"
 
 [[test]]
 name = "test_runner.py"

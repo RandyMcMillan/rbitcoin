@@ -146,6 +146,28 @@ EOF
 assert_fail_msg "reason=unknown illegal" "illegal reason: unknown" \
   python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
 
+# --- analog required for rpc-missing ---
+cat >"$WORKDIR/inv.toml" <<'EOF'
+pin = "v31.1"
+core_commit = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+
+[[test]]
+name = "feature_help.py"
+status = "run"
+
+[[test]]
+name = "wallet_basic.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "p2p_ping.py"
+status = "skip"
+reason = "rpc-missing"
+EOF
+assert_fail_msg "rpc-missing requires analog" "missing analog: p2p_ping.py" \
+  python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
+
 # --- analog required for no-prune / core-internal / no-utxo-set ---
 cat >"$WORKDIR/inv.toml" <<'EOF'
 pin = "v31.1"

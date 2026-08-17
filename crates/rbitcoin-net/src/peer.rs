@@ -6,6 +6,7 @@ use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
 use crate::peer_dos::{PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE};
+use crate::peers::PingAction;
 use crate::v2::{open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer};
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
@@ -291,7 +292,8 @@ pub async fn peer_session_with(
         }),
     )
     .await;
-    // So `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29.
+    // Untracked keepalive so `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29
+    // before LivePeer ping state is armed. Session peers send a tracked ping ~50ms later.
     let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(rand_nonce())).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
@@ -346,6 +348,16 @@ pub async fn peer_session_with(
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(50)), if session.is_some() => {
                     if let Some(s) = session.as_ref() {
+                        match s.take_ping_action(s.clock_now()) {
+                            Some(PingAction::Send { nonce }) => {
+                                let _ = queue_out(&out_tx, NetworkMessage::Ping(nonce));
+                            }
+                            Some(PingAction::Timeout { elapsed_secs }) => {
+                                rbitcoin_log::info!("ping timeout: {elapsed_secs:.6}s");
+                                s.request_disconnect();
+                            }
+                            None => {}
+                        }
                         match s.pending_sendcmpct.swap(0, Ordering::Relaxed) {
                             1 => {
                                 let _ = queue_out(
@@ -505,10 +517,18 @@ pub async fn peer_session_with(
                         // Soft: drop this message but keep session for first offense.
                         continue;
                     }
-                    // Ping: cheap 8-byte path — never leave the I/O task for decode.
+                    // Ping/pong: cheap 8-byte path — never leave the I/O task for decode.
                     if frame.is_ping() {
                         if let Some(n) = frame.ping_nonce() {
                             queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                        }
+                        continue;
+                    }
+                    if frame.is_pong() {
+                        if let Some(s) = session.as_ref() {
+                            if let Some(line) = s.on_pong(&frame.payload, s.clock_now()) {
+                                rbitcoin_log::info!("{line}");
+                            }
                         }
                         continue;
                     }

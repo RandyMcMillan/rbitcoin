@@ -80,6 +80,10 @@ impl FramedMessage {
         self.command == *b"ping\0\0\0\0\0\0\0\0"
     }
 
+    pub fn is_pong(&self) -> bool {
+        self.command == *b"pong\0\0\0\0\0\0\0\0"
+    }
+
     #[inline]
     pub fn is_notfound(&self) -> bool {
         self.command == *b"notfound\0\0\0\0"

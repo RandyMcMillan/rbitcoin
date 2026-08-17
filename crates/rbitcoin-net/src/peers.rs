@@ -68,6 +68,14 @@ pub struct LivePeer {
     pub pending_sendcmpct: std::sync::atomic::AtomicU8,
     /// After a large reorg, announce inv until the peer getheaders/inv's us.
     pub headers_paused: AtomicBool,
+    /// Outstanding ping nonce (`0` = none). Core `m_ping_nonce_sent`.
+    ping_nonce_sent: AtomicU64,
+    /// When the last ping was sent, or `0` if never (`m_ping_start` seconds).
+    ping_start_secs: AtomicU64,
+    /// RPC `ping` queued a probe (`m_ping_queued`).
+    ping_queued: AtomicBool,
+    pingtime: Mutex<Option<f64>>,
+    minping: Mutex<Option<f64>>,
     owner: std::sync::Weak<PeerHub>,
     recv: Mutex<HashMap<String, u64>>,
     sent: Mutex<HashMap<String, u64>>,
@@ -106,6 +114,98 @@ impl LivePeer {
         self.hb_from.store(v, Ordering::Relaxed);
     }
 
+    pub fn queue_ping(&self) {
+        self.ping_queued.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clock_now(&self) -> u64 {
+        self.owner
+            .upgrade()
+            .map(|h| h.now_secs())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            })
+    }
+
+    /// Core `MaybeSendPing`: timeout first, then RPC-queued / interval probe.
+    pub fn take_ping_action(&self, now_secs: u64) -> Option<PingAction> {
+        const PING_INTERVAL: u64 = 120;
+        const TIMEOUT_INTERVAL: u64 = 20 * 60;
+        let nonce = self.ping_nonce_sent.load(Ordering::Relaxed);
+        let start = self.ping_start_secs.load(Ordering::Relaxed);
+        if nonce != 0 && now_secs > start.saturating_add(TIMEOUT_INTERVAL) {
+            let elapsed = now_secs.saturating_sub(start) as f64;
+            return Some(PingAction::Timeout {
+                elapsed_secs: elapsed,
+            });
+        }
+        let queued = self.ping_queued.load(Ordering::Relaxed);
+        let due = nonce == 0 && now_secs > start.saturating_add(PING_INTERVAL);
+        if !queued && !due {
+            return None;
+        }
+        let mut n = rand_ping_nonce();
+        while n == 0 {
+            n = rand_ping_nonce();
+        }
+        self.ping_queued.store(false, Ordering::Relaxed);
+        self.ping_start_secs.store(now_secs, Ordering::Relaxed);
+        self.ping_nonce_sent.store(n, Ordering::Relaxed);
+        Some(PingAction::Send { nonce: n })
+    }
+
+    /// Core pong handling (`p2p_ping.py` needles).
+    pub fn on_pong(&self, payload: &[u8], now_secs: u64) -> Option<String> {
+        let expected = self.ping_nonce_sent.load(Ordering::Relaxed);
+        let (problem, received, finish) = if payload.len() < 8 {
+            (Some("Short payload"), 0u64, true)
+        } else {
+            let received = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0; 8]));
+            if expected == 0 {
+                (Some("Unsolicited pong without ping"), received, false)
+            } else if received == expected {
+                let start = self.ping_start_secs.load(Ordering::Relaxed);
+                if now_secs >= start {
+                    let rtt = (now_secs - start) as f64;
+                    *self.pingtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(rtt);
+                    let mut minp = self.minping.lock().unwrap_or_else(|e| e.into_inner());
+                    *minp = Some(minp.map_or(rtt, |m| m.min(rtt)));
+                }
+                (None, received, true)
+            } else if received == 0 {
+                (Some("Nonce zero"), received, true)
+            } else {
+                (Some("Nonce mismatch"), received, false)
+            }
+        };
+        if finish {
+            self.ping_nonce_sent.store(0, Ordering::Relaxed);
+        }
+        problem.map(|p| {
+            format!(
+                "pong peer={}: {p}, {expected:x} expected, {received:x} received, {} bytes",
+                self.id,
+                payload.len()
+            )
+        })
+    }
+
+    fn ping_rpc_fields(&self, now_secs: u64) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let pingtime = *self.pingtime.lock().unwrap_or_else(|e| e.into_inner());
+        let minping = *self.minping.lock().unwrap_or_else(|e| e.into_inner());
+        let nonce = self.ping_nonce_sent.load(Ordering::Relaxed);
+        let start = self.ping_start_secs.load(Ordering::Relaxed);
+        let pingwait = if nonce != 0 && start != 0 {
+            Some(now_secs.saturating_sub(start) as f64)
+        } else {
+            None
+        };
+        (pingtime, minping, pingwait)
+    }
+
     /// We just accepted a new tip from this peer — consider them for HB.
     pub fn maybe_select_as_hb(&self) {
         if let Some(hub) = self.owner.upgrade() {
@@ -113,7 +213,8 @@ impl LivePeer {
         }
     }
 
-    fn snapshot(&self) -> PeerInfo {
+    fn snapshot(&self, now_secs: u64) -> PeerInfo {
+        let (pingtime, minping, pingwait) = self.ping_rpc_fields(now_secs);
         PeerInfo {
             id: self.id,
             addr: self.addr,
@@ -127,8 +228,31 @@ impl LivePeer {
             conn_type: self.conn_type,
             bip152_hb_to: self.hb_to.load(Ordering::Relaxed),
             bip152_hb_from: self.hb_from.load(Ordering::Relaxed),
+            pingtime,
+            minping,
+            pingwait,
         }
     }
+}
+
+/// Result of Core `MaybeSendPing`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PingAction {
+    Send { nonce: u64 },
+    Timeout { elapsed_secs: f64 },
+}
+
+fn rand_ping_nonce() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static N: AtomicU64 = AtomicU64::new(1);
+    let seq = N.fetch_add(1, Ordering::Relaxed);
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        | 1
 }
 
 /// Count at least Core's 24-byte header; `pong` must be ≥29 for `connect_nodes`.
@@ -156,6 +280,9 @@ pub struct PeerInfo {
     pub conn_type: PeerConnType,
     pub bip152_hb_to: bool,
     pub bip152_hb_from: bool,
+    pub pingtime: Option<f64>,
+    pub minping: Option<f64>,
+    pub pingwait: Option<f64>,
 }
 
 /// Thread-safe session table + addnode remembered addrs.
@@ -166,6 +293,8 @@ pub struct PeerHub {
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
     /// Peers we asked to send us compact (BIP152 HB, max 3, prefer outbound).
     hb_selected: Mutex<Vec<u64>>,
+    /// `setmocktime` seconds; `0` means wall clock.
+    mock_now: AtomicU64,
 }
 
 impl PeerHub {
@@ -176,7 +305,30 @@ impl PeerHub {
             added: Mutex::new(HashSet::new()),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
+            mock_now: AtomicU64::new(0),
         })
+    }
+
+    pub fn now_secs(&self) -> u64 {
+        let mock = self.mock_now.load(Ordering::Relaxed);
+        if mock != 0 {
+            return mock;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    pub fn set_mock_now(&self, ts: u64) {
+        self.mock_now.store(ts, Ordering::Relaxed);
+    }
+
+    pub fn queue_pings(&self) {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        for p in g.values() {
+            p.queue_ping();
+        }
     }
 
     pub fn set_dialer(&self, tx: mpsc::UnboundedSender<DialRequest>) {
@@ -207,6 +359,11 @@ impl PeerHub {
             hb_from: AtomicBool::new(false),
             pending_sendcmpct: std::sync::atomic::AtomicU8::new(0),
             headers_paused: AtomicBool::new(false),
+            ping_nonce_sent: AtomicU64::new(0),
+            ping_start_secs: AtomicU64::new(0),
+            ping_queued: AtomicBool::new(false),
+            pingtime: Mutex::new(None),
+            minping: Mutex::new(None),
             owner: Arc::downgrade(self),
             recv: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
@@ -230,8 +387,9 @@ impl PeerHub {
     }
 
     pub fn snapshot(&self) -> Vec<PeerInfo> {
+        let now = self.now_secs();
         let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-        let mut v: Vec<_> = g.values().map(|p| p.snapshot()).collect();
+        let mut v: Vec<_> = g.values().map(|p| p.snapshot(now)).collect();
         v.sort_by_key(|p| p.id);
         v
     }
@@ -412,5 +570,68 @@ mod tests {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         assert!(hub.addnode(a, "nope").is_err());
+    }
+
+    #[test]
+    fn ping_pong_logs_core_needles() {
+        let hub = PeerHub::new();
+        hub.set_mock_now(1_700_000_000);
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        // start=0 → interval due immediately
+        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs()).unwrap() else {
+            panic!("expected send");
+        };
+        assert_ne!(nonce, 0);
+        let wait = hub.snapshot()[0].pingwait;
+        assert_eq!(wait, Some(0.0));
+
+        hub.set_mock_now(1_700_000_003);
+        assert_eq!(hub.snapshot()[0].pingwait, Some(3.0));
+
+        let short = p.on_pong(&[], hub.now_secs()).expect("short");
+        assert!(short.starts_with("pong peer=0: Short payload"), "{short}");
+        assert!(p
+            .on_pong(&0u64.to_le_bytes(), hub.now_secs())
+            .unwrap()
+            .contains("Unsolicited pong without ping, 0 expected, 0 received, 8 bytes"));
+
+        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs() + 121).unwrap() else {
+            panic!("interval send");
+        };
+        let wrong = (nonce.wrapping_sub(1)).to_le_bytes();
+        let mm = p.on_pong(&wrong, hub.now_secs() + 121).unwrap();
+        assert!(mm.contains("Nonce mismatch"), "{mm}");
+        let zero = p
+            .on_pong(&0u64.to_le_bytes(), hub.now_secs() + 121)
+            .unwrap();
+        assert!(zero.contains("Nonce zero"), "{zero}");
+
+        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs() + 250).unwrap() else {
+            panic!("rpc-style send");
+        };
+        let now = hub.now_secs() + 279;
+        assert!(p.on_pong(&nonce.to_le_bytes(), now).is_none());
+        let snap = {
+            hub.set_mock_now(now);
+            hub.snapshot()
+        };
+        assert_eq!(snap[0].pingtime, Some(29.0));
+        assert_eq!(snap[0].minping, Some(29.0));
+        assert_eq!(snap[0].pingwait, None);
+
+        p.queue_ping();
+        let PingAction::Send { .. } = p.take_ping_action(now).unwrap() else {
+            panic!("queued");
+        };
+        let to = p.take_ping_action(now + 1201).unwrap();
+        match to {
+            PingAction::Timeout { elapsed_secs } => {
+                assert!((elapsed_secs - 1201.0).abs() < 0.01, "{elapsed_secs}");
+                let line = format!("ping timeout: {elapsed_secs:.6}s");
+                assert_eq!(line, "ping timeout: 1201.000000s");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

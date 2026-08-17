@@ -29,3 +29,11 @@ emit = ['Block validation error: {1}']
 [[rule]]
 match = '([0-9a-f]{64}), bad-version\(0x([0-9a-f]{8})\)'
 emit = ['{1}, bad-version(0x{2})']
+
+[[rule]]
+match = 'pong peer=(\d+): (.+)'
+emit = ['pong peer={1}: {2}']
+
+[[rule]]
+match = 'ping timeout: ([0-9.]+)s'
+emit = ['ping timeout: {1}s']

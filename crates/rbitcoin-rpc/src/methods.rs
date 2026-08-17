@@ -326,6 +326,10 @@ pub fn dispatch(
             params.reject_unknown(&[])?;
             Ok(getpeerinfo(ctx))
         }
+        "ping" => {
+            params.reject_unknown(&[])?;
+            ping(ctx)
+        }
         "addnode" => addnode(ctx, &params),
         "disconnectnode" => disconnectnode(ctx, &params),
         "addconnection" => addconnection(ctx, &params),
@@ -468,6 +472,7 @@ const METHOD_LIST: &[&str] = &[
     "getnetworkinfo",
     "getconnectioncount",
     "getpeerinfo",
+    "ping",
     "addnode",
     "disconnectnode",
     "addconnection",
@@ -837,7 +842,7 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
     for (k, v) in p.bytessent_per_msg {
         sent.insert(k, json!(v));
     }
-    json!({
+    let mut row = json!({
         "id": p.id,
         "addr": p.addr.to_string(),
         "addrbind": p.addrbind.to_string(),
@@ -855,7 +860,24 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
         "synced_blocks": -1,
         "bip152_hb_to": p.bip152_hb_to,
         "bip152_hb_from": p.bip152_hb_from,
-    })
+    });
+    if let Some(v) = p.pingtime {
+        row["pingtime"] = json!(v);
+    }
+    if let Some(v) = p.minping {
+        row["minping"] = json!(v);
+    }
+    if let Some(v) = p.pingwait {
+        row["pingwait"] = json!(v);
+    }
+    row
+}
+
+fn ping(ctx: &RpcContext) -> Result<Value, Value> {
+    if let Some(hub) = ctx.peers.as_ref() {
+        hub.queue_pings();
+    }
+    Ok(Value::Null)
 }
 
 fn services_names(bits: u64) -> Vec<&'static str> {
@@ -1865,6 +1887,9 @@ fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     miner
         .set_mock_time(ts)
         .map_err(|e| rpc_error(ERR_MISC, e))?;
+    if let Some(peers) = ctx.peers.as_ref() {
+        peers.set_mock_now(ts as u64);
+    }
     Ok(Value::Null)
 }
 
@@ -3011,6 +3036,7 @@ mod tests {
             "getnetworkinfo",
             "getconnectioncount",
             "getpeerinfo",
+            "ping",
             "getmempoolinfo",
             "getrawmempool",
         ] {

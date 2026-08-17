@@ -128,9 +128,9 @@ impl LiveUnion {
         (known, need)
     }
 
-    fn apply_forgets(&mut self, wave_ids: &[u32]) {
-        for &wid in wave_ids {
-            let Some(keys) = self.wave_keys.remove(&wid) else {
+    fn apply_forgets(&mut self, ids: &[u32]) {
+        for &id in ids {
+            let Some(keys) = self.wave_keys.remove(&id) else {
                 continue;
             };
             for t in keys {
@@ -145,16 +145,9 @@ impl LiveUnion {
         }
     }
 
-    /// Drain forgets, insert this wave's hits, publish one snapshot. Returns wave id.
-    pub fn finish_wave(
-        &mut self,
-        forget: &ForgetQueue,
-        hits: &IdMap,
-        published: &PublishedIds,
-    ) -> u32 {
+    /// Apply dequeued heights, then insert this height's hits. Does not swap.
+    pub fn note_height(&mut self, forget: &ForgetQueue, height: u32, hits: &IdMap) {
         self.apply_forgets(&forget.drain());
-        let wave_id = self.next_wave;
-        self.next_wave = self.next_wave.saturating_add(1);
         let mut keys = Vec::with_capacity(hits.len());
         for (t, &(fk, range)) in hits {
             if *t == [0u8; 32] {
@@ -172,9 +165,26 @@ impl LiveUnion {
                 }
             }
         }
-        self.wave_keys.insert(wave_id, keys);
+        self.wave_keys.insert(height, keys);
+    }
+
+    /// One snapshot swap. Call once after a wave's [`note_height`]s.
+    pub fn publish(&self, published: &PublishedIds) {
         published.publish(Arc::new(self.snapshot()));
-        wave_id
+    }
+
+    /// Drain forgets, insert hits under a synthetic height, publish one snapshot.
+    pub fn finish_wave(
+        &mut self,
+        forget: &ForgetQueue,
+        hits: &IdMap,
+        published: &PublishedIds,
+    ) -> u32 {
+        let height = self.next_wave;
+        self.next_wave = self.next_wave.saturating_add(1);
+        self.note_height(forget, height, hits);
+        self.publish(published);
+        height
     }
 
     pub fn snapshot(&self) -> IdMap {

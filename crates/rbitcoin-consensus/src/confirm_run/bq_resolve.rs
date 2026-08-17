@@ -146,17 +146,19 @@ pub fn confirm_bq_resolve_wave_with_ids(
     }
     stats.hits = hit_map.len() as u32;
     if let Some((live, published, forget)) = ids.as_mut() {
-        live.finish_wave(forget, &hit_map, published);
+        for (h, need) in &per_height {
+            let mut hits = rbitcoin_query::IdMap::new();
+            for t in need {
+                if let Some(&v) = hit_map.get(t) {
+                    hits.insert(*t, v);
+                }
+            }
+            live.note_height(forget, *h, &hits);
+        }
+        live.publish(published);
     }
 
-    for (h, need) in &per_height {
-        let attach: Vec<([u8; 32], rbitcoin_primitives::Fk, (u64, u64))> = need
-            .iter()
-            .filter_map(|t| hit_map.get(t).map(|(fk, range)| (*t, *fk, *range)))
-            .collect();
-        query
-            .block_queue_attach_parent_hits(*h, attach)
-            .map_err(ConsensusError::from)?;
+    for (h, _need) in &per_height {
         query
             .block_queue_mark_resolve_complete(*h)
             .map_err(ConsensusError::from)?;
@@ -296,17 +298,25 @@ mod tests {
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
 
-        let st = confirm_bq_resolve_wave(&q, &params, &[1, 2]).unwrap();
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let st = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            &[1, 2],
+            Some((
+                &mut live,
+                q.published_ids().as_ref(),
+                q.parent_id_forget().as_ref(),
+            )),
+        )
+        .unwrap();
         assert_eq!(st.heights, 2);
         assert!(st.keys >= 1);
         assert!(st.hits >= 1);
-        let hits1 = q.block_queue_parent_hits(1).expect("h1");
-        let hits2 = q.block_queue_parent_hits(2).expect("h2");
         assert!(
-            hits1.contains_key(&g_cb.to_byte_array()),
-            "genesis coinbase must be a TipOnly hit"
+            q.published_ids().get(&g_cb.to_byte_array()).is_some(),
+            "genesis coinbase must be a TipOnly hit in the published union"
         );
-        assert!(hits2.contains_key(&g_cb.to_byte_array()));
         assert!(q.block_queue_is_resolve_complete(1));
         assert!(q.block_queue_is_resolve_complete(2));
         let _ = std::fs::remove_dir_all(&path);
@@ -390,7 +400,6 @@ mod tests {
         assert_eq!(st.heights, 1);
         assert!(q.block_queue_is_resolve_complete(1));
         assert!(!q.block_queue_is_resolve_complete(2));
-        assert!(q.block_queue_parent_hits(2).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -415,11 +424,21 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.tip_height().map(|h| h.0), Some(0));
 
-        let st = confirm_bq_resolve_wave(&q, &params, &[2]).unwrap();
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let st = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            &[2],
+            Some((
+                &mut live,
+                q.published_ids().as_ref(),
+                q.parent_id_forget().as_ref(),
+            )),
+        )
+        .unwrap();
         assert_eq!(st.heights, 1);
-        let hits = q.block_queue_parent_hits(2).expect("child still queued");
         assert!(
-            !hits.contains_key(&cb1.to_byte_array()),
+            q.published_ids().get(&cb1.to_byte_array()).is_none(),
             "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
         );
         assert!(q.block_queue_is_resolve_complete(2));
@@ -723,7 +742,6 @@ mod tests {
             .unwrap();
         confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
         assert!(q.block_queue_is_resolve_complete(1));
-        let hits = q.block_queue_parent_hits(1).unwrap();
         let items = [(Height(1), std::sync::Arc::new(b1))];
         let stamped = crate::confirm_wire_lookup_stamp_with_hits(
             &q,
@@ -731,7 +749,7 @@ mod tests {
             Milestone::NONE,
             &items,
             None,
-            Some(&hits),
+            None,
         )
         .expect("coinbase-only block needs no external head");
         let mat = crate::confirm_wire_load_from_plan(

@@ -500,7 +500,7 @@ impl Query {
                 pin_txid_n = pin_txid_n.saturating_add(1);
                 continue;
             }
-            if let Some((fk, range)) = published.and_then(|p| p.get(t)) {
+            if let Some((fk, range)) = published.unwrap_or(self.published_ids.as_ref()).get(t) {
                 resolved.insert(*t, fk);
                 if let Some(id) = fk.get() {
                     pin_ranges.push((id, range));
@@ -1723,7 +1723,7 @@ mod tests {
     /// Published union supplies create_fk + range with no pin, BQ hits, or head row.
     #[test]
     fn archive_plan_batch_from_store_hits_published_ids() {
-        use crate::{IdMap, PublishedIds};
+        use crate::IdMap;
         use std::sync::Arc;
         let (dir, q) = temp_query("published-ids-stamp");
         let parent_txid = {
@@ -1731,7 +1731,7 @@ mod tests {
             t[0] = 0x55;
             t
         };
-        let published = PublishedIds::new();
+        let published = q.published_ids();
         let mut m = IdMap::new();
         m.insert(parent_txid, (Fk(66), (3000, 24)));
         published.publish(Arc::new(m));
@@ -1746,7 +1746,7 @@ mod tests {
                     &crate::InFlightView::empty(),
                     None,
                     None,
-                    Some(&published),
+                    None,
                 )
                 .expect("published union stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));

@@ -32,13 +32,13 @@ struct LoadAheadState {
 }
 
 impl LoadAheadState {
-    fn new(hub: &ChainHub, published: std::sync::Arc<rbitcoin_query::PublishedIds>) -> Self {
+    fn new(hub: &ChainHub) -> Self {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
-            published,
+            published: std::sync::Arc::clone(hub.query.published_ids()),
             last_loaded: None,
             disconnect_gen_seen: 0,
         }
@@ -1195,16 +1195,13 @@ pub(crate) fn spawn_confirm_engine(
     let loop_stats_load = Arc::clone(&loop_stats);
     let queues_load = Arc::clone(&queues);
     let load_ahead_reset_load = Arc::clone(&load_ahead_reset);
-    let published_ids = Arc::new(rbitcoin_query::PublishedIds::new());
-    let forget_queue = Arc::new(rbitcoin_query::ForgetQueue::new());
-    let published_ids_load = Arc::clone(&published_ids);
     let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!(
                 "ibd: confirm load on dedicated OS thread (claim resolve-complete → stamp+pin)"
             );
-            let mut lookup_ahead = LoadAheadState::new(&hub_load, published_ids_load);
+            let mut lookup_ahead = LoadAheadState::new(&hub_load);
             loop {
                 if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     break;
@@ -1386,12 +1383,6 @@ pub(crate) fn spawn_confirm_engine(
                     })
                     .collect();
                 confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
-                let mut merged = rbitcoin_store::BqParentHits::default();
-                for (h, _, _) in &wire_batch {
-                    if let Some(hits) = hub_load.query.block_queue_parent_hits(*h) {
-                        merged.extend(hits);
-                    }
-                }
                 let t_stamp = Instant::now();
                 let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp_with_hits(
                     &hub_load.query,
@@ -1399,11 +1390,7 @@ pub(crate) fn spawn_confirm_engine(
                     hub_load.milestone,
                     &plan_items,
                     if use_pipe { Some(&pipe) } else { None },
-                    if merged.is_empty() {
-                        None
-                    } else {
-                        Some(&merged)
-                    },
+                    None,
                 );
                 confirm_thr_stats::add_load_work(t_stamp.elapsed());
                 let stamped = match plan_res {
@@ -1585,9 +1572,14 @@ pub(crate) fn spawn_confirm_engine(
             info!("ibd: confirm lookup on dedicated OS thread (BQ-ahead TipOnly head_fk)");
             let _ = queues_lookup;
             let mut live_union = rbitcoin_query::LiveUnion::new();
+            let mut disco_seen = 0u64;
             loop {
                 if feed.stopped() {
                     break;
+                }
+                if hub.query.take_disconnect(&mut disco_seen).is_some() {
+                    live_union = rbitcoin_query::LiveUnion::new();
+                    hub.query.published_ids().unpublish();
                 }
                 let t_sel = Instant::now();
                 let skip: std::collections::HashSet<u32> = {
@@ -1615,8 +1607,8 @@ pub(crate) fn spawn_confirm_engine(
                         &wave_h,
                         Some((
                             &mut live_union,
-                            published_ids.as_ref(),
-                            forget_queue.as_ref(),
+                            hub.query.published_ids().as_ref(),
+                            hub.query.parent_id_forget().as_ref(),
                         )),
                     ) {
                         Ok(st) if st.heights > 0 => {

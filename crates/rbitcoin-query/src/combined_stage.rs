@@ -392,23 +392,23 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_parent_hits_via_query_die_with_dequeue() {
+    fn published_ids_forget_after_dequeue_and_wave_end() {
+        use crate::{IdMap, LiveUnion};
         let (dir, q) = temp_query();
         q.block_queue_enqueue(3, [3u8; 32], 1, b"wire").unwrap();
-        q.block_queue_attach_parent_hits(3, [([0xAAu8; 32], Fk(9), (8, 16))])
-            .unwrap();
         q.block_queue_mark_resolve_complete(3).unwrap();
-        assert!(q.block_queue_is_resolve_complete(3));
-        assert_eq!(
-            q.block_queue_parent_hits(3)
-                .unwrap()
-                .get(&[0xAAu8; 32])
-                .copied(),
-            Some((Fk(9), (8, 16)))
-        );
+        let mut live = LiveUnion::new();
+        let mut hits = IdMap::new();
+        hits.insert([0xAAu8; 32], (Fk(9), (8, 16)));
+        live.note_height(q.parent_id_forget(), 3, &hits);
+        live.publish(q.published_ids());
+        assert_eq!(q.published_ids().get(&[0xAAu8; 32]), Some((Fk(9), (8, 16))));
         assert_eq!(q.block_queue_dequeue_height(3).unwrap(), 1);
         assert!(!q.block_queue_is_resolve_complete(3));
-        assert!(q.block_queue_parent_hits(3).is_none());
+        // Dequeue only enqueues; snapshot updates at the next wave-end publish.
+        live.note_height(q.parent_id_forget(), 4, &IdMap::new());
+        live.publish(q.published_ids());
+        assert!(q.published_ids().get(&[0xAAu8; 32]).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -571,6 +571,9 @@ fn record_chosen_idx_ranges(
                 crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
             }
             None => {
+                crate::uring_session::note_uring_invariant(
+                    crate::uring_session::UringInvariant::IdxRangeMissing,
+                );
                 return Err(StoreError::Corrupt(
                     "invariant: idx range missing after identity",
                 ));

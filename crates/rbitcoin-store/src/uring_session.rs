@@ -524,6 +524,82 @@ pub fn unpack_ud(ud: u64) -> (u8, u16, u32) {
     (kind, epoch, slot)
 }
 
+/// Process counters for harvest invariants (tests + operator logs).
+#[derive(Default)]
+pub struct UringMeters {
+    pub unexpected_cqe: std::sync::atomic::AtomicU64,
+    pub undrained: std::sync::atomic::AtomicU64,
+    pub cq_overflow: std::sync::atomic::AtomicU64,
+    pub idx_range_missing: std::sync::atomic::AtomicU64,
+}
+
+static URING_METERS: UringMeters = UringMeters {
+    unexpected_cqe: std::sync::atomic::AtomicU64::new(0),
+    undrained: std::sync::atomic::AtomicU64::new(0),
+    cq_overflow: std::sync::atomic::AtomicU64::new(0),
+    idx_range_missing: std::sync::atomic::AtomicU64::new(0),
+};
+
+static WARNED_UNEXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_UNDRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_IDX_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+pub(crate) enum UringInvariant {
+    UnexpectedCqe,
+    Undrained,
+    CqOverflow,
+    IdxRangeMissing,
+}
+
+impl UringInvariant {
+    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            Self::UnexpectedCqe => &URING_METERS.unexpected_cqe,
+            Self::Undrained => &URING_METERS.undrained,
+            Self::CqOverflow => &URING_METERS.cq_overflow,
+            Self::IdxRangeMissing => &URING_METERS.idx_range_missing,
+        }
+    }
+
+    fn warned(self) -> &'static std::sync::atomic::AtomicBool {
+        match self {
+            Self::UnexpectedCqe => &WARNED_UNEXPECTED,
+            Self::Undrained => &WARNED_UNDRAINED,
+            Self::CqOverflow => &WARNED_OVERFLOW,
+            Self::IdxRangeMissing => &WARNED_IDX_RANGE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnexpectedCqe => "unexpected_cqe",
+            Self::Undrained => "undrained",
+            Self::CqOverflow => "cq_overflow",
+            Self::IdxRangeMissing => "idx_range_missing",
+        }
+    }
+}
+
+pub(crate) fn note_uring_invariant(kind: UringInvariant) {
+    kind.counter()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !kind
+        .warned()
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        rbitcoin_log::warn!(
+            "store: io_uring invariant {} (Corrupt; not a TipOnly miss)",
+            kind.label()
+        );
+    }
+}
+
+pub fn uring_meters() -> &'static UringMeters {
+    &URING_METERS
+}
+
 /// Expected in-flight `user_data` values for one harvest wave.
 ///
 /// Unmatched or duplicate CQEs are **not** completions — they are
@@ -549,6 +625,7 @@ impl UringPending {
     /// Record a submitted SQE. Duplicate `ud` is an invariant fail.
     pub fn insert(&mut self, ud: u64) -> Result<(), StoreError> {
         if !self.set.insert(ud) {
+            note_uring_invariant(UringInvariant::UnexpectedCqe);
             return Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"));
         }
         Ok(())
@@ -558,6 +635,7 @@ impl UringPending {
     /// On `Err`, `len` is unchanged (the CQE does not count as a completion).
     pub fn expect_cqe(&mut self, ud: u64) -> Result<(), StoreError> {
         if !self.set.remove(&ud) {
+            note_uring_invariant(UringInvariant::UnexpectedCqe);
             return Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"));
         }
         Ok(())
@@ -568,6 +646,7 @@ impl UringPending {
         if self.is_empty() {
             Ok(())
         } else {
+            note_uring_invariant(UringInvariant::Undrained);
             Err(StoreError::Corrupt("invariant: io_uring undrained"))
         }
     }
@@ -577,6 +656,7 @@ pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
     if overflow == 0 {
         Ok(())
     } else {
+        note_uring_invariant(UringInvariant::CqOverflow);
         Err(StoreError::Corrupt("invariant: io_uring cq overflow"))
     }
 }
@@ -695,6 +775,18 @@ mod tests {
             other => panic!("expected overflow Corrupt, got {other:?}"),
         }
         assert!(cq_overflow_result(0).is_ok());
+    }
+
+    #[test]
+    fn uring_meter_bump_and_take() {
+        let before = uring_meters()
+            .unexpected_cqe
+            .load(std::sync::atomic::Ordering::Relaxed);
+        note_uring_invariant(UringInvariant::UnexpectedCqe);
+        let after = uring_meters()
+            .unexpected_cqe
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before);
     }
 
     #[test]

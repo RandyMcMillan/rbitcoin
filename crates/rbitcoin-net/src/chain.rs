@@ -649,6 +649,33 @@ impl ChainHub {
         Ok(())
     }
 
+    /// Mine one block paying `script_pubkey` without connecting it.
+    ///
+    /// Core `generateblock … submit=false` returns the hex for `submitheader`.
+    pub fn assemble_block_to_script(
+        &self,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<bitcoin::Block, NetError> {
+        self.ensure_genesis()?;
+        let tip_h = self
+            .tip_height()
+            .ok_or(NetError::Protocol("generate: no tip"))?;
+        let prev = self
+            .tip_hash()
+            .ok_or(NetError::Protocol("generate: no tip hash"))?;
+        let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
+        let now = self.clock.now_secs() as u32;
+        let time = tip_time.saturating_add(1).max(now);
+        Ok(mine_regtest_paying(
+            prev,
+            time,
+            tip_h.saturating_add(1),
+            script_pubkey,
+            extra_txs,
+        ))
+    }
+
     /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
     ///
     /// Regtest harness only. Extra txs go in the first block. Ensures genesis.

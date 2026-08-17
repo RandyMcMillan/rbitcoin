@@ -81,6 +81,12 @@ pub trait RpcRegtest: Send + Sync {
         extra_txs: Vec<Transaction>,
     ) -> Result<Vec<BlockHash>, String>;
 
+    fn assemble_block_to_script(
+        &self,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<Block, String>;
+
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome;
 
     /// `0` = wall clock. Regtest harness only.
@@ -531,8 +537,9 @@ fn method_help(m: &str) -> String {
         "generatetoaddress" => "generatetoaddress nblocks address (maxtries)\n\
              Regtest harness only. Mines nblocks paying address via the P2P accept path."
             .into(),
-        "generateblock" => "generateblock output transactions\n\
-             Regtest harness only. One block paying output (address or hex script)."
+        "generateblock" => "generateblock output transactions (submit)\n\
+             Regtest harness only. One block paying output (address or hex script). \
+             submit=false returns {hash,hex} without connecting the block."
             .into(),
         "generate" => "generate nblocks (maxtries)\n\
              Regtest harness only. Mines to OP_TRUE (no wallet)."
@@ -1439,10 +1446,10 @@ fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
 }
 
 fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["output", "transactions"])?;
+    params.reject_unknown(&["output", "transactions", "submit"])?;
     let miner = require_regtest_miner(ctx, "generateblock")?;
     let output = params.req_str(0, "output")?;
-    let script = decode_output_script(ctx, output)?;
+    let script = parse_output_descriptor(ctx, output)?;
     let mut extra = Vec::new();
     if let Some(arr) = params.get_array(1, "transactions") {
         for v in arr {
@@ -1458,6 +1465,16 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         ));
     } else {
         return Err(rpc_error(ERR_INVALID_PARAMS, "transactions required"));
+    }
+    let submit = params.opt_bool(2, "submit")?.unwrap_or(true);
+    if !submit {
+        let block = miner
+            .assemble_block_to_script(script, extra)
+            .map_err(|e| rpc_error(ERR_MISC, e))?;
+        return Ok(json!({
+            "hash": block.block_hash().to_string(),
+            "hex": serialize_hex(&block),
+        }));
     }
     let hashes = miner
         .generate_to_script(1, script, extra)
@@ -3484,6 +3501,16 @@ mod tests {
                 .map_err(|e| e.to_string())
         }
 
+        fn assemble_block_to_script(
+            &self,
+            script_pubkey: ScriptBuf,
+            extra_txs: Vec<Transaction>,
+        ) -> Result<Block, String> {
+            self.0
+                .assemble_block_to_script(script_pubkey, extra_txs)
+                .map_err(|e| e.to_string())
+        }
+
         fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
             use bitcoin::Target;
             let target = Target::from_compact(block.header.bits);
@@ -3655,6 +3682,21 @@ mod tests {
         assert_eq!(same, raw_tx);
         let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
         assert_eq!(net["connections_in"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generateblock_submit_false_returns_hex_without_connecting() {
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let tip_before = hub.tip_height();
+        let mut named = serde_json::Map::new();
+        named.insert("output".into(), json!("raw(55)"));
+        named.insert("transactions".into(), json!([]));
+        named.insert("submit".into(), json!(false));
+        let got = dispatch(&ctx, "generateblock", RpcParams::named(named)).unwrap();
+        assert!(got.get("hex").and_then(|v| v.as_str()).is_some());
+        assert!(got.get("hash").and_then(|v| v.as_str()).is_some());
+        assert_eq!(hub.tip_height(), tip_before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

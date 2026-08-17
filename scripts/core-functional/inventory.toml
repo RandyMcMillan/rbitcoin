@@ -918,7 +918,7 @@ analog = "IBD hole-fill / tip-follow getdata"
 name = "rpc_getblockstats.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "getblockstats shipped (rust pin: coinbase-only + OP_RETURN); rpc_getblockstats.py blk00000.dat not found on disk"
+analog = "official: FileNotFoundError renaming blk00000.dat after stats/genesis/OP_RETURN/header-only passed (store/, not Core blocksdir)"
 
 [[test]]
 name = "rpc_getchaintips.py"

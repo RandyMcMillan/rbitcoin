@@ -2,7 +2,7 @@
 //!
 //! Three probe+identity waves (uring when available):
 //! 1. **Open** — unsealed tail (age 0)
-//! 2. **Sealed-hot** — sealed ages 1..=3
+//! 2. **Sealed-hot** — sealed ages 1..=3 (only keys still unfinished)
 //! 3. **Cold** — sealed ages ≥4 (only keys still unfinished)
 //!
 //! Each wave: probe that slice → at most two page-grouped `txid.body` shots
@@ -302,12 +302,15 @@ fn resolve_fk_and_range_core(
     )?;
 
     if any_unfinished(&winner, &connected, heights) {
+        let active = unfinished_mask(&winner, &connected, heights);
         let t_probe = Instant::now();
         let mid = match session.as_mut() {
             Some(s) => table
                 .head
-                .probe_candidates_batch_sealed_hot_on_session(&mixed, s)?,
-            None => table.head.probe_candidates_batch_sealed_hot(&mixed)?,
+                .probe_candidates_batch_sealed_hot_on_session(&mixed, &active, s)?,
+            None => table
+                .head
+                .probe_candidates_batch_sealed_hot(&mixed, &active)?,
         };
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &mid));
@@ -331,10 +334,7 @@ fn resolve_fk_and_range_core(
     }
 
     if any_unfinished(&winner, &connected, heights) {
-        let mut active = vec![false; txids.len()];
-        for i in 0..txids.len() {
-            active[i] = !key_finished(i, &winner, &connected, heights);
-        }
+        let active = unfinished_mask(&winner, &connected, heights);
         let t_probe = Instant::now();
         let cold = match session.as_mut() {
             Some(s) => table
@@ -620,6 +620,16 @@ fn any_unfinished(
     heights: Option<&HeightFence>,
 ) -> bool {
     (0..winner.len()).any(|i| !key_finished(i, winner, connected, heights))
+}
+
+fn unfinished_mask(
+    winner: &[Option<(Fk, (u64, u64))>],
+    connected: &[bool],
+    heights: Option<&HeightFence>,
+) -> Vec<bool> {
+    (0..winner.len())
+        .map(|i| !key_finished(i, winner, connected, heights))
+        .collect()
 }
 
 fn id_idx_wave(
@@ -1073,7 +1083,10 @@ mod tests {
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
         let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
-        let mid = t.head.probe_candidates_batch_sealed_hot(&mixed).unwrap();
+        let mid = t
+            .head
+            .probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()])
+            .unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
         let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
@@ -1126,12 +1139,39 @@ mod tests {
         let first = t.head.first_fks_snapshot();
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
         let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
-        let mid = t.head.probe_candidates_batch_sealed_hot(&mixed).unwrap();
+        let mid = t
+            .head
+            .probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()])
+            .unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
         let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
         assert_eq!(merged, full, "open∪sealed_hot∪cold must equal full probe");
+        let mid_off = t
+            .head
+            .probe_candidates_batch_sealed_hot(&mixed, &vec![false; mixed.len()])
+            .unwrap();
+        assert!(
+            mid_off.iter().all(|c| c.is_empty()),
+            "inactive sealed-hot mask must skip every key"
+        );
+        let hit = mid
+            .iter()
+            .position(|c| !c.is_empty())
+            .expect("expected sealed-hot cands");
+        let mut one = vec![false; mixed.len()];
+        one[hit] = true;
+        let mid_one = t
+            .head
+            .probe_candidates_batch_sealed_hot(&mixed, &one)
+            .unwrap();
+        assert_eq!(mid_one[hit], mid[hit]);
+        for (i, c) in mid_one.iter().enumerate() {
+            if i != hit {
+                assert!(c.is_empty(), "inactive key {i} must not probe sealed-hot");
+            }
+        }
         let mut saw_cold = false;
         for i in 0..txids.len() {
             for &fk in &open[i] {

@@ -1750,6 +1750,10 @@ fn store_start_states_lookup_load_confirm() {
         load_pin.contains("get_outs_by_range_batch"),
         "load pin must denserels by known body range"
     );
+    assert!(
+        !load_pin.contains("tx_spent_range_batch"),
+        "load pin must not spent.idx; write ensure owns abs"
+    );
 
     let _ = std::fs::remove_dir_all(&path);
 }
@@ -1903,10 +1907,10 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Load pin of an already-archived parent stamps `spent_range` (idx only).
-/// Write ensure must be a pin-hit for that fk (no second spent.idx batch).
+/// Load pin of an already-archived parent does **not** spent.idx-batch.
+/// Write `ensure_spend_abs_layouts` fills abs (idx only, no Class A cold).
 #[test]
-fn load_pin_stamps_spent_range_for_archived_parent() {
+fn write_ensure_stamps_spent_range_after_load_pin() {
     use super::{
         ensure_external_parent_denserels_from_plan, ensure_spend_abs_layouts, pin_for_wire_batch,
         ParentPinStamp, Prepared,
@@ -1993,8 +1997,11 @@ fn load_pin_stamps_spent_range_for_archived_parent() {
         None,
     )
     .unwrap();
-    assert!(parents.has_abs_layout(pfk), "load must stamp spent_range");
-    assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
+    assert!(
+        !parents.has_abs_layout(pfk),
+        "load pin must not spent.idx-batch; write ensure owns abs"
+    );
+    assert!(parents.get_spender_abs(pfk, 0).is_none());
 
     let prepared = [Prepared {
         height: Height(1),
@@ -2016,6 +2023,7 @@ fn load_pin_stamps_spent_range_for_archived_parent() {
         cold, 0,
         "archived parent must not cold-load at write ensure"
     );
+    assert!(parents.has_abs_layout(pfk), "write ensure must stamp spent_range");
     assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
     let _ = std::fs::remove_dir_all(&path);
 }

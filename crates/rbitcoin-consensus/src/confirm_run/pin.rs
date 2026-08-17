@@ -31,9 +31,8 @@ pub(super) fn take_need_outs(
 ///
 /// Sources: plan/in-flight offline denserels → **txout body by range** from
 /// [`ParentPinStamp`] (lookup-stamped). Load never reads head / `tx.idx` /
-/// `txid.body`. After outs are pinned, load stamps **`spent.idx` ranges** for
-/// already-archived parents (`tx_spent_range_batch` + `set_spent_range_only`).
-/// That is layout only — not `spent.body` metas and not `put_spend*`.
+/// `txid.body`. Write [`ensure_spend_abs_layouts`] stamps `spent.idx` ranges
+/// for archived parents — load does not idx-batch the full parent set.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -406,7 +405,7 @@ pub(super) fn pin_for_wire_batch(
 
     // Load IO contract: txout outs only via body-by-range (above) or plan/in-flight
     // offline pins. **Never** `tx.idx` / head cold denserels on load (idx is lookup).
-    // `spent.idx` range stamp is below (already-archived parents only).
+    // `spent.idx` range stamp is write `ensure_spend_abs_layouts` (not here).
     let n_cold = 0u64;
     let cold_io_ns = 0u64;
     let cold_decode_ns = 0u64;
@@ -434,29 +433,6 @@ pub(super) fn pin_for_wire_batch(
         }
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;
-
-    // Idx-only: stamp spent.body (off, len) for parents already in Class A.
-    // Write remains the sole annotator; this is not a spent.body meta read.
-    {
-        let mut spent_fks: Vec<rbitcoin_primitives::Fk> = parent_vouts
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .filter(|fk| !batch_parents.has_abs_layout(*fk))
-            .collect();
-        if !spent_fks.is_empty() {
-            spent_fks.sort_unstable_by_key(|f| f.0);
-            spent_fks.dedup();
-            let spent = query
-                .store()
-                .tx_spent_range_batch(&spent_fks)
-                .map_err(ConsensusError::from)?;
-            for (fk, opt) in spent_fks.iter().zip(spent.into_iter()) {
-                if let Some(sr) = opt {
-                    batch_parents.set_spent_range_only(*fk, sr);
-                }
-            }
-        }
-    }
 
     // One store lock: publish Weaks so peer load/writeq can adopt the same Arc.
     let t_publish = Instant::now();
@@ -540,11 +516,11 @@ pub(super) fn pin_for_wire_batch(
 /// tables (aside from the rayon pool and script phase timers).
 /// Ensure spend abs for every spend edge on the write batch.
 ///
-/// Load already stamps `spent_range` for archived parents. This gate covers
-/// residual gaps:
-/// 1. Same-batch creates (range only after `archive_commit_plan` + fill)
-/// 2. Load-ahead parents not yet in `spent.idx` when pinned
-/// 3. Retry after partial write
+/// Sole owner of `spent.idx` range stamp for write. Covers:
+/// 1. Archived parents (load pin no longer idx-batches the full set)
+/// 2. Same-batch creates (range only after `archive_commit_plan` + fill)
+/// 3. Load-ahead parents not yet in `spent.idx` when pinned
+/// 4. Retry after partial write
 ///
 /// Missing abs after those fills is `Corrupt`. Write still annotates every
 /// eligible edge; this function never calls `put_spend*`.

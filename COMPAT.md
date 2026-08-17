@@ -15,6 +15,9 @@ admission) and optional **Esplora-compatible REST** for the same role (history,
 UTXO, broadcast, block/tx fetch by id). Optional **Core-class JSON-RPC subset**
 (see [`docs/rpc.md`](./docs/rpc.md)) — not full Core wallet / mining parity.
 **Scripthash index (`--shindex`) defaults off**; Electrum/Esplora require it.
+On/off costs and start/IBD/tip behavior: [`OPERATOR.md`](./OPERATOR.md)
+(Scripthash index). Disable later leaves SH files on disk; follow does not
+wait on SH materialize.
 
 ### Query surface intent: wallet clients, not graphical explorers
 

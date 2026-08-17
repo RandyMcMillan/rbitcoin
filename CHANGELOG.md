@@ -50,6 +50,9 @@ before 1.0).
 - **No soak program.** Signet-first remains ordinary run advice. Q-35 is
   won't-fix. Docs no longer title a gated “soak” checklist.
 
+- **SH on/off:** COMPAT and README point at the OPERATOR cost table.
+  Disable-after-on leaves SH files on disk; tip follow stays up.
+
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
   `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
   never. Stratum / wallet keys stay non-goals.

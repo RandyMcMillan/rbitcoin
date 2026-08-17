@@ -82,6 +82,8 @@ pub struct ChainHub {
     gbt_assembled: AtomicBool,
     /// Core `-blockmintxfee` in sat/kvB. Default 1.
     block_min_tx_fee_sat_kvb: AtomicU64,
+    /// Block hashes we already issued getdata for (any peer).
+    asked_blocks: RwLock<HashSet<BlockHash>>,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -124,7 +126,22 @@ impl ChainHub {
             block_version: AtomicI32::new(0),
             gbt_assembled: AtomicBool::new(false),
             block_min_tx_fee_sat_kvb: AtomicU64::new(1),
+            asked_blocks: RwLock::new(HashSet::new()),
         }
+    }
+
+    pub fn note_asked_block(&self, hash: BlockHash) {
+        let mut g = self.asked_blocks.write().unwrap();
+        if g.len() >= 4096 {
+            g.clear();
+        }
+        g.insert(hash);
+    }
+
+    pub fn already_have_or_asked_block(&self, hash: &BlockHash) -> bool {
+        self.is_connected(hash)
+            || self.held_body(hash).is_some()
+            || self.asked_blocks.read().unwrap().contains(hash)
     }
 
     pub fn note_gbt_assembled(&self) {
@@ -523,6 +540,68 @@ impl ChainHub {
     /// Remember a consensus-invalid block (not a mutated merkle).
     pub fn note_invalid_block(&self, hash: BlockHash) {
         self.invalidated.write().unwrap().insert(hash);
+    }
+
+    /// True if we have a header row (best chain, header-only tip, or held body).
+    /// Used so we never `getdata` a block inv whose header we have not seen.
+    pub fn knows_header(&self, hash: &BlockHash) -> bool {
+        self.is_connected(hash)
+            || self.header_tips.read().unwrap().contains_key(hash)
+            || self
+                .query
+                .get_header_by_hash(&hash.to_byte_array())
+                .ok()
+                .flatten()
+                .is_some()
+            || self.held_body(hash).is_some()
+    }
+
+    /// `ancestor` is `descendant` or lies on its prev walk (disconnected ok).
+    pub(crate) fn is_header_ancestor(&self, ancestor: BlockHash, descendant: BlockHash) -> bool {
+        if ancestor == descendant {
+            return true;
+        }
+        if ancestor.to_byte_array() == [0u8; 32] {
+            return true;
+        }
+        let mut h = descendant;
+        for _ in 0..64 {
+            let Some(prev) = self.prev_of(&h) else {
+                return false;
+            };
+            if prev == ancestor {
+                return true;
+            }
+            if prev.to_byte_array() == [0u8; 32] {
+                return false;
+            }
+            h = prev;
+        }
+        false
+    }
+
+    /// Header for a connected, held, or archived hash.
+    pub(crate) fn header_of(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
+        if let Some(b) = self.load_side_body(hash) {
+            return Some(b.header);
+        }
+        if let Some(h) = self
+            .query
+            .height_of_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()
+        {
+            if let Ok(Some(b)) = self.block_at_height(h.0) {
+                if b.block_hash() == *hash {
+                    return Some(b.header);
+                }
+            }
+        }
+        self.query
+            .reconstruct_archived_block(&hash.to_byte_array())
+            .ok()
+            .flatten()
+            .map(|b| b.header)
     }
 
     /// Core `submitheader`: decode already succeeded. Missing parent, invalid

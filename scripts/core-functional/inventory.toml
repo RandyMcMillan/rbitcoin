@@ -804,9 +804,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_sendheaders.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "part 1 inv-before-sendheaders green; part 2+ headers/reorg/direct-fetch still red"
+status = "run"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"

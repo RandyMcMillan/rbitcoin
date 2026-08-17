@@ -832,6 +832,16 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .iter()
         .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
         .collect();
+    let prev = if height.0 > 0 {
+        ctx.query
+            .header_at_height(Height(height.0 - 1))
+            .ok()
+            .flatten()
+            .map(|(_, r)| hash_hex_display(&r.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut obj = json!({
         "hash": hash_hex_display(&hash),
         "confirmations": confirmations(ctx, height),
@@ -843,6 +853,7 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
             .unwrap_or(block.header.time),
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", block.header.bits.to_consensus()),
+        "previousblockhash": prev,
         "nTx": block.txdata.len(),
         "tx": txids,
     });
@@ -4064,6 +4075,13 @@ mod tests {
         let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
         let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
         assert_eq!(mined["tx"].as_array().unwrap().len(), 2);
+        let parent = dispatch(
+            &ctx,
+            "getblockhash",
+            vec![json!(mined["height"].as_u64().unwrap() - 1)],
+        )
+        .unwrap();
+        assert_eq!(mined["previousblockhash"], parent);
 
         let scan = dispatch(
             &ctx,

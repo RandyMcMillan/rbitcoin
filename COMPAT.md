@@ -15,6 +15,9 @@ admission) and optional **Esplora-compatible REST** for the same role (history,
 UTXO, broadcast, block/tx fetch by id). Optional **Core-class JSON-RPC subset**
 (see [`docs/rpc.md`](./docs/rpc.md)) — not full Core wallet / mining parity.
 **Scripthash index (`--shindex`) defaults off**; Electrum/Esplora require it.
+On/off costs and start/IBD/tip behavior: [`OPERATOR.md`](./OPERATOR.md)
+(Scripthash index). Disable later leaves SH files on disk; follow does not
+wait on SH materialize.
 
 ### Query surface intent: wallet clients, not graphical explorers
 
@@ -39,8 +42,9 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
 | Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve | v1/v2 high-bandwidth |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
-| Package relay wire | `accept_package` + experimental `rbtpkg` | BIP331 |
-| Pruning / GUI / mining | Not supported | Supported |
+| Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
+| Pruning / GUI | Not supported | Supported |
+| Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
 | JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli` | Full Core RPC |
@@ -50,7 +54,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Method group | Status | Notes |
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
-| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `chainwork` is real. `size_on_disk` / `verificationprogress` are placeholders (see [`docs/rpc.md`](./docs/rpc.md)) |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `chainwork` is real. `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers` (see [`docs/rpc.md`](./docs/rpc.md)) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `maxmempool` is the hub weight budget |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan |
@@ -59,7 +63,8 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |
 | Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness | **Regtest only** (except `submitblock`). Same confirm/accept path as P2P. `setmocktime` is not a wall-clock hook. |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | done | Disconnect/re-accept; precious = equal-work preference |
-| Wallet / mining / GBT | **never** | Non-goal (no GBT / wallet keys) |
+| Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster` / feerate diagram) | done | Cluster-chunk selector. `rules` must include `segwit`. No stratum, no BIP9 testdummy, no wallet keys |
+| Wallet RPC | **never** | No keystore |
 | `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
 | Full `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB; `raw()` MiniWallet subset is the only scan |
 
@@ -69,7 +74,7 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()` will probe tweaks |
+| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below |
 | blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; outs from `txout`). Isolate may still hardcode `electrs.cakewallet.com` |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full** |
@@ -78,6 +83,15 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | transaction.broadcast | done | Mempool accept + P2P inv |
 | relayfee / estimatefee / histogram | done | Libre min + live median |
 | TLS | external | terminate at reverse proxy; node is plain TCP |
+
+### Why `server.version` says electrs
+
+We are **not** electrs. Cake Wallet `getNodeIsElectrs()` lowercases
+`version[0]` and requires the substring `electrs` before it will call
+`blockchain.tweaks.subscribe`. The first element is therefore
+`rbitcoin-electrs <ver>` (`ver` from `workspace.package.version`) so Cake
+will probe tweaks. Isolate may still hardcode `electrs.cakewallet.com`
+after a passing probe.
 | DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
 
 ## Esplora REST surface
@@ -181,8 +195,9 @@ are deferred.
 
 ## Deferred surfaces
 
-Core wallet RPC, mining GBT, fee-estimator research quality, BIP331 native wire
-enum, durable orphans: **out of scope** for this plan.
+Core wallet RPC, fee-estimator research quality, BIP331 native wire enum,
+durable orphans: **out of scope** for this plan. GBT **template RPC** is
+shipped (see above); stratum / pool software is not.
 
 **Permanent non-goals for Electrum/Esplora:** graphical explorer backends
 (address-prefix autocomplete, global search, explorer-only catalogue APIs).

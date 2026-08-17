@@ -1362,6 +1362,47 @@ mod tests {
     }
 
     #[test]
+    fn enter_tip_mode_disable_after_on_leaves_sh_tables() {
+        use rbitcoin_query::IndexMode;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tip-sh-off-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store");
+        let q = Query::open_or_create(&store).unwrap();
+        q.enter_direct_index_mode_sh(true).unwrap();
+        assert!(q.sh_index_enabled());
+        let on = enter_tip_mode(&q, None, true);
+        assert!(on.tip_follow_ready);
+        assert!(store.join("scripthash.body").is_file());
+        let head = store.join("scripthash.head");
+        assert!(
+            head.is_file() || head.is_dir(),
+            "SH head must exist before disable"
+        );
+
+        let off = enter_tip_mode(&q, None, false);
+        assert!(off.tip_follow_ready, "follow stays on after disable");
+        assert!(!off.sh_tip_ready, "Electrum gate closes when shindex off");
+        assert!(!q.sh_index_enabled());
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        assert!(
+            store.join("scripthash.body").is_file(),
+            "disable must not purge SH tables"
+        );
+        assert!(head.is_file() || head.is_dir());
+
+        let again = enter_tip_mode(&q, None, true);
+        assert!(again.tip_follow_ready);
+        assert!(q.sh_index_enabled());
+        assert!(store.join("scripthash.body").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shutdown_flag_and_node_handle_smoke() {
         let sd = Shutdown::new();
         assert!(!sd.requested());

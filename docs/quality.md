@@ -39,7 +39,7 @@ level peers cannot ignore.
 | 3 | **Build & release integrity** | Same toolchain in CI and Nix; byte-repro musl; SBOM/audit gates; no floating `stable` |
 | 4 | **Contributor velocity** | God-files gone or split by stage; warm suite a few minutes; TDD practiced; first-hour tutorial |
 | 5 | **Product surface honesty** | COMPAT accurate; Electrum/Esplora complete for *target* wallets, not explorer bloat |
-| 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; soak playbooks |
+| 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; signet-first then mainnet with monitoring |
 | 7 | **Platform truth** | Linux-first everywhere; macOS/Windows non-goals until an IO story exists |
 
 ### Competitive bar
@@ -77,14 +77,12 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: no fuzz crate, no corpus, no job.** |
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 28 / 267.** Next: `rpc-missing` we already implement (`mempool_accept*`, `mempool_persist`, `interface_rpc`, …) and leftover `core-log`. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
-| 3 | **Q-47** | Honest `getblockchaininfo` disk / progress | honesty | `size_on_disk` and `verificationprogress` are real estimates or stay **explicitly dummy** in RPC output (not just docs). Prefer a cheap archive-bytes sum + header-height fraction over `0` / `0.5` |
-| 4 | **Q-35** | Mainnet soak checklist | ops | Operator checklist + success criteria on top of [`experimental-mainnet.md`](./experimental-mainnet.md): signet resume → mainnet catch-up → tip-follow hours → Electrum query. Optional public tip-height badge |
-| 5 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
-| 6 | **Q-48** | BIP331 rust-bitcoin package types | interop | Real BIP331 `NetworkMessage` (or an explicit refuse) instead of experimental `rbtpkg`. Track rust-bitcoin; **RB-007** |
-| 7 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
-| 8 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 9 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
-| 10 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
+| 3 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
+| 4 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command |
+| 5 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
+| 6 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 7 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
+| 8 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
 
 ### Still valid? (this reaudit)
 
@@ -93,10 +91,11 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | **Q-30** | Keep. Highest correctness hole. Zero in-tree fuzz. |
 | **Q-41** | Keep. 9 → **28** `run` (Wave A + field RPCs). 239 skips remain; 55 `rpc-missing` + 37 `core-log` are the only growth that matches claimed surface. |
 | **Q-37** | **Close.** CI `test` ~85 s (2026-08-17). Recorded in [`TESTING.md`](../TESTING.md). |
+| **Q-47** | **Close.** `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers`. |
 | **Q-31** | Keep, lowered. Useful for Q-30; not blocking operators. |
 | **Q-36** | Keep. IBD/tip INFO is still a firehose (`UpdateTip` + `tip: accept` per block). |
 | **Q-32** | **Won't fix.** Operators grep text. A second JSON dialect is not a goal. |
-| **Q-35** | Keep. Runbook exists; success criteria do not. |
+| **Q-35** | **Won't fix.** Not a gated program. Signet-first is ordinary run advice. |
 | **Q-34** | Keep. Onboarding still medium. |
 | **Q-33** | **Won't fix.** Local `cargo doc` is enough until crates.io. |
 | **Q-24** | **Won't fix.** Single maintainer + bot. GitHub defaults. |
@@ -116,7 +115,7 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 10 |
+| R-10 | **R-10** | Open rank 8 |
 
 New work after this reaudit starts at **Q-50**.
 
@@ -133,6 +132,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-32** | Structured logging option | INFO/DEBUG text is the operator contract. JSON/kv is a second dialect |
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
 | **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
+| **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
 | **—** | Darwin / Windows operator binaries | Linux-shaped IO. Draft `feature/metal-support` stays out of this list |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
@@ -147,6 +147,7 @@ findings 001–021, CI split, map-free README, …) live in
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-47** | Honest `getblockchaininfo` disk / progress | Store file walk + `blocks/headers` (not dummy 0 / 0.5) |
 | **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
 | **—** | Docs map + one owner per fact | `docs/README.md`; folded store-format / startup-states / future-features / COVERAGE (`#81`) |
 | **—** | Tests assert behavior, not repo text | No `include_str!` of production `.rs` / CONTRIBUTING (`#85`) |
@@ -201,13 +202,13 @@ findings 001–021, CI split, map-free README, …) live in
 |-----------|-------|------|
 | Architecture clarity | Strong | Roles + HWM + single Class A appender; schema 17 freeze in SCHEMA.md |
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree |
-| Operator honesty | Strong | CLI primary; dummy chaininfo still labeled (Q-47); README size matches SCHEMA census |
+| Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); README size matches SCHEMA census |
 | Code modularity | Medium | `rpc/methods` **4.8k** after Core-functional growth. Residual giants only via **R-10** |
 | Cross-platform | Weak (honest) | Linux-shaped IO. Darwin draft is won't-fix |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |
-| Dead / stub surface | Strong | Node RPC is a real subset; placeholders called out |
+| Dead / stub surface | Strong | Node RPC is a real subset; no dummy chaininfo numbers |
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
 | Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41) |
 | Adversarial / findings | Medium–Strong | **001–021** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |

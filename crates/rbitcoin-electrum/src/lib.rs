@@ -3,6 +3,10 @@
 //!
 //! Not a graphical block-explorer backend: clients are expected to already
 //! know their scripthashes / txids.
+//!
+//! `server.version[0]` is `rbitcoin-electrs <workspace.package.version>`.
+//! We are not electrs. Cake Wallet `getNodeIsElectrs()` requires the
+//! substring `electrs` before it will probe `blockchain.tweaks.subscribe`.
 
 mod server;
 mod tweaks;

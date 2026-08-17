@@ -7,15 +7,15 @@ index via `--shindex`, default off; not a graphical block-explorer stack) — bu
 around a **libbitcoin-class relational archive** and a **pure-Rust
 consensus/script** path.
 
-> **0.x:** on-disk format and APIs are **unstable until 1.0**. Prefer a **signet
-> soak** before first mainnet cutover; treat early mainnet as high-scrutiny.
+> **0.x:** on-disk format and APIs are **unstable until 1.0**. Run **signet
+> first**, then mainnet with monitoring; treat early mainnet as high-scrutiny.
 > Security contact and policy: [`SECURITY.md`](./SECURITY.md). Operator notes:
 > [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 | | |
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
-| **Version** | 0.1.0 experimental ([`CHANGELOG.md`](./CHANGELOG.md)) |
+| **Version** | experimental 0.x — see [`Cargo.toml`](./Cargo.toml) / [`CHANGELOG.md`](./CHANGELOG.md) |
 | **Platform** | **Linux first** (io_uring + map-free fd store; other OSes unproven) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
@@ -30,7 +30,8 @@ Operator-order facts (mainnet tip moves; treat as ballpark, not a warranty):
 
 - **~200 GiB** hot pin/annotate set after schema 17 (`txout` + `spent` + idx +
   `txid` + `tx.head`); **~700 GiB** if you keep cold `inwit` for reconstruct.
-  Optional `--shindex` is extra. Ballpark, not a warranty — census in
+  Optional `--shindex` is extra (Electrum/Esplora require it; on/off costs in
+  [`OPERATOR.md`](./OPERATOR.md)). Ballpark, not a warranty — census in
   [`SCHEMA.md`](./SCHEMA.md)
 - **Core-class JSON-RPC subset** (default off): [`docs/rpc.md`](./docs/rpc.md)
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`** (full scripts)

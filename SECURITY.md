@@ -6,7 +6,7 @@ and similar infrastructure—not a desktop GUI or end-user wallet.
 
 Until **1.0**, treat mainnet deployment as **early production / high-scrutiny**:
 on-disk format and APIs can still change, and there is **no** long-term support
-SLA. Prefer a signet soak before first mainnet cutover. See
+SLA. Run signet first, then mainnet with monitoring. See
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md) and
 [`OPERATOR.md`](./OPERATOR.md).
 

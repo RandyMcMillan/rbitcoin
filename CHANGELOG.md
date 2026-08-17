@@ -36,7 +36,34 @@ before 1.0).
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
   and into min-relay admission (free tx + delta can enter).
 
+### Removed
+
+- **`rbtpkg` P2P command.** Homegrown len-prefixed package inject is gone.
+  Packages stay on RPC `submitpackage` and Esplora `POST /txs/package`.
+
 ### Changed
+
+- **`getblockchaininfo` disk / progress:** `size_on_disk` is a walk of
+  store file lengths (plus cold inwit when split). `verificationprogress`
+  is `blocks / headers` (1.0 when headers is 0), not a dummy 0.5 / 1.0.
+
+- **No soak program.** Signet-first remains ordinary run advice. Q-35 is
+  won't-fix. Docs no longer title a gated “soak” checklist.
+
+- **SH on/off:** COMPAT and README point at the OPERATOR cost table.
+  Disable-after-on leaves SH files on disk; tip follow stays up.
+
+- **Electrum `electrs` UA + versions:** COMPAT documents why
+  `server.version[0]` contains `electrs` (Cake `getNodeIsElectrs()`).
+  README no longer hardcodes `0.1.0`; shipped strings stay
+  `workspace.package.version`.
+
+- **Quality:** **Q-47** closed (honest chaininfo). **Q-48** is BIP331 when
+  rust-bitcoin grows the types — no private `rbtpkg` stand-in.
+
+- **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
+  `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
+  never. Stratum / wallet keys stay non-goals.
 
 - **Head resolve is three waves, no rank rounds.** Probe+identity is
   open, then sealed ages 1..=3, then sealed age ≥4. Each wave fetches
@@ -61,7 +88,6 @@ before 1.0).
   that miss. The 250 ms odd-page `Corrupt` aborted lookup waves and dumped
   more work onto leftover. Per-page `AtomicU32`s are gone; insert is again
   sole-writer page-coalesced `pwrite`.
->>>>>>> pr-87
 
 - **Tests assert behavior, not the repo.** Default-suite tests no longer
   `include_str!` production sources or `CONTRIBUTING.md` to grep

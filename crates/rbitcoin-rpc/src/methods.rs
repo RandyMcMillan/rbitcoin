@@ -543,8 +543,9 @@ fn method_help(m: &str) -> String {
                 .into()
         }
         "getblockchaininfo" => "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
-             chainwork is summed header work (regtest 2/block). size_on_disk and \
-             verificationprogress are placeholders."
+             chainwork is summed header work (regtest 2/block). size_on_disk is a \
+             walk of store file lengths (plus cold inwit when split). \
+             verificationprogress is blocks/headers (1.0 when headers is 0)."
             .into(),
         "getblockstats" => "getblockstats hash_or_height ( stats )\n\
              Reconstruct the block and return fee / UTXO / weight statistics."
@@ -674,16 +675,21 @@ fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         .as_ref()
         .map(|c| c.best_header_height())
         .unwrap_or(tip);
+    let verificationprogress = if headers == 0 {
+        1.0
+    } else {
+        (tip as f64 / headers as f64).clamp(0.0, 1.0)
+    };
     Ok(json!({
         "chain": chain_name(ctx.network),
         "blocks": tip,
         "headers": headers,
         "bestblockhash": best,
         "difficulty": difficulty_at_tip(ctx).unwrap_or(0.0),
-        "verificationprogress": if ibd { 0.5 } else { 1.0 },
+        "verificationprogress": verificationprogress,
         "initialblockdownload": ibd,
         "chainwork": chainwork_hex(ctx, ctx.query.tip_height()),
-        "size_on_disk": 0,
+        "size_on_disk": ctx.query.store().datadir_bytes(),
         "pruned": false,
         "warnings": "",
     }))
@@ -3006,15 +3012,92 @@ mod tests {
         assert_eq!(info["chain"], "regtest");
         assert_eq!(info["blocks"], 0);
         assert_eq!(info["initialblockdownload"], false);
-        // No headers → zero work. `size_on_disk` stays a placeholder.
+        // No headers → zero work. Empty store still has table files on disk.
         assert_eq!(info["chainwork"], "00".repeat(32));
-        assert_eq!(info["size_on_disk"], 0);
+        let store_bytes = dir_file_bytes(&dir.join("store"));
+        assert!(store_bytes > 0);
+        assert_eq!(info["size_on_disk"].as_u64().unwrap(), store_bytes);
         assert_eq!(info["verificationprogress"], 1.0);
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["size"], 0);
         assert_eq!(mem["loaded"], true);
         let raw = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
         assert_eq!(raw, json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_file_bytes(root: &std::path::Path) -> u64 {
+        fn walk(p: &std::path::Path, acc: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(p) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let path = ent.path();
+                let Ok(meta) = ent.metadata() else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    walk(&path, acc);
+                } else if meta.is_file() {
+                    *acc = acc.saturating_add(meta.len());
+                }
+            }
+        }
+        let mut n = 0;
+        walk(root, &mut n);
+        n
+    }
+
+    #[test]
+    fn getblockchaininfo_disk_and_progress() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        let store_bytes = dir_file_bytes(&dir.join("store"));
+        assert!(store_bytes > 0, "open store has table files");
+        assert_eq!(
+            info["size_on_disk"].as_u64().unwrap(),
+            store_bytes,
+            "size_on_disk is a walk of {{datadir}}/store"
+        );
+        assert_eq!(info["blocks"], 0);
+        assert_eq!(info["headers"], 0);
+        assert_eq!(info["verificationprogress"], 1.0);
+
+        let (addr, script) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["blocks"], 1);
+        assert_eq!(info["headers"], 1);
+        assert_eq!(info["verificationprogress"], 1.0);
+        let store_bytes = dir_file_bytes(&dir.join("store"));
+        assert_eq!(info["size_on_disk"].as_u64().unwrap(), store_bytes);
+        assert!(store_bytes > 0);
+
+        // IBD flag must not force the old dummy 0.5 when the tip is caught up.
+        ctx.initial_block_download.store(true, Ordering::Relaxed);
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["verificationprogress"], 1.0);
+        assert_eq!(info["initialblockdownload"], true);
+        ctx.initial_block_download.store(false, Ordering::Relaxed);
+
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let child = mine_regtest_paying(prev, time, 1, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&child));
+        dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["blocks"], 1);
+        assert_eq!(info["headers"], 2);
+        let p = info["verificationprogress"].as_f64().unwrap();
+        assert!(
+            p > 0.0 && p < 1.0,
+            "headers ahead of bodies → progress in (0, 1), got {p}"
+        );
+        assert!((p - 0.5).abs() < 1e-9, "1/2 == 0.5, got {p}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3271,7 +3354,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(true)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -3312,7 +3399,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(1)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -3777,7 +3868,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
             peers: None,
             chain: Some(Arc::clone(&hub)),
@@ -5107,7 +5202,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -5127,6 +5226,11 @@ mod tests {
         assert_eq!(
             net["version"].as_u64(),
             Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),
+        );
+        assert_eq!(
+            net["subversion"].as_str().unwrap(),
+            rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str],)
+                .unwrap()
         );
         assert_eq!(
             rpc_client_version("0.1.0"),

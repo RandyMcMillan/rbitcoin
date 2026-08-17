@@ -1,12 +1,12 @@
 //! Tip-mode transaction relay (P4): inv/getdata/tx + mempool announce.
 //!
 //! Heavy relay is **gated** on [`MempoolHub::set_relay_enabled`] (false during IBD).
-//! BIP331 package *wire* is not in rust-bitcoin 0.32's `NetworkMessage`; package
-//! accept stays on [`rbitcoin_mempool::ActiveMempool::accept_package`]. Unknown
-//! `sendpackages` / package commands are ignored until a bitcoin crate upgrade.
+//! Package admit is RPC `submitpackage` / Esplora `POST /txs/package` /
+//! [`MempoolHub::accept_package`]. There is no P2P package command (BIP331
+//! is not in rust-bitcoin 0.32 `NetworkMessage`; the old private `rbtpkg`
+//! name is gone).
 
 use arc_swap::ArcSwap;
-use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
@@ -1472,33 +1472,10 @@ pub struct ElectrumMempoolItem {
     pub fee: i64,
 }
 
-/// Decode raw package payload: concat of bitcoin txs (for future BIP331 `pkgtxns`).
-///
-/// Format used by tests / local inject: each tx is length-prefixed u32 LE + raw.
-pub fn decode_len_prefixed_package(payload: &[u8]) -> Result<Vec<Transaction>, String> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= payload.len() {
-        let n = u32::from_le_bytes(payload[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        if i + n > payload.len() {
-            return Err("package truncated".into());
-        }
-        let tx: Transaction = deserialize(&payload[i..i + n]).map_err(|e| e.to_string())?;
-        out.push(tx);
-        i += n;
-    }
-    if i != payload.len() {
-        return Err("package trailing bytes".into());
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
     use bitcoin::{Sequence, TxIn, Witness};
@@ -1525,34 +1502,6 @@ mod tests {
         idx.remove(&t); // miss
         assert_eq!(idx.txs_for(&sh).count(), 0);
         assert!(idx.txs_for(&[3u8; 32]).next().is_none());
-    }
-
-    #[test]
-    fn package_codec_roundtrip() {
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([1u8; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let raw = serialize(&tx);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&raw);
-        let decoded = decode_len_prefixed_package(&payload).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].compute_txid(), tx.compute_txid());
     }
 
     /// While relay is off, per-block remove is deferred; enabling relay runs purge.
@@ -1812,46 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn package_codec_errors_and_query_utxo_miss() {
-        // Truncated length prefix.
-        assert!(decode_len_prefixed_package(&[1, 2, 3]).is_err());
-        // Length claims more than remaining.
-        let mut bad = 100u32.to_le_bytes().to_vec();
-        bad.extend_from_slice(&[0u8; 4]);
-        assert!(decode_len_prefixed_package(&bad).is_err());
-        // Empty package ok.
-        assert!(decode_len_prefixed_package(&[]).unwrap().is_empty());
-        // Garbage tx body.
-        let mut junk = 4u32.to_le_bytes().to_vec();
-        junk.extend_from_slice(&[0xff; 4]);
-        assert!(decode_len_prefixed_package(&junk).is_err());
-        // Trailing bytes after valid package.
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([1u8; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let raw = serialize(&tx);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&raw);
-        payload.push(0xff); // trailing
-        assert!(decode_len_prefixed_package(&payload)
-            .unwrap_err()
-            .contains("trailing"));
-
+    fn query_utxo_provider_miss_is_none() {
         let store_dir = tmp();
         let q = Query::open_or_create(&store_dir).unwrap();
         let provider = QueryUtxoProvider { query: &q };

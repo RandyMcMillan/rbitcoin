@@ -72,7 +72,7 @@ still wait for durable SH when shindex is on.
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
 | `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
 | `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
-| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). `chainwork` is summed header work (regtest 2 per block). **Placeholders:** `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). `chainwork` is summed header work (regtest 2 per block). `size_on_disk` is a walk of `{datadir}/store` file lengths (plus `--datadir-cold` inwit when split). `verificationprogress` is `blocks / headers` clamped to `[0, 1]` (`1.0` when `headers` is 0). |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. |
 | `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. We do not have Core `blk*.dat`, so `rpc_getblockstats.py`'s rename-file needle stays skip. |
 | `getdifficulty` | From tip bits |

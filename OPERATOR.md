@@ -4,8 +4,8 @@
 
 BIP324 v2-only P2P, cluster mempool (Libre admission + **consensus script checks on accept**),
 Electrum confirmed + unconfirmed (TLS via reverse proxy). **Mainnet is experimental** — see
-[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Soak reorgs and disk headroom
-before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Watch reorgs and disk
+headroom before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
 that height; use `--milestone 0` for full scripts.
 
 Architecture: peer wire lands in an **in-RAM body queue**; confirm
@@ -357,8 +357,9 @@ Do **not** wipe `store/` for mempool slot/full errors.
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
-- Package accept: `ActiveMempool::accept_package`; experimental wire command `rbtpkg`
-  (BIP331 not yet in rust-bitcoin 0.32 `NetworkMessage`).
+- Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
+  Esplora `POST /txs/package`. No P2P package command (BIP331 is not in
+  rust-bitcoin 0.32).
 
 ## Scripthash index (`--shindex`)
 
@@ -424,6 +425,9 @@ loopback-only bind is convenient with a local proxy, but it is **not** the
 security model by itself.
 
 **Requires `--shindex`.** Without it the node refuses to start.
+
+`server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()`
+will probe silent-payment tweaks. We are **not** electrs — see `COMPAT.md`.
 
 **Not a graphical explorer.** We serve clients that already know their
 scripthashes / txids; we do **not** aim to back block-explorer search UIs.
@@ -622,10 +626,10 @@ Full script validation (slow, used for consensus parity labs):
   --milestone 0
 ```
 
-### Soak checklist
+### Before trusting mainnet
 
 - [ ] Signet (or large range) to tip; restart resume
-- [ ] Multi-day mainnet soak without corruption / OOM
+- [ ] Mainnet tip follow without corruption / OOM
 - [ ] Post-milestone or `--milestone 0` script path exercised
 - [ ] Disk headroom for full Class A archive
 - [ ] Mempool file growth bounded under load (compaction + eviction)

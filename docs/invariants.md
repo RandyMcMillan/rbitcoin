@@ -143,7 +143,7 @@ bind.
 | `write_ensure_stamps_spent_range_after_load_pin` | pin-then-ensure fills abs; load pin has no `spent.idx` |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
-| `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load; structural IO split asserts |
+| `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load |
 | `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
 | `confirm_engine_pins_spend_of_just_written_pack` | IBD load: child spend of just-written pack (187 denserels miss) |
 | `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 soft requeue |

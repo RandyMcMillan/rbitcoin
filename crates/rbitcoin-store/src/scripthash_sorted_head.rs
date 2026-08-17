@@ -8,10 +8,10 @@
 
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
+use crate::io_handle::IoHandle;
 use crate::scripthash_layout::{ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,8 +140,7 @@ impl SortedHead {
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let mut header = [0u8; DATA_HEADER_LEN as usize];
-        file.read_at(&mut header, 0)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let _ = pread_file(&file, 0, &mut header).map_err(|e| StoreError::io(&path, e))?;
         if header[0..4] != *DATA_MAGIC {
             return Err(StoreError::BadMagic);
         }
@@ -193,9 +192,7 @@ impl SortedHead {
         };
         let enc = value.encode();
         let off = DATA_HEADER_LEN + slot * SH_HEAD_SLOT_SIZE as u64 + SH_HEAD_KEY_LEN as u64;
-        self.file
-            .write_at(&enc, off)
-            .map_err(|e| StoreError::io(&self.path, e))?;
+        pwrite_file(&self.file, off, &enc).map_err(|e| StoreError::io(&self.path, e))?;
         Ok(true)
     }
 
@@ -207,8 +204,7 @@ impl SortedHead {
         let mut rec = [0u8; SH_HEAD_SLOT_SIZE];
         for slot in 0..self.count {
             let off = DATA_HEADER_LEN + slot * SH_HEAD_SLOT_SIZE as u64;
-            self.file
-                .read_at(&mut rec, off)
+            pread_file_exact(&self.file, off, &mut rec)
                 .map_err(|e| StoreError::io(&self.path, e))?;
             let k: ShHeadKey = rec[0..SH_HEAD_KEY_LEN].try_into().unwrap();
             let val = ShHeadValue::decode(&rec[SH_HEAD_KEY_LEN..])?;
@@ -244,8 +240,7 @@ impl SortedHead {
         let n = remain.min(SH_SORTED_RECS_PER_PAGE as u64) as usize;
         let mut page = vec![0u8; n * SH_HEAD_SLOT_SIZE];
         self.preads.fetch_add(1, Ordering::Relaxed);
-        self.file
-            .read_at(&mut page, page_off)
+        pread_file_exact(&self.file, page_off, &mut page)
             .map_err(|e| StoreError::io(&self.path, e))?;
         for s in 0..n {
             let rec = &page[s * SH_HEAD_SLOT_SIZE..(s + 1) * SH_HEAD_SLOT_SIZE];
@@ -262,6 +257,53 @@ impl SortedHead {
         }
         Ok(None)
     }
+}
+
+fn pread_file(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    let n = IoHandle::from_file(file).pread(offset, buf);
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+fn pread_file_exact(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    let h = IoHandle::from_file(file);
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = h.pread(offset + done as u64, &mut buf[done..]);
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pread short",
+            ));
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+fn pwrite_file(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    let h = IoHandle::from_file(file);
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = h.pwrite(offset + done as u64, &buf[done..]);
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite returned 0",
+            ));
+        }
+        done += n as usize;
+    }
+    Ok(())
 }
 
 fn fuse_key16(key: &ShHeadKey) -> u64 {

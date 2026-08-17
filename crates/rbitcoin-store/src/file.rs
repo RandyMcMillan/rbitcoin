@@ -30,10 +30,6 @@ use crate::error::StoreError;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -332,24 +328,16 @@ impl TableFile {
         &self.path
     }
 
-    /// Raw FD for io_uring / pread bulk reads (lock-free; do not close).
-    #[cfg(unix)]
+    /// Portable handle for bulk / session IO (lock-free; do not close).
     #[inline]
-    pub fn read_fd(&self) -> RawFd {
-        self.read_file.as_raw_fd()
+    pub fn read_fd(&self) -> crate::io_handle::IoHandle {
+        self.io_handle()
     }
 
     /// Portable handle for the completion session (lock-free; do not close).
     #[inline]
     pub fn io_handle(&self) -> crate::io_handle::IoHandle {
-        #[cfg(unix)]
-        {
-            crate::io_handle::IoHandle::from_raw_fd(self.read_file.as_raw_fd())
-        }
-        #[cfg(windows)]
-        {
-            crate::io_handle::IoHandle::from_raw_handle(self.read_file.as_raw_handle() as isize)
-        }
+        crate::io_handle::IoHandle::from_file(&self.read_file)
     }
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
@@ -1126,8 +1114,7 @@ mod advise_tests {
         f.ensure_capacity(f.logical_len() + 4096).unwrap();
         f.flush().unwrap();
         f.flush_async().unwrap();
-        let fd = f.read_fd();
-        assert!(fd >= 0);
+        let _ = f.read_fd();
         drop(f);
         let f = TableFile::open(&path, TableKind::TxOut).unwrap();
         let mut buf2 = vec![0u8; payload.len()];

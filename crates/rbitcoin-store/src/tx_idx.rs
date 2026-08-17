@@ -798,7 +798,7 @@ impl TxIdx {
 /// One OS-page pread for planned idx range decode (no IO yet).
 #[derive(Clone, Debug)]
 pub(crate) struct IdxPagePlan {
-    pub fd: std::os::fd::RawFd,
+    pub fd: crate::io_handle::IoHandle,
     pub page_off: u64,
     pub want: usize,
 }

@@ -134,8 +134,9 @@ Agents implement on a worktree branch and let GitHub Actions run the
 workspace/coverage gates — see [`AGENTS.md`](./AGENTS.md).
 
 Operator binary: always the static install under `./target/release/` (or
-`./result/bin/`). After green `master` CI, the **musl** workflow uploads the
-same pair as an Actions artifact (see [`OPERATOR.md`](./OPERATOR.md)).
+`./result/bin/`). After green `master` CI, **musl** / **windows** /
+**macos** upload operator snapshots (see [`OPERATOR.md`](./OPERATOR.md)).
+Label a PR **`static-binaries`** to build those on the PR head.
 Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 

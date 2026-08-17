@@ -467,8 +467,7 @@ fn fill_idx_pages(
     for (i, &res) in results.iter().enumerate() {
         if res < 0 || (res as usize) < pages[i].want {
             let page = &pages[i];
-            let handle = crate::io_handle::IoHandle::from_raw_fd(page.fd);
-            let rc = handle.pread(page.page_off, &mut bufs[i][..page.want]);
+            let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
             if rc < 0 || (rc as usize) < page.want {
                 return false;
             }
@@ -494,8 +493,7 @@ where
 
 fn fill_idx_pages_libc(pages: &[crate::tx_idx::IdxPagePlan], bufs: &mut [Vec<u8>]) -> bool {
     for (i, page) in pages.iter().enumerate() {
-        let handle = crate::io_handle::IoHandle::from_raw_fd(page.fd);
-        let rc = handle.pread(page.page_off, &mut bufs[i][..page.want]);
+        let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
         if rc < 0 || (rc as usize) < page.want {
             return false;
         }
@@ -1259,14 +1257,7 @@ mod tests {
                 .iter()
                 .map(|p| {
                     let mut b = vec![0u8; p.want];
-                    let rc = unsafe {
-                        libc::pread(
-                            p.fd,
-                            b.as_mut_ptr() as *mut libc::c_void,
-                            p.want,
-                            p.page_off as libc::off_t,
-                        )
-                    };
+                    let rc = p.fd.pread(p.page_off, &mut b);
                     assert!(rc > 0, "pread idx page");
                     b
                 })

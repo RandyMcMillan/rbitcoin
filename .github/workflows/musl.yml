@@ -7,6 +7,7 @@
 # Triggers:
 #   - workflow_run: `ci` succeeded on a **push** to master/main
 #   - workflow_dispatch: rebuild a ref (retry / operator request)
+#   - pull_request labeled `static-binaries` (not a required check)
 #
 # Artifacts: rbitcoin-musl-x86_64-linux-<12-sha> (node, cli, SHA256SUMS).
 # First run is a cold crane deps layer; later runs restore the Nix store cache.
@@ -23,10 +24,12 @@ on:
         description: Git ref or SHA to build (empty = this branch tip)
         required: false
         default: ""
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
-  group: musl-${{ github.event.workflow_run.head_sha || github.sha }}
-  cancel-in-progress: false
+  group: musl-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -43,14 +46,18 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
+        github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'static-binaries')
+      ) ||
+      (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         contains(fromJSON('["master", "main"]'), github.event.workflow_run.head_branch) &&
         github.event.workflow_run.head_repository.full_name == github.repository
       )
     env:
-      # workflow_run.head_sha is the green commit. dispatch: input or tip.
-      BUILD_REF: ${{ github.event.workflow_run.head_sha || inputs.ref || github.sha }}
+      # workflow_run.head_sha is the green commit. PR: head SHA. dispatch: input or tip.
+      BUILD_REF: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha || inputs.ref || github.sha }}
     steps:
       - name: Checkout green revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

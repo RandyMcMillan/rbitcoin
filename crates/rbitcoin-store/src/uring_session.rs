@@ -195,6 +195,8 @@ impl UringSession {
     ) -> Result<(), StoreError> {
         #[cfg(test)]
         test_note_sqe(rw_flags, buf.len() as u32);
+        #[cfg(not(target_os = "linux"))]
+        let _ = rw_flags;
         if buf.is_empty() {
             return Ok(());
         }
@@ -254,6 +256,8 @@ impl UringSession {
     ) -> Result<(), StoreError> {
         #[cfg(test)]
         test_note_sqe(rw_flags, buf.len() as u32);
+        #[cfg(not(target_os = "linux"))]
+        let _ = rw_flags;
         if buf.is_empty() {
             return Ok(());
         }
@@ -630,6 +634,7 @@ pub fn unpack_ud(ud: u64) -> (u8, u16, u32) {
 pub(crate) struct UringMeters {
     pub unexpected_cqe: std::sync::atomic::AtomicU64,
     pub undrained: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, target_os = "linux"))]
     pub cq_overflow: std::sync::atomic::AtomicU64,
     pub idx_range_missing: std::sync::atomic::AtomicU64,
 }
@@ -637,12 +642,14 @@ pub(crate) struct UringMeters {
 static URING_METERS: UringMeters = UringMeters {
     unexpected_cqe: std::sync::atomic::AtomicU64::new(0),
     undrained: std::sync::atomic::AtomicU64::new(0),
+    #[cfg(any(test, target_os = "linux"))]
     cq_overflow: std::sync::atomic::AtomicU64::new(0),
     idx_range_missing: std::sync::atomic::AtomicU64::new(0),
 };
 
 static WARNED_UNEXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WARNED_UNDRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, target_os = "linux"))]
 static WARNED_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WARNED_IDX_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -650,6 +657,7 @@ static WARNED_IDX_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub(crate) enum UringInvariant {
     UnexpectedCqe,
     Undrained,
+    #[cfg(any(test, target_os = "linux"))]
     CqOverflow,
     IdxRangeMissing,
 }
@@ -659,6 +667,7 @@ impl UringInvariant {
         match self {
             Self::UnexpectedCqe => &URING_METERS.unexpected_cqe,
             Self::Undrained => &URING_METERS.undrained,
+            #[cfg(any(test, target_os = "linux"))]
             Self::CqOverflow => &URING_METERS.cq_overflow,
             Self::IdxRangeMissing => &URING_METERS.idx_range_missing,
         }
@@ -668,6 +677,7 @@ impl UringInvariant {
         match self {
             Self::UnexpectedCqe => &WARNED_UNEXPECTED,
             Self::Undrained => &WARNED_UNDRAINED,
+            #[cfg(any(test, target_os = "linux"))]
             Self::CqOverflow => &WARNED_OVERFLOW,
             Self::IdxRangeMissing => &WARNED_IDX_RANGE,
         }
@@ -677,6 +687,7 @@ impl UringInvariant {
         match self {
             Self::UnexpectedCqe => "unexpected_cqe",
             Self::Undrained => "undrained",
+            #[cfg(any(test, target_os = "linux"))]
             Self::CqOverflow => "cq_overflow",
             Self::IdxRangeMissing => "idx_range_missing",
         }
@@ -754,6 +765,7 @@ impl UringPending {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
     if overflow == 0 {
         Ok(())
@@ -764,6 +776,7 @@ pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
 }
 
 /// `None` → retry the enter (EINTR). `Some` → hard fail.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn map_enter_err(err: &std::io::Error) -> Option<StoreError> {
     if err.raw_os_error() == Some(libc::EINTR) {
         None

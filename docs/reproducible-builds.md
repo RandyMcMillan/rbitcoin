@@ -76,11 +76,25 @@ After the deps layer is in the store, app-only changes rebuild far less.
 
 **GitHub Actions:** [`.github/workflows/musl.yml`](../.github/workflows/musl.yml)
 runs that same one-build path after a **green** `ci` **push** to `master`/`main`
-(and on `workflow_dispatch`). It stages with
-`scripts/stage-musl-artifacts.sh` (`file(1)` must say statically linked) and
-uploads `rbitcoin-node`, `rbitcoin-cli`, `SHA256SUMS` as
+(and on `workflow_dispatch`, and on PRs labeled **`static-binaries`**). It
+stages with `scripts/stage-musl-artifacts.sh` (`file(1)` must say statically
+linked) and uploads `rbitcoin-node`, `rbitcoin-cli`, `SHA256SUMS` as
 `rbitcoin-musl-x86_64-linux-<12-sha>`. Not a required check; not
 `repro-check.sh`.
+
+### Windows / Darwin snapshots (not Nix)
+
+Fully static musl is **Linux-only**. Nix cannot ship a portable Darwin or
+Windows operator binary the same way:
+
+| OS | Why not Nix `pkgsStatic` | What CI builds |
+|----|--------------------------|----------------|
+| **Windows** | No musl-style fully static PE from this flake; mingw cross is a different CRT than operators run | `windows-2022` + rustc **1.95** + `-C target-feature=+crt-static`. Stage script refuses VC++ / MinGW runtime DLLs |
+| **Darwin** | Apple forbids a static `libSystem` link. `nix build` on a Mac is store-rpath (not portable) | `macos-14` + rustc **1.95**. Stage script allows only `/usr/lib` and `/System/Library` dylibs. Unsigned |
+
+Same cadence as musl: green `master` `ci`, `workflow_dispatch`, or PR
+label **`static-binaries`**. Staging: `scripts/stage-native-artifacts.sh`.
+Not byte-identical with the musl package. Windows IoRing is not supported.
 
 **Byte-identity gate** (`./scripts/repro-check.sh`) still forces two clean
 `--rebuild`s — use it for release verification, not every commit.

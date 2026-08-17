@@ -133,7 +133,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
 | **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
 | **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
-| **—** | Darwin / Windows operator binaries | IO story exists (`pool` / IOCP). Binaries / codesign still not a product until asked |
+| **—** | Darwin / Windows codesign / notarization | Snapshots exist (`macos.yml` / `windows.yml`). Signing is still not a product |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
 
@@ -155,6 +155,7 @@ findings 001–021, CI split, map-free README, …) live in
 | **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
 | **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
 | **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; `musl.yml` after green master `ci` |
+| **—** | Darwin / Windows operator snapshots | `windows.yml` / `macos.yml` after green master `ci` or PR label `static-binaries`. Not codesigned |
 
 ---
 
@@ -184,7 +185,7 @@ findings 001–021, CI split, map-free README, …) live in
 | `#[test]` / `#[tokio::test]` | **~1.43k** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
 | Required CI | `fmt`, `deny`, `clippy`, `test` **~85 s**, `multinode`, `coverage` (~2.5 min) (+ CodeQL) |
-| Extra CI | `musl` after green master `ci`; `core-functional.yml` nightly / labeled PR (not required) |
+| Extra CI | `musl` / `windows` / `macos` after green master `ci` or PR label `static-binaries`; `core-functional.yml` nightly / labeled PR (not required) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |
@@ -204,7 +205,7 @@ findings 001–021, CI split, map-free README, …) live in
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree |
 | Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); README size matches SCHEMA census |
 | Code modularity | Medium | `rpc/methods` **4.8k** after Core-functional growth. Residual giants only via **R-10** |
-| Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. Operator binaries still Linux musl |
+| Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. CI snapshots: musl + CRT-static Windows + system-dylib Darwin |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |

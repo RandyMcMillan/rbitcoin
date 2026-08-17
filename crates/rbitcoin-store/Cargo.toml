@@ -14,10 +14,12 @@ rbitcoin-log = { workspace = true }
 bitcoin_hashes = { workspace = true }
 # fallocate / punch-hole for multi‑GiB grows without zero-fill storms (Linux).
 libc = "0.2"
-# Bulk pread submission for head-resolve / confirm body load (Linux).
-io-uring = "0.7"
 # Datadir store.secret CSPRNG.
 getrandom = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Bulk pread submission for head-resolve / confirm body load (Linux).
+io-uring = "0.7"
 # Sealed segment fuse8 is in-tree (`binary_fuse8` + `fuse8_filter`); no xorf/bincode.
 
 [[bin]]

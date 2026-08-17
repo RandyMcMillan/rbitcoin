@@ -104,7 +104,7 @@ impl TxidBody {
         Ok(Self::entry_offset(fk)? / TXID_OS_PAGE)
     }
 
-    pub fn body_read_fd(&self) -> std::os::fd::RawFd {
+    pub fn body_read_fd(&self) -> crate::io_handle::IoHandle {
         self.file.read_fd()
     }
 

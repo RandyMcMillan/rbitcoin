@@ -1698,7 +1698,7 @@ mod tests {
             t
         };
         let published = q.published_ids();
-        let mut m = IdMap::new();
+        let mut m = IdMap::default();
         m.insert(parent_txid, (Fk(66), (3000, 24)));
         published.publish(Arc::new(m));
         let child = child_spend(parent_txid, 0x66);

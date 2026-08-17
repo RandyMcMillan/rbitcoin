@@ -398,7 +398,7 @@ mod tests {
         q.block_queue_enqueue(3, [3u8; 32], 1, b"wire").unwrap();
         q.block_queue_mark_resolve_complete(3).unwrap();
         let mut live = LiveUnion::new();
-        let mut hits = IdMap::new();
+        let mut hits = IdMap::default();
         hits.insert([0xAAu8; 32], (Fk(9), (8, 16)));
         live.note_height(3, &hits);
         live.publish(q.published_ids());

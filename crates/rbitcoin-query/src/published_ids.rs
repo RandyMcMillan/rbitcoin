@@ -2,18 +2,47 @@
 //!
 //! Lookup prepends one [`IdLayer`] per resolve wave (a span of BQ heights)
 //! and [`publish`](LiveUnion::publish) stores the chain head (`Arc` bump).
-//! Load [`get`](PublishedIds::get) walks newest → older with no mutex. A
-//! layer stays until **no** height in its span is still on the body queue.
-//! [`unpublish`](PublishedIds::unpublish) (store `None`) drops visibility
-//! for new readers; a reader holding the old `Arc` still sees hits.
+//! [`LiveUnion::get`] / [`partition`](LiveUnion::partition) and load
+//! [`get`](PublishedIds::get) walk newest → older. A layer stays until
+//! **no** height in its span is still on the body queue; drop is splice
+//! only (no union rebuild). [`unpublish`](PublishedIds::unpublish) (store
+//! `None`) drops visibility for new readers; a reader holding the old
+//! `Arc` still sees hits.
 
 use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
+/// Identity hasher for `[u8; 32]` txids (already uniform). `finish()` is the
+/// first 8 bytes; equality still compares the full key.
+#[derive(Default, Clone, Copy)]
+pub struct TxidHasher(u64);
+
+impl Hasher for TxidHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() >= 8 {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[..8]);
+            self.0 = u64::from_le_bytes(raw);
+        } else {
+            self.0 = 0;
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0 |= u64::from(b) << (8 * i);
+            }
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Immutable `txid → (create_fk, body_range)` for one resolve wave.
-pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64))>;
+pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64)), BuildHasherDefault<TxidHasher>>;
 
 /// One lookup wave's hits (`lo..=hi` BQ heights) plus the older chain.
 #[derive(Debug)]
@@ -92,10 +121,9 @@ impl PublishedIds {
     }
 }
 
-/// Lookup-thread union of still-queued height layers. Not shared with load.
+/// Lookup-thread chain of still-queued height layers. Not shared with load.
 #[derive(Debug, Default)]
 pub struct LiveUnion {
-    live: HashMap<[u8; 32], (Fk, (u64, u64))>,
     head: Option<Arc<IdLayer>>,
     next_wave: u32,
 }
@@ -109,7 +137,7 @@ impl LiveUnion {
         if *txid == [0u8; 32] {
             return None;
         }
-        self.live.get(txid).copied()
+        self.head.as_deref()?.get(txid)
     }
 
     /// Split `keys` into already-known hits vs TipOnly need.
@@ -117,7 +145,7 @@ impl LiveUnion {
         &self,
         keys: impl IntoIterator<Item = &'a [u8; 32]>,
     ) -> (IdMap, Vec<[u8; 32]>) {
-        let mut known = IdMap::new();
+        let mut known = IdMap::default();
         let mut need = Vec::new();
         for t in keys {
             if *t == [0u8; 32] {
@@ -133,28 +161,16 @@ impl LiveUnion {
         (known, need)
     }
 
-    fn reindex(&mut self) {
-        self.live.clear();
-        let mut cur = self.head.as_deref();
-        while let Some(layer) = cur {
-            for (t, v) in layer.hits.iter() {
-                self.live.entry(*t).or_insert(*v);
-            }
-            cur = layer.older.as_deref();
-        }
-    }
-
     /// Drop layers whose span has no remaining queued height. Does not swap.
     pub fn keep_heights(&mut self, keep: impl Fn(u32) -> bool) {
         self.head = splice_kept(self.head.take(), keep);
-        self.reindex();
     }
 
     /// Prepend one layer covering `lo..=hi` (inclusive).
     pub fn note_span(&mut self, lo: u32, hi: u32, hits: &IdMap) {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
         self.head = splice_kept(self.head.take(), |h| h < lo || h > hi);
-        let mut layer_hits = IdMap::new();
+        let mut layer_hits = IdMap::default();
         for (t, &v) in hits {
             if *t == [0u8; 32] {
                 continue;
@@ -169,7 +185,6 @@ impl LiveUnion {
                 older: self.head.take(),
             }));
         }
-        self.reindex();
     }
 
     /// Prepend a single-height layer (tests / one-shot).
@@ -235,6 +250,31 @@ fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option
 mod tests {
     use super::*;
 
+    #[test]
+    fn txid_hasher_uses_first_8_bytes() {
+        let mut h = TxidHasher::default();
+        let mut t = [0u8; 32];
+        t[..8].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        t[8] = 0xff;
+        h.write(&t);
+        assert_eq!(h.finish(), 0x0102_0304_0506_0708);
+        let mut other = [0u8; 32];
+        other[..8].copy_from_slice(&t[..8]);
+        other[31] = 1;
+        let mut h2 = TxidHasher::default();
+        h2.write(&other);
+        assert_eq!(
+            h2.finish(),
+            h.finish(),
+            "same prefix must hash equal; full-key eq still separates them"
+        );
+        let mut m = IdMap::default();
+        m.insert(t, (Fk(1), (0, 1)));
+        m.insert(other, (Fk(2), (0, 1)));
+        assert_eq!(m.get(&t).map(|v| v.0), Some(Fk(1)));
+        assert_eq!(m.get(&other).map(|v| v.0), Some(Fk(2)));
+    }
+
     fn tid(b: u8) -> [u8; 32] {
         let mut t = [0u8; 32];
         t[0] = b;
@@ -242,7 +282,7 @@ mod tests {
     }
 
     fn map_one() -> Arc<IdMap> {
-        let mut m = HashMap::new();
+        let mut m = IdMap::default();
         m.insert(tid(1), (Fk(9), (100, 8)));
         Arc::new(m)
     }
@@ -278,7 +318,7 @@ mod tests {
     #[test]
     fn zero_txid_is_never_a_hit() {
         let p = PublishedIds::new();
-        let mut m = HashMap::new();
+        let mut m = IdMap::default();
         m.insert([0u8; 32], (Fk(1), (0, 1)));
         p.publish(Arc::new(m));
         assert!(p.get(&[0u8; 32]).is_none());
@@ -367,6 +407,22 @@ mod tests {
             published.get(&tid(1)).is_none(),
             "layer must drop when no height in the span remains"
         );
+    }
+
+    #[test]
+    fn note_span_and_keep_walk_layers_without_union_rebuild() {
+        let mut live = LiveUnion::new();
+        live.note_span(1, 1, &hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.note_span(2, 2, &hits(&[(tid(2), Fk(11), (3, 4))]));
+        live.keep_heights(|h| h == 2);
+        assert_eq!(live.get(&tid(2)), Some((Fk(11), (3, 4))));
+        assert!(
+            live.get(&tid(1)).is_none(),
+            "dropped layer must not be rebuilt into a live union map"
+        );
+        let (known, need) = live.partition([&tid(2), &tid(3)]);
+        assert_eq!(known.get(&tid(2)).copied(), Some((Fk(11), (3, 4))));
+        assert_eq!(need, vec![tid(3)]);
     }
 
     #[test]

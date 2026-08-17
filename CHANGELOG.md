@@ -11,6 +11,12 @@ before 1.0).
 
 ### Changed
 
+- **Store completion session:** `IoSession` backends — Linux `io_uring`
+  (default), portable `RBITCOIN_IO=pool` (Darwin default), Windows IOCP.
+  Spend-annotate, head-resolve, and bulk fill stay multi-stage machines.
+  kqueue / POSIX AIO / `dispatch_io` are not file SQ/CQ rings.
+  `RBITCOIN_IO=pread` still disables the session.
+
 - **Confirm parent identity:** lookup prepends one `IdLayer` per resolve
   wave (`lo..=hi`) and `Arc`-bumps the chain head (`PublishedIds`). Load
   stamp is in-flight → published union → TipOnly leftover. A layer stays

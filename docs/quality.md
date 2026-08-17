@@ -40,7 +40,7 @@ level peers cannot ignore.
 | 4 | **Contributor velocity** | God-files gone or split by stage; warm suite a few minutes; TDD practiced; first-hour tutorial |
 | 5 | **Product surface honesty** | COMPAT accurate; Electrum/Esplora complete for *target* wallets, not explorer bloat |
 | 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; signet-first then mainnet with monitoring |
-| 7 | **Platform truth** | Linux-first everywhere; macOS/Windows non-goals until an IO story exists |
+| 7 | **Platform truth** | Linux-first operator binaries; store IO session exists for Darwin (`pool`) and Windows (IOCP / IoRing). Packaging those OSes is still a later ask |
 
 ### Competitive bar
 
@@ -133,7 +133,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
 | **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
 | **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
-| **—** | Darwin / Windows operator binaries | Linux-shaped IO. Draft `feature/metal-support` stays out of this list |
+| **—** | Darwin / Windows operator binaries | IO story exists (`pool` / IOCP). Binaries / codesign still not a product until asked |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
 
@@ -204,7 +204,7 @@ findings 001–021, CI split, map-free README, …) live in
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree |
 | Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); README size matches SCHEMA census |
 | Code modularity | Medium | `rpc/methods` **4.8k** after Core-functional growth. Residual giants only via **R-10** |
-| Cross-platform | Weak (honest) | Linux-shaped IO. Darwin draft is won't-fix |
+| Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. Operator binaries still Linux musl |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |

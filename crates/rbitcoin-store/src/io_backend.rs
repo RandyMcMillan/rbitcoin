@@ -31,7 +31,7 @@ pub enum WriteIoBackend {
 
 fn parse_read_token(s: &str) -> Option<ReadIoBackend> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "uring" | "io_uring" => Some(ReadIoBackend::Uring),
+        "uring" | "io_uring" | "ioring" | "pool" | "iocp" => Some(ReadIoBackend::Uring),
         "pread" | "fd" | "libc" | "pwrite" => Some(ReadIoBackend::Pread),
         // Legacy body-mmap mode removed.
         "mmap" => {
@@ -44,7 +44,7 @@ fn parse_read_token(s: &str) -> Option<ReadIoBackend> {
 
 fn parse_write_token(s: &str) -> Option<WriteIoBackend> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "uring" | "io_uring" => Some(WriteIoBackend::Uring),
+        "uring" | "io_uring" | "ioring" | "pool" | "iocp" => Some(WriteIoBackend::Uring),
         "pwrite" | "pread" | "fd" | "libc" => Some(WriteIoBackend::Pwrite),
         "mmap" => {
             warn_mmap_demote();
@@ -163,6 +163,9 @@ mod tests {
     fn parse_tokens() {
         assert_eq!(parse_read_token("uring"), Some(ReadIoBackend::Uring));
         assert_eq!(parse_read_token("io_uring"), Some(ReadIoBackend::Uring));
+        assert_eq!(parse_read_token("pool"), Some(ReadIoBackend::Uring));
+        assert_eq!(parse_read_token("iocp"), Some(ReadIoBackend::Uring));
+        assert_eq!(parse_read_token("ioring"), Some(ReadIoBackend::Uring));
         assert_eq!(parse_read_token("pread"), Some(ReadIoBackend::Pread));
         assert_eq!(parse_read_token("fd"), Some(ReadIoBackend::Pread));
         assert_eq!(parse_read_token("libc"), Some(ReadIoBackend::Pread));

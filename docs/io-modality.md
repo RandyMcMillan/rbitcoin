@@ -12,19 +12,36 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
-| **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
+| **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pool` \| `iocp` \| `pread` | Multi-op **completion session** on file handles (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
 | **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
 
-**`RBITCOIN_IO=uring` only selects the bulk batch backend.** Legacy token
-`RBITCOIN_IO=mmap` demotes to **pread** with a one-time warning.
+**`RBITCOIN_IO` selects the completion-session backend** (not per-path).
+Legacy token `mmap` demotes to **pread** with a one-time warning.
 
-Harvest invariants (TLS ring): every SQE is tracked by packed
+| Token | Backend |
+|-------|---------|
+| `uring` / `io_uring` / `ioring` | Linux `io_uring`; Windows IoRing when the probe succeeds |
+| `pool` | Worker-pool completion ring (Darwin **default**; Linux CI pin) |
+| `iocp` | Windows IOCP |
+| `pread` / `fd` / `libc` / `pwrite` | Disable session; libc positional IO (+ workers for reads) |
+
+**Defaults:** Linux `io_uring` if the ring opens, else pool. Darwin **pool**.
+Windows IoRing if `CreateIoRing` resolves, else IOCP (pool if that fails).
+
+**kqueue is not a regular-file backend.** Darwin files report ready immediately;
+`read` still blocks. The pool session is the honest completion ring there.
+
+Harvest invariants (TLS session): every SQE is tracked by packed
 `(kind, epoch, slot)`. A CQE that is unmatched, duplicate, or from a
 prior epoch is `Corrupt`, not a completion and not a TipOnly miss.
-`drain_all` is `Result`; leftover pending after a timed spin is
-`Corrupt`. CQ overflow is `Corrupt`. Per-op short/errno on a live ring
-still libc-completes that op; libc fail is `StoreError::io`. Ring setup
-failure / `RBITCOIN_IO=pread` is the only whole-batch pread fallback.
+`drain_all` is `Result`; leftover pending is `Corrupt`. CQ overflow is
+`Corrupt`. Per-op short/errno on a live session still libc-completes that
+op; libc fail is `StoreError::io`. `RBITCOIN_IO=pread` is the only
+whole-batch pread fallback (session unavailable also falls back).
+
+Machines (spend-annotate RMW, fused head-resolve, pipelined bulk fill)
+stay **multi-stage**. Pool/IOCP/IoRing are session backends — they do
+not flatten those loops to one-shot `pread_batch`.
 
 ---
 
@@ -56,7 +73,8 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 
-Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
+Default: Linux uring if the ring opens else pool; Darwin pool; Windows
+IoRing/IOCP. Ring depth **128**. `RBITCOIN_IO=pread` forces libc.
 
 ### Table transport (all fd)
 

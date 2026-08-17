@@ -9,7 +9,7 @@ below. Do not grow env surface without a damn-good reason.
 | Env | Why it stays |
 |-----|----------------|
 | **`RBITCOIN_LOG`** / **`RUST_LOG`** | Bootstrap logging before conf parse; CLI `--log-level` wins when set |
-| **`RBITCOIN_IO`** | Field escape hatch: force `pread` when io_uring is broken (`mmap` demotes to pread). **Single** bulk switch for all paths |
+| **`RBITCOIN_IO`** | Field escape hatch: `uring` \| `pool` \| `iocp` \| `pread`. **Single** bulk switch. `pread` disables the completion session (`mmap` demotes to pread) |
 
 `RBITCOIN_P2P_MAX_INBOUND` is an **input** when CLI/conf omit `--maxinbound`
 (`NodeConfig::absorb_inbound_env`). The node does not `set_var` it.

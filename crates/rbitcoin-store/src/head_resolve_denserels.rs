@@ -18,7 +18,7 @@
 //! page-grouped bulk pread (one read per OS page of `txid.body`). Nested TLS
 //! uring remains a hard error.
 //!
-//! Backend: global `RBITCOIN_IO` (`uring` \| `pread`).
+//! Backend: global `RBITCOIN_IO` (`uring` \| `pool` \| `pread`).
 
 use crate::error::StoreError;
 use crate::height_fence::HeightFence;
@@ -982,6 +982,21 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pool session drives the same staged resolve machine.
+    #[test]
+    fn pool_fk_and_range_matches_pread() {
+        crate::uring_session::with_forced_session_kind(
+            crate::uring_session::SessionKind::Pool,
+            || {
+                let (dir, t, txids) = seed_table(16);
+                let pread = resolve_fk_and_range_pread(&t, &txids, None, false).unwrap();
+                let via = resolve_fk_and_range_batch(&t, &txids).unwrap();
+                assert_eq!(pread, via);
+                let _ = std::fs::remove_dir_all(&dir);
+            },
+        );
     }
 
     /// After drain, TipOnly hits durable head (write-behind is load-owned).

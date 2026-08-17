@@ -23,11 +23,10 @@
 //!
 //! # Non-Linux
 //!
-//! Windows/macOS use the same `pread_batch` / `pwrite_batch` API surface with
-//! libc (or equivalent) positional IO and optional worker threads. A native
-//! IOCP/kqueue backend is intentionally **not** wired: it would not unify
-//! execution with Linux's completion-driven ring and would add a second code
-//! path without a measured Linux-safe win. See `docs/concurrency.md`.
+//! Darwin default is the **pool** completion session (kqueue is not a
+//! regular-file backend). Windows uses IOCP (IoRing when the probe succeeds).
+//! Machines stay staged; they do not flatten to one-shot `pread`. See
+//! `docs/io-modality.md` and `docs/concurrency.md`.
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -67,27 +66,31 @@ static URING_MODE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 static URING_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Whether io_uring bulk reads are enabled (env + successful ring setup).
+/// Whether a completion session is available (uring / pool / iocp).
+///
+/// `RBITCOIN_IO=pread` (and aliases) disables the session. The name is
+/// historical; machines run on any session backend.
 pub fn io_uring_enabled() -> bool {
     match URING_MODE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let want = std::env::var("RBITCOIN_IO")
-                .map(|s| {
-                    let t = s.trim().to_ascii_lowercase();
-                    t != "pread" && t != "fd" && t != "libc" && t != "pwrite" && t != "mmap"
-                })
-                .unwrap_or(true);
+            if crate::uring_session::forced_session_kind().is_some() {
+                return true;
+            }
+            let want = match parse_io_token() {
+                Some(IoToken::Pread) => false,
+                Some(_) | None => true,
+            };
             if !want {
                 URING_MODE.store(2, Ordering::Relaxed);
                 return false;
             }
-            let ok = probe_uring();
+            let ok = crate::uring_session::UringSession::try_open(32).is_ok();
             URING_MODE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
             if !ok && !URING_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
                 rbitcoin_log::warn!(
-                    "store: io_uring unavailable — bulk reads use pread fallback \
+                    "store: completion session unavailable — bulk reads use pread fallback \
                      (set RBITCOIN_IO=pread to silence)"
                 );
             }
@@ -96,8 +99,62 @@ pub fn io_uring_enabled() -> bool {
     }
 }
 
-fn probe_uring() -> bool {
-    crate::uring_session::UringSession::try_open(32).is_ok()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoToken {
+    Uring,
+    Pool,
+    Iocp,
+    Pread,
+}
+
+fn parse_io_token() -> Option<IoToken> {
+    let s = std::env::var("RBITCOIN_IO").ok()?;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "uring" | "io_uring" | "ioring" => Some(IoToken::Uring),
+        "pool" => Some(IoToken::Pool),
+        "iocp" => Some(IoToken::Iocp),
+        "pread" | "fd" | "libc" | "pwrite" | "mmap" => Some(IoToken::Pread),
+        _ => None,
+    }
+}
+
+/// Backend [`crate::uring_session::UringSession::try_open`] should open.
+pub fn resolved_session_kind() -> crate::uring_session::SessionKind {
+    use crate::uring_session::SessionKind;
+    if let Some(k) = crate::uring_session::forced_session_kind() {
+        return k;
+    }
+    match parse_io_token() {
+        Some(IoToken::Pool) => SessionKind::Pool,
+        Some(IoToken::Iocp) => SessionKind::Iocp,
+        Some(IoToken::Uring) => SessionKind::Uring,
+        Some(IoToken::Pread) => SessionKind::Pool, // unused: gate is off
+        None => default_session_kind(),
+    }
+}
+
+fn default_session_kind() -> crate::uring_session::SessionKind {
+    use crate::uring_session::SessionKind;
+    #[cfg(target_os = "linux")]
+    {
+        SessionKind::Uring
+    }
+    #[cfg(target_os = "macos")]
+    {
+        SessionKind::Pool
+    }
+    #[cfg(windows)]
+    {
+        if crate::io_session_ioring::ioring_available() {
+            SessionKind::Uring
+        } else {
+            SessionKind::Iocp
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        SessionKind::Pool
+    }
 }
 
 /// Worker count for pread fallback (cached).
@@ -1065,6 +1122,38 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pread_batch_on_pool_session() {
+        use crate::uring_session::{with_forced_session_kind, SessionKind};
+        with_forced_session_kind(SessionKind::Pool, || {
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-pread-pool-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("blob");
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"pool-session-bytes!!").unwrap();
+            f.flush().unwrap();
+            let f = std::fs::File::open(&path).unwrap();
+            let fd = f.as_raw_fd();
+            let mut b = [0u8; 4];
+            let mut ops = [ReadOp {
+                fd,
+                offset: 0,
+                buf: &mut b[..],
+                result: i32::MIN,
+            }];
+            pread_batch(&mut ops);
+            assert_eq!(ops[0].result, 4);
+            assert_eq!(&b, b"pool");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

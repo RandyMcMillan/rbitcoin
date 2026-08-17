@@ -30,7 +30,10 @@ use crate::error::StoreError;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -66,12 +69,22 @@ pub struct TableFile {
     grow_tight: AtomicBool,
 }
 
+fn table_open_opts() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+        o.custom_flags(FILE_FLAG_OVERLAPPED);
+    }
+    o
+}
+
 impl TableFile {
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = table_open_opts()
             .create_new(true)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
@@ -112,9 +125,7 @@ impl TableFile {
         kind: TableKind,
     ) -> Result<Self, StoreError> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let file = table_open_opts()
             .create_new(true)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
@@ -144,9 +155,7 @@ impl TableFile {
         data_bytes: u64,
     ) -> Result<(Self, [u8; 16]), StoreError> {
         let path = path.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
@@ -207,9 +216,7 @@ impl TableFile {
         kind: TableKind,
     ) -> Result<(PathBuf, u64), StoreError> {
         let path = path.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
@@ -271,9 +278,7 @@ impl TableFile {
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
 
@@ -328,9 +333,23 @@ impl TableFile {
     }
 
     /// Raw FD for io_uring / pread bulk reads (lock-free; do not close).
+    #[cfg(unix)]
     #[inline]
     pub fn read_fd(&self) -> RawFd {
         self.read_file.as_raw_fd()
+    }
+
+    /// Portable handle for the completion session (lock-free; do not close).
+    #[inline]
+    pub fn io_handle(&self) -> crate::io_handle::IoHandle {
+        #[cfg(unix)]
+        {
+            crate::io_handle::IoHandle::from_raw_fd(self.read_file.as_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            crate::io_handle::IoHandle::from_raw_handle(self.read_file.as_raw_handle() as isize)
+        }
     }
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
@@ -374,17 +393,10 @@ impl TableFile {
         if buf.is_empty() {
             return Ok(());
         }
-        let fd = self.read_file.as_raw_fd();
+        let handle = self.io_handle();
         let mut done = 0usize;
         while done < buf.len() {
-            let rc = unsafe {
-                libc::pread(
-                    fd,
-                    buf[done..].as_mut_ptr() as *mut libc::c_void,
-                    buf.len() - done,
-                    (offset + done as u64) as libc::off_t,
-                )
-            };
+            let rc = handle.pread(offset + done as u64, &mut buf[done..]);
             if rc < 0 {
                 return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
             }
@@ -404,17 +416,10 @@ impl TableFile {
         if bytes.is_empty() {
             return Ok(());
         }
-        let fd = self.read_file.as_raw_fd();
+        let handle = self.io_handle();
         let mut done = 0usize;
         while done < bytes.len() {
-            let rc = unsafe {
-                libc::pwrite(
-                    fd,
-                    bytes[done..].as_ptr() as *const libc::c_void,
-                    bytes.len() - done,
-                    (offset + done as u64) as libc::off_t,
-                )
-            };
+            let rc = handle.pwrite(offset + done as u64, &bytes[done..]);
             if rc < 0 {
                 return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
             }

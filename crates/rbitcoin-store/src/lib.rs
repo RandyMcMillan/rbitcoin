@@ -23,6 +23,12 @@ mod idx_body_pipeline;
 mod int_map;
 mod integrity;
 mod io_backend;
+mod io_handle;
+#[cfg(windows)]
+mod io_session_iocp;
+#[cfg(windows)]
+mod io_session_ioring;
+mod io_session_pool;
 mod open_address;
 mod point_table;
 mod scripthash;
@@ -71,6 +77,7 @@ pub use integrity::{
     merkle_root_from_txids, TipRevalidateReport, TipSeal, TIP_SEAL_NAME, VERIFY_TIP_BLOCKS,
 };
 pub use io_backend::{read_io_backend, write_io_backend, ReadIoBackend, WriteIoBackend};
+pub use io_handle::IoHandle;
 pub use point_table::PointRecord;
 pub use scripthash::{
     has_sh_run_rebuild_source, load_include_hwm, script_hash, sh_run_catalog_key_len_ok,
@@ -124,3 +131,6 @@ pub use tx_table::{
     OutputRecord, SpendMetaBackend, TxRecord, BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF,
 };
 pub use txid_body::{TxidBody, TXID_BODY_HEADER, TXID_ENTRY_LEN};
+pub use uring_session::{
+    with_forced_session_kind, with_thread_local, SessionKind, UringSession, DEFAULT_ENTRIES,
+};

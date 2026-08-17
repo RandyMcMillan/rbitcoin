@@ -1,12 +1,15 @@
-//! Owned io_uring session — **the** ring abstraction for this crate.
+//! Completion-driven IO session — **the** ring abstraction for this crate.
 //!
-//! All production io_uring work goes through [`UringSession`] via
+//! All production bulk / machine IO goes through [`UringSession`] via
 //! [`with_thread_local`]:
 //! - plan head-resolve (confirm stamp / denserels)
 //! - spend annotate abs-meta RMW / pure pwrite
 //! - [`crate::bulk_io`] pread/pwrite batches and page RMW
 //!
-//! **Lifetime:** one long-lived ring per OS thread (TLS). **Nested**
+//! Backends: Linux `io_uring`, portable [`crate::io_session_pool`] (Darwin
+//! default + `RBITCOIN_IO=pool`), Windows IOCP / IoRing.
+//!
+//! **Lifetime:** one long-lived session per OS thread (TLS). **Nested**
 //! [`with_thread_local`] on the same OS thread is a **hard error** (panic) —
 //! never open a temporary mid-wave ring (that regressed plan `head_fk`).
 //! Callers that need bulk probe IO must run it **before** taking the TLS ring
@@ -14,7 +17,9 @@
 //! [`UringSession::new`] on hot paths — that setup/teardowns every batch.
 
 use crate::error::StoreError;
-use std::os::fd::RawFd;
+use crate::io_handle::IoHandle;
+use crate::io_session_pool::PoolEngine;
+use std::cell::Cell;
 use std::path::Path;
 
 /// Default SQ/CQ depth for all store io_uring sessions (bulk, plan head-resolve,
@@ -22,13 +27,50 @@ use std::path::Path;
 /// if a caller requests more (none currently do).
 pub const DEFAULT_ENTRIES: u32 = 128;
 
-/// Owned io_uring for multi-stage submit/complete loops.
-pub struct UringSession {
+/// Which completion backend [`UringSession`] opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Linux io_uring / Windows IoRing.
+    Uring,
+    /// Worker-pool completion ring (Darwin default; Linux `RBITCOIN_IO=pool`).
+    Pool,
+    /// Windows IOCP.
+    Iocp,
+}
+
+thread_local! {
+    static FORCED_KIND: Cell<Option<SessionKind>> = const { Cell::new(None) };
+}
+
+/// Run `f` with TLS / `try_open` opening `kind` (does not nest a session).
+pub fn with_forced_session_kind<R>(kind: SessionKind, f: impl FnOnce() -> R) -> R {
+    FORCED_KIND.with(|c| {
+        let prev = c.replace(Some(kind));
+        let out = f();
+        c.set(prev);
+        out
+    })
+}
+
+pub(crate) fn forced_session_kind() -> Option<SessionKind> {
+    FORCED_KIND.with(|c| c.get())
+}
+
+enum SessionBackend {
     #[cfg(target_os = "linux")]
-    ring: io_uring::IoUring,
+    Uring(io_uring::IoUring),
+    Pool(PoolEngine),
+    #[cfg(windows)]
+    Iocp(crate::io_session_iocp::IocpEngine),
+}
+
+/// Owned completion session for multi-stage submit/complete loops.
+pub struct UringSession {
+    backend: SessionBackend,
     entries: u32,
     pending: UringPending,
     epoch: u16,
+    kind: SessionKind,
 }
 
 impl UringSession {
@@ -44,32 +86,69 @@ impl UringSession {
         Self::try_open(entries)
     }
 
-    /// Create a ring without consulting [`crate::bulk_io::io_uring_enabled`].
+    /// Create a session without consulting [`crate::bulk_io::io_uring_enabled`].
     ///
     /// Used for capability probe and by TLS open after the gate has already
     /// passed (avoids recursion through `io_uring_enabled` → probe → here).
     pub(crate) fn try_open(entries: u32) -> Result<Self, StoreError> {
+        Self::try_open_kind(crate::bulk_io::resolved_session_kind(), entries)
+    }
+
+    /// Open an explicit backend (tests + probe).
+    pub fn try_open_kind(kind: SessionKind, entries: u32) -> Result<Self, StoreError> {
         let entries = entries.max(32).min(4096);
-        #[cfg(target_os = "linux")]
-        {
-            let ring = io_uring::IoUring::new(entries).map_err(|e| {
-                StoreError::io(
-                    Path::new("io_uring"),
-                    std::io::Error::other(format!("io_uring: {e}")),
-                )
-            })?;
-            Ok(Self {
-                ring,
-                entries,
-                pending: UringPending::new(),
-                epoch: 0,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = entries;
-            Err(StoreError::Corrupt("io_uring is Linux-only"))
-        }
+        let backend = match kind {
+            SessionKind::Uring => {
+                #[cfg(target_os = "linux")]
+                {
+                    let ring = io_uring::IoUring::new(entries).map_err(|e| {
+                        StoreError::io(
+                            Path::new("io_uring"),
+                            std::io::Error::other(format!("io_uring: {e}")),
+                        )
+                    })?;
+                    SessionBackend::Uring(ring)
+                }
+                #[cfg(windows)]
+                {
+                    match crate::io_session_iocp::IocpEngine::open(entries) {
+                        Ok(eng) => SessionBackend::Iocp(eng),
+                        Err(_) => SessionBackend::Pool(PoolEngine::open(
+                            crate::bulk_io::bulk_io_workers(),
+                        )),
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", windows)))]
+                {
+                    SessionBackend::Pool(PoolEngine::open(crate::bulk_io::bulk_io_workers()))
+                }
+            }
+            SessionKind::Pool => {
+                SessionBackend::Pool(PoolEngine::open(crate::bulk_io::bulk_io_workers()))
+            }
+            SessionKind::Iocp => {
+                #[cfg(windows)]
+                {
+                    SessionBackend::Iocp(crate::io_session_iocp::IocpEngine::open(entries)?)
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = entries;
+                    return Err(StoreError::Corrupt("iocp is Windows-only"));
+                }
+            }
+        };
+        Ok(Self {
+            backend,
+            entries,
+            pending: UringPending::new(),
+            epoch: 0,
+            kind,
+        })
+    }
+
+    pub fn kind(&self) -> SessionKind {
+        self.kind
     }
 
     pub fn in_flight(&self) -> usize {
@@ -97,7 +176,7 @@ impl UringSession {
     /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
     pub fn push_pread(
         &mut self,
-        fd: RawFd,
+        fd: impl Into<IoHandle>,
         offset: u64,
         buf: &mut [u8],
         user_data: u64,
@@ -105,10 +184,10 @@ impl UringSession {
         self.push_pread_flags(fd, offset, buf, user_data, 0)
     }
 
-    /// Like [`push_pread`] with optional `rw_flags`.
+    /// Like [`push_pread`] with optional `rw_flags` (honored on Linux uring only).
     pub fn push_pread_flags(
         &mut self,
-        fd: RawFd,
+        fd: impl Into<IoHandle>,
         offset: u64,
         buf: &mut [u8],
         user_data: u64,
@@ -116,42 +195,47 @@ impl UringSession {
     ) -> Result<(), StoreError> {
         #[cfg(test)]
         test_note_sqe(rw_flags, buf.len() as u32);
-        #[cfg(target_os = "linux")]
-        {
-            use io_uring::{opcode, types};
-            if buf.is_empty() {
-                return Ok(());
-            }
-            if self.pending.len() >= self.entries as usize {
-                return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
-            }
-            self.pending.insert(user_data)?;
-            let mut b =
-                opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).offset(offset);
-            if rw_flags != 0 {
-                b = b.rw_flags(rw_flags);
-            }
-            let sqe = b.build().user_data(user_data);
-            // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
-            unsafe {
-                if self.ring.submission().push(&sqe).is_err() {
-                    let _ = self.pending.expect_cqe(user_data);
-                    return Err(StoreError::Corrupt("io_uring SQ full"));
-                }
-            }
-            Ok(())
+        if buf.is_empty() {
+            return Ok(());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (fd, offset, buf, user_data, rw_flags);
-            Err(StoreError::Corrupt("io_uring is Linux-only"))
+        if self.pending.len() >= self.entries as usize {
+            return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
+        }
+        self.pending.insert(user_data)?;
+        let handle = fd.into();
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => {
+                use io_uring::{opcode, types};
+                let mut b = opcode::Read::new(
+                    types::Fd(handle.as_raw_fd()),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+                .offset(offset);
+                if rw_flags != 0 {
+                    b = b.rw_flags(rw_flags);
+                }
+                let sqe = b.build().user_data(user_data);
+                // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
+                unsafe {
+                    if ring.submission().push(&sqe).is_err() {
+                        let _ = self.pending.expect_cqe(user_data);
+                        return Err(StoreError::Corrupt("io_uring SQ full"));
+                    }
+                }
+                Ok(())
+            }
+            SessionBackend::Pool(pool) => pool.push_pread(handle, offset, buf, user_data),
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => eng.push_pread(handle, offset, buf, user_data),
         }
     }
 
     /// Push a pwrite SQE. Buffer must stay live until the CQE is harvested.
     pub fn push_pwrite(
         &mut self,
-        fd: RawFd,
+        fd: impl Into<IoHandle>,
         offset: u64,
         buf: &[u8],
         user_data: u64,
@@ -159,10 +243,10 @@ impl UringSession {
         self.push_pwrite_flags(fd, offset, buf, user_data, 0)
     }
 
-    /// Like [`push_pwrite`] with optional `rw_flags`.
+    /// Like [`push_pwrite`] with optional `rw_flags` (honored on Linux uring only).
     pub fn push_pwrite_flags(
         &mut self,
-        fd: RawFd,
+        fd: impl Into<IoHandle>,
         offset: u64,
         buf: &[u8],
         user_data: u64,
@@ -170,51 +254,56 @@ impl UringSession {
     ) -> Result<(), StoreError> {
         #[cfg(test)]
         test_note_sqe(rw_flags, buf.len() as u32);
-        #[cfg(target_os = "linux")]
-        {
-            use io_uring::{opcode, types};
-            if buf.is_empty() {
-                return Ok(());
-            }
-            if self.pending.len() >= self.entries as usize {
-                return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
-            }
-            self.pending.insert(user_data)?;
-            let mut b =
-                opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32).offset(offset);
-            if rw_flags != 0 {
-                b = b.rw_flags(rw_flags);
-            }
-            let sqe = b.build().user_data(user_data);
-            // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
-            unsafe {
-                if self.ring.submission().push(&sqe).is_err() {
-                    let _ = self.pending.expect_cqe(user_data);
-                    return Err(StoreError::Corrupt("io_uring SQ full"));
-                }
-            }
-            Ok(())
+        if buf.is_empty() {
+            return Ok(());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (fd, offset, buf, user_data, rw_flags);
-            Err(StoreError::Corrupt("io_uring is Linux-only"))
+        if self.pending.len() >= self.entries as usize {
+            return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
+        }
+        self.pending.insert(user_data)?;
+        let handle = fd.into();
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => {
+                use io_uring::{opcode, types};
+                let mut b = opcode::Write::new(
+                    types::Fd(handle.as_raw_fd()),
+                    buf.as_ptr(),
+                    buf.len() as u32,
+                )
+                .offset(offset);
+                if rw_flags != 0 {
+                    b = b.rw_flags(rw_flags);
+                }
+                let sqe = b.build().user_data(user_data);
+                // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
+                unsafe {
+                    if ring.submission().push(&sqe).is_err() {
+                        let _ = self.pending.expect_cqe(user_data);
+                        return Err(StoreError::Corrupt("io_uring SQ full"));
+                    }
+                }
+                Ok(())
+            }
+            SessionBackend::Pool(pool) => pool.push_pwrite(handle, offset, buf, user_data),
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => eng.push_pwrite(handle, offset, buf, user_data),
         }
     }
 
     pub fn sync_submission(&mut self) {
         #[cfg(target_os = "linux")]
-        {
-            self.ring.submission().sync();
+        if let SessionBackend::Uring(ring) = &mut self.backend {
+            ring.submission().sync();
         }
     }
 
     /// Submit pending SQEs and wait for at least one CQE. Does not harvest.
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
-        #[cfg(target_os = "linux")]
-        {
-            loop {
-                match self.ring.submit_and_wait(1) {
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => loop {
+                match ring.submit_and_wait(1) {
                     Ok(_) => return Ok(()),
                     Err(e) => {
                         if let Some(err) = map_enter_err(&e) {
@@ -222,26 +311,28 @@ impl UringSession {
                         }
                     }
                 }
+            },
+            SessionBackend::Pool(pool) => {
+                pool.wait_one_cqe();
+                Ok(())
             }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(StoreError::Corrupt("io_uring is Linux-only"))
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => eng.wait_one_cqe(),
         }
     }
 
     /// Kick submission without waiting (non-blocking).
     pub fn submit(&mut self) -> Result<(), StoreError> {
-        #[cfg(target_os = "linux")]
-        {
-            self.ring
-                .submit()
-                .map_err(|_| StoreError::Corrupt("io_uring submit failed"))?;
-            Ok(())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(StoreError::Corrupt("io_uring is Linux-only"))
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => {
+                ring.submit()
+                    .map_err(|_| StoreError::Corrupt("io_uring submit failed"))?;
+                Ok(())
+            }
+            SessionBackend::Pool(_) => Ok(()),
+            #[cfg(windows)]
+            SessionBackend::Iocp(_) => Ok(()),
         }
     }
 
@@ -253,31 +344,34 @@ impl UringSession {
     /// same harvest are still returned after the error is noted; callers must
     /// treat `Err` as fatal and drain.
     pub fn harvest_ready(&mut self) -> Result<Vec<(u64, i32)>, StoreError> {
-        #[cfg(target_os = "linux")]
-        {
-            {
-                let cq = self.ring.completion();
-                cq_overflow_result(cq.overflow())?;
-            }
-            self.ring.completion().sync();
-            let mut out = Vec::new();
-            let mut unexpected = false;
-            for cqe in self.ring.completion() {
-                let ud = cqe.user_data();
-                match self.pending.expect_cqe(ud) {
-                    Ok(()) => out.push((ud, cqe.result())),
-                    Err(_) => unexpected = true,
+        let raw = match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => {
+                {
+                    let cq = ring.completion();
+                    cq_overflow_result(cq.overflow())?;
                 }
+                ring.completion().sync();
+                ring.completion()
+                    .map(|cqe| (cqe.user_data(), cqe.result()))
+                    .collect::<Vec<_>>()
             }
-            if unexpected {
-                Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"))
-            } else {
-                Ok(out)
+            SessionBackend::Pool(pool) => pool.harvest_ready(),
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => eng.harvest_ready(),
+        };
+        let mut out = Vec::new();
+        let mut unexpected = false;
+        for (ud, res) in raw {
+            match self.pending.expect_cqe(ud) {
+                Ok(()) => out.push((ud, res)),
+                Err(_) => unexpected = true,
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(Vec::new())
+        if unexpected {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"))
+        } else {
+            Ok(out)
         }
     }
 
@@ -288,40 +382,50 @@ impl UringSession {
     /// harvest of only-ready CQEs is not enough — the kernel may still write
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
     pub fn drain_all(&mut self) -> Result<(), StoreError> {
-        #[cfg(target_os = "linux")]
-        {
-            // Timed waits: leftover phantom pending must not block forever.
-            // EINTR retries; other enter errors still spin until the bound.
-            let mut spins = 0u32;
-            let max_spins = self.entries.saturating_mul(4).max(64);
-            while !self.pending.is_empty() && spins < max_spins {
-                spins += 1;
-                let ts = io_uring::types::Timespec::new().nsec(1_000_000);
-                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-                match self.ring.submitter().submit_with_args(1, &args) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if map_enter_err(&e).is_some() {
-                            let _ = self.ring.submit();
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(ring) => {
+                // Timed waits: leftover phantom pending must not block forever.
+                let mut spins = 0u32;
+                let max_spins = self.entries.saturating_mul(4).max(64);
+                while !self.pending.is_empty() && spins < max_spins {
+                    spins += 1;
+                    let ts = io_uring::types::Timespec::new().nsec(1_000_000);
+                    let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                    match ring.submitter().submit_with_args(1, &args) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            if map_enter_err(&e).is_some() {
+                                let _ = ring.submit();
+                            }
                         }
                     }
+                    ring.completion().sync();
+                    for cqe in ring.completion() {
+                        let _ = self.pending.expect_cqe(cqe.user_data());
+                    }
                 }
-                self.ring.completion().sync();
-                for cqe in self.ring.completion() {
+                let _ = ring.submit();
+                ring.completion().sync();
+                for cqe in ring.completion() {
                     let _ = self.pending.expect_cqe(cqe.user_data());
                 }
             }
-            let _ = self.ring.submit();
-            self.ring.completion().sync();
-            for cqe in self.ring.completion() {
-                let _ = self.pending.expect_cqe(cqe.user_data());
+            SessionBackend::Pool(pool) => {
+                pool.wait_idle();
+                for (ud, _) in pool.harvest_ready() {
+                    let _ = self.pending.expect_cqe(ud);
+                }
             }
-            self.pending.assert_drained()
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => {
+                eng.wait_idle()?;
+                for (ud, _) in eng.harvest_ready() {
+                    let _ = self.pending.expect_cqe(ud);
+                }
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.pending.assert_drained()
-        }
+        self.pending.assert_drained()
     }
 }
 
@@ -395,14 +499,6 @@ pub fn with_thread_local<R>(
 ) -> Result<R, StoreError> {
     let min_entries = min_entries.max(32).min(4096);
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = min_entries;
-        let _ = f;
-        return Err(StoreError::Corrupt("io_uring is Linux-only"));
-    }
-
-    #[cfg(target_os = "linux")]
     {
         use std::cell::{Cell, RefCell};
 
@@ -439,7 +535,10 @@ pub fn with_thread_local<R>(
                 let mut slot = cell.borrow_mut();
                 let need_open = match slot.as_ref() {
                     None => true,
-                    Some(s) => s.entries() < min_entries,
+                    Some(s) => {
+                        s.entries() < min_entries
+                            || forced_session_kind().is_some_and(|k| k != s.kind())
+                    }
                 };
                 if need_open {
                     if let Some(mut old) = slot.take() {
@@ -909,5 +1008,111 @@ mod tests {
             assert_eq!(b[0], 0xAB);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn tmp_rw(tag: &str) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-session-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("tmp");
+        (path, f)
+    }
+
+    /// Live harvest: pushed user_data comes back; drain leaves in_flight==0.
+    #[test]
+    fn pool_harvest_returns_user_data_and_drains() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (path, mut f) = tmp_rw("pool-harvest");
+        f.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+        f.sync_all().unwrap();
+        let fd = f.as_raw_fd();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        assert_eq!(session.kind(), SessionKind::Pool);
+        let mut a = [0u8; 2];
+        let mut b = [0u8; 2];
+        session.push_pread(fd, 0, &mut a, 10).expect("push a");
+        session.push_pread(fd, 2, &mut b, 11).expect("push b");
+        session.submit().unwrap();
+        session.submit_and_wait_one().unwrap();
+        let mut got = session.harvest_ready().expect("harvest");
+        if got.len() < 2 {
+            session.submit_and_wait_one().unwrap();
+            got.extend(session.harvest_ready().expect("harvest2"));
+        }
+        session.drain_all().expect("drain");
+        assert_eq!(session.in_flight(), 0);
+        let uds: std::collections::HashSet<u64> = got.iter().map(|(u, _)| *u).collect();
+        assert!(uds.contains(&10) && uds.contains(&11), "got {got:?}");
+        assert_eq!(&a, &[0x11, 0x22]);
+        assert_eq!(&b, &[0x33, 0x44]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_unmatched_cqe_is_corrupt() {
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        match session.pending.expect_cqe(99) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("expected unexpected-cqe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_short_read_is_libc_complete_not_silent_ok() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (path, mut f) = tmp_rw("pool-short");
+        f.write_all(&[1u8, 2]).unwrap();
+        f.sync_all().unwrap();
+        let fd = f.as_raw_fd();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let mut buf = [0u8; 8];
+        session.push_pread(fd, 0, &mut buf, 1).unwrap();
+        session.submit().unwrap();
+        session.drain_all().unwrap();
+        // File is only 2 bytes; pread of 8 returns 2, not a silent full fill.
+        // Drain consumed the CQE; re-issue and harvest the result.
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool2");
+        let mut buf = [0u8; 8];
+        session.push_pread(fd, 0, &mut buf, 7).unwrap();
+        session.submit_and_wait_one().unwrap();
+        let got = session.harvest_ready().expect("h");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 7);
+        assert_eq!(got[0].1, 2, "short pread must report transferred bytes");
+        assert_eq!(&buf[..2], &[1, 2]);
+        session.drain_all().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forced_kind_opens_pool_via_tls() {
+        with_forced_session_kind(SessionKind::Pool, || {
+            let kind = with_thread_local(32, |s| s.kind()).expect("tls pool");
+            assert_eq!(kind, SessionKind::Pool);
+        });
+    }
+
+    #[test]
+    fn default_kind_follows_os_when_env_unset() {
+        if std::env::var_os("RBITCOIN_IO").is_some() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(crate::bulk_io::resolved_session_kind(), SessionKind::Uring);
+        #[cfg(target_os = "macos")]
+        assert_eq!(crate::bulk_io::resolved_session_kind(), SessionKind::Pool);
     }
 }

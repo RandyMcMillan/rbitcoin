@@ -38,7 +38,7 @@ pub fn truncated_median(mut scores: Vec<i64>) -> i64 {
         return 0;
     }
     scores.sort_unstable();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         scores[n / 2 - 1]
     } else {
         scores[n / 2]

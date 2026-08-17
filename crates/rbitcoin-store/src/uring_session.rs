@@ -330,6 +330,54 @@ impl Drop for UringSession {
         let _ = self.drain_all();
     }
 }
+
+/// Drain the session when dropped. Declare **after** SQE buffers so drop
+/// order drains while those buffers are still live.
+pub(crate) struct DrainOnDrop<'a> {
+    session: &'a mut UringSession,
+}
+
+impl UringSession {
+    pub(crate) fn drain_guard(&mut self) -> DrainOnDrop<'_> {
+        DrainOnDrop { session: self }
+    }
+}
+
+impl Drop for DrainOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.session.drain_all();
+    }
+}
+
+impl std::ops::Deref for DrainOnDrop<'_> {
+    type Target = UringSession;
+    fn deref(&self) -> &UringSession {
+        self.session
+    }
+}
+
+impl std::ops::DerefMut for DrainOnDrop<'_> {
+    fn deref_mut(&mut self) -> &mut UringSession {
+        self.session
+    }
+}
+
+/// Full-length CQE or `StoreError::io`. Short success is not a soft miss.
+pub(crate) fn require_full_cqe(res: i32, want: usize, path: &Path) -> Result<(), StoreError> {
+    if res < 0 {
+        return Err(StoreError::io(
+            path,
+            std::io::Error::from_raw_os_error(-res),
+        ));
+    }
+    if res as usize != want {
+        return Err(StoreError::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "io_uring short cqe"),
+        ));
+    }
+    Ok(())
+}
 /// Run `f` with this **OS thread's** long-lived io_uring session.
 ///
 /// - Opens once on first use; reopens only if `min_entries` exceeds the current
@@ -647,6 +695,20 @@ mod tests {
             other => panic!("expected overflow Corrupt, got {other:?}"),
         }
         assert!(cq_overflow_result(0).is_ok());
+    }
+
+    #[test]
+    fn spend_annotate_drain_short_cqe_is_io() {
+        let p = Path::new("/tmp/spent.body");
+        match require_full_cqe(4, 8, p) {
+            Err(StoreError::Io { .. }) => {}
+            other => panic!("short CQE must be io, got {other:?}"),
+        }
+        match require_full_cqe(-5, 8, p) {
+            Err(StoreError::Io { .. }) => {}
+            other => panic!("negative CQE must be io, got {other:?}"),
+        }
+        assert!(require_full_cqe(8, 8, p).is_ok());
     }
 
     #[test]

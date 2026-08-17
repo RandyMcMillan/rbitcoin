@@ -87,6 +87,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
 
         let mut free_slots: Vec<usize> = (0..MAX_SLOTS).collect();
         let mut slots: Vec<Option<Slot>> = (0..MAX_SLOTS).map(|_| None).collect();
+        let mut session = session.drain_guard();
         let mut in_flight = 0usize;
 
         let arm = |session: &mut UringSession,
@@ -129,7 +130,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
         };
 
         arm(
-            session,
+            &mut session,
             &mut free_slots,
             &mut slots,
             &mut pending,
@@ -167,23 +168,14 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 }
                 in_flight = in_flight.saturating_sub(1);
                 let edge_i = st.edge_i;
-                let (abs, create_fk, vout, spend_fk) = work[edge_i];
+                let (abs, _create_fk, _vout, spend_fk) = work[edge_i];
 
                 match st.phase {
                     Phase::Reading => {
-                        if res < 0 {
+                        if let Err(e) = uring_session::require_full_cqe(res, META_LEN, &body_path) {
                             free_slots.push(slot);
                             abs_busy.remove(&abs);
-                            return Err(StoreError::io(
-                                &body_path,
-                                std::io::Error::from_raw_os_error(-res),
-                            ));
-                        }
-                        if res as usize != META_LEN {
-                            free_slots.push(slot);
-                            abs_busy.remove(&abs);
-                            cold.push((create_fk, vout, spend_fk));
-                            continue;
+                            return Err(e);
                         }
 
                         let (flags0, field) = decode_spent_slot_v17(&st.buf)?;
@@ -240,22 +232,13 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         in_flight += 1;
                     }
                     Phase::Writing => {
-                        if res < 0 {
+                        if let Err(e) = uring_session::require_full_cqe(res, META_LEN, &body_path) {
                             free_slots.push(slot);
                             abs_busy.remove(&abs);
-                            return Err(StoreError::io(
-                                &body_path,
-                                std::io::Error::from_raw_os_error(-res),
-                            ));
+                            return Err(e);
                         }
-                        if res as usize != META_LEN {
-                            free_slots.push(slot);
-                            abs_busy.remove(&abs);
-                            cold.push((create_fk, vout, spend_fk));
-                        } else {
-                            free_slots.push(slot);
-                            abs_busy.remove(&abs);
-                        }
+                        free_slots.push(slot);
+                        abs_busy.remove(&abs);
                         if let Some(q) = abs_wait.get_mut(&abs) {
                             if let Some(next_ei) = q.pop_front() {
                                 pending.push_front(next_ei);
@@ -269,7 +252,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
             }
 
             arm(
-                session,
+                &mut session,
                 &mut free_slots,
                 &mut slots,
                 &mut pending,
@@ -587,6 +570,7 @@ fn put_spend_batch_pure_write_uring(
         let nslots = MAX_SLOTS.min(groups.len().max(1));
         let mut free_slots: Vec<usize> = (0..nslots).collect();
         let mut slots: Vec<Option<PageSlot>> = (0..nslots).map(|_| None).collect();
+        let mut session = session.drain_guard();
         let mut in_flight = 0usize;
         let mut cold_local = cold.clone();
 
@@ -623,7 +607,7 @@ fn put_spend_batch_pure_write_uring(
         };
 
         arm(
-            session,
+            &mut session,
             &mut free_slots,
             &mut slots,
             &mut pending,
@@ -660,17 +644,10 @@ fn put_spend_batch_pure_write_uring(
                 let gi = st.group_i;
                 match st.phase {
                     Phase::Reading => {
-                        if res < 0 {
+                        let want = st.buf.len();
+                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
                             free_slots.push(slot);
-                            return Err(StoreError::io(
-                                &body_path,
-                                std::io::Error::from_raw_os_error(-res),
-                            ));
-                        }
-                        if res as usize != st.buf.len() {
-                            free_slots.push(slot);
-                            cold_group_edges(&mut cold_local, &groups[gi].writes);
-                            continue;
+                            return Err(e);
                         }
                         poke_spent_page(&mut st.buf, groups[gi].off, &groups[gi].writes)?;
                         st.phase = Phase::Writing;
@@ -687,22 +664,17 @@ fn put_spend_batch_pure_write_uring(
                         in_flight += 1;
                     }
                     Phase::Writing => {
-                        if res < 0 {
+                        let want = st.buf.len();
+                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
                             free_slots.push(slot);
-                            return Err(StoreError::io(
-                                &body_path,
-                                std::io::Error::from_raw_os_error(-res),
-                            ));
-                        }
-                        if res as usize != st.buf.len() {
-                            cold_group_edges(&mut cold_local, &groups[gi].writes);
+                            return Err(e);
                         }
                         free_slots.push(slot);
                     }
                 }
             }
             arm(
-                session,
+                &mut session,
                 &mut free_slots,
                 &mut slots,
                 &mut pending,

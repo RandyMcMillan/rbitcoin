@@ -12,10 +12,8 @@
 //!
 //! **`insert_many` batching:** stable-sort by probe **page** then original index
 //! (preserves call order within a page for rare same-batch duplicate txids). One
-//! page load + multi-insert in RAM + one `pwrite` per dirty page. Concurrent
-//! probes use a per-page RAM seqlock (odd = pwrite in flight) so they hop-scan
-//! a complete image — stale is fine, mixed old/new is not. **Open tail only:**
-//! sealed segments drop the array (`open_immutable` / `without_page_seq`).
+//! page load + multi-insert in RAM + one `pwrite` per dirty page. Visibility is
+//! the syscall plus `published_len` Release — not a CPU fence.
 //!
 //! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
@@ -42,7 +40,7 @@ use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// In-page slot index width (1024 slots / page @ any entry width).
 pub const PAGE_SLOT_BITS: u32 = 10;
@@ -54,10 +52,6 @@ pub const MAX_PROBE: u32 = 1024;
 
 /// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
 pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
-
-/// Give the sole writer time to finish a 4 KiB `pwrite` (CI can preempt
-/// mid-syscall). Then fail closed so a panic between odd/even cannot livelock.
-const PAGE_SEQ_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! {
@@ -315,6 +309,13 @@ pub fn entry_from_page_buf(buf: &[u8], local: u64, entry_bytes: u8) -> Option<u6
     })
 }
 
+/// Two loads + hop of one probe page (leftover-miss dump).
+pub(crate) struct PageHopDump {
+    pub scan: ProbeRegionScan,
+    pub hop_equal_second: bool,
+    pub occupied: u32,
+}
+
 /// Result of hopping through one loaded page.
 #[derive(Debug, Clone)]
 pub struct ProbeRegionScan {
@@ -564,24 +565,6 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
     Ok((layout, generation))
 }
 
-fn new_page_seq(slots: u64, bits: u32) -> Box<[AtomicU32]> {
-    let ps = page_slot_count(bits).max(1);
-    let n = (slots / ps).max(1) as usize;
-    (0..n).map(|_| AtomicU32::new(0)).collect()
-}
-
-#[inline]
-fn page_seq_index_in(n_pages: usize, bits: u32, page_base: u64) -> usize {
-    let ps = page_slot_count(bits).max(1);
-    let i = (page_base / ps) as usize;
-    i.min(n_pages.saturating_sub(1))
-}
-
-#[inline]
-fn page_seq_in(seqs: &[AtomicU32], bits: u32, page_base: u64) -> &AtomicU32 {
-    &seqs[page_seq_index_in(seqs.len(), bits, page_base)]
-}
-
 /// Fixed-width keyless txid → dense create_fk table.
 pub struct AddressHead {
     file: TableFile,
@@ -589,11 +572,6 @@ pub struct AddressHead {
     slots: u64,
     occupied: AtomicU64,
     generation: u64,
-    /// Per-probe-page seqlock (even = idle/published, odd = pwrite in flight).
-    /// `None` = immutable (sealed): no RMW, probes skip the seqlock. Open-tail
-    /// writers bump around each dirty page write-back so concurrent probes retry
-    /// instead of hop-scanning a torn image.
-    page_seq: Option<Box<[AtomicU32]>>,
 }
 
 impl AddressHead {
@@ -634,30 +612,10 @@ impl AddressHead {
             slots,
             occupied: AtomicU64::new(0),
             generation: 0,
-            page_seq: Some(new_page_seq(slots, layout.bits)),
         })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Self::open_inner(path, true, None)
-    }
-
-    /// Sealed / immutable segment: same file, no per-page seqlock heap.
-    pub fn open_immutable(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Self::open_inner(path, false, None)
-    }
-
-    /// Same on-disk head without a seqlock array (in-process seal). Skips the
-    /// occupied recount; sealed pages are no longer written.
-    pub fn without_page_seq(&self) -> Result<Self, StoreError> {
-        Self::open_inner(self.file.path(), false, Some(self.occupied()))
-    }
-
-    fn open_inner(
-        path: impl Into<PathBuf>,
-        with_page_seq: bool,
-        occupied_hint: Option<u64>,
-    ) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -681,21 +639,13 @@ impl AddressHead {
         remove_legacy_meta_sidecar(&path);
 
         let slots = layout.slots();
-        let occupied = match occupied_hint {
-            Some(n) => n,
-            None => count_occupied(&file, slots, layout.entry_bytes)?,
-        };
+        let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
         Ok(Self {
             file,
             layout,
             slots,
             occupied: AtomicU64::new(occupied),
             generation,
-            page_seq: if with_page_seq {
-                Some(new_page_seq(slots, layout.bits))
-            } else {
-                None
-            },
         })
     }
 
@@ -717,15 +667,6 @@ impl AddressHead {
 
     pub fn occupied(&self) -> u64 {
         self.occupied.load(Ordering::Relaxed)
-    }
-
-    /// Process-heap bytes of the per-page seqlock. Zero when this head is
-    /// immutable (sealed segment): no RMW, no seq array.
-    pub fn page_seq_resident_bytes(&self) -> u64 {
-        self.page_seq
-            .as_ref()
-            .map(|s| s.len() * std::mem::size_of::<AtomicU32>())
-            .unwrap_or(0) as u64
     }
 
     pub fn generation(&self) -> u64 {
@@ -790,33 +731,89 @@ impl AddressHead {
         if need == 0 {
             return Ok(0);
         }
-        let Some(seqs) = self.page_seq.as_deref() else {
-            self.file.read_at(off, &mut buf[..need])?;
-            return Ok(need);
-        };
-        let seq = page_seq_in(seqs, self.layout.bits, page_base);
-        let t0 = std::time::Instant::now();
-        let mut spins = 0u32;
-        loop {
-            let s1 = seq.load(Ordering::Acquire);
-            if s1.is_multiple_of(2) {
-                // libc pread only — this runs under the probe TLS ring on retry.
+        {
+            use crate::bulk_io::{self, ReadOp};
+            let fd = self.file.read_fd();
+            let slice = &mut buf[..need];
+            let mut ops = [ReadOp {
+                fd,
+                offset: off,
+                buf: slice,
+                result: i32::MIN,
+            }];
+            bulk_io::pread_batch(&mut ops);
+            if ops[0].result < 0 {
+                return Err(StoreError::io(
+                    self.file.path(),
+                    std::io::Error::from_raw_os_error(-ops[0].result),
+                ));
+            }
+            if (ops[0].result as usize) < need {
                 self.file.read_at(off, &mut buf[..need])?;
-                let s2 = seq.load(Ordering::Acquire);
-                if s1 == s2 {
-                    return Ok(need);
-                }
-            }
-            if t0.elapsed() >= PAGE_SEQ_WAIT {
-                return Err(StoreError::Corrupt("open head page seqlock"));
-            }
-            spins = spins.saturating_add(1);
-            if spins < 1024 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
             }
         }
+        Ok(need)
+    }
+
+    fn load_page_slots_read_at(
+        &self,
+        page_base: u64,
+        n_slots: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, StoreError> {
+        let es = self.layout.entry_bytes as usize;
+        if es != 4 && es != 8 {
+            return Err(StoreError::Corrupt("address head entry_bytes"));
+        }
+        let mut need = (n_slots as usize).saturating_mul(es);
+        if need > buf.len() {
+            return Err(StoreError::Corrupt("probe page buffer short"));
+        }
+        let off = self.entry_off(page_base);
+        let avail = self.file.data_len().saturating_sub(off) as usize;
+        need = (need.min(avail) / es) * es;
+        if need == 0 {
+            return Ok(0);
+        }
+        self.file.read_at(off, &mut buf[..need])?;
+        Ok(need)
+    }
+
+    /// Load the probe page twice and hop. Leftover-miss dump only.
+    pub(crate) fn dump_page_hop(&self, mixed: &[u8; 32]) -> Result<PageHopDump, StoreError> {
+        let bits = self.layout.bits;
+        let page_base = page_base_for_txid(mixed, bits);
+        let page_slots = page_slot_count(bits);
+        let es = self.layout.entry_bytes;
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        let n = self.load_page_slots_read_at(page_base, page_slots, &mut buf)?;
+        let es_u = es as usize;
+        if n < es_u {
+            return Ok(PageHopDump {
+                scan: hop_scan_page(&[], es, 0, 1, 0, MAX_PROBE),
+                hop_equal_second: true,
+                occupied: 0,
+            });
+        }
+        let nslots = (n / es_u) as u64;
+        let h1 = h1_in_page(mixed, bits);
+        let h2 = h2_in_page(mixed, bits);
+        let scan = hop_scan_page(&buf[..n], es, h1, h2, nslots, MAX_PROBE);
+        let mut occupied = 0u32;
+        for i in 0..nslots {
+            if entry_from_page_buf(&buf[..n], i, es).unwrap_or(0) != 0 {
+                occupied = occupied.saturating_add(1);
+            }
+        }
+        let mut buf2 = [0u8; PROBE_REGION_BYTES];
+        let n2 = self.load_page_slots_read_at(page_base, page_slots, &mut buf2)?;
+        let nslots2 = (n2 / es_u) as u64;
+        let scan2 = hop_scan_page(&buf2[..n2.min(buf2.len())], es, h1, h2, nslots2, MAX_PROBE);
+        Ok(PageHopDump {
+            hop_equal_second: scan.cands == scan2.cands && scan.hit_empty == scan2.hit_empty,
+            scan,
+            occupied,
+        })
     }
 
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
@@ -885,17 +882,8 @@ impl AddressHead {
                 }
             }
             if dirty {
-                let Some(seqs) = self.page_seq.as_deref() else {
-                    return Err(StoreError::Corrupt("address head insert on immutable head"));
-                };
-                let seq = page_seq_in(seqs, bits, page_base);
-                // Odd = pwrite in flight. Always restore even so a failed write
-                // cannot pin probes on this page.
-                seq.fetch_add(1, Ordering::Release);
                 let off = self.entry_off(page_base);
-                let wr = self.file.write_at(off, &buf[..n]);
-                seq.fetch_add(1, Ordering::Release);
-                wr?;
+                self.file.write_at(off, &buf[..n])?;
                 self.occupied.fetch_add(n_new, Ordering::Relaxed);
                 #[cfg(test)]
                 test_note_head_page_write();
@@ -1045,7 +1033,6 @@ impl AddressHead {
         let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
         let mut bufs: Vec<Vec<u8>> = (0..pool_n).map(|_| vec![0u8; PROBE_REGION_BYTES]).collect();
         let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
-        let mut slot_seq: Vec<Option<u32>> = vec![None; pool_n];
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
         let mut next_page = 0usize;
         let mut in_flight = 0usize;
@@ -1070,31 +1057,6 @@ impl AddressHead {
                         continue;
                     }
                     let off = self.entry_off(page_base);
-                    let submit_seq = if let Some(seqs) = self.page_seq.as_deref() {
-                        let s1 = page_seq_in(seqs, bits, page_base).load(Ordering::Acquire);
-                        if !s1.is_multiple_of(2) {
-                            // Writer is in pwrite — do not hop a uring snapshot.
-                            let n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
-                            if n >= es_u {
-                                let nslots = (n / es_u) as u64;
-                                let (lo, hi) = page_ranges[pi];
-                                let page = &bufs[slot][..n];
-                                for &(_, orig) in &order[lo..hi] {
-                                    let txid = &txids[orig];
-                                    let h1p = h1_in_page(txid, bits);
-                                    let h2p = h2_in_page(txid, bits);
-                                    let scan = hop_scan_page(page, es, h1p, h2p, nslots, MAX_PROBE);
-                                    out[orig] =
-                                        scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
-                                }
-                            }
-                            free_slots.push(slot);
-                            continue;
-                        }
-                        Some(s1)
-                    } else {
-                        None
-                    };
                     let buf = &mut bufs[slot][..need];
                     buf.fill(0);
                     let ud = crate::uring_session::pack_ud(
@@ -1104,7 +1066,6 @@ impl AddressHead {
                     );
                     session.push_pread_flags(fd, off, buf, ud, rw_flags)?;
                     slot_page[slot] = Some(pi);
-                    slot_seq[slot] = submit_seq;
                     in_flight += 1;
                 }
                 session.sync_submission();
@@ -1149,16 +1110,6 @@ impl AddressHead {
                         n = need;
                     }
                     n = n.min(need);
-                    if let Some(s1) = slot_seq[slot] {
-                        let s2 = self
-                            .page_seq
-                            .as_deref()
-                            .map(|seqs| page_seq_in(seqs, bits, page_base).load(Ordering::Acquire))
-                            .unwrap_or(s1);
-                        if s1 != s2 || !s1.is_multiple_of(2) {
-                            n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
-                        }
-                    }
 
                     if n >= es_u {
                         let nslots = (n / es_u) as u64;
@@ -1390,128 +1341,6 @@ mod tests {
         assert!(h2.probe_fks(&txid).unwrap().contains(&Fk(42)));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
-    }
-
-    /// Dirty-page write-back must publish an even seq so a concurrent probe can
-    /// tell a complete image from an in-flight pwrite.
-    #[test]
-    fn insert_publishes_even_page_seq() {
-        let path = tmp("page-seq-insert");
-        let h = AddressHead::create_with_bits(&path, 12).unwrap();
-        let mut txid = [0u8; 32];
-        txid[0] = 0x7a;
-        let page_base = page_base_for_txid(&txid, 12);
-        assert_eq!(
-            page_seq_in(h.page_seq.as_ref().unwrap(), 12, page_base).load(AtomicOrdering::Relaxed),
-            0,
-            "fresh page seq is even/idle"
-        );
-        h.insert(&txid, Fk(1)).unwrap();
-        let seq =
-            page_seq_in(h.page_seq.as_ref().unwrap(), 12, page_base).load(AtomicOrdering::Relaxed);
-        assert!(seq.is_multiple_of(2), "publish leaves seq even, got {seq}");
-        assert!(
-            seq >= 2,
-            "one dirty write-back bumps 1→odd then 2→even, got {seq}"
-        );
-        assert!(h.probe_fks(&txid).unwrap().contains(&Fk(1)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// Sealed / immutable heads keep no seqlock pages and still probe.
-    #[test]
-    fn immutable_head_has_no_page_seq() {
-        let path = tmp("page-seq-immut");
-        let h = AddressHead::create_with_bits(&path, 12).unwrap();
-        let mut txid = [0u8; 32];
-        txid[0] = 0x5e;
-        h.insert(&txid, Fk(7)).unwrap();
-        assert!(h.page_seq_resident_bytes() > 0);
-        let imm = h.without_page_seq().unwrap();
-        assert_eq!(imm.page_seq_resident_bytes(), 0);
-        assert!(imm.probe_fks(&txid).unwrap().contains(&Fk(7)));
-        let err = imm
-            .insert(&txid, Fk(8))
-            .expect_err("immutable must refuse insert");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("immutable"),
-            "insert on sealed head must name immutable, got {msg}"
-        );
-        drop(h);
-        drop(imm);
-        let opened = AddressHead::open_immutable(&path).unwrap();
-        assert_eq!(opened.page_seq_resident_bytes(), 0);
-        assert!(opened.probe_fks(&txid).unwrap().contains(&Fk(7)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A writer killed between odd and even must not leave lookup spinning, and
-    /// must not hop-scan a page that may be mid-pwrite.
-    #[test]
-    fn probe_refuses_stuck_odd_page_seq() {
-        let path = tmp("page-seq-odd");
-        let h = AddressHead::create_with_bits(&path, 12).unwrap();
-        let mut txid = [0u8; 32];
-        txid[0] = 0x3c;
-        h.insert(&txid, Fk(1)).unwrap();
-        page_seq_in(
-            h.page_seq.as_ref().unwrap(),
-            12,
-            page_base_for_txid(&txid, 12),
-        )
-        .store(1, AtomicOrdering::Release);
-        let err = h
-            .probe_fks(&txid)
-            .expect_err("odd seq is in-flight pwrite; probe must not use the page");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("seqlock"),
-            "stuck-odd must name the seqlock: {msg}"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// Sole writer + concurrent probes: every completed insert stays findable
-    /// (coherent snapshot, possibly one write behind).
-    #[test]
-    fn concurrent_probe_sees_coherent_pages() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-        let path = tmp("page-seq-conc");
-        let h = Arc::new(AddressHead::create_with_bits(&path, 12).unwrap());
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let h = Arc::clone(&h);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut txid = [0u8; 32];
-                txid[0] = 0x11;
-                while !stop.load(AtomicOrdering::Relaxed) {
-                    h.probe_fks(&txid).expect("probe must not Corrupt mid-RMW");
-                }
-            })
-        };
-        let mut batch = Vec::new();
-        for i in 1..=80u64 {
-            let mut txid = [0u8; 32];
-            txid[0] = 0x11;
-            txid[8..16].copy_from_slice(&i.to_le_bytes());
-            batch.push((txid, Fk(i)));
-        }
-        h.insert_many(&batch).unwrap();
-        stop.store(true, AtomicOrdering::Relaxed);
-        reader.join().expect("reader thread");
-        for i in [1u64, 40, 80] {
-            let mut txid = [0u8; 32];
-            txid[0] = 0x11;
-            txid[8..16].copy_from_slice(&i.to_le_bytes());
-            assert!(
-                h.probe_fks(&txid).unwrap().contains(&Fk(i)),
-                "fk={i} missing after concurrent probes"
-            );
-        }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

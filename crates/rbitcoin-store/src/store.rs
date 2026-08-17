@@ -2289,6 +2289,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Same-page foreigner: leftover TipOnly miss is `body`, and the shipped
+    /// miss path records a hop dump (A's fk, no body match, empty stop).
+    #[test]
+    fn tiponly_same_page_foreigner_records_probe_diag() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let a = [0xAAu8; 32];
+        let rec = TxRecord {
+            txid: a,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let a_fk = s
+            .put_tx_full_batch_indexed(
+                &[(rec, vec![], vec![OutputRecord::unspent(1, vec![0x51])])],
+                true,
+            )
+            .unwrap()[0];
+        let bits = s.txs.head.bits();
+        let mix_a = s.txs.secret.mix_txid(&a);
+        let page_a = crate::address_head::page_base_for_txid(&mix_a, bits);
+        let h1_a = crate::address_head::h1_in_page(&mix_a, bits);
+        let mut b = [0xBBu8; 32];
+        let mut found = false;
+        for i in 0u64..500_000 {
+            b[24..32].copy_from_slice(&i.to_le_bytes());
+            let mix_b = s.txs.secret.mix_txid(&b);
+            if crate::address_head::page_base_for_txid(&mix_b, bits) == page_a
+                && crate::address_head::h1_in_page(&mix_b, bits) == h1_a
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "need a same-slot miss key (page+h1)");
+        let hits = s.get_fk_by_txid_batch(&[b]).unwrap();
+        assert!(hits[0].1.is_none(), "B is not in the head");
+        let (on, n_cands) = crate::head_resolve_stats::take_leftover_miss().expect("classified");
+        assert_eq!(on, crate::LeftoverMissOn::Body);
+        assert!(n_cands >= 1, "A must be a hop cand, n_cands={n_cands}");
+        let diag = crate::head_resolve_stats::take_leftover_probe_diag()
+            .expect("leftover miss path must record a probe dump");
+        assert_eq!(diag.txid, b);
+        assert_eq!(diag.page_base, page_a);
+        assert!(diag.hit_empty, "hop must stop at empty");
+        assert!(diag.hop_equal_second, "second page load must match first");
+        assert!(
+            diag.cands
+                .iter()
+                .any(|c| c.abs_fk == a_fk.0 && !c.body_match),
+            "dump must list A's fk with body≠B, cands={:?}",
+            diag.cands
+                .iter()
+                .map(|c| (c.abs_fk, c.body_match))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Documented hazard if tip flushed without strong: tip advanced, missing strong.
     ///
     /// Proves why order is strong→height→header_txs→confirmed: after this bad

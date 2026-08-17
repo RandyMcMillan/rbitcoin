@@ -494,7 +494,6 @@ fn id_idx_wave(
             pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
         {
             crate::head_resolve_stats::add_hit_rank(rank);
-            connected[ki] = heights.is_some();
             chosen_kis.push(ki);
             chosen_fks.push(fk);
             continue;
@@ -515,13 +514,48 @@ fn id_idx_wave(
     }
     let t_idx = Instant::now();
     let ranges = body_ranges_batched(table, &chosen_fks, session)?;
+    record_chosen_idx_ranges(
+        &chosen_kis,
+        &chosen_fks,
+        &ranges,
+        winner,
+        connected,
+        heights,
+        first_fks,
+        local_age,
+    )?;
+    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+    Ok(())
+}
+
+/// Apply idx ranges for identity picks. `connected` is set only when a range
+/// exists — never before idx. Missing range after a chosen fk is Corrupt.
+fn record_chosen_idx_ranges(
+    chosen_kis: &[usize],
+    chosen_fks: &[Fk],
+    ranges: &[Option<(u64, u64)>],
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    connected: &mut [bool],
+    heights: Option<&HeightFence>,
+    first_fks: &[u64],
+    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
+) -> Result<(), StoreError> {
     for ((&ki, &fk), range) in chosen_kis.iter().zip(chosen_fks.iter()).zip(ranges) {
-        if let Some(range) = range {
-            winner[ki] = Some((fk, range));
-            crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
+        match range {
+            Some(range) => {
+                winner[ki] = Some((fk, *range));
+                if heights.is_some_and(|h| h.height_of(fk).is_some()) {
+                    connected[ki] = true;
+                }
+                crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
+            }
+            None => {
+                return Err(StoreError::Corrupt(
+                    "invariant: idx range missing after identity",
+                ));
+            }
         }
     }
-    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
     Ok(())
 }
 
@@ -760,6 +794,58 @@ mod tests {
         }
         let _fks = t.put_full_batch_indexed(&items, true).unwrap();
         (dir, t, txids)
+    }
+
+    #[test]
+    fn connected_after_idx_missing_range_is_corrupt() {
+        let mut winner = vec![None; 1];
+        let mut connected = vec![false; 1];
+        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
+            first_fk: 1,
+            count: 1,
+            height: 0,
+        }]);
+        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
+        match record_chosen_idx_ranges(
+            &[0],
+            &[Fk(1)],
+            &[None],
+            &mut winner,
+            &mut connected,
+            Some(&fence),
+            &[1],
+            &mut age,
+        ) {
+            Err(StoreError::Corrupt("invariant: idx range missing after identity")) => {}
+            other => panic!("expected idx-range Corrupt, got {other:?}"),
+        }
+        assert!(winner[0].is_none());
+        assert!(!connected[0], "must not mark connected without a range");
+    }
+
+    #[test]
+    fn connected_after_idx_sets_winner_and_connected() {
+        let mut winner = vec![None; 1];
+        let mut connected = vec![false; 1];
+        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
+            first_fk: 1,
+            count: 1,
+            height: 0,
+        }]);
+        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
+        record_chosen_idx_ranges(
+            &[0],
+            &[Fk(1)],
+            &[Some((8, 16))],
+            &mut winner,
+            &mut connected,
+            Some(&fence),
+            &[1],
+            &mut age,
+        )
+        .unwrap();
+        assert_eq!(winner[0], Some((Fk(1), (8, 16))));
+        assert!(connected[0]);
     }
 
     /// Uring machine returns same (fk, body_range) as sequential pread path.

@@ -317,6 +317,8 @@ fn pread_batch_on_session_inner(
     ops: &mut [ReadOp<'_>],
     total_nonempty: usize,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
@@ -329,7 +331,11 @@ fn pread_batch_on_session_inner(
             }
             let fd = ops[next].fd;
             let offset = ops[next].offset;
-            let ud = next as u64;
+            let ud = crate::uring_session::pack_ud(
+                crate::uring_session::KIND_BULK_PREAD,
+                epoch,
+                next as u32,
+            );
             // SAFETY: caller owns each `buf` until `pread_batch` returns.
             if session.push_pread(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
@@ -346,13 +352,25 @@ fn pread_batch_on_session_inner(
             break;
         }
 
-        let mut cqes = session.harvest_ready();
+        let mut cqes = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                session.drain_all();
+                return false;
+            }
+        };
         if cqes.is_empty() {
             if session.submit_and_wait_one().is_err() {
                 session.drain_all();
                 return false;
             }
-            cqes = session.harvest_ready();
+            cqes = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    session.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
                 session.drain_all();
                 return false;
@@ -363,7 +381,8 @@ fn pread_batch_on_session_inner(
         }
 
         for (ud, res) in cqes {
-            let i = ud as usize;
+            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
             }
@@ -439,13 +458,25 @@ fn pwrite_batch_on_session(
             break;
         }
 
-        let mut cqes = session.harvest_ready();
+        let mut cqes = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                session.drain_all();
+                return false;
+            }
+        };
         if cqes.is_empty() {
             if session.submit_and_wait_one().is_err() {
                 session.drain_all();
                 return false;
             }
-            cqes = session.harvest_ready();
+            cqes = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    session.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
                 session.drain_all();
                 return false;
@@ -567,13 +598,25 @@ fn page_rmw_on_session(
             break;
         }
 
-        let mut events = session.harvest_ready();
+        let mut events = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                session.drain_all();
+                return false;
+            }
+        };
         if events.is_empty() {
             if session.submit_and_wait_one().is_err() {
                 session.drain_all();
                 return false;
             }
-            events = session.harvest_ready();
+            events = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    session.drain_all();
+                    return false;
+                }
+            };
             if events.is_empty() {
                 continue;
             }

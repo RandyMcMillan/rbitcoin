@@ -1010,10 +1010,10 @@ impl AddressHead {
                     break;
                 }
 
-                let mut cqes = session.harvest_ready();
+                let mut cqes = session.harvest_ready()?;
                 if cqes.is_empty() {
                     session.submit_and_wait_one()?;
-                    cqes = session.harvest_ready();
+                    cqes = session.harvest_ready()?;
                 }
 
                 for (ud, res) in cqes {

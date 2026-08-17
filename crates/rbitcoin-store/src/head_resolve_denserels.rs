@@ -196,8 +196,8 @@ fn resolve_fk_and_range_pread(
         .collect())
 }
 
-/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` high bits).
-const UD_KIND_IDX: u64 = 2;
+/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` kind byte).
+const UD_KIND_IDX: u8 = crate::uring_session::KIND_IDX;
 
 /// Fill idx page buffers via held session; returns true if all pages complete.
 #[cfg(target_os = "linux")]
@@ -208,8 +208,9 @@ fn fill_idx_pages(
 ) -> bool {
     // Staged SQEs on the held plan ring (no nested TLS bulk_io session).
     let flags = 0i32;
+    sess.begin_batch();
     for (i, page) in pages.iter().enumerate() {
-        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, i as u32);
+        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, sess.epoch(), i as u32);
         if sess
             .push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, flags)
             .is_err()
@@ -223,13 +224,25 @@ fn fill_idx_pages(
     let need = pages.len();
     let mut done = 0usize;
     while done < need {
-        let mut cqes = sess.harvest_ready();
+        let mut cqes = match sess.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                sess.drain_all();
+                return false;
+            }
+        };
         if cqes.is_empty() {
             if sess.submit_and_wait_one().is_err() {
                 sess.drain_all();
                 return false;
             }
-            cqes = sess.harvest_ready();
+            cqes = match sess.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    sess.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
                 sess.drain_all();
                 return false;
@@ -239,8 +252,12 @@ fn fill_idx_pages(
             return false;
         }
         for (ud, res) in cqes {
-            let (kind, slot) = crate::uring_session::unpack_ud(ud);
+            let (kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
             if kind != UD_KIND_IDX || (slot as usize) >= results.len() {
+                sess.drain_all();
+                return false;
+            }
+            if results[slot as usize] != i32::MIN {
                 sess.drain_all();
                 return false;
             }

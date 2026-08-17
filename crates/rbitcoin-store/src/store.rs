@@ -344,10 +344,19 @@ impl Store {
     }
 
     /// After `confirmed[]` advanced: append this height’s Class A run.
+    ///
+    /// Missing or empty `header_txs` is **Corrupt** — a silent `Ok` leaves
+    /// `height_of` None for that block’s creates and TipOnly leftover misses
+    /// (restart rebuild from disk then heals).
     pub fn height_fence_extend(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
         let Some((first, n)) = self.header_txs.get_range(header_fk)? else {
-            return Ok(());
+            return Err(StoreError::Corrupt(
+                "height fence: header_txs range missing",
+            ));
         };
+        if n == 0 || first.is_null() {
+            return Err(StoreError::Corrupt("height fence: header_txs range empty"));
+        }
         self.fence_write().extend(height.0, first, n);
         Ok(())
     }
@@ -2198,6 +2207,34 @@ mod tests {
         s.height_fence_extend(Height(1), Fk(2)).unwrap();
         assert_eq!(s.fence_tip_height(), Some(1));
         assert_eq!(s.tx_height_get(Fk(2)).unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirmed tip + missing `header_txs` range: extend must not return `Ok`
+    /// and leave `height_of` None (live TipOnly hole; restart rebuild heals).
+    #[test]
+    fn height_fence_extend_missing_header_txs_is_not_ok_hole() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+        s.rebuild_height_fence().unwrap();
+
+        s.confirmed.set(Height(1), Fk(2)).unwrap();
+        let err = s
+            .height_fence_extend(Height(1), Fk(2))
+            .expect_err("missing header_txs must not silently skip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("header_txs"),
+            "shipped error must name the missing range: {msg}"
+        );
+        assert_eq!(
+            s.tx_height_get(Fk(2)).unwrap(),
+            None,
+            "must not invent a connected height"
+        );
+        assert_eq!(s.fence_tip_height(), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

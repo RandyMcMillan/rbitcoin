@@ -52,6 +52,10 @@ before 1.0).
   `p2p_invalid_messages` / `p2p_unrequested_blocks` / headers-sync /
   `rpc_net` stay skip with tighter analogs.
 
+- **Height fence extend is fail-closed.** Missing or empty `header_txs` for
+  the header is `Corrupt`, not `Ok` with a live `height_of` hole (TipOnly
+  leftover miss that restart rebuild then heals).
+
 - **Invalidate evicts immature coinbase spends.** `QueryUtxoProvider`
   now ORs the input-null coinbase signal with first-in-block, so
   `evict_after_reorg` sees `ImmatureCoinbase` after `invalidateblock`

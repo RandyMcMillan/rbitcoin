@@ -592,15 +592,7 @@ fn body_ranges_batched(
     Ok(out)
 }
 
-/// Sidefile ID (at most two page-grouped shots) then BIP30 match + batched idx.
-///
-/// Shot A is the first four cands of unfinished keys; shot B is the rest only
-/// when the key is still unfinished. A fence-connected win skips shot B; an
-/// unconnected body match does not. Chosen fks share **one** idx-page fill
-/// (held session or libc).
-///
-/// When `session` is `Some`, ID + IDX page preads ride that **already-held**
-/// plan ring. When `None`, libc pread for ID and unique idx pages.
+/// Connected if a height fence is set, else any winner.
 fn key_finished(
     ki: usize,
     winner: &[Option<(Fk, (u64, u64))>],
@@ -632,6 +624,15 @@ fn unfinished_mask(
         .collect()
 }
 
+/// Sidefile ID (at most two page-grouped shots) then BIP30 match + batched idx.
+///
+/// Shot A is the first four cands of unfinished keys; shot B is the rest only
+/// when the key is still unfinished. A fence-connected win skips shot B; an
+/// unconnected body match does not. Chosen fks share **one** idx-page fill
+/// (held session or libc).
+///
+/// When `session` is `Some`, ID + IDX page preads ride that **already-held**
+/// plan ring. When `None`, libc pread for ID and unique idx pages.
 fn id_idx_wave(
     table: &TxTable,
     txids: &[[u8; 32]],

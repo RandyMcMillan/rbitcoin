@@ -74,6 +74,8 @@ pub struct ChainHub {
     header_tips: RwLock<HashMap<BlockHash, (BlockHash, u32)>>,
     /// Set around `accept_branch` connect so each `TipEvent` carries branch length.
     announce_reorg_len: AtomicU32,
+    /// Core `-minimumchainwork` (32-byte BE). `None` = no extra floor.
+    minimum_chain_work: RwLock<Option<[u8; 32]>>,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -112,7 +114,34 @@ impl ChainHub {
             fork_tips: RwLock::new(HashSet::new()),
             header_tips: RwLock::new(HashMap::new()),
             announce_reorg_len: AtomicU32::new(0),
+            minimum_chain_work: RwLock::new(None),
         }
+    }
+
+    /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
+    pub fn set_minimum_chain_work(&self, w: Option<[u8; 32]>) {
+        *self.minimum_chain_work.write().unwrap() = w;
+    }
+
+    /// True when tip work meets `-minimumchainwork` (or the flag is unset).
+    pub fn meets_minimum_chain_work(&self) -> bool {
+        let min = *self.minimum_chain_work.read().unwrap();
+        match min {
+            None => true,
+            Some(min) => match self.chain_work() {
+                Ok(w) => w.to_be_bytes() >= min,
+                Err(_) => false,
+            },
+        }
+    }
+
+    /// Core `nMaxTipAge` (24h): tip time vs [`Self::clock`].
+    pub fn tip_is_stale_for_ibd(&self) -> bool {
+        const MAX_TIP_AGE: u64 = 24 * 60 * 60;
+        let Some(h) = self.tip_header() else {
+            return true;
+        };
+        self.clock.now_secs().saturating_sub(u64::from(h.time)) > MAX_TIP_AGE
     }
 
     /// Attach mempool once (same Query Arc as this hub).

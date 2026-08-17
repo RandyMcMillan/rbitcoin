@@ -38,9 +38,9 @@ before 1.0).
 
 ### Changed
 
-- **Leftover probe dump.** The first TipOnly leftover miss in a pack logs
-  hop + every cand (`txid.body` prefix, match, rel/abs fk) once. The reject
-  line adds `diag=1`.
+- **Leftover probe dump.** A leftover miss (load leftover, not lookup /
+  BQ-ahead TipOnly) logs hop + every cand (`txid.body` prefix, match,
+  rel/abs fk) once. The reject line adds `diag=1`.
 
 - **Quality reaudit (2026-08-17).** [`docs/quality.md`](docs/quality.md)
   Open list re-ranked. Q-37 (suite ≤3 min) closed on CI `test` ~85 s.

@@ -51,8 +51,6 @@ pub fn resolve_fk_and_range_batch_with_tip(
 }
 
 fn note_first_leftover_miss(
-    table: &TxTable,
-    txids: &[[u8; 32]],
     tip_only: bool,
     winner: &[Option<(Fk, (u64, u64))>],
     connected: &[bool],
@@ -70,15 +68,6 @@ fn note_first_leftover_miss(
         let on =
             crate::head_resolve_pick::classify_leftover_miss(n_cands[i], had_id[i], connected[i]);
         crate::head_resolve_stats::note_leftover_miss(on, n_cands[i] as u64);
-        match diagnose_txid_probe(table, &txids[i]) {
-            Ok(d) => {
-                rbitcoin_log::warn!("store: {}", format_leftover_probe_diag(&d));
-                crate::head_resolve_stats::note_leftover_probe_diag(d);
-            }
-            Err(e) => {
-                rbitcoin_log::warn!("store: leftover probe diag failed: {e}");
-            }
-        }
         return;
     }
 }
@@ -127,6 +116,19 @@ fn format_leftover_probe_diag(d: &crate::head_resolve_stats::LeftoverProbeDiag) 
         ));
     }
     s
+}
+
+/// Hop + cand dump for a leftover miss only (not lookup / BQ-ahead TipOnly).
+pub(crate) fn diagnose_and_note_leftover_probe(table: &TxTable, txid: &[u8; 32]) {
+    match diagnose_txid_probe(table, txid) {
+        Ok(d) => {
+            rbitcoin_log::warn!("store: {}", format_leftover_probe_diag(&d));
+            crate::head_resolve_stats::note_leftover_probe_diag(d);
+        }
+        Err(e) => {
+            rbitcoin_log::warn!("store: leftover probe diag failed: {e}");
+        }
+    }
 }
 
 fn diagnose_txid_probe(
@@ -352,9 +354,7 @@ fn resolve_fk_and_range_pread(
             }
         }
     }
-    note_first_leftover_miss(
-        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
-    );
+    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_cands(cands_total);
@@ -766,9 +766,7 @@ fn resolve_fk_and_range_uring(
             &mut had_id,
         )
     })??;
-    note_first_leftover_miss(
-        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
-    );
+    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
     Ok(out)
 }
 

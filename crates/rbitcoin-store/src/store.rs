@@ -737,6 +737,13 @@ impl Store {
         )
     }
 
+    /// Failure-time hop dump for the leftover miss txid (load leftover only).
+    ///
+    /// Lookup / BQ-ahead TipOnly misses must not call this — those are routine.
+    pub fn diagnose_leftover_probe(&self, txid: &[u8; 32]) {
+        crate::head_resolve_denserels::diagnose_and_note_leftover_probe(&self.txs, txid);
+    }
+
     /// Sparse outs by known `txout` ranges (prep; skips idx).
     ///
     /// See [`TxTable::get_outs_by_range_batch`].
@@ -2333,6 +2340,11 @@ mod tests {
         let (on, n_cands) = crate::head_resolve_stats::take_leftover_miss().expect("classified");
         assert_eq!(on, crate::LeftoverMissOn::Body);
         assert!(n_cands >= 1, "A must be a hop cand, n_cands={n_cands}");
+        assert!(
+            crate::head_resolve_stats::take_leftover_probe_diag().is_none(),
+            "resolve must not dump; leftover caller does"
+        );
+        s.diagnose_leftover_probe(&b);
         let diag = crate::head_resolve_stats::take_leftover_probe_diag()
             .expect("leftover miss path must record a probe dump");
         assert_eq!(diag.txid, b);
@@ -2348,6 +2360,22 @@ mod tests {
                 .iter()
                 .map(|c| (c.abs_fk, c.body_match))
                 .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lookup / BQ-ahead also use TipOnly `get_fk_by_txid_batch`. A miss there
+    /// is routine (parent not published yet). Dump + WARN only on leftover.
+    #[test]
+    fn tiponly_resolve_miss_does_not_dump_probe_diag() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let miss = [0xCCu8; 32];
+        let hits = s.get_fk_by_txid_batch(&[miss]).unwrap();
+        assert!(hits[0].1.is_none(), "unknown txid must miss");
+        assert!(
+            crate::head_resolve_stats::take_leftover_probe_diag().is_none(),
+            "resolve TipOnly miss must not hop-dump; leftover miss path only"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

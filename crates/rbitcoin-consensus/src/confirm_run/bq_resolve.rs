@@ -70,7 +70,8 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
 ///
 /// When `ids` is `Some`, skip TipOnly for keys already in the live union and
-/// publish one snapshot at wave end.
+/// publish the layer chain head at wave end. Layers whose heights have left
+/// the body queue are spliced out then.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
@@ -87,7 +88,6 @@ pub fn confirm_bq_resolve_wave_with_ids(
     mut ids: Option<(
         &mut rbitcoin_query::LiveUnion,
         &rbitcoin_query::PublishedIds,
-        &rbitcoin_query::ForgetQueue,
     )>,
 ) -> Result<BqResolveWaveStats, ConsensusError> {
     let t0 = Instant::now();
@@ -123,7 +123,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
     stats.keys = keys.len() as u32;
     let (mut hit_map, need): (BqParentHits, Vec<[u8; 32]>) = match ids.as_mut() {
-        Some((live, _, _)) => {
+        Some((live, _)) => {
             let (known, need) = live.partition(keys.iter());
             stats.skipped = known.len() as u32;
             (known, need)
@@ -145,7 +145,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         }
     }
     stats.hits = hit_map.len() as u32;
-    if let Some((live, published, forget)) = ids.as_mut() {
+    if let Some((live, published)) = ids.as_mut() {
         for (h, need) in &per_height {
             let mut hits = rbitcoin_query::IdMap::new();
             for t in need {
@@ -153,8 +153,14 @@ pub fn confirm_bq_resolve_wave_with_ids(
                     hits.insert(*t, v);
                 }
             }
-            live.note_height(forget, *h, &hits);
+            live.note_height(*h, &hits);
         }
+        let queued: HashSet<u32> = query
+            .block_queue_list_meta()
+            .into_iter()
+            .map(|m| m.height)
+            .collect();
+        live.keep_heights(|h| queued.contains(&h));
         live.publish(published);
     }
 
@@ -303,11 +309,7 @@ mod tests {
             &q,
             &params,
             &[1, 2],
-            Some((
-                &mut live,
-                q.published_ids().as_ref(),
-                q.parent_id_forget().as_ref(),
-            )),
+            Some((&mut live, q.published_ids().as_ref())),
         )
         .unwrap();
         assert_eq!(st.heights, 2);
@@ -347,24 +349,15 @@ mod tests {
             .unwrap();
         let mut live = rbitcoin_query::LiveUnion::new();
         let published = rbitcoin_query::PublishedIds::new();
-        let forget = rbitcoin_query::ForgetQueue::new();
-        let st1 = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            &[1],
-            Some((&mut live, &published, &forget)),
-        )
-        .unwrap();
+        let st1 =
+            confirm_bq_resolve_wave_with_ids(&q, &params, &[1], Some((&mut live, &published)))
+                .unwrap();
         assert_eq!(st1.skipped, 0);
         assert!(st1.hits >= 1);
         assert!(published.get(&g_cb.to_byte_array()).is_some());
-        let st2 = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            &[2],
-            Some((&mut live, &published, &forget)),
-        )
-        .unwrap();
+        let st2 =
+            confirm_bq_resolve_wave_with_ids(&q, &params, &[2], Some((&mut live, &published)))
+                .unwrap();
         assert!(
             st2.skipped >= 1,
             "second wave must skip genesis parent already in live_union"
@@ -429,11 +422,7 @@ mod tests {
             &q,
             &params,
             &[2],
-            Some((
-                &mut live,
-                q.published_ids().as_ref(),
-                q.parent_id_forget().as_ref(),
-            )),
+            Some((&mut live, q.published_ids().as_ref())),
         )
         .unwrap();
         assert_eq!(st.heights, 1);

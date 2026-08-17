@@ -131,7 +131,7 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
-pub use published_ids::{ForgetQueue, IdMap, LiveUnion, PublishedIds};
+pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -1074,8 +1074,6 @@ pub struct Query {
     disconnect_gen: AtomicU64,
     /// Lookup-published parent identity union (wave hits still in the BQ window).
     published_ids: std::sync::Arc<crate::PublishedIds>,
-    /// Heights dequeued since the last lookup wave-end snapshot.
-    parent_id_forget: std::sync::Arc<crate::ForgetQueue>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1154,7 +1152,6 @@ impl Query {
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
-            parent_id_forget: std::sync::Arc::new(crate::ForgetQueue::new()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -1442,20 +1439,12 @@ impl Query {
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
     pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
         let mut g = self.block_queue.lock().unwrap();
-        let n = g.dequeue_height(height)?;
-        drop(g);
-        self.parent_id_forget.enqueue(height);
-        Ok(n)
+        Ok(g.dequeue_height(height)?)
     }
 
-    /// Published wave-identity snapshot for load stamp.
+    /// Published wave-identity chain for load stamp.
     pub fn published_ids(&self) -> &std::sync::Arc<crate::PublishedIds> {
         &self.published_ids
-    }
-
-    /// Forget queue: dequeue enqueues; lookup applies at wave end.
-    pub fn parent_id_forget(&self) -> &std::sync::Arc<crate::ForgetQueue> {
-        &self.parent_id_forget
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.

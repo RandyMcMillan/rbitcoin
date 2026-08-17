@@ -279,14 +279,31 @@ pub struct ParentPinStamp {
 
 impl ParentPinStamp {
     pub(crate) fn from_plan(plan: &rbitcoin_query::ArchiveWritePlan) -> Self {
-        let mut create_by_txid = HashMap::with_capacity(plan.external_parent_txids.len());
-        for (id, tid) in &plan.external_parent_txids {
+        Self::from_maps(
+            plan.external_parent_ranges.clone(),
+            plan.external_parent_txids.clone(),
+        )
+    }
+
+    /// Move plan stamp maps into the load stamp (no 100k-entry clone).
+    pub(crate) fn take_from_plan(plan: &mut rbitcoin_query::ArchiveWritePlan) -> Self {
+        Self::from_maps(
+            std::mem::take(&mut plan.external_parent_ranges),
+            std::mem::take(&mut plan.external_parent_txids),
+        )
+    }
+
+    fn from_maps(
+        ranges: rbitcoin_query::U64Map<(u64, u64)>,
+        txids: rbitcoin_query::U64Map<[u8; 32]>,
+    ) -> Self {
+        let mut create_by_txid = HashMap::with_capacity(txids.len());
+        for (id, tid) in &txids {
             create_by_txid.insert(*tid, *id);
         }
-        // Plan + stamp both use U64Map (identity hasher) for dense create_fk keys.
         Self {
-            ranges: plan.external_parent_ranges.clone(),
-            txids: plan.external_parent_txids.clone(),
+            ranges,
+            txids,
             create_by_txid,
         }
     }
@@ -343,11 +360,11 @@ pub fn confirm_wire_lookup_stamp_with_hits(
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
     query.on_load_pack().map_err(ConsensusError::from)?;
-    let (plan, metas, wire_blocks, plan_ns) =
+    let (mut plan, metas, wire_blocks, plan_ns) =
         wire_lookup_phase(query, params, milestone, blocks, pipeline, pre_resolved)?;
     let ifo = pipeline.map(|p| &p.in_flight);
-    let parent_pin = match plan.as_ref() {
-        Some(p) => ParentPinStamp::from_plan(p),
+    let parent_pin = match plan.as_mut() {
+        Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, ifo)?,
     };
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);

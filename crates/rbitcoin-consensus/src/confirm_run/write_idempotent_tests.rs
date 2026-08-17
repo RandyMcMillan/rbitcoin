@@ -1169,6 +1169,35 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+#[test]
+fn parent_pin_stamp_take_from_plan_moves_maps() {
+    use super::ParentPinStamp;
+    use rbitcoin_query::{ArchiveWritePlan, U64Map};
+
+    let mut ranges = U64Map::default();
+    ranges.insert(7, (8, 16));
+    let mut txids = U64Map::default();
+    txids.insert(7, [0xABu8; 32]);
+    let mut plan = ArchiveWritePlan {
+        packed: vec![],
+        planned_fks: vec![],
+        per_header_ranges: vec![],
+        spends: vec![],
+        batch_creates: vec![],
+        external_parent_outs: Default::default(),
+        external_parent_ranges: ranges,
+        external_parent_txids: txids,
+        batch_pin: vec![],
+        index_tx: false,
+        body_est: 0,
+    };
+    let stamp = ParentPinStamp::take_from_plan(&mut plan);
+    assert!(plan.external_parent_ranges.is_empty());
+    assert!(plan.external_parent_txids.is_empty());
+    assert_eq!(stamp.ranges.get(&7).copied(), Some((8, 16)));
+    assert_eq!(stamp.create_txid(7), Some([0xABu8; 32]));
+}
+
 /// Need a high vout from a multi-out sparse pin (binary search, not linear find).
 #[test]
 fn pin_sparse_need_high_vout_only() {

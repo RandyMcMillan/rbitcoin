@@ -469,62 +469,43 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let mut resolved: HashMap<[u8; 32], Fk> = HashMap::with_capacity(need_vec.len() / 2);
-
-        // Prior plan batch(es) still in the write queue: not head yet.
-        let t_inflight = Instant::now();
-        if !in_flight.is_empty() {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
-                    continue;
-                }
-                if let Some(fk) = in_flight.get_create_fk(t) {
-                    resolved.insert(*t, fk);
-                }
-            }
-        }
-        let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
-
-        // Live pipeline pins (same Weak lifetime as outs share). Not in-flight
-        // creates and not the killed process pin FIFO.
-        let t_pin_txid = Instant::now();
-        let mut pin_txid_n = 0u64;
         let mut pin_ranges: Vec<(u64, (u64, u64))> = Vec::new();
-        if let Some(store) = parent_store {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
-                    continue;
-                }
-                if let Some((fk, range)) = store.lookup_txid(t) {
+        let mut need_head: Vec<[u8; 32]> = Vec::new();
+        let mut pin_txid_n = 0u64;
+
+        // One walk: in-flight → live pin_txid → BQ hits → TipOnly leftover.
+        let t_inflight = Instant::now();
+        let mut pin_txid_ns = 0u64;
+        for t in &need_vec {
+            if let Some(fk) = in_flight.get_create_fk(t) {
+                resolved.insert(*t, fk);
+                continue;
+            }
+            if let Some(store) = parent_store {
+                let t0 = Instant::now();
+                let hit = store.lookup_txid(t);
+                pin_txid_ns = pin_txid_ns.saturating_add(t0.elapsed().as_nanos() as u64);
+                if let Some((fk, range)) = hit {
                     resolved.insert(*t, fk);
                     if let Some(id) = fk.get() {
                         pin_ranges.push((id, range));
                     }
                     pin_txid_n = pin_txid_n.saturating_add(1);
-                }
-            }
-        }
-        let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
-
-        if let Some(hits) = pre_resolved {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
                     continue;
                 }
+            }
+            if let Some(hits) = pre_resolved {
                 if let Some((fk, range)) = hits.get(t) {
                     resolved.insert(*t, *fk);
                     if let Some(id) = fk.get() {
                         pin_ranges.push((id, *range));
                     }
+                    continue;
                 }
             }
+            need_head.push(*t);
         }
-
-        let mut need_head: Vec<[u8; 32]> = Vec::new();
-        for t in &need_vec {
-            if !resolved.contains_key(t) {
-                need_head.push(*t);
-            }
-        }
+        let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 

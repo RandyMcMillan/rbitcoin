@@ -11,11 +11,15 @@ before 1.0).
 
 ### Changed
 
-- **Confirm parent identity:** lookup publishes one `live_union` snapshot
-  (`PublishedIds` / `ArcSwap`) at wave end. Load stamp is in-flight →
-  published union → TipOnly leftover. Body-queue `parent_hits` and stamp
-  `bulk_lookup_txid` are gone. Dequeue enqueues a height forget; disconnect
-  stores `None` immediately. `pin_txid=` now counts published-union hits.
+- **Confirm parent identity:** lookup prepends one `IdLayer` per BQ height
+  and `Arc`-bumps the chain head (`PublishedIds`). Load stamp is in-flight →
+  published union → TipOnly leftover. Layers drop when that height has left
+  the body queue. Disconnect stores `None` immediately. `pin_txid=` counts
+  published-union hits.
+
+- **Head resolve identity:** each probe wave fills `txid.body` in two shots
+  (first four cands, then the rest if still unfinished). A connected win
+  skips the tail. Sealed-hot probes only unfinished keys, same mask as cold.
 
 - **Confirm pin outs:** `ArchiveWritePlan.external_parent_outs` and
   `ensure_external_parent_denserels_from_plan` are gone. IBD pin is
@@ -84,10 +88,11 @@ before 1.0).
   never. Stratum / wallet keys stay non-goals.
 
 - **Head resolve is three waves, no rank rounds.** Probe+identity is
-  open, then sealed ages 1..=3, then sealed age ≥4. Each wave fetches
-  every cand `txid.body` once and walks newest-first (fence-connected
-  wins). Unconnected identity still continues to later waves. TipOnly
-  still strips unconnected at the end.
+  open, then sealed ages 1..=3, then sealed age ≥4. Each wave fills
+  `txid.body` in two shots (first four cands, then the rest if still
+  unfinished) and walks newest-first (fence-connected wins). Sealed-hot
+  and cold probe only unfinished keys. Unconnected identity still
+  continues to later waves. TipOnly still strips unconnected at the end.
 
 - **Leftover probe dump.** A leftover miss (load leftover, not lookup /
   BQ-ahead TipOnly) logs hop + every cand (`txid.body` prefix, match,

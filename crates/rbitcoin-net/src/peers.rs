@@ -3,7 +3,7 @@
 use crate::error::NetError;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::BlockHash;
+use bitcoin::{BlockHash, Wtxid};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,6 +77,15 @@ pub struct LivePeer {
     inv_asked_headers: AtomicBool,
     /// Waiting for a headers reply to our getheaders (no BIP130 cap).
     awaiting_headers: AtomicBool,
+    /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
+    /// answered only if announced here or the tx is reorg-servable.
+    announced_wtx: Mutex<HashSet<Wtxid>>,
+    /// Mempool sequence at last tx INV (Core `m_last_inv_sequence`, starts at 1).
+    last_inv_sequence: AtomicU64,
+    /// Last clock we considered for delayed tx INV (`0` = not initialized).
+    last_tx_inv_now: AtomicU64,
+    /// Set when mocktime jumps; next ping/tick announces mempool txs.
+    tx_inv_requested: AtomicBool,
     /// Outstanding ping nonce (`0` = none). Core `m_ping_nonce_sent`.
     ping_nonce_sent: AtomicU64,
     /// When the last ping was sent, or `0` if never (`m_ping_start` seconds).
@@ -173,6 +182,51 @@ impl LivePeer {
 
     pub fn take_awaiting_headers(&self) -> bool {
         self.awaiting_headers.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn note_announced_wtx(&self, wtxid: Wtxid) {
+        let mut g = self.announced_wtx.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= 50_000 {
+            g.clear();
+        }
+        g.insert(wtxid);
+    }
+
+    pub fn has_announced_wtx(&self, wtxid: &Wtxid) -> bool {
+        self.announced_wtx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(wtxid)
+    }
+
+    pub fn last_inv_sequence(&self) -> u64 {
+        self.last_inv_sequence.load(Ordering::Relaxed)
+    }
+
+    pub fn note_tx_inv_seq(&self, mempool_seq: u64) {
+        self.last_inv_sequence.store(mempool_seq, Ordering::Relaxed);
+    }
+
+    pub fn request_tx_inv(&self) {
+        self.tx_inv_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// True when mock/wall clock jumped enough to announce queued mempool txs.
+    pub fn take_tx_inv_due(&self, now: u64) -> bool {
+        if self.tx_inv_requested.swap(false, Ordering::Relaxed) {
+            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+            return true;
+        }
+        let prev = self.last_tx_inv_now.load(Ordering::Relaxed);
+        if prev == 0 {
+            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+            return false;
+        }
+        if now.saturating_sub(prev) >= 30 {
+            self.last_tx_inv_now.store(now, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     pub fn queue_ping(&self) {
@@ -386,6 +440,10 @@ impl PeerHub {
 
     pub fn set_mock_now(&self, ts: u64) {
         self.mock_now.store(ts, Ordering::Relaxed);
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        for p in g.values() {
+            p.request_tx_inv();
+        }
     }
 
     pub fn queue_pings(&self) {
@@ -427,6 +485,10 @@ impl PeerHub {
             recently_from: Mutex::new(HashSet::new()),
             inv_asked_headers: AtomicBool::new(false),
             awaiting_headers: AtomicBool::new(false),
+            announced_wtx: Mutex::new(HashSet::new()),
+            last_inv_sequence: AtomicU64::new(1),
+            last_tx_inv_now: AtomicU64::new(0),
+            tx_inv_requested: AtomicBool::new(false),
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
@@ -460,6 +522,17 @@ impl PeerHub {
         let mut v: Vec<_> = g.values().map(|p| p.snapshot(now)).collect();
         v.sort_by_key(|p| p.id);
         v
+    }
+
+    /// Sum of per-peer message byte counters (`getnettotals`).
+    pub fn byte_totals(&self) -> (u64, u64) {
+        let mut recv = 0u64;
+        let mut sent = 0u64;
+        for p in self.snapshot() {
+            recv = recv.saturating_add(p.bytesrecv_per_msg.values().sum());
+            sent = sent.saturating_add(p.bytessent_per_msg.values().sum());
+        }
+        (recv, sent)
     }
 
     pub fn get(&self, id: u64) -> Option<Arc<LivePeer>> {
@@ -632,6 +705,24 @@ mod tests {
         assert!(p.stop.load(Ordering::SeqCst));
         hub.unregister(0);
         assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn announced_wtx_is_per_peer() {
+        use bitcoin::hashes::Hash;
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let w = Wtxid::from_byte_array([0x11; 32]);
+        assert!(!p.has_announced_wtx(&w));
+        p.note_announced_wtx(w);
+        assert!(p.has_announced_wtx(&w));
+        assert!(!p.has_announced_wtx(&Wtxid::from_byte_array([0x22; 32])));
+        assert!(!p.take_tx_inv_due(1_700_000_000));
+        assert!(!p.take_tx_inv_due(1_700_000_010));
+        assert!(p.take_tx_inv_due(1_700_000_040));
+        p.request_tx_inv();
+        assert!(p.take_tx_inv_due(1_700_000_041));
     }
 
     #[test]

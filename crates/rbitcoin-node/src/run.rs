@@ -288,6 +288,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     )
     .map_err(|e| NodeError::Config(e))?;
     mempool.set_cluster_limits(config.limit_cluster_count, config.limit_cluster_size_kvb);
+    if config.whitelist.iter().any(|w| w.contains("noban")) {
+        mempool.set_immediate_relay(true);
+    }
     if let Some(s) = config.min_relay_fee_btc.as_deref() {
         if let Some(sat) = parse_btc_to_sat(s) {
             mempool.set_min_relay_sat_kvb(sat);
@@ -652,6 +655,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 rpc_user: config.rpc_user.clone(),
                 rpc_password: config.rpc_password.clone(),
                 cookie_path: Some(config.rpc_cookie_path()),
+                work_queue: config.rpc_work_queue,
                 subversion: Some(
                     rbitcoin_primitives::rbitcoin_subversion(
                         env!("CARGO_PKG_VERSION"),

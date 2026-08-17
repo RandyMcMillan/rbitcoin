@@ -58,6 +58,8 @@ pub struct NodeConfig {
     pub rpc_user: Option<String>,
     /// Optional RPC Basic auth password.
     pub rpc_password: Option<String>,
+    /// Core `-rpcworkqueue`. `None` = unlimited.
+    pub rpc_work_queue: Option<usize>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.
     pub milestone_height: u32,
@@ -128,6 +130,7 @@ impl Default for NodeConfig {
             rpc_listen: None,
             rpc_user: None,
             rpc_password: None,
+            rpc_work_queue: None,
             milestone_height: 0,
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,

@@ -81,17 +81,41 @@ class RpcProxy:
         try:
             payload = json.loads(raw.decode() or "null")
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return 200, json.dumps(
+            return self.forward_raw(raw)
+        if isinstance(payload, list):
+            return self.forward_raw(raw)
+        if isinstance(payload, dict):
+            method = payload.get("method")
+            if isinstance(method, str) and method in self._handlers:
+                return 200, json.dumps(self._one(payload)).encode()
+        return self.forward_raw(raw)
+
+    def forward_raw(self, raw: bytes) -> tuple[int, bytes]:
+        cookie = self.cookie_line() or ""
+        tok = base64.b64encode(cookie.encode()).decode()
+        req = urllib.request.Request(
+            self.node_url,
+            data=raw,
+            headers={
+                "Authorization": f"Basic {tok}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=FORWARD_TIMEOUT_S) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read() if e.fp else b""
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            body = json.dumps(
                 {
                     "result": None,
-                    "error": {"code": -32700, "message": "Parse error"},
+                    "error": {"code": -28, "message": f"Loading... ({e})"},
                     "id": None,
                 }
             ).encode()
-        if isinstance(payload, list):
-            out = [self._one(item) for item in payload]
-            return 200, json.dumps(out).encode()
-        return 200, json.dumps(self._one(payload)).encode()
+            return 200, body
 
     def _one(self, item: Any) -> dict[str, Any]:
         if not isinstance(item, dict):

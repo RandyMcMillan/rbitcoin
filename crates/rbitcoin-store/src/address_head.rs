@@ -728,12 +728,6 @@ impl AddressHead {
             .unwrap_or(0) as u64
     }
 
-    #[inline]
-    pub(crate) fn page_seq_index(&self, page_base: u64) -> usize {
-        let n = self.page_seq.as_ref().map(|s| s.len()).unwrap_or(0);
-        page_seq_index_in(n, self.layout.bits, page_base)
-    }
-
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -1418,13 +1412,13 @@ mod tests {
         txid[0] = 0x7a;
         let page_base = page_base_for_txid(&txid, 12);
         assert_eq!(
-            h.page_seq.as_ref().unwrap()[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed),
+            page_seq_in(h.page_seq.as_ref().unwrap(), 12, page_base).load(AtomicOrdering::Relaxed),
             0,
             "fresh page seq is even/idle"
         );
         h.insert(&txid, Fk(1)).unwrap();
         let seq =
-            h.page_seq.as_ref().unwrap()[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed);
+            page_seq_in(h.page_seq.as_ref().unwrap(), 12, page_base).load(AtomicOrdering::Relaxed);
         assert!(seq.is_multiple_of(2), "publish leaves seq even, got {seq}");
         assert!(
             seq >= 2,
@@ -1471,8 +1465,12 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = 0x3c;
         h.insert(&txid, Fk(1)).unwrap();
-        let idx = h.page_seq_index(page_base_for_txid(&txid, 12));
-        h.page_seq.as_ref().unwrap()[idx].store(1, AtomicOrdering::Release);
+        page_seq_in(
+            h.page_seq.as_ref().unwrap(),
+            12,
+            page_base_for_txid(&txid, 12),
+        )
+        .store(1, AtomicOrdering::Release);
         let err = h
             .probe_fks(&txid)
             .expect_err("odd seq is in-flight pwrite; probe must not use the page");

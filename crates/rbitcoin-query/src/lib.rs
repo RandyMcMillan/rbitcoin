@@ -2151,7 +2151,11 @@ mod tests {
         drop(q);
 
         let q = Query::open_or_create(dir.join("store")).unwrap();
-        assert_eq!(q.tip_height(), Some(Height(0)), "repair must not shrink tip");
+        assert_eq!(
+            q.tip_height(),
+            Some(Height(0)),
+            "repair must not shrink tip"
+        );
         assert!(
             !q.store().strong_tx.is_strong(leftover).unwrap(),
             "open must clear leftover strong above the fence"

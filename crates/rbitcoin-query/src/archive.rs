@@ -582,6 +582,25 @@ impl Query {
             }
             crate::archive_phase_stats::note_leftover_mix(0, age0, age3, age_n);
         }
+        {
+            let mut miss_n = 0u64;
+            let mut first_miss = None;
+            for t in &need_head {
+                if resolved.contains_key(t) {
+                    continue;
+                }
+                miss_n = miss_n.saturating_add(1);
+                if first_miss.is_none() {
+                    first_miss = Some(*t);
+                }
+            }
+            if let Some(tid) = first_miss {
+                let pending = self.store.txs.queued_pending_fk(&tid).is_some();
+                crate::archive_phase_stats::note_union_miss(tid, miss_n, pending);
+            } else {
+                crate::archive_phase_stats::note_union_miss([0u8; 32], 0, false);
+            }
+        }
         let head_fk_ns = t_head.elapsed().as_nanos() as u64;
         // Need/hit before stamp so a leftover miss still meters the fail pack.
         crate::archive_phase_stats::note_resolve_counts(

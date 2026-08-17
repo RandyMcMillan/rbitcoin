@@ -690,6 +690,51 @@ pub mod archive_phase_stats {
         }
     }
 
+    static LAST_MISS_N: AtomicU64 = AtomicU64::new(0);
+    static LAST_MISS_PEND: AtomicU64 = AtomicU64::new(0);
+    static LAST_MISS_TXID: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// First TipOnly-miss prev_txid after in-flight / pin / BQ (union miss).
+    pub fn note_union_miss(txid: [u8; 32], n: u64, pending: bool) {
+        LAST_MISS_N.store(n, Ordering::Relaxed);
+        LAST_MISS_PEND.store(u64::from(pending), Ordering::Relaxed);
+        for (i, slot) in LAST_MISS_TXID.iter().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&txid[i.saturating_mul(8)..i.saturating_mul(8).saturating_add(8)]);
+            slot.store(u64::from_le_bytes(b), Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct LastUnionMiss {
+        pub n: u64,
+        pub pending: bool,
+        pub txid: Option<[u8; 32]>,
+    }
+
+    pub fn last_union_miss() -> LastUnionMiss {
+        let n = LAST_MISS_N.load(Ordering::Relaxed);
+        if n == 0 {
+            return LastUnionMiss::default();
+        }
+        let mut txid = [0u8; 32];
+        for (i, slot) in LAST_MISS_TXID.iter().enumerate() {
+            let off = i.saturating_mul(8);
+            txid[off..off.saturating_add(8)]
+                .copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
+        }
+        LastUnionMiss {
+            n,
+            pending: LAST_MISS_PEND.load(Ordering::Relaxed) != 0,
+            txid: Some(txid),
+        }
+    }
+
     /// Outer prep batch (structure + filter + publish + queue wait).
     /// Plan sub-phases are noted separately via [`note_prep_plan`].
     #[inline]

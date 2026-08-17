@@ -2,31 +2,6 @@
 
 use super::*;
 
-/// Select `need` vouts from a sorted sparse `(vout, out)` list.
-///
-/// `None` if any need vout is missing. Empty `need` with a non-empty list
-/// returns a clone of the full list (legacy layout-only pin).
-pub(super) fn take_need_outs(
-    live_all: &[(u32, rbitcoin_store::OutputRecord)],
-    need: &[u32],
-) -> Option<Vec<(u32, rbitcoin_store::OutputRecord)>> {
-    debug_assert!(
-        live_all.windows(2).all(|w| w[0].0 < w[1].0),
-        "sparse outs must be strictly increasing by vout"
-    );
-    if need.is_empty() {
-        return Some(live_all.to_vec());
-    }
-    let mut live = Vec::with_capacity(need.len());
-    for &v in need {
-        match live_all.binary_search_by_key(&v, |(ov, _)| *ov) {
-            Ok(i) => live.push((v, live_all[i].1.clone())),
-            Err(_) => return None,
-        }
-    }
-    Some(live)
-}
-
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight offline denserels → **txout body by range** from
@@ -203,61 +178,9 @@ pub(super) fn pin_for_wire_batch(
                 if cb.is_some() || plan_range.is_some() {
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
-            } else if let Some(plan) = plan {
-                if let Some(ext) = plan.external_parent_outs.get(id) {
-                    let (tx, _live) = ext.as_ref();
-                    let cb = if tx.input_count != 1 {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    let plan_range = parent_pin
-                        .ranges
-                        .get(id)
-                        .copied()
-                        .or_else(|| plan.external_parent_ranges.get(id).copied());
-                    if cb.is_some() || plan_range.is_some() {
-                        batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
-                    }
-                }
             }
             n_plan_pin = n_plan_pin.saturating_add(1);
             continue;
-        }
-        if let Some(plan) = plan {
-            if let Some(ext) = plan.external_parent_outs.get(id) {
-                let (tx, live_all) = ext.as_ref();
-                if let Some(live) = take_need_outs(live_all, need) {
-                    let checked = if need.is_empty() {
-                        live.iter().map(|(v, _)| *v).collect()
-                    } else {
-                        need.clone()
-                    };
-                    let cb = if tx.input_count != 1 {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    let plan_range = parent_pin
-                        .ranges
-                        .get(id)
-                        .copied()
-                        .or_else(|| plan.external_parent_ranges.get(id).copied());
-                    batch_parents.insert_owned(
-                        fk,
-                        tx.clone(),
-                        live,
-                        checked,
-                        cb,
-                        plan_range,
-                        Vec::new(),
-                    );
-                    n_plan_pin = n_plan_pin.saturating_add(1);
-                    continue;
-                }
-                still_need.insert(*id, need.clone());
-                continue;
-            }
         }
         if let Some(pin) = plan_by_id.get(id) {
             let (tx, outs) = pin.as_ref();
@@ -710,25 +633,4 @@ pub(super) fn ensure_spend_abs_layouts(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod take_need_outs_tests {
-    use super::take_need_outs;
-    use rbitcoin_store::OutputRecord;
-
-    #[test]
-    fn take_need_outs_binary_search_high_vout() {
-        let live = vec![
-            (0, OutputRecord::unspent(1, vec![0x00])),
-            (1, OutputRecord::unspent(2, vec![0x01])),
-            (2, OutputRecord::unspent(3, vec![0x02])),
-            (3, OutputRecord::unspent(4, vec![0x03])),
-        ];
-        let got = take_need_outs(&live, &[0, 3]).expect("need 0 and 3");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0, 0);
-        assert_eq!(got[1].0, 3);
-        assert!(take_need_outs(&live, &[7]).is_none());
-    }
 }

@@ -17,6 +17,11 @@ before 1.0).
   `bulk_lookup_txid` are gone. Dequeue enqueues a height forget; disconnect
   stores `None` immediately. `pin_txid=` now counts published-union hits.
 
+- **Confirm pin outs:** `ArchiveWritePlan.external_parent_outs` and
+  `ensure_external_parent_denserels_from_plan` are gone. IBD pin is
+  `pin_for_wire_batch` (in-flight / same-batch / pstore adopt / cold
+  range). Plan keeps ranges+txids until `freeze_after_pin`.
+
 ### Added
 
 - **`generateblock submit=false`:** mine one block without connecting it

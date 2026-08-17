@@ -18,9 +18,9 @@ pub struct ConfirmLoadStats {
     pub creates_registered: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
-    /// Of `parent_unique`: filled without store denserels IO (same-batch / plan-local).
+    /// Of `parent_unique`: filled without store denserels IO (same-batch / in-flight / adopt).
     pub pin_cache_body: u32,
-    /// Of `parent_unique`: missed same-batch (cold denserels).
+    /// Of `parent_unique`: missed same-batch / in-flight / adopt (cold denserels).
     pub pin_new: u32,
     /// FIFO hit path resolve.
     pub pin_body_ns: u64,

@@ -129,7 +129,7 @@ bind.
 
 - Confirm write annotate / ensure: `rbitcoin-consensus` `confirm_run::{post_commit,ensure_spend_abs_layouts,pin_for_wire_batch}`
 - Structural: `rbitcoin-consensus` `block::structural_validate_spends`
-- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, plan-local `external_parent_outs`
+- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `pin_for_wire_batch` (cold range / adopt)
 - Abs annotate: `rbitcoin-store` `put_spend_batch_by_abs_meta`
 
 ## Regression tests (shipped)

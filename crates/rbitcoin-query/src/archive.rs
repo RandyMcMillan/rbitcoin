@@ -5,7 +5,7 @@
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   in-flight planned creates + `tx.head` resolve, stamp inputs.
 //!   Head-miss parents use **fk-only** head resolve (no denserels on plan stamp);
-//!   denserels for pin load at prep/ensure into plan-local maps only.
+//!   load pin denserels by stamped `txout` range.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs. Pipeline pins stay on the plan (`batch_pin`); no
 //!   process create FIFO seed.
@@ -36,12 +36,6 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     n
 }
 
-/// Sparse external parent outs for pin (need-vouts only).
-///
-/// `(tx, live need outs)` — **not** a full `output_count`-sized expand.
-/// Transient on the plan until pin; sparse need then lives in [`crate::BatchParents`].
-pub type SparseExternalPin = std::sync::Arc<(TxRecord, Vec<(u32, OutputRecord)>)>;
-
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
@@ -56,18 +50,12 @@ pub struct ArchiveWritePlan {
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
-    /// Pipeline-local **sparse** external parent pins (need-vouts only).
-    ///
-    /// Filled by ensure/prep denserels (often from
-    /// [`Self::external_parent_ranges`]). **Dropped after pin**
-    /// ([`Self::clear_external_parent_outs`]).
-    pub external_parent_outs: crate::U64Map<SparseExternalPin>,
     /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
     ///
-    /// Filled at plan stamp (fk+range short-circuit). Prep denserels-loads by
-    /// offset (skip `tx.idx`) into [`Self::external_parent_outs`]. Still live —
-    /// not obsolete after schema-13 `txid.body` (identity is separate from range).
-    /// Pack-scale identity hasher ([`crate::U64Map`]): dense create_fks load evenly.
+    /// Filled at plan stamp (fk+range short-circuit). Load pin denserels-loads by
+    /// this range (skip `tx.idx`). Still live — not obsolete after schema-13
+    /// `txid.body` (identity is separate from range). Pack-scale identity hasher
+    /// ([`crate::U64Map`]): dense create_fks load evenly.
     pub external_parent_ranges: crate::U64Map<(u64, u64)>,
     /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
     ///
@@ -91,7 +79,6 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
-            external_parent_outs: crate::U64Map::default(),
             external_parent_ranges: crate::U64Map::default(),
             external_parent_txids: crate::U64Map::default(),
             batch_pin: Vec::new(),
@@ -110,13 +97,11 @@ impl ArchiveWritePlan {
         self.external_parent_txids.get(&create_fk_id).copied()
     }
 
-    /// Drop pipeline-local external sparse outs after denserels pin.
+    /// Drop stamp staging (ranges + txid reverse) after pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
-    /// reads this map. Ranges + txid reverse may be cleared with outs (prep done).
+    /// reads these maps.
     pub fn clear_external_parent_outs(&mut self) {
-        self.external_parent_outs.clear();
-        self.external_parent_outs.shrink_to_fit();
         self.external_parent_ranges.clear();
         self.external_parent_ranges.shrink_to_fit();
         self.external_parent_txids.clear();
@@ -128,7 +113,7 @@ impl ArchiveWritePlan {
     /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
     /// / headers / spends / `batch_pin`). Prep must call this (or
     /// [`Self::clear_external_parent_outs`]) before enqueue to scripts/write so
-    /// batch-merge never mutates growing external HashMaps.
+    /// batch-merge never mutates growing stamp maps.
     pub fn freeze_after_pin(&mut self) {
         self.clear_external_parent_outs();
     }
@@ -216,10 +201,8 @@ impl ArchiveWritePlan {
         if other.is_empty() && other.per_header_ranges.is_empty() {
             return;
         }
-        other.external_parent_outs.clear();
         other.external_parent_ranges.clear();
         other.external_parent_txids.clear();
-        self.external_parent_outs.clear();
         self.external_parent_ranges.clear();
         self.external_parent_txids.clear();
 
@@ -512,7 +495,6 @@ impl Query {
         // (probe + idx + identity; no denserels body). Prep loads denserels by
         // known body_range (skip tx.idx). Identity for pin is the lookup key
         // already in RAM (`resolved`) — never re-read txid.body at prep.
-        let external_parent_outs: crate::U64Map<SparseExternalPin> = crate::U64Map::default();
         let mut external_parent_ranges: crate::U64Map<(u64, u64)> = crate::U64Map::default();
         let mut external_parent_txids: crate::U64Map<[u8; 32]> =
             crate::U64Map::with_capacity_and_hasher(
@@ -739,7 +721,6 @@ impl Query {
             per_header_ranges,
             spends,
             batch_creates,
-            external_parent_outs,
             external_parent_ranges,
             external_parent_txids,
             batch_pin,
@@ -1437,7 +1418,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Plan head path stamps create_fk only — denserels stay plan-local at prep;
+    /// Plan head path stamps create_fk + range only — pin denserels by range;
     /// commit does not process-seed parents or creates into a pin FIFO.
     #[test]
     fn plan_head_resolved_parents_plan_local_only() {
@@ -1489,11 +1470,7 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
-        // Plan stamp is fk+range only — denserels load at prep by offset.
-        assert!(
-            plan.external_parent_outs.is_empty(),
-            "plan must not denserels-load head parents"
-        );
+        // Plan stamp is fk+range only — denserels load at pin by offset.
         assert!(
             plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
             "plan must record Class A body range for head-resolved parent"
@@ -1758,24 +1735,15 @@ mod tests {
     /// external staging maps are dropped (not union-mutated).
     #[test]
     fn freeze_after_pin_then_append_preserves_fk_order() {
-        use std::sync::Arc;
         let (dir, q) = temp_query("freeze-append");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let mut plan_a = q
             .archive_plan_batch_from(&mut need_a, 1, &crate::InFlightView::empty())
             .unwrap();
-        // Simulate residual staging (must not survive freeze/append).
-        plan_a.external_parent_outs.insert(
-            99,
-            Arc::new((
-                coinbase_apply(99).tx,
-                vec![(0, OutputRecord::unspent(1, vec![0x51]))],
-            )),
-        );
+        // Simulate residual stamp staging (must not survive freeze/append).
         plan_a.external_parent_ranges.insert(99, (0, 1));
         plan_a.external_parent_txids.insert(99, [9u8; 32]);
         plan_a.freeze_after_pin();
-        assert!(plan_a.external_parent_outs.is_empty());
         assert!(plan_a.external_parent_ranges.is_empty());
         assert!(plan_a.external_parent_txids.is_empty());
 
@@ -1783,13 +1751,7 @@ mod tests {
         let mut plan_b = q
             .archive_plan_batch_from(&mut need_b, 2, &crate::InFlightView::empty())
             .unwrap();
-        plan_b.external_parent_outs.insert(
-            88,
-            Arc::new((
-                coinbase_apply(88).tx,
-                vec![(0, OutputRecord::unspent(1, vec![0x51]))],
-            )),
-        );
+        plan_b.external_parent_ranges.insert(88, (0, 1));
         plan_b.freeze_after_pin();
 
         let fks_a = plan_a.planned_fks.clone();
@@ -1799,8 +1761,8 @@ mod tests {
 
         plan_a.append(plan_b);
         assert!(
-            plan_a.external_parent_outs.is_empty(),
-            "append must not keep external staging maps"
+            plan_a.external_parent_ranges.is_empty() && plan_a.external_parent_txids.is_empty(),
+            "append must not keep stamp staging maps"
         );
         assert_eq!(plan_a.planned_fks.len(), 3);
         assert_eq!(&plan_a.planned_fks[..1], &fks_a[..]);

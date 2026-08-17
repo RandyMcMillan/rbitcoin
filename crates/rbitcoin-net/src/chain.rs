@@ -826,8 +826,8 @@ impl ChainHub {
 
     /// IBD **load** after lookup stamp: pin + assemble (does not re-lookup).
     ///
-    /// Single path: denserels by body range from lookup stamp (plan-local or plan=None
-    /// `ParentPinStamp`). No cold denserels dual path.
+    /// Single path: denserels by body range from lookup stamp (`ParentPinStamp` /
+    /// plan ranges). No cold denserels dual path.
     pub fn confirm_wire_load_from_plan(
         &self,
         stamped: PlanStampOutcome,

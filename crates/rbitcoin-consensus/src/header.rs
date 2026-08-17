@@ -40,6 +40,16 @@ pub fn validate_header(
         if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
             return Err(ConsensusError::BadHeader("timestamp too far in future"));
         }
+
+        // Core ContextualCheckBlockHeader: DeploymentActiveAfter(prev) = this
+        // height ≥ buried height. Reject outdated nVersion (BIP34/66/65).
+        let ver = header.version.to_consensus();
+        if (params.bip34_active_at(height.0) && ver < 2)
+            || (params.bip66_active_at(height.0) && ver < 3)
+            || (params.bip65_active_at(height.0) && ver < 4)
+        {
+            return Err(ConsensusError::BadVersion(ver));
+        }
     }
 
     if let Some(cp) = params.checkpoint_at(height) {
@@ -265,7 +275,12 @@ mod median_time_past_tests {
         hdr.bits = bitcoin::CompactTarget::from_consensus(0x207fffff);
         let err = validate_header(&q, &params, Height(1), &hdr).unwrap_err();
         assert!(
-            matches!(err, ConsensusError::BadPrev | ConsensusError::BadHeader(_)),
+            matches!(
+                err,
+                ConsensusError::BadPrev
+                    | ConsensusError::BadHeader(_)
+                    | ConsensusError::BadVersion(_)
+            ),
             "{err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

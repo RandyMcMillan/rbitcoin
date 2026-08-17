@@ -1303,7 +1303,10 @@ impl ChainHub {
         })
         .map_err(|e| {
             let reason = rbitcoin_consensus::block_reject_reason(&e);
-            rbitcoin_log::debug!("{reason}");
+            rbitcoin_log::info!(
+                "{}",
+                rbitcoin_consensus::block_reject_log_line(&hash, &reason)
+            );
             NetError::Consensus(reason)
         })?;
         self.header_tips.write().unwrap().remove(&hash);
@@ -1431,6 +1434,23 @@ impl ChainHub {
 ///
 /// Format is intentionally close to Bitcoin Core `UpdateTip` so operators can
 /// grep one line per height. IBD does not call this for every confirm batch.
+/// `p2p_unrequested_blocks.py` needle when minchainwork rejects an unrequested header.
+pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
+    format!(
+        "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
+    )
+}
+
+/// `p2p_headers_sync_with_minchainwork.py` low-work skip.
+pub fn ignoring_low_work_chain_log(height: u32) -> String {
+    format!("[net] Ignoring low-work chain (height={height})")
+}
+
+/// `p2p_initial_headers_sync.py` first getheaders after connect.
+pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
+    format!("initial getheaders ({locator_height}) to peer={peer}")
+}
+
 pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
     let time = header.time;
     let ver = header.version.to_consensus();
@@ -1672,7 +1692,7 @@ mod tests {
     fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time,
@@ -1692,6 +1712,25 @@ mod tests {
             }
         }
         block
+    }
+
+    #[test]
+    fn core_log_helpers_match_step21_needles() {
+        let h = BlockHash::from_byte_array([0x11; 32]);
+        assert_eq!(
+            accept_block_header_nodos_log(h),
+            format!(
+                "AcceptBlockHeader: not adding new block header {h}, missing anti-dos proof-of-work validation"
+            )
+        );
+        assert_eq!(
+            ignoring_low_work_chain_log(14),
+            "[net] Ignoring low-work chain (height=14)"
+        );
+        assert_eq!(
+            initial_getheaders_log(0, 0),
+            "initial getheaders (0) to peer=0"
+        );
     }
 
     #[test]
@@ -2272,6 +2311,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `feature_dersig.py`: after dersig@102, a version-2 block is `bad-version`.
+    #[test]
+    fn dersig_rejects_version2_and_logs_core_needle() {
+        use bitcoin::block::Version;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-dersig-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let mut params = ChainParams::regtest();
+        params.apply_test_activation_height("dersig", 102).unwrap();
+        let hub = ChainHub::new(q, params, Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad to height 101");
+        assert_eq!(hub.tip_height(), Some(101));
+
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let mut block =
+            mine_regtest_paying(prev, time, 102, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+        block.header.version = Version::from_consensus(2);
+        let bits = block.header.bits;
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let hash = block.block_hash();
+        let err = hub.accept_block(block).expect_err("v2 at height 102");
+        let s = err.to_string();
+        assert!(s.contains("bad-version(0x00000002)"), "shipped reject: {s}");
+        let line = rbitcoin_consensus::block_reject_log_line(&hash, "bad-version(0x00000002)");
+        assert_eq!(line, format!("{hash}, bad-version(0x00000002)"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `feature_cltv.py`: after cltv@111, a version-3 block is `bad-version`.
+    #[test]
+    fn cltv_rejects_version3_and_logs_core_needle() {
+        use bitcoin::block::Version;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-cltv-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let mut params = ChainParams::regtest();
+        params.apply_test_activation_height("cltv", 111).unwrap();
+        let hub = ChainHub::new(q, params, Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(110, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad to height 110");
+        assert_eq!(hub.tip_height(), Some(110));
+
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let mut block =
+            mine_regtest_paying(prev, time, 111, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+        block.header.version = Version::from_consensus(3);
+        let bits = block.header.bits;
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let hash = block.block_hash();
+        let err = hub.accept_block(block).expect_err("v3 at height 111");
+        let s = err.to_string();
+        assert!(s.contains("bad-version(0x00000003)"), "shipped reject: {s}");
+        let line = rbitcoin_consensus::block_reject_log_line(&hash, "bad-version(0x00000003)");
+        assert_eq!(line, format!("{hash}, bad-version(0x00000003)"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn work_better_and_sum_work_helpers() {
         let z = Work::from_be_bytes([0u8; 32]);
@@ -2372,7 +2509,7 @@ mod tests {
     fn mine_with_extra(prev: BlockHash, time: u32, height: u32, extra: Vec<Transaction>) -> Block {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time,

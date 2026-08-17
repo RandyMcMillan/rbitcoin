@@ -272,7 +272,7 @@ fn bad_prev_gathers_winner_via_bq_by_hash() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -391,7 +391,7 @@ fn exploration_apply_win_held_ext_only_in_bq() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -521,7 +521,7 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -641,7 +641,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -846,7 +846,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -1164,7 +1164,7 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -1324,7 +1324,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
     let mine = |prev: BlockHash, time: u32, height: u32| {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time,
@@ -1456,7 +1456,7 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time,
@@ -1579,7 +1579,7 @@ fn apply_peer_event_body_and_control_surface() {
     }
     fn dummy_header(prev: BlockHash, n: u8) -> Header {
         Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([n; 32]),
             time: 1_300_000_000 + u32::from(n),
@@ -1854,7 +1854,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     }
     fn shell(prev: BlockHash, height: u32, n: u32) -> Block {
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time: 1_300_000_000 + n,
@@ -2094,7 +2094,7 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
     }
     fn shell(prev: BlockHash, height: u32, n: u32) -> Block {
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time: 1_300_000_000 + n,
@@ -2217,7 +2217,7 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
     }
     fn dummy_header(prev: BlockHash, n: u32) -> Header {
         Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([n as u8; 32]),
             time: 1_300_000_000 + n,

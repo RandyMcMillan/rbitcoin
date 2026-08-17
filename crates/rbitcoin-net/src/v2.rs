@@ -106,6 +106,11 @@ fn command_to_12(cmd: &str) -> [u8; 12] {
     out
 }
 
+/// `p2p_invalid_messages.py` v2 needle for an unknown short/long type.
+pub fn v2_invalid_message_type_log() -> &'static str {
+    "V2 transport error: invalid message type"
+}
+
 fn command_from_12(cmd12: &[u8; 12]) -> Result<String, NetError> {
     if !command_bytes_ok(cmd12) {
         return Err(NetError::Protocol("invalid message command"));
@@ -174,7 +179,10 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
     }
     let first = contents[0];
     let (command, payload) = if first != 0 {
-        let name = command_for_short_id(first).ok_or(NetError::Protocol("unknown v2 short id"))?;
+        let name = command_for_short_id(first).ok_or_else(|| {
+            rbitcoin_log::info!("{}", v2_invalid_message_type_log());
+            NetError::Protocol("unknown v2 short id")
+        })?;
         (command_to_12(name), contents[1..].to_vec())
     } else {
         if contents.len() < 1 + 12 {
@@ -183,7 +191,10 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
         let mut cmd12 = [0u8; 12];
         cmd12.copy_from_slice(&contents[1..13]);
         // Validate padding / charset.
-        let _ = command_from_12(&cmd12)?;
+        if command_from_12(&cmd12).is_err() {
+            rbitcoin_log::info!("{}", v2_invalid_message_type_log());
+            return Err(NetError::Protocol("invalid message command"));
+        }
         (cmd12, contents[13..].to_vec())
     };
 
@@ -357,6 +368,10 @@ mod tests {
         // Application handshake uses long form (not short-id).
         assert!(short_id_for_command("version").is_none());
         assert!(short_id_for_command("verack").is_none());
+        assert_eq!(
+            v2_invalid_message_type_log(),
+            "V2 transport error: invalid message type"
+        );
         assert!(short_id_for_command("wtxidrelay").is_none());
         assert!(short_id_for_command("sendheaders").is_none());
         assert!(short_id_for_command("sendaddrv2").is_none());

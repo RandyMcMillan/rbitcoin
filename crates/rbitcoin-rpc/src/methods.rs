@@ -326,6 +326,10 @@ pub fn dispatch(
             params.reject_unknown(&[])?;
             Ok(getpeerinfo(ctx))
         }
+        "ping" => {
+            params.reject_unknown(&[])?;
+            ping(ctx)
+        }
         "addnode" => addnode(ctx, &params),
         "disconnectnode" => disconnectnode(ctx, &params),
         "addconnection" => addconnection(ctx, &params),
@@ -468,6 +472,7 @@ const METHOD_LIST: &[&str] = &[
     "getnetworkinfo",
     "getconnectioncount",
     "getpeerinfo",
+    "ping",
     "addnode",
     "disconnectnode",
     "addconnection",
@@ -837,7 +842,7 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
     for (k, v) in p.bytessent_per_msg {
         sent.insert(k, json!(v));
     }
-    json!({
+    let mut row = json!({
         "id": p.id,
         "addr": p.addr.to_string(),
         "addrbind": p.addrbind.to_string(),
@@ -855,7 +860,24 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
         "synced_blocks": -1,
         "bip152_hb_to": p.bip152_hb_to,
         "bip152_hb_from": p.bip152_hb_from,
-    })
+    });
+    if let Some(v) = p.pingtime {
+        row["pingtime"] = json!(v);
+    }
+    if let Some(v) = p.minping {
+        row["minping"] = json!(v);
+    }
+    if let Some(v) = p.pingwait {
+        row["pingwait"] = json!(v);
+    }
+    row
+}
+
+fn ping(ctx: &RpcContext) -> Result<Value, Value> {
+    if let Some(hub) = ctx.peers.as_ref() {
+        hub.queue_pings();
+    }
+    Ok(Value::Null)
 }
 
 fn services_names(bits: u64) -> Vec<&'static str> {
@@ -1216,14 +1238,28 @@ fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
         let rest = rest
             .strip_prefix("script verification failed: ")
             .unwrap_or(rest);
-        let token = rest.split(" txid=").next().unwrap_or(rest);
-        let paren = match token {
-            "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
-            other => other,
-        };
+        let paren = rbitcoin_consensus::script_flag_paren(rest);
         return format!("mempool-script-verify-flag-failed ({paren})");
     }
     s.to_string()
+}
+
+/// Core `reject-details` for a script-verify mempool reject.
+fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Option<String> {
+    let reason = accept_reject_reason(e);
+    if !reason.starts_with("mempool-script-verify-flag-failed") {
+        return None;
+    }
+    let vin = 0usize;
+    let inp = tx.input.get(vin)?;
+    let prev = inp.previous_output;
+    Some(format!(
+        "{reason}, input {vin} of {} (wtxid {}), spending {}:{}",
+        tx.compute_txid(),
+        tx.compute_wtxid(),
+        prev.txid,
+        prev.vout
+    ))
 }
 
 fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1271,12 +1307,16 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             }
             Err(e) => {
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
-                out.push(json!({
+                let mut row = json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": false,
                     "reject-reason": accept_reject_reason(&e),
-                }));
+                });
+                if let Some(details) = accept_reject_details(&e, &tx) {
+                    row["reject-details"] = json!(details);
+                }
+                out.push(row);
             }
         }
     }
@@ -1847,6 +1887,9 @@ fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     miner
         .set_mock_time(ts)
         .map_err(|e| rpc_error(ERR_MISC, e))?;
+    if let Some(peers) = ctx.peers.as_ref() {
+        peers.set_mock_now(ts as u64);
+    }
     Ok(Value::Null)
 }
 
@@ -2993,6 +3036,7 @@ mod tests {
             "getnetworkinfo",
             "getconnectioncount",
             "getpeerinfo",
+            "ping",
             "getmempoolinfo",
             "getrawmempool",
         ] {
@@ -4473,6 +4517,66 @@ mod tests {
         assert_eq!(e["message"], "Block not available (not fully downloaded)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn testmempoolaccept_script_reject_maps_dersig_and_details() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let err = "script: script verification failed: SIG_DER";
+        let reason = accept_reject_reason(&err);
+        assert_eq!(
+            reason,
+            "mempool-script-verify-flag-failed (Non-canonical DER signature)"
+        );
+        let prev = Txid::from_byte_array([0x11; 32]);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let details = accept_reject_details(&err, &tx).expect("script reject has details");
+        let want = format!(
+            "{reason}, input 0 of {} (wtxid {}), spending {}:0",
+            tx.compute_txid(),
+            tx.compute_wtxid(),
+            prev
+        );
+        assert_eq!(details, want);
+    }
+
+    #[test]
+    fn testmempoolaccept_script_reject_maps_cltv_parens() {
+        for (token, paren) in [
+            (
+                "stack empty",
+                "Operation not valid with the current stack size",
+            ),
+            ("CLTV negative", "Negative locktime"),
+            ("CLTV type", "Locktime requirement not satisfied"),
+            ("CLTV", "Locktime requirement not satisfied"),
+            ("CLTV final sequence", "Locktime requirement not satisfied"),
+        ] {
+            let err = format!("script: script verification failed: {token}");
+            assert_eq!(
+                accept_reject_reason(&err),
+                format!("mempool-script-verify-flag-failed ({paren})")
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,10 @@ mod tx_relay;
 mod v2;
 
 pub use cache::BlockCache;
-pub use chain::{log_update_tip, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
+pub use chain::{
+    accept_block_header_nodos_log, ignoring_low_work_chain_log, initial_getheaders_log,
+    log_update_tip, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent,
+};
 pub use codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH};
 pub use error::NetError;
 pub use ibd::{
@@ -32,7 +35,9 @@ pub use peer_dos::{
     inbound_semaphore, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC, DEFAULT_MAX_INBOUND,
     DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
 };
-pub use peers::{parse_peer_addr, DialRequest, LivePeer, PeerConnType, PeerHub, PeerInfo};
+pub use peers::{
+    parse_peer_addr, DialRequest, LivePeer, PeerConnType, PeerHub, PeerInfo, PingAction,
+};
 pub use rbitcoin_mempool::MempoolGraphStats;
 pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,

@@ -6,6 +6,7 @@ use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
 use crate::peer_dos::{PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE};
+use crate::peers::PingAction;
 use crate::v2::{open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer};
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
@@ -291,7 +292,8 @@ pub async fn peer_session_with(
         }),
     )
     .await;
-    // So `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29.
+    // Untracked keepalive so `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29
+    // before LivePeer ping state is armed. Session peers send a tracked ping ~50ms later.
     let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(rand_nonce())).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
@@ -305,6 +307,10 @@ pub async fn peer_session_with(
     });
 
     // Bootstrap: ask for anything above our tip (critical after IBD disconnect).
+    if let Some(s) = meta.session.as_ref() {
+        let h = hub.tip_height().unwrap_or(0);
+        rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
+    }
     if let Err(e) = queue_getheaders(&out_tx, hub.as_ref()) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
@@ -346,6 +352,16 @@ pub async fn peer_session_with(
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(50)), if session.is_some() => {
                     if let Some(s) = session.as_ref() {
+                        match s.take_ping_action(s.clock_now()) {
+                            Some(PingAction::Send { nonce }) => {
+                                let _ = queue_out(&out_tx, NetworkMessage::Ping(nonce));
+                            }
+                            Some(PingAction::Timeout { elapsed_secs }) => {
+                                rbitcoin_log::info!("ping timeout: {elapsed_secs:.6}s");
+                                s.request_disconnect();
+                            }
+                            None => {}
+                        }
                         match s.pending_sendcmpct.swap(0, Ordering::Relaxed) {
                             1 => {
                                 let _ = queue_out(
@@ -505,10 +521,18 @@ pub async fn peer_session_with(
                         // Soft: drop this message but keep session for first offense.
                         continue;
                     }
-                    // Ping: cheap 8-byte path — never leave the I/O task for decode.
+                    // Ping/pong: cheap 8-byte path — never leave the I/O task for decode.
                     if frame.is_ping() {
                         if let Some(n) = frame.ping_nonce() {
                             queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                        }
+                        continue;
+                    }
+                    if frame.is_pong() {
+                        if let Some(s) = session.as_ref() {
+                            if let Some(line) = s.on_pong(&frame.payload, s.clock_now()) {
+                                rbitcoin_log::info!("{line}");
+                            }
                         }
                         continue;
                     }
@@ -653,6 +677,13 @@ async fn handle_peer_frame(
 ) -> Result<(), NetError> {
     let msg = decode_framed_offload(frame).await?;
     match msg.payload() {
+        NetworkMessage::Version(_) => {
+            if let Some(s) = session {
+                rbitcoin_log::info!("redundant version message from peer={}", s.id);
+            } else {
+                rbitcoin_log::info!("redundant version message from peer");
+            }
+        }
         NetworkMessage::Ping(n) => {
             queue_out(out_tx, NetworkMessage::Pong(*n))?;
         }
@@ -1367,7 +1398,7 @@ mod tests {
         use bitcoin::block::{Header, Version};
         use bitcoin::{CompactTarget, TxMerkleNode};
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
             merkle_root: TxMerkleNode::from_byte_array([1u8; 32]),
             time: 1,
@@ -1530,7 +1561,7 @@ mod tests {
         };
         let mut bad = bitcoin::Block {
             header: Header {
-                version: BlockVersion::ONE,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: tip,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
                 time: tip_block.header.time + 600,
@@ -1714,7 +1745,7 @@ mod tests {
             use bitcoin::block::{Header, Version};
             use bitcoin::{CompactTarget, TxMerkleNode};
             let child = Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: gen.block_hash(),
                 merkle_root: TxMerkleNode::from_byte_array([2u8; 32]),
                 time: gen.time + 1,
@@ -2325,7 +2356,7 @@ mod tests {
         };
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: hub.tip_hash().unwrap(),
                 merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1,
@@ -2414,7 +2445,7 @@ mod tests {
             let bits = CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: Header {
-                    version: BlockVersion::ONE,
+                    version: BlockVersion::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,
@@ -2499,7 +2530,7 @@ mod tests {
             let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: bitcoin::block::Header {
-                    version: bitcoin::block::Version::ONE,
+                    version: bitcoin::block::Version::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,
@@ -2572,7 +2603,7 @@ mod tests {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut orphan = bitcoin::Block {
             header: Header {
-                version: BlockVersion::ONE,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: missing_parent,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1_300_000_100,
@@ -2660,7 +2691,7 @@ mod tests {
             let bits = CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: Header {
-                    version: BlockVersion::ONE,
+                    version: BlockVersion::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,

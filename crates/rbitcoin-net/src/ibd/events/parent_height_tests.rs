@@ -41,7 +41,7 @@ fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
         }],
     };
     let header = Header {
-        version: Version::ONE,
+        version: Version::from_consensus(4),
         prev_blockhash: prev,
         merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
         time,

@@ -403,7 +403,17 @@ impl MempoolHub {
 
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
-        self.unbroadcast.lock().unwrap().remove(txid);
+        if self.unbroadcast.lock().unwrap().remove(txid) {
+            rbitcoin_log::info!("{}", Self::unbroadcast_removed_log(txid));
+        }
+    }
+
+    /// Core `mempool_unbroadcast.py` debug.log needle when a local tx confirms
+    /// before a peer getdata's it.
+    pub fn unbroadcast_removed_log(txid: &Txid) -> String {
+        format!(
+            "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
+        )
     }
 
     /// Count peer inv of txs we do not already hold (want → getdata path).
@@ -1510,6 +1520,18 @@ mod tests {
         assert_eq!(mp.remove_for_block(&[dummy]), 0);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn unbroadcast_removed_log_matches_core_needle() {
+        let txid = Txid::from_byte_array([0xab; 32]);
+        let line = MempoolHub::unbroadcast_removed_log(&txid);
+        assert_eq!(
+            line,
+            format!(
+                "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
+            )
+        );
     }
 
     /// Accept → persist → reopen rebuilds the scripthash index; remove unindexes.

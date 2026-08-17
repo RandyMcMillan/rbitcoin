@@ -99,6 +99,7 @@ analog = "follow-up: equal-work tip choice (preciousblock exists)"
 name = "feature_cltv.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: v3 at cltv@111 is bad-version(0x00000003); five CLTV parens + reject-details; unmodified MiniWallet RAW_OP_TRUE + acceptnonstdtxn path not locally proven"
 
 [[test]]
 name = "feature_coinstatsindex.py"
@@ -131,6 +132,7 @@ analog = "crash-recovery / HWM publish tests"
 name = "feature_dersig.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: v2 at dersig@102 is bad-version(0x00000002); SIG_DER → Non-canonical DER + reject-details; unmodified MiniWallet RAW_P2PK path not locally proven"
 
 [[test]]
 name = "feature_dirsymlinks.py"
@@ -521,6 +523,7 @@ analog = "follow-up: TRUC/v3"
 name = "mempool_unbroadcast.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: Removed {txid} from unbroadcast before confirmation; mockscheduler rebroadcast + mempool.dat persist + 15m inv not locally proven"
 
 [[test]]
 name = "mempool_updatefromblock.py"
@@ -669,6 +672,7 @@ reason = "core-log"
 name = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: [net] Ignoring low-work chain (height=N); inbound header-tree work vs offered height + noban Synchronizing blockheaders unmapped"
 
 [[test]]
 name = "p2p_i2p_ports.py"
@@ -694,6 +698,7 @@ reason = "core-log"
 name = "p2p_initial_headers_sync.py"
 status = "skip"
 reason = "core-log"
+analog = "shipped: initial getheaders (0) to peer=0 on connect; Timeout downloading headers / noban / single-recipient getheaders matrix unmapped"
 
 [[test]]
 name = "p2p_invalid_block.py"
@@ -711,6 +716,7 @@ analog = "follow-up: locator bounds"
 name = "p2p_invalid_messages.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: V2 transport error: invalid message type + redundant version; v1 Header error / packet too large / Misbehaving / *other* bytes / noncontinuous headers unmapped"
 
 [[test]]
 name = "p2p_invalid_tx.py"
@@ -783,6 +789,7 @@ reason = "core-log"
 name = "p2p_ping.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: Short payload / Unsolicited / Nonce mismatch / Nonce zero / ping timeout: 1201.000000s; getpeerinfo pingtime/minping/pingwait + ping RPC + setmocktime; unmodified script not locally proven"
 
 [[test]]
 name = "p2p_private_broadcast.py"
@@ -836,6 +843,7 @@ analog = "follow-up: tx privacy"
 name = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: AcceptBlockHeader … missing anti-dos proof-of-work validation; unrequested fork + 288-block window + minwork header skip not shipped"
 
 [[test]]
 name = "p2p_v2_encrypted.py"
@@ -970,6 +978,7 @@ status = "run"
 name = "rpc_net.py"
 status = "skip"
 reason = "core-log"
+analog = "getpeerinfo ping fields shipped; SetNetworkActive / getnettotals / received: addr / addnode/getaddednodeinfo / getnodeaddresses unmapped"
 
 [[test]]
 name = "rpc_orphans.py"

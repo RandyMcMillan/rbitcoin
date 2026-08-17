@@ -221,7 +221,7 @@ mod tests {
     fn mine_with_txs(prev: BlockHash, time: u32, height: u32, extra: Vec<Transaction>) -> Block {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: prev,
             merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
             time,

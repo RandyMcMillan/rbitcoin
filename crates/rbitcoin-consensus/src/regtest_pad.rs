@@ -41,8 +41,10 @@ pub fn mine_regtest_paying(
     extra_txs: Vec<Transaction>,
 ) -> Block {
     let bits = CompactTarget::from_consensus(0x207f_ffff);
+    // Post-BIP65 (regtest height 1) requires nVersion ≥ 4. Core generate uses
+    // VERSIONBITS_TOP_BITS; 4 is the buried minimum and enough for dersig/cltv.
     let header = Header {
-        version: Version::ONE,
+        version: Version::from_consensus(4),
         prev_blockhash: prev,
         merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
         time,

@@ -61,6 +61,10 @@ pub struct RpcContext {
     pub peers: Option<Arc<rbitcoin_net::PeerHub>>,
     /// Live chain (invalidate / reconsider / precious).
     pub chain: Option<Arc<rbitcoin_net::ChainHub>>,
+    /// Core `getrpcinfo.logpath` (`{datadir}/debug.log`).
+    pub logpath: String,
+    /// In-flight RPC methods (method, start) for `getrpcinfo.active_commands`.
+    pub active: std::sync::Mutex<Vec<(String, Instant)>>,
 }
 
 /// Outcome of `submitblock` (Core: `null` or a reject-reason string).
@@ -290,7 +294,16 @@ pub fn dispatch(
     method: &str,
     params: impl Into<RpcParams>,
 ) -> Result<Value, Value> {
-    let params = params.into();
+    ctx.active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((method.to_string(), Instant::now()));
+    let out = dispatch_inner(ctx, method, params.into());
+    ctx.active.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    out
+}
+
+fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Result<Value, Value> {
     match method {
         "help" => help(&params),
         "echo" => echo(&params),
@@ -601,9 +614,21 @@ fn method_help(m: &str) -> String {
 }
 
 fn getrpcinfo(ctx: &RpcContext) -> Value {
+    let active = ctx
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(method, start)| {
+            json!({
+                "method": method,
+                "duration": start.elapsed().as_micros() as u64,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
-        "active_commands": [],
-        "logpath": "",
+        "active_commands": active,
+        "logpath": ctx.logpath,
         "uptime": ctx.uptime_secs(),
         "methods": METHOD_LIST,
     })
@@ -3063,6 +3088,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         (ctx, dir)
     }
@@ -3077,6 +3104,8 @@ mod tests {
         let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
         assert!(info["methods"].as_array().unwrap().len() >= 10);
         assert!(info["uptime"].as_u64().unwrap() >= 42);
+        assert_eq!(info["active_commands"][0]["method"], json!("getrpcinfo"));
+        assert!(info["active_commands"][0]["duration"].as_u64().unwrap() < 1_000_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3439,6 +3468,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -3484,6 +3515,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
 
         let tip_h = chain.tip_height();
@@ -3953,6 +3986,8 @@ mod tests {
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
             peers: None,
             chain: Some(Arc::clone(&hub)),
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         (ctx, dir, hub)
     }
@@ -5298,6 +5333,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(

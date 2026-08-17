@@ -378,7 +378,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: getrpcinfo active_commands is [] not [getrpcinfo]; HTTP 1.x/2.0, notifications 204, logpath, -rpcworkqueue still missing"
+analog = "official: getrpcinfo.active_commands + logpath shipped; JSON-RPC 2.0 batch missing jsonrpc field / error text (interface_rpc.py:151)"
 
 [[test]]
 name = "interface_usdt_coinselection.py"

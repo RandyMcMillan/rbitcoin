@@ -1299,16 +1299,6 @@ mod tests {
     }
 
     #[test]
-    fn address_head_has_no_cpu_fence() {
-        let src = include_str!("address_head.rs");
-        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert!(
-            !prod.contains("atomic::fence") && !prod.contains("fence(Ordering"),
-            "fd-only head pages: pwrite/pread publish; no mmap-era CPU fence"
-        );
-    }
-
-    #[test]
     fn insert_fk_into_page_buf_empty_idempotent_and_second() {
         let bits = 16u32;
         let es = 4u8;

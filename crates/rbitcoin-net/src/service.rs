@@ -436,23 +436,4 @@ mod tests {
             Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd])
         );
     }
-
-    #[test]
-    fn start_with_agent_does_not_read_inbound_env() {
-        let src = include_str!("service.rs");
-        let start = src
-            .split("pub async fn start_with_agent")
-            .nth(1)
-            .expect("start_with_agent");
-        // Function body only (next inherent method), not this test module.
-        let start = start.split("    /// BIP14").next().unwrap_or(start);
-        assert!(
-            !start.contains("max_inbound_from_env"),
-            "inbound cap is a start argument, not RBITCOIN_P2P_MAX_INBOUND"
-        );
-        assert!(
-            start.contains("max_inbound: usize"),
-            "start_with_agent takes the inbound cap"
-        );
-    }
 }

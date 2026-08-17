@@ -183,6 +183,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         if let (Some(&(lo, _)), Some(&(hi, _))) = (per_height.first(), per_height.last()) {
             live.note_span(lo, hi, &hits);
         }
+        let t_keep = Instant::now();
         let queued: HashSet<u32> = query
             .block_queue_list_meta()
             .into_iter()
@@ -190,6 +191,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
             .collect();
         live.keep_heights(|h| queued.contains(&h));
         live.publish(published);
+        crate::confirm_phase_stats::LOOKUP_KEEP_NS
+            .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     for (h, _need) in &per_height {

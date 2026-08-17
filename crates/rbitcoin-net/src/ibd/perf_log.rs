@@ -19,9 +19,12 @@
 //! (pin+assemble) → **scripts** → **write** (sole Class A append + Class C / spends / tip).
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
-//! - **lookup** = structure + stamp create_fk (`plan_ms` / lookup_thr)
-//! - **load** = pre-assemble (`LOAD_NS`: pin denserels) + assemble (`CONNECT_NS`)
-//! - **script** = `SCRIPT_NS`
+//! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`)
+//! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
+//!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
+//!   clone, and post-scriptq prune (`load_thr pack/stamp/pin/asm/prune`).
+//! - **script=** = `SCRIPT_NS` (verify / skip-loop only). `thr script work`
+//!   is that same ns. Recv/send are wait. Feed-ahead join of N is not script.
 //! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tweaks + tip GC
 //!
 //! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
@@ -31,7 +34,8 @@
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
 //! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
 //! `ready=` + `scriptq_hwm=` (OS-thread occupancy + queue high-water). High
-//! load_recv_wait + ready=0 ⇒ lookup is the production pole.
+//! `load_thr stamp=` + `ready>0` + `scriptq=1` ⇒ leftover TipOnly on load,
+//! not “scripts hungry.” High load_recv_wait + ready=0 ⇒ lookup is the pole.
 //!
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
@@ -235,7 +239,6 @@ pub(crate) struct IbdPerfSample {
     pub conf_script_q_hwm: usize,
     pub conf_write_q_hwm: usize,
     pub thr_lookup_claim_ms: u64,
-    pub thr_lookup_clone_ms: u64,
     pub thr_lookup_stamp_ms: u64,
     pub thr_lookup_other_ms: u64,
     pub thr_lookup_send_wait_ms: u64,
@@ -254,8 +257,16 @@ pub(crate) struct IbdPerfSample {
     pub stamp_batch_stamp_ms: u64,
     pub stamp_batch_finish_ms: u64,
     pub thr_load_recv_wait_ms: u64,
-    pub thr_load_work_ms: u64,
+    pub thr_load_pack_ms: u64,
+    pub thr_load_clone_ms: u64,
+    pub thr_load_stamp_ms: u64,
+    pub thr_load_pin_ms: u64,
+    pub thr_load_asm_ms: u64,
+    pub thr_load_prune_ms: u64,
     pub thr_load_send_wait_ms: u64,
+    pub thr_lookup_keep_ms: u64,
+    pub script_jobs: u64,
+    pub script_skip: u64,
     pub thr_script_recv_wait_ms: u64,
     pub thr_script_work_ms: u64,
     pub thr_script_send_wait_ms: u64,
@@ -489,7 +500,6 @@ impl Default for IbdPerfSample {
             conf_script_q_hwm: 0,
             conf_write_q_hwm: 0,
             thr_lookup_claim_ms: 0,
-            thr_lookup_clone_ms: 0,
             thr_lookup_stamp_ms: 0,
             thr_lookup_other_ms: 0,
             thr_lookup_send_wait_ms: 0,
@@ -504,8 +514,16 @@ impl Default for IbdPerfSample {
             stamp_batch_stamp_ms: 0,
             stamp_batch_finish_ms: 0,
             thr_load_recv_wait_ms: 0,
-            thr_load_work_ms: 0,
+            thr_load_pack_ms: 0,
+            thr_load_clone_ms: 0,
+            thr_load_stamp_ms: 0,
+            thr_load_pin_ms: 0,
+            thr_load_asm_ms: 0,
+            thr_load_prune_ms: 0,
             thr_load_send_wait_ms: 0,
+            thr_lookup_keep_ms: 0,
+            script_jobs: 0,
+            script_skip: 0,
             thr_script_recv_wait_ms: 0,
             thr_script_work_ms: 0,
             thr_script_send_wait_ms: 0,
@@ -730,6 +748,8 @@ pub(crate) fn sample(
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
+    let (script_jobs, script_skip, lookup_keep_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_script_mix_and_reset();
     let (ann_ns, ann_n, ann_pread_skip, ann_pread) =
         rbitcoin_consensus::confirm_phase_stats::sample_spend_ann_and_reset();
     let (meta_ns, meta_n) = rbitcoin_consensus::confirm_phase_stats::sample_spend_meta_and_reset();
@@ -906,7 +926,6 @@ pub(crate) fn sample(
         conf_script_q_hwm: conf_q_hwm.0,
         conf_write_q_hwm: conf_q_hwm.1,
         thr_lookup_claim_ms: ns_ms(thr.lookup_claim_ns),
-        thr_lookup_clone_ms: ns_ms(thr.lookup_clone_ns),
         thr_lookup_stamp_ms: ns_ms(thr.lookup_stamp_ns),
         thr_lookup_other_ms: ns_ms(thr.lookup_other_ns),
         thr_lookup_send_wait_ms: ns_ms(thr.lookup_send_wait_ns),
@@ -921,8 +940,16 @@ pub(crate) fn sample(
         stamp_batch_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         stamp_batch_finish_ms: ns_ms(arch_res.prep_finish_ns),
         thr_load_recv_wait_ms: ns_ms(thr.load_recv_wait_ns),
-        thr_load_work_ms: ns_ms(thr.load_work_ns),
+        thr_load_pack_ms: ns_ms(thr.load_pack_ns),
+        thr_load_clone_ms: ns_ms(thr.load_clone_ns),
+        thr_load_stamp_ms: ns_ms(thr.load_stamp_ns),
+        thr_load_pin_ms: ns_ms(thr.load_pin_ns),
+        thr_load_asm_ms: ns_ms(thr.load_asm_ns),
+        thr_load_prune_ms: ns_ms(thr.load_prune_ns),
         thr_load_send_wait_ms: ns_ms(thr.load_send_wait_ns),
+        thr_lookup_keep_ms: ns_ms(lookup_keep_ns),
+        script_jobs,
+        script_skip,
         thr_script_recv_wait_ms: ns_ms(thr.script_recv_wait_ns),
         thr_script_work_ms: ns_ms(thr.script_work_ns),
         thr_script_send_wait_ms: ns_ms(thr.script_send_wait_ns),
@@ -1029,10 +1056,7 @@ fn append_nz(out: &mut String, key: &str, v: u64) {
     }
 }
 
-/// Full load-stage wall (pre-assemble + assemble).
-///
-/// `load_ms` = structure+plan+pin; `connect_ms` = assemble. Together they are
-/// the load OS-thread work for the window.
+/// Pin + assemble stage wall (`load=` on INFO). Not the load OS-thread total.
 fn load_stage_wall_ms(s: &IbdPerfSample) -> u64 {
     s.load_ms.saturating_add(s.connect_ms)
 }
@@ -1080,12 +1104,19 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     );
     let load_wall_ms = load_stage_wall_ms(s);
     let thr_lookup_busy = s
-        .thr_lookup_clone_ms
-        .saturating_add(s.thr_lookup_stamp_ms)
-        .saturating_add(s.thr_lookup_other_ms);
+        .thr_lookup_stamp_ms
+        .saturating_add(s.thr_lookup_other_ms)
+        .saturating_add(s.thr_lookup_keep_ms);
     let thr_lookup_wait = s
         .thr_lookup_claim_ms
         .saturating_add(s.thr_lookup_send_wait_ms);
+    let thr_load_busy = s
+        .thr_load_pack_ms
+        .saturating_add(s.thr_load_clone_ms)
+        .saturating_add(s.thr_load_stamp_ms)
+        .saturating_add(s.thr_load_pin_ms)
+        .saturating_add(s.thr_load_asm_ms)
+        .saturating_add(s.thr_load_prune_ms);
     let thr_load_wait = s
         .thr_load_recv_wait_ms
         .saturating_add(s.thr_load_send_wait_ms);
@@ -1093,23 +1124,33 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .thr_script_recv_wait_ms
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
-        " | conf blks={} lookup={}ms load={}ms script={}ms write={}ms \
-         lookup_thr busy={}ms(claim={}ms clone={}ms wave={}ms other={}ms send_w={}ms) \
-         thr load=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
+        " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
+         lookup_thr busy={}ms(claim={}ms wave={}ms keep={}ms other={}ms send_w={}ms) \
+         load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
+         thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
         s.plan_ms,
         load_wall_ms,
         s.script_ms,
+        s.script_jobs,
+        s.script_skip,
         write_ms,
         thr_lookup_busy,
         s.thr_lookup_claim_ms,
-        s.thr_lookup_clone_ms,
         s.thr_lookup_stamp_ms,
+        s.thr_lookup_keep_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
-        s.thr_load_work_ms,
+        thr_load_busy,
         thr_load_wait,
+        s.thr_load_pack_ms,
+        s.thr_load_clone_ms,
+        s.thr_load_stamp_ms,
+        s.thr_load_pin_ms,
+        s.thr_load_asm_ms,
+        s.thr_load_prune_ms,
+        s.thr_load_send_wait_ms,
         s.thr_script_work_ms,
         thr_script_wait,
         s.thr_write_work_ms,
@@ -1826,6 +1867,32 @@ mod tests {
         assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
+        assert!(line.contains("script=20ms(jobs=0 skip=0)"), "{line}");
+        assert!(line.contains("load_thr busy/wait="), "{line}");
+        assert!(line.contains("pack=0ms"), "{line}");
+        assert!(line.contains("prune=0ms"), "{line}");
+        assert!(line.contains("keep=0ms"), "{line}");
+        s.thr_load_pack_ms = 100;
+        s.thr_load_stamp_ms = 1700;
+        s.thr_load_pin_ms = 700;
+        s.thr_load_prune_ms = 50;
+        s.thr_load_recv_wait_ms = 200;
+        s.script_jobs = 12;
+        s.script_skip = 3;
+        let split = format_info(&s);
+        assert!(split.contains("load_thr busy/wait=2550/200ms"), "{split}");
+        assert!(split.contains("pack=100ms"), "{split}");
+        assert!(split.contains("stamp=1700ms"), "{split}");
+        assert!(split.contains("pin=700ms"), "{split}");
+        assert!(split.contains("prune=50ms"), "{split}");
+        assert!(split.contains("script=20ms(jobs=12 skip=3)"), "{split}");
+        s.thr_load_clone_ms = 75;
+        let with_clone = format_info(&s);
+        assert!(with_clone.contains("clone=75ms"), "{with_clone}");
+        assert!(
+            with_clone.contains("load_thr busy/wait=2625/200ms"),
+            "clone is load-thread work: {with_clone}"
+        );
         // load wall = load_ms(30)+assemble(8) = 38
         assert!(line.contains("load=38ms"), "{line}");
         assert!(

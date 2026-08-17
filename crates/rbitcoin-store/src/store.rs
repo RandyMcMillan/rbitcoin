@@ -343,11 +343,21 @@ impl Store {
         Ok(())
     }
 
-    /// After `confirmed[]` advanced: append this height’s Class A run.
+    /// Append this height’s Class A run to the live fence.
+    ///
+    /// Confirm calls this **before** `confirmed.set_many` so a missing range
+    /// cannot leave tip ahead of `height_of`. Missing or empty `header_txs` is
+    /// **Corrupt** — a silent `Ok` leaves `height_of` None for that block’s
+    /// creates and TipOnly leftover misses (restart rebuild from disk then heals).
     pub fn height_fence_extend(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
         let Some((first, n)) = self.header_txs.get_range(header_fk)? else {
-            return Ok(());
+            return Err(StoreError::Corrupt(
+                "height fence: header_txs range missing",
+            ));
         };
+        if n == 0 || first.is_null() {
+            return Err(StoreError::Corrupt("height fence: header_txs range empty"));
+        }
         self.fence_write().extend(height.0, first, n);
         Ok(())
     }
@@ -716,8 +726,8 @@ impl Store {
         mode: TxidResolveMode,
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
-        // `height_fence_extend` for that whole machine (write `set_many` still
-        // publishes tip). Clone is O(blocks).
+        // `height_fence_extend`. Confirm extends before `set_many`, so tip
+        // cannot publish while this clone is in flight. Clone is O(blocks).
         let fence = self.fence().clone();
         crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
             &self.txs,
@@ -2198,6 +2208,34 @@ mod tests {
         s.height_fence_extend(Height(1), Fk(2)).unwrap();
         assert_eq!(s.fence_tip_height(), Some(1));
         assert_eq!(s.tx_height_get(Fk(2)).unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirmed tip + missing `header_txs` range: extend must not return `Ok`
+    /// and leave `height_of` None (live TipOnly hole; restart rebuild heals).
+    #[test]
+    fn height_fence_extend_missing_header_txs_is_not_ok_hole() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+        s.rebuild_height_fence().unwrap();
+
+        s.confirmed.set(Height(1), Fk(2)).unwrap();
+        let err = s
+            .height_fence_extend(Height(1), Fk(2))
+            .expect_err("missing header_txs must not silently skip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("header_txs"),
+            "shipped error must name the missing range: {msg}"
+        );
+        assert_eq!(
+            s.tx_height_get(Fk(2)).unwrap(),
+            None,
+            "must not invent a connected height"
+        );
+        assert_eq!(s.fence_tip_height(), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

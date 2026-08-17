@@ -441,9 +441,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// Write `set_many` publishes `tip_height` before `height_fence_extend`.
-    /// Prune on confirmed tip drops the parent layer; leftover TipOnly then
-    /// wipes the open-head hit (mainnet 945952 leftover_n=3546 hit=2811).
+    /// Simulated torn publish (`confirmed.set` ahead of the fence). Confirm now
+    /// extends before `set_many`; this still pins that prune-on-confirmed-tip
+    /// would drop the parent (mainnet 945952 leftover_n=3546 hit=2811).
     #[test]
     fn stamp_uses_inflight_when_confirmed_tip_leads_fence() {
         use rbitcoin_query::{InFlightLayer, InFlightLog};

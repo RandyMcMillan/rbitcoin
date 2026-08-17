@@ -38,6 +38,13 @@ before 1.0).
 
 ### Changed
 
+- **Quality reaudit (2026-08-17).** [`docs/quality.md`](docs/quality.md)
+  Open list re-ranked. Q-37 (suite ≤3 min) closed on CI `test` ~85 s.
+  Won't-fix: CODEOWNERS, crates.io publish, rustdoc site, structured
+  logs, tier-C in default CI. New: honest chaininfo disk/progress
+  (**Q-47**), BIP331 rust-bitcoin types (**Q-48**), v2 peer discovery
+  (**Q-49**).
+
 - **Tests assert behavior, not the repo.** Default-suite tests no longer
   `include_str!` production sources or `CONTRIBUTING.md` to grep
   identifiers. Query open leftover-strong repair is pinned by

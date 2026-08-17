@@ -3,18 +3,19 @@
 What is strong, what still blocks “industry-leading,” and what is already
 closed. Replaces the 2026-08-06 point-in-time audit.
 
-**Last reaudit:** 2026-08-16 (schema 17 + Core functional harness + live
-P2P RPC; COMPAT/README honesty). Cruft program **Q-15 / Q-42–Q-46** closed
-the same day (`rbitcoin-cli`, inbound config, RPC honesty, lean deletes).
+**Last reaudit:** 2026-08-17 (docs map #81, Core functional **28** `run`,
+no-repo-sniff #85, CI `test` ~85 s). Previous: 2026-08-16 schema 17 +
+harness + Q-15 / Q-42–Q-46.
 
-**Two lists only**
+**Three lists only**
 
 | Section | Purpose |
 |---------|---------|
 | **Open** | Single prioritized backlog — **rank 1 = next** |
-| **Completed** | Single list of finished quality work — do not reopen without new evidence |
+| **Won't fix** | Explicitly retired. Do not reopen without a new product decision |
+| **Completed** | Finished quality work — do not reopen without new evidence |
 
-North star, baseline, and working rules are context, not a third backlog.
+North star, baseline, and working rules are context, not a fourth backlog.
 Update a row when work lands. Prefer that over a new dated audit PDF.
 
 This is not a security audit. Numbers are order-of-magnitude.
@@ -34,11 +35,11 @@ level peers cannot ignore.
 | # | Pillar | Industry-leading looks like |
 |---|--------|-----------------------------|
 | 1 | **Correctness under adversarial load** | Consensus-aligned with Core where we claim parity; differential fuzz continuous; findings tracked to **fixed** + regression; no silent confirm/store fallbacks |
-| 2 | **Operator trust** | Docs match shipped IO/store; milestone skip impossible to miss; CLI/conf primary; SECURITY contact; honest 0.x |
+| 2 | **Operator trust** | Docs match shipped IO/store; milestone skip impossible to miss; CLI/conf primary; SECURITY contact; honest 0.x; dummy RPC numbers gone or labeled |
 | 3 | **Build & release integrity** | Same toolchain in CI and Nix; byte-repro musl; SBOM/audit gates; no floating `stable` |
 | 4 | **Contributor velocity** | God-files gone or split by stage; warm suite a few minutes; TDD practiced; first-hour tutorial |
-| 5 | **Product surface honesty** | Stub crates demoted or real; COMPAT accurate; Electrum/Esplora complete for *target* wallets, not explorer bloat |
-| 6 | **Observability & ops** | Optional structured logs; residual env in `docs/env-knobs.md`; hermetic tip fixtures; soak playbooks |
+| 5 | **Product surface honesty** | COMPAT accurate; Electrum/Esplora complete for *target* wallets, not explorer bloat |
+| 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; soak playbooks |
 | 7 | **Platform truth** | Linux-first everywhere; macOS/Windows non-goals until an IO story exists |
 
 ### Competitive bar
@@ -52,13 +53,15 @@ level peers cannot ignore.
 
 ### Non-goals that still look like “quality”
 
-Not Open, not Completed — do not add them to either list.
+Not Open, not Completed — see **Won't fix** for retired Q-ids.
 
 - Multi-OS operator binaries before Linux IBD/tip is boringly solid
 - 100% line-coverage theater (gate is **≥90%** LCOV + property-focused tests)
 - Rewriting secp256k1 / rust-bitcoin / tokio “to reduce deps”
 - Flattening purpose-built io_uring machines to batched `pread` (see AGENTS.md)
 - Core-compatible full RPC surface; graphical block-explorer APIs
+- Growing leftover RAM maps to `Vec<Fk>` unless a mainnet miss is shown
+  ([`errata.md`](./errata.md))
 
 ---
 
@@ -67,49 +70,72 @@ Not Open, not Completed — do not add them to either list.
 **One list.** Rank is overall operator + contributor leverage, not a category.
 Tags are scan hints only.
 
-The 2026-08-12 **R-01–R-10** program lives here: **R-01–R-06 and Q-16/Q-20
-are in Completed**; leftover R-ids keep their relative order (R-07/Q-30;
-**R-10 last**). Older Q-ids that were never R-ids sit among them by the
-same leverage rule. Do not recreate a second R-table or P0/P1/P2 split.
-
-| Rank | ID | Item | Tag | Done looks like |
-|-----:|----|------|-----|-----------------|
-| 1 | **Q-30** | Continuous differential fuzz | reliability | Nightly/weekly script + BIP324 + header/block wire (fuzzamoto-class or in-tree); crashes → `docs/external_findings/` + regression |
-| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool scripts we claim; remaining skips keep honest `analog=`; unlabeled PRs stay cargo-only; nightly green |
-| 3 | **Q-37** | Warm default suite **≤3 min** (stretch **&lt;2 min**) on a CI-class host | test-speed | Re-measure `cargo test --workspace` after R-03; record wall in TESTING.md. If still over budget, cut more; if inside, close. No new default remine-100 / &gt;2 s tests without justification |
-| 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline regression (no live API) |
-| 5 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship; DEBUG/`tip: perf` keeps meters. Getheaders storm (#43) is closed; SH megakey heartbeat is sampled 10 s |
-| 6 | **Q-32** | Structured logging option | ops | JSON or key=value **without** breaking operator greps |
-| 7 | **Q-35** | Mainnet soak narrative | ops | Operator soak checklist + success criteria; optional public tip-height badge. Runbook exists (`experimental-mainnet.md`) |
-| 8 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET |
-| 9 | **Q-33** | Published rustdoc | docs | `cargo doc` site for first-party crates |
-| 10 | **Q-24** | CODEOWNERS / issue templates | process | When public collaboration actually needs them |
-| 11 | **Q-25** | Publish-ready package metadata | process | homepage / crates.io only if we intend to publish |
-| 12 | **Q-38** | Tier-C multinode in default CI | ci | Keep `#[ignore]` + `scripts/integration.sh` unless wall/flake budget is proven |
-| 13 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-16 giants: `scripthash.rs` **4.1k**, `query/lib` **3.3k**, `electrum/server` **3.3k**, `rpc/methods` **2.9k**, `store.rs` **2.8k**, `interpreter` **2.7k**. No drive-by splits |
-
 **P0 trust/correctness (Q-01–Q-05) stays empty.** Do not reopen without new
 evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 
+| Rank | ID | Item | Tag | Done looks like |
+|-----:|----|------|-----|-----------------|
+| 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: no fuzz crate, no corpus, no job.** |
+| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 28 / 267.** Next: `rpc-missing` we already implement (`mempool_accept*`, `mempool_persist`, `interface_rpc`, …) and leftover `core-log`. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
+| 3 | **Q-47** | Honest `getblockchaininfo` disk / progress | honesty | `size_on_disk` and `verificationprogress` are real estimates or stay **explicitly dummy** in RPC output (not just docs). Prefer a cheap archive-bytes sum + header-height fraction over `0` / `0.5` |
+| 4 | **Q-35** | Mainnet soak checklist | ops | Operator checklist + success criteria on top of [`experimental-mainnet.md`](./experimental-mainnet.md): signet resume → mainnet catch-up → tip-follow hours → Electrum query. Optional public tip-height badge |
+| 5 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
+| 6 | **Q-48** | BIP331 rust-bitcoin package types | interop | Real BIP331 `NetworkMessage` (or an explicit refuse) instead of experimental `rbtpkg`. Track rust-bitcoin; **RB-007** |
+| 7 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
+| 8 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 9 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
+| 10 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
+
+### Still valid? (this reaudit)
+
+| ID | Verdict |
+|----|---------|
+| **Q-30** | Keep. Highest correctness hole. Zero in-tree fuzz. |
+| **Q-41** | Keep. 9 → **28** `run` (Wave A + field RPCs). 239 skips remain; 55 `rpc-missing` + 37 `core-log` are the only growth that matches claimed surface. |
+| **Q-37** | **Close.** CI `test` ~85 s (2026-08-17). Recorded in [`TESTING.md`](../TESTING.md). |
+| **Q-31** | Keep, lowered. Useful for Q-30; not blocking operators. |
+| **Q-36** | Keep. IBD/tip INFO is still a firehose (`UpdateTip` + `tip: accept` per block). |
+| **Q-32** | **Won't fix.** Operators grep text. A second JSON dialect is not a goal. |
+| **Q-35** | Keep. Runbook exists; success criteria do not. |
+| **Q-34** | Keep. Onboarding still medium. |
+| **Q-33** | **Won't fix.** Local `cargo doc` is enough until crates.io. |
+| **Q-24** | **Won't fix.** Single maintainer + bot. GitHub defaults. |
+| **Q-25** | **Won't fix.** Ship musl via Nix, not crates.io. |
+| **Q-38** | **Won't fix.** Heavies stay `#[ignore]` + `scripts/integration.sh`. |
+| **R-10** | Keep last. `rpc/methods` grew with the Core-functional wave — peel when Q-41 needs a seam. |
+
 ### ID aliases (R-program ↔ catalog)
 
-R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed id is in
-**bold**. Do not start **R-11+** — new work is the next unused **Q-id (Q-42+)**.
+R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed/Won't-fix
+id is in **bold**. Do not start **R-11+** — new work is the next unused
+**Q-id (Q-47+)**.
 
 | R-id | Canonical | Where |
 |------|-----------|-------|
-| R-01 | **R-01** | Completed |
-| R-02 | **R-02** | Completed |
-| R-03 | **R-03** | Completed (Q-37 is the leftover wall measure) |
-| R-04 | **R-04** | Completed |
-| R-05 | **Q-22** | Completed |
-| R-06 | **R-06** | Completed |
+| R-01–R-06 | **R-01–R-06** | Completed |
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 13 |
+| R-10 | **R-10** | Open rank 10 |
 
-New work after the 2026-08-16 cruft program starts at **Q-47**.
+New work after this reaudit starts at **Q-50**.
+
+---
+
+## Won't fix
+
+Retired on purpose. Not a backlog. Not a failure.
+
+| ID | Item | Why |
+|----|------|-----|
+| **Q-24** | CODEOWNERS / issue templates | No public collaboration process to own. Revisit only if external reviewers are invited |
+| **Q-25** | crates.io package metadata | Distribution is `nix build .#rbitcoin-musl`. `repository` is already set |
+| **Q-32** | Structured logging option | INFO/DEBUG text is the operator contract. JSON/kv is a second dialect |
+| **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
+| **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
+| **—** | Darwin / Windows operator binaries | Linux-shaped IO. Draft `feature/metal-support` stays out of this list |
+| **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
+| **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
 
 ---
 
@@ -121,16 +147,13 @@ findings 001–021, CI split, map-free README, …) live in
 
 | ID | Item | Resolution |
 |----|------|------------|
-| **Q-15** | `rbitcoin-cli` talks to node RPC | Cookie / `--rpcuser` HTTP client for the documented subset. Dummy chaininfo fields stay labeled |
-| **Q-42** | `--maxinbound` is config, not `set_var` | `P2PNode::start_with_agent` takes the cap |
-| **Q-43** | RPC numbers match this process | `maxmempool` is hub weight; `version` is rbitcoin semver; `localservices` from flags |
-| **Q-44** | Unused Core-style standardness | Deleted; admit is Libre only |
-| **Q-45** | Path-named IO backend aliases | `read_io_backend` / `write_io_backend` only |
-| **Q-46** | `crate_name` / smoke theater | Deleted with `DEFAULT_IBD_OUTBOUND` |
-| **—** | Core functional harness | Inventory + shim + nightly + **9** unmodified v31.1 scripts. Remaining `run` growth is **Q-41** |
-| **—** | Schema 17 durable store | Thin LAYOUT17 + 8 B spent; leftover 16 catalogs refused; wipe+re-IBD is the operator message |
-| **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | Closed 2026-08-12 program. Leftover wall measure is **Q-37** |
-| **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny` job; `musl.yml` after green master `ci` |
+| **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
+| **—** | Docs map + one owner per fact | `docs/README.md`; folded store-format / startup-states / future-features / COVERAGE (`#81`) |
+| **—** | Tests assert behavior, not repo text | No `include_str!` of production `.rs` / CONTRIBUTING (`#85`) |
+| **—** | Core functional `run` set | **28** unmodified v31.1 scripts (was 9). Remaining growth is **Q-41** |
+| **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
+| **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
+| **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; `musl.yml` after green master `ci` |
 
 ---
 
@@ -139,8 +162,8 @@ findings 001–021, CI split, map-free README, …) live in
 | Do | Do not |
 |----|--------|
 | Close work by **moving the Open row into Completed** in the same edit as the landing change | Leave `Status: fixed` in Open, or start a second table |
-| New item: next unused **Q-id (Q-42+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
-| Keep unshipped research as a dated note under `docs/` and fold it into the owner when it lands | Add research notes to Open or Completed |
+| New item: next unused **Q-id (Q-50+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
+| Retire a row to **Won't fix** when the product will not do it | Leave dead Open rows “for completeness” |
 | God-file peels only when a higher Open row needs a seam (**R-10**) | Split `query/lib` / `interpreter.rs` as a standalone “modularity” project |
 | Suite: no new remine-100 / default test **&gt;2 s** without justification ([TESTING.md](../TESTING.md)) | Time the full workspace as a planning spike |
 | Differentials / crashes → `docs/external_findings/` + named regression | Soft dual paths on confirm identity / denserels / Class A load |
@@ -149,17 +172,17 @@ findings 001–021, CI split, map-free README, …) live in
 
 ## Baseline snapshot
 
-**Measured 2026-08-16** (`crates/**/*.rs`, no build artifacts):
+**Measured 2026-08-17** (`crates/**/*.rs`, no build artifacts):
 
 | Metric | Value |
 |--------|-------|
-| First-party Rust LOC | **~139k** (was ~126k on 2026-08-12) |
+| First-party Rust LOC | **~146k** (was ~139k on 2026-08-16) |
 | Workspace crates | **13** (`rbitcoin-cli` … `rbitcoin-test`; no wallet crate) |
-| Largest production files (lines) | `scripthash` **4056**, `query/lib` **3335**, `electrum/server` **3278**, `rpc/methods` **2869**, `store` **2808**, `sorted_run` **2726**, `interpreter` **2671**, `sh_builder` **2468**, `ibd/perf_log` **2455**, `peer` **2366** |
-| Largest test files (lines) | `tx_table/tests` **2853**, `scenarios` **2303**, `confirm_reject_tests` **2335**, `write_idempotent_tests` **2141** |
-| `#[test]` / `#[tokio::test]` | **~1.36k** |
+| Largest production files (lines) | `rpc/methods` **4822**, `scripthash` **4046**, `query/lib` **3461**, `electrum/server` **3267**, `peer` **2945**, `store` **2866**, `chain` **2757**, `sorted_run` **2710**, `interpreter` **2601**, `sh_builder` **2421** |
+| Largest test files (lines) | `tx_table/tests` **2903**, `confirm_reject_tests` **2335**, `scenarios` **2266**, `write_idempotent_tests` **2182** |
+| `#[test]` / `#[tokio::test]` | **~1.43k** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
-| Required CI | `fmt`, `deny`, `clippy`, `test`, `multinode`, `coverage` (+ CodeQL workflow) |
+| Required CI | `fmt`, `deny`, `clippy`, `test` **~85 s**, `multinode`, `coverage` (~2.5 min) (+ CodeQL) |
 | Extra CI | `musl` after green master `ci`; `core-functional.yml` nightly / labeled PR (not required) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
@@ -167,26 +190,27 @@ findings 001–021, CI split, map-free README, …) live in
 | Release | `nix build .#rbitcoin-musl` → static install |
 | Core corpora | **No allowlist** |
 | Findings 001–021 | All **fixed** (no new numbered reports since 021) |
-| Core functional | **9** unmodified v31.1 scripts `run`; rest skip + analog |
+| Core functional | **28** unmodified v31.1 scripts `run`; 239 skip (68 `no-wallet`, 55 `rpc-missing`, 37 `core-log`, …) |
 | Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
-| On-disk | **Schema 17 durable**; leftover single-file `sp_tweaks` unlinked |
+| On-disk | **Schema 17 durable** |
+| Fuzz | **None** |
 
-### Grade board (subjective; 2026-08-16)
+### Grade board (subjective; 2026-08-17)
 
 | Dimension | Grade | Note |
 |-----------|-------|------|
-| Architecture clarity | Strong | Roles + HWM + single Class A appender; schema 17 freeze documented |
+| Architecture clarity | Strong | Roles + HWM + single Class A appender; schema 17 freeze in SCHEMA.md |
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree |
-| Operator honesty | Strong | CLI primary; schema 17 wipe message; dummy chaininfo fields now labeled; README size matches SCHEMA census |
-| Code modularity | Medium | Confirm peeled; `scripthash` / `electrum/server` / `rpc/methods` grew. Residual giants only via **R-10** |
-| Cross-platform | Weak (honest) | Linux-shaped IO |
-| Docs consistency | Strong | This reaudit fixed COMPAT vs `rpc.md` (MiniWallet `scantxoutset` / `gettxout`) |
-| Contributor onboarding | Medium–Strong | how-we-plan + TDD + Core functional inventory; tutorial still **Q-34** |
-| CI fidelity | Strong | Split gates, CodeQL, pinned Actions; Core functional nightly is extra |
-| Dead / stub surface | Strong | Node RPC is a real subset; `rbitcoin-cli` talks cookie/user-pass; dummy chaininfo fields stay labeled |
-| Test reliability/speed | Medium–Strong | **R-03** removed worst remine pads; Core functional harness landed; **Q-37** wall still not re-measured |
-| Tip-follow mempool APIs | Strong | **R-01–R-04**; refresh still one linearize under a short read |
-| Adversarial / findings | Strong | No allowlist; **001–021** closed; next is **Q-30**; Core functional is the active consensus-surface program (**Q-41**) |
+| Operator honesty | Strong | CLI primary; dummy chaininfo still labeled (Q-47); README size matches SCHEMA census |
+| Code modularity | Medium | `rpc/methods` **4.8k** after Core-functional growth. Residual giants only via **R-10** |
+| Cross-platform | Weak (honest) | Linux-shaped IO. Darwin draft is won't-fix |
+| Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
+| Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
+| CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |
+| Dead / stub surface | Strong | Node RPC is a real subset; placeholders called out |
+| Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
+| Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41) |
+| Adversarial / findings | Medium–Strong | **001–021** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |
 
 ---
 
@@ -202,6 +226,7 @@ findings 001–021, CI split, map-free README, …) live in
 - External findings hygiene + Core corpora without allowlist.
 - Confirm dual-path kill + tier-A multinode in default/CI.
 - Soft-migrate durable side formats; no silent wipes.
+- Tests assert shipped behavior, not repo text.
 - Schema 17 leftover regenerate for optional `sp_tweaks` files (not a Class A wipe).
 
 ---
@@ -211,9 +236,9 @@ findings 001–021, CI split, map-free README, …) live in
 | Audience | Read |
 |----------|------|
 | Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active program is **Q-41** (Core functional `run` set) |
-| Release engineering | **Q-20**, **Q-21**, **Q-23** |
+| Release engineering | **Q-20**, **Q-21**, **Q-23** (completed) |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** |
-| Docs / README | **Q-39**, **Q-14** (done), then **Q-34** |
+| Docs / README | Map is done; then **Q-34** |
 | “Are we leading yet?” | North star + grade board |
 
 ---

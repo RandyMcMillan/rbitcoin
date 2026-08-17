@@ -37,7 +37,7 @@ Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
 | [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract. |
-| [`quality.md`](./quality.md) | Living quality roadmap (Open list + short Completed). |
+| [`quality.md`](./quality.md) | Living quality roadmap (Open + Won't fix + short Completed). |
 | [`reproducible-builds.md`](./reproducible-builds.md) | Pinned Nix / musl byte-identity. |
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |

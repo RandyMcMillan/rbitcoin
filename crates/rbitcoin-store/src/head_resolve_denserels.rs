@@ -5,10 +5,11 @@
 //! 2. **Sealed-hot** — sealed ages 1..=3
 //! 3. **Cold** — sealed ages ≥4 (only keys still unfinished)
 //!
-//! Each wave: probe that slice → **one** page-grouped `txid.body` fetch of every
-//! cand → newest-first walk (`body==want`, fence-connected if a fence is on) →
-//! one `tx.idx` fill for chosen fks. Unconnected identity does **not** skip
-//! later waves. TipOnly strips unconnected winners at the end.
+//! Each wave: probe that slice → at most two page-grouped `txid.body` shots
+//! (first four cands, then the rest if still unfinished) → newest-first walk
+//! (`body==want`, fence-connected if a fence is on) → one `tx.idx` fill for
+//! chosen fks. Unconnected identity does **not** skip later waves or shot B.
+//! TipOnly strips unconnected winners at the end.
 //!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
 //! idx, returns `(fk, body_range)` so prep denserels-loads by offset.
@@ -591,12 +592,12 @@ fn body_ranges_batched(
     Ok(out)
 }
 
-/// Sidefile ID (page-grouped bulk) then depth-first BIP30 match + batched idx.
+/// Sidefile ID (at most two page-grouped shots) then BIP30 match + batched idx.
 ///
-/// Collects every still-active key's cand create_fks, fills identities with
-/// **one bulk pread per OS page** of `txid.body`, then walks each key's cand
-/// list in original order in RAM. Chosen fks share **one** idx-page fill
-/// (held session or libc). No nested TLS bulk from `record_range`.
+/// Shot A is the first four cands of unfinished keys; shot B is the rest only
+/// when the key is still unfinished. A fence-connected win skips shot B; an
+/// unconnected body match does not. Chosen fks share **one** idx-page fill
+/// (held session or libc).
 ///
 /// When `session` is `Some`, ID + IDX page preads ride that **already-held**
 /// plan ring. When `None`, libc pread for ID and unique idx pages.
@@ -638,69 +639,95 @@ fn id_idx_wave(
     session: &mut Option<&mut UringSession>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
-    use crate::head_resolve_pick::{miss_peeks_in_prefix, pick_winner};
+    use crate::head_resolve_pick::{
+        miss_peeks_in_prefix, next_id_shot, pick_winner, ID_FILL_CHUNK,
+    };
     use std::collections::HashMap;
 
     let n = cands_by_key.len();
-    let mut need: Vec<Fk> = Vec::new();
-    {
-        let mut seen = std::collections::HashSet::new();
-        for ki in 0..n {
-            if key_finished(ki, winner, connected, heights) {
-                continue;
-            }
-            for &fk in &cands_by_key[ki] {
+    let mut filled = vec![0usize; n];
+    let mut skip = vec![false; n];
+    let mut started = vec![false; n];
+    for ki in 0..n {
+        let done = key_finished(ki, winner, connected, heights);
+        skip[ki] = done;
+        started[ki] = !done;
+    }
+    let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut chosen_kis: Vec<usize> = Vec::new();
+    let mut chosen_fks: Vec<Fk> = Vec::new();
+
+    for take in [ID_FILL_CHUNK, usize::MAX] {
+        let shot = next_id_shot(cands_by_key, &filled, &skip, take);
+        let mut need: Vec<Fk> = Vec::new();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for fk in shot {
                 let Some(id) = fk.get() else {
                     continue;
                 };
+                if id_map.contains_key(&id) {
+                    continue;
+                }
                 if seen.insert(id) {
                     need.push(fk);
                 }
             }
         }
-    }
-
-    let t_id = Instant::now();
-    let (id_map, _pages) = if need.is_empty() {
-        (HashMap::new(), 0)
-    } else {
-        match session.as_mut() {
-            Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
-            None => side.get_many_page_grouped(&need)?,
+        if !need.is_empty() {
+            let t_id = Instant::now();
+            let (more, _pages) = match session.as_mut() {
+                Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
+                None => side.get_many_page_grouped(&need)?,
+            };
+            *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+            *body_lookups = body_lookups.saturating_add(more.len() as u64);
+            id_map.extend(more);
         }
-    };
-    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-    *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
-
-    let mut chosen_kis: Vec<usize> = Vec::new();
-    let mut chosen_fks: Vec<Fk> = Vec::new();
-    for ki in 0..n {
-        if key_finished(ki, winner, connected, heights) {
-            continue;
-        }
-        let cands = &cands_by_key[ki];
-        let filled = cands.len();
-        *miss_peeks =
-            miss_peeks.saturating_add(miss_peeks_in_prefix(cands, filled, &txids[ki], &id_map));
-        if pick_winner(cands, filled, &txids[ki], &id_map, None).is_some() {
-            had_id[ki] = true;
-        }
-        if let Some((fk, rank)) = pick_winner(cands, filled, &txids[ki], &id_map, heights) {
-            crate::head_resolve_stats::add_hit_rank(rank);
-            chosen_kis.push(ki);
-            chosen_fks.push(fk);
-            continue;
-        }
-        if heights.is_some() {
-            if winner[ki].is_some() {
+        for ki in 0..n {
+            if skip[ki] {
                 continue;
             }
-            if let Some((fk, rank)) = pick_winner(cands, filled, &txids[ki], &id_map, None) {
+            filled[ki] = filled[ki].saturating_add(take).min(cands_by_key[ki].len());
+        }
+        for ki in 0..n {
+            if skip[ki] {
+                continue;
+            }
+            let cands = &cands_by_key[ki];
+            let nfill = filled[ki];
+            if pick_winner(cands, nfill, &txids[ki], &id_map, None).is_some() {
+                had_id[ki] = true;
+            }
+            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, heights) {
                 crate::head_resolve_stats::add_hit_rank(rank);
                 chosen_kis.push(ki);
                 chosen_fks.push(fk);
+                skip[ki] = true;
+                continue;
+            }
+            if heights.is_none() || nfill < cands.len() || winner[ki].is_some() {
+                continue;
+            }
+            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, None) {
+                crate::head_resolve_stats::add_hit_rank(rank);
+                chosen_kis.push(ki);
+                chosen_fks.push(fk);
+                skip[ki] = true;
             }
         }
+    }
+
+    for ki in 0..n {
+        if !started[ki] {
+            continue;
+        }
+        *miss_peeks = miss_peeks.saturating_add(miss_peeks_in_prefix(
+            &cands_by_key[ki],
+            filled[ki],
+            &txids[ki],
+            &id_map,
+        ));
     }
     let t_idx = Instant::now();
     let ranges = match session.as_mut() {

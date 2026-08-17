@@ -2129,29 +2129,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn query_open_repairs_class_c_once_after_revalidate() {
-        let src = include_str!("lib.rs");
-        let open = src
-            .split("pub fn open_or_create_layout")
-            .nth(1)
-            .and_then(|s| s.split("let store_path = store.path()").next())
-            .expect("open_or_create_layout");
+    fn query_open_clears_strong_above_tip() {
+        let (dir, q) = temp_query("open-repair-above-tip");
+        let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
+        h0.hash = rbitcoin_store::block_header_hash(
+            h0.version,
+            &[0u8; 32],
+            &h0.merkle_root,
+            h0.timestamp,
+            h0.bits,
+            h0.nonce,
+        );
+        let hfk = q.put_header(&h0).unwrap();
+        q.store().confirmed.set(Height(0), hfk).unwrap();
+        q.store().rebuild_height_fence().unwrap();
+        let leftover = Fk(99);
+        q.store().strong_tx.set_strong(leftover, hfk).unwrap();
+        q.store().flush_class_c_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        assert!(q.store().strong_tx.is_strong(leftover).unwrap());
+        drop(q);
+
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)), "repair must not shrink tip");
         assert!(
-            open.contains("revalidate_tip_window"),
-            "revalidate before repair: {open}"
+            !q.store().strong_tx.is_strong(leftover).unwrap(),
+            "open must clear leftover strong above the fence"
         );
-        let repair_pos = open.find("repair_class_c_above_tip").expect("one repair");
-        let reval_pos = open.find("revalidate_tip_window").expect("revalidate");
-        assert!(reval_pos < repair_pos, "revalidate must run first");
-        assert_eq!(
-            open.matches("repair_class_c_above_tip").count(),
-            1,
-            "one complement repair"
-        );
-        assert!(
-            !open.contains("repair_orphan_class_c"),
-            "orphan alias is the same walk — do not call twice: {open}"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_query(label: &str) -> (std::path::PathBuf, Query) {

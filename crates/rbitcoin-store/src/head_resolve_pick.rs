@@ -233,6 +233,33 @@ mod tests {
         assert!(next_id_cand(&cands, 1, &want, &map, None).is_none());
     }
 
+    /// Full cand list + complete id_map: newest unconnected body match does
+    /// not win when a shallower cand is fence-connected.
+    #[test]
+    fn full_map_connected_beats_newer_unconnected() {
+        let want = [0xAAu8; 32];
+        let cands = [Fk(10), Fk(20)];
+        let ht = fence_on(&[20]);
+        let map = ids(&[(10, want), (20, want)]);
+        let (fk, rank) = pick_winner(&cands, cands.len(), &want, &map, Some(&ht)).unwrap();
+        assert_eq!(fk, Fk(20));
+        assert_eq!(rank, 2);
+    }
+
+    /// A cand with no `id_map` entry is not a match (same as wrong body).
+    #[test]
+    fn missing_id_map_entry_is_not_a_match() {
+        let want = [0xAAu8; 32];
+        let cands = [Fk(10), Fk(20)];
+        let ht = fence_on(&[10, 20]);
+        let map = ids(&[(20, want)]);
+        let (fk, rank) = pick_winner(&cands, cands.len(), &want, &map, Some(&ht)).unwrap();
+        assert_eq!(fk, Fk(20));
+        assert_eq!(rank, 2);
+        let empty = ids(&[]);
+        assert!(pick_winner(&cands, cands.len(), &want, &empty, Some(&ht)).is_none());
+    }
+
     #[test]
     fn leftover_miss_classifies_head_body_idx_fence() {
         assert_eq!(

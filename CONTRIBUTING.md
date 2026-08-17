@@ -82,10 +82,15 @@ nix build .#rbitcoin-musl
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
-Green **push** CI on `master`/`main` also runs [`.github/workflows/musl.yml`](./.github/workflows/musl.yml)
-and uploads `rbitcoin-musl-x86_64-linux-<sha>` (90 days). That is a snapshot,
-not the byte-identity gate (`repro-check.sh`). Download from the **musl**
-check on the commit, not from the `ci` run.
+Green **push** CI on `master`/`main` also runs
+[`.github/workflows/musl.yml`](./.github/workflows/musl.yml),
+[`.github/workflows/windows.yml`](./.github/workflows/windows.yml), and
+[`.github/workflows/macos.yml`](./.github/workflows/macos.yml) and uploads
+90-day snapshots (Linux musl static, Windows CRT-static, Darwin
+system-dylib). That is not the byte-identity gate (`repro-check.sh`).
+Download from those workflow checks on the commit, not from the `ci` run.
+Label a PR **`static-binaries`** to run the same three builds on the PR
+head. Unlabeled PRs keep the cargo gates only.
 
 ## Commits
 

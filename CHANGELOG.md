@@ -9,6 +9,15 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **CI Windows / Darwin snapshots:** after a green `ci` run on
+  `master`/`main` (and on `workflow_dispatch`, and on PRs labeled
+  `static-binaries`), workflows `windows` and `macos` upload CRT-static
+  PE and system-dylib Darwin `rbitcoin-node` / `rbitcoin-cli` +
+  `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
+  label. Linux musl stays Nix; Darwin/Windows are native runners.
+
 ### Changed
 
 - **`ibd: perf` load/script tokens:** `load=` is pin+assemble only.

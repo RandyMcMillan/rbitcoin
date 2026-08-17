@@ -578,6 +578,24 @@ fn queue_getheaders(
     queue_out(out, NetworkMessage::GetHeaders(gh))
 }
 
+fn queue_block_getdata(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    requested_blocks: &mut HashSet<BlockHash>,
+    want: &[BlockHash],
+) -> Result<(), NetError> {
+    if want.is_empty() {
+        return Ok(());
+    }
+    let inv: Vec<Inventory> = want.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
+    for h in want {
+        requested_blocks.insert(*h);
+    }
+    for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
+        queue_out(out, NetworkMessage::GetData(chunk.to_vec()))?;
+    }
+    Ok(())
+}
+
 /// Incomplete compact block waiting for `blocktxn`.
 struct PendingCmpct {
     hsi: HeaderAndShortIds,
@@ -797,6 +815,9 @@ async fn handle_peer_frame(
                             if let Some(s) = session {
                                 s.headers_paused.store(false, Ordering::Relaxed);
                             }
+                        } else if !hub.meets_minimum_chain_work() {
+                            // Learn header-chain work before getdata (minchainwork).
+                            let _ = queue_getheaders(out_tx, hub);
                         } else if !pending_blocks.contains_key(h) {
                             want.push(Inventory::WitnessBlock(*h));
                         }
@@ -865,18 +886,16 @@ async fn handle_peer_frame(
                 if !connecting {
                     let _ = queue_getheaders(out_tx, hub);
                 } else {
+                    let last = headers[n - 1].block_hash();
                     let mut want = Vec::new();
-                    for hdr in headers.iter().take(n) {
-                        let hash = hdr.block_hash();
-                        if hub.is_connected(&hash)
-                            || pending_blocks.contains_key(&hash)
-                            || requested_blocks.contains(&hash)
-                        {
-                            continue;
-                        }
-                        want.push(hash);
-                    }
-                    if let Some(last) = want.last().copied() {
+                    if header_path_meets_minwork(hub, pending_headers, last) {
+                        want = missing_blocks_on_header_path(
+                            hub,
+                            pending_headers,
+                            last,
+                            pending_blocks,
+                            requested_blocks,
+                        );
                         match header_branch_vs_tip(hub, pending_headers, last) {
                             Some(std::cmp::Ordering::Less) => want.clear(),
                             // Equal-work side fork: BIP130 direct-fetch cap 16.
@@ -889,16 +908,7 @@ async fn handle_peer_frame(
                             None | Some(std::cmp::Ordering::Greater) => {}
                         }
                     }
-                    if !want.is_empty() {
-                        let inv: Vec<Inventory> =
-                            want.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
-                        for h in &want {
-                            requested_blocks.insert(*h);
-                        }
-                        for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
-                            queue_out(out_tx, NetworkMessage::GetData(chunk.to_vec()))?;
-                        }
-                    }
+                    queue_block_getdata(out_tx, requested_blocks, &want)?;
                 }
             }
             if n >= MAX_HEADERS_RESULTS {
@@ -909,6 +919,11 @@ async fn handle_peer_frame(
             let hash = block.block_hash();
             pending_cmpct.remove(&hash);
             requested_blocks.remove(&hash);
+            pending_headers.entry(hash).or_insert(block.header);
+            if !any_header_path_meets_minwork(hub, pending_headers, hash) {
+                pending_blocks.insert(hash, block.clone());
+                return Ok(());
+            }
             match hub.accept_received_block(block.clone()) {
                 Ok(AcceptOutcome::Accepted { .. }) => {
                     pending_blocks.remove(&hash);
@@ -941,55 +956,71 @@ async fn handle_peer_frame(
         NetworkMessage::CmpctBlock(cb) => {
             let hsi = cb.compact_block.clone();
             let hash = hsi.header.block_hash();
-            if compact_header_low_work(hub, &hsi.header) {
-                let id = session.map(|s| s.id).unwrap_or(0);
-                rbitcoin_log::debug!("Ignoring low-work compact block from peer {id}");
-            } else if hub.has_block(&hash) {
-            } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
-                if matches!(
-                    hub.accept_received_block(block),
-                    Ok(AcceptOutcome::Accepted { .. })
-                ) {
-                    if let Some(s) = session {
-                        s.maybe_select_as_hb();
-                    }
-                }
-                drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
-            } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
-                if missing.is_empty() {
-                    queue_out(
-                        out_tx,
-                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                    )?;
-                } else if pending_cmpct.len() >= MAX_PENDING_CMPCT
-                    && !pending_cmpct.contains_key(&hash)
-                {
-                    *ban_score = ban_score.saturating_add(10);
-                    queue_out(
-                        out_tx,
-                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                    )?;
-                } else {
-                    pending_cmpct.insert(
-                        hash,
-                        PendingCmpct {
-                            hsi: hsi.clone(),
-                            missing: missing.clone(),
-                            version: 2,
-                        },
-                    );
-                    queue_out(
-                        out_tx,
-                        NetworkMessage::GetBlockTxn(GetBlockTxn {
-                            txs_request: crate::compact::missing_request(hash, &missing),
-                        }),
-                    )?;
-                }
+            pending_headers.entry(hash).or_insert(hsi.header);
+            if !any_header_path_meets_minwork(hub, pending_headers, hash) {
+                // Below -minimumchainwork: keep header, do not reconstruct/accept.
             } else {
-                queue_out(
-                    out_tx,
-                    NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                )?;
+                let ancestors: Vec<BlockHash> = missing_blocks_on_header_path(
+                    hub,
+                    pending_headers,
+                    hash,
+                    pending_blocks,
+                    requested_blocks,
+                )
+                .into_iter()
+                .filter(|h| *h != hash)
+                .collect();
+                queue_block_getdata(out_tx, requested_blocks, &ancestors)?;
+                if compact_header_low_work(hub, &hsi.header) {
+                    let id = session.map(|s| s.id).unwrap_or(0);
+                    rbitcoin_log::debug!("Ignoring low-work compact block from peer {id}");
+                } else if hub.has_block(&hash) {
+                } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
+                    if matches!(
+                        hub.accept_received_block(block),
+                        Ok(AcceptOutcome::Accepted { .. })
+                    ) {
+                        if let Some(s) = session {
+                            s.maybe_select_as_hb();
+                        }
+                    }
+                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
+                    if missing.is_empty() {
+                        queue_out(
+                            out_tx,
+                            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                        )?;
+                    } else if pending_cmpct.len() >= MAX_PENDING_CMPCT
+                        && !pending_cmpct.contains_key(&hash)
+                    {
+                        *ban_score = ban_score.saturating_add(10);
+                        queue_out(
+                            out_tx,
+                            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                        )?;
+                    } else {
+                        pending_cmpct.insert(
+                            hash,
+                            PendingCmpct {
+                                hsi: hsi.clone(),
+                                missing: missing.clone(),
+                                version: 2,
+                            },
+                        );
+                        queue_out(
+                            out_tx,
+                            NetworkMessage::GetBlockTxn(GetBlockTxn {
+                                txs_request: crate::compact::missing_request(hash, &missing),
+                            }),
+                        )?;
+                    }
+                } else {
+                    queue_out(
+                        out_tx,
+                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                    )?;
+                }
             }
         }
         NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
@@ -1100,6 +1131,99 @@ fn header_branch_vs_tip(
         }
     }
     None
+}
+
+/// Core: do not download/connect a peer's chain until its best-known work
+/// meets `-minimumchainwork` (`feature_minchainwork.py`).
+fn header_path_meets_minwork(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return true;
+    };
+    if hub.meets_minimum_chain_work() {
+        return true;
+    }
+    let Some(work) = work_of_header_path(hub, pending, tip) else {
+        return false;
+    };
+    work.to_be_bytes() >= min
+}
+
+fn any_header_path_meets_minwork(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    extra_tip: BlockHash,
+) -> bool {
+    if header_path_meets_minwork(hub, pending, extra_tip) {
+        return true;
+    }
+    pending
+        .keys()
+        .any(|h| *h != extra_tip && header_path_meets_minwork(hub, pending, *h))
+}
+
+fn work_of_header_path(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> Option<bitcoin::Work> {
+    let mut extra: Vec<bitcoin::Work> = Vec::new();
+    let mut h = tip;
+    for _ in 0..10_000 {
+        if hub.is_connected(&h) {
+            let height = hub
+                .query
+                .height_of_hash(&h.to_byte_array())
+                .ok()
+                .flatten()?
+                .0;
+            let base = hub.work_through_height(height).ok()?;
+            extra.reverse();
+            return Some(crate::most_work::sum_work(
+                std::iter::once(base).chain(extra),
+            ));
+        }
+        let hdr = pending.get(&h)?;
+        extra.push(hdr.work());
+        h = hdr.prev_blockhash;
+        if h.to_byte_array() == [0u8; 32] {
+            extra.reverse();
+            return Some(crate::most_work::sum_work(extra.into_iter()));
+        }
+    }
+    None
+}
+
+/// Bodies on `tip`'s header path that we have not connected, stashed, or asked for.
+fn missing_blocks_on_header_path(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+    pending_blocks: &HashMap<BlockHash, bitcoin::Block>,
+    requested: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
+    let mut path = Vec::new();
+    let mut h = tip;
+    for _ in 0..10_000 {
+        if hub.is_connected(&h) {
+            break;
+        }
+        if !pending_blocks.contains_key(&h) && !requested.contains(&h) {
+            path.push(h);
+        }
+        let Some(hdr) = pending.get(&h) else {
+            break;
+        };
+        h = hdr.prev_blockhash;
+        if h.to_byte_array() == [0u8; 32] {
+            break;
+        }
+    }
+    path.reverse();
+    path
 }
 
 /// Compact (or header) whose prev is far behind tip: one block cannot beat
@@ -1435,6 +1559,135 @@ mod tests {
             "getheaders at/above minchainwork must serve the 51st header"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn minchainwork_does_not_getdata_below_floor() {
+        use bitcoin::ScriptBuf;
+        use rbitcoin_primitives::Height;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::consensus::encode::serialize;
+            use bitcoin::p2p::message::RawNetworkMessage;
+            use bitcoin::Network;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("minwork-gd");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            let mut min = [0u8; 32];
+            min[31] = 0x65;
+            hub.set_minimum_chain_work(Some(min));
+
+            let (dir2, q2) = tmp_store("minwork-src");
+            let src = ChainHub::new(q2, ChainParams::regtest(), Milestone::NONE);
+            src.ensure_genesis().unwrap();
+            src.generate_to_script(50, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .unwrap();
+            let mut hdrs = Vec::new();
+            for h in 1..=50u32 {
+                hdrs.push(src.query.wire_header_at_height(Height(h)).unwrap());
+            }
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+
+            fn drain_getdata(rx: &mut mpsc::UnboundedReceiver<NetworkMessage>) -> Vec<BlockHash> {
+                let mut hashes = Vec::new();
+                while let Ok(m) = rx.try_recv() {
+                    if let NetworkMessage::GetData(inv) = m {
+                        for i in inv {
+                            match i {
+                                Inventory::Block(h) | Inventory::WitnessBlock(h) => hashes.push(h),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                hashes
+            }
+
+            // sendheaders announce is one header per mined tip.
+            for hdr in &hdrs[..49] {
+                handle_peer_frame(
+                    frame_for(NetworkMessage::Headers(vec![*hdr])),
+                    &hub,
+                    &out_tx,
+                    &mut wants_headers,
+                    &mut wtxid,
+                    &mut send_cmpct,
+                    &mut cmpct_ver,
+                    &mut pending_headers,
+                    &mut pending_blocks,
+                    &mut pending_cmpct,
+                    &mut from_peer,
+                    &mut requested,
+                    &mut ban,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                drain_getdata(&mut out_rx).is_empty(),
+                "must not getdata a 49-block chain (work 100 < 101)"
+            );
+            assert_eq!(hub.tip_height(), Some(0));
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::Headers(vec![hdrs[49]])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            let got = drain_getdata(&mut out_rx);
+            let h1 = hdrs[0].block_hash();
+            let h50 = hdrs[49].block_hash();
+            assert_eq!(
+                got.len(),
+                50,
+                "50th header (work 102) must getdata the whole path, got {got:?}"
+            );
+            assert_eq!(got[0], h1, "getdata should start at height 1");
+            assert_eq!(got[49], h50, "getdata should end at height 50");
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(dir2);
+        });
     }
 
     #[test]

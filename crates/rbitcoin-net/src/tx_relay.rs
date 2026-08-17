@@ -93,13 +93,12 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         } else {
             Amount::from_sat(out.value as u64)
         };
-        let create_height = self
-            .query
-            .store()
-            .tx_height_get(fk)
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+        let create_height = self.query.store().tx_height_get(fk).ok().flatten()?;
+        let tip = self.query.tip_height()?.0;
+        // Disconnected creates stay in Class A; they are not chain coins.
+        if create_height > tip {
+            return None;
+        }
         // Coinbase: null prevout on input 0, or first tx in its confirmed block.
         // Either signal is enough — `block_tx_fks` can miss after a disconnect
         // while the input record still says coinbase (`mempool_reorg`).

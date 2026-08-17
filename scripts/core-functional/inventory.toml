@@ -97,9 +97,7 @@ analog = "follow-up: equal-work tip choice (preciousblock exists)"
 
 [[test]]
 name = "feature_cltv.py"
-status = "skip"
-reason = "core-log"
-analog = "rust pin: v3 at cltv@111 is bad-version(0x00000003); five CLTV parens + reject-details; unmodified MiniWallet RAW_OP_TRUE + acceptnonstdtxn path not locally proven"
+status = "run"
 
 [[test]]
 name = "feature_coinstatsindex.py"
@@ -130,9 +128,7 @@ analog = "crash-recovery / HWM publish tests"
 
 [[test]]
 name = "feature_dersig.py"
-status = "skip"
-reason = "core-log"
-analog = "rust pin: v2 at dersig@102 is bad-version(0x00000002); SIG_DER → Non-canonical DER + reject-details; unmodified MiniWallet RAW_P2PK path not locally proven"
+status = "run"
 
 [[test]]
 name = "feature_dirsymlinks.py"
@@ -226,9 +222,7 @@ reason = "core-log"
 
 [[test]]
 name = "feature_minchainwork.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "rust pin: 50-block tip minwork 0x65 getheaders empty, 51st serves; unmodified script (IBD clock / 3-node relay) not locally proven"
+status = "run"
 
 [[test]]
 name = "feature_notifications.py"
@@ -384,7 +378,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "HTTP 1.x/2.0 status, notifications (204), getrpcinfo logpath/active_commands, -rpcworkqueue"
+analog = "official: getrpcinfo active_commands is [] not [getrpcinfo]; HTTP 1.x/2.0, notifications 204, logpath, -rpcworkqueue still missing"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -496,8 +490,8 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 [[test]]
 name = "mempool_reorg.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "rust pin: invalidate evicts immature coinbase spends; unmodified test_reorg_relay not locally proven"
+reason = "core-net-policy"
+analog = "official: unannounced getdata served tx not notfound (test_reorg_relay); immature eviction + ancestorcount after reorg are production"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -787,9 +781,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_ping.py"
-status = "skip"
-reason = "core-log"
-analog = "rust pin: Short payload / Unsolicited / Nonce mismatch / Nonce zero / ping timeout: 1201.000000s; getpeerinfo pingtime/minping/pingwait + ping RPC + setmocktime; unmodified script not locally proven"
+status = "run"
 
 [[test]]
 name = "p2p_private_broadcast.py"
@@ -908,7 +900,8 @@ analog = "follow-up: estimatesmartfee exists; Core multi-horizon text"
 [[test]]
 name = "rpc_generate.py"
 status = "skip"
-reason = "no-wallet"
+reason = "rpc-missing"
+analog = "official: getblock(verbose=2) has no scriptPubKey.address; generate hidden -32601 and getblock verbose alias shipped"
 
 [[test]]
 name = "rpc_getblockfilter.py"
@@ -926,7 +919,7 @@ analog = "IBD hole-fill / tip-follow getdata"
 name = "rpc_getblockstats.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "getblockstats shipped (rust pin: coinbase-only + OP_RETURN); rpc_getblockstats.py blk00000.dat not found on disk"
+analog = "official: FileNotFoundError renaming blk00000.dat after stats/genesis/OP_RETURN/header-only passed (store/, not Core blocksdir)"
 
 [[test]]
 name = "rpc_getchaintips.py"
@@ -1005,7 +998,7 @@ reason = "no-wallet"
 name = "rpc_rawtransaction.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: gettxout / createraw / fundraw"
+analog = "official: without -txindex getrawtransaction still serves (Class A always indexes); type-check -3 shipped"
 
 [[test]]
 name = "rpc_scanblocks.py"
@@ -1086,8 +1079,7 @@ reason = "no-tool"
 
 [[test]]
 name = "tool_rpcauth.py"
-status = "skip"
-reason = "no-tool"
+status = "run"
 
 [[test]]
 name = "tool_signet_miner.py"

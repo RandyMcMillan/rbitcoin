@@ -132,6 +132,16 @@ impl RpcRegtest for HubRegtest {
             .map_err(|e| e.to_string())
     }
 
+    fn assemble_block_to_script(
+        &self,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<Block, String> {
+        self.0
+            .assemble_block_to_script(script_pubkey, extra_txs)
+            .map_err(|e| e.to_string())
+    }
+
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
         use bitcoin::Target;
         let target = Target::from_compact(block.header.bits);

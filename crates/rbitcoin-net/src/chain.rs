@@ -135,6 +135,28 @@ impl ChainHub {
         }
     }
 
+    /// Core `-minimumchainwork` floor (32-byte BE), if set.
+    pub fn min_chain_work_floor(&self) -> Option<[u8; 32]> {
+        *self.minimum_chain_work.read().unwrap()
+    }
+
+    /// Sum wire-header work from genesis through `height` (inclusive) on the tip chain.
+    pub fn work_through_height(&self, height: u32) -> Result<Work, NetError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(Work::from_be_bytes([0u8; 32]));
+        };
+        let end = height.min(tip);
+        let mut works = Vec::new();
+        for h in 0..=end {
+            let hdr = self
+                .query
+                .wire_header_at_height(Height(h))
+                .map_err(|e| NetError::Consensus(e.to_string()))?;
+            works.push(hdr.work());
+        }
+        Ok(sum_work(works.into_iter()))
+    }
+
     /// Core `nMaxTipAge` (24h): tip time vs [`Self::clock`].
     pub fn tip_is_stale_for_ibd(&self) -> bool {
         const MAX_TIP_AGE: u64 = 24 * 60 * 60;
@@ -625,6 +647,33 @@ impl ChainHub {
         drop(confirmed);
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    /// Mine one block paying `script_pubkey` without connecting it.
+    ///
+    /// Core `generateblock … submit=false` returns the hex for `submitheader`.
+    pub fn assemble_block_to_script(
+        &self,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<bitcoin::Block, NetError> {
+        self.ensure_genesis()?;
+        let tip_h = self
+            .tip_height()
+            .ok_or(NetError::Protocol("generate: no tip"))?;
+        let prev = self
+            .tip_hash()
+            .ok_or(NetError::Protocol("generate: no tip hash"))?;
+        let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
+        let now = self.clock.now_secs() as u32;
+        let time = tip_time.saturating_add(1).max(now);
+        Ok(mine_regtest_paying(
+            prev,
+            time,
+            tip_h.saturating_add(1),
+            script_pubkey,
+            extra_txs,
+        ))
     }
 
     /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
@@ -2265,7 +2314,25 @@ mod tests {
             }],
         };
         mp.accept_tx(&spend).expect("mature coinbase spend");
-        assert_eq!(mp.live_count(), 1);
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: spend.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9998_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&child).expect("child of coinbase spend");
+        assert_eq!(mp.live_count(), 2);
 
         // QueryUtxoProvider must see a coinbase at height 1 (same path evict uses).
         let coin = crate::tx_relay::QueryUtxoProvider {
@@ -2283,7 +2350,7 @@ mod tests {
         assert_eq!(
             mp.live_count(),
             0,
-            "invalidate below maturity must evict the coinbase spend"
+            "invalidate below maturity must evict the coinbase spend and its child"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

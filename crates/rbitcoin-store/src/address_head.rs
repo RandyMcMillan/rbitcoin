@@ -754,7 +754,7 @@ impl AddressHead {
         let mut spins = 0u32;
         loop {
             let s1 = self.page_seq[seq_i].load(Ordering::Acquire);
-            if s1 % 2 == 0 {
+            if s1.is_multiple_of(2) {
                 // libc pread only — this runs under the probe TLS ring on retry.
                 self.file.read_at(off, &mut buf[..need])?;
                 let s2 = self.page_seq[seq_i].load(Ordering::Acquire);
@@ -1024,7 +1024,7 @@ impl AddressHead {
                     let off = self.entry_off(page_base);
                     let seq_i = self.page_seq_index(page_base);
                     let s1 = self.page_seq[seq_i].load(Ordering::Acquire);
-                    if s1 % 2 == 1 {
+                    if !s1.is_multiple_of(2) {
                         // Writer is in pwrite — do not hop a uring snapshot.
                         let n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
                         if n >= es_u {
@@ -1098,7 +1098,7 @@ impl AddressHead {
                     n = n.min(need);
                     let s1 = slot_seq[slot];
                     let s2 = self.page_seq[self.page_seq_index(page_base)].load(Ordering::Acquire);
-                    if s1 != s2 || s1 % 2 == 1 {
+                    if s1 != s2 || !s1.is_multiple_of(2) {
                         n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
                     }
 
@@ -1360,7 +1360,7 @@ mod tests {
         );
         h.insert(&txid, Fk(1)).unwrap();
         let seq = h.page_seq[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed);
-        assert_eq!(seq % 2, 0, "publish leaves seq even, got {seq}");
+        assert!(seq.is_multiple_of(2), "publish leaves seq even, got {seq}");
         assert!(
             seq >= 2,
             "one dirty write-back bumps 1→odd then 2→even, got {seq}"

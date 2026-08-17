@@ -44,7 +44,7 @@ other than `MULTI_SPENDER` are Corrupt. Inwit prevout is still
 `create_fk:u64` + CompactSize vout (Δfk is an **18 / inwit-only**
 follow-up). Writer/RAM on 17 (not on-disk): idx stems roll independently;
 `strong_tx` always L2; no `RWF_DONTCACHE`. See
-[`docs/store-format.md`](docs/store-format.md).
+[`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze).
 
 Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
 pages (`ver=0`, `n>0`) rematerialize.
@@ -130,7 +130,7 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 - Dense **`txid.body`**: 32-byte header + 32-byte txid per create_fk (append with Class A).
 - Packed **`tx.body` meta without leading txid** (32 B meta only); 8-byte align only (no page non-straddle for body txid).
 - Head-resolve identity via **sidefile**, not Prefix33 body peeks.
-- **RWF_DONTCACHE** on uring SQEs (historical multi-target policy; later spend-pwrite-only; **removed** after the `spent`/`txout` split — see [`docs/store-format.md`](docs/store-format.md)).
+- **RWF_DONTCACHE** on uring SQEs (historical multi-target policy; later spend-pwrite-only; **removed** after the `spent`/`txout` split — see [`SCHEMA.md`](SCHEMA.md) Schema 17 freeze).
 - IBD **body queue is process-local RAM** (not durable `store/block_queue/`): avoids double disk write of every block (queue + Class A); restart redownloads; soft densify assign: under ~100 MiB free ahead; over that only ~1 min confirm window at tip rate. Legacy on-disk queue dirs are ignored/removed on open.
 - **Wipe / reindex required** from schema 12 (body layout + new sidefile incompatible).
 

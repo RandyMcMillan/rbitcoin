@@ -1,9 +1,9 @@
 # Which head file is which
 
 One map for `address_head` / `hashhead` / `sharded` / `segmented` / `scripthash_head`.
-Confirm stages (lookup / load / scripts / write) live in
-[`concurrency.md`](./concurrency.md). On-disk bytes:
-[`SCHEMA.md`](../SCHEMA.md).
+Confirm stages (lookup / load / scripts / write) and allowed IO live in
+[`invariants.md`](./invariants.md). Roles: [`concurrency.md`](./concurrency.md).
+On-disk bytes: [`SCHEMA.md`](../SCHEMA.md).
 
 ## Picture
 
@@ -45,7 +45,7 @@ connected sibling in a cold age can win.
 
 `sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) decides which
 `tx.head` segments are probed first. It is not an IO flag. `RWF_DONTCACHE`
-is retired ([`store-format.md`](./store-format.md)).
+is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
 
 ## Confirm stages (pointer)
 

@@ -85,8 +85,8 @@ Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).
 
 ## Novel on-disk model
 
-Deep layout: [`SCHEMA.md`](../SCHEMA.md). Crash / tip commit:
-[`docs/crash-recovery.md`](./crash-recovery.md).
+Deep layout and schema 17 freeze: [`SCHEMA.md`](../SCHEMA.md). Crash / tip
+commit: [`docs/crash-recovery.md`](./crash-recovery.md).
 
 ### Class A / B / C (intuition)
 
@@ -223,8 +223,8 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 
 | Doc | Contents |
 |-----|----------|
-| [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables and versions |
-| [`docs/store-format.md`](./store-format.md) | Schema 17 freeze: hot set, widths, kinds, what forces 18 |
+| [`SCHEMA.md`](../SCHEMA.md) | Current on-disk tables, schema 17 freeze, what forces 18 |
+| [`docs/invariants.md`](./invariants.md) | Confirm stage IO, leftover union, store start states |
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
 | [`docs/heads.md`](./heads.md) | Which head file / module (tx / header / SH) |

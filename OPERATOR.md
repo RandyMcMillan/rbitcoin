@@ -189,7 +189,7 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 
 **RWF_DONTCACHE:** not used. `spent.body` is its own file; evicting those
 pages after annotate does not protect `txout`. See
-[`docs/store-format.md`](docs/store-format.md).
+[`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze).
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO.

@@ -183,7 +183,7 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 
 | Env | Values | Note |
 |-----|--------|------|
-| **`RBITCOIN_IO`** | `uring` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
+| **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 
@@ -191,8 +191,11 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 pages after annotate does not protect `txout`. See
 [`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze).
 
-- **uring** — io_uring bulk pread/pwrite (ring depth **128**).
-- **pread** / **pwrite** — libc positional IO.
+- **uring** — Linux io_uring (ring depth **128**). On Windows this opens
+  IOCP.
+- **pool** — worker-pool completion session (Darwin default).
+- **iocp** — Windows IOCP (Windows default).
+- **pread** / **pwrite** — libc positional IO (session off).
 - Class A **`txout` / `inwit` / `spent` + `*.idx` linear appends always pwrite**.
 
 ## Defaults and memory budgets

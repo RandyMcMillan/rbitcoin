@@ -12,11 +12,13 @@ before 1.0).
 ### Changed
 
 - **Core functional Wave D leftovers.** Official unmodified
-  `interface_rpc.py` is now `run` (32 inventory run names). HTTP JSON-RPC
-  2.0 batch, notifications (204), and version/HTTP status dialect match
-  Core v31.1. `getnettotals` sums live peer byte counters. Mempool GetData
-  answers unannounced recent txs with `notfound` and serves disconnected-
-  block txs (`mempool_reorg` first remaining is mocktime INV `:111`).
+  `interface_rpc.py` and `mempool_reorg.py` are now `run` (33 inventory
+  run names). HTTP JSON-RPC 2.0 batch, notifications (204), and
+  version/HTTP status dialect match Core v31.1. `getnettotals` sums live
+  peer byte counters. Mempool GetData follows Core `info_for_relay`
+  (entry sequence < last INV); reorg-reaccept uses sequence 0 so
+  disconnected-block txs are servable without INV, and a later regular
+  submit of the same wtxid is `notfound` until announced.
 
 - **`ibd: perf` load/script tokens:** `load=` is pin+assemble only.
   `load_thr pack/stamp/pin/asm/prune` is the load OS thread (leftover

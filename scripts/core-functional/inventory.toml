@@ -487,9 +487,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 
 [[test]]
 name = "mempool_reorg.py"
-status = "skip"
-reason = "core-net-policy"
-analog = "official: notfound + mocktime INV of 3 shipped; immediate getdata after sendraw still serves (mempool_reorg.py:122 test_reorg_relay)"
+status = "run"
 
 [[test]]
 name = "mempool_resurrect.py"

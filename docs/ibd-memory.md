@@ -100,7 +100,6 @@ intentional:
 | **Sealed `tx.head` fuse8** | **~1.5–1.6 GiB** | `open_file` loads every sealed `.fuse8` fingerprint array into process RAM (~9 bits/key). `file=` stays ~6 MiB because heads are FdOnly. |
 | **Class C L2 `strong_tx`** | **~177 MiB** | 1 bit/create, under the 256 MiB in-RAM cap. |
 | **Open-segment `open_keys`** | **~100–200 MiB** | `Vec<u64>` fuse keys for the unsealed tail. |
-| **Open `tx.head` page seqlock** | **128 KiB** | Per-page `AtomicU32` on the unsealed tail only. Sealed segments do not keep the array. |
 | **`height_by_hash`** | **~60 MiB** | Query comment; still unmetered. |
 | **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |
 

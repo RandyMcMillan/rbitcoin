@@ -38,6 +38,13 @@ before 1.0).
 
 ### Changed
 
+- **Withdrawn: open `tx.head` page seqlock (#82 / #84).** Leftover misses
+  are old parent txids with a long hop of cands (`miss_on=body`, ~25–34).
+  A torn old/new page still holds those occupants; seqlock cannot explain
+  that miss. The 250 ms odd-page `Corrupt` aborted lookup waves and dumped
+  more work onto leftover. Per-page `AtomicU32`s are gone; insert is again
+  sole-writer page-coalesced `pwrite`.
+
 - **Tests assert behavior, not the repo.** Default-suite tests no longer
   `include_str!` production sources or `CONTRIBUTING.md` to grep
   identifiers. Query open leftover-strong repair is pinned by
@@ -51,15 +58,6 @@ before 1.0).
   the slim harness contract. Removed `COVERAGE.md`,
   `docs/store-format.md`, `docs/startup-states.md`,
   `docs/design-ibd-most-work-reorg.md`, and `docs/future-features/`.
-
-- **Open `tx.head` page RMW is seqlocked.** Each probe page has a RAM
-  `AtomicU32` (even = published, odd = `pwrite` in flight). Concurrent leftover
-  / lookup probes retry until they see a complete image (stale is fine). Stuck
-  odd is `Corrupt("open head page seqlock")`. No on-disk change.
-
-- **Sealed `tx.head` segments drop the page seqlock.** The per-page `AtomicU32`
-  array is open-tail only (~128 KiB per 25-bit segment). Seal replaces the head
-  with an immutable view; reopen of a sealed file never allocates the array.
 
 - **Source-code comments are a smell.** `CONTRIBUTING.md` now states that
   a comment restating *what* the next code does, *why* it exists, or a

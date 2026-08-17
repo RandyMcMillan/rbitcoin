@@ -9,6 +9,7 @@ mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
 mod in_flight;
+mod published_ids;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -130,6 +131,7 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
+pub use published_ids::{IdMap, PublishedIds};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,

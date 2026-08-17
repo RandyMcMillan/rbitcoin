@@ -82,6 +82,8 @@ pub struct ChainHub {
     gbt_assembled: AtomicBool,
     /// Core `-blockmintxfee` in sat/kvB. Default 1.
     block_min_tx_fee_sat_kvb: AtomicU64,
+    /// Block hashes we already issued getdata for (any peer).
+    asked_blocks: RwLock<HashSet<BlockHash>>,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -124,7 +126,22 @@ impl ChainHub {
             block_version: AtomicI32::new(0),
             gbt_assembled: AtomicBool::new(false),
             block_min_tx_fee_sat_kvb: AtomicU64::new(1),
+            asked_blocks: RwLock::new(HashSet::new()),
         }
+    }
+
+    pub fn note_asked_block(&self, hash: BlockHash) {
+        let mut g = self.asked_blocks.write().unwrap();
+        if g.len() >= 4096 {
+            g.clear();
+        }
+        g.insert(hash);
+    }
+
+    pub fn already_have_or_asked_block(&self, hash: &BlockHash) -> bool {
+        self.is_connected(hash)
+            || self.held_body(hash).is_some()
+            || self.asked_blocks.read().unwrap().contains(hash)
     }
 
     pub fn note_gbt_assembled(&self) {
@@ -163,6 +180,69 @@ impl ChainHub {
     /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
     pub fn set_minimum_chain_work(&self, w: Option<[u8; 32]>) {
         *self.minimum_chain_work.write().unwrap() = w;
+    }
+
+    /// Work of `header` hanging off a known parent (tip-extend, header-only
+    /// chain, or side), else just the header's own work.
+    pub fn work_with_header(&self, header: &Header) -> Work {
+        let mut extra = vec![header.work()];
+        let mut prev = header.prev_blockhash;
+        for _ in 0..10_000 {
+            if prev.to_byte_array() == [0u8; 32] {
+                return crate::most_work::sum_work(extra.into_iter());
+            }
+            if let Some(h) = self
+                .query
+                .height_of_hash(&prev.to_byte_array())
+                .ok()
+                .flatten()
+            {
+                let base = self
+                    .work_through_height(h.0)
+                    .unwrap_or(Work::from_be_bytes([0u8; 32]));
+                extra.push(base);
+                return crate::most_work::sum_work(extra.into_iter());
+            }
+            let Some(hdr) = self.header_of(&prev) else {
+                return crate::most_work::sum_work(extra.into_iter());
+            };
+            extra.push(hdr.work());
+            prev = hdr.prev_blockhash;
+        }
+        crate::most_work::sum_work(extra.into_iter())
+    }
+
+    /// Unrequested body more than 288 heights above the validated tip.
+    pub fn unrequested_too_far_ahead(&self, header: &Header) -> bool {
+        let tip = self.tip_height().unwrap_or(0);
+        let prev = header.prev_blockhash;
+        let parent_h = self
+            .query
+            .height_of_hash(&prev.to_byte_array())
+            .ok()
+            .flatten()
+            .map(|h| h.0)
+            .or_else(|| self.header_tips.read().unwrap().get(&prev).map(|(_, h)| *h));
+        let Some(parent_h) = parent_h else {
+            return false;
+        };
+        parent_h.saturating_add(1) > tip.saturating_add(288)
+    }
+
+    /// Unrequested body whose header-path work is strictly below the tip.
+    pub fn unrequested_weaker_than_tip(&self, header: &Header) -> bool {
+        let Ok(tip) = self.chain_work() else {
+            return false;
+        };
+        crate::most_work::work_better(tip, self.work_with_header(header))
+    }
+
+    /// True when connecting `header` would still be below `-minimumchainwork`.
+    pub fn header_below_minwork(&self, header: &Header) -> bool {
+        let Some(min) = self.min_chain_work_floor() else {
+            return false;
+        };
+        self.work_with_header(header).to_be_bytes() < min
     }
 
     /// True when tip work meets `-minimumchainwork` (or the flag is unset).
@@ -381,7 +461,12 @@ impl ChainHub {
                 if parents.contains(&hash) {
                     continue;
                 }
-                record(&mut out, hash, "valid-headers");
+                let status = if self.held_path_has_body_gap(hash) {
+                    "headers-only"
+                } else {
+                    "valid-headers"
+                };
+                record(&mut out, hash, status);
             }
         }
         for path in self.invalidated_paths.read().unwrap().iter() {
@@ -397,6 +482,26 @@ impl ChainHub {
                 .then_with(|| a.hash.to_byte_array().cmp(&b.hash.to_byte_array()))
         });
         tips
+    }
+
+    fn held_path_has_body_gap(&self, tip: BlockHash) -> bool {
+        let mut h = tip;
+        for _ in 0..10_000 {
+            if self.is_connected(&h) {
+                return false;
+            }
+            if self.load_side_body(&h).is_none() {
+                return true;
+            }
+            let Some(prev) = self.prev_of(&h) else {
+                return true;
+            };
+            if prev.to_byte_array() == [0u8; 32] {
+                return false;
+            }
+            h = prev;
+        }
+        true
     }
 
     /// Prev hash from a held/archive body or the header store (no extra index).
@@ -523,6 +628,89 @@ impl ChainHub {
     /// Remember a consensus-invalid block (not a mutated merkle).
     pub fn note_invalid_block(&self, hash: BlockHash) {
         self.invalidated.write().unwrap().insert(hash);
+    }
+
+    /// True if we have a header row (best chain, header-only tip, or held body).
+    /// Used so we never `getdata` a block inv whose header we have not seen.
+    pub fn knows_header(&self, hash: &BlockHash) -> bool {
+        self.is_connected(hash)
+            || self.header_tips.read().unwrap().contains_key(hash)
+            || self
+                .query
+                .get_header_by_hash(&hash.to_byte_array())
+                .ok()
+                .flatten()
+                .is_some()
+            || self.held_body(hash).is_some()
+    }
+
+    /// `ancestor` is `descendant` or lies on its prev walk (disconnected ok).
+    pub(crate) fn is_header_ancestor(&self, ancestor: BlockHash, descendant: BlockHash) -> bool {
+        if ancestor == descendant {
+            return true;
+        }
+        if ancestor.to_byte_array() == [0u8; 32] {
+            return true;
+        }
+        let mut h = descendant;
+        for _ in 0..64 {
+            let Some(prev) = self.prev_of(&h) else {
+                return false;
+            };
+            if prev == ancestor {
+                return true;
+            }
+            if prev.to_byte_array() == [0u8; 32] {
+                return false;
+            }
+            h = prev;
+        }
+        false
+    }
+
+    /// Header for a connected, held, archived, or header-only hash.
+    pub(crate) fn header_of(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
+        if let Some(b) = self.load_side_body(hash) {
+            return Some(b.header);
+        }
+        if let Some(h) = self
+            .query
+            .height_of_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()
+        {
+            if let Ok(Some(b)) = self.block_at_height(h.0) {
+                if b.block_hash() == *hash {
+                    return Some(b.header);
+                }
+            }
+        }
+        if let Some(b) = self
+            .query
+            .reconstruct_archived_block(&hash.to_byte_array())
+            .ok()
+            .flatten()
+        {
+            return Some(b.header);
+        }
+        let (_, rec) = self
+            .query
+            .get_header_by_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()?;
+        let prev = if rec.prev_fk.is_null() {
+            BlockHash::from_byte_array([0u8; 32])
+        } else {
+            BlockHash::from_byte_array(self.query.get_header(rec.prev_fk).ok()?.hash)
+        };
+        Some(bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(rec.version),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array(rec.merkle_root),
+            time: rec.timestamp,
+            bits: bitcoin::CompactTarget::from_consensus(rec.bits),
+            nonce: rec.nonce,
+        })
     }
 
     /// Core `submitheader`: decode already succeeded. Missing parent, invalid
@@ -1281,9 +1469,8 @@ impl ChainHub {
         }
     }
 
-    /// Cap matches tip-follow pending (`MAX_PENDING_BLOCKS = 128`): enough for
-    /// a ≥99-block side path, not an unbounded index.
-    const HELD_BODIES_CAP: usize = 128;
+    /// Core unrequested-block window is 288 ahead of the validated tip.
+    const HELD_BODIES_CAP: usize = 320;
 
     fn hold_body(&self, block: Block) {
         let hash = block.block_hash();
@@ -1862,6 +2049,31 @@ mod tests {
             initial_getheaders_log(0, 0),
             "initial getheaders (0) to peer=0"
         );
+    }
+
+    #[test]
+    fn unrequested_header_below_minwork_is_anti_dos() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut min = [0u8; 32];
+        min[31] = 0x10;
+        hub.set_minimum_chain_work(Some(min));
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_000, 1);
+        assert!(
+            hub.header_below_minwork(&b1.header),
+            "genesis+1 must stay below 0x10"
+        );
+        hub.set_minimum_chain_work(None);
+        hub.accept_block(b1.clone()).unwrap();
+        let b2 = mine(b1.block_hash(), 1_300_000_100, 2);
+        hub.accept_block(b2.clone()).unwrap();
+        let fork = mine(gen, 1_300_000_200, 1);
+        assert!(
+            hub.unrequested_weaker_than_tip(&fork.header),
+            "genesis-fork at height 1 is weaker than tip 2"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

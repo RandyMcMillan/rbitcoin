@@ -1,7 +1,7 @@
 //! Peer handshake, serve, tip follow, and announce (BIP324 v2 transport).
 
 use crate::cache::BlockCache;
-use crate::chain::{AcceptOutcome, ChainHub};
+use crate::chain::{accept_block_header_nodos_log, AcceptOutcome, ChainHub};
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
@@ -33,6 +33,9 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// How often an established session re-issues `getheaders` so a quiet peer or
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
+
+/// Core `MAX_BLOCKS_TO_ANNOUNCE`: more than this on a reorg falls back to inv.
+const MAX_BLOCKS_TO_ANNOUNCE: u32 = 8;
 
 /// True when a session error is a missing store row (not peer malice / corrupt IO).
 ///
@@ -301,7 +304,7 @@ pub async fn peer_session_with(
         let h = hub.tip_height().unwrap_or(0);
         rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
     }
-    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref()) {
+    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), meta.session.as_deref(), true) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
 
@@ -374,59 +377,67 @@ pub async fn peer_session_with(
                             if !hub.meets_minimum_chain_work() {
                                 continue;
                             }
-                            if ev.reorg_branch_len > 8 {
-                                if let Some(s) = session.as_ref() {
-                                    s.headers_paused.store(true, Ordering::Relaxed);
-                                }
-                                if hub.tip_hash() == Some(ev.hash) {
+                            let from_peer = session
+                                .as_ref()
+                                .is_some_and(|s| s.take_block_from_peer(&ev.hash));
+                            let (sent, known) = session
+                                .as_ref()
+                                .map(|s| s.header_marks())
+                                .unwrap_or((None, None));
+                            match tip_announce_decision(
+                                hub.as_ref(),
+                                &ev,
+                                peer_wants_headers,
+                                sent,
+                                known,
+                                from_peer,
+                            ) {
+                                TipAnnounce::Skip => continue,
+                                TipAnnounce::Inv(h) => {
                                     queue_out(
                                         &out_tx,
-                                        NetworkMessage::Inv(vec![Inventory::WitnessBlock(ev.hash)]),
+                                        NetworkMessage::Inv(vec![Inventory::WitnessBlock(h)]),
                                     )?;
                                 }
-                                continue;
-                            }
-                            let paused = session.as_ref().is_some_and(|s| {
-                                s.headers_paused.load(Ordering::Relaxed)
-                            });
-                            if paused {
-                                queue_out(
-                                    &out_tx,
-                                    NetworkMessage::Inv(vec![Inventory::WitnessBlock(ev.hash)]),
-                                )?;
-                                continue;
-                            }
-                            if peer_send_cmpct {
-                                if let Ok(Some(block)) = block_for_peer(
-                                    hub.cache.as_ref(),
-                                    hub.query.as_ref(),
-                                    &ev.hash,
-                                ) {
-                                    let nonce = rand_nonce();
-                                    if let Ok(hsi) = HeaderAndShortIds::from_block(
-                                        &block,
-                                        nonce,
-                                        peer_cmpct_version.max(1).min(2),
-                                        &[0],
-                                    ) {
-                                        queue_out(
-                                            &out_tx,
-                                            NetworkMessage::CmpctBlock(CmpctBlock {
-                                                compact_block: hsi,
-                                            }),
-                                        )?;
-                                        continue;
+                                TipAnnounce::Headers(hs) => {
+                                    if let Some(last) = hs.last() {
+                                        if let Some(s) = session.as_ref() {
+                                            s.note_best_header_sent(last.block_hash());
+                                        }
                                     }
+                                    if peer_send_cmpct && hs.len() == 1 {
+                                        if let Ok(Some(block)) = block_for_peer(
+                                            hub.cache.as_ref(),
+                                            hub.query.as_ref(),
+                                            &ev.hash,
+                                        ) {
+                                            let nonce = rand_nonce();
+                                            if let Ok(hsi) = HeaderAndShortIds::from_block(
+                                                &block,
+                                                nonce,
+                                                peer_cmpct_version.max(1).min(2),
+                                                &[0],
+                                            ) {
+                                                queue_out(
+                                                    &out_tx,
+                                                    NetworkMessage::CmpctBlock(CmpctBlock {
+                                                        compact_block: hsi,
+                                                    }),
+                                                )?;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    queue_out(&out_tx, NetworkMessage::Headers(hs))?;
                                 }
                             }
-                            queue_out(&out_tx, tip_announce_msg(&ev, peer_wants_headers))?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                 }
                 _ = headers_poll.tick() => {
-                    let _ = queue_getheaders(&out_tx, hub.as_ref());
+                    let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
@@ -572,13 +583,21 @@ pub(crate) fn tip_follow_locator(hub: &ChainHub) -> Vec<BlockHash> {
 fn queue_getheaders(
     out: &mpsc::UnboundedSender<NetworkMessage>,
     hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    mark_awaiting: bool,
 ) -> Result<(), NetError> {
+    if mark_awaiting {
+        if let Some(s) = session {
+            s.note_awaiting_headers();
+        }
+    }
     let locator = tip_follow_locator(hub);
     let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
     queue_out(out, NetworkMessage::GetHeaders(gh))
 }
 
 fn queue_block_getdata(
+    hub: &ChainHub,
     out: &mpsc::UnboundedSender<NetworkMessage>,
     requested_blocks: &mut HashSet<BlockHash>,
     want: &[BlockHash],
@@ -589,6 +608,7 @@ fn queue_block_getdata(
     let inv: Vec<Inventory> = want.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
     for h in want {
         requested_blocks.insert(*h);
+        hub.note_asked_block(*h);
     }
     for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
         queue_out(out, NetworkMessage::GetData(chunk.to_vec()))?;
@@ -699,16 +719,17 @@ async fn handle_peer_frame(
             *peer_wtxid_relay = true;
         }
         NetworkMessage::GetHeaders(gh) => {
-            if let Some(s) = session {
-                s.headers_paused.store(false, Ordering::Relaxed);
-            }
             let headers = headers_reply_for_getheaders(hub, gh)?;
+            if let Some(s) = session {
+                if let Some(last) = headers.last() {
+                    s.note_best_header_sent(last.block_hash());
+                } else if let Some(tip) = hub.tip_hash() {
+                    s.note_best_header_sent(tip);
+                }
+            }
             queue_out(out_tx, NetworkMessage::Headers(headers))?;
         }
         NetworkMessage::GetBlocks(gb) => {
-            if let Some(s) = session {
-                s.headers_paused.store(false, Ordering::Relaxed);
-            }
             let headers = headers_for_peer(
                 hub.cache.as_ref(),
                 hub.query.as_ref(),
@@ -807,19 +828,28 @@ async fn handle_peer_frame(
         NetworkMessage::Inv(items) => {
             let mut want = Vec::new();
             let mut inv_tx_n = 0u64;
+            let mut need_headers = false;
             let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false);
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                        if hub.is_connected(h) {
-                            if let Some(s) = session {
-                                s.headers_paused.store(false, Ordering::Relaxed);
+                        if let Some(s) = session {
+                            s.note_block_from_peer(*h);
+                            s.note_best_known(*h);
+                        }
+                        if !hub.is_connected(h) {
+                            if !hub.knows_header(h) && !pending_headers.contains_key(h) {
+                                if session.is_none_or(|s| {
+                                    s.advertises_network() || s.try_ask_headers_for_inv()
+                                }) {
+                                    need_headers = true;
+                                }
                             }
-                        } else if !hub.meets_minimum_chain_work() {
-                            // Learn header-chain work before getdata (minchainwork).
-                            let _ = queue_getheaders(out_tx, hub);
-                        } else if !pending_blocks.contains_key(h) {
-                            want.push(Inventory::WitnessBlock(*h));
+                            // Have a header: do not getdata from inv. Bodies come
+                            // from header-announcement direct fetch (BIP130) or a
+                            // getheaders reply. Inv of a known hash from a second
+                            // peer (p2p_sendheaders inv_node) must not steal or
+                            // duplicate that getdata.
                         }
                     }
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
@@ -860,22 +890,27 @@ async fn handle_peer_frame(
                     .count() as u64;
                 mp.note_getdata_tx(gd_tx);
             }
+            if need_headers {
+                let _ = queue_getheaders(out_tx, hub, session, true);
+            }
             if !want.is_empty() {
                 queue_out(out_tx, NetworkMessage::GetData(want))?;
             }
         }
         NetworkMessage::Headers(headers) => {
             let n = headers.len().min(MAX_HEADERS_RESULTS);
+            let headers_reply = session.is_some_and(|s| s.take_awaiting_headers());
             if n == 0 {
                 // Empty headers is a failed getheaders response, not an announcement.
             } else if let Some(first) = headers.first() {
                 let prev = first.prev_blockhash;
-                let connecting = prev.to_byte_array() == [0u8; 32]
-                    || hub.is_connected(&prev)
-                    || pending_headers.contains_key(&prev)
-                    || hub.held_body(&prev).is_some();
+                let connecting = header_announcement_connects(hub, pending_headers, prev);
                 for hdr in headers.iter().take(n) {
                     let hash = hdr.block_hash();
+                    if let Some(s) = session {
+                        s.note_block_from_peer(hash);
+                        s.note_best_known(hash);
+                    }
                     if pending_headers.len() >= MAX_PENDING_HEADERS
                         && !pending_headers.contains_key(&hash)
                     {
@@ -884,8 +919,11 @@ async fn handle_peer_frame(
                     pending_headers.insert(hash, *hdr);
                 }
                 if !connecting {
-                    let _ = queue_getheaders(out_tx, hub);
+                    let _ = queue_getheaders(out_tx, hub, session, true);
                 } else {
+                    for hdr in headers.iter().take(n) {
+                        let _ = hub.ensure_header(hdr);
+                    }
                     let last = headers[n - 1].block_hash();
                     let mut want = Vec::new();
                     if header_path_meets_minwork(hub, pending_headers, last) {
@@ -898,25 +936,61 @@ async fn handle_peer_frame(
                         );
                         match header_branch_vs_tip(hub, pending_headers, last) {
                             Some(std::cmp::Ordering::Less) => want.clear(),
-                            // Equal-work side fork: BIP130 direct-fetch cap 16.
-                            // Catch-up / tip-extend (Greater) must not cap —
-                            // csv / getchaintips send long header batches.
-                            Some(std::cmp::Ordering::Equal) => {
+                            // BIP130 cap is for unsolicited announcements only.
+                            // A getheaders reply (rejoin / catch-up) must fetch
+                            // the whole offered path.
+                            Some(std::cmp::Ordering::Equal) if !headers_reply => {
                                 let room = 16usize.saturating_sub(requested_blocks.len());
                                 want.truncate(room);
                             }
-                            None | Some(std::cmp::Ordering::Greater) => {}
+                            Some(std::cmp::Ordering::Greater) if !headers_reply => {
+                                let side = header_path_join(hub, pending_headers, last)
+                                    .is_some_and(|h| hub.tip_hash() != Some(h));
+                                if side {
+                                    let room = 16usize.saturating_sub(requested_blocks.len());
+                                    want.truncate(room);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    queue_block_getdata(out_tx, requested_blocks, &want)?;
+                    queue_block_getdata(hub, out_tx, requested_blocks, &want)?;
                 }
             }
             if n >= MAX_HEADERS_RESULTS {
-                let _ = queue_getheaders(out_tx, hub);
+                let _ = queue_getheaders(out_tx, hub, session, true);
             }
         }
         NetworkMessage::Block(block) => {
             let hash = block.block_hash();
+            if let Some(s) = session {
+                s.note_block_from_peer(hash);
+                s.note_best_known(hash);
+            }
+            if !requested_blocks.contains(&hash) {
+                if hub.header_below_minwork(&block.header) {
+                    rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
+                    return Ok(());
+                }
+                let prev = block.header.prev_blockhash;
+                if prev.to_byte_array() != [0u8; 32]
+                    && !hub.knows_header(&prev)
+                    && !pending_headers.contains_key(&prev)
+                {
+                    return Err(NetError::Protocol(
+                        "unrequested block with missing parent header",
+                    ));
+                }
+                if hub.unrequested_weaker_than_tip(&block.header) {
+                    let _ = hub.ensure_header(&block.header);
+                    return Ok(());
+                }
+                if hub.unrequested_too_far_ahead(&block.header) {
+                    let _ = hub.ensure_header(&block.header);
+                    return Ok(());
+                }
+            }
+            let _ = hub.ensure_header(&block.header);
             pending_cmpct.remove(&hash);
             requested_blocks.remove(&hash);
             pending_headers.entry(hash).or_insert(block.header);
@@ -970,7 +1044,7 @@ async fn handle_peer_frame(
                 .into_iter()
                 .filter(|h| *h != hash)
                 .collect();
-                queue_block_getdata(out_tx, requested_blocks, &ancestors)?;
+                queue_block_getdata(hub, out_tx, requested_blocks, &ancestors)?;
                 if compact_header_low_work(hub, &hsi.header) {
                     let id = session.map(|s| s.id).unwrap_or(0);
                     rbitcoin_log::debug!("Ignoring low-work compact block from peer {id}");
@@ -1074,12 +1148,116 @@ async fn handle_peer_frame(
     Ok(())
 }
 
-fn tip_announce_msg(ev: &crate::chain::TipEvent, peer_wants_headers: bool) -> NetworkMessage {
-    if peer_wants_headers {
-        NetworkMessage::Headers(vec![ev.header])
-    } else {
-        NetworkMessage::Inv(vec![Inventory::WitnessBlock(ev.hash)])
+#[derive(Debug)]
+enum TipAnnounce {
+    Headers(Vec<bitcoin::block::Header>),
+    Inv(BlockHash),
+    Skip,
+}
+
+fn peer_has_header(
+    hub: &ChainHub,
+    sent: Option<BlockHash>,
+    known: Option<BlockHash>,
+    hash: BlockHash,
+) -> bool {
+    if hash.to_byte_array() == [0u8; 32] {
+        return true;
     }
+    for mark in [sent, known].into_iter().flatten() {
+        if mark == hash || hub.is_header_ancestor(hash, mark) {
+            return true;
+        }
+    }
+    false
+}
+
+fn tip_announce_decision(
+    hub: &ChainHub,
+    ev: &crate::chain::TipEvent,
+    wants_headers: bool,
+    best_header_sent: Option<BlockHash>,
+    best_known: Option<BlockHash>,
+    from_this_peer: bool,
+) -> TipAnnounce {
+    if from_this_peer {
+        return TipAnnounce::Skip;
+    }
+    if ev.reorg_branch_len > MAX_BLOCKS_TO_ANNOUNCE {
+        if hub.tip_hash() == Some(ev.hash) {
+            return TipAnnounce::Inv(ev.hash);
+        }
+        return TipAnnounce::Skip;
+    }
+    if !wants_headers {
+        return TipAnnounce::Inv(ev.hash);
+    }
+    if peer_has_header(hub, best_header_sent, best_known, ev.hash) {
+        return TipAnnounce::Skip;
+    }
+    let mut out = vec![ev.header];
+    let mut prev = ev.header.prev_blockhash;
+    if peer_has_header(hub, best_header_sent, best_known, prev) {
+        return TipAnnounce::Headers(out);
+    }
+    for _ in 1..MAX_BLOCKS_TO_ANNOUNCE {
+        let Some(hdr) = hub.header_of(&prev) else {
+            return TipAnnounce::Inv(ev.hash);
+        };
+        out.push(hdr);
+        prev = hdr.prev_blockhash;
+        if peer_has_header(hub, best_header_sent, best_known, prev) {
+            out.reverse();
+            return TipAnnounce::Headers(out);
+        }
+    }
+    TipAnnounce::Inv(ev.hash)
+}
+
+fn header_announcement_connects(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    prev: BlockHash,
+) -> bool {
+    if prev.to_byte_array() == [0u8; 32]
+        || hub.is_connected(&prev)
+        || hub.held_body(&prev).is_some()
+    {
+        return true;
+    }
+    let mut h = prev;
+    for _ in 0..10_000 {
+        if hub.is_connected(&h) || hub.held_body(&h).is_some() {
+            return true;
+        }
+        let Some(hdr) = pending.get(&h) else {
+            return false;
+        };
+        h = hdr.prev_blockhash;
+        if h.to_byte_array() == [0u8; 32] {
+            return true;
+        }
+    }
+    false
+}
+
+fn header_path_join(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) -> Option<BlockHash> {
+    let mut h = start;
+    for _ in 0..10_000 {
+        if hub.is_connected(&h) {
+            return Some(h);
+        }
+        let hdr = pending.get(&h)?;
+        h = hdr.prev_blockhash;
+        if h.to_byte_array() == [0u8; 32] {
+            return None;
+        }
+    }
+    None
 }
 
 /// Compare announced header-chain length (equal-bits ≈ work) to our path
@@ -1190,7 +1368,10 @@ fn missing_blocks_on_header_path(
         if hub.is_connected(&h) {
             break;
         }
-        if !pending_blocks.contains_key(&h) && !requested.contains(&h) {
+        if !pending_blocks.contains_key(&h)
+            && !requested.contains(&h)
+            && !hub.already_have_or_asked_block(&h)
+        {
             path.push(h);
         }
         let Some(hdr) = pending.get(&h) else {
@@ -1476,20 +1657,164 @@ mod tests {
             header,
             reorg_branch_len: 0,
         };
-        match tip_announce_msg(&ev, true) {
-            NetworkMessage::Headers(h) => {
+        let (dir, q) = tmp_store("announce-msg");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        match tip_announce_decision(&hub, &ev, true, None, None, false) {
+            TipAnnounce::Headers(h) => {
                 assert_eq!(h.len(), 1);
                 assert_eq!(h[0].block_hash(), hash);
             }
             other => panic!("expected Headers, got {other:?}"),
         }
-        match tip_announce_msg(&ev, false) {
-            NetworkMessage::Inv(inv) => {
-                assert_eq!(inv.len(), 1);
-                assert!(matches!(inv[0], Inventory::WitnessBlock(h) if h == hash));
-            }
+        match tip_announce_decision(&hub, &ev, false, None, None, false) {
+            TipAnnounce::Inv(h) => assert_eq!(h, hash),
             other => panic!("expected Inv, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tip_announce_inv_after_large_reorg_until_peer_catches_up() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let (dir, q) = tmp_store("announce-reorg");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(8, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let sent_tip = hub.tip_hash().unwrap();
+        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let ext = hub.tip_hash().unwrap();
+        let ext_h = hub.header_of(&ext).unwrap();
+        let ev = crate::chain::TipEvent {
+            height: hub.tip_height().unwrap(),
+            hash: ext,
+            header: ext_h,
+            reorg_branch_len: 0,
+        };
+        match tip_announce_decision(&hub, &ev, true, Some(sent_tip), None, false) {
+            TipAnnounce::Headers(h) => {
+                assert_eq!(h.len(), 1);
+                assert_eq!(h[0].block_hash(), ext);
+            }
+            other => panic!("tip-extend should be headers, got {other:?}"),
+        }
+        match tip_announce_decision(&hub, &ev, true, Some(sent_tip), None, true) {
+            TipAnnounce::Skip => {}
+            other => panic!("from-this-peer must skip, got {other:?}"),
+        }
+
+        let (fork_hash, fork_time) = {
+            let rec = hub
+                .query
+                .header_at_height(rbitcoin_primitives::Height(5))
+                .unwrap()
+                .unwrap();
+            (BlockHash::from_byte_array(rec.1.hash), rec.1.timestamp)
+        };
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            let cb = Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let mut block = bitcoin::Block {
+                header: Header {
+                    version: BlockVersion::from_consensus(4),
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![cb],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        };
+        let mut prev = fork_hash;
+        let mut branch = Vec::new();
+        for i in 0..9u32 {
+            let b = mine(prev, fork_time.saturating_add(600 + i), 6 + i);
+            prev = b.block_hash();
+            branch.push(b);
+        }
+        hub.accept_branch(&branch).unwrap();
+        let new_tip = hub.tip_hash().unwrap();
+        let new_hdr = hub.header_of(&new_tip).unwrap();
+        let reorg_ev = crate::chain::TipEvent {
+            height: hub.tip_height().unwrap(),
+            hash: new_tip,
+            header: new_hdr,
+            reorg_branch_len: 9,
+        };
+        match tip_announce_decision(&hub, &reorg_ev, true, Some(sent_tip), None, false) {
+            TipAnnounce::Inv(h) => assert_eq!(h, new_tip),
+            other => panic!("large reorg must inv tip, got {other:?}"),
+        }
+
+        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let after = hub.tip_hash().unwrap();
+        let after_h = hub.header_of(&after).unwrap();
+        let after_ev = crate::chain::TipEvent {
+            height: hub.tip_height().unwrap(),
+            hash: after,
+            header: after_h,
+            reorg_branch_len: 0,
+        };
+        match tip_announce_decision(&hub, &after_ev, true, Some(sent_tip), None, false) {
+            TipAnnounce::Inv(h) => assert_eq!(h, after),
+            other => panic!("still far from sent mark must inv, got {other:?}"),
+        }
+        match tip_announce_decision(&hub, &after_ev, true, Some(after), None, false) {
+            TipAnnounce::Skip => {}
+            other => panic!("already sent this hash must skip, got {other:?}"),
+        }
+        match tip_announce_decision(
+            &hub,
+            &after_ev,
+            true,
+            None,
+            Some(after_h.prev_blockhash),
+            false,
+        ) {
+            TipAnnounce::Headers(h) => {
+                assert_eq!(h.len(), 1);
+                assert_eq!(h[0].block_hash(), after);
+            }
+            other => panic!("known prev must headers, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1688,7 +2013,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         assert!(queue_out(&tx, NetworkMessage::Verack).is_err());
-        assert!(queue_getheaders(&tx, &hub).is_err());
+        assert!(queue_getheaders(&tx, &hub, None, false).is_err());
 
         // headers_for_peer empty store after genesis still returns (tip exists).
         use bitcoin::p2p::message_blockdata::GetHeadersMessage;
@@ -1902,7 +2227,7 @@ mod tests {
             let headers_msg = out_rx.try_recv().unwrap();
             assert!(matches!(headers_msg, NetworkMessage::Headers(_)));
 
-            // Inv for unknown block → GetData witness block.
+            // Inv for unknown block → GetHeaders (never getdata without a header).
             let want_h = BlockHash::from_byte_array([0xee; 32]);
             handle_peer_frame(
                 frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(want_h)])),
@@ -1923,10 +2248,14 @@ mod tests {
             .await
             .unwrap();
             match out_rx.try_recv().unwrap() {
-                NetworkMessage::GetData(v) => {
-                    assert!(matches!(v[0], Inventory::WitnessBlock(h) if h == want_h));
+                NetworkMessage::GetHeaders(gh) => {
+                    assert!(
+                        !gh.locator_hashes.is_empty() || gh.stop_hash == want_h,
+                        "unknown block inv must getheaders, locators={:?}",
+                        gh.locator_hashes
+                    );
                 }
-                other => panic!("expected GetData, got {other:?}"),
+                other => panic!("expected GetHeaders for unknown inv, got {other:?}"),
             }
 
             // Headers message inserts pending + issues getdata.
@@ -2177,7 +2506,7 @@ mod tests {
             assert!(send_cmpct); // still true from earlier v2
             assert_eq!(cmpct_ver, 2);
 
-            // Inventory::Block (non-witness) for unknown → GetData WitnessBlock.
+            // Inventory::Block (non-witness) for unknown → GetHeaders.
             let want2 = BlockHash::from_byte_array([0xcc; 32]);
             handle_peer_frame(
                 frame_for(NetworkMessage::Inv(vec![Inventory::Block(want2)])),
@@ -2198,10 +2527,8 @@ mod tests {
             .await
             .unwrap();
             match out_rx.try_recv().unwrap() {
-                NetworkMessage::GetData(v) => {
-                    assert!(matches!(v[0], Inventory::WitnessBlock(h) if h == want2));
-                }
-                other => panic!("expected GetData, got {other:?}"),
+                NetworkMessage::GetHeaders(_) => {}
+                other => panic!("expected GetHeaders for unknown inv, got {other:?}"),
             }
 
             // Inv for known tip → no GetData.
@@ -2945,5 +3272,125 @@ mod tests {
         assert!(hub.is_connected(&b1.block_hash()));
         assert!(hub.is_connected(&b2.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inv_of_already_asked_block_does_not_getdata() {
+        // p2p_sendheaders Part 2: test_node announces headers (we getdata),
+        // then inv_node re-invs the same hashes. One getdata in flight globally.
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::Network;
+        use rbitcoin_primitives::Height;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::p2p::message::RawNetworkMessage;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        fn drain_block_getdata(rx: &mut mpsc::UnboundedReceiver<NetworkMessage>) -> Vec<BlockHash> {
+            let mut hashes = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let NetworkMessage::GetData(inv) = m {
+                    for i in inv {
+                        if let Inventory::Block(h) | Inventory::WitnessBlock(h) = i {
+                            hashes.push(h);
+                        }
+                    }
+                }
+            }
+            hashes
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (src_dir, src_q) = tmp_store("inv-asked-src");
+            let src = ChainHub::new(src_q, ChainParams::regtest(), Milestone::NONE);
+            src.ensure_genesis().unwrap();
+            src.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .unwrap();
+            let hdr = src.query.wire_header_at_height(Height(1)).unwrap();
+            let hash = hdr.block_hash();
+
+            let (dir, q) = tmp_store("inv-asked-dst");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::Headers(vec![hdr])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            let first = drain_block_getdata(&mut out_rx);
+            assert_eq!(first, vec![hash], "header announce must getdata once");
+            assert!(hub.already_have_or_asked_block(&hash));
+
+            // Second peer: empty local requested set, same hub (asked_blocks).
+            let (out_tx2, mut out_rx2) = mpsc::unbounded_channel();
+            let mut pending_headers2 = HashMap::new();
+            let mut requested2 = HashSet::new();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(hash)])),
+                &hub,
+                &out_tx2,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers2,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested2,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            let second = drain_block_getdata(&mut out_rx2);
+            assert!(
+                second.is_empty(),
+                "duplicate inv must not getdata, got {second:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(src_dir);
+            let _ = std::fs::remove_dir_all(dir);
+        });
     }
 }

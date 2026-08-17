@@ -3,6 +3,7 @@
 use crate::error::NetError;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::BlockHash;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,8 +67,16 @@ pub struct LivePeer {
     pub hb_from: AtomicBool,
     /// Session should send `sendcmpct`: 0 = none, 1 = off, 2 = on.
     pub pending_sendcmpct: std::sync::atomic::AtomicU8,
-    /// After a large reorg, announce inv until the peer getheaders/inv's us.
-    pub headers_paused: AtomicBool,
+    /// Last header we announced to this peer (Core `pindexBestHeaderSent`).
+    best_header_sent: Mutex<Option<BlockHash>>,
+    /// Best connected block this peer advertised (Core `pindexBestKnownBlock`).
+    best_known: Mutex<Option<BlockHash>>,
+    /// Block hashes this peer just sent us — do not announce them back.
+    recently_from: Mutex<HashSet<BlockHash>>,
+    /// We already sent inv-triggered getheaders this session.
+    inv_asked_headers: AtomicBool,
+    /// Waiting for a headers reply to our getheaders (no BIP130 cap).
+    awaiting_headers: AtomicBool,
     /// Outstanding ping nonce (`0` = none). Core `m_ping_nonce_sent`.
     ping_nonce_sent: AtomicU64,
     /// When the last ping was sent, or `0` if never (`m_ping_start` seconds).
@@ -112,6 +121,58 @@ impl LivePeer {
 
     pub fn set_hb_from(&self, v: bool) {
         self.hb_from.store(v, Ordering::Relaxed);
+    }
+
+    pub fn note_best_header_sent(&self, hash: BlockHash) {
+        *self
+            .best_header_sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hash);
+    }
+
+    pub fn note_best_known(&self, hash: BlockHash) {
+        *self.best_known.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+    }
+
+    pub fn header_marks(&self) -> (Option<BlockHash>, Option<BlockHash>) {
+        (
+            *self
+                .best_header_sent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            *self.best_known.lock().unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    pub fn note_block_from_peer(&self, hash: BlockHash) {
+        let mut g = self.recently_from.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= 256 {
+            g.clear();
+        }
+        g.insert(hash);
+    }
+
+    pub fn take_block_from_peer(&self, hash: &BlockHash) -> bool {
+        self.recently_from
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash)
+    }
+
+    pub fn try_ask_headers_for_inv(&self) -> bool {
+        !self.inv_asked_headers.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn advertises_network(&self) -> bool {
+        self.services & service_flags_u64(ServiceFlags::NETWORK) != 0
+    }
+
+    pub fn note_awaiting_headers(&self) {
+        self.awaiting_headers.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_awaiting_headers(&self) -> bool {
+        self.awaiting_headers.swap(false, Ordering::Relaxed)
     }
 
     pub fn queue_ping(&self) {
@@ -361,7 +422,11 @@ impl PeerHub {
             hb_to: AtomicBool::new(false),
             hb_from: AtomicBool::new(false),
             pending_sendcmpct: std::sync::atomic::AtomicU8::new(0),
-            headers_paused: AtomicBool::new(false),
+            best_header_sent: Mutex::new(None),
+            best_known: Mutex::new(None),
+            recently_from: Mutex::new(HashSet::new()),
+            inv_asked_headers: AtomicBool::new(false),
+            awaiting_headers: AtomicBool::new(false),
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
@@ -520,6 +585,7 @@ pub fn parse_peer_addr(s: &str) -> Result<SocketAddr, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
     use bitcoin::p2p::address::Address;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -566,6 +632,24 @@ mod tests {
         assert!(p.stop.load(Ordering::SeqCst));
         hub.unregister(0);
         assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn skip_announce_of_block_this_peer_sent() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let h = BlockHash::from_byte_array([0xab; 32]);
+        assert!(!p.take_block_from_peer(&h));
+        p.note_block_from_peer(h);
+        assert!(p.take_block_from_peer(&h));
+        assert!(!p.take_block_from_peer(&h));
+        assert!(p.try_ask_headers_for_inv());
+        assert!(!p.try_ask_headers_for_inv());
+        p.note_best_header_sent(h);
+        p.note_best_known(h);
+        assert_eq!(p.header_marks(), (Some(h), Some(h)));
+        assert!(p.advertises_network());
     }
 
     #[test]

@@ -737,12 +737,12 @@ fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
         .query
         .height_of_hash(&hash)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_MISC, "Block not found"))?;
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
     let (_, rec) = ctx
         .query
         .header_at_height(height)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_MISC, "Block not found"))?;
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
     if !verbose {
         let hdr = ctx
             .query
@@ -811,11 +811,50 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         None => opt_verbosity(params, 1, "verbose")?,
     };
     let hash = parse_hash32_display(hash_hex)?;
-    let height = ctx
+    let height = match ctx
         .query
         .height_of_hash(&hash)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_MISC, "Block not found"))?;
+    {
+        Some(h) => h,
+        None => {
+            let typed = BlockHash::from_byte_array(hash);
+            if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
+                if verbosity == 0 {
+                    let mut raw = Vec::new();
+                    block
+                        .consensus_encode(&mut raw)
+                        .map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
+                    return Ok(json!(hex_encode(raw)));
+                }
+                let txids: Vec<String> = block
+                    .txdata
+                    .iter()
+                    .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
+                    .collect();
+                return Ok(json!({
+                    "hash": hash_hex_display(&hash),
+                    "confirmations": -1,
+                    "version": block.header.version.to_consensus(),
+                    "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
+                    "time": block.header.time,
+                    "nonce": block.header.nonce,
+                    "bits": format!("{:08x}", block.header.bits.to_consensus()),
+                    "nTx": block.txdata.len(),
+                    "tx": txids,
+                }));
+            }
+            let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
+                || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
+            if header_only {
+                return Err(rpc_error(
+                    ERR_MISC,
+                    "Block not available (not fully downloaded)",
+                ));
+            }
+            return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"));
+        }
+    };
     let block = ctx
         .query
         .reconstruct_block_at_height(height)
@@ -832,6 +871,16 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .iter()
         .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
         .collect();
+    let prev = if height.0 > 0 {
+        ctx.query
+            .header_at_height(Height(height.0 - 1))
+            .ok()
+            .flatten()
+            .map(|(_, r)| hash_hex_display(&r.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut obj = json!({
         "hash": hash_hex_display(&hash),
         "confirmations": confirmations(ctx, height),
@@ -843,6 +892,7 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
             .unwrap_or(block.header.time),
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", block.header.bits.to_consensus()),
+        "previousblockhash": prev,
         "nTx": block.txdata.len(),
         "tx": txids,
     });
@@ -4064,6 +4114,13 @@ mod tests {
         let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
         let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
         assert_eq!(mined["tx"].as_array().unwrap().len(), 2);
+        let parent = dispatch(
+            &ctx,
+            "getblockhash",
+            vec![json!(mined["height"].as_u64().unwrap() - 1)],
+        )
+        .unwrap();
+        assert_eq!(mined["previousblockhash"], parent);
 
         let scan = dispatch(
             &ctx,

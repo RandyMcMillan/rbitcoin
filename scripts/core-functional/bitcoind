@@ -105,6 +105,7 @@ IGNORE_FLAGS = frozenset(
         "logtimestamps",
         "printpriority",
         "addresstype",
+        "checkblockindex",
     }
 )
 

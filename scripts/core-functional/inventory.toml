@@ -597,7 +597,7 @@ reason = "core-log"
 name = "p2p_compactblocks.py"
 status = "skip"
 reason = "core-log"
-analog = "cmpct v2 + coinbase prefill + getblocktxn + low-work log; full script not unmodified-green"
+analog = "official: wait_for_block_announcement 30s in test_sendcmpct check_announcement_of_new_block (p2p_compactblocks.py:206 / :215); v2/prefill/getblocktxn already shipped"
 
 [[test]]
 name = "p2p_compactblocks_blocksonly.py"
@@ -607,9 +607,7 @@ analog = "follow-up: compact + blocksonly"
 
 [[test]]
 name = "p2p_compactblocks_hb.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "HB slot select + sendcmpct drain shipped; script not unmodified-green"
+status = "run"
 
 [[test]]
 name = "p2p_disconnect_ban.py"
@@ -665,7 +663,7 @@ reason = "core-log"
 name = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
 reason = "core-log"
-analog = "rust pin: [net] Ignoring low-work chain (height=N); inbound header-tree work vs offered height + noban Synchronizing blockheaders unmapped"
+analog = "official: Expected 'Synchronizing blockheaders, height: 14' not found in log (p2p_headers_sync_with_minchainwork.py:62); -checkblockindex ignored"
 
 [[test]]
 name = "p2p_i2p_ports.py"
@@ -691,7 +689,7 @@ reason = "core-log"
 name = "p2p_initial_headers_sync.py"
 status = "skip"
 reason = "core-log"
-analog = "shipped: initial getheaders (0) to peer=0 on connect; Timeout downloading headers / noban / single-recipient getheaders matrix unmapped"
+analog = "official: assert 'getheaders' not in peer2.last_message (p2p_initial_headers_sync.py:94); initial getheaders goes to every inbound peer"
 
 [[test]]
 name = "p2p_invalid_block.py"
@@ -708,8 +706,8 @@ analog = "follow-up: locator bounds"
 [[test]]
 name = "p2p_invalid_messages.py"
 status = "skip"
-reason = "core-log"
-analog = "rust pin: V2 transport error: invalid message type + redundant version; v1 Header error / packet too large / Misbehaving / *other* bytes / noncontinuous headers unmapped"
+reason = "rpc-missing"
+analog = "official: Method not found: getnettotals (p2p_invalid_messages.py:93 test_buffer)"
 
 [[test]]
 name = "p2p_invalid_tx.py"
@@ -804,9 +802,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_sendheaders.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "part 1 inv-before-sendheaders green; part 2+ headers/reorg/direct-fetch still red"
+status = "run"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"
@@ -834,7 +830,7 @@ analog = "follow-up: tx privacy"
 name = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
-analog = "rust pin: AcceptBlockHeader … missing anti-dos proof-of-work validation; unrequested fork + 288-block window + minwork header skip not shipped"
+analog = "official: after minwork anti-dos + weaker header-only + missing-header disconnect + 288 window, sync_with_ping hung 60s sending 288 unrequested bodies (p2p_unrequested_blocks.py:189)"
 
 [[test]]
 name = "p2p_v2_encrypted.py"

@@ -2314,7 +2314,25 @@ mod tests {
             }],
         };
         mp.accept_tx(&spend).expect("mature coinbase spend");
-        assert_eq!(mp.live_count(), 1);
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: spend.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9998_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&child).expect("child of coinbase spend");
+        assert_eq!(mp.live_count(), 2);
 
         // QueryUtxoProvider must see a coinbase at height 1 (same path evict uses).
         let coin = crate::tx_relay::QueryUtxoProvider {
@@ -2332,7 +2350,7 @@ mod tests {
         assert_eq!(
             mp.live_count(),
             0,
-            "invalidate below maturity must evict the coinbase spend"
+            "invalidate below maturity must evict the coinbase spend and its child"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

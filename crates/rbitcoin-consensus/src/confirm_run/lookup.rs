@@ -424,6 +424,14 @@ pub(super) fn stamp_parent_pin_archived(
                 }
             }
         }
+        if let Some((fk, range)) = query.published_ids().get(tid) {
+            if let Some(id) = fk.get() {
+                stamp.create_by_txid.insert(*tid, id);
+                stamp.txids.insert(id, *tid);
+                stamp.ranges.insert(id, range);
+            }
+            continue;
+        }
         need_head.push(*tid);
     }
     need_head.sort_unstable();

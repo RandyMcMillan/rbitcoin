@@ -586,9 +586,15 @@ impl Query {
             }
             if let Some(tid) = first_miss {
                 let pending = self.store.txs.queued_pending_fk(&tid).is_some();
-                crate::archive_phase_stats::note_union_miss(tid, miss_n, pending);
+                let (miss_on, miss_cands) =
+                    rbitcoin_store::head_resolve_stats::take_leftover_miss()
+                        .map(|(on, n)| (Some(on.as_str()), n))
+                        .unwrap_or((None, 0));
+                crate::archive_phase_stats::note_union_miss(
+                    tid, miss_n, pending, miss_on, miss_cands,
+                );
             } else {
-                crate::archive_phase_stats::note_union_miss([0u8; 32], 0, false);
+                crate::archive_phase_stats::note_union_miss([0u8; 32], 0, false, None, 0);
             }
         }
         let head_fk_ns = t_head.elapsed().as_nanos() as u64;

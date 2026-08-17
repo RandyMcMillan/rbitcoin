@@ -61,6 +61,7 @@ pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
+pub use head_resolve_pick::{classify_leftover_miss, LeftoverMissOn};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use height_fence::{FenceRun, HeightFence};

@@ -101,6 +101,52 @@ pub(crate) fn partition_cands_age0(
     (age0, older)
 }
 
+/// Which lookup table a TipOnly leftover miss failed on.
+///
+/// Confirm leftover is `tx.head` probe → `txid.body` identity → fence → `tx.idx`
+/// range. The operator line names the first table that did not produce a usable
+/// fact. `idx` is connected identity with no published range (usually Corrupt
+/// before leftover); included so a silent range miss is not labeled `head`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftoverMissOn {
+    /// No probe candidates (hot + cold).
+    Head,
+    /// Probe cands, no `txid.body` match for the wanted txid.
+    Body,
+    /// Connected identity, no `tx.idx` / `txout.idx` body range.
+    Idx,
+    /// Identity match exists, no fence height (TipOnly drops it).
+    Fence,
+}
+
+impl LeftoverMissOn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Body => "body",
+            Self::Idx => "idx",
+            Self::Fence => "fence",
+        }
+    }
+}
+
+/// Classify a TipOnly leftover miss from facts the resolve machine already has.
+pub fn classify_leftover_miss(
+    n_cands: usize,
+    had_identity: bool,
+    connected: bool,
+) -> LeftoverMissOn {
+    if n_cands == 0 {
+        LeftoverMissOn::Head
+    } else if !had_identity {
+        LeftoverMissOn::Body
+    } else if !connected {
+        LeftoverMissOn::Fence
+    } else {
+        LeftoverMissOn::Idx
+    }
+}
+
 /// How many of the filled prefix peeks missed the wanted txid (for `miss_peeks`).
 pub(crate) fn miss_peeks_in_prefix(
     cands: &[Fk],
@@ -185,6 +231,27 @@ mod tests {
         let (fk, rank) = pick_winner(&cands, 1, &want, &map, None).unwrap();
         assert_eq!((fk, rank), (Fk(1), 1));
         assert!(next_id_cand(&cands, 1, &want, &map, None).is_none());
+    }
+
+    #[test]
+    fn leftover_miss_classifies_head_body_idx_fence() {
+        assert_eq!(
+            classify_leftover_miss(0, false, false),
+            LeftoverMissOn::Head
+        );
+        assert_eq!(
+            classify_leftover_miss(3, false, false),
+            LeftoverMissOn::Body
+        );
+        assert_eq!(
+            classify_leftover_miss(3, true, false),
+            LeftoverMissOn::Fence
+        );
+        assert_eq!(classify_leftover_miss(3, true, true), LeftoverMissOn::Idx);
+        assert_eq!(LeftoverMissOn::Head.as_str(), "head");
+        assert_eq!(LeftoverMissOn::Body.as_str(), "body");
+        assert_eq!(LeftoverMissOn::Idx.as_str(), "idx");
+        assert_eq!(LeftoverMissOn::Fence.as_str(), "fence");
     }
 
     #[test]

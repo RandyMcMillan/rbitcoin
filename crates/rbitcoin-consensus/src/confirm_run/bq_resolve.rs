@@ -633,6 +633,12 @@ mod tests {
             !msg.contains("invariant: external parent missing BQ TipOnly hit"),
             "leftover miss is unresolved, not the old forbid-head invariant: {msg}"
         );
+        let miss = rbitcoin_query::archive_phase_stats::last_union_miss();
+        assert_eq!(
+            miss.miss_on,
+            Some("fence"),
+            "disconnected leftover is identity-without-fence, not a head miss: {miss:?}"
+        );
         let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
         assert!(
             last.head_need > 0,

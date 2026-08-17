@@ -50,6 +50,28 @@ pub fn resolve_fk_and_range_batch_with_tip(
     resolve_fk_and_range_batch_opts(table, txids, Some(heights), tip_only)
 }
 
+fn note_first_leftover_miss(
+    tip_only: bool,
+    winner: &[Option<(Fk, (u64, u64))>],
+    connected: &[bool],
+    n_cands: &[usize],
+    had_id: &[bool],
+) {
+    crate::head_resolve_stats::clear_leftover_miss();
+    if !tip_only {
+        return;
+    }
+    for i in 0..winner.len() {
+        if winner[i].is_some() {
+            continue;
+        }
+        let on =
+            crate::head_resolve_pick::classify_leftover_miss(n_cands[i], had_id[i], connected[i]);
+        crate::head_resolve_stats::note_leftover_miss(on, n_cands[i] as u64);
+        return;
+    }
+}
+
 fn resolve_fk_and_range_batch_opts(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -57,6 +79,7 @@ fn resolve_fk_and_range_batch_opts(
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     if txids.is_empty() {
+        crate::head_resolve_stats::clear_leftover_miss();
         return Ok(Vec::new());
     }
     match io_backend::read_io_backend() {
@@ -106,6 +129,8 @@ fn resolve_fk_and_range_pread(
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut connected = vec![false; txids.len()];
+    let mut n_cands = vec![0usize; txids.len()];
+    let mut had_id = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
@@ -120,6 +145,9 @@ fn resolve_fk_and_range_pread(
     let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(hot_cands.iter().map(|c| c.len() as u64).sum());
+    for (i, c) in hot_cands.iter().enumerate() {
+        n_cands[i] = n_cands[i].saturating_add(c.len());
+    }
     let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
     id_idx_wave(
         table,
@@ -137,6 +165,7 @@ fn resolve_fk_and_range_pread(
         &first_fks,
         &mut local_age,
         None,
+        &mut had_id,
     )?;
     id_idx_wave(
         table,
@@ -154,6 +183,7 @@ fn resolve_fk_and_range_pread(
         &first_fks,
         &mut local_age,
         None,
+        &mut had_id,
     )?;
 
     // Wave 2: cold depth for keys that are still unfinished.
@@ -176,6 +206,9 @@ fn resolve_fk_and_range_pread(
         let cold_cands = table.head.probe_candidates_batch_cold(&mixed, &active)?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(cold_cands.iter().map(|c| c.len() as u64).sum());
+        for (i, c) in cold_cands.iter().enumerate() {
+            n_cands[i] = n_cands[i].saturating_add(c.len());
+        }
         id_idx_wave(
             table,
             txids,
@@ -192,6 +225,7 @@ fn resolve_fk_and_range_pread(
             &first_fks,
             &mut local_age,
             None,
+            &mut had_id,
         )?;
     }
     if tip_only && heights.is_some() {
@@ -201,6 +235,7 @@ fn resolve_fk_and_range_pread(
             }
         }
     }
+    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_cands(cands_total);
@@ -456,6 +491,7 @@ fn id_idx_wave(
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
     mut session: Option<&mut UringSession>,
+    had_id: &mut [bool],
 ) -> Result<(), StoreError> {
     use crate::head_resolve_pick::{miss_peeks_in_prefix, next_id_cand, pick_winner};
     use std::collections::HashMap;
@@ -511,6 +547,9 @@ fn id_idx_wave(
             &txids[ki],
             &id_map,
         ));
+        if pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, None).is_some() {
+            had_id[ki] = true;
+        }
         if let Some((fk, rank)) =
             pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
         {
@@ -622,6 +661,8 @@ fn resolve_fk_and_range_uring_on(
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
+    let mut n_cands = vec![0usize; txids.len()];
+    let mut had_id = vec![false; txids.len()];
 
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
@@ -637,6 +678,9 @@ fn resolve_fk_and_range_uring_on(
         .probe_candidates_batch_hot_on_session(&mixed, session)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(hot_cands.iter().map(|v| v.len() as u64).sum());
+    for (i, c) in hot_cands.iter().enumerate() {
+        n_cands[i] = n_cands[i].saturating_add(c.len());
+    }
     debug_assert_eq!(session.in_flight(), 0);
 
     let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
@@ -656,6 +700,7 @@ fn resolve_fk_and_range_uring_on(
         &first_fks,
         &mut local_age,
         Some(session),
+        &mut had_id,
     )?;
     id_idx_wave(
         table,
@@ -673,6 +718,7 @@ fn resolve_fk_and_range_uring_on(
         &first_fks,
         &mut local_age,
         Some(session),
+        &mut had_id,
     )?;
 
     // ── Wave 2: full cold head for unfinished keys + ID/IDX ───────────────
@@ -696,6 +742,9 @@ fn resolve_fk_and_range_uring_on(
             .probe_candidates_batch_cold_on_session(&mixed, &active, session)?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(cold_cands.iter().map(|v| v.len() as u64).sum());
+        for (i, c) in cold_cands.iter().enumerate() {
+            n_cands[i] = n_cands[i].saturating_add(c.len());
+        }
         debug_assert_eq!(session.in_flight(), 0);
 
         id_idx_wave(
@@ -714,6 +763,7 @@ fn resolve_fk_and_range_uring_on(
             &first_fks,
             &mut local_age,
             Some(session),
+            &mut had_id,
         )?;
     }
     if tip_only && heights.is_some() {
@@ -723,6 +773,7 @@ fn resolve_fk_and_range_uring_on(
             }
         }
     }
+    note_first_leftover_miss(tip_only, winner, connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_idx(idx_ns);

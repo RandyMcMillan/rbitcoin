@@ -16,6 +16,7 @@
 //! No separate wave1/wave2 counters: under current policy, winners at age ≤ 3 are
 //! wave1 hits; age ≥ 4 are wave2. Hist is over **resolved** keys only (`hit_n`).
 
+use crate::head_resolve_pick::LeftoverMissOn;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Histogram buckets for winner sealed-age (last bucket is ages ≥ CAP−1).
@@ -38,6 +39,53 @@ static HIT_RANK_N: AtomicU64 = AtomicU64::new(0);
 static MISS_PEEKS: AtomicU64 = AtomicU64::new(0);
 /// Keys resolved from the unflushed head-insert map (write-behind).
 static PENDING_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// First TipOnly leftover miss in the last resolve batch (`0` = none).
+/// 1=head 2=body 3=idx 4=fence — see [`LeftoverMissOn`].
+static LAST_MISS_ON: AtomicU64 = AtomicU64::new(0);
+static LAST_MISS_CANDS: AtomicU64 = AtomicU64::new(0);
+
+fn miss_on_code(on: LeftoverMissOn) -> u64 {
+    match on {
+        LeftoverMissOn::Head => 1,
+        LeftoverMissOn::Body => 2,
+        LeftoverMissOn::Idx => 3,
+        LeftoverMissOn::Fence => 4,
+    }
+}
+
+fn miss_on_from_code(code: u64) -> Option<LeftoverMissOn> {
+    match code {
+        1 => Some(LeftoverMissOn::Head),
+        2 => Some(LeftoverMissOn::Body),
+        3 => Some(LeftoverMissOn::Idx),
+        4 => Some(LeftoverMissOn::Fence),
+        _ => None,
+    }
+}
+
+/// Clear leftover-miss classification (start of a resolve batch).
+pub fn clear_leftover_miss() {
+    LAST_MISS_ON.store(0, Ordering::Relaxed);
+    LAST_MISS_CANDS.store(0, Ordering::Relaxed);
+}
+
+/// Record the first leftover miss in this batch (later calls ignored).
+pub fn note_leftover_miss(on: LeftoverMissOn, n_cands: u64) {
+    if LAST_MISS_ON
+        .compare_exchange(0, miss_on_code(on), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        LAST_MISS_CANDS.store(n_cands, Ordering::Relaxed);
+    }
+}
+
+/// Last leftover miss table + probe cand count (`None` if the batch hit every key).
+pub fn take_leftover_miss() -> Option<(LeftoverMissOn, u64)> {
+    let code = LAST_MISS_ON.swap(0, Ordering::Relaxed);
+    let cands = LAST_MISS_CANDS.swap(0, Ordering::Relaxed);
+    miss_on_from_code(code).map(|on| (on, cands))
+}
 
 /// Winner sealed-age histogram (index = age from tip; last bucket is tail).
 static AGE_HIT: [AtomicU64; AGE_CAP] = [const { AtomicU64::new(0) }; AGE_CAP];

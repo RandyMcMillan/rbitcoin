@@ -2205,6 +2205,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Unknown prev_txid: no probe cands → leftover miss is `head`, not body/idx.
+    #[test]
+    fn tiponly_unknown_txid_miss_on_head() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let miss = [0x11u8; 32];
+        let hits = s.get_fk_by_txid_batch(&[miss]).unwrap();
+        assert!(hits[0].1.is_none());
+        let (on, cands) = crate::head_resolve_stats::take_leftover_miss().expect("classified");
+        assert_eq!(on, crate::LeftoverMissOn::Head);
+        assert_eq!(cands, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Head + txid.body exist, no fence run → TipOnly leftover miss is `fence`.
+    #[test]
+    fn tiponly_unconnected_identity_miss_on_fence() {
+        use crate::tx_table::OutputRecord;
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let txid = [0x22u8; 32];
+        let rec = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let _fk = s
+            .put_tx_full_batch_indexed(
+                &[(rec, vec![], vec![OutputRecord::unspent(1, vec![0x51])])],
+                true,
+            )
+            .unwrap()[0];
+        let hits = s.get_fk_by_txid_batch(&[txid]).unwrap();
+        assert!(
+            hits[0].1.is_none(),
+            "TipOnly must drop unconnected identity"
+        );
+        let (on, cands) = crate::head_resolve_stats::take_leftover_miss().expect("classified");
+        assert_eq!(on, crate::LeftoverMissOn::Fence);
+        assert!(
+            cands >= 1,
+            "open-head probe must have produced the create fk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Leftover TipOnly must not hold the fence lock across head IO — clone.
     #[test]
     fn leftover_batch_clones_fence_before_resolve() {

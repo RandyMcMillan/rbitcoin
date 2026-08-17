@@ -681,6 +681,9 @@ pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
                 ));
             }
             s.push_str(&format!(" pending={}", u8::from(miss.pending)));
+            if let Some(on) = miss.miss_on {
+                s.push_str(&format!(" miss_on={} miss_cands={}", on, miss.miss_cands));
+            }
         }
         s.push(')');
         s

@@ -98,6 +98,28 @@ fn resolve_inwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
     }
 }
 
+fn dir_file_bytes(root: &Path) -> u64 {
+    fn walk(p: &Path, acc: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let Ok(meta) = ent.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path, acc);
+            } else if meta.is_file() {
+                *acc = acc.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut n = 0;
+    walk(root, &mut n);
+    n
+}
+
 fn write_inwit_reloc(hot: &Path) -> Result<(), StoreError> {
     let p = inwit_reloc_path(hot);
     if p.exists() {
@@ -296,6 +318,16 @@ impl Store {
     /// Cold store directory when inwit is split (`{datadir-cold}/store`).
     pub fn cold_path(&self) -> Option<&Path> {
         self.cold_path.as_deref()
+    }
+
+    /// Sum of regular file lengths under the hot store and, when split, the
+    /// cold inwit directory. Used by `getblockchaininfo.size_on_disk`.
+    pub fn datadir_bytes(&self) -> u64 {
+        let mut n = dir_file_bytes(&self.path);
+        if let Some(cold) = &self.cold_path {
+            n = n.saturating_add(dir_file_bytes(cold));
+        }
+        n
     }
 
     pub fn tip_height(&self) -> Option<Height> {
@@ -2882,6 +2914,10 @@ mod tests {
         drop(s);
         let s = Store::open_layout(StoreLayout::with_cold(&hot, &cold)).unwrap();
         assert_eq!(s.cold_path(), Some(cold.as_path()));
+        let hot_n = dir_file_bytes(&hot);
+        let cold_n = dir_file_bytes(&cold);
+        assert!(hot_n > 0 && cold_n > 0);
+        assert_eq!(s.datadir_bytes(), hot_n.saturating_add(cold_n));
         let _ = std::fs::remove_dir_all(&root);
     }
 

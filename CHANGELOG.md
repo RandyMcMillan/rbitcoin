@@ -43,6 +43,10 @@ before 1.0).
 
 ### Changed
 
+- **`getblockchaininfo` disk / progress:** `size_on_disk` is a walk of
+  store file lengths (plus cold inwit when split). `verificationprogress`
+  is `blocks / headers` (1.0 when headers is 0), not a dummy 0.5 / 1.0.
+
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
   `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
   never. Stratum / wallet keys stay non-goals.

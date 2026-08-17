@@ -368,7 +368,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     &mut need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
-                    Some(p.parent_store.as_ref()),
                     Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
@@ -377,7 +376,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     &mut need,
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
-                    None,
                     None,
                 )
                 .map_err(ConsensusError::from)?,

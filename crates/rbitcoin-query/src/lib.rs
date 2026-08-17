@@ -16,6 +16,7 @@ mod scripthash;
 mod sh_builder;
 mod soft_densify;
 mod sp_tweaks;
+mod stamp;
 mod wave_prevout;
 
 pub use combined_stage::{body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate};
@@ -136,6 +137,7 @@ pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
+pub use stamp::{fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp};
 pub use wave_prevout::ThinInput;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).

@@ -887,7 +887,6 @@ mod tests {
                 1,
                 &rbitcoin_query::InFlightView::empty(),
                 None,
-                None,
             )
             .expect_err("disconnected leftover must not TipThenAny-fill");
         let msg = err.to_string();

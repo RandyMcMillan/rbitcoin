@@ -54,8 +54,9 @@ pub const MAX_PROBE: u32 = 1024;
 /// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
 pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
 
-/// Give the sole writer time to finish a 4 KiB `pwrite`, then fail closed.
-const PAGE_SEQ_RETRIES: u32 = 64;
+/// Give the sole writer time to finish a 4 KiB `pwrite` (CI can preempt
+/// mid-syscall). Then fail closed so a panic between odd/even cannot livelock.
+const PAGE_SEQ_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! {
@@ -749,25 +750,28 @@ impl AddressHead {
             return Ok(0);
         }
         let seq_i = self.page_seq_index(page_base);
-        for attempt in 0..PAGE_SEQ_RETRIES {
+        let t0 = std::time::Instant::now();
+        let mut spins = 0u32;
+        loop {
             let s1 = self.page_seq[seq_i].load(Ordering::Acquire);
-            if s1 % 2 == 1 {
-                if attempt >= 8 {
-                    std::thread::yield_now();
+            if s1 % 2 == 0 {
+                // libc pread only — this runs under the probe TLS ring on retry.
+                self.file.read_at(off, &mut buf[..need])?;
+                let s2 = self.page_seq[seq_i].load(Ordering::Acquire);
+                if s1 == s2 {
+                    return Ok(need);
                 }
-                continue;
             }
-            // libc pread only — this runs under the probe TLS ring on retry.
-            self.file.read_at(off, &mut buf[..need])?;
-            let s2 = self.page_seq[seq_i].load(Ordering::Acquire);
-            if s1 == s2 {
-                return Ok(need);
+            if t0.elapsed() >= PAGE_SEQ_WAIT {
+                return Err(StoreError::Corrupt("open head page seqlock"));
             }
-            if attempt >= 8 {
+            spins = spins.saturating_add(1);
+            if spins < 1024 {
+                std::hint::spin_loop();
+            } else {
                 std::thread::yield_now();
             }
         }
-        Err(StoreError::Corrupt("open head page seqlock"))
     }
 
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {

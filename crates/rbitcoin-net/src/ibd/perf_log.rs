@@ -10,7 +10,7 @@
 //! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
 //!
-//! **Pins:** pipeline-local (plan batch_pin / BatchParents / external_parent_outs).
+//! **Pins:** pipeline-local (plan batch_pin / BatchParents).
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.

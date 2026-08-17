@@ -1,253 +1,20 @@
-//! Lookup / stamp / denserels warm for wire confirm.
+//! Lookup / stamp for wire confirm.
 
 use super::*;
 
-/// Stats from lookup-stage denserels ensure (external parents → plan-local).
+/// Pin-stage denserels mix (`pin_for_wire_batch`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already had denserels in plan.external_parent_outs or in-flight.
+    /// Already covered via in-flight / same-batch / pstore adopt.
     pub already: u32,
-    /// Cold denserels body loads (into plan-local only).
+    /// Cold denserels body loads (`txout` by stamped range). Always 0 on the
+    /// shipped pin path — range-fill is `PIN_NEW`, not this field.
     pub cold: u32,
     /// Same-batch plan creates (offline denserels at pin).
     pub same_batch: u32,
     pub work_ns: u64,
-}
-
-/// External parents only: one `OutsDenserels` cold load into
-/// **`plan.external_parent_outs`** (pipeline-local).
-///
-/// Parent create_fks come from **plan-stamped** inputs (and in-flight). No head
-/// resolve here — plan already stamped via batch + head. Same-batch creates are
-/// skipped (pin uses offline denserels).
-///
-/// After this returns, load pin must see every external parent covered via
-/// plan-local map, in-flight, or same-batch (no cold denserels dual path on load).
-pub fn ensure_external_parent_denserels_from_plan(
-    query: &Query,
-    plan: Option<&mut rbitcoin_query::ArchiveWritePlan>,
-    in_flight: Option<&rbitcoin_query::InFlightView>,
-) -> Result<DenserelsWarmStats, ConsensusError> {
-    use rbitcoin_query::confirm_load_stats;
-    use rbitcoin_store::IdxBodyMode;
-    use std::sync::atomic::Ordering;
-
-    let t0 = Instant::now();
-    let mut st = DenserelsWarmStats::default();
-    let Some(plan) = plan else {
-        st.work_ns = t0.elapsed().as_nanos() as u64;
-        return Ok(st);
-    };
-
-    let mut batch_create_ids: U64Map<()> = U64Map::default();
-    for fk in &plan.planned_fks {
-        if let Some(id) = fk.get() {
-            batch_create_ids.insert(id, ());
-        }
-    }
-
-    // Reverse map from wire prev_txid (lookup stamp may omit it on synthetic plans).
-    let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
-    let t_collect = Instant::now();
-    for ((_pin, ins), _) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-        for inp in ins {
-            if inp.is_coinbase() || inp.prev_index == u32::MAX {
-                continue;
-            }
-            if let Some(pid) = inp.create_fk.get() {
-                parent_vouts.entry(pid).or_default().push(inp.prev_index);
-                if inp.prev_txid != [0u8; 32] {
-                    plan.external_parent_txids
-                        .entry(pid)
-                        .or_insert(inp.prev_txid);
-                }
-            }
-        }
-    }
-    for vouts in parent_vouts.values_mut() {
-        vouts.sort_unstable();
-        vouts.dedup();
-    }
-    let collect_ns = t_collect.elapsed().as_nanos() as u64;
-
-    let mut cold_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    for (id, _need) in &parent_vouts {
-        if batch_create_ids.contains_key(id) {
-            st.same_batch = st.same_batch.saturating_add(1);
-            continue;
-        }
-        st.parents = st.parents.saturating_add(1);
-        let fk = rbitcoin_primitives::Fk(*id);
-        if plan
-            .external_parent_outs
-            .get(id)
-            .is_some_and(|pin| !pin.1.is_empty())
-        {
-            st.already = st.already.saturating_add(1);
-            continue;
-        }
-        if let Some(ifo) = in_flight {
-            if ifo.get_out(*id).is_some_and(|pin| !pin.1.is_empty()) {
-                st.already = st.already.saturating_add(1);
-                continue;
-            }
-        }
-        cold_fks.push(fk);
-    }
-    cold_fks.sort_unstable_by_key(|f| f.0);
-    cold_fks.dedup();
-    st.cold = cold_fks.len() as u32;
-
-    let mut cold_io_ns = 0u64;
-    if !cold_fks.is_empty() {
-        let t_io = Instant::now();
-        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
-            Vec::new();
-        let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
-        for fk in &cold_fks {
-            let id = fk.get().unwrap_or(0);
-            if let Some(&range) = plan.external_parent_ranges.get(&id) {
-                let tid = known_create_txid_load(id, Some(plan))?;
-                let need = parent_vouts.get(&id).cloned().unwrap_or_default();
-                by_range.push((*fk, range, tid, need));
-            } else {
-                need_idx.push(*fk);
-            }
-        }
-        if !by_range.is_empty() {
-            let n_range = by_range.len() as u64;
-            let (decoded, body_ns, dec_ns) = query
-                .store()
-                .get_outs_by_range_batch(&by_range)
-                .map_err(ConsensusError::from)?;
-            let rng_ns = body_ns.saturating_add(dec_ns);
-            if rng_ns > 0 {
-                confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
-            }
-            if body_ns > 0 {
-                confirm_load_stats::COLD_RANGE_BODY_NS.fetch_add(body_ns, Ordering::Relaxed);
-            }
-            if dec_ns > 0 {
-                confirm_load_stats::COLD_RANGE_DECODE_NS.fetch_add(dec_ns, Ordering::Relaxed);
-            }
-            confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            for ((_fk, _range, _tid, need), row) in by_range.into_iter().zip(decoded.into_iter()) {
-                let Some(id) = _fk.get() else {
-                    continue;
-                };
-                let Some((tx, live, _sparse)) = row else {
-                    continue;
-                };
-                let _ = need;
-                plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, live)));
-            }
-            confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
-        }
-        if !need_idx.is_empty() {
-            let t_idx = Instant::now();
-            let loaded =
-                rbitcoin_query::load_creates_once(query.store(), &need_idx, IdxBodyMode::Outs)
-                    .map_err(ConsensusError::from)?;
-            let idx_ns = t_idx.elapsed().as_nanos() as u64;
-            let n_idx = loaded.len() as u64;
-            if idx_ns > 0 {
-                confirm_load_stats::COLD_IDX_NS.fetch_add(idx_ns, Ordering::Relaxed);
-            }
-            if n_idx > 0 {
-                confirm_load_stats::COLD_IDX_N.fetch_add(n_idx, Ordering::Relaxed);
-            }
-            confirm_load_stats::BODY_TX_READS.fetch_add(n_idx, Ordering::Relaxed);
-            confirm_load_stats::FULL_TX_READS.fetch_add(n_idx, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW.fetch_add(n_idx, Ordering::Relaxed);
-            for c in loaded {
-                let Some(id) = c.fk.get() else {
-                    continue;
-                };
-                let (mut tx, outs, dens) = if let Some(dec) = c.decoded_outs {
-                    dec
-                } else {
-                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                        &c.raw,
-                        Some(query.store().txs.store_secret()),
-                    )
-                    .map_err(|_| {
-                        ConsensusError::Store(StoreError::Corrupt(
-                            "invariant: lookup stage external parent denserels decode failed",
-                        ))
-                    })?
-                };
-                fill_create_txid_load(&mut tx, id, Some(plan))?;
-                let need = parent_vouts.get(&id).cloned().unwrap_or_default();
-                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = if need.is_empty() {
-                    outs.into_iter()
-                        .enumerate()
-                        .map(|(i, o)| (i as u32, o))
-                        .collect()
-                } else {
-                    need.iter()
-                        .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                        .collect()
-                };
-                let _sparse = if need.is_empty() {
-                    dens.into_iter()
-                        .enumerate()
-                        .filter(|(_, r)| *r != rbitcoin_query::SPENDER_REL_UNKNOWN)
-                        .map(|(i, r)| (i as u32, r))
-                        .collect()
-                } else {
-                    rbitcoin_query::sparse_spender_rels(&dens, &need)
-                };
-                plan.external_parent_outs
-                    .insert(id, std::sync::Arc::new((tx, live)));
-            }
-        }
-        cold_io_ns = t_io.elapsed().as_nanos() as u64;
-        if cold_io_ns > 0 {
-            confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
-        }
-        // Union miss is Corrupt: every cold parent must be a plan-local sparse pin.
-        for fk in &cold_fks {
-            let id = fk.get().unwrap_or(0);
-            if plan
-                .external_parent_outs
-                .get(&id)
-                .is_none_or(|pin| pin.1.is_empty())
-            {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: lookup stage failed to load external parent denserels",
-                )));
-            }
-        }
-    }
-
-    st.work_ns = t0.elapsed().as_nanos() as u64;
-    lookup_stage_stats::note(
-        0,
-        st.parents as u64,
-        st.already as u64,
-        st.cold as u64,
-        st.same_batch as u64,
-        0,
-        collect_ns,
-        0,
-        cold_io_ns,
-    );
-    if st.work_ns > 0 {
-        confirm_load_stats::PARENT_PIN_NS.fetch_add(st.work_ns, Ordering::Relaxed);
-        confirm_load_stats::NS.fetch_add(st.work_ns, Ordering::Relaxed);
-    }
-    if st.parents > 0 {
-        confirm_load_stats::PARENT_UNIQUE.fetch_add(st.parents as u64, Ordering::Relaxed);
-    }
-    if st.already > 0 {
-        confirm_load_stats::PIN_CACHE_BODY.fetch_add(st.already as u64, Ordering::Relaxed);
-    }
-    Ok(st)
 }
 
 /// Lookup-stamped external parent material for load body denserels.
@@ -501,11 +268,11 @@ pub(super) fn stamp_parent_pin_archived(
     Ok(stamp)
 }
 
-/// IBD **load** after lookup denserels ensure: pin + assemble.
+/// IBD **load** after lookup stamp: pin + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.
-/// Single path: denserels by body range from lookup stamp (plan-local or
-/// plan=None `ParentPinStamp`). Never cold dual-path denserels / txid.body on load.
+/// Single path: denserels by body range from lookup stamp (`ParentPinStamp` /
+/// plan ranges). Never cold dual-path denserels / txid.body on load.
 pub fn confirm_wire_load_from_plan(
     query: &Query,
     params: &ChainParams,
@@ -918,28 +685,6 @@ pub mod lookup_stage_stats {
     }
 }
 
-/// Create identity for **load** pin denserels: plan stamp reverse map only.
-///
-/// **Load never reads `txid.body`.** Lookup stamps `external_parent_txids` from
-/// wire `prev_txid` (or lookup-side `txid.body` for plan=None rehydrate). Missing
-/// identity here is a lookup miss, not a sidefile fallback.
-#[inline]
-pub(super) fn known_create_txid_load(
-    create_fk_id: u64,
-    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-) -> Result<[u8; 32], ConsensusError> {
-    if let Some(p) = plan {
-        if let Some(tid) = p.external_parent_txid(create_fk_id) {
-            if tid != [0u8; 32] {
-                return Ok(tid);
-            }
-        }
-    }
-    Err(ConsensusError::Store(StoreError::Corrupt(
-        "invariant: lookup stage miss (load parent create identity not stamped)",
-    )))
-}
-
 /// Lookup-side identity fill: plan RAM first, else `txid.body` (lookup may read
 /// the sidefile; load must not call this).
 #[inline]
@@ -966,18 +711,4 @@ pub(super) fn known_create_txid_lookup(
         )));
     }
     Ok(tid)
-}
-
-/// Schema-13 denserels decode leaves zero identity — stamp from plan RAM only (load).
-#[inline]
-pub(super) fn fill_create_txid_load(
-    tx: &mut rbitcoin_store::TxRecord,
-    create_fk_id: u64,
-    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-) -> Result<(), ConsensusError> {
-    if tx.txid != [0u8; 32] {
-        return Ok(());
-    }
-    tx.txid = known_create_txid_load(create_fk_id, plan)?;
-    Ok(())
 }

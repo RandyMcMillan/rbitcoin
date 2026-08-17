@@ -1993,7 +1993,7 @@ fn wire_prep_external_parent_denserels_cold_class_a() {
         .expect("parent head");
     let _ = parent_fk;
 
-    // Prep A/B: external parent denserels from Class A (plan-local / cold).
+    // Prep A/B: external parent denserels from Class A (pin by stamped range).
     let mat_a = confirm_wire_load_phase(
         &q,
         &params,
@@ -2156,8 +2156,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
     // Prep freezes plan after pin; only sparse BatchParents remains.
     assert!(
-        plan_a.external_parent_outs.is_empty(),
-        "post-pin plan must not retain external sparse outs on load→scripts→write handoff"
+        plan_a.external_parent_ranges.is_empty() && plan_a.external_parent_txids.is_empty(),
+        "post-pin plan must not retain stamp staging on load→scripts→write handoff"
     );
     // packed pin half and batch_pin share CreatePin Arc (no outs double-store).
     assert_eq!(plan_a.batch_pin.len(), plan_a.packed.len());

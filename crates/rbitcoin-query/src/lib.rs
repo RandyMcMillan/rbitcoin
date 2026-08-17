@@ -121,7 +121,7 @@ pub mod process_mem_stats {
     }
 }
 
-pub use archive::{ArchiveWritePlan, CreatePin, SparseExternalPin};
+pub use archive::{ArchiveWritePlan, CreatePin};
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
@@ -151,11 +151,11 @@ pub mod confirm_load_stats {
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin filled from same-batch / plan-local (no Class A re-decode).
+    /// Pin filled from same-batch / in-flight / pstore adopt (no Class A re-decode).
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
     /// Wire plan / in-flight parent pins (subset of pin_cache; not denserels hits).
     pub static PIN_PLAN: AtomicU64 = AtomicU64::new(0);
-    /// Pin candidates that missed same-batch / plan-local (cold denserels).
+    /// Pin candidates that missed same-batch / in-flight / adopt (cold denserels).
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);

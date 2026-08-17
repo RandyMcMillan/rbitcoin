@@ -54,8 +54,7 @@ pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
-    ensure_external_parent_denserels_from_plan, DenserelsWarmStats, ParentPinStamp,
-    PlanStampOutcome,
+    DenserelsWarmStats, ParentPinStamp, PlanStampOutcome,
 };
 use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
 use phases::{assemble_run, script_wave};

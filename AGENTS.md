@@ -86,8 +86,8 @@ If a change seems to require collapsing a machine, **stop and ask**.
 
 ### Pins: pipeline-local only
 
-Pin material is **plan / batch only** (`batch_pin`, `BatchParents`, plan-local
-sparse `external_parent_outs`). No process create pin FIFO. IBD confirm intake
+Pin material is **plan / batch only** (`batch_pin`, `BatchParents`). No process
+create pin FIFO. IBD confirm intake
 is **body queue wire only** → lookup → load.
 
 Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**

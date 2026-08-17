@@ -2,8 +2,8 @@
 //!
 //! Production confirm load calls [`load_creates_once`] for Class A create decode
 //! and pin_new denserels. Always idx→body with `range=None` (no process pin FIFO).
-//! Pipeline pins live on the plan (`batch_pin`, `BatchParents`, plan-local
-//! `external_parent_outs`); ancient parents use cold Class A.
+//! Pipeline pins live on the plan (`batch_pin`, `BatchParents`); ancient
+//! parents use cold Class A by stamped range.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{

@@ -139,18 +139,18 @@ fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -
             buf: *mut u8,
             n: u32,
             got: *mut u32,
-            ov: *mut Overlapped,
+            ov: *mut core::ffi::c_void,
         ) -> i32;
         fn WriteFile(
             h: *mut core::ffi::c_void,
             buf: *const u8,
             n: u32,
             got: *mut u32,
-            ov: *mut Overlapped,
+            ov: *mut core::ffi::c_void,
         ) -> i32;
         fn GetOverlappedResult(
             h: *mut core::ffi::c_void,
-            ov: *mut Overlapped,
+            ov: *mut core::ffi::c_void,
             got: *mut u32,
             wait: i32,
         ) -> i32;
@@ -166,17 +166,18 @@ fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -
     };
     let mut got: u32 = 0;
     let h = handle as *mut core::ffi::c_void;
+    let ovp = (&mut ov) as *mut Overlapped as *mut core::ffi::c_void;
     let ok = if write {
-        unsafe { WriteFile(h, ptr, len as u32, &mut got, &mut ov) }
+        unsafe { WriteFile(h, ptr, len as u32, &mut got, ovp) }
     } else {
-        unsafe { ReadFile(h, ptr, len as u32, &mut got, &mut ov) }
+        unsafe { ReadFile(h, ptr, len as u32, &mut got, ovp) }
     };
     if ok == 0 {
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return -(err as i32);
         }
-        if unsafe { GetOverlappedResult(h, &mut ov, &mut got, 1) } == 0 {
+        if unsafe { GetOverlappedResult(h, ovp, &mut got, 1) } == 0 {
             return -(unsafe { GetLastError() } as i32);
         }
     }

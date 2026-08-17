@@ -38,14 +38,14 @@ extern "system" {
         buf: *mut u8,
         n: u32,
         got: *mut u32,
-        ov: *mut Overlapped,
+        ov: *mut core::ffi::c_void,
     ) -> i32;
     fn WriteFile(
         h: *mut core::ffi::c_void,
         buf: *const u8,
         n: u32,
         got: *mut u32,
-        ov: *mut Overlapped,
+        ov: *mut core::ffi::c_void,
     ) -> i32;
     fn GetLastError() -> u32;
 }
@@ -148,10 +148,11 @@ impl IocpEngine {
         }));
         let h = handle.as_raw_handle() as *mut core::ffi::c_void;
         let mut got = 0u32;
+        let ovp = ov as *mut core::ffi::c_void;
         let ok = if write {
-            unsafe { WriteFile(h, ptr, len as u32, &mut got, ov) }
+            unsafe { WriteFile(h, ptr, len as u32, &mut got, ovp) }
         } else {
-            unsafe { ReadFile(h, ptr, len as u32, &mut got, ov) }
+            unsafe { ReadFile(h, ptr, len as u32, &mut got, ovp) }
         };
         if ok == 0 {
             let err = unsafe { GetLastError() };

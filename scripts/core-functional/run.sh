@@ -99,6 +99,7 @@ mkdir -p "$(dirname "$CONFIG_OUT")"
 sed \
   -e "s|@SRCDIR@|${CORE_SRC}|g" \
   -e "s|@BUILDDIR@|${CORE_SRC}|g" \
+  -e "s|@RPCAUTH@|${HERE}/rpcauth.py|g" \
   "$HERE/config.ini.template" >"$CONFIG_OUT"
 
 SHIM="${HERE}/bitcoind"

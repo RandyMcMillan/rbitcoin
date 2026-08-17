@@ -8,7 +8,7 @@
    and [`docs/crash-recovery.md`](./docs/crash-recovery.md) over inventing
    new design notes.
 2. Prefer **high-level functional/integration tests** over unit tests
-   ([`COVERAGE.md`](./COVERAGE.md), [`TESTING.md`](./TESTING.md)).
+   ([`TESTING.md`](./TESTING.md)).
 3. Every PR must keep **≥90% line** coverage on first-party code (and ≥90%
    branch when measured on nightly) via `./scripts/coverage.sh` — same bar as CI.
 4. Target is **production server-side** node software (wallet backends, etc.).

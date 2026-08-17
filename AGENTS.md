@@ -298,7 +298,7 @@ only for real noise after a toolchain bump — prefer fixing the code.
 ### Coverage job (CI, not local default)
 
 `./scripts/coverage.sh` enforces **≥90% first-party line coverage** (LCOV
-`LH`/`LF`; see `COVERAGE.md`). It is a **required** CI job (slow). Prefer not
+`LH`/`LF`; see [`TESTING.md`](TESTING.md)). It is a **required** CI job (slow). Prefer not
 to grow uncovered production regions; the 90% bar applies to new and existing
 code. If CI `coverage` fails, add a pin and push — do not start a local
 coverage run unless you cannot use Actions.

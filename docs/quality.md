@@ -137,7 +137,7 @@ audit closures. Do not reopen without new evidence.
 | **Q-14** | Head-module glossary | [`docs/heads.md`](./heads.md): which file/module; lookup 2-wave; confirm stages point at concurrency |
 | **Q-40** | Host `rust-toolchain` pin | Root `rust-toolchain.toml` channel **1.95.0** |
 | **Q-21** | SBOM for musl release | `scripts/sbom.sh` / `scripts/sbom.py` emit CycloneDX 1.5 from `Cargo.lock` |
-| **Q-39** | Operator/docs vs shipped model | OPERATOR body-queue → confirm; README crate map; COVERAGE workspace members; findings 001–021; CONTRIBUTING lists deny/multinode |
+| **Q-39** | Operator/docs vs shipped model | OPERATOR body-queue → confirm; README crate map; TESTING.md workspace members; findings 001–021; CONTRIBUTING lists deny/multinode |
 | **Q-16** | Residual `RBITCOIN_*` env | Unstable set listed in `env-knobs.md`; dead path-IO / `FD_APPEND` / `BLOCK_QUEUE_MB` / `TX_HEAD_ACCESS` (FdOnly token) gone |
 | **Q-20** | `cargo deny` / advisory CI | `deny.toml` + required `deny` job (`taiki-e/install-action` `cargo-deny@0.20.2`) |
 | **R-06** | Tip-follow store integrity (`confirmed[]` null tail; tip+1 `NotFound`; idx clone) | Open trims trailing null `confirmed[]`; tip+1 after heal is not `NotFound`; `TxIdx::open` refuses non-monotone starts (`IDX_OPEN_DOUBLE_APPEND`) |

@@ -46,7 +46,8 @@ before 1.0).
   walks the chain (txid identity hasher; no union `reindex`). Drop is
   splice when no height in the span remains on the BQ. While `ready` is
   over half the 1-min BQ window, lookup holds short waves so it does not
-  mint one layer per newly fetched block. Disconnect stores `None`
+  mint one layer per newly fetched block, unless the first unresolved
+  height is in the load-facing half of that window (O(1) vs `path_lo`). Disconnect stores `None`
   immediately. `pin_txid=` counts published-union hits. IBD lookup
   TipOnly-resolves up to **64000** inputs (include-overshoot) or **1080**
   blocks per wave (8× load's 8000-input cap; ~1 week of 10-minute blocks).

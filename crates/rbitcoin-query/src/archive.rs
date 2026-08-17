@@ -1742,7 +1742,10 @@ mod tests {
             assert_eq!(plan.external_parent_ranges.get(&66), Some(&(3000, 24)));
             assert_eq!(plan.external_parent_txid(66), Some(parent_txid));
             let mix = crate::archive_phase_stats::sample_and_reset();
-            assert_eq!(mix.pin_txid_n, 1, "published union hits use the id_cache meter");
+            assert_eq!(
+                mix.pin_txid_n, 1,
+                "published union hits use the id_cache meter"
+            );
             assert_eq!(
                 mix.head_need, 0,
                 "published union must skip leftover TipOnly"

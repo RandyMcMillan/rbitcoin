@@ -830,6 +830,7 @@ dependencies = [
  "axum",
  "base64",
  "bitcoin",
+ "getrandom 0.4.3",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",

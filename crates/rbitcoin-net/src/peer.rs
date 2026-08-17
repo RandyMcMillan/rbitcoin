@@ -457,9 +457,10 @@ pub async fn peer_session_with(
                                     continue;
                                 }
                                 if let Some(mp) = hub.mempool() {
+                                    let inbound = session.as_ref().is_some_and(|s| s.inbound);
                                     if mp.relay_enabled()
-                                        && mp.immediate_relay()
                                         && mp.contains(&txid)
+                                        && (mp.immediate_relay() || !inbound)
                                     {
                                         let inv = if let Some(tx) = mp.get_tx(&txid) {
                                             Inventory::WTx(tx.compute_wtxid())

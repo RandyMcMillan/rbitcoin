@@ -469,61 +469,51 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let mut resolved: HashMap<[u8; 32], Fk> = HashMap::with_capacity(need_vec.len() / 2);
+        let mut pin_ranges: Vec<(u64, (u64, u64))> = Vec::new();
+        let mut need_head: Vec<[u8; 32]> = Vec::new();
+        let mut pin_txid_n = 0u64;
 
-        // Prior plan batch(es) still in the write queue: not head yet.
+        // In-flight first so pin_txid bulk skips those keys (one walk after).
         let t_inflight = Instant::now();
-        if !in_flight.is_empty() {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
-                    continue;
-                }
-                if let Some(fk) = in_flight.get_create_fk(t) {
-                    resolved.insert(*t, fk);
-                }
+        let mut still_need: Vec<&[u8; 32]> = Vec::new();
+        for t in &need_vec {
+            if let Some(fk) = in_flight.get_create_fk(t) {
+                resolved.insert(*t, fk);
+            } else {
+                still_need.push(t);
             }
         }
         let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
-        // Live pipeline pins (same Weak lifetime as outs share). Not in-flight
-        // creates and not the killed process pin FIFO.
+        // One lock for all remaining pin_txid keys (not one mutex per txid).
         let t_pin_txid = Instant::now();
-        let mut pin_txid_n = 0u64;
-        let mut pin_ranges: Vec<(u64, (u64, u64))> = Vec::new();
-        if let Some(store) = parent_store {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
-                    continue;
-                }
-                if let Some((fk, range)) = store.lookup_txid(t) {
-                    resolved.insert(*t, fk);
-                    if let Some(id) = fk.get() {
-                        pin_ranges.push((id, range));
-                    }
-                    pin_txid_n = pin_txid_n.saturating_add(1);
-                }
+        let pin_hits = match parent_store {
+            Some(store) if !still_need.is_empty() => {
+                store.bulk_lookup_txid(still_need.iter().copied())
             }
-        }
+            _ => HashMap::new(),
+        };
         let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
 
-        if let Some(hits) = pre_resolved {
-            for t in &need_vec {
-                if resolved.contains_key(t) {
-                    continue;
+        for t in still_need {
+            if let Some(&(fk, range)) = pin_hits.get(t) {
+                resolved.insert(*t, fk);
+                if let Some(id) = fk.get() {
+                    pin_ranges.push((id, range));
                 }
+                pin_txid_n = pin_txid_n.saturating_add(1);
+                continue;
+            }
+            if let Some(hits) = pre_resolved {
                 if let Some((fk, range)) = hits.get(t) {
                     resolved.insert(*t, *fk);
                     if let Some(id) = fk.get() {
                         pin_ranges.push((id, *range));
                     }
+                    continue;
                 }
             }
-        }
-
-        let mut need_head: Vec<[u8; 32]> = Vec::new();
-        for t in &need_vec {
-            if !resolved.contains_key(t) {
-                need_head.push(*t);
-            }
+            need_head.push(*t);
         }
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;

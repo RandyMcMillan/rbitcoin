@@ -92,10 +92,11 @@ pub fn confirm_write_phase(
             }
         }
     }
-    // Ensure abs for residual spend edges before structural + annotate:
+    // Ensure abs before structural + annotate (sole spent.idx stamper):
+    // - archived parents (load pin no longer idx-batches the set)
     // - same-batch creates (range after Class A commit + fill_planned)
     // - load-ahead parents that had no spent.idx stem at pin
-    // - retry after partial write (archived parents are already stamped at load)
+    // - retry after partial write
     {
         let t_ens = Instant::now();
         ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;

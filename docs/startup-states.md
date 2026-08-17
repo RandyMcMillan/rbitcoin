@@ -17,13 +17,14 @@ See [`crash-recovery.md`](./crash-recovery.md).
 | Stage | Allowed store IO | Forbidden |
 |-------|------------------|-----------|
 | **lookup** | `tx.head`, `txid.body`, `txout.idx` / `spent.idx` (fk + ranges), header tables | **body decode** (`txout` / `inwit`) |
-| **load** | **`txout.body` only** (outs by known range) | `tx.head`, `txid.body`, idx, `inwit` |
+| **load** | **`txout.body` only** (outs by known range) | `tx.head`, `txid.body`, idx (`txout` / `spent`), `inwit` |
 | **scripts** | none | any store IO |
-| **write** | Class A append + annotate + tip (own era) | re-resolve parents via head |
+| **write** | Class A append + annotate + tip (own era); `spent.idx` range stamp | re-resolve parents via head |
 
 Warmup that needs body outs before a pipeline start is **outside** the
-pipeline (not on lookup). Lookup hands load: create_fk stamps + `txout` /
-`spent` ranges + parent txids (RAM reverse map from wire / sidefile).
+pipeline (not on lookup). Lookup hands load: create_fk stamps + `txout`
+ranges + parent txids (RAM reverse map from wire / sidefile). Write
+`ensure_spend_abs_layouts` stamps `spent.idx` ranges.
 
 ## Store start states (intake at confirm start)
 

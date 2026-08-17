@@ -2,13 +2,37 @@
 
 use super::*;
 
+/// Select `need` vouts from a sorted sparse `(vout, out)` list.
+///
+/// `None` if any need vout is missing. Empty `need` with a non-empty list
+/// returns a clone of the full list (legacy layout-only pin).
+pub(super) fn take_need_outs(
+    live_all: &[(u32, rbitcoin_store::OutputRecord)],
+    need: &[u32],
+) -> Option<Vec<(u32, rbitcoin_store::OutputRecord)>> {
+    debug_assert!(
+        live_all.windows(2).all(|w| w[0].0 < w[1].0),
+        "sparse outs must be strictly increasing by vout"
+    );
+    if need.is_empty() {
+        return Some(live_all.to_vec());
+    }
+    let mut live = Vec::with_capacity(need.len());
+    for &v in need {
+        match live_all.binary_search_by_key(&v, |(ov, _)| *ov) {
+            Ok(i) => live.push((v, live_all[i].1.clone())),
+            Err(_) => return None,
+        }
+    }
+    Some(live)
+}
+
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight offline denserels → **txout body by range** from
 /// [`ParentPinStamp`] (lookup-stamped). Load never reads head / `tx.idx` /
-/// `txid.body`. After outs are pinned, load stamps **`spent.idx` ranges** for
-/// already-archived parents (`tx_spent_range_batch` + `set_spent_range_only`).
-/// That is layout only — not `spent.body` metas and not `put_spend*`.
+/// `txid.body`. Write [`ensure_spend_abs_layouts`] stamps `spent.idx` ranges
+/// for archived parents — load does not idx-batch the full parent set.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -219,23 +243,9 @@ pub(super) fn pin_for_wire_batch(
         if let Some(plan) = plan {
             if let Some(ext) = plan.external_parent_outs.get(id) {
                 let (tx, live_all) = ext.as_ref();
-                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                    .iter()
-                    .filter_map(|&v| {
-                        live_all
-                            .iter()
-                            .find(|(ov, _)| *ov == v)
-                            .map(|(_, o)| (v, o.clone()))
-                    })
-                    .collect();
-                if live.len() == need.len() || (need.is_empty() && !live_all.is_empty()) {
-                    let live = if need.is_empty() {
-                        live_all.clone()
-                    } else {
-                        live
-                    };
+                if let Some(live) = take_need_outs(live_all, need) {
                     let checked = if need.is_empty() {
-                        live_all.iter().map(|(v, _)| *v).collect()
+                        live.iter().map(|(v, _)| *v).collect()
                     } else {
                         need.clone()
                     };
@@ -309,17 +319,19 @@ pub(super) fn pin_for_wire_batch(
     {
         let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
-        for (id, need) in &still_need {
+        let pending = std::mem::take(&mut still_need);
+        for (id, need) in pending {
             let range = parent_pin
                 .ranges
-                .get(id)
+                .get(&id)
                 .copied()
-                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
+                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(&id).copied()));
             let Some(range) = range else {
+                still_need.insert(id, need);
                 continue;
             };
-            let tid = parent_pin.create_txid(*id).or_else(|| {
-                plan.and_then(|p| p.external_parent_txid(*id))
+            let tid = parent_pin.create_txid(id).or_else(|| {
+                plan.and_then(|p| p.external_parent_txid(id))
                     .filter(|t| *t != [0u8; 32])
             });
             let Some(tid) = tid else {
@@ -327,7 +339,7 @@ pub(super) fn pin_for_wire_batch(
                     "invariant: lookup stage miss (load parent create identity not stamped)",
                 )));
             };
-            range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
+            range_jobs.push((rbitcoin_primitives::Fk(id), range, tid, need));
         }
         if !range_jobs.is_empty() {
             let n_range = range_jobs.len() as u64;
@@ -393,7 +405,7 @@ pub(super) fn pin_for_wire_batch(
 
     // Load IO contract: txout outs only via body-by-range (above) or plan/in-flight
     // offline pins. **Never** `tx.idx` / head cold denserels on load (idx is lookup).
-    // `spent.idx` range stamp is below (already-archived parents only).
+    // `spent.idx` range stamp is write `ensure_spend_abs_layouts` (not here).
     let n_cold = 0u64;
     let cold_io_ns = 0u64;
     let cold_decode_ns = 0u64;
@@ -421,29 +433,6 @@ pub(super) fn pin_for_wire_batch(
         }
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;
-
-    // Idx-only: stamp spent.body (off, len) for parents already in Class A.
-    // Write remains the sole annotator; this is not a spent.body meta read.
-    {
-        let mut spent_fks: Vec<rbitcoin_primitives::Fk> = parent_vouts
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .filter(|fk| !batch_parents.has_abs_layout(*fk))
-            .collect();
-        if !spent_fks.is_empty() {
-            spent_fks.sort_unstable_by_key(|f| f.0);
-            spent_fks.dedup();
-            let spent = query
-                .store()
-                .tx_spent_range_batch(&spent_fks)
-                .map_err(ConsensusError::from)?;
-            for (fk, opt) in spent_fks.iter().zip(spent.into_iter()) {
-                if let Some(sr) = opt {
-                    batch_parents.set_spent_range_only(*fk, sr);
-                }
-            }
-        }
-    }
 
     // One store lock: publish Weaks so peer load/writeq can adopt the same Arc.
     let t_publish = Instant::now();
@@ -527,11 +516,11 @@ pub(super) fn pin_for_wire_batch(
 /// tables (aside from the rayon pool and script phase timers).
 /// Ensure spend abs for every spend edge on the write batch.
 ///
-/// Load already stamps `spent_range` for archived parents. This gate covers
-/// residual gaps:
-/// 1. Same-batch creates (range only after `archive_commit_plan` + fill)
-/// 2. Load-ahead parents not yet in `spent.idx` when pinned
-/// 3. Retry after partial write
+/// Sole owner of `spent.idx` range stamp for write. Covers:
+/// 1. Archived parents (load pin no longer idx-batches the full set)
+/// 2. Same-batch creates (range only after `archive_commit_plan` + fill)
+/// 3. Load-ahead parents not yet in `spent.idx` when pinned
+/// 4. Retry after partial write
 ///
 /// Missing abs after those fills is `Corrupt`. Write still annotates every
 /// eligible edge; this function never calls `put_spend*`.
@@ -763,4 +752,25 @@ pub(super) fn ensure_spend_abs_layouts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod take_need_outs_tests {
+    use super::take_need_outs;
+    use rbitcoin_store::OutputRecord;
+
+    #[test]
+    fn take_need_outs_binary_search_high_vout() {
+        let live = vec![
+            (0, OutputRecord::unspent(1, vec![0x00])),
+            (1, OutputRecord::unspent(2, vec![0x01])),
+            (2, OutputRecord::unspent(3, vec![0x02])),
+            (3, OutputRecord::unspent(4, vec![0x03])),
+        ];
+        let got = take_need_outs(&live, &[0, 3]).expect("need 0 and 3");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 0);
+        assert_eq!(got[1].0, 3);
+        assert!(take_need_outs(&live, &[7]).is_none());
+    }
 }

@@ -977,6 +977,8 @@ impl AddressHead {
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
         let mut next_page = 0usize;
         let mut in_flight = 0usize;
+        session.begin_batch();
+        let epoch = session.epoch();
 
         // On error, drain while bufs still live (SQE destinations).
         let run = (|| -> Result<(), StoreError> {
@@ -999,7 +1001,12 @@ impl AddressHead {
                     let off = self.entry_off(page_base);
                     let buf = &mut bufs[slot][..need];
                     buf.fill(0);
-                    session.push_pread_flags(fd, off, buf, slot as u64, rw_flags)?;
+                    let ud = crate::uring_session::pack_ud(
+                        crate::uring_session::KIND_PROBE,
+                        epoch,
+                        slot as u32,
+                    );
+                    session.push_pread_flags(fd, off, buf, ud, rw_flags)?;
                     slot_page[slot] = Some(pi);
                     in_flight += 1;
                 }
@@ -1010,15 +1017,19 @@ impl AddressHead {
                     break;
                 }
 
-                let mut cqes = session.harvest_ready();
+                let mut cqes = session.harvest_ready()?;
                 if cqes.is_empty() {
                     session.submit_and_wait_one()?;
-                    cqes = session.harvest_ready();
+                    cqes = session.harvest_ready()?;
                 }
 
                 for (ud, res) in cqes {
-                    let slot = ud as usize;
-                    if slot >= pool_n || slot_page[slot].is_none() {
+                    let (kind, _ep, slot) = crate::uring_session::unpack_ud(ud);
+                    let slot = slot as usize;
+                    if kind != crate::uring_session::KIND_PROBE
+                        || slot >= pool_n
+                        || slot_page[slot].is_none()
+                    {
                         return Err(StoreError::Corrupt("probe page bad slot"));
                     }
                     in_flight = in_flight.saturating_sub(1);
@@ -1060,7 +1071,7 @@ impl AddressHead {
             Ok(())
         })();
 
-        session.drain_all();
+        session.drain_all()?;
         run
     }
 

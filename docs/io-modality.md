@@ -18,6 +18,14 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 **`RBITCOIN_IO=uring` only selects the bulk batch backend.** Legacy token
 `RBITCOIN_IO=mmap` demotes to **pread** with a one-time warning.
 
+Harvest invariants (TLS ring): every SQE is tracked by packed
+`(kind, epoch, slot)`. A CQE that is unmatched, duplicate, or from a
+prior epoch is `Corrupt`, not a completion and not a TipOnly miss.
+`drain_all` is `Result`; leftover pending after a timed spin is
+`Corrupt`. CQ overflow is `Corrupt`. Per-op short/errno on a live ring
+still libc-completes that op; libc fail is `StoreError::io`. Ring setup
+failure / `RBITCOIN_IO=pread` is the only whole-batch pread fallback.
+
 ---
 
 ## RAM tiers (L0 / L1 / L2)

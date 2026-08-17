@@ -263,7 +263,7 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
     match with_bulk_session(|session| {
         #[cfg(test)]
         if test_force_session_false() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
         pread_batch_on_session_inner(session, ops, total_nonempty)
@@ -317,6 +317,8 @@ fn pread_batch_on_session_inner(
     ops: &mut [ReadOp<'_>],
     total_nonempty: usize,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
@@ -329,11 +331,15 @@ fn pread_batch_on_session_inner(
             }
             let fd = ops[next].fd;
             let offset = ops[next].offset;
-            let ud = next as u64;
+            let ud = crate::uring_session::pack_ud(
+                crate::uring_session::KIND_BULK_PREAD,
+                epoch,
+                next as u32,
+            );
             // SAFETY: caller owns each `buf` until `pread_batch` returns.
             if session.push_pread(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 break;
@@ -346,24 +352,37 @@ fn pread_batch_on_session_inner(
             break;
         }
 
-        let mut cqes = session.harvest_ready();
-        if cqes.is_empty() {
-            if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+        let mut cqes = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = session.drain_all();
                 return false;
             }
-            cqes = session.harvest_ready();
+        };
+        if cqes.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                let _ = session.drain_all();
+                return false;
+            }
+            cqes = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = session.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
         for (ud, res) in cqes {
-            let i = ud as usize;
+            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
             }
@@ -381,7 +400,7 @@ fn pread_batch_on_session_inner(
             any_fail = true;
         }
     }
-    session.drain_all();
+    let _ = session.drain_all();
     // Signal caller to fall back to pread if any SQE failed.
     !any_fail
 }
@@ -411,6 +430,8 @@ fn pwrite_batch_on_session(
     ops: &mut [WriteOp<'_>],
     total_nonempty: usize,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
@@ -423,10 +444,14 @@ fn pwrite_batch_on_session(
             }
             let fd = ops[next].fd;
             let offset = ops[next].offset;
-            let ud = next as u64;
+            let ud = crate::uring_session::pack_ud(
+                crate::uring_session::KIND_BULK_PWRITE,
+                epoch,
+                next as u32,
+            );
             if session.push_pwrite(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 break;
@@ -439,24 +464,37 @@ fn pwrite_batch_on_session(
             break;
         }
 
-        let mut cqes = session.harvest_ready();
-        if cqes.is_empty() {
-            if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+        let mut cqes = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = session.drain_all();
                 return false;
             }
-            cqes = session.harvest_ready();
+        };
+        if cqes.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                let _ = session.drain_all();
+                return false;
+            }
+            cqes = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = session.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
         for (ud, res) in cqes {
-            let i = ud as usize;
+            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
             }
@@ -464,18 +502,30 @@ fn pwrite_batch_on_session(
         }
     }
 
+    let ok = finish_pwrite_wave(ops);
+    let _ = session.drain_all();
+    ok
+}
+
+/// Unfilled or failed pwrite ops are not success. Caller libc-retries.
+fn finish_pwrite_wave(ops: &mut [WriteOp<'_>]) -> bool {
+    let mut any_fail = false;
     for op in ops.iter_mut() {
         if !op.buf.is_empty() && op.result == i32::MIN {
             op.result = -5;
+            any_fail = true;
+        }
+        if op.result < 0 {
+            any_fail = true;
         }
     }
-    session.drain_all();
-    true
+    !any_fail
 }
 
-/// user_data: low 63 bits = page index; bit 63 set ⇒ write completion.
 #[cfg(all(test, target_os = "linux"))]
-const RMW_WRITE_BIT: u64 = 1u64 << 63;
+fn rmw_ud(kind: u8, epoch: u16, i: usize) -> u64 {
+    crate::uring_session::pack_ud(kind, epoch, i as u32)
+}
 
 #[cfg(all(test, target_os = "linux"))]
 fn page_rmw_pipelined_uring(
@@ -491,6 +541,8 @@ fn page_rmw_on_session(
     pages: &mut [PageRmw<'_>],
     apply: &mut dyn FnMut(usize, &mut [u8]) -> bool,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = pages.len();
     // 0 = need read, 1 = read in flight, 2 = need write, 3 = write in flight, 4 = done
     let mut state = vec![0u8; n];
@@ -519,7 +571,12 @@ fn page_rmw_on_session(
                 let fd = pages[i].fd;
                 let offset = pages[i].offset;
                 if session
-                    .push_pwrite(fd, offset, pages[i].buf, (i as u64) | RMW_WRITE_BIT)
+                    .push_pwrite(
+                        fd,
+                        offset,
+                        pages[i].buf,
+                        rmw_ud(crate::uring_session::KIND_RMW_WRITE, epoch, i),
+                    )
                     .is_err()
                 {
                     break;
@@ -548,7 +605,12 @@ fn page_rmw_on_session(
             let fd = pages[i].fd;
             let offset = pages[i].offset;
             if session
-                .push_pread(fd, offset, pages[i].buf, i as u64)
+                .push_pread(
+                    fd,
+                    offset,
+                    pages[i].buf,
+                    rmw_ud(crate::uring_session::KIND_RMW_READ, epoch, i),
+                )
                 .is_err()
             {
                 break;
@@ -567,36 +629,49 @@ fn page_rmw_on_session(
             break;
         }
 
-        let mut events = session.harvest_ready();
-        if events.is_empty() {
-            if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+        let mut events = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = session.drain_all();
                 return false;
             }
-            events = session.harvest_ready();
+        };
+        if events.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                let _ = session.drain_all();
+                return false;
+            }
+            events = match session.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = session.drain_all();
+                    return false;
+                }
+            };
             if events.is_empty() {
                 continue;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
         for (ud, res) in events {
-            let i = (ud & !RMW_WRITE_BIT) as usize;
+            let (kind, _ep, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i >= n {
                 continue;
             }
-            if ud & RMW_WRITE_BIT != 0 {
+            if kind == crate::uring_session::KIND_RMW_WRITE {
                 if res < 0 || res as usize != pages[i].buf.len() {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 state[i] = 4;
                 done += 1;
-            } else {
+            } else if kind == crate::uring_session::KIND_RMW_READ {
                 if res < 0 || res as usize != pages[i].buf.len() {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 let dirty = apply(i, pages[i].buf);
@@ -607,11 +682,14 @@ fn page_rmw_on_session(
                     state[i] = 4;
                     done += 1;
                 }
+            } else {
+                let _ = session.drain_all();
+                return false;
             }
         }
     }
 
-    session.drain_all();
+    let _ = session.drain_all();
     done == n && need_read == 0 && need_write == 0
 }
 
@@ -772,6 +850,21 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn pwrite_batch_fail_unfilled_is_not_success() {
+        let buf = [1u8; 4];
+        let mut ops = [WriteOp {
+            fd: 0,
+            offset: 0,
+            buf: &buf,
+            result: i32::MIN,
+        }];
+        assert!(!finish_pwrite_wave(&mut ops));
+        assert_eq!(ops[0].result, -5);
+        ops[0].result = 4;
+        assert!(finish_pwrite_wave(&mut ops));
+    }
 
     /// Dense surface: empty ops, empty bufs, serial RMW, multi-worker fallback,
     /// workers/io_uring helpers (without racing env with parallel tests for mode).

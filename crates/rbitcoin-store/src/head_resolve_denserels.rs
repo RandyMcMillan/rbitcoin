@@ -60,12 +60,33 @@ fn resolve_fk_and_range_batch_opts(
         return Ok(Vec::new());
     }
     match io_backend::read_io_backend() {
-        ReadIoBackend::Uring => match resolve_fk_and_range_uring(table, txids, heights, tip_only) {
-            Ok(v) => Ok(v),
-            // Ring open fail (agent 9p / disabled): sync depth-first fallback.
-            Err(_) => resolve_fk_and_range_pread(table, txids, heights, tip_only),
-        },
+        ReadIoBackend::Uring => map_uring_resolve(
+            resolve_fk_and_range_uring(table, txids, heights, tip_only),
+            || resolve_fk_and_range_pread(table, txids, heights, tip_only),
+        ),
         ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
+    }
+}
+
+/// Fallback to pread only when the ring cannot be opened. Harvest invariants
+/// (`Corrupt` / `Io` from a live machine) must not be swallowed.
+fn map_uring_resolve<T>(
+    uring: Result<T, StoreError>,
+    pread: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    match uring {
+        Ok(v) => Ok(v),
+        Err(e) if is_uring_unavailable(&e) => pread(),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_uring_unavailable(err: &StoreError) -> bool {
+    match err {
+        StoreError::Corrupt("io_uring unavailable")
+        | StoreError::Corrupt("io_uring is Linux-only") => true,
+        StoreError::Io { path, .. } if path.as_os_str() == "io_uring" => true,
+        _ => false,
     }
 }
 
@@ -196,8 +217,8 @@ fn resolve_fk_and_range_pread(
         .collect())
 }
 
-/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` high bits).
-const UD_KIND_IDX: u64 = 2;
+/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` kind byte).
+const UD_KIND_IDX: u8 = crate::uring_session::KIND_IDX;
 
 /// Fill idx page buffers via held session; returns true if all pages complete.
 #[cfg(target_os = "linux")]
@@ -208,13 +229,14 @@ fn fill_idx_pages(
 ) -> bool {
     // Staged SQEs on the held plan ring (no nested TLS bulk_io session).
     let flags = 0i32;
+    sess.begin_batch();
     for (i, page) in pages.iter().enumerate() {
-        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, i as u32);
+        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, sess.epoch(), i as u32);
         if sess
             .push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, flags)
             .is_err()
         {
-            sess.drain_all();
+            let _ = sess.drain_all();
             return false;
         }
     }
@@ -223,25 +245,41 @@ fn fill_idx_pages(
     let need = pages.len();
     let mut done = 0usize;
     while done < need {
-        let mut cqes = sess.harvest_ready();
-        if cqes.is_empty() {
-            if sess.submit_and_wait_one().is_err() {
-                sess.drain_all();
+        let mut cqes = match sess.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = sess.drain_all();
                 return false;
             }
-            cqes = sess.harvest_ready();
+        };
+        if cqes.is_empty() {
+            if sess.submit_and_wait_one().is_err() {
+                let _ = sess.drain_all();
+                return false;
+            }
+            cqes = match sess.harvest_ready() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = sess.drain_all();
+                    return false;
+                }
+            };
             if cqes.is_empty() {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
         } else if sess.submit().is_err() {
-            sess.drain_all();
+            let _ = sess.drain_all();
             return false;
         }
         for (ud, res) in cqes {
-            let (kind, slot) = crate::uring_session::unpack_ud(ud);
+            let (kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
             if kind != UD_KIND_IDX || (slot as usize) >= results.len() {
-                sess.drain_all();
+                let _ = sess.drain_all();
+                return false;
+            }
+            if results[slot as usize] != i32::MIN {
+                let _ = sess.drain_all();
                 return false;
             }
             results[slot as usize] = res;
@@ -477,7 +515,6 @@ fn id_idx_wave(
             pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
         {
             crate::head_resolve_stats::add_hit_rank(rank);
-            connected[ki] = heights.is_some();
             chosen_kis.push(ki);
             chosen_fks.push(fk);
             continue;
@@ -498,13 +535,51 @@ fn id_idx_wave(
     }
     let t_idx = Instant::now();
     let ranges = body_ranges_batched(table, &chosen_fks, session)?;
+    record_chosen_idx_ranges(
+        &chosen_kis,
+        &chosen_fks,
+        &ranges,
+        winner,
+        connected,
+        heights,
+        first_fks,
+        local_age,
+    )?;
+    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+    Ok(())
+}
+
+/// Apply idx ranges for identity picks. `connected` is set only when a range
+/// exists — never before idx. Missing range after a chosen fk is Corrupt.
+fn record_chosen_idx_ranges(
+    chosen_kis: &[usize],
+    chosen_fks: &[Fk],
+    ranges: &[Option<(u64, u64)>],
+    winner: &mut [Option<(Fk, (u64, u64))>],
+    connected: &mut [bool],
+    heights: Option<&HeightFence>,
+    first_fks: &[u64],
+    local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
+) -> Result<(), StoreError> {
     for ((&ki, &fk), range) in chosen_kis.iter().zip(chosen_fks.iter()).zip(ranges) {
-        if let Some(range) = range {
-            winner[ki] = Some((fk, range));
-            crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
+        match range {
+            Some(range) => {
+                winner[ki] = Some((fk, *range));
+                if heights.is_some_and(|h| h.height_of(fk).is_some()) {
+                    connected[ki] = true;
+                }
+                crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
+            }
+            None => {
+                crate::uring_session::note_uring_invariant(
+                    crate::uring_session::UringInvariant::IdxRangeMissing,
+                );
+                return Err(StoreError::Corrupt(
+                    "invariant: idx range missing after identity",
+                ));
+            }
         }
     }
-    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
     Ok(())
 }
 
@@ -743,6 +818,84 @@ mod tests {
         }
         let _fks = t.put_full_batch_indexed(&items, true).unwrap();
         (dir, t, txids)
+    }
+
+    #[test]
+    fn resolve_uring_no_swallow_corrupt() {
+        let err = StoreError::Corrupt("invariant: io_uring unexpected cqe");
+        let mut pread_hits = 0u32;
+        match map_uring_resolve(Err(err), || {
+            pread_hits += 1;
+            Ok(Vec::<([u8; 32], Option<(Fk, (u64, u64))>)>::new())
+        }) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("Corrupt must propagate, got {other:?}"),
+        }
+        assert_eq!(pread_hits, 0);
+    }
+
+    #[test]
+    fn resolve_uring_unavailable_falls_back_to_pread() {
+        let mut pread_hits = 0u32;
+        let out = map_uring_resolve(Err(StoreError::Corrupt("io_uring unavailable")), || {
+            pread_hits += 1;
+            Ok(vec![([0u8; 32], None::<(Fk, (u64, u64))>)])
+        })
+        .unwrap();
+        assert_eq!(pread_hits, 1);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn connected_after_idx_missing_range_is_corrupt() {
+        let mut winner = vec![None; 1];
+        let mut connected = vec![false; 1];
+        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
+            first_fk: 1,
+            count: 1,
+            height: 0,
+        }]);
+        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
+        match record_chosen_idx_ranges(
+            &[0],
+            &[Fk(1)],
+            &[None],
+            &mut winner,
+            &mut connected,
+            Some(&fence),
+            &[1],
+            &mut age,
+        ) {
+            Err(StoreError::Corrupt("invariant: idx range missing after identity")) => {}
+            other => panic!("expected idx-range Corrupt, got {other:?}"),
+        }
+        assert!(winner[0].is_none());
+        assert!(!connected[0], "must not mark connected without a range");
+    }
+
+    #[test]
+    fn connected_after_idx_sets_winner_and_connected() {
+        let mut winner = vec![None; 1];
+        let mut connected = vec![false; 1];
+        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
+            first_fk: 1,
+            count: 1,
+            height: 0,
+        }]);
+        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
+        record_chosen_idx_ranges(
+            &[0],
+            &[Fk(1)],
+            &[Some((8, 16))],
+            &mut winner,
+            &mut connected,
+            Some(&fence),
+            &[1],
+            &mut age,
+        )
+        .unwrap();
+        assert_eq!(winner[0], Some((Fk(1), (8, 16))));
+        assert!(connected[0]);
     }
 
     /// Uring machine returns same (fk, body_range) as sequential pread path.

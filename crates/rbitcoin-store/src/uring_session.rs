@@ -27,7 +27,8 @@ pub struct UringSession {
     #[cfg(target_os = "linux")]
     ring: io_uring::IoUring,
     entries: u32,
-    in_flight: usize,
+    pending: UringPending,
+    epoch: u16,
 }
 
 impl UringSession {
@@ -60,7 +61,8 @@ impl UringSession {
             Ok(Self {
                 ring,
                 entries,
-                in_flight: 0,
+                pending: UringPending::new(),
+                epoch: 0,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -71,7 +73,7 @@ impl UringSession {
     }
 
     pub fn in_flight(&self) -> usize {
-        self.in_flight
+        self.pending.len()
     }
 
     pub fn entries(&self) -> u32 {
@@ -79,7 +81,17 @@ impl UringSession {
     }
 
     pub fn free_sq(&self) -> usize {
-        (self.entries as usize).saturating_sub(self.in_flight)
+        (self.entries as usize).saturating_sub(self.pending.len())
+    }
+
+    /// Harvest epoch baked into [`pack_ud`]. Increment at the start of each
+    /// machine wave so leftover CQEs from the previous wave cannot match.
+    pub fn epoch(&self) -> u16 {
+        self.epoch
+    }
+
+    pub fn begin_batch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
@@ -110,9 +122,10 @@ impl UringSession {
             if buf.is_empty() {
                 return Ok(());
             }
-            if self.in_flight >= self.entries as usize {
+            if self.pending.len() >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
+            self.pending.insert(user_data)?;
             let mut b =
                 opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).offset(offset);
             if rw_flags != 0 {
@@ -121,12 +134,11 @@ impl UringSession {
             let sqe = b.build().user_data(user_data);
             // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&sqe)
-                    .map_err(|_| StoreError::Corrupt("io_uring SQ full"))?;
+                if self.ring.submission().push(&sqe).is_err() {
+                    let _ = self.pending.expect_cqe(user_data);
+                    return Err(StoreError::Corrupt("io_uring SQ full"));
+                }
             }
-            self.in_flight += 1;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
@@ -164,9 +176,10 @@ impl UringSession {
             if buf.is_empty() {
                 return Ok(());
             }
-            if self.in_flight >= self.entries as usize {
+            if self.pending.len() >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
+            self.pending.insert(user_data)?;
             let mut b =
                 opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32).offset(offset);
             if rw_flags != 0 {
@@ -175,12 +188,11 @@ impl UringSession {
             let sqe = b.build().user_data(user_data);
             // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&sqe)
-                    .map_err(|_| StoreError::Corrupt("io_uring SQ full"))?;
+                if self.ring.submission().push(&sqe).is_err() {
+                    let _ = self.pending.expect_cqe(user_data);
+                    return Err(StoreError::Corrupt("io_uring SQ full"));
+                }
             }
-            self.in_flight += 1;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
@@ -201,10 +213,16 @@ impl UringSession {
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
-            self.ring
-                .submit_and_wait(1)
-                .map_err(|_| StoreError::Corrupt("io_uring submit_and_wait failed"))?;
-            Ok(())
+            loop {
+                match self.ring.submit_and_wait(1) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        if let Some(err) = map_enter_err(&e) {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -229,20 +247,37 @@ impl UringSession {
 
     /// Harvest all currently ready CQEs (non-blocking). Each item is
     /// `(user_data, result)` where `result` is bytes transferred or negated errno.
-    pub fn harvest_ready(&mut self) -> Vec<(u64, i32)> {
+    ///
+    /// A CQE whose `user_data` is not pending is **not** a completion —
+    /// `Corrupt("invariant: io_uring unexpected cqe")`. Expected CQEs in the
+    /// same harvest are still returned after the error is noted; callers must
+    /// treat `Err` as fatal and drain.
+    pub fn harvest_ready(&mut self) -> Result<Vec<(u64, i32)>, StoreError> {
         #[cfg(target_os = "linux")]
         {
+            {
+                let cq = self.ring.completion();
+                cq_overflow_result(cq.overflow())?;
+            }
             self.ring.completion().sync();
             let mut out = Vec::new();
+            let mut unexpected = false;
             for cqe in self.ring.completion() {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                out.push((cqe.user_data(), cqe.result()));
+                let ud = cqe.user_data();
+                match self.pending.expect_cqe(ud) {
+                    Ok(()) => out.push((ud, cqe.result())),
+                    Err(_) => unexpected = true,
+                }
             }
-            out
+            if unexpected {
+                Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"))
+            } else {
+                Ok(out)
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -252,34 +287,96 @@ impl UringSession {
     /// buffers are dropped (error unwind, end of probe batch). A shallow
     /// harvest of only-ready CQEs is not enough — the kernel may still write
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
-    pub fn drain_all(&mut self) {
+    pub fn drain_all(&mut self) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
-            // Bound spin: entries cap × small factor; never hang forever.
+            // Timed waits: leftover phantom pending must not block forever.
+            // EINTR retries; other enter errors still spin until the bound.
             let mut spins = 0u32;
             let max_spins = self.entries.saturating_mul(4).max(64);
-            while self.in_flight > 0 && spins < max_spins {
+            while !self.pending.is_empty() && spins < max_spins {
                 spins += 1;
-                let _ = self.ring.submit_and_wait(1);
+                let ts = io_uring::types::Timespec::new().nsec(1_000_000);
+                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                match self.ring.submitter().submit_with_args(1, &args) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if map_enter_err(&e).is_some() {
+                            let _ = self.ring.submit();
+                        }
+                    }
+                }
                 self.ring.completion().sync();
-                for _ in self.ring.completion() {
-                    self.in_flight = self.in_flight.saturating_sub(1);
+                for cqe in self.ring.completion() {
+                    let _ = self.pending.expect_cqe(cqe.user_data());
                 }
             }
-            // Best-effort final harvest if the kernel is wedged.
             let _ = self.ring.submit();
             self.ring.completion().sync();
-            for _ in self.ring.completion() {
-                self.in_flight = self.in_flight.saturating_sub(1);
+            for cqe in self.ring.completion() {
+                let _ = self.pending.expect_cqe(cqe.user_data());
             }
+            self.pending.assert_drained()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.pending.assert_drained()
         }
     }
 }
 
 impl Drop for UringSession {
     fn drop(&mut self) {
-        self.drain_all();
+        let _ = self.drain_all();
     }
+}
+
+/// Drain the session when dropped. Declare **after** SQE buffers so drop
+/// order drains while those buffers are still live.
+pub(crate) struct DrainOnDrop<'a> {
+    session: &'a mut UringSession,
+}
+
+impl UringSession {
+    pub(crate) fn drain_guard(&mut self) -> DrainOnDrop<'_> {
+        DrainOnDrop { session: self }
+    }
+}
+
+impl Drop for DrainOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.session.drain_all();
+    }
+}
+
+impl std::ops::Deref for DrainOnDrop<'_> {
+    type Target = UringSession;
+    fn deref(&self) -> &UringSession {
+        self.session
+    }
+}
+
+impl std::ops::DerefMut for DrainOnDrop<'_> {
+    fn deref_mut(&mut self) -> &mut UringSession {
+        self.session
+    }
+}
+
+/// Full-length CQE or `StoreError::io`. Short success is not a soft miss.
+pub(crate) fn require_full_cqe(res: i32, want: usize, path: &Path) -> Result<(), StoreError> {
+    if res < 0 {
+        return Err(StoreError::io(
+            path,
+            std::io::Error::from_raw_os_error(-res),
+        ));
+    }
+    if res as usize != want {
+        return Err(StoreError::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "io_uring short cqe"),
+        ));
+    }
+    Ok(())
 }
 /// Run `f` with this **OS thread's** long-lived io_uring session.
 ///
@@ -347,7 +444,7 @@ pub fn with_thread_local<R>(
                 if need_open {
                     if let Some(mut old) = slot.take() {
                         if old.in_flight() != 0 {
-                            old.drain_all();
+                            old.drain_all()?;
                         }
                         drop(old);
                     }
@@ -356,9 +453,13 @@ pub fn with_thread_local<R>(
                 }
                 let session = slot.as_mut().expect("session just ensured");
                 if session.in_flight() != 0 {
-                    session.drain_all();
+                    session.drain_all()?;
                 }
-                Ok(f(session))
+                let out = f(session);
+                if session.in_flight() != 0 {
+                    session.drain_all()?;
+                }
+                Ok(out)
             });
             out
         })
@@ -392,22 +493,184 @@ pub fn test_take_last_sqe_lens() -> Vec<u32> {
     LAST_SQE_LENS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
-/// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).
+/// Kind byte for [`pack_ud`]. Distinct per machine so a leftover CQE cannot
+/// complete a different stage's slot (probe slot `5` ≠ ID op `5`).
+pub const KIND_BULK_PREAD: u8 = 1;
+pub const KIND_IDX: u8 = 2;
+pub const KIND_PROBE: u8 = 3;
+pub const KIND_BULK_PWRITE: u8 = 4;
+pub const KIND_SPEND_META_READ: u8 = 5;
+pub const KIND_SPEND_META_WRITE: u8 = 6;
+pub const KIND_SPEND_PAGE_READ: u8 = 7;
+pub const KIND_SPEND_PAGE_WRITE: u8 = 8;
+#[cfg(test)]
+pub const KIND_RMW_READ: u8 = 9;
+#[cfg(test)]
+pub const KIND_RMW_WRITE: u8 = 10;
+
+/// Pack `(kind, epoch, slot)` into `user_data`.
 ///
-/// Used by multi-stage io_uring machines (head resolve, spend annotate).
+/// Layout: kind `u8` @ 56, epoch `u16` @ 40, slot `u32` @ 0.
+/// Used by multi-stage io_uring machines (head resolve, spend annotate, bulk).
 #[inline]
-pub fn pack_ud(kind: u64, slot: u32) -> u64 {
-    const KIND_SHIFT: u64 = 62;
-    (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
+pub fn pack_ud(kind: u8, epoch: u16, slot: u32) -> u64 {
+    ((kind as u64) << 56) | ((epoch as u64) << 40) | (slot as u64)
 }
 
 /// Unpack [`pack_ud`].
 #[inline]
-pub fn unpack_ud(ud: u64) -> (u64, u32) {
-    const KIND_SHIFT: u64 = 62;
-    let kind = ud >> KIND_SHIFT;
-    let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
-    (kind, slot)
+pub fn unpack_ud(ud: u64) -> (u8, u16, u32) {
+    let kind = (ud >> 56) as u8;
+    let epoch = (ud >> 40) as u16;
+    let slot = ud as u32;
+    (kind, epoch, slot)
+}
+
+/// Process counters for harvest invariants (tests + operator logs).
+#[derive(Default)]
+pub(crate) struct UringMeters {
+    pub unexpected_cqe: std::sync::atomic::AtomicU64,
+    pub undrained: std::sync::atomic::AtomicU64,
+    pub cq_overflow: std::sync::atomic::AtomicU64,
+    pub idx_range_missing: std::sync::atomic::AtomicU64,
+}
+
+static URING_METERS: UringMeters = UringMeters {
+    unexpected_cqe: std::sync::atomic::AtomicU64::new(0),
+    undrained: std::sync::atomic::AtomicU64::new(0),
+    cq_overflow: std::sync::atomic::AtomicU64::new(0),
+    idx_range_missing: std::sync::atomic::AtomicU64::new(0),
+};
+
+static WARNED_UNEXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_UNDRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_IDX_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+pub(crate) enum UringInvariant {
+    UnexpectedCqe,
+    Undrained,
+    CqOverflow,
+    IdxRangeMissing,
+}
+
+impl UringInvariant {
+    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            Self::UnexpectedCqe => &URING_METERS.unexpected_cqe,
+            Self::Undrained => &URING_METERS.undrained,
+            Self::CqOverflow => &URING_METERS.cq_overflow,
+            Self::IdxRangeMissing => &URING_METERS.idx_range_missing,
+        }
+    }
+
+    fn warned(self) -> &'static std::sync::atomic::AtomicBool {
+        match self {
+            Self::UnexpectedCqe => &WARNED_UNEXPECTED,
+            Self::Undrained => &WARNED_UNDRAINED,
+            Self::CqOverflow => &WARNED_OVERFLOW,
+            Self::IdxRangeMissing => &WARNED_IDX_RANGE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnexpectedCqe => "unexpected_cqe",
+            Self::Undrained => "undrained",
+            Self::CqOverflow => "cq_overflow",
+            Self::IdxRangeMissing => "idx_range_missing",
+        }
+    }
+}
+
+pub(crate) fn note_uring_invariant(kind: UringInvariant) {
+    kind.counter()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !kind
+        .warned()
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        rbitcoin_log::warn!(
+            "store: io_uring invariant {} (Corrupt; not a TipOnly miss)",
+            kind.label()
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn uring_meters() -> &'static UringMeters {
+    &URING_METERS
+}
+
+/// Expected in-flight `user_data` values for one harvest wave.
+///
+/// Unmatched or duplicate CQEs are **not** completions — they are
+/// `Corrupt("invariant: io_uring unexpected cqe")`.
+#[derive(Default)]
+pub(crate) struct UringPending {
+    set: std::collections::HashSet<u64>,
+}
+
+impl UringPending {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Record a submitted SQE. Duplicate `ud` is an invariant fail.
+    pub fn insert(&mut self, ud: u64) -> Result<(), StoreError> {
+        if !self.set.insert(ud) {
+            note_uring_invariant(UringInvariant::UnexpectedCqe);
+            return Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"));
+        }
+        Ok(())
+    }
+
+    /// Accept one CQE. Unmatched or already-completed `ud` is an invariant fail.
+    /// On `Err`, `len` is unchanged (the CQE does not count as a completion).
+    pub fn expect_cqe(&mut self, ud: u64) -> Result<(), StoreError> {
+        if !self.set.remove(&ud) {
+            note_uring_invariant(UringInvariant::UnexpectedCqe);
+            return Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"));
+        }
+        Ok(())
+    }
+
+    /// After drain: leftover pending SQEs are an invariant, not a silent OK.
+    pub fn assert_drained(&self) -> Result<(), StoreError> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            note_uring_invariant(UringInvariant::Undrained);
+            Err(StoreError::Corrupt("invariant: io_uring undrained"))
+        }
+    }
+}
+
+pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
+    if overflow == 0 {
+        Ok(())
+    } else {
+        note_uring_invariant(UringInvariant::CqOverflow);
+        Err(StoreError::Corrupt("invariant: io_uring cq overflow"))
+    }
+}
+
+/// `None` → retry the enter (EINTR). `Some` → hard fail.
+pub(crate) fn map_enter_err(err: &std::io::Error) -> Option<StoreError> {
+    if err.raw_os_error() == Some(libc::EINTR) {
+        None
+    } else {
+        Some(StoreError::Corrupt("io_uring submit_and_wait failed"))
+    }
 }
 
 #[cfg(test)]
@@ -415,14 +678,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pack_ud_kinds_are_unique_and_do_not_alias() {
+        let kinds = [
+            KIND_BULK_PREAD,
+            KIND_IDX,
+            KIND_PROBE,
+            KIND_BULK_PWRITE,
+            KIND_SPEND_META_READ,
+            KIND_SPEND_META_WRITE,
+            KIND_SPEND_PAGE_READ,
+            KIND_SPEND_PAGE_WRITE,
+            KIND_RMW_READ,
+            KIND_RMW_WRITE,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for k in kinds {
+            assert!(seen.insert(k), "duplicate kind {k}");
+        }
+        // Leftover probe slot 5 must not look like ID op 5 or idx slot 5.
+        let probe = pack_ud(KIND_PROBE, 1, 5);
+        let id = pack_ud(KIND_BULK_PREAD, 1, 5);
+        let idx = pack_ud(KIND_IDX, 1, 5);
+        assert_ne!(probe, id);
+        assert_ne!(probe, idx);
+        assert_ne!(id, idx);
+        // Epoch N CQE is a different ud than epoch N+1 (same kind+slot).
+        assert_ne!(pack_ud(KIND_PROBE, 1, 5), pack_ud(KIND_PROBE, 2, 5));
+        let (k, e, s) = unpack_ud(probe);
+        assert_eq!((k, e, s), (KIND_PROBE, 1, 5));
+    }
+
+    #[test]
     fn pack_unpack_roundtrip() {
-        for kind in [0u64, 1, 2, 3] {
-            for slot in [0u32, 1, 42, 0xffff, u32::MAX] {
-                let (k, s) = unpack_ud(pack_ud(kind, slot));
-                assert_eq!(k, kind);
-                assert_eq!(s, slot);
+        for kind in [0u8, 1, 2, 3, 255] {
+            for epoch in [0u16, 1, 42, u16::MAX] {
+                for slot in [0u32, 1, 42, 0xffff, u32::MAX] {
+                    let (k, e, s) = unpack_ud(pack_ud(kind, epoch, slot));
+                    assert_eq!(k, kind);
+                    assert_eq!(e, epoch);
+                    assert_eq!(s, slot);
+                }
             }
         }
+    }
+
+    #[test]
+    fn pending_cqe_accepts_exact_pending_set() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        p.insert(2).unwrap();
+        assert_eq!(p.len(), 2);
+        p.expect_cqe(1).unwrap();
+        p.expect_cqe(2).unwrap();
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn pending_cqe_rejects_unmatched() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        match p.expect_cqe(99) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("expected unexpected-cqe Corrupt, got {other:?}"),
+        }
+        assert_eq!(p.len(), 1, "reject must not count as a completion");
+    }
+
+    #[test]
+    fn pending_cqe_rejects_duplicate() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        p.expect_cqe(1).unwrap();
+        match p.expect_cqe(1) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("expected unexpected-cqe Corrupt, got {other:?}"),
+        }
+        assert!(p.is_empty(), "duplicate must not resurrect a slot");
+    }
+
+    #[test]
+    fn drain_all_reports_undrained_on_leftover_pending() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        match p.assert_drained() {
+            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
+            other => panic!("expected undrained Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_all_ok_when_empty() {
+        assert!(UringPending::new().assert_drained().is_ok());
+    }
+
+    #[test]
+    fn harvest_reports_cq_overflow() {
+        match cq_overflow_result(1) {
+            Err(StoreError::Corrupt("invariant: io_uring cq overflow")) => {}
+            other => panic!("expected overflow Corrupt, got {other:?}"),
+        }
+        assert!(cq_overflow_result(0).is_ok());
+    }
+
+    #[test]
+    fn uring_meter_bump_and_take() {
+        let before = uring_meters()
+            .unexpected_cqe
+            .load(std::sync::atomic::Ordering::Relaxed);
+        note_uring_invariant(UringInvariant::UnexpectedCqe);
+        let after = uring_meters()
+            .unexpected_cqe
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn spend_annotate_drain_short_cqe_is_io() {
+        let p = Path::new("/tmp/spent.body");
+        match require_full_cqe(4, 8, p) {
+            Err(StoreError::Io { .. }) => {}
+            other => panic!("short CQE must be io, got {other:?}"),
+        }
+        match require_full_cqe(-5, 8, p) {
+            Err(StoreError::Io { .. }) => {}
+            other => panic!("negative CQE must be io, got {other:?}"),
+        }
+        assert!(require_full_cqe(8, 8, p).is_ok());
+    }
+
+    #[test]
+    fn enter_eintr_is_retry_not_corrupt() {
+        let e = std::io::Error::from_raw_os_error(libc::EINTR);
+        assert!(map_enter_err(&e).is_none());
+        let other = std::io::Error::from_raw_os_error(libc::EIO);
+        match map_enter_err(&other) {
+            Some(StoreError::Corrupt("io_uring submit_and_wait failed")) => {}
+            other => panic!("expected submit Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_cqe_insert_duplicate_ud_is_corrupt() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        match p.insert(1) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("expected unexpected-cqe Corrupt, got {other:?}"),
+        }
+        assert_eq!(p.len(), 1);
     }
 
     #[test]
@@ -491,16 +894,16 @@ mod tests {
 
         let mut session = UringSession::try_open(32).expect("uring");
         let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
-        for b in bufs.iter_mut() {
+        for (i, b) in bufs.iter_mut().enumerate() {
             session
-                .push_pread(fd, 0, b.as_mut_slice(), 0)
+                .push_pread(fd, 0, b.as_mut_slice(), i as u64)
                 .expect("push");
         }
         session.sync_submission();
         let _ = session.submit();
         assert!(session.in_flight() > 0);
         // Buffers still live — drain must complete every CQE into them.
-        session.drain_all();
+        session.drain_all().expect("drain");
         assert_eq!(session.in_flight(), 0);
         for b in &bufs {
             assert_eq!(b[0], 0xAB);

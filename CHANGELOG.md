@@ -29,6 +29,15 @@ before 1.0).
 
 ### Changed
 
+- **io_uring harvest is fail-closed.** Unmatched/duplicate CQEs, leftover
+  undrained SQEs, CQ overflow, and identity-without-idx-range are
+  `Corrupt("invariant: io_uring …")` / `idx range missing after identity`,
+  not a quiet TipOnly `MissingPrevout`. Distinct `user_data` kinds + epoch
+  so a leftover probe slot cannot complete an identity pread. Spend
+  annotate drains before slot buffers drop. Pwrite unfilled ops fail
+  closed to libc retry. Uring resolve no longer swallows Corrupt into
+  pread (ring-unavailable still falls back).
+
 - **Mempool block connect evicts conflicts:** a confirmed block that
   spends a mempool tx's inputs (without including that tx) drops the
   conflict and its descendants. `wallet_txn_*` reorgs need this.

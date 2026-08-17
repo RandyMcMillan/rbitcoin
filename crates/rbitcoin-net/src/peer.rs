@@ -844,9 +844,12 @@ async fn handle_peer_frame(
                                 }) {
                                     need_headers = true;
                                 }
-                            } else if !pending_blocks.contains_key(h) {
-                                want.push(Inventory::WitnessBlock(*h));
                             }
+                            // Have a header: do not getdata from inv. Bodies come
+                            // from header-announcement direct fetch (BIP130) or a
+                            // getheaders reply. Inv of a known hash from a second
+                            // peer (p2p_sendheaders inv_node) must not steal or
+                            // duplicate that getdata.
                         }
                     }
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
@@ -3269,5 +3272,125 @@ mod tests {
         assert!(hub.is_connected(&b1.block_hash()));
         assert!(hub.is_connected(&b2.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inv_of_already_asked_block_does_not_getdata() {
+        // p2p_sendheaders Part 2: test_node announces headers (we getdata),
+        // then inv_node re-invs the same hashes. One getdata in flight globally.
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::Network;
+        use rbitcoin_primitives::Height;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::p2p::message::RawNetworkMessage;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        fn drain_block_getdata(rx: &mut mpsc::UnboundedReceiver<NetworkMessage>) -> Vec<BlockHash> {
+            let mut hashes = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let NetworkMessage::GetData(inv) = m {
+                    for i in inv {
+                        if let Inventory::Block(h) | Inventory::WitnessBlock(h) = i {
+                            hashes.push(h);
+                        }
+                    }
+                }
+            }
+            hashes
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (src_dir, src_q) = tmp_store("inv-asked-src");
+            let src = ChainHub::new(src_q, ChainParams::regtest(), Milestone::NONE);
+            src.ensure_genesis().unwrap();
+            src.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .unwrap();
+            let hdr = src.query.wire_header_at_height(Height(1)).unwrap();
+            let hash = hdr.block_hash();
+
+            let (dir, q) = tmp_store("inv-asked-dst");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::Headers(vec![hdr])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            let first = drain_block_getdata(&mut out_rx);
+            assert_eq!(first, vec![hash], "header announce must getdata once");
+            assert!(hub.already_have_or_asked_block(&hash));
+
+            // Second peer: empty local requested set, same hub (asked_blocks).
+            let (out_tx2, mut out_rx2) = mpsc::unbounded_channel();
+            let mut pending_headers2 = HashMap::new();
+            let mut requested2 = HashSet::new();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(hash)])),
+                &hub,
+                &out_tx2,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers2,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested2,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            let second = drain_block_getdata(&mut out_rx2);
+            assert!(
+                second.is_empty(),
+                "duplicate inv must not getdata, got {second:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(src_dir);
+            let _ = std::fs::remove_dir_all(dir);
+        });
     }
 }

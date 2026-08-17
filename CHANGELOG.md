@@ -114,7 +114,9 @@ before 1.0).
   `p2p_sendheaders.py` and `p2p_compactblocks_hb.py` are now `run`
   (31 inventory run names). Header announce follows Core
   `pindexBestHeaderSent` (inv after a large reorg until the peer
-  catches up; getblocks does not resume). Unrequested anti-dos:
+  catches up; getblocks does not resume). Block bodies are requested
+  from header announcements or getheaders replies, not from inv.
+  Unrequested anti-dos:
   minwork header skip, weaker forks stay headers-only, missing parent
   header disconnects, 288-height window. `p2p_unrequested_blocks.py`
   / headers-sync / `p2p_invalid_messages.py` / `p2p_compactblocks.py`

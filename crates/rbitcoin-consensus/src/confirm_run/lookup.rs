@@ -278,13 +278,6 @@ pub struct ParentPinStamp {
 }
 
 impl ParentPinStamp {
-    pub(crate) fn from_plan(plan: &rbitcoin_query::ArchiveWritePlan) -> Self {
-        Self::from_maps(
-            plan.external_parent_ranges.clone(),
-            plan.external_parent_txids.clone(),
-        )
-    }
-
     /// Move plan stamp maps into the load stamp (no 100k-entry clone).
     pub(crate) fn take_from_plan(plan: &mut rbitcoin_query::ArchiveWritePlan) -> Self {
         Self::from_maps(

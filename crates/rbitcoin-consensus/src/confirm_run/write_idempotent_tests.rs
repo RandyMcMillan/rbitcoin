@@ -852,16 +852,9 @@ fn plan_ensure_denserels_then_forbid_skips_cold_io() {
     );
 
     // Pin Forbid hits plan-local (no extra cold).
-    let (parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .unwrap();
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _thin, _warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
     assert!(parents.contains(pfk));
     assert_eq!(
         rbitcoin_query::body_ok_reads(),
@@ -919,7 +912,7 @@ fn pin_for_wire_missing_parent_is_invariant_error() {
         witness: vec![],
     }];
     let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let plan = ArchiveWritePlan {
+    let mut plan = ArchiveWritePlan {
         packed: vec![(std::sync::Arc::new((spend_tx, spend_outs)), spend_ins)],
         planned_fks: vec![Fk(1)],
         per_header_ranges: vec![],
@@ -933,16 +926,9 @@ fn pin_for_wire_missing_parent_is_invariant_error() {
         body_est: 0,
     };
 
-    let err = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .expect_err("missing parent must hard-fail pin");
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let err = pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+        .expect_err("missing parent must hard-fail pin");
     let msg = format!("{err}");
     assert!(
         msg.contains("invariant")
@@ -999,7 +985,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         script_sig: vec![],
         witness: vec![],
     }];
-    let plan = ArchiveWritePlan {
+    let mut plan = ArchiveWritePlan {
         packed: vec![(
             std::sync::Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
             spend_ins,
@@ -1034,16 +1020,9 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
     )]));
     let ifo = log.snapshot();
 
-    let err = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        Some(&ifo),
-        None,
-    )
-    .expect_err("incomplete outs must hard-fail pin");
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let err = pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], Some(&ifo), None)
+        .expect_err("incomplete outs must hard-fail pin");
     let msg = format!("{err}");
     assert!(
         msg.contains("invariant")
@@ -1137,16 +1116,10 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
         plan.external_parent_outs.get(&parent_id).unwrap(),
         &external
     ));
-    let (parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .expect("pin external via SparseExternalPin Arc (body denserels by range only)");
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _thin, _warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+            .expect("pin external via SparseExternalPin Arc (body denserels by range only)");
     assert!(parents.contains(Fk(parent_id)));
     assert!(
         parents.get_parent_out(Fk(parent_id), 0).is_some(),
@@ -1262,7 +1235,7 @@ fn pin_sparse_need_high_vout_only() {
         witness: vec![],
     }];
     let spend_pin: CreatePin = Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])]));
-    let plan = ArchiveWritePlan {
+    let mut plan = ArchiveWritePlan {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
@@ -1279,16 +1252,10 @@ fn pin_sparse_need_high_vout_only() {
         index_tx: false,
         body_est: 0,
     };
-    let (parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .expect("pin high vout");
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _thin, _warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+            .expect("pin high vout");
     assert!(parents.get_parent_out(Fk(parent_id), 3).is_some());
     assert!(
         parents.get_parent_out(Fk(parent_id), 1).is_none(),
@@ -1399,16 +1366,10 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
         }
     }
 
-    let (_parents, _thin, warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        Some(&store),
-    )
-    .expect("adopt 1 + range-fill 2");
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (_parents, _thin, warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, Some(&store))
+            .expect("adopt 1 + range-fill 2");
     assert_eq!(warm.parents, 3);
     assert_eq!(
         warm.already, 1,
@@ -1505,16 +1466,9 @@ fn ensure_external_sparse_need_not_full_output_count() {
     assert_eq!(pin.1[0].0, 3, "only spent need-vout");
     assert_eq!(pin.1[0].1.value, 1003);
 
-    let (parents, _, _) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .unwrap();
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _, _) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
     assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 3).is_some());
     assert!(parents.get_parent_out(Fk(pfk.get().unwrap()), 0).is_none());
 
@@ -1987,16 +1941,9 @@ fn write_ensure_stamps_spent_range_after_load_pin() {
     plan.planned_fks = vec![Fk(2)];
     ensure_external_parent_denserels_from_plan(&q, Some(&mut plan), None).unwrap();
 
-    let (mut parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .unwrap();
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (mut parents, _thin, _warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
     assert!(
         !parents.has_abs_layout(pfk),
         "load pin must not spent.idx-batch; write ensure owns abs"
@@ -2023,7 +1970,10 @@ fn write_ensure_stamps_spent_range_after_load_pin() {
         cold, 0,
         "archived parent must not cold-load at write ensure"
     );
-    assert!(parents.has_abs_layout(pfk), "write ensure must stamp spent_range");
+    assert!(
+        parents.has_abs_layout(pfk),
+        "write ensure must stamp spent_range"
+    );
     assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
     let _ = std::fs::remove_dir_all(&path);
 }
@@ -2092,16 +2042,9 @@ fn load_pin_does_not_stamp_same_batch_create() {
     ];
     plan.planned_fks = vec![Fk(2), Fk(3)];
 
-    let (parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &ParentPinStamp::from_plan(&plan),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .unwrap();
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _thin, _warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
     assert!(parents.contains(Fk(2)));
     assert!(
         !parents.has_abs_layout(Fk(2)),

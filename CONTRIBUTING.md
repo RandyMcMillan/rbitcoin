@@ -33,6 +33,12 @@
    still requires it. Crate and public-item rustdoc (`//!` / `///`) that
    documents a surface, not a walkthrough of the next line, is not this
    rule.
+8. **Tests assert behavior, not the repo.** Default-suite tests drive a
+   **shipped** function or scenario and assert an **observable** result
+   (return, store after reopen, peer/RPC/log line). Do not `include_str!`
+   production sources or markdown and `contains` identifiers, comments, or
+   call graphs. Fixture JSON/hex and tests that read **datadir** bytes are
+   not this rule.
 
 ## Workflow
 
@@ -97,3 +103,5 @@ check on the commit, not from the `ci` run.
 - [ ] Experimental / milestone honesty preserved in user-facing docs when relevant
 - [ ] No restating `//` comments. Remaining line comments name an invariant,
       protocol, `SAFETY` requirement, or library quirk the types cannot state.
+- [ ] Tests assert shipped behavior, not source/docs text (`include_str!` of
+      production `.rs` or markdown is not a pin).

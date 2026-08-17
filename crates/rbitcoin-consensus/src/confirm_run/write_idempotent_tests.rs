@@ -1665,50 +1665,6 @@ fn store_start_states_lookup_load_confirm() {
     }
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s1));
 
-    // Structural: lookup stage source must not denserels-decode body on stamp path.
-    // Stamp/load live in lookup.rs after Q-10/Q-11 stage split.
-    let src = include_str!("lookup.rs");
-    let stamp_fn = src
-        .split("pub fn confirm_wire_lookup_stamp")
-        .nth(1)
-        .and_then(|s| s.split("pub fn confirm_wire_load_from_plan").next())
-        .expect("stamp fn slice");
-    assert!(
-        !stamp_fn.contains("get_outs_by_range_batch"),
-        "lookup stamp must never body denserels-decode"
-    );
-    assert!(
-        !stamp_fn.contains("IdxBodyMode::OutsDenserels"),
-        "lookup stamp must never idx denserels body"
-    );
-    // pin_for_wire_batch lives in pin.rs (Q-11 extract); still denserels-by-range only.
-    let pin_src = include_str!("pin.rs");
-    let load_pin = pin_src
-        .split("fn pin_for_wire_batch")
-        .nth(1)
-        .and_then(|s| s.split("fn ensure_spend_abs_layouts").next())
-        .expect("pin fn slice");
-    assert!(
-        !load_pin.contains("get_fk_by_txid("),
-        "load pin must not probe head"
-    );
-    assert!(
-        !load_pin.contains(".body_txid("),
-        "load pin must not read txid.body"
-    );
-    assert!(
-        !load_pin.contains("load_creates_once"),
-        "load pin must not idx denserels via load_creates_once"
-    );
-    assert!(
-        load_pin.contains("get_outs_by_range_batch"),
-        "load pin must denserels by known body range"
-    );
-    assert!(
-        !load_pin.contains("tx_spent_range_batch"),
-        "load pin must not spent.idx; write ensure owns abs"
-    );
-
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -2223,41 +2179,4 @@ fn structural_pinned_without_abs_is_invariant_error() {
         "unexpected err: {msg}"
     );
     let _ = std::fs::remove_dir_all(&path);
-}
-
-#[test]
-fn write_mtp_does_not_get_header_plan() {
-    let mtp = include_str!("../block/mod.rs");
-    let start = mtp.find("fn mtp_at(").expect("mtp_at");
-    let body = &mtp[start..start + 600];
-    assert!(
-        body.contains("median_time_past_store"),
-        "write mtp_at must use store+carried, not header-cache median_time_past"
-    );
-    assert!(
-        !body.contains("median_time_past(query"),
-        "write mtp_at must not call get_header_plan via median_time_past"
-    );
-    let phases = include_str!("phases.rs");
-    let post = phases
-        .split("pub(super) fn post_commit")
-        .nth(1)
-        .expect("post_commit");
-    assert!(
-        !post.contains("advance_parent_cache_tip"),
-        "post_commit must not GC header cache; load polls store tip"
-    );
-    let write = include_str!("write.rs");
-    assert!(
-        !write.contains("advance_parent_cache_tip"),
-        "write must not call advance_parent_cache_tip"
-    );
-    assert!(
-        write.contains("note_head_drain_fk"),
-        "write publishes drain-fk HWM after insert"
-    );
-    assert!(
-        !write.contains("send_leftover_notes"),
-        "write does not send leftover notes (Class A does)"
-    );
 }

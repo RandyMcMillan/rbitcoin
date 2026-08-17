@@ -38,6 +38,11 @@ before 1.0).
 
 ### Changed
 
+- **Tests assert behavior, not the repo.** Default-suite tests no longer
+  `include_str!` production sources or `CONTRIBUTING.md` to grep
+  identifiers. Query open leftover-strong repair is pinned by
+  `Query::open_or_create` reopen. CONTRIBUTING principle 8.
+
 - **Documentation map.** [`docs/README.md`](docs/README.md) is the only
   index (one audience, one start file; one fact, one owner). Coverage
   policy lives in `TESTING.md`. Schema 17 freeze tables live in

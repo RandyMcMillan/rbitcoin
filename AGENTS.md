@@ -262,6 +262,7 @@ when a scenario would be slow / multi-GB. One entry per production path.
 | **Same-block / corrupt spender meta** | Same-block spends use **pending only**. Spender height before create → ignore as unspent. |
 | **No test-only production APIs** | No `*_for_test` backdoors when tests can use real clamps. |
 | **No re-implemented oracles in tests** | Drive the shipped function. |
+| **No repo-text tests** | Do not `include_str!` production `.rs` / markdown and `contains` identifiers. See CONTRIBUTING principle 8. |
 | **Collapse same-entry duplicates** | One closer test; drop the twin when coverage remains. |
 | **Compile/test lean** | Fewer full-store opens; measure before claiming wall-time wins. |
 | **No production-scale fixtures** | Tiny N / `RBITCOIN_HEAD_SCALE=tiny` / `pad_empty_from`. See [`TESTING.md`](TESTING.md). New default tests **>2 s** wall need PR justification. |

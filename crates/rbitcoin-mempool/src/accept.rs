@@ -1176,22 +1176,6 @@ mod tests {
         p
     }
 
-    #[test]
-    fn admit_policy_source_is_libre_only() {
-        let src = include_str!("accept.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            prod.contains("check_libre_admission"),
-            "prepare must call Libre admission"
-        );
-        assert!(
-            !prod.contains("check_tx_standard"),
-            "Core-style standardness is not an admit gate"
-        );
-        assert!(!prod.contains("is_standard_script_pubkey"));
-        assert!(!prod.contains("is_push_only"));
-    }
-
     /// Tip high enough that maturity/finality/BIP68 do not block normal test txs.
     const TIP_OK: ChainTipCtx = ChainTipCtx {
         height: 1_000_000,

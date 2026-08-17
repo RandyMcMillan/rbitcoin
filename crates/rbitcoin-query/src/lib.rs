@@ -2129,29 +2129,38 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn query_open_repairs_class_c_once_after_revalidate() {
-        let src = include_str!("lib.rs");
-        let open = src
-            .split("pub fn open_or_create_layout")
-            .nth(1)
-            .and_then(|s| s.split("let store_path = store.path()").next())
-            .expect("open_or_create_layout");
-        assert!(
-            open.contains("revalidate_tip_window"),
-            "revalidate before repair: {open}"
+    fn query_open_clears_strong_above_tip() {
+        let (dir, q) = temp_query("open-repair-above-tip");
+        let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
+        h0.hash = rbitcoin_store::block_header_hash(
+            h0.version,
+            &[0u8; 32],
+            &h0.merkle_root,
+            h0.timestamp,
+            h0.bits,
+            h0.nonce,
         );
-        let repair_pos = open.find("repair_class_c_above_tip").expect("one repair");
-        let reval_pos = open.find("revalidate_tip_window").expect("revalidate");
-        assert!(reval_pos < repair_pos, "revalidate must run first");
+        let hfk = q.put_header(&h0).unwrap();
+        q.store().confirmed.set(Height(0), hfk).unwrap();
+        q.store().rebuild_height_fence().unwrap();
+        let leftover = Fk(99);
+        q.store().strong_tx.set_strong(leftover, hfk).unwrap();
+        q.store().flush_class_c_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        assert!(q.store().strong_tx.is_strong(leftover).unwrap());
+        drop(q);
+
+        let q = Query::open_or_create(dir.join("store")).unwrap();
         assert_eq!(
-            open.matches("repair_class_c_above_tip").count(),
-            1,
-            "one complement repair"
+            q.tip_height(),
+            Some(Height(0)),
+            "repair must not shrink tip"
         );
         assert!(
-            !open.contains("repair_orphan_class_c"),
-            "orphan alias is the same walk — do not call twice: {open}"
+            !q.store().strong_tx.is_strong(leftover).unwrap(),
+            "open must clear leftover strong above the fence"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
@@ -2312,39 +2321,8 @@ mod tests {
     }
 
     /// Disconnecting a confirmed block must emit an info/warn line (not debug).
-    /// Source pin: every `disconnect_tip` path is the sole durable disconnect.
     #[test]
     fn disconnect_tip_logs_each_block_at_least_info() {
-        let src = include_str!("connect.rs");
-        let start = src
-            .find("pub fn disconnect_tip")
-            .expect("Query::disconnect_tip");
-        let rest = &src[start..];
-        let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
-        let body = &rest[..end];
-        assert!(
-            body.contains("log_disconnect_tip(")
-                || body.contains("warn!")
-                || body.contains("info!"),
-            "disconnect_tip must log each leaving block at info/warn: {body}"
-        );
-        let log_body = src
-            .split("fn log_disconnect_tip")
-            .nth(1)
-            .expect("log_disconnect_tip helper")
-            .lines()
-            .take(8)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            log_body.contains("warn!") || log_body.contains("info!"),
-            "disconnect log must be at least info: {log_body}"
-        );
-        assert!(
-            !log_body.contains("debug!") && !log_body.contains("trace!"),
-            "must not hide disconnects at debug/trace: {log_body}"
-        );
-
         let (dir, q) = temp_query("disconnect-log");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);
         let hash0 = h0.hash;

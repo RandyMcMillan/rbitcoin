@@ -2264,30 +2264,3 @@ fn unified_wire_pipeline_rejects_double_spend() {
     );
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
 }
-
-/// Structural: wire prep path must not call wire_rebuild-from-Class-A for batch creates.
-#[test]
-fn unified_wire_prep_source_has_no_wire_rebuild() {
-    let src = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../rbitcoin-consensus/src/confirm_run/mod.rs"
-    ));
-    // confirm_wire_load_phase body must not invoke wire_rebuild.
-    let start = src
-        .find("pub fn confirm_wire_load_phase")
-        .expect("confirm_wire_load_phase");
-    let rest = &src[start..];
-    let end = rest
-        .find("\npub fn confirm_wire_run")
-        .or_else(|| rest.find("\npub fn confirm_scripts_phase"))
-        .expect("end of wire prep");
-    let body = &rest[..end];
-    assert!(
-        !body.contains("wire_rebuild("),
-        "wire prep must not call wire_rebuild for batch creates"
-    );
-    assert!(
-        body.contains("assemble_run(") && body.contains("&wire_blocks"),
-        "wire prep must assemble from intake wire_blocks"
-    );
-}

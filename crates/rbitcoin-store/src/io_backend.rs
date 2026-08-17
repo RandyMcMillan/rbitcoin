@@ -222,19 +222,4 @@ mod tests {
         let _ = effective_write(WriteIoBackend::Pwrite);
         let _ = effective_write(WriteIoBackend::Uring);
     }
-
-    #[test]
-    fn public_surface_is_two_getters() {
-        let src = include_str!("io_backend.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(prod.contains("pub fn read_io_backend"));
-        assert!(prod.contains("pub fn write_io_backend"));
-        assert!(!prod.contains("pub fn pin_io_backend"));
-        assert!(!prod.contains("pub fn head_resolve_io_backend"));
-        assert!(!prod.contains("pub fn spend_meta_io_backend"));
-        assert!(!prod.contains("pub fn class_c_io_backend"));
-        assert!(!prod.contains("pub fn spend_ann_io_backend"));
-        assert!(!prod.contains("class_a_append_uses_pwrite"));
-        assert!(!prod.contains("_path_env"));
-    }
 }

@@ -7,8 +7,8 @@ index via `--shindex`, default off; not a graphical block-explorer stack) — bu
 around a **libbitcoin-class relational archive** and a **pure-Rust
 consensus/script** path.
 
-> **0.x:** on-disk format and APIs are **unstable until 1.0**. Prefer a **signet
-> soak** before first mainnet cutover; treat early mainnet as high-scrutiny.
+> **0.x:** on-disk format and APIs are **unstable until 1.0**. Run **signet
+> first**, then mainnet with monitoring; treat early mainnet as high-scrutiny.
 > Security contact and policy: [`SECURITY.md`](./SECURITY.md). Operator notes:
 > [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 

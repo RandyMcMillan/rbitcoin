@@ -7,8 +7,8 @@ This node can perform multi-peer IBD, tip follow, Electrum (post-tip), and
 Libre-class mempool participation. Treat consensus and ops as **under active
 hardening**. Completing any particular full mainnet IBD is an **operator-side**
 job and is **not** a packaging or “ready for experimental use” gate for this
-repository — resume catch-up on the same datadir until tip, then soak tip follow
-before trusting Electrum.
+repository — resume catch-up on the same datadir until tip, then run tip follow
+with monitoring before trusting Electrum.
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ Binary: `./target/release/rbitcoin-node` (fully static). More knobs:
   --log-level info
 ```
 
-Time-box a soak with `--max-run-secs` if desired. Prefer local listen + reverse
+Time-box a run with `--max-run-secs` if desired. Prefer local listen + reverse
 proxy TLS for Electrum; do not expose plain Electrum to the internet.
 
 ## Mainnet catch-up (typical)

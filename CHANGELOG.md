@@ -47,6 +47,9 @@ before 1.0).
   store file lengths (plus cold inwit when split). `verificationprogress`
   is `blocks / headers` (1.0 when headers is 0), not a dummy 0.5 / 1.0.
 
+- **No soak program.** Signet-first remains ordinary run advice. Q-35 is
+  won't-fix. Docs no longer title a gated “soak” checklist.
+
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
   `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
   never. Stratum / wallet keys stay non-goals.

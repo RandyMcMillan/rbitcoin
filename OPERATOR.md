@@ -4,8 +4,8 @@
 
 BIP324 v2-only P2P, cluster mempool (Libre admission + **consensus script checks on accept**),
 Electrum confirmed + unconfirmed (TLS via reverse proxy). **Mainnet is experimental** — see
-[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Soak reorgs and disk headroom
-before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Watch reorgs and disk
+headroom before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
 that height; use `--milestone 0` for full scripts.
 
 Architecture: peer wire lands in an **in-RAM body queue**; confirm
@@ -623,10 +623,10 @@ Full script validation (slow, used for consensus parity labs):
   --milestone 0
 ```
 
-### Soak checklist
+### Before trusting mainnet
 
 - [ ] Signet (or large range) to tip; restart resume
-- [ ] Multi-day mainnet soak without corruption / OOM
+- [ ] Mainnet tip follow without corruption / OOM
 - [ ] Post-milestone or `--milestone 0` script path exercised
 - [ ] Disk headroom for full Class A archive
 - [ ] Mempool file growth bounded under load (compaction + eviction)

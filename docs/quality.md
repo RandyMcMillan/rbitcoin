@@ -39,7 +39,7 @@ level peers cannot ignore.
 | 3 | **Build & release integrity** | Same toolchain in CI and Nix; byte-repro musl; SBOM/audit gates; no floating `stable` |
 | 4 | **Contributor velocity** | God-files gone or split by stage; warm suite a few minutes; TDD practiced; first-hour tutorial |
 | 5 | **Product surface honesty** | COMPAT accurate; Electrum/Esplora complete for *target* wallets, not explorer bloat |
-| 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; soak playbooks |
+| 6 | **Observability & ops** | Default INFO shippable; residual env in `docs/env-knobs.md`; signet-first then mainnet with monitoring |
 | 7 | **Platform truth** | Linux-first everywhere; macOS/Windows non-goals until an IO story exists |
 
 ### Competitive bar
@@ -78,13 +78,12 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: no fuzz crate, no corpus, no job.** |
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 28 / 267.** Next: `rpc-missing` we already implement (`mempool_accept*`, `mempool_persist`, `interface_rpc`, …) and leftover `core-log`. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-47** | Honest `getblockchaininfo` disk / progress | honesty | `size_on_disk` and `verificationprogress` are real estimates or stay **explicitly dummy** in RPC output (not just docs). Prefer a cheap archive-bytes sum + header-height fraction over `0` / `0.5` |
-| 4 | **Q-35** | Mainnet soak checklist | ops | Operator checklist + success criteria on top of [`experimental-mainnet.md`](./experimental-mainnet.md): signet resume → mainnet catch-up → tip-follow hours → Electrum query. Optional public tip-height badge |
-| 5 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
-| 6 | **Q-48** | BIP331 rust-bitcoin package types | interop | Real BIP331 `NetworkMessage` (or an explicit refuse) instead of experimental `rbtpkg`. Track rust-bitcoin; **RB-007** |
-| 7 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
-| 8 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 9 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
-| 10 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
+| 4 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
+| 5 | **Q-48** | BIP331 rust-bitcoin package types | interop | Real BIP331 `NetworkMessage` (or an explicit refuse) instead of experimental `rbtpkg`. Track rust-bitcoin; **RB-007** |
+| 6 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
+| 7 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 8 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
+| 9 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
 
 ### Still valid? (this reaudit)
 
@@ -96,7 +95,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | **Q-31** | Keep, lowered. Useful for Q-30; not blocking operators. |
 | **Q-36** | Keep. IBD/tip INFO is still a firehose (`UpdateTip` + `tip: accept` per block). |
 | **Q-32** | **Won't fix.** Operators grep text. A second JSON dialect is not a goal. |
-| **Q-35** | Keep. Runbook exists; success criteria do not. |
+| **Q-35** | **Won't fix.** Not a gated program. Signet-first is ordinary run advice. |
 | **Q-34** | Keep. Onboarding still medium. |
 | **Q-33** | **Won't fix.** Local `cargo doc` is enough until crates.io. |
 | **Q-24** | **Won't fix.** Single maintainer + bot. GitHub defaults. |
@@ -116,7 +115,7 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 10 |
+| R-10 | **R-10** | Open rank 9 |
 
 New work after this reaudit starts at **Q-50**.
 
@@ -133,6 +132,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-32** | Structured logging option | INFO/DEBUG text is the operator contract. JSON/kv is a second dialect |
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
 | **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
+| **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
 | **—** | Darwin / Windows operator binaries | Linux-shaped IO. Draft `feature/metal-support` stays out of this list |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |

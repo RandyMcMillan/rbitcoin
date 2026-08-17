@@ -8,7 +8,7 @@ update that file — do not paste a parallel spec.
 
 | Audience | Start | Owns |
 |----------|-------|------|
-| Operator / new human | [`README.md`](../README.md) → [`OPERATOR.md`](../OPERATOR.md) | How to run, flags, soak |
+| Operator / new human | [`README.md`](../README.md) → [`OPERATOR.md`](../OPERATOR.md) | How to run, flags |
 | Product / interop | [`COMPAT.md`](../COMPAT.md) | Intentional differences, Electrum/RPC surface |
 | Contributor (human) | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Principles, review checklist, comments-as-smell, CI commands |
 | Agent | [`AGENTS.md`](../AGENTS.md) | Short hard rules + pointers (not a second design book) |
@@ -49,7 +49,7 @@ Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
 | Doc | Owns |
 |-----|------|
 | [`README.md`](../README.md) | Product pitch + short pointer table (this map is the rest). |
-| [`OPERATOR.md`](../OPERATOR.md) | Day-to-day ops, flags, soak. |
+| [`OPERATOR.md`](../OPERATOR.md) | Day-to-day ops, flags. |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Human+agent principles + checklist. |
 | [`AGENTS.md`](../AGENTS.md) | Harness-injected agent contract. |
 | [`COMPAT.md`](../COMPAT.md) | Product surface. |

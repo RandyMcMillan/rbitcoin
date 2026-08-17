@@ -39,6 +39,12 @@ pub fn bq_resolve_wave_stop_after(
 /// per newly fetched block.
 ///
 /// `ready` is BQ depth. `soft_win` is the 1-min confirm window (`bq soft=n/win`).
+/// `path_lo` is the load frontier (store tip+1). `first_unresolved` is the
+/// lowest collected height (already sorted by [`BlockQueue::unresolved_heights`]).
+///
+/// Never hold when the first unresolved height sits in the load-facing half
+/// of the window (`first - path_lo ≤ win/2`) — that is the block load is
+/// about to claim. O(1): two subtracts, no extra queue walk.
 /// `soft_win == 0` (rate unknown) never holds.
 #[inline]
 pub fn bq_resolve_wave_hold_partial(
@@ -46,8 +52,13 @@ pub fn bq_resolve_wave_hold_partial(
     soft_win: u32,
     sum_inputs: u32,
     n_blocks: usize,
+    path_lo: u32,
+    first_unresolved: u32,
 ) -> bool {
     if soft_win == 0 || n_blocks == 0 {
+        return false;
+    }
+    if first_unresolved.saturating_sub(path_lo) <= soft_win / 2 {
         return false;
     }
     ready > soft_win / 2
@@ -171,14 +182,22 @@ pub fn confirm_bq_resolve_wave_with_ids(
         }
     }
 
-    if bq_resolve_wave_hold_partial(
-        query.block_queue_count() as u32,
-        query.soft_confirm_window(),
-        sum_inputs,
-        per_height.len(),
-    ) {
-        stats.work_ns = t0.elapsed().as_nanos() as u64;
-        return Ok(stats);
+    if let Some(&(first, _)) = per_height.first() {
+        let path_lo = query
+            .tip_height()
+            .map(|h| h.0.saturating_add(1))
+            .unwrap_or(0);
+        if bq_resolve_wave_hold_partial(
+            query.block_queue_count() as u32,
+            query.soft_confirm_window(),
+            sum_inputs,
+            per_height.len(),
+            path_lo,
+            first,
+        ) {
+            stats.work_ns = t0.elapsed().as_nanos() as u64;
+            return Ok(stats);
+        }
     }
 
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
@@ -437,18 +456,23 @@ mod tests {
 
     #[test]
     fn hold_partial_table() {
-        // fat BQ + short wave → hold
-        assert!(bq_resolve_wave_hold_partial(330, 180, 4_000, 1));
+        // far unresolved (beyond first half of win) + fat + short → hold
+        assert!(bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 191));
+        // same, but gap is in the first half of the window → emit (load needs it)
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 190));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100));
         // fat BQ + full input wave → emit
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 64_100, 16));
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 64_100, 16, 100, 250
+        ));
         // fat BQ + full block cap → emit
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 1, 1080));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 1, 1080, 100, 250));
         // thin BQ + short wave → emit (load catching up)
-        assert!(!bq_resolve_wave_hold_partial(50, 180, 4_000, 1));
+        assert!(!bq_resolve_wave_hold_partial(50, 180, 4_000, 1, 100, 250));
         // rate unknown (win=0) → never hold
-        assert!(!bq_resolve_wave_hold_partial(330, 0, 4_000, 1));
+        assert!(!bq_resolve_wave_hold_partial(330, 0, 4_000, 1, 100, 250));
         // nothing collected
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 0, 0));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 0, 0, 100, 100));
     }
 
     #[test]
@@ -479,6 +503,35 @@ mod tests {
         let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
         assert_eq!(st.heights, 1, "unknown window must allow a short wave");
         assert!(q.block_queue_is_resolve_complete(8));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn fat_bq_emits_short_wave_when_gap_is_at_load_frontier() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        for h in 1..=20u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+            prev = b.block_hash();
+        }
+        for h in 2..=20u32 {
+            q.block_queue_mark_resolve_complete(h).unwrap();
+        }
+        // win=12; ready=20 > 6 (fat) but height 1 is path_lo — load is waiting on it.
+        let _ = q.block_queue_update_soft_pressure(Some(0.2));
+        let st = confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
+        assert_eq!(
+            st.heights, 1,
+            "unresolved height in the first half of the soft window must emit"
+        );
+        assert!(q.block_queue_is_resolve_complete(1));
         let _ = std::fs::remove_dir_all(&path);
     }
 

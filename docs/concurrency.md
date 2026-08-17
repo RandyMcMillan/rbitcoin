@@ -19,7 +19,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Load claim pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do **not** treat ~32 as pack size (that was 8000/250 mid-chain, not fat-era).
 
-**IBD lookup resolve wave:** TipOnly `head_fk` over at most **1080** BQ-ready heights or soft **64000** inputs (include-overshoot; 256 k unique-key safety cap), then mark those complete for load to claim. One published identity layer per wave; get walks the chain (no union rebuild). When `ready >` half the 1-min BQ window, lookup waits for a full wave instead of minting a 1-block layer.
+**IBD lookup resolve wave:** TipOnly `head_fk` over at most **1080** BQ-ready heights or soft **64000** inputs (include-overshoot; 256 k unique-key safety cap), then mark those complete for load to claim. One published identity layer per wave; get walks the chain (no union rebuild). When `ready >` half the 1-min BQ window, lookup waits for a full wave instead of minting a 1-block layer — unless the first unresolved height is within `path_lo + win/2` (load is about to claim it; O(1) from the already-sorted unresolved list).
 
 **`ibd: perf`:** `load=` is pin+assemble only. Load OS-thread leftover TipOnly is `load_thr stamp=`; post-scriptq in-flight drop is `prune=`. `script=` is verify ns (`jobs=`/`skip=`), not feed-ahead join. `ready>0` + `scriptq=1` + high `stamp=` means leftover on load, not a hungry script pool.
 

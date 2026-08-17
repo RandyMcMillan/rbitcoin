@@ -99,6 +99,7 @@ analog = "follow-up: equal-work tip choice (preciousblock exists)"
 name = "feature_cltv.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: v3 at cltv@111 is bad-version(0x00000003); five CLTV parens + reject-details; unmodified MiniWallet RAW_OP_TRUE + acceptnonstdtxn path not locally proven"
 
 [[test]]
 name = "feature_coinstatsindex.py"

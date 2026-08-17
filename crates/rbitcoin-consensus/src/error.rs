@@ -207,6 +207,30 @@ mod tests {
             block_reject_reason(&ConsensusError::Script("SIG_DER".into())),
             "block-script-verify-flag-failed (Non-canonical DER signature)"
         );
+        // feature_cltv.py five BIP65 paren reasons (stack / negative / type /
+        // locktime / SEQUENCE_FINAL).
+        for (token, paren) in [
+            (
+                "stack empty",
+                "Operation not valid with the current stack size",
+            ),
+            ("CLTV negative", "Negative locktime"),
+            ("CLTV type", "Locktime requirement not satisfied"),
+            ("CLTV", "Locktime requirement not satisfied"),
+            ("CLTV final sequence", "Locktime requirement not satisfied"),
+        ] {
+            assert_eq!(
+                block_reject_reason(&ConsensusError::Script(token.into())),
+                format!("block-script-verify-flag-failed ({paren})")
+            );
+            assert_eq!(
+                block_reject_log_line(
+                    "abcd",
+                    &format!("block-script-verify-flag-failed ({paren})")
+                ),
+                format!("Block validation error: block-script-verify-flag-failed ({paren})")
+            );
+        }
         assert_eq!(
             block_reject_reason(&ConsensusError::BadVersion(2)),
             "bad-version(0x00000002)"

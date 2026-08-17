@@ -4534,6 +4534,26 @@ mod tests {
     }
 
     #[test]
+    fn testmempoolaccept_script_reject_maps_cltv_parens() {
+        for (token, paren) in [
+            (
+                "stack empty",
+                "Operation not valid with the current stack size",
+            ),
+            ("CLTV negative", "Negative locktime"),
+            ("CLTV type", "Locktime requirement not satisfied"),
+            ("CLTV", "Locktime requirement not satisfied"),
+            ("CLTV final sequence", "Locktime requirement not satisfied"),
+        ] {
+            let err = format!("script: script verification failed: {token}");
+            assert_eq!(
+                accept_reject_reason(&err),
+                format!("mempool-script-verify-flag-failed ({paren})")
+            );
+        }
+    }
+
+    #[test]
     fn getpeerinfo_empty_without_hub() {
         let (ctx, dir) = ctx_empty();
         let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();

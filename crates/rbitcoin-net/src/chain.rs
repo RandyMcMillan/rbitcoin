@@ -2324,6 +2324,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `feature_cltv.py`: after cltv@111, a version-3 block is `bad-version`.
+    #[test]
+    fn cltv_rejects_version3_and_logs_core_needle() {
+        use bitcoin::block::Version;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-cltv-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let mut params = ChainParams::regtest();
+        params.apply_test_activation_height("cltv", 111).unwrap();
+        let hub = ChainHub::new(q, params, Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(110, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad to height 110");
+        assert_eq!(hub.tip_height(), Some(110));
+
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let mut block =
+            mine_regtest_paying(prev, time, 111, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+        block.header.version = Version::from_consensus(3);
+        let bits = block.header.bits;
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let hash = block.block_hash();
+        let err = hub.accept_block(block).expect_err("v3 at height 111");
+        let s = err.to_string();
+        assert!(s.contains("bad-version(0x00000003)"), "shipped reject: {s}");
+        let line = rbitcoin_consensus::block_reject_log_line(&hash, "bad-version(0x00000003)");
+        assert_eq!(line, format!("{hash}, bad-version(0x00000003)"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn work_better_and_sum_work_helpers() {
         let z = Work::from_be_bytes([0u8; 32]);

@@ -449,6 +449,14 @@ pub fn test_take_last_sqe_lens() -> Vec<u32> {
 /// complete a different stage's slot (probe slot `5` ≠ ID op `5`).
 pub const KIND_BULK_PREAD: u8 = 1;
 pub const KIND_IDX: u8 = 2;
+pub const KIND_PROBE: u8 = 3;
+pub const KIND_BULK_PWRITE: u8 = 4;
+pub const KIND_SPEND_META_READ: u8 = 5;
+pub const KIND_SPEND_META_WRITE: u8 = 6;
+pub const KIND_SPEND_PAGE_READ: u8 = 7;
+pub const KIND_SPEND_PAGE_WRITE: u8 = 8;
+pub const KIND_RMW_READ: u8 = 9;
+pub const KIND_RMW_WRITE: u8 = 10;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
 ///
@@ -537,6 +545,37 @@ pub(crate) fn map_enter_err(err: &std::io::Error) -> Option<StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_ud_kinds_are_unique_and_do_not_alias() {
+        let kinds = [
+            KIND_BULK_PREAD,
+            KIND_IDX,
+            KIND_PROBE,
+            KIND_BULK_PWRITE,
+            KIND_SPEND_META_READ,
+            KIND_SPEND_META_WRITE,
+            KIND_SPEND_PAGE_READ,
+            KIND_SPEND_PAGE_WRITE,
+            KIND_RMW_READ,
+            KIND_RMW_WRITE,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for k in kinds {
+            assert!(seen.insert(k), "duplicate kind {k}");
+        }
+        // Leftover probe slot 5 must not look like ID op 5 or idx slot 5.
+        let probe = pack_ud(KIND_PROBE, 1, 5);
+        let id = pack_ud(KIND_BULK_PREAD, 1, 5);
+        let idx = pack_ud(KIND_IDX, 1, 5);
+        assert_ne!(probe, id);
+        assert_ne!(probe, idx);
+        assert_ne!(id, idx);
+        // Epoch N CQE is a different ud than epoch N+1 (same kind+slot).
+        assert_ne!(pack_ud(KIND_PROBE, 1, 5), pack_ud(KIND_PROBE, 2, 5));
+        let (k, e, s) = unpack_ud(probe);
+        assert_eq!((k, e, s), (KIND_PROBE, 1, 5));
+    }
 
     #[test]
     fn pack_unpack_roundtrip() {

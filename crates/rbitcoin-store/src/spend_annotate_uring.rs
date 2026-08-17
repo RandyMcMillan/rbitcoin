@@ -76,6 +76,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
     }
 
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
+        session.begin_batch();
+        let epoch = session.epoch();
         // Pending edge indices not yet started.
         let mut pending: VecDeque<usize> = (0..work.len()).collect();
         // Abs offsets with an RMW in flight (serialize same-outpoint).
@@ -114,7 +116,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 });
                 {
                     let s = slots[slot].as_mut().unwrap();
-                    session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, 0)?;
+                    let ud = uring_session::pack_ud(
+                        uring_session::KIND_SPEND_META_READ,
+                        epoch,
+                        slot as u32,
+                    );
+                    session.push_pread_flags(body_fd, abs, &mut s.buf, ud, 0)?;
                 }
                 *in_flight += 1;
             }
@@ -143,13 +150,21 @@ pub fn put_spend_batch_by_abs_meta_uring(
             }
 
             for (ud, res) in cqes {
-                let slot = ud as usize;
+                let (kind, _ep, slot) = uring_session::unpack_ud(ud);
+                let slot = slot as usize;
                 if slot >= slots.len() {
                     return Err(StoreError::Corrupt("spend annotate bad user_data"));
                 }
                 let mut st = slots[slot]
                     .take()
                     .ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
+                let expect = match st.phase {
+                    Phase::Reading => uring_session::KIND_SPEND_META_READ,
+                    Phase::Writing => uring_session::KIND_SPEND_META_WRITE,
+                };
+                if kind != expect {
+                    return Err(StoreError::Corrupt("spend annotate bad user_data"));
+                }
                 in_flight = in_flight.saturating_sub(1);
                 let edge_i = st.edge_i;
                 let (abs, create_fk, vout, spend_fk) = work[edge_i];
@@ -215,7 +230,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         slots[slot] = Some(st);
                         {
                             let s = slots[slot].as_mut().unwrap();
-                            session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, 0)?;
+                            let ud = uring_session::pack_ud(
+                                uring_session::KIND_SPEND_META_WRITE,
+                                epoch,
+                                slot as u32,
+                            );
+                            session.push_pwrite_flags(body_fd, abs, &s.buf, ud, 0)?;
                         }
                         in_flight += 1;
                     }
@@ -561,6 +581,8 @@ fn put_spend_batch_pure_write_uring(
     }
 
     let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
+        session.begin_batch();
+        let epoch = session.epoch();
         let mut pending: VecDeque<usize> = (0..groups.len()).collect();
         let nslots = MAX_SLOTS.min(groups.len().max(1));
         let mut free_slots: Vec<usize> = (0..nslots).collect();
@@ -588,13 +610,12 @@ fn put_spend_batch_pure_write_uring(
                 });
                 {
                     let s = slots[slot].as_mut().unwrap();
-                    session.push_pread_flags(
-                        body_fd,
-                        groups[gi].off,
-                        &mut s.buf,
-                        slot as u64,
-                        0,
-                    )?;
+                    let ud = uring_session::pack_ud(
+                        uring_session::KIND_SPEND_PAGE_READ,
+                        epoch,
+                        slot as u32,
+                    );
+                    session.push_pread_flags(body_fd, groups[gi].off, &mut s.buf, ud, 0)?;
                 }
                 *in_flight += 1;
             }
@@ -620,13 +641,21 @@ fn put_spend_batch_pure_write_uring(
                 cqes = session.harvest_ready()?;
             }
             for (ud, res) in cqes {
-                let slot = ud as usize;
+                let (kind, _ep, slot) = uring_session::unpack_ud(ud);
+                let slot = slot as usize;
                 if slot >= slots.len() {
                     return Err(StoreError::Corrupt("spend pure-write bad user_data"));
                 }
                 let mut st = slots[slot]
                     .take()
                     .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
+                let expect = match st.phase {
+                    Phase::Reading => uring_session::KIND_SPEND_PAGE_READ,
+                    Phase::Writing => uring_session::KIND_SPEND_PAGE_WRITE,
+                };
+                if kind != expect {
+                    return Err(StoreError::Corrupt("spend pure-write bad user_data"));
+                }
                 in_flight = in_flight.saturating_sub(1);
                 let gi = st.group_i;
                 match st.phase {
@@ -648,7 +677,12 @@ fn put_spend_batch_pure_write_uring(
                         slots[slot] = Some(st);
                         {
                             let s = slots[slot].as_mut().unwrap();
-                            session.push_pwrite(body_fd, groups[gi].off, &s.buf, slot as u64)?;
+                            let ud = uring_session::pack_ud(
+                                uring_session::KIND_SPEND_PAGE_WRITE,
+                                epoch,
+                                slot as u32,
+                            );
+                            session.push_pwrite(body_fd, groups[gi].off, &s.buf, ud)?;
                         }
                         in_flight += 1;
                     }

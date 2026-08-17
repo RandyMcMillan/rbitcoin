@@ -430,6 +430,8 @@ fn pwrite_batch_on_session(
     ops: &mut [WriteOp<'_>],
     total_nonempty: usize,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
@@ -442,7 +444,11 @@ fn pwrite_batch_on_session(
             }
             let fd = ops[next].fd;
             let offset = ops[next].offset;
-            let ud = next as u64;
+            let ud = crate::uring_session::pack_ud(
+                crate::uring_session::KIND_BULK_PWRITE,
+                epoch,
+                next as u32,
+            );
             if session.push_pwrite(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
                     let _ = session.drain_all();
@@ -487,7 +493,8 @@ fn pwrite_batch_on_session(
         }
 
         for (ud, res) in cqes {
-            let i = ud as usize;
+            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
             }
@@ -504,9 +511,10 @@ fn pwrite_batch_on_session(
     true
 }
 
-/// user_data: low 63 bits = page index; bit 63 set ⇒ write completion.
 #[cfg(all(test, target_os = "linux"))]
-const RMW_WRITE_BIT: u64 = 1u64 << 63;
+fn rmw_ud(kind: u8, epoch: u16, i: usize) -> u64 {
+    crate::uring_session::pack_ud(kind, epoch, i as u32)
+}
 
 #[cfg(all(test, target_os = "linux"))]
 fn page_rmw_pipelined_uring(
@@ -522,6 +530,8 @@ fn page_rmw_on_session(
     pages: &mut [PageRmw<'_>],
     apply: &mut dyn FnMut(usize, &mut [u8]) -> bool,
 ) -> bool {
+    session.begin_batch();
+    let epoch = session.epoch();
     let n = pages.len();
     // 0 = need read, 1 = read in flight, 2 = need write, 3 = write in flight, 4 = done
     let mut state = vec![0u8; n];
@@ -550,7 +560,12 @@ fn page_rmw_on_session(
                 let fd = pages[i].fd;
                 let offset = pages[i].offset;
                 if session
-                    .push_pwrite(fd, offset, pages[i].buf, (i as u64) | RMW_WRITE_BIT)
+                    .push_pwrite(
+                        fd,
+                        offset,
+                        pages[i].buf,
+                        rmw_ud(crate::uring_session::KIND_RMW_WRITE, epoch, i),
+                    )
                     .is_err()
                 {
                     break;
@@ -579,7 +594,12 @@ fn page_rmw_on_session(
             let fd = pages[i].fd;
             let offset = pages[i].offset;
             if session
-                .push_pread(fd, offset, pages[i].buf, i as u64)
+                .push_pread(
+                    fd,
+                    offset,
+                    pages[i].buf,
+                    rmw_ud(crate::uring_session::KIND_RMW_READ, epoch, i),
+                )
                 .is_err()
             {
                 break;
@@ -626,18 +646,19 @@ fn page_rmw_on_session(
         }
 
         for (ud, res) in events {
-            let i = (ud & !RMW_WRITE_BIT) as usize;
+            let (kind, _ep, slot) = crate::uring_session::unpack_ud(ud);
+            let i = slot as usize;
             if i >= n {
                 continue;
             }
-            if ud & RMW_WRITE_BIT != 0 {
+            if kind == crate::uring_session::KIND_RMW_WRITE {
                 if res < 0 || res as usize != pages[i].buf.len() {
                     let _ = session.drain_all();
                     return false;
                 }
                 state[i] = 4;
                 done += 1;
-            } else {
+            } else if kind == crate::uring_session::KIND_RMW_READ {
                 if res < 0 || res as usize != pages[i].buf.len() {
                     let _ = session.drain_all();
                     return false;
@@ -650,6 +671,9 @@ fn page_rmw_on_session(
                     state[i] = 4;
                     done += 1;
                 }
+            } else {
+                let _ = session.drain_all();
+                return false;
             }
         }
     }

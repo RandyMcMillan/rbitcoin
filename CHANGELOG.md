@@ -33,6 +33,11 @@ before 1.0).
 
 ### Changed
 
+- **Open `tx.head` page RMW is seqlocked.** Each probe page has a RAM
+  `AtomicU32` (even = published, odd = `pwrite` in flight). Concurrent leftover
+  / lookup probes retry until they see a complete image (stale is fine). Stuck
+  odd is `Corrupt("open head page seqlock")`. No on-disk change.
+
 - **Source-code comments are a smell.** `CONTRIBUTING.md` now states that
   a comment restating *what* the next code does, *why* it exists, or a
   *weird* approach usually means names, signatures, or the library fit

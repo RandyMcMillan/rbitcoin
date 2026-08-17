@@ -832,7 +832,7 @@ analog = "follow-up: tx privacy"
 name = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
-analog = "rust pin: AcceptBlockHeader … missing anti-dos proof-of-work validation; unrequested fork + 288-block window + minwork header skip not shipped"
+analog = "official: after minwork anti-dos + weaker header-only + missing-header disconnect + 288 window, sync_with_ping hung 60s sending 288 unrequested bodies (p2p_unrequested_blocks.py:189)"
 
 [[test]]
 name = "p2p_v2_encrypted.py"

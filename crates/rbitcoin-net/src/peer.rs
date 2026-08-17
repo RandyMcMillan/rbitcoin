@@ -1,7 +1,7 @@
 //! Peer handshake, serve, tip follow, and announce (BIP324 v2 transport).
 
 use crate::cache::BlockCache;
-use crate::chain::{AcceptOutcome, ChainHub};
+use crate::chain::{accept_block_header_nodos_log, AcceptOutcome, ChainHub};
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
@@ -908,6 +908,9 @@ async fn handle_peer_frame(
                 if !connecting {
                     let _ = queue_getheaders(out_tx, hub);
                 } else {
+                    for hdr in headers.iter().take(n) {
+                        let _ = hub.ensure_header(hdr);
+                    }
                     let last = headers[n - 1].block_hash();
                     let mut want = Vec::new();
                     if header_path_meets_minwork(hub, pending_headers, last) {
@@ -951,6 +954,30 @@ async fn handle_peer_frame(
                 s.note_block_from_peer(hash);
                 s.note_best_known(hash);
             }
+            if !requested_blocks.contains(&hash) {
+                if hub.header_below_minwork(&block.header) {
+                    rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
+                    return Ok(());
+                }
+                let prev = block.header.prev_blockhash;
+                if prev.to_byte_array() != [0u8; 32]
+                    && !hub.knows_header(&prev)
+                    && !pending_headers.contains_key(&prev)
+                {
+                    return Err(NetError::Protocol(
+                        "unrequested block with missing parent header",
+                    ));
+                }
+                if hub.unrequested_weaker_than_tip(&block.header) {
+                    let _ = hub.ensure_header(&block.header);
+                    return Ok(());
+                }
+                if hub.unrequested_too_far_ahead(&block.header) {
+                    let _ = hub.ensure_header(&block.header);
+                    return Ok(());
+                }
+            }
+            let _ = hub.ensure_header(&block.header);
             pending_cmpct.remove(&hash);
             requested_blocks.remove(&hash);
             pending_headers.entry(hash).or_insert(block.header);

@@ -55,7 +55,7 @@ wire / body-queue
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
 | **lookup** | `tx.head`, `txout.idx` / `spent.idx` (fk + ranges), `txid.body`, headers | **`txout`/`inwit` decode** |
-| **load** | **`txout.body` outs by range** (from lookup stamp) | head, idx, `txid.body`, `inwit` |
+| **load** | **`txout.body` outs by range** (from lookup stamp) | head, idx (`txout` / `spent`), `txid.body`, `inwit` |
 | **scripts** | none | any store IO |
 
 | Stage | Invariant | Soft path allowed? |
@@ -63,8 +63,8 @@ wire / body-queue
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
 | Parent create_fk union | **in-flight** (prune **after** pin + scripts handoff: drain inserted fk span **and** `fence.covers_fk_span`) → pin_txid → BQ hits → **TipOnly** (connected **and** idx `body_range`). No leftover pending map. Disconnect drops in-flight layers at that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent). Identity without idx range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
 | io_uring harvest | Pending `user_data` set + kind/epoch. Unexpected CQE, undrained leftover, CQ overflow | **No** silent success. `Corrupt("invariant: io_uring …")`. Ring-unavailable still pread-fallback |
-| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `inwit` on pin |
-| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `spent.idx` on pin; **no** `inwit` on pin |
+| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. **Sole** `spent.idx` stamper (`tx_spent_range_batch`) | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
@@ -106,6 +106,7 @@ bind.
 | `pin_for_wire_incomplete_outs_is_invariant_error` | `pin_for_wire_batch` incomplete outs → cold miss |
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
+| `write_ensure_stamps_spent_range_after_load_pin` | pin-then-ensure fills abs; load pin has no `spent.idx` |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load; structural IO split asserts |

@@ -29,6 +29,17 @@ before 1.0).
 
 ### Changed
 
+- **Load pin hygiene (scriptq feed).** Sparse need-vouts are binary-searched
+  (sorted decode outs). Stamp maps move off the plan (`take_from_plan`)
+  instead of cloning two ~100k U64Maps. Archive bind is one walk
+  (in-flight → pin_txid → BQ → TipOnly). `pin_txid` is one Weak-map lock
+  per pack (`bulk_lookup_txid`), not one mutex per remaining prev_txid.
+  Load pin no longer `tx_spent_range_batch`s the parent set — write
+  `ensure_spend_abs_layouts` is the sole `spent.idx` stamper. IBD
+  `pread_skip` on write may drop; `scriptq` is the customer. Leftover
+  TipOnly vs BQ leakage is still a host spike (no pending map, no
+  soft-requeue).
+
 - **io_uring harvest is fail-closed.** Unmatched/duplicate CQEs, leftover
   undrained SQEs, CQ overflow, and identity-without-idx-range are
   `Corrupt("invariant: io_uring …")` / `idx range missing after identity`,

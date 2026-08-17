@@ -34,8 +34,10 @@ before 1.0).
   conflict and its descendants. `wallet_txn_*` reorgs need this.
 
 - **No leftover pending map.** Parent identity is in-flight until
-  drain-fk **and** fence after the child bind (n−1). Fence alone
-  dropped layers during `tx.head` seal (269204 leftover 1121/1120).
+  drain-fk **and** fence after pin + scripts handoff (n−1 outs).
+  Prune-after-bind dropped those outs before pin (mainnet 187
+  `load parent without body_range denserels`). Fence alone dropped
+  layers during `tx.head` seal (269204 leftover 1121/1120).
   Disconnect drops in-flight layers at that height. Header-cache GC
   polls store tip every load pack. Store `PendingHeadInserts` is a
   write-local drain `Vec`. Not a leftover soft-requeue.

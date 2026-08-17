@@ -61,7 +61,7 @@ wire / body-queue
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
-| Parent create_fk union | **in-flight** (prune **after** bind: drain inserted fk span **and** `fence.covers_fk_span`) → pin_txid → BQ hits → **TipOnly** (connected). No leftover pending map. Disconnect drops in-flight layers at that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent) |
+| Parent create_fk union | **in-flight** (prune **after** pin + scripts handoff: drain inserted fk span **and** `fence.covers_fk_span`) → pin_txid → BQ hits → **TipOnly** (connected). No leftover pending map. Disconnect drops in-flight layers at that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent) |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `inwit` on pin |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
@@ -79,10 +79,11 @@ structural cold spentness).
 ## Why there is no leftover pending map
 
 In-flight is the only RAM `txid → create_fk` cache for planned creates
-(plus `CreatePin` outs). Load prunes it **after** bind, when drain has
-inserted the layer (seal is inside that insert) **and** the fence covers
-the span. n−1 binds from in-flight before that prune. TipOnly is the
-home once the layer is gone.
+(plus `CreatePin` outs). Load prunes it **after** pin and scripts handoff,
+when drain has inserted the layer (seal is inside that insert) **and**
+the fence covers the span. Stamp skips `body_range` when in-flight still
+has outs (n−1); pin needs those outs. TipOnly is the home once the layer
+is gone.
 
 Fence alone during drain/seal (67438 / 269204) does not drop the layer.
 Drain alone does not drop it (TipOnly would reject unconnected).
@@ -108,4 +109,5 @@ bind.
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load; structural IO split asserts |
 | `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
+| `confirm_engine_pins_spend_of_just_written_pack` | IBD load: child spend of just-written pack (187 denserels miss) |
 | `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 soft requeue |

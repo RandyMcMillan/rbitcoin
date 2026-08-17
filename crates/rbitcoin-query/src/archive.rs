@@ -549,7 +549,8 @@ impl Query {
             external_parent_ranges.insert(id, range);
         }
         // After in-flight / live pins / BQ-ahead: TipOnly (connected). In-flight
-        // is pruned **after** this bind (n−1), so no leftover pending map.
+        // is pruned **after** pin + scripts handoff (n−1 outs), so no leftover
+        // pending map.
         let t_head = Instant::now();
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
@@ -971,7 +972,7 @@ mod tests {
         );
         assert!(
             !prod.contains("leftover_bind_then_forget") && !prod.contains("send_leftover_notes"),
-            "leftover pending map is gone; in-flight holds n−1 until prune after bind"
+            "leftover pending map is gone; in-flight holds n−1 until prune after pin"
         );
         assert!(
             prod.contains("get_fk_by_txid_batch(&need_head)"),
@@ -1216,7 +1217,7 @@ mod tests {
         }
     }
 
-    /// n−1: in-flight still has the parent at child bind (prune is after bind).
+    /// n−1: in-flight still has the parent at child bind (prune is after pin).
     #[test]
     fn inflight_binds_parent_after_commit_before_prune() {
         let (dir, q) = temp_query("inflight-n-minus-1");

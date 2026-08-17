@@ -1145,14 +1145,17 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
 }
 
 fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["txid", "verbose", "blockhash"])?;
+    params.reject_unknown(&["txid", "verbose", "verbosity", "blockhash"])?;
     let hex = params.req_str(0, "txid")?;
-    let verbose = match params.get(1, "verbose") {
+    let verbose = match params
+        .get(1, "verbose")
+        .or_else(|| params.get(1, "verbosity"))
+    {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(v) => json_u64(v)
             .map(|n| n != 0)
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "verbose must be a bool"))?,
+            .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "not of expected type number"))?,
     };
     let want = parse_hash32_display(hex)?;
 

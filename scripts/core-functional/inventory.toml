@@ -998,7 +998,7 @@ reason = "no-wallet"
 name = "rpc_rawtransaction.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: gettxout / createraw / fundraw"
+analog = "official: without -txindex getrawtransaction still serves (Class A always indexes); type-check -3 shipped"
 
 [[test]]
 name = "rpc_scanblocks.py"
@@ -1079,8 +1079,7 @@ reason = "no-tool"
 
 [[test]]
 name = "tool_rpcauth.py"
-status = "skip"
-reason = "no-tool"
+status = "run"
 
 [[test]]
 name = "tool_signet_miner.py"

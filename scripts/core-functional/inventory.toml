@@ -222,9 +222,7 @@ reason = "core-log"
 
 [[test]]
 name = "feature_minchainwork.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "rust pin: 50-block tip minwork 0x65 getheaders empty, 51st serves; unmodified script (IBD clock / 3-node relay) not locally proven"
+status = "run"
 
 [[test]]
 name = "feature_notifications.py"

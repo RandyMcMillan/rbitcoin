@@ -26,8 +26,6 @@ mod io_backend;
 mod io_handle;
 #[cfg(windows)]
 mod io_session_iocp;
-#[cfg(windows)]
-mod io_session_ioring;
 mod io_session_pool;
 mod open_address;
 mod point_table;

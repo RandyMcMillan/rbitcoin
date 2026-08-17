@@ -30,7 +30,7 @@ pub const DEFAULT_ENTRIES: u32 = 128;
 /// Which completion backend [`UringSession`] opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
-    /// Linux io_uring. On Windows this still opens IOCP (no IoRing engine yet).
+    /// Linux io_uring. On Windows this opens IOCP.
     Uring,
     /// Worker-pool completion ring (Darwin default; Linux `RBITCOIN_IO=pool`).
     Pool,
@@ -1114,5 +1114,7 @@ mod tests {
         assert_eq!(crate::bulk_io::resolved_session_kind(), SessionKind::Uring);
         #[cfg(target_os = "macos")]
         assert_eq!(crate::bulk_io::resolved_session_kind(), SessionKind::Pool);
+        #[cfg(windows)]
+        assert_eq!(crate::bulk_io::resolved_session_kind(), SessionKind::Iocp);
     }
 }

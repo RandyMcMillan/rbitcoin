@@ -110,7 +110,7 @@ enum IoToken {
 fn parse_io_token() -> Option<IoToken> {
     let s = std::env::var("RBITCOIN_IO").ok()?;
     match s.trim().to_ascii_lowercase().as_str() {
-        "uring" | "io_uring" | "ioring" => Some(IoToken::Uring),
+        "uring" | "io_uring" => Some(IoToken::Uring),
         "pool" => Some(IoToken::Pool),
         "iocp" => Some(IoToken::Iocp),
         "pread" | "fd" | "libc" | "pwrite" | "mmap" => Some(IoToken::Pread),

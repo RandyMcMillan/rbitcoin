@@ -20,13 +20,13 @@ Legacy token `mmap` demotes to **pread** with a one-time warning.
 
 | Token | Backend |
 |-------|---------|
-| `uring` / `io_uring` / `ioring` | Linux `io_uring`. On Windows the token still opens **IOCP** (IoRing is probe-only; no submit engine yet) |
+| `uring` / `io_uring` | Linux `io_uring`. On Windows the token opens **IOCP** |
 | `pool` | Worker-pool completion ring (Darwin **default**; Linux CI pin) |
 | `iocp` | Windows IOCP (Windows **default**) |
 | `pread` / `fd` / `libc` / `pwrite` | Disable session; libc positional IO (+ workers for reads) |
 
 **Defaults:** Linux `io_uring` if the ring opens, else pool. Darwin **pool**.
-Windows **IOCP**.
+Windows **IOCP**. Windows IoRing is not supported.
 
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
 `read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also

@@ -45,15 +45,12 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
         if st.ordered_set.insert(hash) {
             st.ordered.push_back(hash);
         }
-        // Same-height sibling (or any path entry not yet confirmed) needs densify.
         if e.height <= tip_h && hash != tip_hash {
             explore_is_sibling_fork = true;
             if !e.has_body {
                 explore_need.push(hash);
             }
         } else if !e.has_body {
-            // Extension beyond tip: densify via ordered/height band; also register
-            // first few for reorg gather when on a sibling fork.
             if explore_is_sibling_fork && explore_need.len() < 4 {
                 explore_need.push(hash);
             }
@@ -113,7 +110,6 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
             break;
         }
     }
-    // Also sample by max height in hash_height if ordered is empty/ghosty.
     if tips.is_empty() {
         if let Some((&h, _)) = st.hash_height.iter().max_by_key(|(_, &ht)| ht) {
             tips.push(h);

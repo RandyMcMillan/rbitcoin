@@ -32,7 +32,7 @@ const OCC_SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024;
 const OCC_MAGIC: &[u8; 8] = b"SHOCC001";
 
 const DEFAULT_SLOTS: u64 = 64;
-const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
+const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 
 /// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).
@@ -98,7 +98,7 @@ pub fn prefix_shard_of(full: &[u8; 32], n_shards: usize) -> usize {
         n.is_power_of_two() && n <= 256,
         "scripthash prefix shards must be power-of-two ≤ 256, got {n}"
     );
-    let bits = n.trailing_zeros() as usize; // log2(n)
+    let bits = n.trailing_zeros() as usize;
     (full[0] as usize) >> (8 - bits)
 }
 
@@ -308,7 +308,6 @@ impl ScriptHashHead {
     ) -> Result<(Option<ShHeadValue>, u64), StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
-        // 4 KiB chunk probe (128 × 32 B) — one pread per chunk under FdOnly.
         let mut cache = SlotPageCache::new(self, slots);
         let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
@@ -349,7 +348,6 @@ impl ScriptHashHead {
             return Ok((Vec::new(), 0));
         }
         let slots = self.state.lock().unwrap().slots;
-        // (primary_slot, input_index, head_key) — slot first for unstable sort.
         let mut order: Vec<(u64, usize, ShHeadKey)> = fulls
             .iter()
             .enumerate()
@@ -361,7 +359,6 @@ impl ScriptHashHead {
             .collect();
         order.sort_unstable_by_key(|&(slot, _, _)| slot);
         let mut out = vec![None; fulls.len()];
-        // 4 KiB chunk probe (128 × 32 B) — one pread per chunk under FdOnly.
         let mut cache = SlotPageCache::new(self, slots);
         for &(primary, i, key) in &order {
             let mut slot = primary;
@@ -399,7 +396,6 @@ impl ScriptHashHead {
                 return Ok(false);
             }
             if k == key {
-                // Keep key, zero value (soft clear) — one chunk write-back.
                 cache.write_slot(slot, &key, &[0u8; SH_HEAD_VALUE_LEN])?;
                 cache.flush()?;
                 return Ok(true);
@@ -545,7 +541,6 @@ impl ScriptHashHead {
         if upserts.is_empty() {
             return Ok(Vec::new());
         }
-        // Known-empty + may place new + all fit: one sequential fill (no remainder).
         if allow_new && self.is_known_empty() {
             let slots = self.state.lock().unwrap().slots;
             let max_fit = slots
@@ -557,7 +552,6 @@ impl ScriptHashHead {
                 return Ok(Vec::new());
             }
         }
-        // Update-only on empty table: nothing can match → full remainder.
         if !allow_new && self.is_known_empty() {
             return Ok(upserts.to_vec());
         }
@@ -572,7 +566,6 @@ impl ScriptHashHead {
         work.sort_unstable_by_key(|(k, _, _)| Self::hash_slot(k, slots_now));
 
         let mut remainder: Vec<(ShHeadKey, ShHeadValue)> = Vec::new();
-        // After the first new-key placement failure, only in-place updates apply.
         let mut allow_new = allow_new;
         let mut i = 0usize;
         while i < work.len() {
@@ -595,7 +588,6 @@ impl ScriptHashHead {
                         i += 1;
                     }
                     InsertResult::NeedSlot => {
-                        // New key cannot place — keep applying updates for the rest.
                         allow_new = false;
                         remainder.push((key, val.clone()));
                         i += 1;
@@ -1416,7 +1408,6 @@ impl ShardedScriptHashHead {
                 .map(|(k, v)| (head_key_from_full(k), v.clone()))
                 .collect();
             let rem = self.shards[0].insert_many_no_rehash(&mapped, allow_new)?;
-            // Map 16 B head keys back to full inputs (prefix match).
             if !rem.is_empty() {
                 for (hk, hv) in rem {
                     if let Some((full, _)) =

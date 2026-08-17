@@ -340,7 +340,6 @@ impl ActiveMempool {
             items.push((entry, tx));
         }
         graph.rebuild_from(items);
-        // Keep live_count in sync with graph after rebuild.
         store.set_live_count(graph.len() as u32);
         Ok(Self {
             store,
@@ -406,7 +405,6 @@ impl ActiveMempool {
         if dead == 0 {
             return Ok(None);
         }
-        // Compact if dead ≥ 25% of capacity or dead ≥ live (wasteful body).
         let cap = self.store.meta().slot_cap;
         if dead * 4 >= cap || (live > 0 && dead >= live) || (live == 0 && dead > 0) {
             return Ok(Some(self.compact()?));
@@ -441,7 +439,6 @@ impl ActiveMempool {
             .saturating_add(t_script.elapsed().as_micros() as u64);
         script_res?;
         let r = self.commit_after_script(tx, prep, utxos, tip)?;
-        // Promote orphans waiting on this parent (best-effort; nested orphans re-park).
         self.promote_orphans_of(r.txid, utxos, tip);
         Ok(r)
     }
@@ -480,7 +477,6 @@ impl ActiveMempool {
             }
         }
 
-        // Resolve prevouts: in-mempool first, then provider (chain).
         let t_utxo = Instant::now();
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
         let mut chain_coins: Vec<Option<Coin>> = Vec::with_capacity(tx.input.len());
@@ -507,7 +503,6 @@ impl ActiveMempool {
                             .saturating_add(t_utxo.elapsed().as_micros() as u64);
                         return Err(AcceptError::Policy("mempool double-spend"));
                     }
-                    // Still need the value from the creator's output for fee calc.
                 }
                 parent_txids.insert(creator);
                 let parent_tx = self
@@ -546,7 +541,6 @@ impl ActiveMempool {
             return Err(AcceptError::MissingPrevout(tx.input[0].previous_output));
         }
 
-        // Structural chain-context (011): maturity, absolute finality, BIP68.
         check_mempool_structural(tx, &chain_coins, tip)?;
 
         let output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -583,7 +577,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let _ = (utxos, tip); // reserved for future chain re-query on race
+        let _ = (utxos, tip);
         let txid = tx.compute_txid();
         if self.graph.contains(&txid) {
             return Err(AcceptError::Duplicate(txid));
@@ -611,7 +605,6 @@ impl ActiveMempool {
                     }
                 }
                 parent_txids.insert(creator);
-                // Parent body must still exist for mempool-created outs.
                 if self.bodies.get(&creator).is_none() {
                     return Err(AcceptError::Durable("parent body missing".into()));
                 }
@@ -653,7 +646,6 @@ impl ActiveMempool {
         } else {
             BTreeSet::new()
         };
-        // Parents that remain after RBF (not in conflict set).
         let parent_txids: BTreeSet<Txid> = parent_txids
             .into_iter()
             .filter(|p| !conflict_set.contains(p))
@@ -785,7 +777,6 @@ impl ActiveMempool {
     ) {
         let children = self.orphanage.take_children_of(&parent);
         for child in children {
-            // Re-parks if still missing other parents; ignores soft errors.
             if let Ok(r) = self.accept_tx_inner(&child, utxos, tip) {
                 self.promote_orphans_of(r.txid, utxos, tip);
             }
@@ -801,7 +792,6 @@ impl ActiveMempool {
         if self.store.has_free_slot() {
             return Ok(());
         }
-        // Prefer grow when under max (legacy 4k / mid-grow full under weight budget).
         match self.store.grow_slots() {
             Ok(()) => {
                 if self.store.has_free_slot() {
@@ -811,7 +801,6 @@ impl ActiveMempool {
             Err(MempoolError::Full) => {}
             Err(e) => return Err(e.into()),
         }
-        // At MAX_SLOT_CAP or grow failed to free: evict worst chunks.
         let mut guard = 0u32;
         while !self.store.has_free_slot() && guard < 10_000 {
             guard += 1;
@@ -850,11 +839,9 @@ impl ActiveMempool {
             let Some((_rep, chunk)) = self.graph.worst_chunk() else {
                 break;
             };
-            // If the only remaining chunk is the protected tx, stop (over budget but keep it).
             if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
                 break;
             }
-            // Evict entire worst chunk (mining order: lowest fee-rate diagram segment).
             for t in &chunk.txids {
                 if protect == Some(*t) {
                     continue;
@@ -865,7 +852,7 @@ impl ActiveMempool {
                 }
             }
             if removed == 0 {
-                break; // would only remove protected
+                break;
             }
         }
         Ok(removed)
@@ -890,7 +877,6 @@ impl ActiveMempool {
                 weight: total_weight,
             });
         }
-        // Reject coinbase / duplicates inside package.
         let mut seen = BTreeSet::new();
         let mut pkg_ids = BTreeSet::new();
         for tx in txs {
@@ -903,7 +889,6 @@ impl ActiveMempool {
             }
             pkg_ids.insert(id);
         }
-        // Topo check: every in-package parent must appear earlier.
         for (i, tx) in txs.iter().enumerate() {
             for inp in &tx.input {
                 let parent = inp.previous_output.txid;
@@ -917,7 +902,6 @@ impl ActiveMempool {
             }
         }
 
-        // One stage accumulator for the whole package (hub sample-and-reset).
         self.last_accept_stages = AcceptStageUs::default();
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         for tx in txs {
@@ -928,7 +912,6 @@ impl ActiveMempool {
                     accepted.push(r);
                 }
                 Err(e) => {
-                    // Roll back this package's accepts (children first).
                     for r in accepted.iter().rev() {
                         let _ = self.remove_txid(&r.txid);
                     }
@@ -997,7 +980,6 @@ impl ActiveMempool {
         self.orphanage.erase_for_block(block_txids);
         if n > 0 {
             let _ = self.maybe_compact();
-            // Tip connect: push dirty admits/removes to sidecars before return.
             let _ = self.store.persist_if_dirty();
         }
         Ok(n)
@@ -1131,7 +1113,6 @@ pub fn rbf_pays_for_replacement(
         return false;
     }
     let vsize = policy::get_virtual_size(new_weight);
-    // ceil(vsize * rate / 1000)
     let inc = vsize
         .saturating_mul(INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB)
         .saturating_add(999)
@@ -1155,7 +1136,6 @@ pub fn pure_rbfr_pays(new_fee: u64, new_weight: u64, direct_fee: u64, direct_wei
     if new_v == 0 || old_v == 0 {
         return false;
     }
-    // new_fee/new_v >= (NUM/DEN) * direct_fee/old_v
     new_fee.saturating_mul(RBFR_RATIO_DEN).saturating_mul(old_v)
         >= direct_fee
             .saturating_mul(RBFR_RATIO_NUM)

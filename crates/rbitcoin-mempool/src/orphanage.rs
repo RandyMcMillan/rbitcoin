@@ -90,7 +90,6 @@ impl Orphanage {
         if weight > MAX_ORPHAN_TX_WEIGHT {
             return false;
         }
-        // Evict FIFO until we fit.
         while !self.by_txid.is_empty()
             && (self.by_txid.len() >= self.max_count
                 || self.total_weight.saturating_add(weight) > self.max_weight)
@@ -153,7 +152,6 @@ impl Orphanage {
         for cid in children {
             if let Some(e) = self.by_txid.remove(&cid) {
                 self.total_weight = self.total_weight.saturating_sub(e.weight);
-                // Drop other parent links for this orphan.
                 for p in &e.missing {
                     if p == parent {
                         continue;
@@ -188,7 +186,6 @@ impl Orphanage {
         for t in drop {
             self.remove_txid(&t);
         }
-        // Compact fifo (remove_txid leaves stale ids).
         self.fifo.retain(|t| self.by_txid.contains_key(t));
     }
 }

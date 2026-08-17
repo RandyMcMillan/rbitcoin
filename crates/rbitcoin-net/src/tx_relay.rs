@@ -260,7 +260,6 @@ pub struct MempoolHub {
     fee_snapshot: ArcSwap<FeeSnapshot>,
     fee_dirty: AtomicBool,
     fee_refreshing: AtomicBool,
-    // Tip-follow 5s DEBUG meters (sample-and-reset).
     meter_accepts: AtomicU64,
     meter_rejects: AtomicU64,
     meter_accept_us: AtomicU64,
@@ -682,7 +681,6 @@ impl MempoolHub {
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
 
-        // Stage prepare under exclusive lock (resolve + structural + policy).
         let prep = {
             let t_lock = Instant::now();
             let mut g = self.inner.write().unwrap();
@@ -702,7 +700,6 @@ impl MempoolHub {
             }
         };
 
-        // Script outside lock on shared script_pool / rbtc-scripts worker.
         let t_script = Instant::now();
         if let Err(e) =
             rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
@@ -714,7 +711,6 @@ impl MempoolHub {
         }
         stages.script_us = t_script.elapsed().as_micros() as u64;
 
-        // Commit under exclusive lock (re-check + durable + orphan promote).
         let result = {
             let t_lock = Instant::now();
             let mut g = self.inner.write().unwrap();
@@ -846,7 +842,6 @@ impl MempoolHub {
                 (Some(p), None) => p,
                 (None, Some(f)) => f,
                 (None, None) => {
-                    // Empty pool: optional confirm-memory floor as BTC/kB.
                     let v = confirm_floor
                         .map(|r| (r as f64) / 100_000_000.0)
                         .unwrap_or(-1.0);
@@ -902,7 +897,6 @@ impl MempoolHub {
         self.meter_accept_stages(lock_us, stages);
         match result {
             Ok(res) => {
-                // Attribute package wall to each accepted member for rate visibility.
                 let per = us / (res.len().max(1) as u64);
                 for (tx, r) in txs.iter().zip(res.iter()) {
                     self.meter_accept_wall(per, true);
@@ -1385,8 +1379,6 @@ impl MempoolHub {
         rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as f64 / 100_000_000.0
     }
 
-    // ── Confirm-memory floor (step 5) ─────────────────────────────────────
-
     /// Ring of recently confirmed package feerates (sat/kvB), newest last.
     /// Filled from `remove_for_block` when live entries leave the pool.
     fn confirm_memory_floor_sat_per_kvb(&self) -> Option<u64> {
@@ -1394,7 +1386,6 @@ impl MempoolHub {
         if mem.is_empty() {
             return None;
         }
-        // Median of samples (practical floor).
         let mut v: Vec<u64> = mem.iter().copied().collect();
         v.sort_unstable();
         Some(v[v.len() / 2].max(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB))

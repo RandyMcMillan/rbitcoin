@@ -42,7 +42,6 @@ use rbitcoin_query::ProcessOwnedSizes;
 /// One 5s window of IBD counters (post sample-and-reset).
 #[derive(Clone, Debug)]
 pub(crate) struct IbdPerfSample {
-    // Pipeline health (not from atomics).
     pub inflight: usize,
     pub inflight_cap: usize,
     /// In-RAM block queue used bytes / count (process heap wire payloads).
@@ -56,7 +55,6 @@ pub(crate) struct IbdPerfSample {
     pub peers: usize,
     pub headers_done: bool,
 
-    // LoopStats
     pub confirm_ms: u64,
     pub confirm_blocks: u64,
     pub confirm_reject_stops: u64,
@@ -70,7 +68,6 @@ pub(crate) struct IbdPerfSample {
     /// `(first, batch_n, batch_inputs, elapsed_ms)` if confirm mid-batch.
     pub live: Option<(u32, u32, u32, u64)>,
 
-    // Confirm phases (ns → ms at format)
     pub phase_blks: u64,
     pub recon_ms: u64,
     pub wire_ms: u64,
@@ -156,7 +153,6 @@ pub(crate) struct IbdPerfSample {
     /// filter need + plan batch + tx_fks wiring.
     pub prep_filter_plan_ms: u64,
     pub cache_tip_ms: u64,
-    // raw ns for us/blk
     pub recon_ns: u64,
     pub wire_ns: u64,
     pub connect_ns: u64,
@@ -183,7 +179,6 @@ pub(crate) struct IbdPerfSample {
     pub wf_body_store: u64,
     pub wf_store_body_ms: u64,
 
-    // SH sub (Direct: collect; tip append: sort/seed/body/head)
     pub sh_filter_ms: u64,
     pub sh_collect_ms: u64,
     pub sh_sort_ms: u64,
@@ -194,7 +189,6 @@ pub(crate) struct IbdPerfSample {
     pub sh_collect_pin: u64,
     pub sh_collect_cold: u64,
 
-    // Parent cache / confirm-load
     pub load_win_ms: u64,
     pub load_blocks: u64,
     pub load_utxo_parents: u64,
@@ -240,7 +234,6 @@ pub(crate) struct IbdPerfSample {
     /// Max scriptq depth since last 5s sample.
     pub conf_script_q_hwm: usize,
     pub conf_write_q_hwm: usize,
-    // OS-thread occupancy (ms) — wait vs busy; explains idle load vs work sums.
     pub thr_lookup_claim_ms: u64,
     pub thr_lookup_clone_ms: u64,
     pub thr_lookup_stamp_ms: u64,
@@ -268,7 +261,6 @@ pub(crate) struct IbdPerfSample {
     pub thr_script_send_wait_ms: u64,
     pub thr_write_recv_wait_ms: u64,
     pub thr_write_work_ms: u64,
-    // Plan stage (bq → plan+denserels ensure → load queue)
     pub plan_blks: u64,
     pub plan_ms: u64,
     pub plan_collect_ms: u64,
@@ -287,7 +279,6 @@ pub(crate) struct IbdPerfSample {
     pub load_edge_fk: u64,
     pub load_edge_cb: u64,
 
-    // Archive
     pub arch_ext_need: u64,
     pub arch_head_need: u64,
     pub arch_head_hit: u64,
@@ -990,7 +981,6 @@ pub(crate) fn sample(
         arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
-        // Sample write phases for class_a commit DEBUG (also drains atomics).
         arch_write_total_ms: ns_ms(arch_res.write_total_ns),
         arch_write_reserve_ms: ns_ms(arch_res.write_reserve_ns),
         arch_write_body_ms: ns_ms(arch_res.write_body_ns),
@@ -1077,9 +1067,6 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let write_ms = write_stage_ms(s);
-    // Download / body-queue pressure (what starves tip advance).
-    // `bq soft=` = time-depth densify gate; `RAM=` = queue heap MiB.
-    // Count lives only in soft= (no redundant n= / body_pend=).
     let mut out = format!(
         "ibd: perf inflight={}/{} bq soft={}/{} RAM={}MiB buf_ahead={} hole={} peers={}",
         s.inflight,
@@ -1091,8 +1078,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Four-stage confirm **work** walls (sums; may mis-rank vs idle load).
-    // Prefer thr busy/wait + ready= / scriptq_hwm for long-pole diagnosis.
     let load_wall_ms = load_stage_wall_ms(s);
     let thr_lookup_busy = s
         .thr_lookup_clone_ms
@@ -1135,7 +1120,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_hwm,
         s.conf_write_q_cap,
     ));
-    let _ = thr_lookup_wait; // claim+send already in lookup_thr fields
+    let _ = thr_lookup_wait;
     if s.stamp_struct_ms > 0
         || s.stamp_prepare_ms > 0
         || s.stamp_batch_ms > 0
@@ -1167,7 +1152,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.stamp_batch_finish_ms,
         ));
     }
-    // Winner sealed-age locality (cdf3 ≈ wave1 hit % under ages≤3 hot policy).
     if s.arch_prep_age_hit_n > 0 {
         out.push_str(&format!(
             " head_loc(cdf0={} cdf3={} cdf7={} cdf15={} cdf31={} n={})",
@@ -1196,8 +1180,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
-    // Load stage detail: plan batch + pin mix + assemble.
-    // pin_hit% = PIN_CACHE_BODY / (PIN_CACHE_BODY + PIN_NEW).
     // CACHE_BODY is adopt / plan / in-flight / same-batch only — this
     // window's cold range-fills increment PIN_NEW, not cache.
     let pin_hit_pct = {
@@ -1209,7 +1191,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
-    // Prefer wire pin sub-timers when present; fall back to aggregate pin body/new_io.
     let plan_pin_ms = if s.load_plan_pin_ms > 0 {
         s.load_plan_pin_ms
     } else {
@@ -1223,7 +1204,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let cold_dec_ms = s.load_cold_decode_ms;
     let cold_range_ms = s.load_cold_range_ms;
     let cold_idx_ms = s.load_cold_idx_ms;
-    // us/new: cold denserels wall per cold create (prefer split sum, else cold_io).
     let cold_for_us = if cold_range_ms + cold_idx_ms > 0 {
         cold_range_ms.saturating_add(cold_idx_ms)
     } else {
@@ -1234,16 +1214,13 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     } else {
         0
     };
-    // us/in: prevout wall per non-coinbase input.
     let asm_prev_us_per_in = if s.asm_in_n > 0 {
         (s.asm_prevout_ms.saturating_mul(1000)) / s.asm_in_n
     } else {
         0
     };
     let plan_batch = plan_batch_ms(s);
-    // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan batch + …).
     let pre_assemble = s.load_ms;
-    // I1 load budget: total = pre_asm + assemble; pin = parent pin wall; other residual.
     let pin_budget_ms = s.load_parent_pin_ms;
     let asm_budget_ms = s.connect_ms;
     let other_budget_ms = load_wall_ms
@@ -1323,7 +1300,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         out.push_str(&format!(" miss_p={}", s.load_missing_parents));
     }
 
-    // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tweaks / tip GC.
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
@@ -1354,7 +1330,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.meta_ms,
         s.meta_n,
     ));
-    // Class A body/head detail when present (from archive commit).
     if s.arch_write_body_ms > 0 || s.arch_write_head_ms > 0 || s.arch_write_htxs_ms > 0 {
         out.push_str(&format!(
             " class_a_sub(body={} head={} htxs={} reserve={})",
@@ -1449,14 +1424,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "resolve_us", us(s.resolve_ns));
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));
-    // Wire-body store cost (nonzero only on non-unified residual paths).
     if s.wf_body_store > 0 || s.wf_store_body_ms > 0 {
         out.push_str(&format!(
             " | wire_body store={} store_ms={}",
             s.wf_body_store, s.wf_store_body_ms,
         ));
     }
-    // SH: Direct only accrues collect; tip-append fields only if non-zero.
     out.push_str(&format!(" | sh collect={}", s.sh_collect_ms));
     append_nz(&mut out, "filter", s.sh_filter_ms);
     append_nz(&mut out, "sort", s.sh_sort_ms);
@@ -1513,7 +1486,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    // Plan-batch resolve mix (head / in-flight / stamp — no process pin FIFO).
     if s.arch_ext_need > 0 || s.arch_prep_assign_ms > 0 {
         let resolve_us_blk = if s.arch_resolve_blocks > 0 {
             (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
@@ -1542,7 +1514,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_head_need,
             s.arch_batch_stamp,
         ));
-        // Head resolve probe detail when cold head lookups ran.
         if s.arch_prep_probe_ms > 0
             || s.arch_prep_idx_ms > 0
             || s.arch_prep_body_txid_ms > 0
@@ -1559,7 +1530,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                 0
             };
             let hit_rank_avg = s.arch_prep_hit_rank_avg_x100 as f64 / 100.0;
-            // probe_us/key: first-class FdOnly demap metric (window probe_ms → µs/key).
             let probe_us_key = if s.arch_prep_head_keys > 0 {
                 (s.arch_prep_probe_ms * 1000) / s.arch_prep_head_keys
             } else {
@@ -1609,8 +1579,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             ));
         }
     }
-    // Class A commit walls (no process pin seed).
-    // ca_head_us/blk: first-class demap metric for page-RMW insert cost.
     if s.arch_write_blocks > 0 || s.arch_write_total_ms > 0 {
         let ca_head_us_blk = if s.arch_write_blocks > 0 {
             (s.arch_write_head_ms * 1000) / s.arch_write_blocks
@@ -1663,14 +1631,12 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let primary_mib = h.primary_body_bytes / (1024 * 1024);
     let script_wire_mib = cp.script_wire_bytes / (1024 * 1024);
     let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
-    // file% of RSS: how much of process RSS is file-backed (mmap tables + .so).
     let file_pct = if s.rss_kb > 0 {
         (100 * s.rss_file_kb) / s.rss_kb
     } else {
         0
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
-    // Heap meters (approx payload bytes → MiB). Residual = anon − known heap.
     let if_mib = o.inflight_bytes / (1024 * 1024);
     let ps_mib = o.pstore_bytes / (1024 * 1024);
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
@@ -1734,7 +1700,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
         cp.write_blocks,
         write_wire_mib,
-        // Pipeline-wide parent entries in scriptq + writeq (meter only; no budget).
         cp.parents_total(),
         cp.feed_ready,
         cp.feed_inflight,
@@ -1773,7 +1738,6 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
     if enabled(Level::Debug) {
         debug!("{}", format_debug(s));
     }
-    // Surface multi-second write / SH tails that hide in window averages.
     if s.phase_blks > 0 {
         let c_ms = s.class_c_ms / s.phase_blks.max(1);
         let sh_ms = s.sh_ms / s.phase_blks.max(1);

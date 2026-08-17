@@ -264,7 +264,6 @@ impl ArrayTable {
         }
 
         if n == disk && dirty_lo >= disk {
-            // No length change and no in-prefix dirty — nothing to write.
             drop(guard);
             self.dirty.store(false, Ordering::Release);
             self.dirty_lo.store(u64::MAX, Ordering::Release);
@@ -281,9 +280,7 @@ impl ArrayTable {
             }
             drop(guard);
             self.file.write_at(Self::offset(disk), &bytes)?;
-            // write_at already published HWM to cover the suffix end.
             let logical = FILE_HEADER_LEN as u64 + n * ELEM;
-            // Ensure HWM exact (write_at publishes end of write which equals this).
             debug_assert_eq!(self.file.logical_len(), logical);
             let _ = logical;
             self.disk_len.store(n, Ordering::Release);

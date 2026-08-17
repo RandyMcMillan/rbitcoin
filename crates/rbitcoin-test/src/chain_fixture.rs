@@ -43,7 +43,6 @@ pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> M
     let mut tip = genesis.block_hash();
     let mut tip_time = genesis.header.time;
 
-    // Height 1: coinbase we will mature and spend.
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
     let matured_coinbase_txid = b1.txdata[0].compute_txid();
     accept_and_connect_block(query, params, Height(1), &b1, ms).unwrap();
@@ -62,7 +61,6 @@ pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> M
         blocks.push(b);
     }
 
-    // Spend at height maturity + 2
     let spend_height = last_pad + 1;
     let spend = spend_anyone_can_spend(matured_coinbase_txid, 0, Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_height, vec![spend]);

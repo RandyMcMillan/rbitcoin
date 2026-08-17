@@ -370,7 +370,6 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
 /// Raise mainnet as deeper buried tips become the norm.
 pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
     match network {
-        // Scripts skipped through a deeply buried height for experimental mainnet IBD.
         rbitcoin_primitives::Network::Mainnet => 840_000,
         rbitcoin_primitives::Network::Testnet => 2_500_000,
         // Signet tip moves; keep default above typical tip so catch-up stays under

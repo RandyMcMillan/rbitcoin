@@ -54,7 +54,10 @@ pub use lookup::{
     ensure_external_parent_denserels_from_plan, DenserelsWarmStats, ParentPinStamp,
     PlanStampOutcome,
 };
-use lookup::{known_create_txid_lookup, stamp_parent_pin_archived};
+use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
+use phases::{assemble_run, script_wave};
+#[cfg(test)]
+use phases::{check_bip34, expected_bits_extending, post_commit};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
 pub use scripts::scripts_feed_test_sync;
 pub use scripts::{
@@ -62,11 +65,6 @@ pub use scripts::{
     join_scripts_polling, scripts_stage_from_load_channel, ScriptsBatchMeta, ScriptsPhaseHandle,
 };
 pub use write::confirm_write_phase;
-// Production helpers used by orchestration in this module and write stage.
-use phases::{assemble_run, script_wave};
-// Test modules reach these via super::
-#[cfg(test)]
-use phases::{check_bip34, expected_bits_extending, post_commit};
 #[cfg(test)]
 use write::write_height_needed;
 
@@ -248,7 +246,6 @@ pub fn confirm_wire_load_phase_pipelined(
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
 
     for (i, (height, block)) in blocks.iter().enumerate() {
-        // One owned clone into Arc; later pipeline stages only bump the refcount.
         let t = Instant::now();
         let block = Arc::new(block.clone());
         ns_wire_arc = ns_wire_arc.saturating_add(t.elapsed().as_nanos() as u64);
@@ -258,7 +255,6 @@ pub fn confirm_wire_load_phase_pipelined(
         // Sole compute_txid pass for this block in the confirm pipeline.
         let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
-        // First height must sit at pipeline path_lo (store tip+1, or last loaded+1).
         // Later heights in the same batch validate against prior wire, not store tip.
         let t = Instant::now();
         if i == 0 {
@@ -266,10 +262,8 @@ pub fn confirm_wire_load_phase_pipelined(
                 return Err(ConsensusError::BadPrev);
             }
             if path_lo == store_path_lo {
-                // Extends confirmed tip: full header validation against store.
                 validate_header(query, params, *height, &block.header)?;
             } else {
-                // Ahead of tip: parent must match prior prepped batch (or explicit parent).
                 let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
                 if block.header.prev_blockhash.to_byte_array() != expect_prev {
                     return Err(ConsensusError::BadPrev);
@@ -352,7 +346,7 @@ pub fn confirm_wire_load_phase_pipelined(
             {
                 m.tx_fks = list;
             }
-            // Index by batch position — never rehash wire for lookup.
+            // Never rehash wire for lookup — index by batch position.
             let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
@@ -384,18 +378,7 @@ pub fn confirm_wire_load_phase_pipelined(
                 )
                 .map_err(ConsensusError::from)?,
         };
-        // Expand each header body range to ordered create fks.
-        let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
-        for &(hfk, first, n) in &plan.per_header_ranges {
-            let Some(hid) = hfk.get() else { continue };
-            let mut slice = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                slice.push(rbitcoin_primitives::Fk(
-                    first.0.saturating_add(u64::from(i)),
-                ));
-            }
-            by_header.insert(hid, slice);
-        }
+        let by_header = create_fks_from_header_ranges(&plan.per_header_ranges);
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
@@ -440,7 +423,6 @@ pub fn confirm_wire_load_phase_pipelined(
         inflight,
         parent_store,
     )?;
-    // Freeze plan for write: drop external staging maps (sparse BatchParents remains).
     if let Some(ref mut p) = plan {
         p.freeze_after_pin();
     }
@@ -518,7 +500,6 @@ pub fn confirm_wire_run_preverified(
         .iter()
         .map(|(h, b)| (*h, Arc::new(b.clone())))
         .collect();
-    // Lookup: structure + stamp create_fk + parent ranges (no body denserels).
     let stamped = confirm_wire_lookup_stamp(query, params, milestone, &arcs, None)?;
     let mat = confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;
     let ok = confirm_scripts_phase(mat.batch)?;
@@ -614,8 +595,6 @@ impl ScriptOkBatch {
         Ok(())
     }
 }
-
-// ─── phases ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod write_idempotent_tests;

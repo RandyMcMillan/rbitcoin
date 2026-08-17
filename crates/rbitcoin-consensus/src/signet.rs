@@ -49,7 +49,6 @@ pub fn validate_signet_block_solution(
     block: &Block,
     challenge: &Script,
 ) -> Result<(), ConsensusError> {
-    // Genesis (null prev) is always valid.
     if block.header.prev_blockhash.to_byte_array() == [0u8; 32] {
         return Ok(());
     }
@@ -110,7 +109,7 @@ fn build_signet_txs(
 
     // Core: `vin.emplace_back(COutPoint(), CScript(OP_0), 0)` then `scriptSig << block_data`.
     // scriptSig must be OP_0 + push(block_data) or the to_spend txid (and sighash) is wrong.
-    let mut ss = vec![0x00]; // OP_0
+    let mut ss = vec![0x00];
     push_data(&mut ss, &block_data);
     let to_spend = Transaction {
         version: bitcoin::transaction::Version::non_standard(0),
@@ -142,7 +141,7 @@ fn build_signet_txs(
         }],
         output: vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]), // OP_RETURN
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
         }],
     };
 

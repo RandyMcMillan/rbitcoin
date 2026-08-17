@@ -106,8 +106,6 @@ pub(crate) fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
-    // Heavier header path that does not meet tip: getdata the connecting
-    // prefix instead of waiting on a dead tip+1.
     let _ = super::reorg::consider_disconnected_heavier(st, hub);
 
     let tip = hub.tip_height().unwrap_or(0);
@@ -128,7 +126,6 @@ pub(crate) fn assign_work_ordered(
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
     }
 
-    // 1) Always cover tip confirm batch (≤32) with multi-peer race.
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
@@ -176,7 +173,6 @@ pub(crate) fn assign_work_ordered(
         st.assign_rot = peer_i;
     }
 
-    // 2) Densify only when not Critical (BQ soft window already covered).
     if matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -193,7 +189,6 @@ pub(crate) fn assign_work_ordered(
 
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
     let depth_bytes = hub.query.block_queue_stats().1;
-    // Under free-byte floor: full densify_hi. Over it: only confirm-time window.
     let band_hi = rbitcoin_query::soft_densify_band_hi(
         path_lo,
         densify_hi,
@@ -313,11 +308,9 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
     if st.body.is_known_archived(&h) {
         return None;
     }
-    // Matching BQ wire → densified. Wrong first-wins dequeued as Gap.
     if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
         return None;
     }
-    // Zombie pending without matching wire → demote so skip_download allows getdata.
     demote_zombie_pending_for_fetch(&mut st.body, hub, h, Some(ht));
     if st.body.skip_download(hub, &h) {
         return None;
@@ -433,7 +426,6 @@ pub(crate) fn contiguous_tip_holes(
         if claim_ready(hub, &mut st.body, ht, &hash) {
             break;
         }
-        // Need getdata (and not already inflight — cover_tip_holes filters that).
         holes.push(hash);
     }
     holes
@@ -563,15 +555,12 @@ pub(crate) fn cover_tip_holes(
         if hub.has_block(&h) {
             continue;
         }
-        // Matching BQ wire → claim-ready enough for cover skip; wrong first-wins dropped.
         if let Some(ht) = ht {
             if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
                 continue;
             }
         }
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
-        // Stale tip-hole inflight with no wire → clear and re-race (frozen inflight).
-        // Prefer not immediately reusing the same peer set when alternatives exist.
         let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
             if now.duration_since(req.started_at) >= TIP_HOLE_INFLIGHT_STALE {
@@ -591,7 +580,6 @@ pub(crate) fn cover_tip_holes(
         }
         let mut need = want - already;
         let mut placed_any = false;
-        // Prefer non-avoided (re-race) then higher bps; avoid peers still last-resort.
         let ranked = rank_tip_hole_peers(&st.slots, alive, &avoid);
         for &pid in &ranked {
             if need == 0 {

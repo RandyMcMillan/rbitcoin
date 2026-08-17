@@ -184,8 +184,6 @@ async fn application_handshake(
         nonce: rand_nonce(),
         user_agent: user_agent.to_string(),
         start_height,
-        // Advertise willingness to receive tx inv when we have a mempool hub.
-        // Actual inv processing is gated on MempoolHub::relay_enabled (tip mode).
         relay: true,
     };
 
@@ -202,8 +200,6 @@ async fn application_handshake(
                 if matches!(other, NetworkMessage::Verack) {
                     return Err(NetError::Protocol("verack before version"));
                 }
-                // Ignore wtxidrelay / sendaddrv2 / etc. that may arrive before
-                // verack on modern peers (we still require version first).
                 let _ = other;
             }
         }
@@ -227,7 +223,6 @@ async fn application_handshake(
             NetworkMessage::Ping(n) => {
                 write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
             }
-            // Core may pipeline sendaddrv2 / wtxidrelay / sendcmpct before/after verack.
             _ => {}
         }
     }
@@ -278,12 +273,8 @@ pub async fn peer_session_with(
         .map(|p| p.to_string())
         .unwrap_or_else(|| "peer".into());
 
-    // Prefer headers; accept high-bandwidth compact v2 (witness short-ids) with
-    // mempool reconstruction — fall back to full getdata when fill fails.
-    // (wtxidrelay is negotiated pre-verack in the handshake — BIP339.)
     let _ = write_v2_msg(&mut writer, NetworkMessage::SendHeaders).await;
-    // BIP152: advertise compact v2 at low-bandwidth. HB (`send_compact: true`)
-    // is selected later via `maybe_select_as_hb` (max 3, prefer outbound).
+    // BIP152: compact v2 low-bandwidth. HB is selected later (max 3, prefer outbound).
     let _ = write_v2_msg(
         &mut writer,
         NetworkMessage::SendCmpct(SendCmpct {
@@ -306,7 +297,6 @@ pub async fn peer_session_with(
         }
     });
 
-    // Bootstrap: ask for anything above our tip (critical after IBD disconnect).
     if let Some(s) = meta.session.as_ref() {
         let h = hub.tip_height().unwrap_or(0);
         rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
@@ -316,27 +306,18 @@ pub async fn peer_session_with(
     }
 
     let mut peer_wants_headers = false;
-    // BIP339: peer sent `wtxidrelay` (we announce/request MSG_WTX when true).
     let mut peer_wtxid_relay = false;
-    // BIP152: peer asked for high-bandwidth compact announces (`sendcmpct`).
     let mut peer_send_cmpct = false;
     let mut peer_cmpct_version: u32 = 2;
-    // Headers received while assembling a potential reorg branch (hash → header).
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
-    // Blocks waiting for in-order accept (hash → block).
     let mut pending_blocks: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
-    // Incomplete compact blocks awaiting `blocktxn` (hash → state).
     let mut pending_cmpct: HashMap<BlockHash, PendingCmpct> = HashMap::new();
-    // Txids we received from this peer (origin exclusion for announce).
     let mut from_this_peer: HashMap<bitcoin::Txid, ()> = HashMap::new();
-    // In-flight block getdata (BIP130 direct-fetch cap = 16).
     let mut requested_blocks: HashSet<BlockHash> = HashSet::new();
-    // Session misbehavior score (disconnect at BAN_SCORE_THRESHOLD).
     let mut ban_score: u32 = 0;
     let mut rate = PeerRateLimiter::default_limits();
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
-    // First tick completes immediately — skip so we don't double the bootstrap send.
     headers_poll.tick().await;
 
     let session = meta.session.clone();
@@ -397,7 +378,6 @@ pub async fn peer_session_with(
                                 if let Some(s) = session.as_ref() {
                                     s.headers_paused.store(true, Ordering::Relaxed);
                                 }
-                                // One inv of the new tip; skip intermediate branch hashes.
                                 if hub.tip_hash() == Some(ev.hash) {
                                     queue_out(
                                         &out_tx,
@@ -446,14 +426,12 @@ pub async fn peer_session_with(
                     }
                 }
                 _ = headers_poll.tick() => {
-                    // Quiet peers / missed announces: re-pull from our tip locator.
                     let _ = queue_getheaders(&out_tx, hub.as_ref());
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
                         Some(rx.recv().await)
                     } else {
-                        // No mempool — park this branch forever.
                         std::future::pending::<()>().await;
                         None
                     }
@@ -462,7 +440,6 @@ pub async fn peer_session_with(
                         match ann {
                             Ok(ann) => {
                                 let txid = ann.txid;
-                                // Origin exclusion: do not re-announce to the peer that sent it.
                                 if from_this_peer.contains_key(&txid) {
                                     continue;
                                 }
@@ -486,7 +463,6 @@ pub async fn peer_session_with(
                         }
                     }
                 }
-                // Frame on this task; heavy payload decode is offloaded.
                 frame = read_v2_frame(&mut reader, magic) => {
                     let frame = match frame {
                         Ok(f) => f,
@@ -508,7 +484,6 @@ pub async fn peer_session_with(
                     if let Some(ref sess) = session {
                         sess.note_recv(&framed_cmd(&frame), frame.payload_len() as u64);
                     }
-                    // Per-peer rate limit (msg + byte window) — disconnect when abused.
                     let frame_len = frame.payload_len();
                     if !rate.note(frame_len) {
                         ban_score = ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
@@ -518,7 +493,6 @@ pub async fn peer_session_with(
                         if ban_score >= BAN_SCORE_THRESHOLD {
                             return Err(NetError::Protocol("peer ban score threshold"));
                         }
-                        // Soft: drop this message but keep session for first offense.
                         continue;
                     }
                     // Ping/pong: cheap 8-byte path — never leave the I/O task for decode.
@@ -695,7 +669,6 @@ async fn handle_peer_frame(
             // Segwit networks: only version 2 (wtxid short-ids) enables HB.
             // Version 1 and version > 2 are ignored (p2p_compactblocks).
             if sc.version == 2 {
-                // They asked us to send compact (or cancelled). That is hb_from.
                 *peer_send_cmpct = sc.send_compact;
                 *peer_cmpct_version = 2;
                 if let Some(sess) = session {
@@ -832,8 +805,6 @@ async fn handle_peer_frame(
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains(txid) {
-                                    // MSG_TX / MSG_WITNESS_TX inv: fetch by txid (wtxid only
-                                    // when the inv type is MSG_WTX — handled below).
                                     want.push(Inventory::WitnessTransaction(*txid));
                                     inv_tx_n = inv_tx_n.saturating_add(1);
                                 }
@@ -855,7 +826,6 @@ async fn handle_peer_frame(
             }
             if let Some(mp) = hub.mempool() {
                 mp.note_inv_tx(inv_tx_n);
-                // Count only tx-shaped getdata items (not block getdata from inv).
                 let gd_tx = want
                     .iter()
                     .filter(|i| {
@@ -939,9 +909,6 @@ async fn handle_peer_frame(
             let hash = block.block_hash();
             pending_cmpct.remove(&hash);
             requested_blocks.remove(&hash);
-            // Same receive path as RPC submitblock: tip-extend, or hold +
-            // most-work `accept_branch`. Per-peer pending is a download window
-            // for bodies whose parent is still unknown — not a second assembler.
             match hub.accept_received_block(block.clone()) {
                 Ok(AcceptOutcome::Accepted { .. }) => {
                     pending_blocks.remove(&hash);
@@ -978,7 +945,6 @@ async fn handle_peer_frame(
                 let id = session.map(|s| s.id).unwrap_or(0);
                 rbitcoin_log::debug!("Ignoring low-work compact block from peer {id}");
             } else if hub.has_block(&hash) {
-                // already have
             } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
                 if matches!(
                     hub.accept_received_block(block),
@@ -991,7 +957,6 @@ async fn handle_peer_frame(
                 drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
             } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
                 if missing.is_empty() {
-                    // Should not happen; fall back.
                     queue_out(
                         out_tx,
                         NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -1058,7 +1023,6 @@ async fn handle_peer_frame(
                     from_this_peer.insert(txid, ());
                     match mp.accept_tx(tx) {
                         Ok(_) => {}
-                        // Soft: already in pool, parked waiting on parent(s), or full.
                         Err(rbitcoin_mempool::AcceptError::Duplicate(_)) => {}
                         Err(rbitcoin_mempool::AcceptError::Orphaned(_)) => {}
                         Err(rbitcoin_mempool::AcceptError::Policy("mempool full")) => {}
@@ -1069,9 +1033,7 @@ async fn handle_peer_frame(
                 }
             }
         }
-        NetworkMessage::MemPool => {
-            // Intentionally no bulk dump (DoS); Electrum is the query path.
-        }
+        NetworkMessage::MemPool => {}
         NetworkMessage::GetAddr => {
             queue_out(out_tx, NetworkMessage::Addr(vec![]))?;
         }
@@ -1183,7 +1145,6 @@ fn drain_pending(
         }
     }
 
-    // Download window + hub hold: ask for parents we still lack.
     let mut missing: Vec<BlockHash> = hub.held_missing_parents();
     for b in pending_blocks.values() {
         let prev = b.header.prev_blockhash;

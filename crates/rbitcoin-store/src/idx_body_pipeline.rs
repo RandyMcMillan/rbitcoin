@@ -94,7 +94,6 @@ pub fn run_idx_body_pipeline_backend(
     if jobs.is_empty() {
         return Ok(());
     }
-    // Resolve missing ranges via sorted idx batch (segmented u32 stride; FdOnly).
     let mut need_fk: Vec<Fk> = Vec::new();
     let mut need_slot: Vec<usize> = Vec::new();
     for (i, j) in jobs.iter().enumerate() {
@@ -134,7 +133,6 @@ pub fn run_idx_body_pipeline_backend(
         return Ok(());
     }
 
-    // Sort by body offset for sequential page fault / pread locality.
     submitted.sort_unstable_by_key(|&i| jobs[i].range.map(|(o, _)| o).unwrap_or(0));
 
     // Body bulk: one uring/pread SQE per job (distinct buffers). Idx was already

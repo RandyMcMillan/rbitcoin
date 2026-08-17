@@ -24,7 +24,6 @@ impl Query {
         let Some(tip) = self.tip_height() else {
             return Ok(None);
         };
-        // Fast path: tip / tip-1 without index lock.
         if let Some((_, rec)) = self.header_at_height(tip)? {
             if &rec.hash == hash {
                 return Ok(Some(tip));
@@ -59,7 +58,6 @@ impl Query {
             return Ok(());
         }
         if let Some(prev_tip) = g.tip {
-            // Tip extension by one: insert new tip hash only.
             if tip.0 == prev_tip.saturating_add(1) {
                 if let Some((_, rec)) = self.header_at_height(tip)? {
                     g.map.insert(rec.hash, tip.0);
@@ -67,7 +65,6 @@ impl Query {
                     return Ok(());
                 }
             }
-            // Single-height disconnect: remove old tip hash.
             if prev_tip == tip.0.saturating_add(1) {
                 // Old tip header may still be loadable via archive by walking map keys —
                 // drop any entry whose height is prev_tip.
@@ -76,7 +73,6 @@ impl Query {
                 return Ok(());
             }
         }
-        // Full rebuild (open, reorg, first use).
         g.map.clear();
         g.map.reserve((tip.0 as usize).saturating_add(1));
         for h in 0..=tip.0 {
@@ -147,7 +143,6 @@ impl Query {
             }
             h -= step;
         }
-        // Always include genesis.
         if let Some((_fk, rec)) = self.header_at_height(Height::GENESIS)? {
             let g = BlockHash::from_byte_array(rec.hash);
             if out.last() != Some(&g) {
@@ -185,7 +180,6 @@ impl Query {
                 start = 0;
                 break;
             }
-            // Find height of locator on our chain.
             if let Some(h) = self.height_of_hash(&loc.to_byte_array())? {
                 start = h.0.saturating_add(1);
                 break 'outer;

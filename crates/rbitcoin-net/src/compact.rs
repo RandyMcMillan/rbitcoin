@@ -72,7 +72,6 @@ pub fn try_reconstruct(
         prefilled_set.insert(abs);
     }
 
-    // Walk block indexes in order; non-prefilled consume short_ids in order.
     let mut short_i = 0usize;
     let mut missing = Vec::new();
     for abs in 0..total {

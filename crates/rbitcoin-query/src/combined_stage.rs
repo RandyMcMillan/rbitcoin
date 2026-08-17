@@ -12,7 +12,6 @@ use rbitcoin_store::{
 };
 use std::cell::Cell;
 
-// Per-thread body-ok pread counter (thread-local so parallel tests do not race).
 thread_local! {
     static BODY_OK_READS: Cell<u64> = const { Cell::new(0) };
 }

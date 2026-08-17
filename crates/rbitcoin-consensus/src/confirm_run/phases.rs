@@ -29,8 +29,6 @@ pub(super) fn assemble_run(
         let prev_mtp: u32;
 
         if i == 0 {
-            // MTP + prev link for the first height of a load batch.
-            //
             // IBD pipelines load(N+1) ∥ scripts(N) ∥ write(N−1). Tip GC drops
             // header plans for h ≤ tip when write advances tip. Assemble must
             // not snapshot tip once: a concurrent tip_gc can drop plans while
@@ -52,13 +50,11 @@ pub(super) fn assemble_run(
                         .header_at_height(Height(h))
                         .map_err(ConsensusError::from)?
                     {
-                        // Confirmed (plan tip-GC'd or never cached) — store wins.
                         times.push(rec.timestamp);
                         if h == prev_h.0 && rec.hash != prev_hash {
                             return Err(ConsensusError::BadPrev);
                         }
                     } else {
-                        // Unconfirmed parent with no plan: earlier load not ready.
                         return Err(ConsensusError::Store(StoreError::Corrupt(
                             "confirm: load incomplete (parent header plan missing above tip)",
                         )));
@@ -71,7 +67,6 @@ pub(super) fn assemble_run(
                 prev_mtp = mtp;
                 time_window = times;
 
-                // Bits / PoW / checkpoint: store when parent is confirmed; else plan.
                 if query
                     .header_at_height(prev_h)
                     .map_err(ConsensusError::from)?
@@ -81,7 +76,6 @@ pub(super) fn assemble_run(
                 } else if let Some(prev_plan) =
                     query.confirm_parent_cache().get_header_plan(prev_h.0)
                 {
-                    // Checkpoint uses once-computed meta.hash (no header rehash).
                     if let Some(cp) = params.checkpoint_at(height) {
                         if cp.to_byte_array() != block_hash {
                             return Err(ConsensusError::BadHeader("checkpoint mismatch"));
@@ -121,7 +115,6 @@ pub(super) fn assemble_run(
             if block.header.prev_blockhash.to_byte_array() != prev.hash {
                 return Err(ConsensusError::BadPrev);
             }
-            // time_window ends at previous block → median is prev-block MTP.
             let mtp = median_time_past_times(&time_window);
             if block.header.time <= mtp {
                 return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
@@ -146,7 +139,6 @@ pub(super) fn assemble_run(
                 .map_err(|_| ConsensusError::InvalidPow)?;
         }
 
-        // Height-gated structure soft forks (archive prep skipped these).
         if params.bip34_active_at(height.0) {
             check_bip34(block, height.0)?;
         }
@@ -178,7 +170,7 @@ pub(super) fn assemble_run(
             prev_mtp,
             &block_hash,
             bip16_active,
-            Some(block), // share wire Arc — no Transaction clone into jobs
+            Some(block),
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -219,7 +211,6 @@ pub(super) fn structural_run(
     use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-    // MTP of height H reused across blocks/spends in this write run.
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
         if p.height.0 > 0 {
@@ -284,7 +275,6 @@ pub(super) fn script_wave(
             continue;
         }
         for job in &p.jobs {
-            // txid attached at assemble — always consult mempool preverified (tip).
             if preverified.contains(&job.txid) {
                 n_skip = n_skip.saturating_add(1);
                 continue;
@@ -347,9 +337,7 @@ pub(super) fn post_commit(
     batch_parents: &rbitcoin_query::BatchParents,
     meta_by_abs: &rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
 ) -> Result<(u64, u64), ConsensusError> {
-    // Confirm write (IBD + tip via accept_and_connect → confirm_wire_run):
-    // batch durable spend annotations after Class C. Load pin must supply
-    // denserels + body_range so every edge has abs layout — one path only.
+    // Load pin must supply denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
     if query.spend_index_enabled() {
         let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk)> =

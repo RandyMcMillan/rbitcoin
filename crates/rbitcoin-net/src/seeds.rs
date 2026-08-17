@@ -93,8 +93,6 @@ pub fn resolve_all_seeds(network: Network) -> Vec<SocketAddr> {
     out
 }
 
-// ── Peer flags (1 byte) ─────────────────────────────────────────────────────
-
 /// Informational peer flags packed into one byte (more bits reserved for later).
 ///
 /// | bit | name | meaning |
@@ -184,7 +182,6 @@ impl PeerFlags {
         if self.is_slow() && !self.is_fast() {
             return 1;
         }
-        // Untried, fast, or has_connected (and not slow/failed/incompat).
         0
     }
 
@@ -301,7 +298,6 @@ impl AddrMan {
         if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
-            // Stay compatible if we just spoke v2.
             f.remove(PeerFlags::INCOMPATIBLE);
         }
     }
@@ -379,8 +375,6 @@ impl AddrMan {
         self.order.iter().filter_map(|a| self.entry(a)).collect()
     }
 
-    // ── Persistence ─────────────────────────────────────────────────────────
-
     /// On-disk format magic line (text, one peer per line).
     pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
 
@@ -414,7 +408,6 @@ impl AddrMan {
                 saw_magic = true;
                 continue;
             }
-            // `addr flags` — flags as decimal or 0x-hex u8
             let mut parts = line.split_whitespace();
             let Some(addr_s) = parts.next() else {
                 continue;

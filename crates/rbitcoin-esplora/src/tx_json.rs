@@ -31,7 +31,6 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
 pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
     let wire = query.reconstruct_tx(tx_fk)?;
     let status = tx_status_json(query, tx_fk)?;
-    // Store order: (meta, inputs, outputs).
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
 
     let mut vin = Vec::with_capacity(wire.input.len());
@@ -183,6 +182,10 @@ fn inner_redeemscript_asm(script_sig: &[u8]) -> Option<String> {
     Some(bitcoin::Script::from_bytes(last).to_asm_string())
 }
 
+fn is_der_sig_prefix(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&0x30)
+}
+
 /// Witness script: last stack item when it looks like a script (P2WSH / nested).
 fn inner_witnessscript_asm(witness_hex: &[String]) -> Option<String> {
     if witness_hex.len() < 2 {
@@ -193,8 +196,7 @@ fn inner_witnessscript_asm(witness_hex: &[String]) -> Option<String> {
     if bytes.is_empty() || bytes.len() > 10_000 {
         return None;
     }
-    // Skip DER signatures.
-    if bytes.first() == Some(&0x30) {
+    if is_der_sig_prefix(&bytes) {
         return None;
     }
     Some(bitcoin::Script::from_bytes(&bytes).to_asm_string())

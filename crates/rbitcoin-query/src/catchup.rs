@@ -227,7 +227,6 @@ impl Query {
             ShPreMaterializeAction, SH_SEAL_LAG_OK,
         };
 
-        // Already tip-ready and no FORCE: nothing to merge or recollect.
         if !sh_force_rebuild() && self.sh_is_tip_ready() {
             self.sync_sh_seal_from_include_hwm()?;
             rbitcoin_log::info!(
@@ -288,7 +287,6 @@ impl Query {
                 self.store.scripthash.note_include_hwm(s)?;
             }
             ShPreMaterializeAction::ClampSealTo { floor } => {
-                // Only when residual runs are empty (plan already Noop if runs present).
                 rbitcoin_log::info!(
                     "node: scripthash durable head include_hwm={floor} < seal={seal} and no \
                      residual runs — clamping SEAL to HWM for gap recollect"
@@ -346,7 +344,6 @@ impl Query {
                 .finalize_and_bulk_materialize_cancellable(&self.store, Some(c))?,
         };
 
-        // Second guard: materialize Ok(0) with empty head + Class A present.
         if n == 0
             && !self.store.scripthash.has_durable_index()
             && tip_max > 0
@@ -445,7 +442,6 @@ impl Query {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
-        // Single enable gate for recollect (FORCE/reset prep also re-enable).
         // Parallel catalog writers: pause IBD crumb compact only for this scope —
         // restore prior flag so mid-IBD enter_direct recollect does not leave
         // compact permanently off for the rest of Direct IBD.
@@ -503,7 +499,6 @@ impl Query {
         let sh_run = &self.sh_run;
 
         std::thread::scope(|scope| {
-            // Status heartbeats (same scope as workers; 1s poll, log every 10s).
             scope.spawn(|| {
                 let mut last_log = Instant::now();
                 loop {
@@ -547,7 +542,6 @@ impl Query {
                     // Spilling at every chunk end only yields ~5–10 MiB (64k×~2–3 outs).
                     let mut local: Vec<ScriptHashRecord> =
                         Vec::with_capacity(thread_spill_recs.min(1 << 22));
-                    // Chunks fully scanned into `local` but not yet durable on disk.
                     let mut pending_done: Vec<usize> = Vec::with_capacity(32);
 
                     let flush_pending_done = |pending: &mut Vec<usize>| -> Result<(), StoreError> {
@@ -582,7 +576,6 @@ impl Query {
                                 .unwrap_or(false)
                         {
                             stop.store(true, AtomicOrdering::Relaxed);
-                            // Durable progress: spill + commit only fully scanned chunks.
                             let _ = spill_and_commit(&mut local, &mut pending_done);
                             break;
                         }
@@ -591,7 +584,6 @@ impl Query {
                         }
                         let i = next_chunk.fetch_add(1, AtomicOrdering::Relaxed);
                         if i >= n_chunks {
-                            // Worker idle: flush remaining buffer (may be <128 MiB tail).
                             if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
                                 *first_err.lock().unwrap() = Some(e);
                                 stop.store(true, AtomicOrdering::Relaxed);
@@ -636,7 +628,6 @@ impl Query {
                                             Fk(fk),
                                         ));
                                     }
-                                    // Spill only at ~128 MiB — not per chunk.
                                     if local.len() >= thread_spill_recs {
                                         // Current chunk not finished → do not put `i` in
                                         // pending yet; only commit earlier full chunks.
@@ -672,7 +663,6 @@ impl Query {
                         }
 
                         if !chunk_ok {
-                            // Partial chunk: spill durable prior chunks only.
                             let _ = spill_and_commit(&mut local, &mut pending_done);
                             break;
                         }

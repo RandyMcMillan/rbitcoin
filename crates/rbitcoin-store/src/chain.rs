@@ -304,7 +304,7 @@ impl StrongTxTable {
             };
         }
         let start = id - 1;
-        let end = start + u64::from(count); // exclusive
+        let end = start + u64::from(count);
         self.set_bits_range(start, end, true)
     }
 
@@ -330,7 +330,7 @@ impl StrongTxTable {
             return Ok(());
         }
         drop(guard);
-        // L0 bulk path (same as before).
+
         let mut bit = start;
         if !bit.is_multiple_of(8) {
             let byte_end = (bit + 8) & !7;
@@ -586,7 +586,7 @@ impl StrongTxTable {
         let body_len = v.len() as u64;
         let disk = self.disk_bytes.load(Ordering::Acquire);
         let dirty_lo = self.dirty_lo_bit.load(Ordering::Acquire);
-        // First byte that may contain a dirty bit.
+
         let dirty_byte = if dirty_lo == u64::MAX {
             body_len
         } else {
@@ -594,7 +594,6 @@ impl StrongTxTable {
         };
 
         if body_len > disk && dirty_byte >= disk {
-            // Pure growth into new bytes: write only the new suffix.
             let suffix = v[disk as usize..].to_vec();
             drop(guard);
             let n = suffix.len() as u64;

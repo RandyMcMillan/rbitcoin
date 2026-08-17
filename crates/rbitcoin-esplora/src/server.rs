@@ -194,7 +194,6 @@ pub async fn run_esplora(
         max_track_txs: config.max_track_txs.max(1),
     };
 
-    // REST routes: concurrency / body / timeout apply here only.
     // axum 0.8 path params use `{name}` (not `:name`).
     let rest = Router::new()
         .route("/blocks/tip/height", get(tip_height))
@@ -401,7 +400,6 @@ pub(crate) fn not_found() -> Response {
 }
 
 pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
-    // QueryError is StoreError.
     match e {
         StoreError::NotFound => not_found(),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),

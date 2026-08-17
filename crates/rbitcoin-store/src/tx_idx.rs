@@ -80,7 +80,6 @@ impl TxIdx {
         let dir = dir.to_path_buf();
         let stem = stem.to_string();
         ensure_idx_layout(&dir, &stem)?;
-        // Empty meta (0 segments).
         write_meta(&dir, &stem, &[])?;
         Ok(Self {
             dir,
@@ -119,7 +118,6 @@ impl TxIdx {
                 file: Arc::new(file),
             });
         }
-        // Validate non-overlap / monotone first_fk.
         for w in segs.windows(2) {
             let a = &w[0];
             let b = &w[1];
@@ -170,7 +168,6 @@ impl TxIdx {
             write_meta_from_segs(&self.dir, &self.stem, &[])?;
             return Ok(());
         }
-        // Keep segments fully at or before new_count; shrink the boundary segment.
         let mut kept: Vec<Segment> = Vec::new();
         for s in segs.drain(..) {
             let last = s.first_fk.saturating_add(s.count).saturating_sub(1);
@@ -181,7 +178,6 @@ impl TxIdx {
             if s.first_fk > new_count {
                 break;
             }
-            // Boundary: keep first_fk..=new_count.
             let keep_n = new_count.saturating_sub(s.first_fk).saturating_add(1);
             kept.push(Segment {
                 first_fk: s.first_fk,
@@ -250,7 +246,6 @@ impl TxIdx {
         let seg = &segs[si];
         let i = id - seg.first_fk;
         if i + 1 >= seg.count {
-            // Need next segment or last-record path — fall back.
             let start = self.record_start(id)?;
             let end = self.record_start(id + 1)?;
             if end < start {
@@ -301,7 +296,6 @@ impl TxIdx {
         let n = (last - first + 1) as usize;
         let need_next = last < count;
         let mut starts = Vec::with_capacity(n + usize::from(need_next));
-        // Read starts first..=last [+ last+1] possibly across segments.
         let end_id = if need_next { last + 1 } else { last };
         self.collect_starts(first, end_id, &mut starts)?;
         let mut out = Vec::with_capacity(n);
@@ -333,7 +327,6 @@ impl TxIdx {
             let take_last = last.min(seg_last_fk);
             let i0 = id - seg.first_fk;
             let i1 = take_last - seg.first_fk;
-            // OS-page-aligned bulk read covering [i0..=i1], then extract slots.
             read_starts_page_aligned(seg, i0, i1, out)?;
             id = take_last + 1;
         }
@@ -350,7 +343,6 @@ impl TxIdx {
         }
         let segs = self.segments_snapshot();
         let mut out: Vec<Option<u64>> = vec![None; ids.len()];
-        // (orig_i, file_id, slot_i, seg_index)
         let mut jobs: Vec<(usize, u32, u64, usize)> = Vec::new();
         for (oi, &id) in ids.iter().enumerate() {
             if id == 0 {
@@ -369,7 +361,6 @@ impl TxIdx {
         if jobs.is_empty() {
             return Ok(out);
         }
-        // Group by (file_id, os_page) for one read per page.
         jobs.sort_unstable_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| slot_file_off(a.2).cmp(&slot_file_off(b.2)))
@@ -462,9 +453,8 @@ impl TxIdx {
                 .then_with(|| slot_file_off(a.2).cmp(&slot_file_off(b.2)))
         });
 
-        // Unique pages: (si, page_off) → page buffer index
         let mut page_keys: Vec<(usize, u64)> = Vec::new();
-        let mut page_job_ranges: Vec<(usize, usize)> = Vec::new(); // [p, q) into jobs
+        let mut page_job_ranges: Vec<(usize, usize)> = Vec::new();
         let mut p = 0usize;
         while p < jobs.len() {
             let si = jobs[p].3;
@@ -481,7 +471,6 @@ impl TxIdx {
             p = q;
         }
 
-        // Allocate one 4 KiB buffer per unique page; bulk pread.
         let mut pages: Vec<Vec<u8>> = page_keys
             .iter()
             .map(|(si, page_off)| {
@@ -577,14 +566,12 @@ impl TxIdx {
 
         let mut i = 0usize;
         while i < starts.len() {
-            // Ensure tail segment can take starts[i].
             self.ensure_tail_for(base_count + 1 + i as u64, starts[i], soft)?;
             let segs = self.segments_snapshot();
             let tail = segs
                 .last()
                 .ok_or(StoreError::Corrupt("tx.idx no segment"))?;
             let body_base = tail.body_base;
-            // How many consecutive starts fit in this segment?
             let mut j = i;
             while j < starts.len() {
                 let abs = starts[j];
@@ -597,7 +584,7 @@ impl TxIdx {
                 }
                 let rel = delta / IDX_STRIDE;
                 if rel > u32::MAX as u64 {
-                    break; // need new segment
+                    break;
                 }
                 // Soft span: allow first slot of segment always; else roll when
                 // span from base would exceed soft (except we already placed some).
@@ -611,11 +598,9 @@ impl TxIdx {
                 j += 1;
             }
             if j == i {
-                // Single start cannot fit — force new segment with body_base=abs.
                 self.roll_segment(base_count + 1 + i as u64, starts[i])?;
                 continue;
             }
-            // Encode u32s for starts[i..j]
             let n = j - i;
             let mut blob = Vec::with_capacity(n * 4);
             for &abs in &starts[i..j] {
@@ -623,12 +608,9 @@ impl TxIdx {
                 blob.extend_from_slice(&rel.to_le_bytes());
             }
             let slot_off = FILE_HEADER_LEN as u64 + tail.count * 4;
-            // Re-borrow file via snapshot (tail Arc).
             let segs = self.segments_snapshot();
             let tail = segs.last().unwrap();
-            // Linear idx append: pwrite (FdOnly segment; same as body appends).
             tail.file.write_at_pwrite(slot_off, &blob)?;
-            // Update tail count in segment list.
             {
                 let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
                 let mut new_list = (**guard).clone();
@@ -638,7 +620,6 @@ impl TxIdx {
             }
             i = j;
         }
-        // Persist meta after batch (counts updated).
         let segs = self.segments_snapshot();
         write_meta_from_segs(&self.dir, &self.stem, &segs)?;
         Ok(())
@@ -682,7 +663,6 @@ impl TxIdx {
             .next_file_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = segment_path(&self.dir, &self.stem, file_id);
-        // Replace if empty leftover.
         let _ = std::fs::remove_file(&path);
         let file = TableFile::create(&path, TableKind::ArrayLink)?;
         file.set_grow_tight(true);
@@ -696,7 +676,6 @@ impl TxIdx {
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
             let mut new_list = (**guard).clone();
-            // Drop empty trailing segment if any.
             if let Some(last) = new_list.last() {
                 if last.count == 0 {
                     new_list.pop();
@@ -766,7 +745,6 @@ impl TxIdx {
         let page0 = plan_page(&segs[si0], slot0)?;
 
         if id == count {
-            // Last published record: start(id) + body_end.
             let start_rel = (slot_file_off(slot0) - page0.page_off) as u16;
             return Ok(BodyRangeIdxPlan {
                 pages: vec![page0],
@@ -1033,10 +1011,8 @@ fn read_starts_page_aligned(
             ));
         }
         if (rc as usize) < want {
-            // Short read — complete via plain pread.
             seg.file.read_at(page_off, &mut page)?;
         }
-        // Extract slots that fall in this page and in [slot..=i1].
         while slot <= i1 {
             let off = slot_file_off(slot);
             if off >= page_end {
@@ -1062,7 +1038,6 @@ fn find_segment_index(segs: &[Segment], id: u64) -> Option<usize> {
     if segs.is_empty() || id == 0 {
         return None;
     }
-    // Binary search by first_fk.
     let mut lo = 0usize;
     let mut hi = segs.len();
     while lo < hi {

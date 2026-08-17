@@ -142,7 +142,6 @@ pub fn mine_regtest_block(
         .expect("non-empty block has merkle root");
 
     let target = Target::from_compact(bits);
-    // Regtest difficulty is trivial.
     for nonce in 0..u32::MAX {
         block.header.nonce = nonce;
         if block.header.validate_pow(target).is_ok() {

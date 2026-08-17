@@ -80,7 +80,7 @@ impl TableFile {
         header[0..4].copy_from_slice(&STORE_MAGIC);
         header[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
         header[6..8].copy_from_slice(&kind.as_u16().to_le_bytes());
-        // HWM starts at header size (empty body).
+
         header[8..16].copy_from_slice(&(FILE_HEADER_LEN as u64).to_le_bytes());
         file.write_all(&header)
             .map_err(|e| StoreError::io(&path, e))?;

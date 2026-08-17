@@ -41,7 +41,6 @@ pub fn ensure_external_parent_denserels_from_plan(
         return Ok(st);
     };
 
-    // Same-batch create ids (offline denserels at pin — do not cold-load Class A).
     let mut batch_create_ids: U64Map<()> = U64Map::default();
     for fk in &plan.planned_fks {
         if let Some(id) = fk.get() {
@@ -49,9 +48,7 @@ pub fn ensure_external_parent_denserels_from_plan(
         }
     }
 
-    // Spent parent create_fk → need vouts (from stamped inputs only).
-    // Also fill reverse map from wire prev_txid (lookup stamp may have omitted
-    // when tests build synthetic plans).
+    // Reverse map from wire prev_txid (lookup stamp may omit it on synthetic plans).
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let t_collect = Instant::now();
     for ((_pin, ins), _) in plan.packed.iter().zip(plan.planned_fks.iter()) {
@@ -83,7 +80,6 @@ pub fn ensure_external_parent_denserels_from_plan(
         }
         st.parents = st.parents.saturating_add(1);
         let fk = rbitcoin_primitives::Fk(*id);
-        // Plan-local external parent already loaded (sparse need denserels).
         if plan
             .external_parent_outs
             .get(id)
@@ -92,7 +88,6 @@ pub fn ensure_external_parent_denserels_from_plan(
             st.already = st.already.saturating_add(1);
             continue;
         }
-        // In-flight offline denserels already available for pin.
         if let Some(ifo) = in_flight {
             if ifo.get_out(*id).is_some_and(|pin| !pin.1.is_empty()) {
                 st.already = st.already.saturating_add(1);
@@ -108,14 +103,12 @@ pub fn ensure_external_parent_denserels_from_plan(
     let mut cold_io_ns = 0u64;
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
-        // Prefer plan stamp body ranges (skip tx.idx) — sparse need denserels.
         let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
         let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if let Some(&range) = plan.external_parent_ranges.get(&id) {
-                // ensure is load-prep body denserels: identity from plan stamp only.
                 let tid = known_create_txid_load(id, Some(plan))?;
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 by_range.push((*fk, range, tid, need));
@@ -140,8 +133,6 @@ pub fn ensure_external_parent_denserels_from_plan(
                 confirm_load_stats::COLD_RANGE_DECODE_NS.fetch_add(dec_ns, Ordering::Relaxed);
             }
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            // Keep sparse need-vouts only — no full output_count dense expand
-            // (AGENTS prefer-immutable / avoid wasteful mutable bag growth).
             for ((_fk, _range, _tid, need), row) in by_range.into_iter().zip(decoded.into_iter()) {
                 let Some(id) = _fk.get() else {
                     continue;
@@ -156,7 +147,6 @@ pub fn ensure_external_parent_denserels_from_plan(
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
         }
-        // Fallback: idx→body denserels (no plan range).
         if !need_idx.is_empty() {
             let t_idx = Instant::now();
             let loaded =
@@ -191,7 +181,6 @@ pub fn ensure_external_parent_denserels_from_plan(
                     })?
                 };
                 fill_create_txid_load(&mut tx, id, Some(plan))?;
-                // Sparse need only — drop full dense outs after selecting need vouts.
                 let need = parent_vouts.get(&id).cloned().unwrap_or_default();
                 let live: Vec<(u32, rbitcoin_store::OutputRecord)> = if need.is_empty() {
                     outs.into_iter()
@@ -221,7 +210,7 @@ pub fn ensure_external_parent_denserels_from_plan(
             confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
         }
-        // Completeness: every cold parent must be plan-local sparse pin.
+        // Union miss is Corrupt: every cold parent must be a plan-local sparse pin.
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if plan
@@ -237,9 +226,8 @@ pub fn ensure_external_parent_denserels_from_plan(
     }
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
-    // Parent mix + subtimers; wall TOTAL_NS is owned by lookup stage caller.
     lookup_stage_stats::note(
-        0, // blocks counted by caller
+        0,
         st.parents as u64,
         st.already as u64,
         st.cold as u64,
@@ -419,7 +407,7 @@ pub(super) fn stamp_parent_pin_archived(
     for (tid, id) in &same_batch {
         stamp.create_by_txid.insert(*tid, *id);
         stamp.txids.insert(*id, *tid);
-        // same-batch denserels offline at pin — range optional
+        // Same-batch denserels are offline at pin — range optional.
     }
     let mut need_head: Vec<[u8; 32]> = Vec::new();
     for tid in need_external.keys() {
@@ -429,8 +417,8 @@ pub(super) fn stamp_parent_pin_archived(
                     stamp.create_by_txid.insert(*tid, id);
                     stamp.txids.insert(id, *tid);
                     if ifo.get_out(id).is_none() {
-                        // body on disk expected — fill range below
-                        need_head.push(*tid); // reuse batch for range via head
+                        // In-flight create without outs: body is on disk — fill range below.
+                        need_head.push(*tid);
                     }
                     continue;
                 }
@@ -438,10 +426,8 @@ pub(super) fn stamp_parent_pin_archived(
         }
         need_head.push(*tid);
     }
-    // Dedup need_head after mixed in_flight path.
     need_head.sort_unstable();
     need_head.dedup();
-    // Drop txs already fully stamped with range from a prior head fill.
     need_head.retain(|t| {
         stamp
             .create_by_txid
@@ -465,8 +451,7 @@ pub(super) fn stamp_parent_pin_archived(
             }
         }
     }
-    // Any create_fk without range and without offline denserels outs: idx body_range.
-    // Includes same-batch already-archived creates (plan=None has no CreatePin offline).
+    // plan=None same-batch already-archived creates have no CreatePin offline — idx body_range.
     let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
     let mut seen = U64Set::default();
     for (&id, _) in &stamp.txids {
@@ -531,7 +516,6 @@ pub fn confirm_wire_load_from_plan(
         ..
     } = stamped;
 
-    // Load denserels by body range from parent_pin (lookup stamped). Never head/idx.
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
@@ -543,7 +527,6 @@ pub fn confirm_wire_load_from_plan(
         ifo,
         parent_store,
     )?;
-    // Freeze plan for write: drop external staging; sparse BatchParents remains.
     if let Some(ref mut p) = plan {
         p.freeze_after_pin();
     }
@@ -587,7 +570,7 @@ pub(super) fn wire_lookup_phase(
         Option<rbitcoin_query::ArchiveWritePlan>,
         Vec<BodyMeta>,
         Vec<Arc<Block>>,
-        u64, // plan wall ns (filter+plan_batch dominate)
+        u64,
     ),
     ConsensusError,
 > {
@@ -615,7 +598,6 @@ pub(super) fn wire_lookup_phase(
     };
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
 
-    // Stamp sub-walls (structure + prepare summed over batch; plan batch below).
     let mut struct_ns = 0u64;
     let mut prepare_ns = 0u64;
 
@@ -664,7 +646,6 @@ pub(super) fn wire_lookup_phase(
         struct_ns = struct_ns.saturating_add(t_struct.elapsed().as_nanos() as u64);
 
         let t_prep = Instant::now();
-        // Reuse structure txids — no second hash in prepare.
         let (header_rec, txs) =
             crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
         let header_fk = if let Some((fk, _)) = query
@@ -715,7 +696,7 @@ pub(super) fn wire_lookup_phase(
             {
                 m.tx_fks = list;
             }
-            // Index by batch position — never rehash wire for lookup.
+            // Never rehash wire for lookup — index by batch position.
             let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
@@ -747,18 +728,7 @@ pub(super) fn wire_lookup_phase(
                 )
                 .map_err(ConsensusError::from)?,
         };
-        // Expand each header body range to ordered create fks.
-        let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
-        for &(hfk, first, n) in &plan.per_header_ranges {
-            let Some(hid) = hfk.get() else { continue };
-            let mut slice = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                slice.push(rbitcoin_primitives::Fk(
-                    first.0.saturating_add(u64::from(i)),
-                ));
-            }
-            by_header.insert(hid, slice);
-        }
+        let by_header = create_fks_from_header_ranges(&plan.per_header_ranges);
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
@@ -791,6 +761,23 @@ pub(super) fn wire_lookup_phase(
     let plan_ns = filter_ns.saturating_add(batch_ns);
     plan_stamp_sub_stats::note(struct_ns, prepare_ns, filter_ns, batch_ns);
     Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+pub(super) fn create_fks_from_header_ranges(
+    per_header_ranges: &[(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
+) -> U64Map<Vec<rbitcoin_primitives::Fk>> {
+    let mut by_header: U64Map<Vec<rbitcoin_primitives::Fk>> = U64Map::default();
+    for &(hfk, first, n) in per_header_ranges {
+        let Some(hid) = hfk.get() else { continue };
+        let mut slice = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            slice.push(rbitcoin_primitives::Fk(
+                first.0.saturating_add(u64::from(i)),
+            ));
+        }
+        by_header.insert(hid, slice);
+    }
+    by_header
 }
 
 /// Stamp-phase sub-walls for lookup_thr diagnosis (structure / prepare / filter / batch).

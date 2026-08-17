@@ -91,7 +91,6 @@ pub fn projected_inflow_wu_above(
                 .unwrap_or(0)
                 .saturating_add(1)
         };
-        // Include bucket if its floor rate is strictly above R (competitors).
         if bucket_lo > rate_sat_per_kvb {
             sum = sum.saturating_add(inflow_wu_per_s_by_bucket[i].saturating_mul(horizon_secs));
         }

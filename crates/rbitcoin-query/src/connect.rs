@@ -15,7 +15,6 @@ pub struct ConfirmPrepared {
 
 impl Query {
     pub fn confirm_block(&self, height: Height, header_hash: &[u8; 32]) -> Result<Fk, QueryError> {
-        // Idempotent if already confirmed at this height.
         if let Some(h) = self.height_of_hash(header_hash)? {
             if h == height {
                 if let Some((fk, _)) = self.get_header_by_hash(header_hash)? {
@@ -84,7 +83,6 @@ impl Query {
             }
         }
 
-        // Tip linkage: first height must be genesis or tip+1.
         match self.tip_height() {
             None => {
                 if items[0].height != Height::GENESIS {
@@ -94,7 +92,6 @@ impl Query {
             Some(tip) => {
                 let expect = tip.next().ok_or(StoreError::Corrupt("height overflow"))?;
                 if items[0].height != expect {
-                    // Idempotent single-height re-confirm at current tip height.
                     if items.len() == 1 {
                         if let Some(fk) = self.store.confirmed.get(items[0].height)? {
                             if fk == items[0].header_fk {
@@ -107,7 +104,6 @@ impl Query {
             }
         }
 
-        // Validate header fks up front (both parallel arms need valid items).
         for item in items {
             if item.header_fk.is_null() {
                 return Err(StoreError::InvalidFk);
@@ -198,7 +194,6 @@ impl Query {
 
                 let t_collect = std::time::Instant::now();
                 let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
-                // Rough upper bound: a few outputs per new tx (grows as needed).
                 sh_creates.reserve(sh_new_txs.len().saturating_mul(2));
                 // Prefer write-batch CreatePin outs (same Class A commit) → cold
                 // store. Never resolve via txid — catch-up has no durable head
@@ -212,7 +207,6 @@ impl Query {
                     t_collect.elapsed().as_nanos() as u64,
                 );
 
-                // Tip SH metering: create rows + distinct scripts (Phase 0 tip accept).
                 if !sh_creates.is_empty() {
                     sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
                     let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
@@ -222,7 +216,6 @@ impl Query {
                     sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
                 }
 
-                // Max create_fk written this wave (tip-mode durable HWM/SEAL after commit).
                 let mut tip_sh_max_fk = 0u64;
                 if !sh_creates.is_empty() {
                     if self.sh_run.is_enabled() {
@@ -245,7 +238,6 @@ impl Query {
                         add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
                     }
                 }
-                // Height / create_fk watermarks advance only after tip commit (below).
                 Ok(tip_sh_max_fk)
             });
 
@@ -275,7 +267,6 @@ impl Query {
             return Err(e);
         }
 
-        // Tip is the commit point (after strong + SH both finished).
         let t_tip = std::time::Instant::now();
         self.store.confirmed.set_many(&confirmed_pairs)?;
         for item in items {
@@ -305,7 +296,6 @@ impl Query {
         crate::class_c_phase_stats::TIP_NS
             .fetch_add(t_tip.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        // Keep hash→height map current (tip+1 insert when single-height tip follow).
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
@@ -342,7 +332,6 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        // Always key packed body by `tx_fk` (catch-up has no durable `tx.head`).
         let inputs = self.tx_input_run_class_a(tx_fk, &tx)?;
         let mut edges = Vec::with_capacity(inputs.len());
         for (i, inp) in inputs.iter().enumerate() {
@@ -392,7 +381,6 @@ impl Query {
             crate::class_c_phase_stats::SH_COLLECT_PIN.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        // Cold store: create_fk → tx.idx → body.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
             crate::class_c_phase_stats::SH_COLLECT_COLD.fetch_add(1, Ordering::Relaxed);
@@ -415,7 +403,6 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        // Packed Class A — one body IO.
         let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
         if inputs.len() as u32 != tx.input_count {
             return Err(StoreError::Corrupt("packed input count mismatch"));
@@ -435,7 +422,6 @@ impl Query {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        // Packed Class A.
         let (_, _, outs) = self.store.get_tx_full(create_fk)?;
         if outs.len() as u32 != tx.output_count {
             return Err(StoreError::Corrupt("packed output count mismatch"));
@@ -481,7 +467,6 @@ impl Query {
             .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
-        // 1. Scripthash unlink only — do **not** clear strong yet.
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
@@ -508,27 +493,23 @@ impl Query {
             }
         }
 
-        // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
         self.store.height_fence_pop_tip(height);
         self.note_disconnect_height(height.0);
         let _ = self.on_load_pack();
         self.store.flush_confirmed_only()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
-        // Height index: tip−1 remove when map was current; else rebuild on next ensure.
         if let Some(new_tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(new_tip);
         } else {
             self.invalidate_height_by_hash_index();
         }
 
-        // 3. Only after tip is durable lower: clear strong for disconnected txs.
         for &tx_fk in &tx_fks {
             self.store.strong_tx.set_unstrong(tx_fk)?;
         }
         self.store.flush_class_c_after_disconnect_tip()?;
 
-        // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
         self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         Ok(())
@@ -544,6 +525,5 @@ pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], n_tx: usize) -> 
 }
 
 fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
-    // Warn: leaving a confirmed block is not the common path (reorg).
     rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
 }

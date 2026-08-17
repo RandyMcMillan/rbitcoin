@@ -214,7 +214,6 @@ impl VarTable {
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
 
-        // Collect unique start slots needed: id for all; id+1 when interior.
         let mut start_ids: Vec<u64> = Vec::with_capacity(jobs.len() * 2);
         for &(_, id) in &jobs {
             start_ids.push(id);
@@ -319,7 +318,6 @@ impl VarTable {
         if body_blob.is_empty() {
             return Ok(());
         }
-        // Fast path: single WriteOp + HWM publish matching write_at_pwrite.
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
         use crate::bulk_io::{self, WriteOp};
@@ -331,14 +329,11 @@ impl VarTable {
         }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
-            // Fallback: full pwrite path (capacity already ensured).
             return self.body.write_at_pwrite(start, body_blob);
         }
         if (ops[0].result as usize) != body_blob.len() {
-            // Short write — complete via TableFile (publishes HWM).
             return self.body.write_at_pwrite(start, body_blob);
         }
-        // Bytes on disk; advance HWM / dirty like write_at_pwrite.
         self.body
             .set_logical_len(end.max(self.body.logical_len()))?;
         Ok(())

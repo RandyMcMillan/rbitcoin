@@ -1130,7 +1130,6 @@ fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         let mut entry = mempool_graph_json(mp, &tid, fee, weight);
         if let Some(obj) = entry.as_object_mut() {
             obj.insert("wtxid".into(), json!(wtxid));
-            // `fees` already set by mempool_graph_json (includes modified/chunk).
         }
         return Ok(entry);
     }

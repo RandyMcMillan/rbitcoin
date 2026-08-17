@@ -27,7 +27,7 @@ pub const HEAD_KEY_LEN: usize = 16;
 const SLOT_SIZE: usize = HEAD_KEY_LEN + 8;
 /// High bit of packed value: multi-list head (else sole create_fk).
 const MULTI_BIT: u64 = 1u64 << 63;
-const MULTI_REC_LEN: usize = 16; // create_fk | next
+const MULTI_REC_LEN: usize = 16;
 const DEFAULT_SLOTS: u64 = 64;
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 /// Slots per page-cache RMW chunk (128 × 24 B = 3 KiB).
@@ -67,7 +67,7 @@ const CHUNK_CACHE_MAX: usize = 256;
 /// Aggregate rehash chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
 /// Single rehash still WARN if clear size or wall time exceeds these (host risk).
-const REHASH_WARN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+const REHASH_WARN_BYTES: u64 = 64 * 1024 * 1024;
 const REHASH_WARN_MS: u128 = 500;
 
 /// Which hash-head file (drives mainnet pre-size).
@@ -527,7 +527,6 @@ impl HashHead {
             return self.bulk_fill_empty(entries, on_prev);
         }
 
-        // Sort by primary hash slot so linear probes walk nearby pages.
         let mut work: Vec<([u8; 32], Fk)> = entries.to_vec();
         let slots_now = self.state.lock().unwrap().slots;
         work.sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots_now));
@@ -733,8 +732,6 @@ impl HashHead {
         let new_bytes = SLOT_SIZE as u64 * new_slots;
         let t0 = Instant::now();
 
-        // Collect live entries only (~occupied × slot, not empty slots). Packed
-        // values (sole or MULTI_BIT multi heads) are preserved as-is.
         let mut entries: Vec<(HeadKey, u64)> = Vec::new();
         entries
             .try_reserve_exact(occupied as usize)
@@ -761,7 +758,6 @@ impl HashHead {
             slot += n as u64;
         }
 
-        // Grow file, then clear the **entire** slot region without zero-fill writes.
         let need = FILE_HEADER_LEN as u64 + new_bytes;
         self.file.ensure_capacity(need)?;
         self.file.set_logical_len(need)?;
@@ -773,7 +769,6 @@ impl HashHead {
             state.occupied = 0;
         }
 
-        // Slot-sorted reinsert for better page locality on large tables.
         entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
         let n_entries = entries.len() as u64;
         let mut cache = SlotPageCache::new(self, new_slots);

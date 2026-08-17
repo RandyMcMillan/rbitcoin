@@ -361,7 +361,7 @@ impl Mempool {
         }
         let old_cap = self.slot_cap;
         let need = SLOTS_HEADER + (new_cap as usize) * SLOT_REC;
-        self.slots.resize(need, 0); // new records are FREE (0)
+        self.slots.resize(need, 0);
         self.slots[8..12].copy_from_slice(&new_cap.to_le_bytes());
         self.slot_cap = new_cap;
         self.persist_all()?;

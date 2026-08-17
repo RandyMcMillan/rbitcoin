@@ -138,7 +138,6 @@ fn note_probe_depth_on_insert(depth: u32) {
         return;
     }
     let n = PROBE_INSERT_DEPTH_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    // Once only — first deep insert; further events counted silently.
     if n == 1 {
         rbitcoin_log::warn!(
             "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (first depth={depth}; \
@@ -245,7 +244,6 @@ pub fn h1_in_page(txid: &[u8; 32], bits: u32) -> u64 {
         return (v >> (64 - bits)) & ((1u64 << bits) - 1);
     }
     let page_bits = bits - PAGE_SLOT_BITS;
-    // Bits [page_bits, page_bits+10) of the BE stream.
     (v >> (64 - page_bits - PAGE_SLOT_BITS)) & (PAGE_SLOTS - 1)
 }
 
@@ -635,7 +633,6 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
-        // Logging: segmented head emits one multi-seg open summary; keep quiet here.
         Ok(Self {
             file,
             layout,
@@ -745,7 +742,6 @@ impl AddressHead {
                 ));
             }
             if (ops[0].result as usize) < need {
-                // Short read — fall back to TableFile complete pread.
                 self.file.read_at(off, &mut buf[..need])?;
             }
         }
@@ -789,7 +785,6 @@ impl AddressHead {
         let page_slots = page_slot_count(bits);
         let es_u = es as usize;
 
-        // Stable sort: same-page order stays call order (duplicate txids).
         entries.sort_by(|a, b| page_base_for_txid(&a.0, bits).cmp(&page_base_for_txid(&b.0, bits)));
 
         let mut buf = [0u8; PROBE_REGION_BYTES];
@@ -819,7 +814,6 @@ impl AddressHead {
                 }
             }
             if dirty {
-                // One OS-page-aligned write for the whole probe page (4 KiB @ 4 B).
                 let off = self.entry_off(page_base);
                 self.file.write_at(off, &buf[..n])?;
                 self.occupied.fetch_add(n_new, Ordering::Relaxed);
@@ -892,7 +886,6 @@ impl AddressHead {
             .collect();
         order.sort_unstable_by_key(|&(p, i)| (p, i));
 
-        // Unique pages in order, with [start,end) key ranges into `order`.
         let mut page_bases: Vec<u64> = Vec::new();
         let mut page_ranges: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
@@ -923,7 +916,6 @@ impl AddressHead {
                 &mut out,
             )?,
             None => {
-                // Standalone: one reusable page buffer, serial load (cheap).
                 let mut buf = [0u8; PROBE_REGION_BYTES];
                 for (pi, &page_base) in page_bases.iter().enumerate() {
                     let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
@@ -972,7 +964,6 @@ impl AddressHead {
         // Fixed pool — never one buffer per unique page in the stamp.
         let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
         let mut bufs: Vec<Vec<u8>> = (0..pool_n).map(|_| vec![0u8; PROBE_REGION_BYTES]).collect();
-        // Which unique page index each pool slot is loading (or None if free).
         let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
         let mut next_page = 0usize;
@@ -983,7 +974,6 @@ impl AddressHead {
         // On error, drain while bufs still live (SQE destinations).
         let run = (|| -> Result<(), StoreError> {
             loop {
-                // Arm free slots up to ring free_sq.
                 while next_page < n_pages
                     && !free_slots.is_empty()
                     && session.free_sq() > 0
@@ -1106,7 +1096,7 @@ impl AddressHead {
 
 fn count_occupied(file: &TableFile, slots: u64, entry_bytes: u8) -> Result<u64, StoreError> {
     let es = u64::from(entry_bytes);
-    const SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024; // 16 MiB
+    const SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024;
     if slots * es > SCAN_BYTE_CAP {
         // Large segments (e.g. 25-bit): skip full scan; occupied stays approximate 0.
         return Ok(0);

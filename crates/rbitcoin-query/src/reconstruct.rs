@@ -216,7 +216,6 @@ impl Query {
         }
         let header = self.wire_header_from_record_prev(&rec, prev_hash)?;
         let mut txdata = Vec::with_capacity(tx_fks.len());
-        // Dedup create_fk → txid across the whole block.
         let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
         for fk in tx_fks {
             let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_for_wire(fk)?;

@@ -235,7 +235,6 @@ pub mod confirm_load_stats {
         pub edge_coinbase: u64,
     }
 
-    // ── Last completed pin batch (slow-prep logs; not window-summed) ───────
     static LAST_PIN_ADOPT_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_PIN_PLAN_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_PIN_COLD_NS: AtomicU64 = AtomicU64::new(0);
@@ -414,7 +413,6 @@ pub mod archive_phase_stats {
         exclusive::with(f)
     }
 
-    // ── counts (resolve mix) ─────────────────────────────────────────────
     /// Headers (blocks) planned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
@@ -433,7 +431,6 @@ pub mod archive_phase_stats {
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
 
-    // ── prep walls (ns) ──────────────────────────────────────────────────
     /// Full load batch wall (struct → lookup → enqueue wait).
     pub static PREP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
@@ -453,7 +450,6 @@ pub mod archive_phase_stats {
     pub static PREP_QWAIT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
-    // ── write / commit walls (ns) ─────────────────────────────────────────
     pub static WRITE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_RESERVE_NS: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_BODY_NS: AtomicU64 = AtomicU64::new(0);
@@ -1143,7 +1139,6 @@ impl Query {
             sp_tweaks: Mutex::new(sp_tweaks),
             sptweaks_enabled: AtomicBool::new(false),
             sptweaks_origin: AtomicU32::new(sptweaks_origin),
-            // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
@@ -1153,12 +1148,9 @@ impl Query {
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
         };
-        // Eager height index so first Esplora/P2P mid-chain lookup is hot.
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
         }
-        // Warm cache from durable head if present (resume with index on).
-        // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
     }
 
@@ -1327,8 +1319,6 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Durable head → spender. Confirm path uses create_fk via
-        // [`Self::is_outpoint_spent_create`] when the fk is already known.
         Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
     }
 
@@ -1421,9 +1411,7 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
-        // Intentionally ignores soft assign restriction — request-limited only.
         let mut g = self.block_queue.lock().unwrap();
-        // Idempotent: already queued for this height (re-offer after race).
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
@@ -1643,7 +1631,6 @@ impl Query {
         let Some(tip) = self.tip_height() else {
             return Ok((0, 0));
         };
-        // Empty index → bulk append. Sparse/partial → probe to avoid dups.
         let probe = self.point_edge_count() > 0;
         let mut txs = 0u64;
         let mut edges_total = 0u64;
@@ -1670,7 +1657,6 @@ impl Query {
             };
             for fk in fks {
                 if probe {
-                    // Per-tx path with existence probe (partial reindex).
                     self.mark_spends_for_tx(fk, true)?;
                 } else {
                     let mut edges = self.collect_spend_edges(fk, false)?;
@@ -1679,7 +1665,6 @@ impl Query {
                         flush_batch(&mut edge_batch)?;
                     }
                     if edges.len() >= EDGE_BATCH {
-                        // Single fat tx: write on its own.
                         self.store.put_spend_batch(&edges)?;
                     } else {
                         edge_batch.append(&mut edges);
@@ -1794,7 +1779,6 @@ impl Query {
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
-        // Prefer full-run cache via fk when we know it (txid→fk process cache).
         if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
             return self.tx_output_at_fk(fk, tx, vout);
         }
@@ -1811,7 +1795,6 @@ impl Query {
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
-        // Packed Class A — one body IO.
         let (_, _, outs) = self.store.get_tx_full(create_fk)?;
         outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
     }
@@ -1909,7 +1892,6 @@ impl Query {
             return Ok(Vec::new());
         }
 
-        // prev_fk → list of (child_fk, child_hash)
         let mut children: U64Map<Vec<(Fk, [u8; 32])>> = U64Map::default();
         for id in 1..=n {
             let fk = Fk(id);
@@ -1918,12 +1900,7 @@ impl Query {
             children.entry(prev).or_default().push((fk, rec.hash));
         }
 
-        // Walk tip → ancestors (bounded). At each parent, if a sibling of the
-        // on-path child heads a **strictly heavier** subtree than the on-path
-        // child, explore that sibling. Covers tip-on-loser-child (mainnet 0139ed
-        // under 0169eb: better fork is d1e0 under grandparent 807f).
         const ANCESTOR_HOPS: u32 = 32;
-        // (fk, hash, has_body, height of sibling)
         let mut best_sib: Option<(Fk, [u8; 32], bool, u32)> = None;
         let mut path_fk = tip_fk;
         let mut path_h = tip_height;
@@ -1970,7 +1947,6 @@ impl Query {
                         }
                     };
                     if take {
-                        // Sibling shares height with the on-path child at this level.
                         best_sib = Some((fk, hash, has_body, path_h));
                     }
                 }
@@ -2006,9 +1982,6 @@ impl Query {
             if kids.is_empty() {
                 break;
             }
-            // Prefer the child that heads the heaviest header subtree (most-work
-            // path). Body presence only breaks ties; then higher fk.
-            // (Old body-first order re-elected archived losing forks after reorg.)
             let mut best: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
             for &(fk, hash) in kids {
                 let has_body = self.store.header_txs.has_body(fk)?;

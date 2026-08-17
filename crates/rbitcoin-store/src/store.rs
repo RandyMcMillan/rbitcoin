@@ -209,7 +209,6 @@ impl Store {
                  (schema 17 uses segmented dirs; --sptweaks backfill regenerates)"
             );
         }
-        // Scripthash table is new in Phase 6 — create if missing (upgrade path).
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open(&path)?
         } else {
@@ -663,7 +662,6 @@ impl Store {
             return Ok(());
         }
         let mut work = edges.to_vec();
-        // Group by create_fk + body range, then vout.
         work.sort_unstable_by_key(|(c, v, _, off, _)| (c.0, *off, *v));
         let mut i = 0;
         while i < work.len() {
@@ -854,7 +852,6 @@ impl Store {
         if !multi {
             return self.is_confirmed_strong_at(field, tip);
         }
-        // Multi: walk spenders (cold / rare during IBD).
         let mut found = false;
         point_table::for_each_spender_create(
             &self.txs,
@@ -914,7 +911,6 @@ impl Store {
                 }
                 continue;
             }
-            // Multi-list: rare during IBD.
             if !self.has_confirmed_strong_spender_create(create_tx_fk, v, body_range)? {
                 unspent.push(v);
             }

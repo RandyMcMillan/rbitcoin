@@ -63,7 +63,6 @@ fn verify_key_path(
     cache: &mut SighashCache<&Transaction>,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
-    // Borrow witness sig bytes (no heap copy for the common 64/65-byte path).
     let sig_raw = input
         .witness
         .nth(0)

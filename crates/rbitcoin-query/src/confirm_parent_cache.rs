@@ -95,7 +95,6 @@ impl ConfirmParentCache {
             g.hash_to_height.remove(&old_hash);
         }
         g.hash_to_height.insert(hash, height);
-        // Publish immutable plan Arc (no rewrite-in-place of tx_fks).
         g.headers.insert(
             height,
             Arc::new(HeaderPlanCache {

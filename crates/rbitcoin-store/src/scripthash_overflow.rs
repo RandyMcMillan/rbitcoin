@@ -334,7 +334,7 @@ impl ShOverflowStack {
                 .ok_or(StoreError::Corrupt("scripthash.ovf: seal without open"))?;
             (open.id, open.slots())
         };
-        // Build fuse from occupied 16 B head keys (sync — segment is small).
+
         let mut set: HashSet<u64> = HashSet::new();
         {
             let open = self.segs.last().unwrap();
@@ -353,7 +353,7 @@ impl ShOverflowStack {
             let open = self.segs.last_mut().unwrap();
             open.fuse = Some(fuse);
         }
-        // Next open segment, same slot count.
+
         let next_id = id + 1;
         let dir = ovf_dir(&self.store_dir);
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
@@ -388,7 +388,7 @@ impl ShOverflowStack {
                 self.maybe_seal_at_load(seal_load)?;
                 return Ok(());
             }
-            // Open full (or probe exhausted): seal and place remainder on next.
+
             self.seal_open_and_roll()?;
             pending = rem;
         }
@@ -412,7 +412,6 @@ impl ShOverflowStack {
     }
 
     pub fn insert(&self, key: &[u8; 32], val: &ShHeadValue) -> Result<(), StoreError> {
-        // Prefer home segment if key already present.
         if let Some((id, _)) = self.get_with_home(key)? {
             return self.insert_on_segment(id, &[(*key, val.clone())]);
         }

@@ -16,6 +16,21 @@
    and [`docs/concurrency.md`](./docs/concurrency.md).
 6. Security-sensitive reports go through [`SECURITY.md`](./SECURITY.md), not
    public issues.
+7. **Source-code comments are a smell.** A comment that restates *what* the
+   next statements do means the code itself is not clear — prefer names,
+   types, and structure that read as the algorithm. A comment that restates
+   *why* those statements exist means the function name or signature is not
+   carrying the contract — prefer a name and type that make the reason
+   obvious at the call site. A comment that explains a *weird* approach
+   usually means the language, library, or framework is a poor fit — prefer
+   changing the approach or isolating the quirk at a named boundary. Most
+   comments should not exist. Keep a comment only when a specific remaining
+   clarity problem (an invariant, protocol rule, or `SAFETY` requirement
+   the types cannot state) or a specific quirk of why this code exists (a
+   library or workaround constraint that would otherwise look like a bug)
+   still requires it. Crate and public-item rustdoc (`//!` / `///`) that
+   documents a surface, not a walkthrough of the next line, is not this
+   rule.
 
 ## Workflow
 
@@ -78,3 +93,5 @@ check on the commit, not from the `ci` run.
 - [ ] Public API preferred over `#[cfg(test)]` white-box access
 - [ ] Store changes respect Class A/B/C and allocate-then-publish
 - [ ] Experimental / milestone honesty preserved in user-facing docs when relevant
+- [ ] No restating `//` comments. Remaining line comments name an invariant,
+      protocol, `SAFETY` requirement, or library quirk the types cannot state.

@@ -38,6 +38,10 @@ before 1.0).
   / lookup probes retry until they see a complete image (stale is fine). Stuck
   odd is `Corrupt("open head page seqlock")`. No on-disk change.
 
+- **Sealed `tx.head` segments drop the page seqlock.** The per-page `AtomicU32`
+  array is open-tail only (~128 KiB per 25-bit segment). Seal replaces the head
+  with an immutable view; reopen of a sealed file never allocates the array.
+
 - **Source-code comments are a smell.** `CONTRIBUTING.md` now states that
   a comment restating *what* the next code does, *why* it exists, or a
   *weird* approach usually means names, signatures, or the library fit

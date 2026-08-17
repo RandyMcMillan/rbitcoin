@@ -62,7 +62,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
 | Capacity grow (`TableFile`) | No map epochs; fallocate/`set_len` only; readers use published HWM (Acquire) |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
-| `tx.head` insert | **Sole writer**: page-coalesced `pwrite` + per-page RAM seqlock (odd during write-back). Probes retry for a coherent snapshot. Role exclusivity — not multi-inserter safe |
+| `tx.head` insert | **Sole writer**: page-coalesced `pwrite` + per-page RAM seqlock on the **open tail only** (odd during write-back). Sealed segments drop the array. Probes retry for a coherent snapshot. Role exclusivity — not multi-inserter safe |
 | `tx.head` segment seal | Synchronous on roll: build fuse8 + mark sealed + open new head (no shadow resize) |
 | Process `rehash_gate` | Rare multi‑GiB open-hash rehash (host freeze prevention) |
 | `ChainHub::confirmed` | `RwLock<HashSet>` for O(1) `has_block` (IBD assign path) |

@@ -14,7 +14,8 @@
 //! (preserves call order within a page for rare same-batch duplicate txids). One
 //! page load + multi-insert in RAM + one `pwrite` per dirty page. Concurrent
 //! probes use a per-page RAM seqlock (odd = pwrite in flight) so they hop-scan
-//! a complete image — stale is fine, mixed old/new is not.
+//! a complete image — stale is fine, mixed old/new is not. **Open tail only:**
+//! sealed segments drop the array (`open_immutable` / `without_page_seq`).
 //!
 //! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
@@ -569,6 +570,18 @@ fn new_page_seq(slots: u64, bits: u32) -> Box<[AtomicU32]> {
     (0..n).map(|_| AtomicU32::new(0)).collect()
 }
 
+#[inline]
+fn page_seq_index_in(n_pages: usize, bits: u32, page_base: u64) -> usize {
+    let ps = page_slot_count(bits).max(1);
+    let i = (page_base / ps) as usize;
+    i.min(n_pages.saturating_sub(1))
+}
+
+#[inline]
+fn page_seq_in(seqs: &[AtomicU32], bits: u32, page_base: u64) -> &AtomicU32 {
+    &seqs[page_seq_index_in(seqs.len(), bits, page_base)]
+}
+
 /// Fixed-width keyless txid → dense create_fk table.
 pub struct AddressHead {
     file: TableFile,
@@ -577,10 +590,10 @@ pub struct AddressHead {
     occupied: AtomicU64,
     generation: u64,
     /// Per-probe-page seqlock (even = idle/published, odd = pwrite in flight).
-    /// RAM only — sealed segments never increment; open-tail writers bump around
-    /// each dirty page write-back so concurrent probes retry instead of hop-scanning
-    /// a torn image.
-    page_seq: Box<[AtomicU32]>,
+    /// `None` = immutable (sealed): no RMW, probes skip the seqlock. Open-tail
+    /// writers bump around each dirty page write-back so concurrent probes retry
+    /// instead of hop-scanning a torn image.
+    page_seq: Option<Box<[AtomicU32]>>,
 }
 
 impl AddressHead {
@@ -621,11 +634,30 @@ impl AddressHead {
             slots,
             occupied: AtomicU64::new(0),
             generation: 0,
-            page_seq: new_page_seq(slots, layout.bits),
+            page_seq: Some(new_page_seq(slots, layout.bits)),
         })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_inner(path, true, None)
+    }
+
+    /// Sealed / immutable segment: same file, no per-page seqlock heap.
+    pub fn open_immutable(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_inner(path, false, None)
+    }
+
+    /// Same on-disk head without a seqlock array (in-process seal). Skips the
+    /// occupied recount; sealed pages are no longer written.
+    pub fn without_page_seq(&self) -> Result<Self, StoreError> {
+        Self::open_inner(self.file.path(), false, Some(self.occupied()))
+    }
+
+    fn open_inner(
+        path: impl Into<PathBuf>,
+        with_page_seq: bool,
+        occupied_hint: Option<u64>,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -649,14 +681,21 @@ impl AddressHead {
         remove_legacy_meta_sidecar(&path);
 
         let slots = layout.slots();
-        let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
+        let occupied = match occupied_hint {
+            Some(n) => n,
+            None => count_occupied(&file, slots, layout.entry_bytes)?,
+        };
         Ok(Self {
             file,
             layout,
             slots,
             occupied: AtomicU64::new(occupied),
             generation,
-            page_seq: new_page_seq(slots, layout.bits),
+            page_seq: if with_page_seq {
+                Some(new_page_seq(slots, layout.bits))
+            } else {
+                None
+            },
         })
     }
 
@@ -680,11 +719,19 @@ impl AddressHead {
         self.occupied.load(Ordering::Relaxed)
     }
 
+    /// Process-heap bytes of the per-page seqlock. Zero when this head is
+    /// immutable (sealed segment): no RMW, no seq array.
+    pub fn page_seq_resident_bytes(&self) -> u64 {
+        self.page_seq
+            .as_ref()
+            .map(|s| s.len() * std::mem::size_of::<AtomicU32>())
+            .unwrap_or(0) as u64
+    }
+
     #[inline]
     pub(crate) fn page_seq_index(&self, page_base: u64) -> usize {
-        let ps = page_slot_count(self.layout.bits).max(1);
-        let i = (page_base / ps) as usize;
-        i.min(self.page_seq.len().saturating_sub(1))
+        let n = self.page_seq.as_ref().map(|s| s.len()).unwrap_or(0);
+        page_seq_index_in(n, self.layout.bits, page_base)
     }
 
     pub fn generation(&self) -> u64 {
@@ -749,15 +796,19 @@ impl AddressHead {
         if need == 0 {
             return Ok(0);
         }
-        let seq_i = self.page_seq_index(page_base);
+        let Some(seqs) = self.page_seq.as_deref() else {
+            self.file.read_at(off, &mut buf[..need])?;
+            return Ok(need);
+        };
+        let seq = page_seq_in(seqs, self.layout.bits, page_base);
         let t0 = std::time::Instant::now();
         let mut spins = 0u32;
         loop {
-            let s1 = self.page_seq[seq_i].load(Ordering::Acquire);
+            let s1 = seq.load(Ordering::Acquire);
             if s1.is_multiple_of(2) {
                 // libc pread only — this runs under the probe TLS ring on retry.
                 self.file.read_at(off, &mut buf[..need])?;
-                let s2 = self.page_seq[seq_i].load(Ordering::Acquire);
+                let s2 = seq.load(Ordering::Acquire);
                 if s1 == s2 {
                     return Ok(need);
                 }
@@ -840,13 +891,16 @@ impl AddressHead {
                 }
             }
             if dirty {
-                let seq_i = self.page_seq_index(page_base);
+                let Some(seqs) = self.page_seq.as_deref() else {
+                    return Err(StoreError::Corrupt("address head insert on immutable head"));
+                };
+                let seq = page_seq_in(seqs, bits, page_base);
                 // Odd = pwrite in flight. Always restore even so a failed write
                 // cannot pin probes on this page.
-                self.page_seq[seq_i].fetch_add(1, Ordering::Release);
+                seq.fetch_add(1, Ordering::Release);
                 let off = self.entry_off(page_base);
                 let wr = self.file.write_at(off, &buf[..n]);
-                self.page_seq[seq_i].fetch_add(1, Ordering::Release);
+                seq.fetch_add(1, Ordering::Release);
                 wr?;
                 self.occupied.fetch_add(n_new, Ordering::Relaxed);
                 #[cfg(test)]
@@ -997,7 +1051,7 @@ impl AddressHead {
         let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
         let mut bufs: Vec<Vec<u8>> = (0..pool_n).map(|_| vec![0u8; PROBE_REGION_BYTES]).collect();
         let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
-        let mut slot_seq: Vec<u32> = vec![0; pool_n];
+        let mut slot_seq: Vec<Option<u32>> = vec![None; pool_n];
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
         let mut next_page = 0usize;
         let mut in_flight = 0usize;
@@ -1022,26 +1076,31 @@ impl AddressHead {
                         continue;
                     }
                     let off = self.entry_off(page_base);
-                    let seq_i = self.page_seq_index(page_base);
-                    let s1 = self.page_seq[seq_i].load(Ordering::Acquire);
-                    if !s1.is_multiple_of(2) {
-                        // Writer is in pwrite — do not hop a uring snapshot.
-                        let n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
-                        if n >= es_u {
-                            let nslots = (n / es_u) as u64;
-                            let (lo, hi) = page_ranges[pi];
-                            let page = &bufs[slot][..n];
-                            for &(_, orig) in &order[lo..hi] {
-                                let txid = &txids[orig];
-                                let h1p = h1_in_page(txid, bits);
-                                let h2p = h2_in_page(txid, bits);
-                                let scan = hop_scan_page(page, es, h1p, h2p, nslots, MAX_PROBE);
-                                out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                    let submit_seq = if let Some(seqs) = self.page_seq.as_deref() {
+                        let s1 = page_seq_in(seqs, bits, page_base).load(Ordering::Acquire);
+                        if !s1.is_multiple_of(2) {
+                            // Writer is in pwrite — do not hop a uring snapshot.
+                            let n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
+                            if n >= es_u {
+                                let nslots = (n / es_u) as u64;
+                                let (lo, hi) = page_ranges[pi];
+                                let page = &bufs[slot][..n];
+                                for &(_, orig) in &order[lo..hi] {
+                                    let txid = &txids[orig];
+                                    let h1p = h1_in_page(txid, bits);
+                                    let h2p = h2_in_page(txid, bits);
+                                    let scan = hop_scan_page(page, es, h1p, h2p, nslots, MAX_PROBE);
+                                    out[orig] =
+                                        scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                                }
                             }
+                            free_slots.push(slot);
+                            continue;
                         }
-                        free_slots.push(slot);
-                        continue;
-                    }
+                        Some(s1)
+                    } else {
+                        None
+                    };
                     let buf = &mut bufs[slot][..need];
                     buf.fill(0);
                     let ud = crate::uring_session::pack_ud(
@@ -1051,7 +1110,7 @@ impl AddressHead {
                     );
                     session.push_pread_flags(fd, off, buf, ud, rw_flags)?;
                     slot_page[slot] = Some(pi);
-                    slot_seq[slot] = s1;
+                    slot_seq[slot] = submit_seq;
                     in_flight += 1;
                 }
                 session.sync_submission();
@@ -1096,10 +1155,15 @@ impl AddressHead {
                         n = need;
                     }
                     n = n.min(need);
-                    let s1 = slot_seq[slot];
-                    let s2 = self.page_seq[self.page_seq_index(page_base)].load(Ordering::Acquire);
-                    if s1 != s2 || !s1.is_multiple_of(2) {
-                        n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
+                    if let Some(s1) = slot_seq[slot] {
+                        let s2 = self
+                            .page_seq
+                            .as_deref()
+                            .map(|seqs| page_seq_in(seqs, bits, page_base).load(Ordering::Acquire))
+                            .unwrap_or(s1);
+                        if s1 != s2 || !s1.is_multiple_of(2) {
+                            n = self.load_page_slots(page_base, page_slots, &mut bufs[slot])?;
+                        }
                     }
 
                     if n >= es_u {
@@ -1354,18 +1418,47 @@ mod tests {
         txid[0] = 0x7a;
         let page_base = page_base_for_txid(&txid, 12);
         assert_eq!(
-            h.page_seq[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed),
+            h.page_seq.as_ref().unwrap()[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed),
             0,
             "fresh page seq is even/idle"
         );
         h.insert(&txid, Fk(1)).unwrap();
-        let seq = h.page_seq[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed);
+        let seq =
+            h.page_seq.as_ref().unwrap()[h.page_seq_index(page_base)].load(AtomicOrdering::Relaxed);
         assert!(seq.is_multiple_of(2), "publish leaves seq even, got {seq}");
         assert!(
             seq >= 2,
             "one dirty write-back bumps 1→odd then 2→even, got {seq}"
         );
         assert!(h.probe_fks(&txid).unwrap().contains(&Fk(1)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sealed / immutable heads keep no seqlock pages and still probe.
+    #[test]
+    fn immutable_head_has_no_page_seq() {
+        let path = tmp("page-seq-immut");
+        let h = AddressHead::create_with_bits(&path, 12).unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x5e;
+        h.insert(&txid, Fk(7)).unwrap();
+        assert!(h.page_seq_resident_bytes() > 0);
+        let imm = h.without_page_seq().unwrap();
+        assert_eq!(imm.page_seq_resident_bytes(), 0);
+        assert!(imm.probe_fks(&txid).unwrap().contains(&Fk(7)));
+        let err = imm
+            .insert(&txid, Fk(8))
+            .expect_err("immutable must refuse insert");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("immutable"),
+            "insert on sealed head must name immutable, got {msg}"
+        );
+        drop(h);
+        drop(imm);
+        let opened = AddressHead::open_immutable(&path).unwrap();
+        assert_eq!(opened.page_seq_resident_bytes(), 0);
+        assert!(opened.probe_fks(&txid).unwrap().contains(&Fk(7)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1379,7 +1472,7 @@ mod tests {
         txid[0] = 0x3c;
         h.insert(&txid, Fk(1)).unwrap();
         let idx = h.page_seq_index(page_base_for_txid(&txid, 12));
-        h.page_seq[idx].store(1, AtomicOrdering::Release);
+        h.page_seq.as_ref().unwrap()[idx].store(1, AtomicOrdering::Release);
         let err = h
             .probe_fks(&txid)
             .expect_err("odd seq is in-flight pwrite; probe must not use the page");

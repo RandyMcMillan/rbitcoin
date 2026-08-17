@@ -1,6 +1,6 @@
 //! IBD most-work reorg: classify BadPrev, rank candidates, apply via `accept_branch`.
 //!
-//! See [`docs/design-ibd-most-work-reorg.md`]. Orchestration-thread only.
+//! See `docs/architecture.md` (most-work chain selection). Orchestration-thread only.
 
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;

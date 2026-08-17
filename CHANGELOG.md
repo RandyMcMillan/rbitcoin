@@ -33,6 +33,15 @@ before 1.0).
 
 ### Changed
 
+- **Documentation map.** [`docs/README.md`](docs/README.md) is the only
+  index (one audience, one start file; one fact, one owner). Coverage
+  policy lives in `TESTING.md`. Schema 17 freeze tables live in
+  `SCHEMA.md`. Confirm start states live in `docs/invariants.md`.
+  Most-work reorg rules live in `docs/architecture.md`. `AGENTS.md` is
+  the slim harness contract. Removed `COVERAGE.md`,
+  `docs/store-format.md`, `docs/startup-states.md`,
+  `docs/design-ibd-most-work-reorg.md`, and `docs/future-features/`.
+
 - **Open `tx.head` page RMW is seqlocked.** Each probe page has a RAM
   `AtomicU32` (even = published, odd = `pwrite` in flight). Concurrent leftover
   / lookup probes retry until they see a complete image (stale is fine). Stuck
@@ -164,7 +173,7 @@ before 1.0).
   own idx at the soft span. Inwit no longer forces hot idx splits.
 - **`strong_tx`:** always L2 (1 bit/fk). `RBITCOIN_CLASS_C_INRAM_MAX_MB`
   still caps `confirmed` / `header_txs_*` only.
-- **Schema 17 freeze note:** [`docs/store-format.md`](docs/store-format.md)
+- **Schema 17 freeze note:** [`SCHEMA.md`](SCHEMA.md)
   (hot set, widths, kinds without wipe, what forces 18).
 
 - **`getdeploymentinfo`:** buried `bip34` / `bip66` / `bip65` / `csv` /

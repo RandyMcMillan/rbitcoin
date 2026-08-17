@@ -58,7 +58,7 @@ const MAX_PENDING_HEADERS: usize = 8_000;
 /// Cap on the per-peer download window and missing-parent getdata burst
 /// (DoS / process RAM). Must be ≥99 so tip-follow can *request* a 99-block
 /// competing branch; apply is `ChainHub::accept_received_block` (see
-/// `docs/design-ibd-most-work-reorg.md`).
+/// `docs/architecture.md` most-work chain selection).
 const MAX_PENDING_BLOCKS: usize = 128;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).

@@ -3,8 +3,9 @@
 **Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
 **Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
 byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).
-Freeze rationale (hot set, widths, kinds without wipe, writer policy):
-[`docs/store-format.md`](docs/store-format.md).  
+This freeze does **not** wipe a 17 datadir again. Stay on 17 until a listed
+18 change lands.
+
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
@@ -22,6 +23,94 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
+
+---
+
+## Schema 17 freeze
+
+### What 17 locks (on-disk)
+
+| Object | Frozen choice |
+|--------|----------------|
+| Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
+| Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
+| Idx | Per-stem `*.idx/` directories; **u32 stride-8**; hard span `2^32 × 8` ≈ 32 GiB; soft roll default 16 GiB |
+| Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`) |
+| Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
+| Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
+| Secret | `store.secret` XOR of scripts/witness; keyed `tx.head` mix |
+
+Empty / leftover prior files may be unlinked or `meta` rewritten on open as
+already listed above. A packed `tx.body` with creates, leftover schema-16 SH
+catalogs, or 16-layout Class A with creates is **refused**.
+
+### Writer / RAM policy (same schema — not a bump)
+
+| Policy | Choice |
+|--------|--------|
+| Idx rolls | Each Class A stem rolls independently at **that** stem’s soft span. `inwit` is the fat stem and must not force `txout` / `spent` splits. |
+| `strong_tx` | Always L2. `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) still caps **`confirmed`** and **`header_txs_*`** only. |
+| `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
+
+### New script kinds without a wipe
+
+Kind nibble **10–15** is **Corrupt** on this binary (no implicit width). A new
+consensus script type does **not** force a 17 datadir wipe:
+
+| Path | On-disk | Old 17 binary | New binary |
+|------|---------|---------------|------------|
+| **RAW** | kind 0 + CompactSize + bytes | already decodes | same |
+| **Soft-18** | new kind nibble + known width; `SCHEMA_VERSION = 18` | **refuses** 18 `meta` (or unknown kind) | reads 17 files; writes 18 |
+
+Use RAW when the type is rare. Use soft-18 when the type is common enough to
+pay a width table. Soft-18 is **not** a silent in-place rewrite of 17 files.
+Inwit `create_fk` Δfk (parked) is the same class: **18 or an inwit-only
+rewrite**, not a silent 17 mutate.
+
+### Field widths (10 years)
+
+Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
+~1.4e9.
+
+| Field | Width | Headroom |
+|-------|-------|----------|
+| `create_fk` / `header_fk` | u64 | 1e18-class; not a 10y issue |
+| Spent `spender_field` | u56 | Same; 2^56 creates is not a Bitcoin problem |
+| Height / `confirmed[]` index | u32 | ~1e6 heights now; 10y adds ~0.5e6; year 2106 is **timestamp**, not height |
+| Idx relative | u32 × stride 8 | 32 GiB **per segment**. Soft 16 GiB rolls first. |
+| `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
+| SH megakey page | 4 KiB delta stream | Page chain; not a single-integer cap |
+| `sp_tweaks` off | u32 per segment | Already segmented |
+| Script kind | 4 bits | 0–9 used; 10–15 reserved Corrupt; extension = RAW or soft-18 |
+
+Practical risks are **soft-span misuse** (one idx segment past 32 GiB) and
+**Bitcoin timestamp 2106** (consensus, every node).
+
+### What would force schema 18
+
+A **byte-incompatible** change to Class A / OA / body / idx / SH catalog
+layout, or anything that cannot soft-open 17 files.
+
+| Change | 18? | Notes |
+|--------|-----|-------|
+| New implicit-width script kind | Optional | RAW = no bump; nibble = soft-18 (17 refuses 18) |
+| Inwit Δfk | Yes or inwit-only rewrite | Parked; cold stem |
+| Idx not stride-8 / not u32 | Yes | Would retire the 8-align pad |
+| Packed Class A again / merge stems | Yes | Wipe |
+| SH `key_len` ≠ 40 or raw-u64 pages | Yes | 17 already refuses leftovers |
+| `txid.body` not dense 32 B/fk | Yes | Soft-open only if dual-read is explicit |
+| Fuse8 envelope v3 | No | Soft-migrate like v1→v2 (log + rewrite; no wipe) |
+| Independent rolls / L2 strong / no DONTCACHE | No | Writer/RAM only |
+
+Parked size work that is **not** 17: inwit Δfk; drop 8-align pad on empty
+inwit / zero-out spent (needs a different idx encoding); `txid.body`
+compression. Do not chase `inwit` size as an IBD **hot-set** win — put it
+on a cold volume (`--datadir-cold`). Census: [Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13).
+
+Process: bump `SCHEMA_VERSION`, document this file + `SCHEMA_HISTORY.md` in
+the same commit, refuse or soft-open with a one-line operator message. Do
+not treat decode failure as “recreate the whole table” unless the OA layout
+itself changed.
 
 ---
 
@@ -259,7 +348,7 @@ Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
 covers hash/data only. Spender flags live only on `spent`. A new consensus
 script type does **not** wipe a 17 datadir: encode it as kind 0 **RAW**, or
 introduce an implicit-width nibble as **soft-18** (18 reads 17; this 17
-binary refuses 18 / unknown kind). See [`docs/store-format.md`](docs/store-format.md).
+binary refuses 18 / unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 
 ### Sole-spender slot (`spent.body`)
 
@@ -511,7 +600,9 @@ Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
 
 | Doc | Topic |
 |-----|--------|
+| [`docs/README.md`](docs/README.md) | Documentation map |
 | [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md) | Prior schema versions |
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer ownership, IBD vs tip |
+| [`docs/invariants.md`](docs/invariants.md) | Confirm stage IO / leftover union |
 | [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, segmented head seal |
 | [`OPERATOR.md`](./OPERATOR.md) | Datadir ops, env knobs |

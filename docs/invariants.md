@@ -77,6 +77,40 @@ RPC, Electrum, and standalone tools may still use store cold paths.
 `validate_block_connect` remains a no-write unit-test helper only (empty pin →
 structural cold spentness).
 
+## Process open (before P2P / confirm)
+
+Normative write-order and repair: [`crash-recovery.md`](./crash-recovery.md).
+Short sequence:
+
+| Step | Action |
+|------|--------|
+| 1 | `Store::open` + schema gates |
+| 2 | Soft `tip_seal` clamp (if present) |
+| 3 | Trim trailing null `confirmed[]` slots, then tip-window revalidate last **6** heights; shrink/clear on fail; rebuild fence |
+| 4 | One `repair_class_c_above_tip` (fence complement: holes + short suffix) |
+| 5 | Then node may densify / extend tip |
+
+`TxIdx::open` refuses a non-monotone tail (`IDX_OPEN_DOUBLE_APPEND`). Offline
+compact: `scripts/repair-idx-double-append.py`. No live heal of a cloned
+published idx window.
+
+## Store start states (intake at confirm start)
+
+| State | Class A for tip+1 | Headers | Parent head | Handler (lookup cleans) |
+|-------|-------------------|---------|-------------|-------------------------|
+| **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+txout/spent range+txid; load `txout` by range |
+| **S1 already-archived** | body present (plan=None) | present | parents on head | lookup still stamps parent fk+ranges+txid (idx/head); load `txout` only |
+| **S2 tip-ahead pack** | prior pack uncommitted | — | parents in in_flight | plan uses in_flight create_fk; **must** also stamp ranges (idx) when body exists, or use offline CreatePin |
+| **S3 short catch-up** | mixed S0/S1 over gap | present | mostly cold | ordered claim tip+1 only for write; lookup may plan ahead with reserved HWM |
+| **S4 cascade fail** | tip+1 blacklisted or write failed | — | — | tip-ahead write may hit `fk mismatch` / `connect height not tip+1` → **soft requeue**, not permanent blacklist |
+
+| Error | State | Root | Fix |
+|-------|-------|------|-----|
+| `lookup stage miss (load cold denserels forbidden)` | S0/S3 | Load Forbid + parents without plan range | Lookup always fills `external_parent_ranges`; load outs by `txout` range only |
+| `put_full_batch fk mismatch` | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
+| `parent create_fk unresolved` | S2 | Leftover union miss | **Permanent.** Fix publish order. Do not soft-requeue. |
+| false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup `txid.body` only |
+
 ## Why there is no leftover pending map
 
 In-flight is the only RAM `txid → create_fk` cache for planned creates

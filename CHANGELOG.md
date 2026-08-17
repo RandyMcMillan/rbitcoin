@@ -11,6 +11,10 @@ before 1.0).
 
 ### Added
 
+- **`getblockstats`:** reconstruct the block and return Core fee / UTXO /
+  weight fields (`hash_or_height`, `stats`). Genesis is excluded from
+  actual UTXO counts; `OP_RETURN` is unspendable.
+
 - **`docs/errata.md`:** RAM leftover maps are one fk per txid. Pre-BIP30
   clobber is correct enough; post-BIP30 a disconnected sibling in those
   maps is an unlikely visibility hole, not the n−1 leftover miss.
@@ -29,9 +33,21 @@ before 1.0).
 
 ### Changed
 
+- **Invalidate evicts immature coinbase spends.** `QueryUtxoProvider`
+  now ORs the input-null coinbase signal with first-in-block, so
+  `evict_after_reorg` sees `ImmatureCoinbase` after `invalidateblock`
+  drops tip below maturity.
+
+- **`-minimumchainwork` is live on P2P.** Below the floor: stay in IBD
+  (also if tip age > 24h), do not announce blocks, ignore inbound
+  `getheaders`. Tip-follow still runs so later blocks can raise work.
+  `getblockheader` / `getblockchaininfo` report real header `chainwork`
+  (regtest 2 per block), not `""`.
+
 - **IBD leftover miss names the table:** stamp reject lines include
   `miss_on=head|body|idx|fence` and `miss_cands=` so a TipOnly miss is not
   read as a bare missing prevout (`body` is `txid.body` identity).
+
 - **Load pin hygiene (scriptq feed).** Sparse need-vouts are binary-searched
   (sorted decode outs). Stamp maps move off the plan (`take_from_plan`)
   instead of cloning two ~100k U64Maps. Archive bind is one walk

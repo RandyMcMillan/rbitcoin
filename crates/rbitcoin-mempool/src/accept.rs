@@ -1442,6 +1442,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// After invalidate drops tip below coinbase maturity, the live spend leaves.
+    #[test]
+    fn evict_nonfinal_drops_now_immature_coinbase_spend() {
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x44; 32]),
+            vout: 0,
+        };
+        let coin = Coin {
+            txout: TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            create_height: 1,
+            create_mtp: 0,
+            is_coinbase: true,
+        };
+        let utxos = MapUtxoProvider {
+            map: HashMap::from([(op, coin)]),
+        };
+        let tx = spend_tx(op, 49_0000_0000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(
+            &tx,
+            &utxos,
+            ChainTipCtx {
+                height: 200,
+                mtp: u32::MAX,
+            },
+        )
+        .expect("mature at tip 200");
+        assert_eq!(mp.live_count(), 1);
+        mp.evict_nonfinal(
+            &utxos,
+            ChainTipCtx {
+                height: 9,
+                mtp: u32::MAX,
+            },
+        );
+        assert_eq!(
+            mp.live_count(),
+            0,
+            "next_height=10 < create+100 must evict the coinbase spend"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Stage timers are recorded on a successful chain-spend accept.
     #[test]
     fn accept_records_stage_us_on_success() {

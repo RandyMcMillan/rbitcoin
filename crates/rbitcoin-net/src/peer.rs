@@ -373,6 +373,10 @@ pub async fn peer_session_with(
                 tip = tip_rx.recv() => {
                     match tip {
                         Ok(ev) => {
+                            // Below `-minimumchainwork` stay in IBD: do not relay blocks.
+                            if !hub.meets_minimum_chain_work() {
+                                continue;
+                            }
                             if ev.reorg_branch_len > 8 {
                                 if let Some(s) = session.as_ref() {
                                     s.headers_paused.store(true, Ordering::Relaxed);
@@ -676,7 +680,7 @@ async fn handle_peer_frame(
             if let Some(s) = session {
                 s.headers_paused.store(false, Ordering::Relaxed);
             }
-            let headers = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)?;
+            let headers = headers_reply_for_getheaders(hub, gh)?;
             queue_out(out_tx, NetworkMessage::Headers(headers))?;
         }
         NetworkMessage::GetBlocks(gb) => {
@@ -1214,6 +1218,17 @@ fn drain_pending_once(
     Ok(())
 }
 
+/// Inbound `getheaders` reply. Empty while tip work is below `-minimumchainwork`.
+pub(crate) fn headers_reply_for_getheaders(
+    hub: &ChainHub,
+    gh: &bitcoin::p2p::message_blockdata::GetHeadersMessage,
+) -> Result<Vec<bitcoin::block::Header>, NetError> {
+    if !hub.meets_minimum_chain_work() {
+        return Ok(Vec::new());
+    }
+    headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)
+}
+
 fn headers_for_peer(
     cache: &BlockCache,
     query: &Query,
@@ -1380,6 +1395,54 @@ mod tests {
             }
             other => panic!("expected Inv, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn minchainwork_getheaders_empty_until_floor() {
+        use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+        use bitcoin::ScriptBuf;
+
+        let (dir, q) = tmp_store("minwork");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let mut min = [0u8; 32];
+        min[31] = 0x65; // 101
+        hub.set_minimum_chain_work(Some(min));
+        let first = hub
+            .generate_to_script(49, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("49 blocks");
+        assert_eq!(hub.tip_height(), Some(49));
+        let h49 = *first.last().expect("height 49 hash");
+        // Genesis + 49 = 50 blocks * 2 work = 100 < 101.
+        assert!(
+            !hub.meets_minimum_chain_work(),
+            "work at height 49 must be below 0x65"
+        );
+        let gh = GetHeadersMessage::new(
+            vec![hub.tip_hash().unwrap()],
+            BlockHash::from_byte_array([0u8; 32]),
+        );
+        let below = headers_reply_for_getheaders(&hub, &gh).unwrap();
+        assert!(
+            below.is_empty(),
+            "getheaders below minchainwork must be empty, got {}",
+            below.len()
+        );
+
+        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("51st block");
+        assert_eq!(hub.tip_height(), Some(50));
+        assert!(
+            hub.meets_minimum_chain_work(),
+            "work at height 50 must meet 0x65"
+        );
+        let gh = GetHeadersMessage::new(vec![h49], BlockHash::from_byte_array([0u8; 32]));
+        let above = headers_reply_for_getheaders(&hub, &gh).unwrap();
+        assert!(
+            !above.is_empty(),
+            "getheaders at/above minchainwork must serve the 51st header"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

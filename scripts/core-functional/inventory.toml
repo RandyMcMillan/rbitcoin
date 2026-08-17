@@ -226,7 +226,7 @@ reason = "core-log"
 name = "feature_minchainwork.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: minchainwork"
+analog = "rust pin: 50-block tip minwork 0x65 getheaders empty, 51st serves; unmodified script (IBD clock / 3-node relay) not locally proven"
 
 [[test]]
 name = "feature_notifications.py"
@@ -382,7 +382,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: batch/http error-shape parity"
+analog = "HTTP 1.x/2.0 status, notifications (204), getrpcinfo logpath/active_commands, -rpcworkqueue"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -495,7 +495,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "submitblock 20-block fork accept_branch green; invalidateblock does not evict immature coinbase spends"
+analog = "rust pin: invalidate evicts immature coinbase spends; unmodified test_reorg_relay not locally proven"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -862,7 +862,7 @@ reason = "core-net-policy"
 name = "rpc_blockchain.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: waitforblock*/gettxout/getchaintxstats; getblock exists"
+analog = "chainwork real; still missing gettxoutsetinfo/muhash, prune, getchaintxstats, getnetworkhashps"
 
 [[test]]
 name = "rpc_createmultisig.py"
@@ -918,7 +918,7 @@ analog = "IBD hole-fill / tip-follow getdata"
 name = "rpc_getblockstats.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "node field-parity: getblockstats (default path is submitblock, not wallet)"
+analog = "getblockstats shipped (rust pin: coinbase-only + OP_RETURN); rpc_getblockstats.py blk00000.dat not found on disk"
 
 [[test]]
 name = "rpc_getchaintips.py"
@@ -959,8 +959,8 @@ status = "run"
 [[test]]
 name = "rpc_misc.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: echojson/getmemoryinfo/getindexinfo"
+reason = "core-internal"
+analog = "will not add echo crash switch, locked-page getmemoryinfo, or logging() qt toggle"
 
 [[test]]
 name = "rpc_named_arguments.py"

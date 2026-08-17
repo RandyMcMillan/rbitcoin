@@ -222,6 +222,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     )
     .await
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    node.hub.set_minimum_chain_work(config.minimum_chain_work);
 
     let mempool = MempoolHub::open_with_weight_persist(
         config.mempool_path(),
@@ -402,9 +403,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         catch_up_complete = true;
     }
 
+    // Still enter tip-follow when work is below `-minimumchainwork` so later
+    // blocks can raise the tip. Relay / getheaders stay gated on the hub floor.
     if catch_up_complete && !tip_meets_min_work(&config, &node.hub) {
-        info!("ibd: tip work below -minimumchainwork — staying in IBD (no relay)");
-        catch_up_complete = false;
+        info!("ibd: tip work below -minimumchainwork — following without relay");
     }
 
     // ── Steady state: tip tracking + block relay ────────────────────────────
@@ -434,7 +436,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
             // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
             // `-blocksonly` keeps relay off (blocks still follow).
-            if !config.blocksonly {
+            // `-minimumchainwork` keeps relay off until tip work meets the floor.
+            if !config.blocksonly && tip_meets_min_work(&config, &node.hub) {
                 mempool.set_relay_enabled(true);
             }
             info!(
@@ -643,7 +646,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             {
                 Ok(h) => {
                     h.initial_block_download.store(
-                        !tip_follow_ready || !tip_meets_min_work(&config, &node.hub),
+                        !tip_follow_ready
+                            || !tip_meets_min_work(&config, &node.hub)
+                            || node.hub.tip_is_stale_for_ibd(),
                         Ordering::SeqCst,
                     );
                     h.connections
@@ -730,8 +735,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
                 h.connections
                     .store(node.follow_live_count() as u64, Ordering::Relaxed);
-                h.initial_block_download
-                    .store(!tip_meets_min_work(&config, &node.hub), Ordering::SeqCst);
+                if !config.blocksonly
+                    && !mempool.relay_enabled()
+                    && tip_meets_min_work(&config, &node.hub)
+                {
+                    mempool.set_relay_enabled(true);
+                    info!("ibd: tip work now meets -minimumchainwork — enabling relay");
+                }
+                h.initial_block_download.store(
+                    !tip_meets_min_work(&config, &node.hub) || node.hub.tip_is_stale_for_ibd(),
+                    Ordering::SeqCst,
+                );
             }
             if matches!(wake, TipFollowWake::Stop) {
                 break;

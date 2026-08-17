@@ -41,3 +41,43 @@ emit = ['ping timeout: {1}s']
 [[rule]]
 match = 'Removed ([0-9a-f]{64}) from set of unbroadcast txns before confirmation that txn was sent out'
 emit = ['Removed {1} from set of unbroadcast txns before confirmation that txn was sent out']
+
+[[rule]]
+match = 'V2 transport error: invalid message type'
+emit = ['V2 transport error: invalid message type']
+
+[[rule]]
+match = 'redundant version message from peer(=.*)?'
+emit = ['redundant version message from peer']
+
+[[rule]]
+match = 'AcceptBlockHeader: not adding new block header ([0-9a-f]{64}), missing anti-dos proof-of-work validation'
+emit = ['AcceptBlockHeader: not adding new block header {1}, missing anti-dos proof-of-work validation']
+
+[[rule]]
+match = '\[net\] Ignoring low-work chain \(height=(\d+)\)'
+emit = ['[net] Ignoring low-work chain (height={1})']
+
+[[rule]]
+match = 'initial getheaders \((\d+)\) to peer=(\d+)'
+emit = ['initial getheaders ({1}) to peer={2}']
+
+[[rule]]
+match = 'Synchronizing blockheaders, height: (\d+)'
+emit = ['Synchronizing blockheaders, height: {1}']
+
+[[rule]]
+match = 'Timeout downloading headers, disconnecting peer=(\d+)'
+emit = ['Timeout downloading headers, disconnecting peer={1}']
+
+[[rule]]
+match = 'Timeout downloading headers from noban peer, not disconnecting peer=(\d+)'
+emit = ['Timeout downloading headers from noban peer, not disconnecting peer={1}']
+
+[[rule]]
+match = 'SetNetworkActive: (true|false)'
+emit = ['SetNetworkActive: {1}']
+
+[[rule]]
+match = 'received: addr'
+emit = ['received: addr']

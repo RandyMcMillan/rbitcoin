@@ -672,6 +672,7 @@ reason = "core-log"
 name = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: [net] Ignoring low-work chain (height=N); inbound header-tree work vs offered height + noban Synchronizing blockheaders unmapped"
 
 [[test]]
 name = "p2p_i2p_ports.py"
@@ -697,6 +698,7 @@ reason = "core-log"
 name = "p2p_initial_headers_sync.py"
 status = "skip"
 reason = "core-log"
+analog = "shipped: initial getheaders (0) to peer=0 on connect; Timeout downloading headers / noban / single-recipient getheaders matrix unmapped"
 
 [[test]]
 name = "p2p_invalid_block.py"
@@ -714,6 +716,7 @@ analog = "follow-up: locator bounds"
 name = "p2p_invalid_messages.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: V2 transport error: invalid message type + redundant version; v1 Header error / packet too large / Misbehaving / *other* bytes / noncontinuous headers unmapped"
 
 [[test]]
 name = "p2p_invalid_tx.py"
@@ -840,6 +843,7 @@ analog = "follow-up: tx privacy"
 name = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: AcceptBlockHeader … missing anti-dos proof-of-work validation; unrequested fork + 288-block window + minwork header skip not shipped"
 
 [[test]]
 name = "p2p_v2_encrypted.py"
@@ -974,6 +978,7 @@ status = "run"
 name = "rpc_net.py"
 status = "skip"
 reason = "core-log"
+analog = "getpeerinfo ping fields shipped; SetNetworkActive / getnettotals / received: addr / addnode/getaddednodeinfo / getnodeaddresses unmapped"
 
 [[test]]
 name = "rpc_orphans.py"

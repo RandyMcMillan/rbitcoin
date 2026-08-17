@@ -306,10 +306,22 @@ pub struct MempoolHub {
     dir: PathBuf,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
+    /// Wtxids re-admitted from a disconnected block. Core serves these
+    /// even if this peer has not been INV'd yet (`mempool_reorg`).
+    reorg_servable: Mutex<HashSet<Wtxid>>,
+    /// Core mempool entry_sequence. Regular accept starts at 1; reorg is 0.
+    relay_seq: Mutex<HashMap<Wtxid, u64>>,
+    next_relay_seq: AtomicU64,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
     fee_deltas: Mutex<HashMap<Txid, i64>>,
     /// Monotonic template generation (admit / remove / prioritise). GBT longpoll.
     template_updates: AtomicU64,
+    /// Core whitelist `noban` — INV immediately instead of waiting on mocktime.
+    immediate_relay: AtomicBool,
+    /// Last `setmocktime` (0 = wall). Used to age mempool txs for delayed INV.
+    mock_now: AtomicU64,
+    /// Mock/wall seconds when each live wtxid was accepted.
+    accept_at: Mutex<HashMap<Wtxid, u64>>,
 }
 
 impl MempoolHub {
@@ -373,6 +385,12 @@ impl MempoolHub {
             meter_list_live_meta: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
+            reorg_servable: Mutex::new(HashSet::new()),
+            relay_seq: Mutex::new(HashMap::new()),
+            next_relay_seq: AtomicU64::new(1),
+            immediate_relay: AtomicBool::new(false),
+            mock_now: AtomicU64::new(0),
+            accept_at: Mutex::new(HashMap::new()),
             fee_deltas: Mutex::new(HashMap::new()),
             template_updates: AtomicU64::new(0),
         };
@@ -573,6 +591,30 @@ impl MempoolHub {
 
     pub fn relay_enabled(&self) -> bool {
         self.relay_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_immediate_relay(&self, on: bool) {
+        self.immediate_relay.store(on, Ordering::Relaxed);
+    }
+
+    pub fn immediate_relay(&self) -> bool {
+        self.immediate_relay.load(Ordering::Relaxed)
+    }
+
+    pub fn note_mock_now(&self, ts: u64) {
+        self.mock_now.store(ts, Ordering::Relaxed);
+    }
+
+    pub fn tx_inv_due(&self, wtxid: &Wtxid) -> bool {
+        let now = self.mock_now.load(Ordering::Relaxed);
+        if now == 0 {
+            return false;
+        }
+        self.accept_at
+            .lock()
+            .unwrap()
+            .get(wtxid)
+            .is_some_and(|at| now.saturating_sub(*at) >= 30)
     }
 
     /// Drop every live mempool entry whose create is confirmed-strong on tip.
@@ -784,6 +826,11 @@ impl MempoolHub {
                     .unwrap_or_default();
                 self.publish_announce(&r, shs);
                 self.note_template_update();
+                let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
+                let w = tx.compute_wtxid();
+                self.relay_seq.lock().unwrap().insert(w, seq);
+                let at = self.mock_now.load(Ordering::Relaxed);
+                self.accept_at.lock().unwrap().insert(w, at);
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -1046,10 +1093,41 @@ impl MempoolHub {
         };
         let tip = self.chain_tip_ctx();
         let mut g = self.inner.write().unwrap();
-        g.reorg_disconnect_reaccept(txs, &utxo, tip)
-            .into_iter()
-            .filter(|r| r.is_ok())
-            .count()
+        let results = g.reorg_disconnect_reaccept(txs, &utxo, tip);
+        drop(g);
+        let mut n = 0;
+        {
+            let mut s = self.reorg_servable.lock().unwrap();
+            for (tx, r) in txs.iter().filter(|t| !t.is_coinbase()).zip(results) {
+                if r.is_ok() {
+                    let w = tx.compute_wtxid();
+                    s.insert(w);
+                    self.relay_seq.lock().unwrap().insert(w, 0);
+                    let at = self.mock_now.load(Ordering::Relaxed);
+                    self.accept_at.lock().unwrap().insert(w, at);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// True if this wtxid entered the mempool from a disconnected block.
+    pub fn is_reorg_servable(&self, wtxid: &Wtxid) -> bool {
+        self.reorg_servable.lock().unwrap().contains(wtxid)
+    }
+
+    pub fn current_relay_seq(&self) -> u64 {
+        self.next_relay_seq.load(Ordering::Relaxed)
+    }
+
+    /// Core `info_for_relay`: entry_sequence < peer's last INV sequence.
+    pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
+        self.relay_seq
+            .lock()
+            .unwrap()
+            .get(wtxid)
+            .is_some_and(|s| *s < last_inv_seq)
     }
 
     /// Drop live txs that are non-final / immature at the new tip (invalidate
@@ -1502,6 +1580,58 @@ mod tests {
         idx.remove(&t); // miss
         assert_eq!(idx.txs_for(&sh).count(), 0);
         assert!(idx.txs_for(&[3u8; 32]).next().is_none());
+    }
+
+    #[test]
+    fn reorg_reaccept_marks_wtxid_servable() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(!hub.is_reorg_servable(&tx.compute_wtxid()));
+        assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
+        assert!(hub.is_reorg_servable(&tx.compute_wtxid()));
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// While relay is off, per-block remove is deferred; enabling relay runs purge.

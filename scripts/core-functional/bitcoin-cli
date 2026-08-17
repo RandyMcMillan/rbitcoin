@@ -138,6 +138,12 @@ def main(argv: list[str]) -> int:
         if not raw:
             print(f"error: {e}", file=sys.stderr)
             return 1
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            text = raw if raw.endswith("\n") else raw + "\n"
+            print(f"error: Server response: {text}", end="", file=sys.stderr)
+            return 1
     except OSError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

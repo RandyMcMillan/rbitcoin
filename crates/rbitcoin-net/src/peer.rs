@@ -346,6 +346,7 @@ pub async fn peer_session_with(
                             }
                             None => {}
                         }
+                        queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
                         match s.pending_sendcmpct.swap(0, Ordering::Relaxed) {
                             1 => {
                                 let _ = queue_out(
@@ -455,16 +456,21 @@ pub async fn peer_session_with(
                                     continue;
                                 }
                                 if let Some(mp) = hub.mempool() {
-                                    if mp.relay_enabled() && mp.contains(&txid) {
-                                        let inv = if peer_wtxid_relay {
-                                            if let Some(tx) = mp.get_tx(&txid) {
-                                                Inventory::WTx(tx.compute_wtxid())
-                                            } else {
-                                                Inventory::WitnessTransaction(txid)
-                                            }
+                                    if mp.relay_enabled()
+                                        && mp.immediate_relay()
+                                        && mp.contains(&txid)
+                                    {
+                                        let inv = if let Some(tx) = mp.get_tx(&txid) {
+                                            Inventory::WTx(tx.compute_wtxid())
                                         } else {
                                             Inventory::WitnessTransaction(txid)
                                         };
+                                        if let Some(s) = session.as_ref() {
+                                            if let Inventory::WTx(w) = inv {
+                                                s.note_announced_wtx(w);
+                                            }
+                                            s.note_tx_inv_seq(mp.current_relay_seq());
+                                        }
                                         queue_out(&out_tx, NetworkMessage::Inv(vec![inv]))?;
                                     }
                                 }
@@ -658,6 +664,42 @@ fn try_cmpct_missing(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> O
     }
 }
 
+fn queue_due_tx_invs(
+    hub: &ChainHub,
+    session: &crate::peers::LivePeer,
+    from_this_peer: &HashMap<bitcoin::Txid, ()>,
+    out_tx: &mpsc::UnboundedSender<NetworkMessage>,
+) {
+    let Some(mp) = hub.mempool() else {
+        return;
+    };
+    if !mp.relay_enabled() {
+        return;
+    }
+    let now = session.clock_now();
+    let clock_due = session.take_tx_inv_due(now);
+    let live = mp.list_live();
+    let age_due = live
+        .iter()
+        .any(|(_, _, _, tx)| mp.tx_inv_due(&tx.compute_wtxid()));
+    if !clock_due && !age_due {
+        return;
+    }
+    let mut n = 0u32;
+    for (txid, _, _, tx) in live {
+        if from_this_peer.contains_key(&txid) {
+            continue;
+        }
+        let w = tx.compute_wtxid();
+        session.note_announced_wtx(w);
+        let _ = queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
+        n += 1;
+    }
+    if n > 0 {
+        session.note_tx_inv_seq(mp.current_relay_seq());
+    }
+}
+
 /// Finish a pending compact block with a `blocktxn` payload.
 fn apply_cmpct_blocktxn(
     hub: &ChainHub,
@@ -697,6 +739,9 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Ping(n) => {
+            if let Some(s) = session {
+                queue_due_tx_invs(hub, s, from_this_peer, out_tx);
+            }
             queue_out(out_tx, NetworkMessage::Pong(*n))?;
         }
         NetworkMessage::Pong(_) => {}
@@ -776,16 +821,51 @@ async fn handle_peer_frame(
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx(txid) {
-                                mp.mark_broadcast(txid);
-                                queue_out(out_tx, NetworkMessage::Tx(tx))?;
+                                let w = tx.compute_wtxid();
+                                let announced = session.is_some_and(|s| s.has_announced_wtx(&w));
+                                let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
+                                if announced
+                                    || mp.is_reorg_servable(&w)
+                                    || mp.is_relay_servable(&w, last_inv)
+                                {
+                                    mp.mark_broadcast(txid);
+                                    if let Some(s) = session {
+                                        s.note_announced_wtx(w);
+                                    }
+                                    queue_out(out_tx, NetworkMessage::Tx(tx))?;
+                                } else {
+                                    queue_out(
+                                        out_tx,
+                                        NetworkMessage::NotFound(vec![item.clone()]),
+                                    )?;
+                                }
+                            } else {
+                                queue_out(out_tx, NetworkMessage::NotFound(vec![item.clone()]))?;
                             }
                         }
                     }
                     Inventory::WTx(wtxid) => {
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
-                                mp.mark_broadcast(&tx.compute_txid());
-                                queue_out(out_tx, NetworkMessage::Tx(tx))?;
+                                let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
+                                let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
+                                if announced
+                                    || mp.is_reorg_servable(wtxid)
+                                    || mp.is_relay_servable(wtxid, last_inv)
+                                {
+                                    mp.mark_broadcast(&tx.compute_txid());
+                                    if let Some(s) = session {
+                                        s.note_announced_wtx(*wtxid);
+                                    }
+                                    queue_out(out_tx, NetworkMessage::Tx(tx))?;
+                                } else {
+                                    queue_out(
+                                        out_tx,
+                                        NetworkMessage::NotFound(vec![item.clone()]),
+                                    )?;
+                                }
+                            } else {
+                                queue_out(out_tx, NetworkMessage::NotFound(vec![item.clone()]))?;
                             }
                         }
                     }
@@ -2745,7 +2825,7 @@ mod tests {
                 other => panic!("expected GetData for unknown txs, got {other:?}"),
             }
 
-            // GetData for missing tx → silent (no response).
+            // GetData for missing tx → notfound (Core ProcessGetData).
             handle_peer_frame(
                 frame_for(NetworkMessage::GetData(vec![
                     Inventory::WitnessTransaction(unknown_txid),
@@ -2767,7 +2847,18 @@ mod tests {
             )
             .await
             .unwrap();
-            // No tx in mempool → no outbound.
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v.len(), 1);
+                }
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v.len(), 1);
+                }
+                other => panic!("expected second NotFound, got {other:?}"),
+            }
             assert!(out_rx.try_recv().is_err());
 
             // Accept path with invalid prevout — still exercises Tx arm (inserts from_peer).
@@ -2857,6 +2948,214 @@ mod tests {
             .unwrap();
             assert!(!from_peer.contains_key(&pkg_txid));
             assert_eq!(hub.mempool().unwrap().live_count(), 0);
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// GetData serves a mempool tx only after we INV'd it, or if it re-entered
+    /// from a disconnected block (`mempool_reorg.py` test_reorg_relay).
+    #[test]
+    fn getdata_tx_notfound_unless_announced_or_reorg() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("gd-privacy");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb1 = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let cb2 = hub
+                .query
+                .reconstruct_block_at_height(Height(2))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let recent = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb1, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let disconnected = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb2, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            hub.mempool()
+                .unwrap()
+                .accept_tx(&recent)
+                .expect("accept recent");
+            assert_eq!(
+                hub.mempool()
+                    .unwrap()
+                    .reorg_reaccept(std::slice::from_ref(&disconnected)),
+                1
+            );
+
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let sess = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    recent.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(sess.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(recent.compute_wtxid())]);
+                }
+                other => panic!("unannounced recent must notfound, got {other:?}"),
+            }
+
+            sess.note_announced_wtx(recent.compute_wtxid());
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    recent.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(sess.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::Tx(tx) => assert_eq!(tx.compute_wtxid(), recent.compute_wtxid()),
+                other => panic!("announced recent must serve tx, got {other:?}"),
+            }
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    disconnected.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(sess.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::Tx(tx) => {
+                    assert_eq!(tx.compute_wtxid(), disconnected.compute_wtxid())
+                }
+                other => panic!("reorg-servable must serve without INV, got {other:?}"),
+            }
 
             let _ = std::fs::remove_dir_all(dir);
         });

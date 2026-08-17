@@ -36,6 +36,7 @@ where
     let mut rpc_listen: Option<SocketAddr> = None;
     let mut rpc_user: Option<String> = None;
     let mut rpc_password: Option<String> = None;
+    let mut rpc_work_queue: Option<usize> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
     let mut seeds_set = false;
@@ -304,6 +305,31 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                     return ExitCode::from(2);
                 }
                 rpc_password = Some(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
+            other if other.starts_with("--rpcworkqueue=") => {
+                match other["--rpcworkqueue=".len()..].parse::<usize>() {
+                    Ok(n) if n > 0 => rpc_work_queue = Some(n),
+                    _ => {
+                        eprintln!("error: bad --rpcworkqueue");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--rpcworkqueue" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --rpcworkqueue requires a depth");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<usize>() {
+                    Ok(n) if n > 0 => rpc_work_queue = Some(n),
+                    _ => {
+                        eprintln!("error: bad --rpcworkqueue");
+                        return ExitCode::from(2);
+                    }
+                }
                 i += 1;
             }
             "--mempool-size-mb" | "--maxmempool" => {
@@ -828,6 +854,9 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if let Some(p) = rpc_password {
         config.rpc_password = Some(p);
+    }
+    if let Some(n) = rpc_work_queue {
+        config.rpc_work_queue = Some(n);
     }
     if !connect.is_empty() {
         config.connect = connect;

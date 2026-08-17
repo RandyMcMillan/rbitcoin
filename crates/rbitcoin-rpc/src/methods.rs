@@ -354,6 +354,10 @@ fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Result<V
             params.reject_unknown(&[])?;
             Ok(json!(ctx.connections.load(Ordering::Relaxed)))
         }
+        "getnettotals" => {
+            params.reject_unknown(&[])?;
+            Ok(getnettotals(ctx))
+        }
         "getpeerinfo" => {
             params.reject_unknown(&[])?;
             Ok(getpeerinfo(ctx))
@@ -417,10 +421,7 @@ fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Result<V
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
         )),
-        _ => Err(rpc_error(
-            ERR_METHOD_NOT_FOUND,
-            format!("Method not found: {method}"),
-        )),
+        _ => Err(rpc_error(ERR_METHOD_NOT_FOUND, "Method not found")),
     }
 }
 
@@ -505,6 +506,7 @@ const METHOD_LIST: &[&str] = &[
     "getdifficulty",
     "getnetworkinfo",
     "getconnectioncount",
+    "getnettotals",
     "getpeerinfo",
     "ping",
     "addnode",
@@ -678,7 +680,7 @@ fn getblockhash(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .query
         .header_at_height(Height(height))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_MISC, "Block height out of range"))?;
+        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMETER, "Block height out of range"))?;
     Ok(json!(hash_hex_display(&rec.hash)))
 }
 
@@ -936,6 +938,31 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
 fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     tip.saturating_sub(height.0).saturating_add(1)
+}
+
+fn getnettotals(ctx: &RpcContext) -> Value {
+    let (recv, sent) = ctx
+        .peers
+        .as_ref()
+        .map(|h| h.byte_totals())
+        .unwrap_or((0, 0));
+    let timemillis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    json!({
+        "totalbytesrecv": recv,
+        "totalbytessent": sent,
+        "timemillis": timemillis,
+        "uploadtarget": {
+            "timeframe": 86400,
+            "target": 0,
+            "target_reached": false,
+            "serve_historical_blocks": true,
+            "bytes_left_in_cycle": 0,
+            "time_left_in_cycle": 0,
+        },
+    })
 }
 
 fn getpeerinfo(ctx: &RpcContext) -> Value {
@@ -2102,6 +2129,9 @@ fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     if let Some(peers) = ctx.peers.as_ref() {
         peers.set_mock_now(ts as u64);
     }
+    if let Some(mp) = ctx.mempool.as_ref() {
+        mp.note_mock_now(ts as u64);
+    }
     Ok(Value::Null)
 }
 
@@ -3031,7 +3061,7 @@ pub fn handle_request(ctx: &RpcContext, body: &Value) -> Value {
         None => {
             return json!({
                 "result": null,
-                "error": rpc_error(ERR_INVALID_REQUEST, "missing method"),
+                "error": rpc_error(ERR_INVALID_REQUEST, "Missing method"),
                 "id": id,
             });
         }
@@ -5219,6 +5249,9 @@ mod tests {
         assert_eq!(net["connections_in"], 0);
         assert_eq!(net["connections_out"], 1);
         assert_eq!(net["connections"], 1);
+        let totals = dispatch(&ctx, "getnettotals", vec![]).unwrap();
+        assert!(totals["totalbytesrecv"].as_u64().unwrap() >= 29);
+        assert_eq!(totals["totalbytessent"].as_u64().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

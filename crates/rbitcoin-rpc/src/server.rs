@@ -1,7 +1,7 @@
 //! HTTP JSON-RPC server (axum) with Basic auth.
 
 use crate::auth::{parse_basic_auth, resolve_rpc_auth, RpcAuth};
-use crate::methods::{handle_request, RpcContext, RpcRegtest};
+use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -32,6 +32,8 @@ pub struct RpcConfig {
     pub cookie_path: Option<PathBuf>,
     /// `getnetworkinfo.subversion`. Empty → `/rbitcoin:VERSION/`.
     pub subversion: Option<String>,
+    /// Core `-rpcworkqueue`. `None` = unlimited (tests / default).
+    pub work_queue: Option<usize>,
 }
 
 /// Live RPC server handle.
@@ -58,6 +60,7 @@ impl RpcHandle {
 struct AppState {
     ctx: Arc<RpcContext>,
     auth: RpcAuth,
+    work_queue: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Start Core-class JSON-RPC on `config.listen` (plain HTTP; TLS via reverse proxy).
@@ -109,9 +112,14 @@ pub async fn run_rpc(
         .local_addr()
         .map_err(|e| format!("rpc local_addr: {e}"))?;
 
+    let work_queue = config
+        .work_queue
+        .filter(|n| *n > 0)
+        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
     let state = AppState {
         ctx,
         auth: auth.clone(),
+        work_queue,
     };
     let app = Router::new().route("/", post(rpc_post)).with_state(state);
 
@@ -158,51 +166,251 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         )
             .into_response();
     }
+    let _permit = if let Some(sem) = state.work_queue.as_ref() {
+        match sem.try_acquire() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Work queue depth exceeded\n",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => {
-            let err = serde_json::json!({
-                "result": null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") },
-                "id": null,
-            });
-            return (StatusCode::OK, axum::Json(err)).into_response();
+        Err(_) => {
+            return parse_error_response();
         }
     };
     let ctx = Arc::clone(&state.ctx);
-    let joined = tokio::task::spawn_blocking(move || {
-        if let Some(arr) = parsed.as_array() {
-            serde_json::Value::Array(arr.iter().map(|req| rpc_one(&ctx, req)).collect())
-        } else {
-            rpc_one(&ctx, &parsed)
-        }
-    })
-    .await;
+    let joined = tokio::task::spawn_blocking(move || exec_http_rpc(&ctx, parsed)).await;
     match joined {
-        Ok(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
+        Ok(HttpRpcOut::Json(status, body)) => (status, axum::Json(body)).into_response(),
+        Ok(HttpRpcOut::Empty(status)) => status.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("rpc join: {e}")).into_response(),
     }
 }
 
-fn rpc_one(ctx: &RpcContext, req: &serde_json::Value) -> serde_json::Value {
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(serde_json::json!([]));
-    let params_s = serde_json::to_string(&params).unwrap_or_else(|_| "[]".into());
-    // Core `ThreadRPCServer method=` — GBT longpoll assert_debug_log needs this
-    // *before* the wait, not after handle_request returns.
+fn parse_error_response() -> Response {
+    let err = serde_json::json!({
+        "id": null,
+        "result": null,
+        "error": { "code": -32700, "message": "Parse error" },
+    });
+    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(err)).into_response()
+}
+
+enum HttpRpcOut {
+    Json(StatusCode, serde_json::Value),
+    Empty(StatusCode),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonRpcVer {
+    V1,
+    V2,
+}
+
+fn parse_jsonrpc_ver(req: &serde_json::Value) -> Result<JsonRpcVer, (i64, &'static str)> {
+    match req.get("jsonrpc") {
+        None => Ok(JsonRpcVer::V1),
+        Some(serde_json::Value::String(s)) if s == "1.0" || s == "1.1" => Ok(JsonRpcVer::V1),
+        Some(serde_json::Value::String(s)) if s == "2.0" => Ok(JsonRpcVer::V2),
+        Some(serde_json::Value::String(_)) => Err((-32600, "JSON-RPC version not supported")),
+        Some(_) => Err((-32600, "jsonrpc field must be a string")),
+    }
+}
+
+fn reply_v1(
+    id: Option<serde_json::Value>,
+    result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    if let Some(id) = id {
+        o.insert("id".into(), id);
+    }
+    o.insert("result".into(), result.unwrap_or(serde_json::Value::Null));
+    o.insert("error".into(), error.unwrap_or(serde_json::Value::Null));
+    serde_json::Value::Object(o)
+}
+
+fn reply_v2(
+    id: serde_json::Value,
+    result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert("jsonrpc".into(), serde_json::json!("2.0"));
+    o.insert("id".into(), id);
+    if let Some(e) = error {
+        o.insert("error".into(), e);
+    } else {
+        o.insert("result".into(), result.unwrap_or(serde_json::Value::Null));
+    }
+    serde_json::Value::Object(o)
+}
+
+fn v1_http_status(error: &serde_json::Value) -> StatusCode {
+    match error.get("code").and_then(|c| c.as_i64()) {
+        Some(-32600) => StatusCode::BAD_REQUEST,
+        Some(-32601) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn exec_http_rpc(ctx: &RpcContext, parsed: serde_json::Value) -> HttpRpcOut {
+    if let Some(arr) = parsed.as_array() {
+        let mut out = Vec::new();
+        for req in arr {
+            match exec_one(ctx, req) {
+                OneOut::Reply(body) => out.push(body),
+                OneOut::Notification => {}
+                OneOut::BadVersion { error } => {
+                    out.push(serde_json::json!({
+                        "id": req.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "result": null,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+        if out.is_empty() && !arr.is_empty() {
+            return HttpRpcOut::Empty(StatusCode::NO_CONTENT);
+        }
+        return HttpRpcOut::Json(StatusCode::OK, serde_json::Value::Array(out));
+    }
+    if parsed.is_object() {
+        return match exec_one(ctx, &parsed) {
+            OneOut::Reply(body) => {
+                let ver = parse_jsonrpc_ver(&parsed).unwrap_or(JsonRpcVer::V1);
+                let status = if ver == JsonRpcVer::V2 {
+                    StatusCode::OK
+                } else if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+                    v1_http_status(err)
+                } else {
+                    StatusCode::OK
+                };
+                HttpRpcOut::Json(status, body)
+            }
+            OneOut::Notification => HttpRpcOut::Empty(StatusCode::NO_CONTENT),
+            OneOut::BadVersion { error } => HttpRpcOut::Json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "result": null,
+                    "error": error,
+                }),
+            ),
+        };
+    }
+    HttpRpcOut::Json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({
+            "id": null,
+            "result": null,
+            "error": { "code": -32700, "message": "Parse error" },
+        }),
+    )
+}
+
+enum OneOut {
+    Reply(serde_json::Value),
+    Notification,
+    BadVersion { error: serde_json::Value },
+}
+
+fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
+    let ver = match parse_jsonrpc_ver(req) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return OneOut::BadVersion {
+                error: serde_json::json!({ "code": code, "message": msg }),
+            };
+        }
+    };
+    let has_id = req.as_object().is_some_and(|m| m.contains_key("id"));
+    let notification = ver == JsonRpcVer::V2 && !has_id;
+    let id = if has_id {
+        Some(req.get("id").cloned().unwrap_or(serde_json::Value::Null))
+    } else {
+        None
+    };
+    let method = match req.get("method").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => {
+            let err = serde_json::json!({ "code": -32600, "message": "Missing method" });
+            if notification {
+                return OneOut::Notification;
+            }
+            return OneOut::Reply(match ver {
+                JsonRpcVer::V2 => reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err)),
+                JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
+            });
+        }
+    };
+    let params = match req.get("params") {
+        None | Some(serde_json::Value::Null) => crate::methods::RpcParams::empty(),
+        Some(serde_json::Value::Array(a)) => crate::methods::RpcParams::positional(a.clone()),
+        Some(serde_json::Value::Object(m)) => crate::methods::RpcParams::named(m.clone()),
+        Some(_) => {
+            let err = serde_json::json!({
+                "code": -32602,
+                "message": "params must be array or object",
+            });
+            if notification {
+                return OneOut::Notification;
+            }
+            return OneOut::Reply(match ver {
+                JsonRpcVer::V2 => reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err)),
+                JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
+            });
+        }
+    };
     if method == "getblocktemplate" {
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
     }
+    let params_s = req
+        .get("params")
+        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
     let t0 = Instant::now();
-    let resp = handle_request(ctx, req);
+    let dispatched = handle_request_dispatch(ctx, method, params);
     let wall_ms = t0.elapsed().as_millis() as u64;
-    let err = resp
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
-    rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err.as_deref());
-    resp
+    let err_s = match &dispatched {
+        Err(e) => e
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string()),
+        Ok(_) => None,
+    };
+    rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err_s.as_deref());
+    if notification {
+        return OneOut::Notification;
+    }
+    let id_v1 = id.clone();
+    let id_v2 = id.clone().unwrap_or(serde_json::Value::Null);
+    OneOut::Reply(match dispatched {
+        Ok(result) => match ver {
+            JsonRpcVer::V2 => reply_v2(id_v2.clone(), Some(result), None),
+            JsonRpcVer::V1 => reply_v1(id_v1.clone(), Some(result), None),
+        },
+        Err(error) => match ver {
+            JsonRpcVer::V2 => reply_v2(id_v2, None, Some(error)),
+            JsonRpcVer::V1 => reply_v1(id_v1, None, Some(error)),
+        },
+    })
+}
+
+fn handle_request_dispatch(
+    ctx: &RpcContext,
+    method: &str,
+    params: crate::methods::RpcParams,
+) -> Result<serde_json::Value, serde_json::Value> {
+    crate::methods::dispatch(ctx, method, params)
 }
 
 fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
@@ -289,6 +497,7 @@ mod tests {
             rpc_password: Some("testpass".into()),
             cookie_path: None,
             subversion: None,
+            work_queue: None,
         };
         let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -353,6 +562,155 @@ mod tests {
             "{text}"
         );
 
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn post_raw(
+        addr: SocketAddr,
+        auth: &RpcAuth,
+        body: &[u8],
+    ) -> (u16, Option<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let auth_h = basic_auth_header(auth);
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        let status: u16 = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+        let json_body = text[body_start..].trim();
+        let parsed = if json_body.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(json_body).unwrap_or(serde_json::json!(json_body)))
+        };
+        (status, parsed)
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_v2_batch_and_http_codes() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-v2-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Arc::new(Query::open_or_create(dir.join("store")).unwrap());
+        let mp =
+            MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
+        mp.set_relay_enabled(true);
+        let cfg = RpcConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            datadir: dir.clone(),
+            network: Network::Regtest,
+            rpc_user: Some("testuser".into()),
+            rpc_password: Some("testpass".into()),
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+        };
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        let batch = serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"getblockcount"},
+            {"jsonrpc":"2.0","id":2,"method":"invalidmethod"},
+            {"jsonrpc":"2.0","id":4,"pizza":"sausage"}
+        ]);
+        let (st, body) = post_raw(
+            handle.local_addr,
+            &handle.auth,
+            batch.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        let arr = body.unwrap();
+        assert_eq!(arr[0]["jsonrpc"], "2.0");
+        assert_eq!(arr[0]["result"], 0);
+        assert!(arr[0].get("error").is_none());
+        assert_eq!(arr[1]["error"]["code"], -32601);
+        assert_eq!(arr[1]["error"]["message"], "Method not found");
+        assert_eq!(arr[2]["error"]["message"], "Missing method");
+
+        let (st, body) = post_raw(
+            handle.local_addr,
+            &handle.auth,
+            br#"{"jsonrpc":"2.0","method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 204, "{body:?}");
+        assert!(body.is_none());
+
+        let (st, body) = post_raw(handle.local_addr, &handle.auth, b"").await;
+        assert_eq!(st, 500);
+        assert_eq!(body.unwrap()["error"]["message"], "Parse error");
+
+        let (st, body) = post_raw(
+            handle.local_addr,
+            &handle.auth,
+            br#"{"jsonrpc":2,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 400);
+        assert_eq!(
+            body.unwrap()["error"]["message"],
+            "jsonrpc field must be a string"
+        );
+
+        let (st, _) = post_raw(
+            handle.local_addr,
+            &handle.auth,
+            br#"{"jsonrpc":"1.1","id":1,"method":"invalidmethod"}"#,
+        )
+        .await;
+        assert_eq!(st, 404);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_work_queue_exceeded() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-rpc-wq-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Arc::new(Query::open_or_create(dir.join("store")).unwrap());
+        let mp =
+            MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
+        let cfg = RpcConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            datadir: dir.clone(),
+            network: Network::Regtest,
+            rpc_user: Some("testuser".into()),
+            rpc_password: Some("testpass".into()),
+            cookie_path: None,
+            subversion: None,
+            work_queue: Some(1),
+        };
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let (st, body) = post_raw(
+            handle.local_addr,
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        assert_eq!(body.unwrap()["result"], 0);
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

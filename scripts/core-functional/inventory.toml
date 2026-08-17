@@ -376,9 +376,7 @@ reason = "no-core-rest"
 
 [[test]]
 name = "interface_rpc.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "official: getrpcinfo.active_commands + logpath shipped; JSON-RPC 2.0 batch missing jsonrpc field / error text (interface_rpc.py:151)"
+status = "run"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -491,7 +489,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "core-net-policy"
-analog = "official: unannounced getdata served tx (mempool_reorg.py:94 test_reorg_relay); immature eviction + ancestorcount after reorg are production"
+analog = "official: unannounced getdata notfound shipped; after setmocktime+300 get_invs is 0 not 3 (mempool_reorg.py:111 test_reorg_relay)"
 
 [[test]]
 name = "mempool_resurrect.py"

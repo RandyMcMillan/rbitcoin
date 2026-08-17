@@ -515,9 +515,7 @@ analog = "follow-up: TRUC/v3"
 
 [[test]]
 name = "mempool_unbroadcast.py"
-status = "skip"
-reason = "core-log"
-analog = "rust pin: Removed {txid} from unbroadcast before confirmation; mockscheduler rebroadcast + mempool.dat persist + 15m inv not locally proven"
+status = "run"
 
 [[test]]
 name = "mempool_updatefromblock.py"

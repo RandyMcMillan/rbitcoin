@@ -79,7 +79,7 @@ fn non_coinbase_spend(n: u8) -> Transaction {
 fn block_with(txs: Vec<Transaction>) -> Block {
     let mut block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0; 32]),
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
             time: 1_290_000_000,
@@ -725,7 +725,7 @@ fn assemble_full_mode_spend_and_bip68() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: tip,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time: tip_time + 600,
@@ -767,7 +767,7 @@ fn assemble_full_mode_spend_and_bip68() {
     let bits = CompactTarget::from_consensus(0x207f_ffff);
     let mut block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: tip,
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
             time: tip_time + 600,
@@ -964,7 +964,7 @@ fn n1_assemble_cold_why_reasons() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: tip,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time: tip_time + 600,
@@ -1185,7 +1185,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time,
@@ -1210,7 +1210,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
         txs.extend(extra);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time,

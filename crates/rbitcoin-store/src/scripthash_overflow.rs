@@ -1,16 +1,23 @@
-//! Schema-14 SH overflow: stack of mono OA segments sized to **one main shard**.
+//! Leftover schema-14 SH overflow helpers.
 //!
-//! After main seals, new keys land on the open overflow segment
-//! (`scripthash.ovf/NNNNNN`). When load ≥ ~0.80 or a new key cannot place
-//! (no rehash), the open segment is sealed with a real BF8R fuse and a new
-//! same-size empty segment is opened. Lookups: open → sealed (fuse-gated).
+//! Production incremental creates use ingest OA (`scripthash.ovf/ingest`) and
+//! seal to `SHSR` files. This module keeps wipe of legacy `scripthash.ovf.head`
+//! and isolated tests of the old mono OA stack. Open of leftover OA segs is
+//! refused by `ScriptHashTable`.
 
 use crate::error::StoreError;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+
+#[cfg(test)]
 use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
+#[cfg(test)]
 use crate::scripthash_head::{ScriptHashHead, ShardedScriptHashHead};
+#[cfg(test)]
 use crate::scripthash_layout::ShHeadValue;
+#[cfg(test)]
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 
 /// Directory under the store root for overflow segment files.
 pub const OVERFLOW_DIR: &str = "scripthash.ovf";
@@ -20,6 +27,7 @@ pub const LEGACY_OVERFLOW_HEAD: &str = "scripthash.ovf.head";
 pub const LEGACY_OVERFLOW_FUSE: &str = "scripthash.ovf.head.fuse8";
 
 /// Slot count for one overflow segment (= one main shard).
+#[cfg(test)]
 #[inline]
 pub fn ovf_segment_slots(main: &ShardedScriptHashHead) -> u64 {
     let per = main.slots_per_shard();
@@ -30,21 +38,25 @@ pub fn ovf_segment_slots(main: &ShardedScriptHashHead) -> u64 {
     per
 }
 
+#[cfg(test)]
 #[inline]
 pub fn ovf_dir(store_dir: &Path) -> PathBuf {
     store_dir.join(OVERFLOW_DIR)
 }
 
+#[cfg(test)]
 #[inline]
 pub fn ovf_seg_path(store_dir: &Path, id: u32) -> PathBuf {
     ovf_dir(store_dir).join(format!("{id:06}"))
 }
 
+#[cfg(test)]
 #[inline]
 pub fn ovf_fuse_path(store_dir: &Path, id: u32) -> PathBuf {
     ovf_dir(store_dir).join(format!("{id:06}.fuse8"))
 }
 
+#[cfg(test)]
 fn file_is_shsr(path: &Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
@@ -55,6 +67,7 @@ fn file_is_shsr(path: &Path) -> bool {
 }
 
 /// Fuse key from full Electrum scripthash (16 B head prefix + zero pad).
+#[cfg(test)]
 #[inline]
 pub fn sh_ovf_fuse_key(full: &[u8; 32]) -> u64 {
     let mut pad = [0u8; 32];
@@ -63,6 +76,7 @@ pub fn sh_ovf_fuse_key(full: &[u8; 32]) -> u64 {
 }
 
 /// One mono OA segment (open if `fuse` is None).
+#[cfg(test)]
 pub struct OvfSegment {
     pub id: u32,
     pub head: ScriptHashHead,
@@ -70,6 +84,7 @@ pub struct OvfSegment {
     pub fuse: Option<SealedFuse8>,
 }
 
+#[cfg(test)]
 impl OvfSegment {
     pub fn is_open(&self) -> bool {
         self.fuse.is_none()
@@ -81,11 +96,13 @@ impl OvfSegment {
 }
 
 /// Stack of mono overflow segments under `scripthash.ovf/`.
+#[cfg(test)]
 pub struct ShOverflowStack {
     store_dir: PathBuf,
     segs: Vec<OvfSegment>,
 }
 
+#[cfg(test)]
 impl ShOverflowStack {
     pub fn empty(store_dir: &Path) -> Self {
         Self {
@@ -96,10 +113,6 @@ impl ShOverflowStack {
 
     pub fn is_empty(&self) -> bool {
         self.segs.is_empty()
-    }
-
-    pub fn segs(&self) -> &[OvfSegment] {
-        &self.segs
     }
 
     /// Number of mono overflow segments (0 if none).
@@ -252,17 +265,6 @@ impl ShOverflowStack {
             }
         }
         Ok(None)
-    }
-
-    /// Visit every live head value on all segments (oldest → newest).
-    pub fn for_each_occupied(
-        &self,
-        mut f: impl FnMut([u8; 32], ShHeadValue) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        for seg in &self.segs {
-            seg.head.for_each_occupied(&mut f)?;
-        }
-        Ok(())
     }
 
     /// Insert known-home updates on `seg_id` (update-only if sealed).

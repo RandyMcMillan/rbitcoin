@@ -18,7 +18,9 @@ use crate::scripthash_layout::{
     head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
     SH_HEAD_VALUE_LEN,
 };
-use crate::sharded_hashhead::{initial_slots_per_shard, shard_count_for_role};
+#[cfg(test)]
+use crate::sharded_hashhead::initial_slots_per_shard;
+use crate::sharded_hashhead::shard_count_for_role;
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1159,6 +1161,7 @@ pub struct ShardedScriptHashHead {
 }
 
 impl ShardedScriptHashHead {
+    #[cfg(test)]
     pub fn create_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
         debug_assert_eq!(role, HeadRole::ScriptHash);
         Self::create_sharded(
@@ -1223,8 +1226,8 @@ impl ShardedScriptHashHead {
             if names.is_empty() {
                 return Err(StoreError::Corrupt("sharded scripthash head empty"));
             }
-            // Mainnet expects 64-way. Legacy counts are handled by
-            // [`crate::scripthash::ScriptHashTable::open`] (migrate from runs).
+            // Mainnet expects 64-way. Leftover live OA at `scripthash.head` is
+            // refused by [`crate::scripthash::ScriptHashTable::open`].
             let expected = shard_count_for_role(role);
             if expected > 1 && names.len() != expected {
                 return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
@@ -1257,41 +1260,17 @@ impl ShardedScriptHashHead {
         prefix_shard_of(full, self.shards.len())
     }
 
+    #[cfg(test)]
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         self.shards[self.shard_of(key)].get(key)
     }
 
-    /// Batch head probe (shard-grouped + per-shard slot-ordered). Tip SH seed.
-    pub fn get_many(&self, keys: &[[u8; 32]]) -> Result<Vec<Option<ShHeadValue>>, StoreError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let n_shards = self.shards.len();
-        if n_shards == 1 {
-            return self.shards[0].get_many(keys);
-        }
-        let mut out = vec![None; keys.len()];
-        let mut buckets: Vec<Vec<(usize, [u8; 32])>> = (0..n_shards).map(|_| Vec::new()).collect();
-        for (i, k) in keys.iter().enumerate() {
-            buckets[self.shard_of(k)].push((i, *k));
-        }
-        for (si, bucket) in buckets.into_iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
-            }
-            let fulls: Vec<[u8; 32]> = bucket.iter().map(|(_, k)| *k).collect();
-            let vals = self.shards[si].get_many(&fulls)?;
-            for ((orig_i, _), v) in bucket.into_iter().zip(vals.into_iter()) {
-                out[orig_i] = v;
-            }
-        }
-        Ok(out)
-    }
-
+    #[cfg(test)]
     pub fn insert(&self, key: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
         self.shards[self.shard_of(key)].insert(key, value)
     }
 
+    #[cfg(test)]
     pub fn clear_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
         self.shards[self.shard_of(key)].clear_key(key)
     }
@@ -1301,11 +1280,13 @@ impl ShardedScriptHashHead {
     }
 
     /// Slot count of one main shard (overflow segment geometry = this size).
+    #[cfg(test)]
     pub fn slots_per_shard(&self) -> u64 {
         self.shards.first().map(|s| s.slots()).unwrap_or(64)
     }
 
     /// Total OA slots across all main shards.
+    #[cfg(test)]
     pub fn total_slots(&self) -> u64 {
         self.shards.iter().map(|s| s.slots()).sum()
     }
@@ -1365,103 +1346,6 @@ impl ShardedScriptHashHead {
     /// at once. Small runs skip the per-shard flush and rely on later table flush.
     /// Max occupied/slots before SH main/overflow should seal (plan: 0.80).
     pub const SH_SEAL_LOAD: f64 = 0.80;
-
-    /// Weighted load across shards (known occupancy only).
-    pub fn load_ratio(&self) -> Option<f64> {
-        let mut occ = 0u64;
-        let mut slots = 0u64;
-        for s in &self.shards {
-            // Any shard with unknown occupancy makes the aggregate unknown.
-            let _ = s.load_ratio()?;
-            let o = s.occupied();
-            let sl = s.slots();
-            if sl == 0 {
-                return None;
-            }
-            occ = occ.saturating_add(o);
-            slots = slots.saturating_add(sl);
-        }
-        if slots == 0 {
-            return None;
-        }
-        Some(occ as f64 / slots as f64)
-    }
-
-    /// Insert without rehash. Returns **remainder** full keys that need overflow.
-    ///
-    /// `allow_new`: see [`ScriptHashHead::insert_many_no_rehash`]. Sealed main
-    /// try-upsert must pass **false** so free slots are never used for new keys.
-    pub fn insert_many_sharded_no_rehash(
-        &self,
-        entries: &[([u8; 32], ShHeadValue)],
-        flush_each_shard: bool,
-        allow_new: bool,
-    ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-        let n = self.shards.len();
-        let mut remainder: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        if n == 1 {
-            let mapped: Vec<_> = entries
-                .iter()
-                .map(|(k, v)| (head_key_from_full(k), v.clone()))
-                .collect();
-            let rem = self.shards[0].insert_many_no_rehash(&mapped, allow_new)?;
-            if !rem.is_empty() {
-                for (hk, hv) in rem {
-                    if let Some((full, _)) =
-                        entries.iter().find(|(f, _)| head_key_from_full(f) == hk)
-                    {
-                        remainder.push((*full, hv));
-                    } else {
-                        // Reconstruct padded full from head key (seed/get uses same).
-                        let mut full = [0u8; 32];
-                        full[..SH_HEAD_KEY_LEN].copy_from_slice(&hk);
-                        remainder.push((full, hv));
-                    }
-                }
-            }
-            return Ok(remainder);
-        }
-        let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> = (0..n).map(|_| Vec::new()).collect();
-        for (k, v) in entries {
-            buckets[self.shard_of(k)].push((*k, v.clone()));
-        }
-        for (si, bucket) in buckets.into_iter().enumerate() {
-            if bucket.is_empty() {
-                continue;
-            }
-            let mapped: Vec<_> = bucket
-                .iter()
-                .map(|(k, v)| (head_key_from_full(k), v.clone()))
-                .collect();
-            let rem = self.shards[si].insert_many_no_rehash(&mapped, allow_new)?;
-            for (hk, hv) in rem {
-                if let Some((full, _)) = bucket.iter().find(|(f, _)| head_key_from_full(f) == hk) {
-                    remainder.push((*full, hv));
-                } else {
-                    let mut full = [0u8; 32];
-                    full[..SH_HEAD_KEY_LEN].copy_from_slice(&hk);
-                    remainder.push((full, hv));
-                }
-            }
-            if flush_each_shard {
-                self.shards[si].flush()?;
-            }
-        }
-        Ok(remainder)
-    }
-
-    pub fn for_each_occupied(
-        &self,
-        mut f: impl FnMut([u8; 32], ShHeadValue) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        for shard in &self.shards {
-            shard.for_each_occupied(&mut f)?;
-        }
-        Ok(())
-    }
 
     pub fn flush(&self) -> Result<(), StoreError> {
         for s in &self.shards {

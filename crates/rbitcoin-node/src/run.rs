@@ -38,6 +38,43 @@ impl std::fmt::Debug for NodeHandle {
     }
 }
 
+/// Parse Core BTC/kvB (`0.00000001`) to sat/kvB.
+fn parse_btc_to_sat(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, rest) = s.strip_prefix('-').map(|r| (true, r)).unwrap_or((false, s));
+    if neg {
+        return Some(0);
+    }
+    let (whole_s, frac_s) = match rest.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (rest, ""),
+    };
+    if whole_s.is_empty() && frac_s.is_empty() {
+        return None;
+    }
+    let whole: u64 = if whole_s.is_empty() {
+        0
+    } else {
+        whole_s.parse().ok()?
+    };
+    let mut frac = frac_s.to_string();
+    if frac.len() > 8 {
+        frac.truncate(8);
+    }
+    while frac.len() < 8 {
+        frac.push('0');
+    }
+    let frac_n: u64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().ok()?
+    };
+    Some(whole.saturating_mul(100_000_000).saturating_add(frac_n))
+}
+
 impl NodeHandle {
     pub fn network_name(&self) -> &'static str {
         self.config.network.as_str()
@@ -219,6 +256,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .await
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
     node.hub.set_minimum_chain_work(config.minimum_chain_work);
+    if let Some(t) = config.mock_time {
+        node.hub.clock.set_mock(t);
+    }
+    if let Some(v) = config.block_version {
+        node.hub.set_block_version(v);
+    }
+    if let Some(s) = config.block_min_tx_fee_btc.as_deref() {
+        match parse_btc_to_sat(s) {
+            Some(sat) => node.hub.set_block_min_tx_fee_sat_kvb(sat),
+            None => {
+                return Err(NodeError::Config(format!("bad --blockmintxfee {s}")));
+            }
+        }
+    }
 
     let mempool = MempoolHub::open_with_weight_persist(
         config.mempool_path(),
@@ -228,6 +279,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     )
     .map_err(|e| NodeError::Config(e))?;
     mempool.set_cluster_limits(config.limit_cluster_count, config.limit_cluster_size_kvb);
+    if let Some(s) = config.min_relay_fee_btc.as_deref() {
+        if let Some(sat) = parse_btc_to_sat(s) {
+            mempool.set_min_relay_sat_kvb(sat);
+        }
+    }
     node.hub
         .attach_mempool(mempool.clone())
         .map_err(|_| NodeError::Config("mempool already attached".into()))?;
@@ -1177,6 +1233,14 @@ mod tests {
         assert!(tip_follow_checks_stale(TipFollowWakeKind::TipSame));
         assert!(!tip_follow_checks_stale(TipFollowWakeKind::TipChanged));
         assert!(!tip_follow_checks_stale(TipFollowWakeKind::Stop));
+    }
+
+    #[test]
+    fn parse_blockmintxfee_btc_to_sat() {
+        assert_eq!(parse_btc_to_sat("0.00000001"), Some(1));
+        assert_eq!(parse_btc_to_sat("0"), Some(0));
+        assert_eq!(parse_btc_to_sat("0.025"), Some(2_500_000));
+        assert_eq!(parse_btc_to_sat("0.00000005"), Some(5));
     }
 
     /// Persistent stale interval must complete even when a faster perf tick

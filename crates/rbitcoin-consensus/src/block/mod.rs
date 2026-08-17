@@ -168,6 +168,23 @@ pub fn block_has_witness(block: &Block) -> bool {
         .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
 }
 
+/// BIP141 coinbase `OP_RETURN` script for GBT `default_witness_commitment` (nonce = 0).
+pub fn witness_commitment_script(non_cb_wtxids: impl IntoIterator<Item = [u8; 32]>) -> Vec<u8> {
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let reserved = [0u8; 32];
+    let mut leaves = vec![[0u8; 32]];
+    leaves.extend(non_cb_wtxids);
+    let witness_root = merkle_root_bytes(&leaves);
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&witness_root);
+    buf[32..].copy_from_slice(&reserved);
+    let hash = sha256d::Hash::hash(&buf);
+    let mut spk = Vec::with_capacity(38);
+    spk.extend_from_slice(&MAGIC);
+    spk.extend_from_slice(&hash.to_byte_array());
+    spk
+}
+
 /// BIP141: set coinbase reserved witness + `OP_RETURN` commitment (nonce = zeros).
 ///
 /// Updates `header.merkle_root`. Caller still grinds PoW. No-op when no witness.
@@ -201,7 +218,7 @@ pub fn apply_witness_commitment(block: &mut Block) {
 }
 
 /// Core-style legacy sigop count (CHECKSIG=1, CHECKMULTISIG=20 or accurate N).
-fn legacy_sigop_count(tx: &Transaction) -> u64 {
+pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
     let mut n = 0u64;
     for inp in &tx.input {
         n = n.saturating_add(script_sigop_count(inp.script_sig.as_bytes(), false));
@@ -339,6 +356,14 @@ fn witness_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
         }
     }
     n
+}
+
+/// GBT `sigops`: Core `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
+///
+/// Full `GetTransactionSigOpCost` also adds P2SH/witness when prevouts are
+/// known; template rows use this scaled legacy count (P2PK output = 4).
+pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
+    legacy_sigop_count(tx).saturating_mul(4)
 }
 
 /// Full Core-style sigop cost for one tx given prevouts (BIP16 + BIP141).

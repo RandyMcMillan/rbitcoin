@@ -63,6 +63,9 @@ where
     let mut limit_cluster_size_kvb: Option<u32> = None;
     let mut peer_timeout_secs: Option<u64> = None;
     let mut minimum_chain_work: Option<[u8; 32]> = None;
+    let mut mock_time: Option<i64> = None;
+    let mut block_version: Option<i32> = None;
+    let mut block_min_tx_fee_btc: Option<String> = None;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -585,6 +588,69 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
+            other if other.starts_with("--mocktime=") => {
+                match other["--mocktime=".len()..].parse::<i64>() {
+                    Ok(n) if n >= 0 => mock_time = Some(n),
+                    _ => {
+                        eprintln!("error: bad --mocktime");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--mocktime" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --mocktime requires a unix time");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<i64>() {
+                    Ok(n) if n >= 0 => mock_time = Some(n),
+                    _ => {
+                        eprintln!("error: bad --mocktime");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--blockversion=") => {
+                match other["--blockversion=".len()..].parse::<i32>() {
+                    Ok(n) => block_version = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --blockversion: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--blockversion" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --blockversion requires an integer");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<i32>() {
+                    Ok(n) => block_version = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --blockversion: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--blockmintxfee=") => {
+                block_min_tx_fee_btc = Some(other["--blockmintxfee=".len()..].to_string());
+                i += 1;
+            }
+            "--blockmintxfee" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --blockmintxfee requires a value");
+                    return ExitCode::from(2);
+                }
+                block_min_tx_fee_btc = Some(args[i].to_string_lossy().into_owned());
+                i += 1;
+            }
             other if other.starts_with("--minimumchainwork=") => {
                 match crate::config::parse_minimum_chain_work(&other["--minimumchainwork=".len()..])
                 {
@@ -819,6 +885,15 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if let Some(w) = minimum_chain_work {
         config.minimum_chain_work = Some(w);
+    }
+    if let Some(t) = mock_time {
+        config.mock_time = Some(t);
+    }
+    if let Some(v) = block_version {
+        config.block_version = Some(v);
+    }
+    if let Some(s) = block_min_tx_fee_btc {
+        config.block_min_tx_fee_btc = Some(s);
     }
 
     // Unstable env is an input when CLI/conf omitted inbound — never set_var.

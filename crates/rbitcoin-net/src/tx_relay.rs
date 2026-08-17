@@ -1172,6 +1172,11 @@ impl MempoolHub {
             .set_cluster_limits(count, size_kvb);
     }
 
+    /// Core `-minrelaytxfee` overlay (sat/kvB). `0` admits any non-negative fee.
+    pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
+        self.inner.write().unwrap().set_min_relay_sat_kvb(sat_kvb);
+    }
+
     /// In-mempool ancestors of `txid`, **excluding** itself (Core RPC).
     pub fn ancestor_txids(&self, txid: &Txid) -> Option<Vec<Txid>> {
         let g = self.inner.read().unwrap();

@@ -1,14 +1,38 @@
 //! sigop_cost_tests (peeled from block.rs).
 
 use super::{
-    is_p2sh_script, last_script_push, p2sh_sigop_count, script_sigop_count, tx_sigop_cost,
-    witness_sigop_count,
+    is_p2sh_script, last_script_push, p2sh_sigop_count, script_sigop_count, tx_gbt_sigops,
+    tx_sigop_cost, witness_sigop_count,
 };
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+#[test]
+fn gbt_sigops_scales_legacy_checksig() {
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
+        }],
+    };
+    assert_eq!(tx_gbt_sigops(&tx), 4);
+    let empty = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    assert_eq!(tx_gbt_sigops(&empty), 0);
+}
 
 #[test]
 fn last_push_pushdata_and_non_push_skip() {

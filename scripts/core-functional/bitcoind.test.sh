@@ -123,7 +123,8 @@ assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments
 OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
   -testactivationheight=csv@102 -permitbaremultisig=0 -maxconnections=8 \
-  -minimumchainwork=0x65 -limitancestorcount=5 \
+  -minimumchainwork=0x65 -limitancestorcount=5 -blockversion=1337 -mocktime=1296688602 \
+  -blockmintxfee=0.00000001 \
   2>/dev/null)" || OUTX=""
 if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
   && printf '%s' "$OUTX" | grep -q -- "--whitelist=noban@127.0.0.1" \
@@ -131,6 +132,9 @@ if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
   && printf '%s' "$OUTX" | grep -q -- "--permitbaremultisig=0" \
   && printf '%s' "$OUTX" | grep -q -- "--maxconnections=8" \
   && printf '%s' "$OUTX" | grep -q -- "--minimumchainwork=0x65" \
+  && printf '%s' "$OUTX" | grep -q -- "--blockversion=1337" \
+  && printf '%s' "$OUTX" | grep -q -- "--mocktime=1296688602" \
+  && printf '%s' "$OUTX" | grep -q -- "--blockmintxfee=0.00000001" \
   && ! printf '%s' "$OUTX" | grep -q -- "limitancestor" \
   && ! printf '%s' "$OUTX" | grep -q -- "txindex" \
   && ! printf '%s' "$OUTX" | grep -q -- "fastprune"; then

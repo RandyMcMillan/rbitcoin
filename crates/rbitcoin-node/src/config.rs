@@ -100,6 +100,12 @@ pub struct NodeConfig {
     pub peer_timeout_secs: Option<u64>,
     /// Core `-minimumchainwork` (32-byte BE work). `None` = no extra IBD floor.
     pub minimum_chain_work: Option<[u8; 32]>,
+    /// Core `-mocktime` at start (`None` = wall clock).
+    pub mock_time: Option<i64>,
+    /// Core `-blockversion` GBT override (`None` = default).
+    pub block_version: Option<i32>,
+    /// Core `-blockmintxfee` as BTC/kvB text (`None` = default 1 sat/kvB).
+    pub block_min_tx_fee_btc: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -142,6 +148,9 @@ impl Default for NodeConfig {
             limit_cluster_size_kvb: None,
             peer_timeout_secs: None,
             minimum_chain_work: None,
+            mock_time: None,
+            block_version: None,
+            block_min_tx_fee_btc: None,
         }
     }
 }

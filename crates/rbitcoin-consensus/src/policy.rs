@@ -44,11 +44,19 @@ pub fn get_virtual_size(weight: u64) -> u64 {
 ///
 /// Uses integer compare: `fee * 1000 >= vsize * MIN_RELAY_FEE_RATE_SAT_PER_KVB`.
 pub fn meets_min_relay_fee(fee_sat: u64, weight: u64) -> bool {
+    meets_min_relay_fee_at(fee_sat, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB)
+}
+
+/// Same as [`meets_min_relay_fee`] with an explicit sat/kvB floor (`0` = no floor).
+pub fn meets_min_relay_fee_at(fee_sat: u64, weight: u64, sat_kvb: u64) -> bool {
+    if sat_kvb == 0 {
+        return true;
+    }
     let vsize = get_virtual_size(weight);
     if vsize == 0 {
         return false;
     }
-    fee_sat.saturating_mul(1000) >= vsize.saturating_mul(MIN_RELAY_FEE_RATE_SAT_PER_KVB)
+    fee_sat.saturating_mul(1000) >= vsize.saturating_mul(sat_kvb)
 }
 
 /// Feerate in sat/kvB for diagnostics (floors).
@@ -101,6 +109,16 @@ pub fn check_libre_annex(tx: &Transaction) -> PolicyResult {
 ///
 /// Callers still enforce consensus, cluster limits, and DoS caps separately.
 pub fn check_libre_admission(tx: &Transaction, fee_sat: u64, weight: u64) -> PolicyResult {
+    check_libre_admission_at(tx, fee_sat, weight, MIN_RELAY_FEE_RATE_SAT_PER_KVB)
+}
+
+/// Libre admission with an explicit min-relay floor (Core `-minrelaytxfee`).
+pub fn check_libre_admission_at(
+    tx: &Transaction,
+    fee_sat: u64,
+    weight: u64,
+    min_relay_sat_kvb: u64,
+) -> PolicyResult {
     if tx.is_coinbase() {
         return PolicyResult::NonStandard("coinbase");
     }
@@ -113,7 +131,7 @@ pub fn check_libre_admission(tx: &Transaction, fee_sat: u64, weight: u64) -> Pol
     if weight > MAX_STANDARD_TX_WEIGHT {
         return PolicyResult::NonStandard("tx weight");
     }
-    if !meets_min_relay_fee(fee_sat, weight) {
+    if !meets_min_relay_fee_at(fee_sat, weight, min_relay_sat_kvb) {
         return PolicyResult::NonStandard("min relay fee");
     }
     check_libre_annex(tx)
@@ -135,6 +153,8 @@ mod tests {
         assert!(meets_min_relay_fee(100, 4000));
         assert!(!meets_min_relay_fee(99, 4000));
         assert_eq!(fee_rate_sat_per_kvb(100, 4000), 100);
+        assert!(meets_min_relay_fee_at(1, 4000, 0));
+        assert!(!meets_min_relay_fee_at(1, 4000, 100));
     }
 
     #[test]

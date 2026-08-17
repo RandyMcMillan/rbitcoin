@@ -53,6 +53,9 @@ FORWARD_FLAGS = frozenset(
         "limitclustersize",
         "peertimeout",
         "minimumchainwork",
+        "mocktime",
+        "blockversion",
+        "blockmintxfee",
     }
 )
 
@@ -213,6 +216,7 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
             "peertimeout",
             "maxconnections",
             "minimumchainwork",
+            "blockmintxfee",
         ):
             i += 1
             if i >= len(argv):

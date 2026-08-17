@@ -248,6 +248,15 @@ macro_rules! trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Global log level is process-wide; serialize tests that call `init*`.
+    fn lock_log_init() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn level_parse_and_order() {
@@ -272,6 +281,7 @@ mod tests {
 
     #[test]
     fn init_and_enabled() {
+        let _g = lock_log_init();
         init(Level::Warn);
         assert!(enabled(Level::Error));
         assert!(enabled(Level::Warn));
@@ -294,6 +304,7 @@ mod tests {
 
     #[test]
     fn log_at_respects_level() {
+        let _g = lock_log_init();
         init(Level::Error);
         // Should not panic; visual check not required.
         log_at(Level::Info, format_args!("hidden"));
@@ -323,6 +334,7 @@ mod tests {
 
     #[test]
     fn max_level_maps_all_stored_values() {
+        let _g = lock_log_init();
         init(Level::Error);
         assert_eq!(max_level(), Some(Level::Error));
         init(Level::Debug);
@@ -335,6 +347,7 @@ mod tests {
 
     #[test]
     fn init_from_env_off_and_level() {
+        let _g = lock_log_init();
         // Save/restore around env mutation for process safety.
         let prev_rb = std::env::var_os("RBITCOIN_LOG");
         let prev_rust = std::env::var_os("RUST_LOG");

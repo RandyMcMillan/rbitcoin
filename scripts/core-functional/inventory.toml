@@ -491,7 +491,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "core-net-policy"
-analog = "official: unannounced getdata served tx not notfound (test_reorg_relay); immature eviction + ancestorcount after reorg are production"
+analog = "official: unannounced getdata served tx (mempool_reorg.py:94 test_reorg_relay); immature eviction + ancestorcount after reorg are production"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -908,7 +908,7 @@ analog = "none (no compact filters)"
 name = "rpc_getblockfrompeer.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: getchaintips has no headers-only row for competing short tip after connect (rpc_getblockfrompeer.py:59); getblockfrompeer not reached"
+analog = "official: headers-only competing tip shipped; Method not found: getblockfrompeer (rpc_getblockfrompeer.py:69); prune fetch later"
 
 [[test]]
 name = "rpc_getblockstats.py"

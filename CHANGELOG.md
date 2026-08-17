@@ -128,6 +128,16 @@ before 1.0).
   an invariant, protocol, `SAFETY` requirement, or library quirk. First-party
   production sources were cleaned to that bar.
 
+- **Core functional Wave D.** Future-tip load abort (Core 2h
+  `MAX_FUTURE_BLOCK_TIME` vs `-mocktime`). `getblock(verbose=2)`
+  `scriptPubKey.address`. `getrpcinfo.active_commands` + `logpath`.
+  Official leftovers stay skip with first-failure analogs:
+  `rpc_blockchain` missing `time` (`:157`), `rpc_generate` `combo()`
+  (`:55`), `interface_rpc` JSON-RPC 2.0 batch (`:151`),
+  `rpc_getblockfrompeer` method (`:69`), `mempool_reorg` unannounced
+  getdata (`:94`), `rpc_net` dual connections (`:100`). Inventory still
+  **31** `run`.
+
 - **Core functional Wave C.** Official unmodified
   `p2p_sendheaders.py` and `p2p_compactblocks_hb.py` are now `run`
   (31 inventory run names). Header announce follows Core

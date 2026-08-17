@@ -271,6 +271,8 @@ pub struct MempoolHub {
     relay_enabled: AtomicBool,
     /// Broadcast accepts so sessions can inv (origin exclusion is per-session).
     announce: broadcast::Sender<MempoolAnnounce>,
+    /// `setmocktime` jump: sessions INV live mempool txs (Core scheduler).
+    inv_flush: broadcast::Sender<()>,
     /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
@@ -349,6 +351,7 @@ impl MempoolHub {
         let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
+        let (inv_flush, _) = broadcast::channel(16);
         let unbroadcast = if persist {
             load_unbroadcast_file(&dir_buf)
         } else {
@@ -360,6 +363,7 @@ impl MempoolHub {
             query,
             relay_enabled: AtomicBool::new(false),
             announce,
+            inv_flush,
             recent: Mutex::new(std::collections::VecDeque::with_capacity(
                 MEMPOOL_RECENT_CAP,
             )),
@@ -603,6 +607,11 @@ impl MempoolHub {
 
     pub fn note_mock_now(&self, ts: u64) {
         self.mock_now.store(ts, Ordering::Relaxed);
+        let _ = self.inv_flush.send(());
+    }
+
+    pub fn subscribe_inv_flush(&self) -> broadcast::Receiver<()> {
+        self.inv_flush.subscribe()
     }
 
     pub fn tx_inv_due(&self, wtxid: &Wtxid) -> bool {

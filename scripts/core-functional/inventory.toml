@@ -489,7 +489,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "core-net-policy"
-analog = "official: unannounced getdata notfound shipped; after setmocktime+300 get_invs is 0 not 3 (mempool_reorg.py:111 test_reorg_relay)"
+analog = "official: notfound + mocktime INV of 3 shipped; immediate getdata after sendraw still serves (mempool_reorg.py:122 test_reorg_relay)"
 
 [[test]]
 name = "mempool_resurrect.py"

@@ -320,6 +320,7 @@ pub async fn peer_session_with(
     let mut ban_score: u32 = 0;
     let mut rate = PeerRateLimiter::default_limits();
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
+    let mut inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
     headers_poll.tick().await;
 
@@ -477,6 +478,21 @@ pub async fn peer_session_with(
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => {}
+                        }
+                    }
+                }
+                flush = async {
+                    if let Some(rx) = inv_flush_rx.as_mut() {
+                        Some(rx.recv().await)
+                    } else {
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                } => {
+                    if matches!(flush, Some(Ok(()))) {
+                        if let Some(s) = session.as_ref() {
+                            s.request_tx_inv();
+                            queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
                         }
                     }
                 }
@@ -691,6 +707,9 @@ fn queue_due_tx_invs(
             continue;
         }
         let w = tx.compute_wtxid();
+        if !mp.tx_inv_due(&w) {
+            continue;
+        }
         session.note_announced_wtx(w);
         let _ = queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
         n += 1;

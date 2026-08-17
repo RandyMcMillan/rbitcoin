@@ -3335,7 +3335,7 @@ mod tests {
             gh["error"]["message"].as_str().unwrap_or(""),
             "named params not supported; use array"
         );
-        assert_eq!(gh["error"]["code"], ERR_MISC); // height out of range
+        assert_eq!(gh["error"]["code"], ERR_INVALID_PARAMETER); // height out of range
 
         let missing = handle_request(&ctx, &json!({"method":"getblock","params":{}}));
         assert_eq!(missing["error"]["code"], ERR_INVALID_PARAMS);
@@ -3402,7 +3402,7 @@ mod tests {
             gh["error"]["message"].as_str().unwrap_or(""),
             "height required"
         );
-        assert_eq!(gh["error"]["code"], ERR_MISC);
+        assert_eq!(gh["error"]["code"], ERR_INVALID_PARAMETER);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

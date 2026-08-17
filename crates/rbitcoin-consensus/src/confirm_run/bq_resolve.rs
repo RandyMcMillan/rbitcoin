@@ -1,7 +1,7 @@
 //! BQ-ahead TipOnly parent resolve (lookup wave).
 //!
 //! One [`Store::get_fk_by_txid_batch`] (TipOnly) across a ready-height wave
-//! (soft **16000** inputs / hard **1080** blocks). Hits live on the BQ record.
+//! (soft **64000** inputs / hard **1080** blocks). Hits live on the BQ record.
 //! Does not claim, structure, or stamp.
 
 use super::*;
@@ -16,11 +16,12 @@ use std::io::Cursor;
 /// block cap so early-IBD waves are fat enough that one published identity
 /// layer covers many heights. Soft stop is Σ `tx.input`
 /// ([`BQ_RESOLVE_WAVE_MAX_INPUTS`]), include-overshoot, same shape as load.
+/// Fat-era 64 k inputs is ~16 blocks → ~20 layers at `ready≈330`.
 pub const BQ_RESOLVE_WAVE_MAX_BLOCKS: usize = 1080;
-/// Soft max Σ `tx.input` per lookup wave (2× load's 8000; overshoot included).
-pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 16_000;
+/// Soft max Σ `tx.input` per lookup wave (8× load's 8000; overshoot included).
+pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 64_000;
 /// Safety cap so one megablock run cannot stall the wave.
-pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 64_000;
+pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 256_000;
 
 /// Same include-overshoot rule as load [`pack_stop_after`]: stop after the
 /// block that crosses the soft input budget or hits the hard height cap.
@@ -32,6 +33,30 @@ pub fn bq_resolve_wave_stop_after(
     hard_max_blocks: usize,
 ) -> bool {
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
+}
+
+/// Hold a short wave while the BQ is fat so lookup does not mint one layer
+/// per newly fetched block.
+///
+/// `ready` is BQ depth. `soft_win` is the 1-min confirm window (`bq soft=n/win`).
+/// `soft_win == 0` (rate unknown) never holds.
+#[inline]
+pub fn bq_resolve_wave_hold_partial(
+    ready: u32,
+    soft_win: u32,
+    sum_inputs: u32,
+    n_blocks: usize,
+) -> bool {
+    if soft_win == 0 || n_blocks == 0 {
+        return false;
+    }
+    ready > soft_win / 2
+        && !bq_resolve_wave_stop_after(
+            sum_inputs,
+            n_blocks,
+            BQ_RESOLVE_WAVE_MAX_INPUTS,
+            BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        )
 }
 
 /// Outcome of one TipOnly wave over BQ-ready heights.
@@ -146,13 +171,23 @@ pub fn confirm_bq_resolve_wave_with_ids(
         }
     }
 
+    if bq_resolve_wave_hold_partial(
+        query.block_queue_count() as u32,
+        query.soft_confirm_window(),
+        sum_inputs,
+        per_height.len(),
+    ) {
+        stats.work_ns = t0.elapsed().as_nanos() as u64;
+        return Ok(stats);
+    }
+
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
     stats.keys = keys.len() as u32;
     let (mut hit_map, need): (BqParentHits, Vec<[u8; 32]>) = match ids.as_mut() {
         Some((live, _)) => {
             let (known, need) = live.partition(keys.iter());
             stats.skipped = known.len() as u32;
-            (known, need)
+            (known.into_iter().collect(), need)
         }
         None => (HashMap::new(), keys),
     };
@@ -172,7 +207,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
     }
     stats.hits = hit_map.len() as u32;
     if let Some((live, published)) = ids.as_mut() {
-        let mut hits = rbitcoin_query::IdMap::new();
+        let mut hits = rbitcoin_query::IdMap::default();
         for (_h, need) in &per_height {
             for t in need {
                 if let Some(&v) = hit_map.get(t) {
@@ -381,7 +416,7 @@ mod tests {
         let st = confirm_bq_resolve_wave(&q, &params, &heights).unwrap();
         assert_eq!(
             st.heights, 9,
-            "lookup wave must outgrow the old 8-height cap (soft 16000 inputs / hard 1080 blocks)"
+            "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
         );
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -389,14 +424,62 @@ mod tests {
     #[test]
     fn resolve_wave_pack_limits_are_4x_load_class() {
         assert_eq!(BQ_RESOLVE_WAVE_MAX_BLOCKS, 1080);
-        assert_eq!(BQ_RESOLVE_WAVE_MAX_INPUTS, 16_000);
+        assert_eq!(BQ_RESOLVE_WAVE_MAX_INPUTS, 64_000);
+        assert_eq!(BQ_RESOLVE_WAVE_MAX_KEYS, 256_000);
         assert!(BQ_RESOLVE_WAVE_MAX_BLOCKS >= 144 * 4);
-        assert!(BQ_RESOLVE_WAVE_MAX_INPUTS >= 8000);
+        assert!(BQ_RESOLVE_WAVE_MAX_INPUTS >= 8000 * 8);
         // Include-overshoot: take the crossing block, then stop.
-        assert!(!bq_resolve_wave_stop_after(15_900, 1, 16_000, 1080));
-        assert!(bq_resolve_wave_stop_after(16_100, 2, 16_000, 1080));
-        assert!(bq_resolve_wave_stop_after(1, 1080, 16_000, 1080));
-        assert!(!bq_resolve_wave_stop_after(16_000, 1079, 16_000, 1080));
+        assert!(!bq_resolve_wave_stop_after(63_900, 1, 64_000, 1080));
+        assert!(bq_resolve_wave_stop_after(64_100, 2, 64_000, 1080));
+        assert!(bq_resolve_wave_stop_after(1, 1080, 64_000, 1080));
+        assert!(!bq_resolve_wave_stop_after(64_000, 1079, 64_000, 1080));
+    }
+
+    #[test]
+    fn hold_partial_table() {
+        // fat BQ + short wave → hold
+        assert!(bq_resolve_wave_hold_partial(330, 180, 4_000, 1));
+        // fat BQ + full input wave → emit
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 64_100, 16));
+        // fat BQ + full block cap → emit
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 1, 1080));
+        // thin BQ + short wave → emit (load catching up)
+        assert!(!bq_resolve_wave_hold_partial(50, 180, 4_000, 1));
+        // rate unknown (win=0) → never hold
+        assert!(!bq_resolve_wave_hold_partial(330, 0, 4_000, 1));
+        // nothing collected
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 0, 0));
+    }
+
+    #[test]
+    fn fat_bq_holds_short_unresolved_tail() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        for h in 1..=8u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+            prev = b.block_hash();
+        }
+        for h in 1..=7u32 {
+            q.block_queue_mark_resolve_complete(h).unwrap();
+        }
+        // win = 0.2 * 60 = 12; ready=8 > 6 → hold the 1-block tail
+        let _ = q.block_queue_update_soft_pressure(Some(0.2));
+        let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
+        assert_eq!(st.heights, 0, "fat BQ must not mint a 1-block layer");
+        assert!(!q.block_queue_is_resolve_complete(8));
+
+        let _ = q.block_queue_update_soft_pressure(None);
+        let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
+        assert_eq!(st.heights, 1, "unknown window must allow a short wave");
+        assert!(q.block_queue_is_resolve_complete(8));
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]

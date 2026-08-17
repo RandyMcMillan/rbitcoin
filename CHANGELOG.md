@@ -33,6 +33,15 @@ before 1.0).
 
 ### Changed
 
+- **Documentation map.** [`docs/README.md`](docs/README.md) is the only
+  index (one audience, one start file; one fact, one owner). Coverage
+  policy lives in `TESTING.md`. Schema 17 freeze tables live in
+  `SCHEMA.md`. Confirm start states live in `docs/invariants.md`.
+  Most-work reorg rules live in `docs/architecture.md`. `AGENTS.md` is
+  the slim harness contract. Removed `COVERAGE.md`,
+  `docs/store-format.md`, `docs/startup-states.md`,
+  `docs/design-ibd-most-work-reorg.md`, and `docs/future-features/`.
+
 - **Source-code comments are a smell.** `CONTRIBUTING.md` now states that
   a comment restating *what* the next code does, *why* it exists, or a
   *weird* approach usually means names, signatures, or the library fit

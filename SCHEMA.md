@@ -600,7 +600,9 @@ Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
 
 | Doc | Topic |
 |-----|--------|
+| [`docs/README.md`](docs/README.md) | Documentation map |
 | [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md) | Prior schema versions |
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer ownership, IBD vs tip |
+| [`docs/invariants.md`](docs/invariants.md) | Confirm stage IO / leftover union |
 | [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, segmented head seal |
 | [`OPERATOR.md`](./OPERATOR.md) | Datadir ops, env knobs |

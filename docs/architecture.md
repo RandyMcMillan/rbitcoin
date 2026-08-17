@@ -1,9 +1,9 @@
 # Architecture: how rbitcoin differs
 
-This page is the **newcomer map** for design uniqueness. Normative layouts and
-role tables live in the linked deep docs; this document explains *why* the node
-is built this way and how it compares to Bitcoin Core and to external Electrum
-indexers.
+This page explains *why* the node is built this way and how it compares to
+Bitcoin Core and to external Electrum indexers. The documentation map is
+[`docs/README.md`](./README.md). Normative layouts and role tables live in
+the linked owner docs.
 
 **Status:** experimental 0.x. On-disk format and APIs are **unstable until 1.0**.
 
@@ -233,7 +233,8 @@ Test matrix for rules we own: [`docs/consensus-tests.md`](./consensus-tests.md).
 ## Pipeline summary (IBD)
 
 Peer → body queue → **lookup** (stamp) → **load** (pin) → **scripts** → **write**
-(sole Class A appender). Roles, pack size, pins:
+(sole Class A appender). Stage IO:
+[`invariants.md`](./invariants.md). Roles, pack size, pins:
 [`concurrency.md`](./concurrency.md). Heads used on lookup:
 [`heads.md`](./heads.md).
 

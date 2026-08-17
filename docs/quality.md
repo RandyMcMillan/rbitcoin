@@ -115,66 +115,22 @@ New work after the 2026-08-16 cruft program starts at **Q-47**.
 
 ## Completed
 
-**One list.** Newest quality program first, then earlier Q-ids, then 2026-08-06
-audit closures. Do not reopen without new evidence.
+**One short list** of the latest quality program. Older closures (Q-01–Q-14,
+findings 001–021, CI split, map-free README, …) live in
+[`CHANGELOG.md`](../CHANGELOG.md). Do not reopen without new evidence.
 
 | ID | Item | Resolution |
 |----|------|------------|
-| **Q-15** | `rbitcoin-cli` talks to node RPC | Cookie / `--rpcuser` HTTP client for the documented subset. `chainwork` is real header work. `size_on_disk` / `verificationprogress` stay labeled placeholders |
-| **Q-42** | `--maxinbound` is config, not `set_var` | `P2PNode::start_with_agent` takes the cap; env is parse-time input only |
-| **Q-43** | RPC numbers match this process | `maxmempool` is hub weight; `version` is rbitcoin semver (0.1.0 → 100); `localservices` from `local_service_flags` |
-| **Q-44** | Unused Core-style standardness | `check_tx_standard` / template helpers deleted; admit is Libre only |
+| **Q-15** | `rbitcoin-cli` talks to node RPC | Cookie / `--rpcuser` HTTP client for the documented subset. Dummy chaininfo fields stay labeled |
+| **Q-42** | `--maxinbound` is config, not `set_var` | `P2PNode::start_with_agent` takes the cap |
+| **Q-43** | RPC numbers match this process | `maxmempool` is hub weight; `version` is rbitcoin semver; `localservices` from flags |
+| **Q-44** | Unused Core-style standardness | Deleted; admit is Libre only |
 | **Q-45** | Path-named IO backend aliases | `read_io_backend` / `write_io_backend` only |
 | **Q-46** | `crate_name` / smoke theater | Deleted with `DEFAULT_IBD_OUTBOUND` |
-| **—** | Core functional harness | Inventory + bitcoind shim + nightly + **9** unmodified v31.1 scripts (`feature_help` / `uacomment` / `dirsymlinks` / `framework_miniwallet` / `rpc_uptime` / `rpc_named_arguments` / `mempool_spend_coinbase` / `mempool_resurrect` / `p2p_block_sync`) + analog scenarios. Remaining `run` growth is **Q-41** (`#46`–`#51`) |
-| **—** | Schema 17 durable store | Thin LAYOUT17 `txout` + kinds 0–9 + 8 B spent; SH `key_len=40` stream + page deltas; leftover `archive_epoch` / `store/wire` / single-file `sp_tweaks` unlinked; wipe+re-IBD is the operator message (`#45`) |
-| **—** | Live P2P control RPC | `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection` on the session table |
-| **—** | `sp_tweaks` 4 GiB segments | Tip-only `off:u32` (no `header_fk`); original `0`/`33` body; roll `NNNNNN` (`#50`) |
-| **—** | IBD tip getheaders storm | Already-known 1-header announces stay off `ordered` (`#43`) |
-| **—** | SH megakey heartbeats | Status INFO every 10 s mid-key (`#44`) |
-| **—** | `DisconnectTip` warn | Every confirmed disconnect (`#42`) |
-| **Q-23** | Optional musl CI | `.github/workflows/musl.yml` after green master `ci` (`nix build .#rbitcoin-musl`, artifact upload; not a required PR check) |
-| **Q-14** | Head-module glossary | [`docs/heads.md`](./heads.md): which file/module; lookup 2-wave; confirm stages point at concurrency |
-| **Q-40** | Host `rust-toolchain` pin | Root `rust-toolchain.toml` channel **1.95.0** |
-| **Q-21** | SBOM for musl release | `scripts/sbom.sh` / `scripts/sbom.py` emit CycloneDX 1.5 from `Cargo.lock` |
-| **Q-39** | Operator/docs vs shipped model | OPERATOR body-queue → confirm; README crate map; TESTING.md workspace members; findings 001–021; CONTRIBUTING lists deny/multinode |
-| **Q-16** | Residual `RBITCOIN_*` env | Unstable set listed in `env-knobs.md`; dead path-IO / `FD_APPEND` / `BLOCK_QUEUE_MB` / `TX_HEAD_ACCESS` (FdOnly token) gone |
-| **Q-20** | `cargo deny` / advisory CI | `deny.toml` + required `deny` job (`taiki-e/install-action` `cargo-deny@0.20.2`) |
-| **R-06** | Tip-follow store integrity (`confirmed[]` null tail; tip+1 `NotFound`; idx clone) | Open trims trailing null `confirmed[]`; tip+1 after heal is not `NotFound`; `TxIdx::open` refuses non-monotone starts (`IDX_OPEN_DOUBLE_APPEND`) |
-| — | IBD tip-hole cover + relative-slow disconnect | Tip-hole getdata ranks live `speed_sample` bps; stale inflight **6s** re-race (avoid last holders); `far_slots_per_peer=2` while `hole>0`; relative-slow outlier disconnect (`OUTLIER_RATIO=2` + cluster-spread + hysteresis) |
-| — | Page-grouped `txid.body` identity on lookup | Head-resolve ID stage bulk-preads shared 4 KiB sidefile pages, then RAM BIP30 walk (same winners as serial peek) |
-| **R-01** | Mempool read-path decoupling (histogram / frontier / `list_live`) | Published chunks on the fee snapshot; `list_live_meta` for body-free RPC/Esplora |
-| **R-02** | Persistent shared `script_pool` | Process-wide `rbtc-scripts` steal `try_for_each`; coordinators own phases; join does not spawn per admit |
-| **R-03** | Default remine pads `1..=103` | Electrum + MempoolHub tests use `pad_empty_from`. Full-suite wall → **Q-37** |
-| **R-04** | `TxGraph` mining-chunk cache | Rebuild only after insert/remove/`rebuild_from` |
-| **Q-22** / **R-05** | Coverage job compiled `cargo-llvm-cov` from crates.io | `taiki-e/install-action` prebuilt `cargo-llvm-cov@0.6.14`, Action **commit-pinned** (CodeQL) |
-| — | Esplora `/fee-estimates` 11× graph linearize under hub lock | Published fee table (`4714473`); histogram/list follow-on was **R-01** |
-| — | Findings **012–021** (fuzzamoto differential) | All **fixed** + named Regression (identity/BIP30 cluster, tapleaf, compact-block, reorg drain) |
-| **Q-01** | Core script/TX allowlist debt | **No allowlist**; all data rows must pass |
-| **Q-02** | Confirm dual-path soft recovery | No `ColdPinMode`; no load identity soft-fill; `invariants.md` kill list |
-| **Q-03** | Multi-node IBD only `#[ignore]` | Tier A default + required CI `multinode`; heavies stay ignored (**Q-38**) |
-| **Q-04** | Env knob museum (primary) | Path-IO + confirm-queue envs removed; CLI first; leftovers → **Q-16** |
-| **Q-05** | MSRV `1.74` untested | `rust-version = "1.95"` matching CI/Nix |
-| **Q-10** / **Q-11** | God-files / long confirm fns | Test peels + `confirm_run` stages + `tx_table/packed` + `query/soft_densify`. Residual giants → **R-10** |
-| **Q-12** | Store `allow(dead_code)` hotspots | Live APIs unsilenced; test-only under `#[cfg(test)]` |
-| **Q-13** | Catch-up retry used `IbdConfig::for_test` | `catch_up_retry_config` uses production `Default` + `target_peers: 1` |
-| — | Findings **001–011** + process | `docs/external_findings/`; all **fixed** + named Regression |
-| — | Most-work reorg / tip-hole livelocks | Multi-hop reorg, tip-hole, zombie pending, resume O(N²)/stack |
-| — | SH/fuse wipe on payload-only format | fuse8 soft-migrate; AGENTS format rules |
-| — | Deps: rayon / xorf / bincode on hot graph | In-tree fuse8 + `script_pool` |
-| — | README “map epochs” / mmap mental model | Map-free tables, HWM publish, no map epochs |
-| — | Linux-only not front-and-center | README platform row + supported IO target |
-| — | 100% coverage theater | Gate is **≥90%** first-party LCOV `LH`/`LF` |
-| — | SECURITY contact missing | `security@reardencode.com` |
-| — | RPC described as Core-compatible while stub | Description fixed: stub / not Core surface |
-| — | Dual handbook chaos | AGENTS + CONTRIBUTING + how-we-plan (some overlap remains; acceptable) |
-| — | CI floating `@stable` vs Nix pin | rustc **1.95.0**; nixos-26.05 |
-| — | Coverage + test thrash one `target/` | `target/dev` vs `target/cov` |
-| — | Monolithic `test` job hid fmt/clippy | Separate jobs + required **`multinode`** |
-| — | No CodeQL | `.github/workflows/codeql.yml` (Rust `build-mode: none`) |
-| — | Dependabot noise (rustc tag / hashes) | Ignore `dtolnay/rust-toolchain` + `bitcoin_hashes` |
-| — | No Esplora | REST + wallet-scoped WS |
-| — | Signet-only custom nets | Custom signet / mutinynet |
+| **—** | Core functional harness | Inventory + shim + nightly + **9** unmodified v31.1 scripts. Remaining `run` growth is **Q-41** |
+| **—** | Schema 17 durable store | Thin LAYOUT17 + 8 B spent; leftover 16 catalogs refused; wipe+re-IBD is the operator message |
+| **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | Closed 2026-08-12 program. Leftover wall measure is **Q-37** |
+| **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny` job; `musl.yml` after green master `ci` |
 
 ---
 

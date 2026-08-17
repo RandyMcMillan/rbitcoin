@@ -957,7 +957,11 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         match rt.block_on(run_p2p(config)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                error!("{e}");
+                if matches!(e, crate::error::NodeError::FutureTip) {
+                    eprintln!("{e}");
+                } else {
+                    error!("{e}");
+                }
                 ExitCode::FAILURE
             }
         }

@@ -61,6 +61,10 @@ pub struct RpcContext {
     pub peers: Option<Arc<rbitcoin_net::PeerHub>>,
     /// Live chain (invalidate / reconsider / precious).
     pub chain: Option<Arc<rbitcoin_net::ChainHub>>,
+    /// Core `getrpcinfo.logpath` (`{datadir}/debug.log`).
+    pub logpath: String,
+    /// In-flight RPC methods (method, start) for `getrpcinfo.active_commands`.
+    pub active: std::sync::Mutex<Vec<(String, Instant)>>,
 }
 
 /// Outcome of `submitblock` (Core: `null` or a reject-reason string).
@@ -290,7 +294,16 @@ pub fn dispatch(
     method: &str,
     params: impl Into<RpcParams>,
 ) -> Result<Value, Value> {
-    let params = params.into();
+    ctx.active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((method.to_string(), Instant::now()));
+    let out = dispatch_inner(ctx, method, params.into());
+    ctx.active.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    out
+}
+
+fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Result<Value, Value> {
     match method {
         "help" => help(&params),
         "echo" => echo(&params),
@@ -601,9 +614,21 @@ fn method_help(m: &str) -> String {
 }
 
 fn getrpcinfo(ctx: &RpcContext) -> Value {
+    let active = ctx
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(method, start)| {
+            json!({
+                "method": method,
+                "duration": start.elapsed().as_micros() as u64,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
-        "active_commands": [],
-        "logpath": "",
+        "active_commands": active,
+        "logpath": ctx.logpath,
         "uptime": ctx.uptime_secs(),
         "methods": METHOD_LIST,
     })
@@ -897,7 +922,12 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         "tx": txids,
     });
     if verbosity >= 2 {
-        let txs: Vec<Value> = block.txdata.iter().map(|tx| tx_to_json(tx, None)).collect();
+        let net = rpc_btc_network(ctx.network);
+        let txs: Vec<Value> = block
+            .txdata
+            .iter()
+            .map(|tx| tx_to_json(tx, None, net))
+            .collect();
         obj["tx"] = json!(txs);
     }
     Ok(obj)
@@ -1240,7 +1270,11 @@ fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             if !verbose {
                 return Ok(json!(serialize_hex(&tx)));
             }
-            return Ok(tx_to_json(&tx, Some(json!({ "in_mempool": true }))));
+            return Ok(tx_to_json(
+                &tx,
+                Some(json!({ "in_mempool": true })),
+                rpc_btc_network(ctx.network),
+            ));
         }
     }
 
@@ -1256,7 +1290,11 @@ fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     if !verbose {
         return Ok(json!(serialize_hex(&tx)));
     }
-    Ok(tx_to_json(&tx, Some(json!({ "in_mempool": false }))))
+    Ok(tx_to_json(
+        &tx,
+        Some(json!({ "in_mempool": false })),
+        rpc_btc_network(ctx.network),
+    ))
 }
 
 fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1454,13 +1492,30 @@ fn require_regtest_miner<'a>(
         .ok_or_else(|| rpc_error(ERR_MISC, format!("{method} requires a live chain hub")))
 }
 
-fn decode_output_script(ctx: &RpcContext, s: &str) -> Result<ScriptBuf, Value> {
-    let btc_net = match ctx.network {
+fn rpc_btc_network(n: Network) -> BtcNetwork {
+    match n {
         Network::Mainnet => BtcNetwork::Bitcoin,
         Network::Testnet => BtcNetwork::Testnet,
         Network::Signet => BtcNetwork::Signet,
         Network::Regtest => BtcNetwork::Regtest,
-    };
+    }
+}
+
+fn script_pubkey_json(script: &ScriptBuf, network: BtcNetwork) -> Value {
+    let mut obj = json!({
+        "hex": hex_encode(script.as_bytes()),
+        "asm": script.to_asm_string(),
+    });
+    if let Ok(addr) = Address::from_script(script, network) {
+        if let Some(m) = obj.as_object_mut() {
+            m.insert("address".into(), json!(addr.to_string()));
+        }
+    }
+    obj
+}
+
+fn decode_output_script(ctx: &RpcContext, s: &str) -> Result<ScriptBuf, Value> {
+    let btc_net = rpc_btc_network(ctx.network);
     if let Ok(a) = s.parse::<Address<_>>() {
         match a.require_network(btc_net) {
             Ok(addr) => return Ok(addr.script_pubkey()),
@@ -2927,7 +2982,7 @@ pub(crate) fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
     deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
 }
 
-fn tx_to_json(tx: &Transaction, extra: Option<Value>) -> Value {
+fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -> Value {
     let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
     let mut vin = Vec::new();
     for (i, inp) in tx.input.iter().enumerate() {
@@ -2943,10 +2998,7 @@ fn tx_to_json(tx: &Transaction, extra: Option<Value>) -> Value {
         vout.push(json!({
             "value": out.value.to_btc(),
             "n": i,
-            "scriptPubKey": {
-                "hex": hex_encode(out.script_pubkey.as_bytes()),
-                "asm": out.script_pubkey.to_asm_string(),
-            }
+            "scriptPubKey": script_pubkey_json(&out.script_pubkey, network),
         }));
     }
     let mut obj = json!({
@@ -3036,6 +3088,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         (ctx, dir)
     }
@@ -3050,6 +3104,8 @@ mod tests {
         let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
         assert!(info["methods"].as_array().unwrap().len() >= 10);
         assert!(info["uptime"].as_u64().unwrap() >= 42);
+        assert_eq!(info["active_commands"][0]["method"], json!("getrpcinfo"));
+        assert!(info["active_commands"][0]["duration"].as_u64().unwrap() < 1_000_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3412,6 +3468,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -3457,6 +3515,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
 
         let tip_h = chain.tip_height();
@@ -3926,6 +3986,8 @@ mod tests {
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
             peers: None,
             chain: Some(Arc::clone(&hub)),
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         (ctx, dir, hub)
     }
@@ -3984,6 +4046,10 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(hex, rbitcoin_primitives::hex_encode(script.as_bytes()));
+        assert_eq!(
+            blk["tx"][0]["vout"][0]["scriptPubKey"]["address"],
+            json!(addr)
+        );
         // Core getblock(hash, False) is verbosity 0 (raw hex).
         let raw = dispatch(&ctx, "getblock", vec![best.clone(), json!(false)]).unwrap();
         assert!(raw.as_str().unwrap().len() > 160);
@@ -5267,6 +5333,8 @@ mod tests {
             regtest: None,
             peers: None,
             chain: None,
+            logpath: String::new(),
+            active: std::sync::Mutex::new(Vec::new()),
         };
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(

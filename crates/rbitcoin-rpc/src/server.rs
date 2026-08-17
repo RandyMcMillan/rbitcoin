@@ -98,6 +98,8 @@ pub async fn run_rpc(
         regtest,
         peers,
         chain,
+        logpath: config.datadir.join("debug.log").display().to_string(),
+        active: std::sync::Mutex::new(Vec::new()),
     });
 
     let listener = TcpListener::bind(config.listen)

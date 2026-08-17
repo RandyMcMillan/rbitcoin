@@ -378,7 +378,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: getrpcinfo active_commands is [] not [getrpcinfo]; HTTP 1.x/2.0, notifications 204, logpath, -rpcworkqueue still missing"
+analog = "official: getrpcinfo.active_commands + logpath shipped; JSON-RPC 2.0 batch missing jsonrpc field / error text (interface_rpc.py:151)"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -491,7 +491,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "core-net-policy"
-analog = "official: unannounced getdata served tx not notfound (test_reorg_relay); immature eviction + ancestorcount after reorg are production"
+analog = "official: unannounced getdata served tx (mempool_reorg.py:94 test_reorg_relay); immature eviction + ancestorcount after reorg are production"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -857,7 +857,7 @@ reason = "core-net-policy"
 name = "rpc_blockchain.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: assert_start_raises_init_error missing 'The block database contains a block which appears to be from the future.' (rpc_blockchain.py:125); getnetworkhashps shipped; prune/muhash/getchaintxstats still later"
+analog = "official: future-block init shipped; getblockchaininfo missing 'time' (rpc_blockchain.py:157); prune keys / muhash / getchaintxstats still later"
 
 [[test]]
 name = "rpc_createmultisig.py"
@@ -896,7 +896,7 @@ analog = "follow-up: estimatesmartfee exists; Core multi-horizon text"
 name = "rpc_generate.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: getblock(verbose=2) has no scriptPubKey.address; generate hidden -32601 and getblock verbose alias shipped"
+analog = "official: getblock(verbose=2) scriptPubKey.address shipped; generateblock combo() not parsed (rpc_generate.py:55)"
 
 [[test]]
 name = "rpc_getblockfilter.py"
@@ -908,7 +908,7 @@ analog = "none (no compact filters)"
 name = "rpc_getblockfrompeer.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "official: getchaintips has no headers-only row for competing short tip after connect (rpc_getblockfrompeer.py:59); getblockfrompeer not reached"
+analog = "official: headers-only competing tip shipped; Method not found: getblockfrompeer (rpc_getblockfrompeer.py:69); prune fetch later"
 
 [[test]]
 name = "rpc_getblockstats.py"

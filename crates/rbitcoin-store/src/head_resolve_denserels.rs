@@ -400,7 +400,6 @@ fn resolve_fk_and_range_pread(
 const UD_KIND_IDX: u8 = crate::uring_session::KIND_IDX;
 
 /// Fill idx page buffers via held session; returns true if all pages complete.
-#[cfg(target_os = "linux")]
 fn fill_idx_pages(
     sess: &mut UringSession,
     pages: &[crate::tx_idx::IdxPagePlan],
@@ -468,29 +467,14 @@ fn fill_idx_pages(
     for (i, &res) in results.iter().enumerate() {
         if res < 0 || (res as usize) < pages[i].want {
             let page = &pages[i];
-            let rc = unsafe {
-                libc::pread(
-                    page.fd,
-                    bufs[i].as_mut_ptr() as *mut libc::c_void,
-                    page.want,
-                    page.page_off as libc::off_t,
-                )
-            };
+            let handle = crate::io_handle::IoHandle::from_raw_fd(page.fd);
+            let rc = handle.pread(page.page_off, &mut bufs[i][..page.want]);
             if rc < 0 || (rc as usize) < page.want {
                 return false;
             }
         }
     }
     true
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fill_idx_pages(
-    _sess: &mut UringSession,
-    _pages: &[crate::tx_idx::IdxPagePlan],
-    _bufs: &mut [Vec<u8>],
-) -> bool {
-    false
 }
 
 /// Dedup idx OS pages by `(fd, page_off)` so a wave fills each page once.
@@ -510,14 +494,8 @@ where
 
 fn fill_idx_pages_libc(pages: &[crate::tx_idx::IdxPagePlan], bufs: &mut [Vec<u8>]) -> bool {
     for (i, page) in pages.iter().enumerate() {
-        let rc = unsafe {
-            libc::pread(
-                page.fd,
-                bufs[i].as_mut_ptr() as *mut libc::c_void,
-                page.want,
-                page.page_off as libc::off_t,
-            )
-        };
+        let handle = crate::io_handle::IoHandle::from_raw_fd(page.fd);
+        let rc = handle.pread(page.page_off, &mut bufs[i][..page.want]);
         if rc < 0 || (rc as usize) < page.want {
             return false;
         }
@@ -991,9 +969,15 @@ mod tests {
             crate::uring_session::SessionKind::Pool,
             || {
                 let (dir, t, txids) = seed_table(16);
+                let _ = crate::uring_session::test_take_last_sqe_lens();
                 let pread = resolve_fk_and_range_pread(&t, &txids, None, false).unwrap();
                 let via = resolve_fk_and_range_batch(&t, &txids).unwrap();
                 assert_eq!(pread, via);
+                let sqes = crate::uring_session::test_take_last_sqe_lens();
+                assert!(
+                    !sqes.is_empty(),
+                    "pool resolve must push probe/idx SQEs on the held session"
+                );
                 let _ = std::fs::remove_dir_all(&dir);
             },
         );

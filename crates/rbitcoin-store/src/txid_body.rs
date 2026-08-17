@@ -302,36 +302,29 @@ impl TxidBody {
         // Prefer held-session bulk pread; else libc pread (never nested TLS).
         let mut used_session = false;
         if let Some(sess) = session.as_mut() {
-            #[cfg(target_os = "linux")]
-            {
-                use crate::bulk_io::ReadOp;
-                // SAFETY: each jobs[i].1 is a distinct Vec owned until after pread_batch_on_session.
-                let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
-                for (first, blob, _) in jobs.iter_mut() {
-                    let off = Self::entry_offset(*first)?;
-                    let ptr = blob.as_mut_ptr();
-                    let len = blob.len();
-                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                    ops.push(ReadOp {
-                        fd,
-                        offset: off,
-                        buf: slice,
-                        result: i32::MIN,
-                    });
-                }
-                used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);
-                if used_session {
-                    for (op, (first, blob, _)) in ops.iter().zip(jobs.iter_mut()) {
-                        if op.result < 0 || (op.result as usize) != blob.len() {
-                            // Complete short / failed page via libc pread.
-                            self.file.pread_at(Self::entry_offset(*first)?, blob)?;
-                        }
+            use crate::bulk_io::ReadOp;
+            // SAFETY: each jobs[i].1 is a distinct Vec owned until after pread_batch_on_session.
+            let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
+            for (first, blob, _) in jobs.iter_mut() {
+                let off = Self::entry_offset(*first)?;
+                let ptr = blob.as_mut_ptr();
+                let len = blob.len();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                ops.push(ReadOp {
+                    fd,
+                    offset: off,
+                    buf: slice,
+                    result: i32::MIN,
+                });
+            }
+            used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);
+            if used_session {
+                for (op, (first, blob, _)) in ops.iter().zip(jobs.iter_mut()) {
+                    if op.result < 0 || (op.result as usize) != blob.len() {
+                        // Complete short / failed page via libc pread.
+                        self.file.pread_at(Self::entry_offset(*first)?, blob)?;
                     }
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = sess;
             }
         }
         if !used_session {
@@ -404,6 +397,33 @@ mod tests {
         let t2 = TxidBody::open(&dir).unwrap();
         assert_eq!(t2.count(), 2);
         assert_eq!(t2.get(Fk(2)).unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Held pool session must fill identity pages via `pread_batch_on_session`
+    /// (not one-shot `pread_at`). SQE lens prove the session path ran.
+    #[test]
+    fn page_grouped_on_pool_session_pushes_sqes() {
+        use crate::uring_session::{SessionKind, UringSession};
+        let dir = tmp();
+        let t = TxidBody::create(&dir).unwrap();
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        t.append_batch(0, &[a, b]).unwrap();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let _ = crate::uring_session::test_take_last_sqe_lens();
+        let (map, pages) = t
+            .get_many_page_grouped_on_session(&[Fk(1), Fk(2)], &mut session)
+            .expect("session identity");
+        session.drain_all().unwrap();
+        assert_eq!(pages, 1);
+        assert_eq!(map.get(&1), Some(&a));
+        assert_eq!(map.get(&2), Some(&b));
+        let sqes = crate::uring_session::test_take_last_sqe_lens();
+        assert!(
+            !sqes.is_empty(),
+            "get_many_page_grouped_on_session must submit on the held session"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

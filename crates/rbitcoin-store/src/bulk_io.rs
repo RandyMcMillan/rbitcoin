@@ -290,7 +290,6 @@ pub fn page_rmw_pipelined(
 /// **Must not** be called while another `with_thread_local` is active on this
 /// OS thread (nested TLS uring panics). Plan head-resolve streams probe/id/idx
 /// SQEs on its own held session instead.
-#[cfg(target_os = "linux")]
 fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) -> R) -> Option<R> {
     match crate::uring_session::with_thread_local(RING_ENTRIES, f) {
         Ok(r) => Some(r),
@@ -304,7 +303,6 @@ fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) 
 
 /// Pipelined bulk pread via thread-local [`crate::uring_session::UringSession`].
 /// `user_data = op index`. Returns false → caller uses pread fallback.
-#[cfg(target_os = "linux")]
 fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
@@ -334,12 +332,12 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
 // Test-only fault inject: force mid-wave `Some(false)` from `pread_batch_uring`
 // so we prove that path does not permanently disable process-wide io_uring.
 // Kept: no production API can inject a partial-session failure without this.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 thread_local! {
     static TEST_FORCE_SESSION_FALSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 fn test_force_session_false() -> bool {
     TEST_FORCE_SESSION_FALSE.with(|c| c.get())
 }
@@ -348,7 +346,6 @@ fn test_force_session_false() -> bool {
 ///
 /// Used by head-resolve ID stage after probe holds the ring. Returns false if
 /// any SQE failed — caller falls back to libc pread for that batch.
-#[cfg(target_os = "linux")]
 pub(crate) fn pread_batch_on_session(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [ReadOp<'_>],
@@ -368,7 +365,6 @@ pub(crate) fn pread_batch_on_session(
     pread_batch_on_session_inner(session, ops, total_nonempty)
 }
 
-#[cfg(target_os = "linux")]
 fn pread_batch_on_session_inner(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [ReadOp<'_>],
@@ -463,7 +459,6 @@ fn pread_batch_on_session_inner(
 }
 
 /// Pipelined bulk pwrite — same fill/harvest shape as [`pread_batch_uring`].
-#[cfg(target_os = "linux")]
 fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
@@ -481,7 +476,6 @@ fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn pwrite_batch_on_session(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [WriteOp<'_>],
@@ -579,12 +573,12 @@ fn finish_pwrite_wave(ops: &mut [WriteOp<'_>]) -> bool {
     !any_fail
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 fn rmw_ud(kind: u8, epoch: u16, i: usize) -> u64 {
     crate::uring_session::pack_ud(kind, epoch, i as u32)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 fn page_rmw_pipelined_uring(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,
@@ -592,7 +586,7 @@ fn page_rmw_pipelined_uring(
     with_bulk_session(|session| page_rmw_on_session(session, pages, &mut apply)).unwrap_or(false)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 fn page_rmw_on_session(
     session: &mut crate::uring_session::UringSession,
     pages: &mut [PageRmw<'_>],
@@ -748,24 +742,6 @@ fn page_rmw_on_session(
 
     let _ = session.drain_all();
     done == n && need_read == 0 && need_write == 0
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pread_batch_uring(_ops: &mut [ReadOp<'_>]) -> bool {
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pwrite_batch_uring(_ops: &mut [WriteOp<'_>]) -> bool {
-    false
-}
-
-#[cfg(all(test, not(target_os = "linux")))]
-fn page_rmw_pipelined_uring(
-    _pages: &mut [PageRmw<'_>],
-    _apply: impl FnMut(usize, &mut [u8]) -> bool,
-) -> bool {
-    false
 }
 
 fn pread_batch_fallback(ops: &mut [ReadOp<'_>]) {
@@ -1152,6 +1128,27 @@ mod tests {
             pread_batch(&mut ops);
             assert_eq!(ops[0].result, 4);
             assert_eq!(&b, b"pool");
+
+            // Held-session path (head-resolve ID / idx) must also work on pool.
+            let mut sess = crate::uring_session::UringSession::try_open_kind(
+                crate::uring_session::SessionKind::Pool,
+                32,
+            )
+            .expect("held pool");
+            let mut b2 = [0u8; 4];
+            let mut ops2 = [ReadOp {
+                fd,
+                offset: 5,
+                buf: &mut b2[..],
+                result: i32::MIN,
+            }];
+            assert!(
+                pread_batch_on_session(&mut sess, &mut ops2),
+                "pread_batch_on_session must succeed on pool (not a linux-only stub)"
+            );
+            assert_eq!(ops2[0].result, 4);
+            assert_eq!(&b2, b"sess");
+            sess.drain_all().unwrap();
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

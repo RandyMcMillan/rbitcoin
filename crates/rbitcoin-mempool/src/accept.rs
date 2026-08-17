@@ -1766,6 +1766,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `mempool_cluster.py` `test_cluster_merging_size`: 10 singletons plus a
+    /// merger padded to remaining+4 vB must trip `too-large-cluster`.
+    #[test]
+    fn cluster_merge_size_ten_way_rejects() {
+        let dir = tmp_dir();
+        let limit_vb = 10_000u64;
+        let mut map = HashMap::new();
+        let mut parent_ops = Vec::new();
+        for i in 0u8..10 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i; 32]),
+                vout: 0,
+            };
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(1_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+            parent_ops.push(op);
+        }
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(None, Some(10)); // 10 kvB
+        let mut spent = Vec::new();
+        let mut parent_vsize = 0u64;
+        for op in &parent_ops {
+            let tx = spend_tx(*op, 900_000);
+            parent_vsize += tx.weight().to_wu().saturating_add(3) / 4;
+            let tid = tx.compute_txid();
+            mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+            spent.push(OutPoint { txid: tid, vout: 0 });
+        }
+        let remaining = limit_vb.saturating_sub(parent_vsize);
+        assert!(remaining >= 500, "fixture remaining={remaining}");
+        let mut merger = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: spent
+                .iter()
+                .map(|op| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+                },
+            ],
+        };
+        let target = remaining + 4;
+        while (merger.vsize() as u64) < target {
+            let mut pad = merger.output[1].script_pubkey.to_bytes();
+            pad.push(0x61);
+            merger.output[1].script_pubkey = ScriptBuf::from_bytes(pad);
+        }
+        let err = mp.accept_tx(&merger, &utxos, TIP_OK).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { .. }),
+            "ten-way merger vsize={} remaining={remaining} got {err}",
+            merger.vsize()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reorg_reaccept() {
         let dir = tmp_dir();

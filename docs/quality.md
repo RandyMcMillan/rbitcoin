@@ -120,7 +120,7 @@ audit closures. Do not reopen without new evidence.
 
 | ID | Item | Resolution |
 |----|------|------------|
-| **Q-15** | `rbitcoin-cli` talks to node RPC | Cookie / `--rpcuser` HTTP client for the documented subset. `chainwork` / `size_on_disk` / `verificationprogress` stay labeled placeholders |
+| **Q-15** | `rbitcoin-cli` talks to node RPC | Cookie / `--rpcuser` HTTP client for the documented subset. `chainwork` is real header work. `size_on_disk` / `verificationprogress` stay labeled placeholders |
 | **Q-42** | `--maxinbound` is config, not `set_var` | `P2PNode::start_with_agent` takes the cap; env is parse-time input only |
 | **Q-43** | RPC numbers match this process | `maxmempool` is hub weight; `version` is rbitcoin semver (0.1.0 → 100); `localservices` from `local_service_flags` |
 | **Q-44** | Unused Core-style standardness | `check_tx_standard` / template helpers deleted; admit is Libre only |

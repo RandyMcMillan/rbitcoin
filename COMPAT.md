@@ -50,7 +50,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Method group | Status | Notes |
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
-| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`) | done | Archive reconstruct. `chainwork` / `size_on_disk` / `verificationprogress` are placeholders (see [`docs/rpc.md`](./docs/rpc.md)) |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `chainwork` is real. `size_on_disk` / `verificationprogress` are placeholders (see [`docs/rpc.md`](./docs/rpc.md)) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `maxmempool` is the hub weight budget |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan |

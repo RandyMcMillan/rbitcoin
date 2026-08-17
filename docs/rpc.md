@@ -72,8 +72,9 @@ still wait for durable SH when shindex is on.
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
 | `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
 | `syncwithvalidationinterfacequeue` | No-op `null` (no wallet/index callback queue) |
-| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). **Placeholders:** `chainwork` is `""`, `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. |
-| `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). `chainwork` is summed header work (regtest 2 per block). **Placeholders:** `size_on_disk` is `0`, `verificationprogress` is `0.5` during IBD else `1.0`. |
+| `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. |
+| `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. We do not have Core `blk*.dat`, so `rpc_getblockstats.py`'s rename-file needle stays skip. |
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `version` is rbitcoin semver as a Core integer (`0.1.0` → `100`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2` |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |

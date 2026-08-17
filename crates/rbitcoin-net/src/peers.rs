@@ -131,6 +131,9 @@ impl LivePeer {
     }
 
     /// Core `MaybeSendPing`: timeout first, then RPC-queued / interval probe.
+    ///
+    /// Never-sent peers keep `ping_start_secs == 0`, so any `now_secs` above
+    /// 120 is interval-due (same comparison as a last ping at Unix epoch 0).
     pub fn take_ping_action(&self, now_secs: u64) -> Option<PingAction> {
         const PING_INTERVAL: u64 = 120;
         const TIMEOUT_INTERVAL: u64 = 20 * 60;
@@ -143,8 +146,8 @@ impl LivePeer {
             });
         }
         let queued = self.ping_queued.load(Ordering::Relaxed);
-        let due = nonce == 0 && now_secs > start.saturating_add(PING_INTERVAL);
-        if !queued && !due {
+        let interval_due = nonce == 0 && now_secs > start.saturating_add(PING_INTERVAL);
+        if !queued && !interval_due {
             return None;
         }
         let mut n = rand_ping_nonce();
@@ -578,7 +581,6 @@ mod tests {
         hub.set_mock_now(1_700_000_000);
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        // start=0 → interval due immediately
         let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs()).unwrap() else {
             panic!("expected send");
         };

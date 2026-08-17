@@ -75,6 +75,8 @@ pub struct LivePeer {
     recently_from: Mutex<HashSet<BlockHash>>,
     /// We already sent inv-triggered getheaders this session.
     inv_asked_headers: AtomicBool,
+    /// Waiting for a headers reply to our getheaders (no BIP130 cap).
+    awaiting_headers: AtomicBool,
     /// Outstanding ping nonce (`0` = none). Core `m_ping_nonce_sent`.
     ping_nonce_sent: AtomicU64,
     /// When the last ping was sent, or `0` if never (`m_ping_start` seconds).
@@ -159,6 +161,18 @@ impl LivePeer {
 
     pub fn try_ask_headers_for_inv(&self) -> bool {
         !self.inv_asked_headers.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn advertises_network(&self) -> bool {
+        self.services & service_flags_u64(ServiceFlags::NETWORK) != 0
+    }
+
+    pub fn note_awaiting_headers(&self) {
+        self.awaiting_headers.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_awaiting_headers(&self) -> bool {
+        self.awaiting_headers.swap(false, Ordering::Relaxed)
     }
 
     pub fn queue_ping(&self) {
@@ -412,6 +426,7 @@ impl PeerHub {
             best_known: Mutex::new(None),
             recently_from: Mutex::new(HashSet::new()),
             inv_asked_headers: AtomicBool::new(false),
+            awaiting_headers: AtomicBool::new(false),
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
@@ -634,6 +649,7 @@ mod tests {
         p.note_best_header_sent(h);
         p.note_best_known(h);
         assert_eq!(p.header_marks(), (Some(h), Some(h)));
+        assert!(p.advertises_network());
     }
 
     #[test]

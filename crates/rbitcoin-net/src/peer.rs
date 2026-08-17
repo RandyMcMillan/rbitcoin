@@ -304,7 +304,7 @@ pub async fn peer_session_with(
         let h = hub.tip_height().unwrap_or(0);
         rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
     }
-    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref()) {
+    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), meta.session.as_deref(), true) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
 
@@ -437,7 +437,7 @@ pub async fn peer_session_with(
                     }
                 }
                 _ = headers_poll.tick() => {
-                    let _ = queue_getheaders(&out_tx, hub.as_ref());
+                    let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
@@ -583,7 +583,14 @@ pub(crate) fn tip_follow_locator(hub: &ChainHub) -> Vec<BlockHash> {
 fn queue_getheaders(
     out: &mpsc::UnboundedSender<NetworkMessage>,
     hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    mark_awaiting: bool,
 ) -> Result<(), NetError> {
+    if mark_awaiting {
+        if let Some(s) = session {
+            s.note_awaiting_headers();
+        }
+    }
     let locator = tip_follow_locator(hub);
     let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
     queue_out(out, NetworkMessage::GetHeaders(gh))
@@ -832,7 +839,9 @@ async fn handle_peer_frame(
                         }
                         if !hub.is_connected(h) {
                             if !hub.knows_header(h) && !pending_headers.contains_key(h) {
-                                if session.is_none_or(|s| s.try_ask_headers_for_inv()) {
+                                if session.is_none_or(|s| {
+                                    s.advertises_network() || s.try_ask_headers_for_inv()
+                                }) {
                                     need_headers = true;
                                 }
                             } else if !pending_blocks.contains_key(h) {
@@ -879,7 +888,7 @@ async fn handle_peer_frame(
                 mp.note_getdata_tx(gd_tx);
             }
             if need_headers {
-                let _ = queue_getheaders(out_tx, hub);
+                let _ = queue_getheaders(out_tx, hub, session, true);
             }
             if !want.is_empty() {
                 queue_out(out_tx, NetworkMessage::GetData(want))?;
@@ -887,6 +896,7 @@ async fn handle_peer_frame(
         }
         NetworkMessage::Headers(headers) => {
             let n = headers.len().min(MAX_HEADERS_RESULTS);
+            let headers_reply = session.is_some_and(|s| s.take_awaiting_headers());
             if n == 0 {
                 // Empty headers is a failed getheaders response, not an announcement.
             } else if let Some(first) = headers.first() {
@@ -906,7 +916,7 @@ async fn handle_peer_frame(
                     pending_headers.insert(hash, *hdr);
                 }
                 if !connecting {
-                    let _ = queue_getheaders(out_tx, hub);
+                    let _ = queue_getheaders(out_tx, hub, session, true);
                 } else {
                     for hdr in headers.iter().take(n) {
                         let _ = hub.ensure_header(hdr);
@@ -923,14 +933,14 @@ async fn handle_peer_frame(
                         );
                         match header_branch_vs_tip(hub, pending_headers, last) {
                             Some(std::cmp::Ordering::Less) => want.clear(),
-                            // BIP130: at most 16 in-flight on a competing fork.
-                            // Tip-extend / catch-up (join == tip) stays uncapped
-                            // so csv / getchaintips long header batches still fetch.
-                            Some(std::cmp::Ordering::Equal) => {
+                            // BIP130 cap is for unsolicited announcements only.
+                            // A getheaders reply (rejoin / catch-up) must fetch
+                            // the whole offered path.
+                            Some(std::cmp::Ordering::Equal) if !headers_reply => {
                                 let room = 16usize.saturating_sub(requested_blocks.len());
                                 want.truncate(room);
                             }
-                            Some(std::cmp::Ordering::Greater) => {
+                            Some(std::cmp::Ordering::Greater) if !headers_reply => {
                                 let side = header_path_join(hub, pending_headers, last)
                                     .is_some_and(|h| hub.tip_hash() != Some(h));
                                 if side {
@@ -938,14 +948,14 @@ async fn handle_peer_frame(
                                     want.truncate(room);
                                 }
                             }
-                            None => {}
+                            _ => {}
                         }
                     }
                     queue_block_getdata(hub, out_tx, requested_blocks, &want)?;
                 }
             }
             if n >= MAX_HEADERS_RESULTS {
-                let _ = queue_getheaders(out_tx, hub);
+                let _ = queue_getheaders(out_tx, hub, session, true);
             }
         }
         NetworkMessage::Block(block) => {
@@ -2000,7 +2010,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         assert!(queue_out(&tx, NetworkMessage::Verack).is_err());
-        assert!(queue_getheaders(&tx, &hub).is_err());
+        assert!(queue_getheaders(&tx, &hub, None, false).is_err());
 
         // headers_for_peer empty store after genesis still returns (tip exists).
         use bitcoin::p2p::message_blockdata::GetHeadersMessage;

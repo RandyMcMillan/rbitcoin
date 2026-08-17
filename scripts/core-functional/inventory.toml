@@ -783,9 +783,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_ping.py"
-status = "skip"
-reason = "core-log"
-analog = "rust pin: Short payload / Unsolicited / Nonce mismatch / Nonce zero / ping timeout: 1201.000000s; getpeerinfo pingtime/minping/pingwait + ping RPC + setmocktime; unmodified script not locally proven"
+status = "run"
 
 [[test]]
 name = "p2p_private_broadcast.py"

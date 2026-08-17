@@ -33,6 +33,18 @@ before 1.0).
 
 ### Changed
 
+- **Core debug.log campaign (Step 21).** BIP34/66/65 outdated `nVersion`
+  is `bad-version(0x…)`. Connect script fail logs
+  `Block validation error: …` (`SIG_DER` / five CLTV parens).
+  `testmempoolaccept` emits `reject-details`. Ping/pong logs Core
+  `Short payload` / `Nonce mismatch` / `Nonce zero` / `ping timeout`
+  and `getpeerinfo` RTT fields. Confirming an unbroadcast local tx
+  logs Core's removal line. V2 unknown type and redundant version
+  log the `p2p_invalid_messages` needles. Official `feature_dersig` /
+  `feature_cltv` / `p2p_ping` / `mempool_unbroadcast` /
+  `p2p_invalid_messages` / `p2p_unrequested_blocks` / headers-sync /
+  `rpc_net` stay skip with tighter analogs.
+
 - **Invalidate evicts immature coinbase spends.** `QueryUtxoProvider`
   now ORs the input-null coinbase signal with first-in-block, so
   `evict_after_reorg` sees `ImmatureCoinbase` after `invalidateblock`

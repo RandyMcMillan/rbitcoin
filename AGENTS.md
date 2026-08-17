@@ -207,7 +207,25 @@ export CARGO_TARGET_DIR=/tmp/rbtc-<short>/target/dev
 | `CARGO_TARGET_DIR` | Inside the worktree (`…/target/dev`) so objects stay off the other agent’s tree |
 | Identity | Worktree-only `git config --worktree user.name` / `user.email` when committing as a bot; do not change the primary checkout’s `user.*` |
 | Remotes | Worktrees **share** `origin` with the primary checkout. Never `git remote set-url origin`. |
-| After merge | `git worktree remove` the dir; delete the local branch |
+| After merge | See **After merge cleanup** below |
+
+### After merge cleanup
+
+Once the PR is **merged** (not while it is still open):
+
+```bash
+git worktree remove /tmp/rbtc-<short>          # --force only if the tree is junk
+git branch -d <area>/<short-name>
+git push https://github.com/reardencode/rbitcoin.git --delete <area>/<short-name>
+git fetch https://github.com/reardencode/rbitcoin.git --prune
+```
+
+| Keep | Delete |
+|------|--------|
+| `master` / `main`, the primary checkout, any **open-PR** worktree + its local/remote branch | Merged topic worktrees, merged local topic branches, merged remote topic branches |
+| `benthecarman/*` and other contributor remotes | Stale `origin/<topic>` after GitHub already deleted the head (fetch `--prune`) |
+
+Do **not** delete a branch that still has an open PR. Do **not** `git push --delete master`.
 
 ### Local tests (thin on purpose)
 

@@ -188,6 +188,7 @@ on `master`/`main` after the PR merges**.
 | **Plan coded** | Push the worktree branch over the **HTTPS URL** (leave `origin` on SSH); **one PR** for the whole plan (many commits). See `AGENTS.md` § Push. |
 | **Plan complete** | Required Actions checks on that PR are **green** (`fmt` / `deny` / `clippy` / `test` / `multinode` / `coverage`). Poll after open and after every fixup push. |
 | **Musl install** | **Only** on `master`/`main` after merge |
+| **After merge** | Remove the worktree; delete the local **and** remote topic branch; `git fetch --prune`. See `AGENTS.md` § After merge cleanup. |
 
 Logical commits per step still follow public hygiene; each checkpoint must leave
 **targeted** tests green. Do not call the plan done on a red PR.
@@ -291,6 +292,7 @@ Before closing a **plan**:
 - [ ] Work landed on a worktree topic branch (not local `master`)  
 - [ ] One PR contains the plan’s commits  
 - [ ] Required GitHub Actions checks on that PR are green  
+- [ ] After merge: worktree removed; local and remote topic branches deleted 
 
 
 ---

@@ -267,12 +267,14 @@ impl Query {
             return Err(e);
         }
 
+        // Fence first: missing header_txs is Corrupt. Publishing confirmed[]
+        // before extend would leave tip ahead of height_of (leftover TipOnly hole).
         let t_tip = std::time::Instant::now();
-        self.store.confirmed.set_many(&confirmed_pairs)?;
         for item in items {
             self.store
                 .height_fence_extend(item.height, item.header_fk)?;
         }
+        self.store.confirmed.set_many(&confirmed_pairs)?;
         // Do not forget pending here: drain may still be inserting tx.head
         // (67438). Write forgets after drain.join() *and* this extend.
         // L2 write-behind barrier: complete-or-fail Class C image to disk **before**

@@ -54,7 +54,9 @@ before 1.0).
 
 - **Height fence extend is fail-closed.** Missing or empty `header_txs` for
   the header is `Corrupt`, not `Ok` with a live `height_of` hole (TipOnly
-  leftover miss that restart rebuild then heals).
+  leftover miss that restart rebuild then heals). Confirm publishes the
+  fence run **before** `confirmed[]` so a failed extend cannot leave tip
+  ahead of `height_of`.
 
 - **Invalidate evicts immature coinbase spends.** `QueryUtxoProvider`
   now ORs the input-null coinbase signal with first-in-block, so

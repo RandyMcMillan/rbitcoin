@@ -3088,6 +3088,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Missing `header_txs` makes extend fail-closed. Tip must not stay advanced
+    /// (`set_many` then extend would leave a fence hole at the new tip).
+    #[test]
+    fn confirm_missing_header_txs_does_not_advance_tip() {
+        let (dir, q) = temp_query("confirm-no-htxs");
+        let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
+        let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+
+        let (h1, _) = coinbase_block(1, prev, Some(h0.hash));
+        let h1_fk = q.ensure_header(&h1).unwrap();
+        let err = q
+            .confirm_blocks_run(&[ConfirmPrepared {
+                height: Height(1),
+                header_fk: h1_fk,
+                tx_fks: vec![],
+            }])
+            .expect_err("missing header_txs must fail confirm");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("header_txs"),
+            "shipped confirm error must name header_txs: {msg}"
+        );
+        assert_eq!(
+            q.tip_height(),
+            Some(Height(0)),
+            "failed extend must not leave confirmed tip ahead of the fence"
+        );
+        assert_eq!(
+            q.store().tx_height_get(Fk(1)).unwrap(),
+            Some(0),
+            "genesis fence run must remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Non-contiguous tx_fks in confirm_blocks_run + mark_spends multi-edge path.
     #[test]
     fn confirm_noncontiguous_fks_and_mark_spends() {

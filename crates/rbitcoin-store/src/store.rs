@@ -343,11 +343,12 @@ impl Store {
         Ok(())
     }
 
-    /// After `confirmed[]` advanced: append this height’s Class A run.
+    /// Append this height’s Class A run to the live fence.
     ///
-    /// Missing or empty `header_txs` is **Corrupt** — a silent `Ok` leaves
-    /// `height_of` None for that block’s creates and TipOnly leftover misses
-    /// (restart rebuild from disk then heals).
+    /// Confirm calls this **before** `confirmed.set_many` so a missing range
+    /// cannot leave tip ahead of `height_of`. Missing or empty `header_txs` is
+    /// **Corrupt** — a silent `Ok` leaves `height_of` None for that block’s
+    /// creates and TipOnly leftover misses (restart rebuild from disk then heals).
     pub fn height_fence_extend(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
         let Some((first, n)) = self.header_txs.get_range(header_fk)? else {
             return Err(StoreError::Corrupt(
@@ -725,8 +726,8 @@ impl Store {
         mode: TxidResolveMode,
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
-        // `height_fence_extend` for that whole machine (write `set_many` still
-        // publishes tip). Clone is O(blocks).
+        // `height_fence_extend`. Confirm extends before `set_many`, so tip
+        // cannot publish while this clone is in flight. Clone is O(blocks).
         let fence = self.fence().clone();
         crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
             &self.txs,

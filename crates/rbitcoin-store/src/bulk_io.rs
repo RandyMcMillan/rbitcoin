@@ -401,7 +401,7 @@ fn pread_batch_on_session_inner(
         }
     }
     let _ = session.drain_all();
-    // Signal caller to fall back to pread if any SQE failed.
+
     !any_fail
 }
 

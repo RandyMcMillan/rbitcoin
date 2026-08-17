@@ -27,11 +27,8 @@ mod reorg;
 mod state;
 mod status;
 
-// reorg module used by events/state; public surface via crate::most_work + tests.
-
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
-// compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
 
 use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
@@ -245,10 +242,9 @@ pub async fn ibd_cancellable(
             .unwrap_or(false)
     };
 
-    // Genesis must exist so getheaders locator is real and blocks link to tip.
     hub.ensure_genesis()?;
 
-    // Dual channels: body path (framed/decoded blocks) never waits behind Headers.
+    // Body events must not wait behind Headers (single-FIFO waste).
     let (body_tx, mut body_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let sinks = PeerEventSinks {
@@ -256,12 +252,8 @@ pub async fn ibd_cancellable(
         ctrl: ctrl_tx,
     };
 
-    // Peer TCP tasks share the node multi-thread runtime. Heavy CPU (block
-    // deserialize, archive prep, confirm scripts) runs off those workers
-    // (blocking pool / dedicated OS threads) so socket tasks stay schedulable.
-    // A second nested `ibd-net` runtime was removed: it **panicked on SIGINT**
-    // when the outer select dropped this future (`Cannot drop a runtime in an
-    // async context`).
+    // Nested `ibd-net` runtime panicked on SIGINT (`Cannot drop a runtime in an
+    // async context`) when the outer select dropped this future.
     {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -270,7 +262,6 @@ pub async fn ibd_cancellable(
             "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: lookup+load+scripts+write OS threads)"
         );
     }
-    // Dial book: persisted peers (flags) + seeds/connect, ranked by PeerFlags.
     let mut peer_sess = PeerBookSession::new(cfg.peers.clone(), peers);
     let next_peer_id = Arc::new(AtomicUsize::new(0));
 
@@ -326,7 +317,6 @@ pub async fn ibd_cancellable(
     // Background redial — never .await dial on the IBD event loop (that stalled tip).
     let mut last_redial = Instant::now() - Duration::from_secs(15);
     let mut redial_handle: Option<JoinHandle<dial::DialBatchResult>> = None;
-    // Consecutive redial batches that added zero peers (network-down / pool dead).
     let mut dark_redial_empty: u32 = 0;
 
     let accepted = Arc::new(AtomicU32::new(0));
@@ -335,19 +325,15 @@ pub async fn ibd_cancellable(
     let confirm_lag = Arc::new(AtomicU32::new(0));
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
-    // Snapshot for genuine 5s tip rate (progress + perf share this tick).
     let mut last_sample_tip = start_tip;
     let mut tip_rate_tracker = TipRateTracker::new();
     tip_rate_tracker.push(Instant::now(), start_tip);
-    // Max concurrent unique downloads (not tip-distance).
     let window = cfg.window;
 
     let mut st = IbdWorkState::new(initial_slots, hub.tip_hash(), hub.tip_height());
-    // Reload post-tip headers + Class A from disk so restart does not re-getdata
-    // bodies that are already archived (ordered path was process-local only).
     seed_work_path_from_store(&mut st, hub.as_ref());
 
-    // Kick header sync — try a few peers (channel may close if handshake race).
+    // Channel may close if handshake races the first getheaders.
     for _ in 0..st.slots.len().min(4) {
         let tips = work_path_tips(&st);
         if request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips).unwrap_or(false) {
@@ -356,7 +342,6 @@ pub async fn ibd_cancellable(
     }
 
     let loop_stats = Arc::new(LoopStats::default());
-    // Seed Class A body count from disk (not zero at restart).
     let store_class_a_bodies = hub.query.archived_block_count().unwrap_or(0);
     loop_stats
         .archived_bodies
@@ -364,17 +349,13 @@ pub async fn ibd_cancellable(
     if store_class_a_bodies > 0 {
         info!("ibd: store has {store_class_a_bodies} Class A bodies (seed)");
     }
-    // Contiguous densify horizon / receive refuse reference (tip+1 or resume).
     let archive_write_next = Arc::new(AtomicU32::new(if hub.tip_height().is_some() {
         st.max_ready_height.saturating_add(1)
     } else {
         0
     }));
-    // Pipeline pins are plan-local / BatchParents only (no process create FIFO).
-    // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
-    // Body queue is RAM-only (no durable wire payloads). Same-process residual
-    // still notes feed readiness; after restart the queue is empty.
+    // Body queue is RAM-only; restart is empty. Same-process residual can still note feed.
     match rehydrate_block_queue_into_confirm(hub.as_ref(), &mut st, confirm_feed.as_ref()) {
         Ok(n) if n > 0 => {
             rbitcoin_log::debug!("ibd: rehydrate: noted {n} in-RAM body queue entries");
@@ -384,8 +365,6 @@ pub async fn ibd_cancellable(
             warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
-    // Class A on the tip path (partial confirm / prior densify) → reconstruct
-    // into BQ for the tip batch so claim_ready without peer re-getdata.
     match rehydrate_class_a_into_body_queue(
         hub.as_ref(),
         &mut st,
@@ -396,7 +375,6 @@ pub async fn ibd_cancellable(
             info!("ibd: Class A rehydrate filled {n} body-queue height(s) for tip batch");
         }
         Ok(0) => {
-            // Silence is what made the tip+1 has_block stall look like "no errors".
             rbitcoin_log::debug!(
                 "ibd: Class A rehydrate filled 0 (tip+1 missing height map, has_block, or no Class A)"
             );
@@ -406,7 +384,6 @@ pub async fn ibd_cancellable(
             warn!("ibd: Class A rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
-    // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
     info!("ibd: confirm pipeline lookup+load+scripts+write (raw BQ wire; single Class A commit)");
@@ -420,7 +397,6 @@ pub async fn ibd_cancellable(
         Arc::clone(&accepted),
         Arc::clone(&loop_stats),
     );
-    // Seed engine with any bodies already in the RAM queue for the work path.
     offer_confirm_ready(
         &confirm_feed,
         &st.height_to_hash,
@@ -437,21 +413,16 @@ pub async fn ibd_cancellable(
             warn!("ibd: cancel requested — stopping IBD");
             break;
         }
-        // Yield occasionally so shutdown can run; every-tick yield_now burned
-        // scheduler time while confirm already saturates cores.
         loop_n = loop_n.wrapping_add(1);
         if loop_n.is_multiple_of(8) {
             tokio::task::yield_now().await;
         }
 
-        // Confirm results first — keep tip moving even when peer header floods
-        // dominate drain budget (and free ordered front for the next offer).
         while let Ok(ev) = confirm_ev_rx.try_recv() {
             match ev {
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                    // Body accepted — drop from ordered and mark archived.
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -459,8 +430,6 @@ pub async fn ibd_cancellable(
                     max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
-                    // No body queue / Class A for this hash — clear pending+known so
-                    // densify can re-getdata tip holes (do not leave soft-stall).
                     st.body.demote_known(hash);
                     st.body.mark_missing(hash);
                 }
@@ -477,7 +446,6 @@ pub async fn ibd_cancellable(
             }
         }
 
-        // Drain all ready peer events **before** stall checks.
         if !drain_ready_peer_and_archive_events(
             &mut st,
             hub.as_ref(),
@@ -492,7 +460,6 @@ pub async fn ibd_cancellable(
             break;
         }
 
-        // Drop already-confirmed / past-tip prefixes from the ordered queue.
         let tip_now = hub.tip_height().unwrap_or(0);
         while let Some(&front) = st.ordered.front() {
             let past = hub.has_block(&front)
@@ -504,14 +471,8 @@ pub async fn ibd_cancellable(
                 break;
             }
         }
-        // Compact ghosts + bound hash_height / header_fks (see IbdWorkState::hygiene).
         st.hygiene();
 
-        // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Soft BQ assign (no hysteresis): under ~100 MiB free densify ahead; over
-        // that only the next ~1 min of confirm work at tip rate. Peer reads /
-        // block_queue_offer never consult soft limits. Tip-hole race always
-        // runs. Window covered → Critical.
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let _ = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
         let (_bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
@@ -538,13 +499,10 @@ pub async fn ibd_cancellable(
             tip_rate_opt,
         );
 
-        // Complete multi-hop reorg when mid bodies landed (BQ/held) without
-        // waiting for another BadPrev reject cycle.
         if st.reorg.awaiting().is_some() && try_complete_awaiting_reorg(&mut st, hub.as_ref()) {
             last_progress = Instant::now();
         }
 
-        // Note claim-ready heights into the confirm feed (body queue / pending wire only).
         offer_confirm_ready(
             &confirm_feed,
             &st.height_to_hash,
@@ -554,13 +512,11 @@ pub async fn ibd_cancellable(
             &max_ready_shared,
         );
         update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
-        // Apply confirm results without doing Class C on this task.
         while let Ok(ev) = confirm_ev_rx.try_recv() {
             match ev {
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                    // Body accepted — drop from ordered and mark archived.
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -583,7 +539,6 @@ pub async fn ibd_cancellable(
                 }
             }
         }
-        // Progress may have arrived (peer IO is concurrent).
         if !drain_ready_peer_and_archive_events(
             &mut st,
             hub.as_ref(),
@@ -597,9 +552,6 @@ pub async fn ibd_cancellable(
         )? {
             break;
         }
-        // Re-assign only if drain/confirm freed meaningful inflight slots
-        // (avoid double planner work every loop tick). Empty inflight + saturated
-        // pipeline still runs Critical only (write_next race / tip hole).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
             let tip_rate2 = tip_rate_tracker.eta_rate(Instant::now());
@@ -625,12 +577,8 @@ pub async fn ibd_cancellable(
             );
         }
 
-        // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
-        //
-        // Sparse far-only readiness used to push max_ready ≈ max_ordered while
-        // most bodies were still missing. That made the soft-cap bypass look
-        // empty forever → header floods and drain livelock. Only bypass soft
-        // cap when the ordered path is **mostly claim-ready** (dense).
+        // Soft-cap `ordered_set` (not deque ghosts). Bypass only when the path is dense
+        // (sparse far-ready used to look empty forever → header flood / drain livelock).
         {
             let live = st.ordered_set.len();
             let known_ready = st.body.known_len();
@@ -651,8 +599,6 @@ pub async fn ibd_cancellable(
                 if live == 0 {
                     let fan = empty_path_header_fan(lag, st.inflight.len(), alive);
                     if fan == 0 {
-                        // Near tip: remaining work is inflight/BQ/confirm, not
-                        // another locator walk. Let catch-up complete / SH / follow.
                         st.headers_done = true;
                     } else {
                         let tips = work_path_tips(&st);
@@ -674,14 +620,11 @@ pub async fn ibd_cancellable(
             }
         }
 
-        // Hard path reset after a long stall with no tip advance.
-        // Do not clear a full st.ordered queue that simply has not finished getdata yet.
+        // Hard reset only when ordered is empty — a full queue still waiting on getdata is not stalled.
         if last_progress.elapsed() > cfg.stall.saturating_mul(6)
             && st.ordered.is_empty()
             && st.inflight.is_empty()
         {
-            // Rebuild ordered from any retained hash_height above tip (known
-            // headers that lost ordered membership after tip drain / hygiene).
             let tip_now = hub.tip_height().unwrap_or(0);
             let mut above: Vec<(u32, bitcoin::BlockHash)> = st
                 .hash_height
@@ -701,7 +644,6 @@ pub async fn ibd_cancellable(
                     rebuilt += 1;
                 }
             }
-            // Store may still hold unconfirmed headers past tip (ensure_header_fk).
             let before_seed = st.ordered.len();
             seed_work_path_from_store(&mut st, hub.as_ref());
             let seeded = st.ordered.len().saturating_sub(before_seed);
@@ -711,7 +653,6 @@ pub async fn ibd_cancellable(
                 st.ordered.len()
             );
             st.headers_done = false;
-            // Refresh height_to_hash for densify/offer after rebuild.
             for (&h, &ht) in &st.hash_height {
                 if st.ordered_set.contains(&h) {
                     st.height_to_hash.insert(ht, h);
@@ -722,7 +663,6 @@ pub async fn ibd_cancellable(
             last_progress = Instant::now();
         }
 
-        // Stall only after progress events are applied.
         let now = Instant::now();
         disconnect_stalled_block_peers(
             &mut st.slots,
@@ -731,8 +671,6 @@ pub async fn ibd_cancellable(
             now,
             cfg.stall,
         );
-        // Relative-slow outliers (warm-up + cluster gate + hysteresis); absolute
-        // stall above remains the zero-progress floor.
         disconnect_relative_slow_block_peers(
             &mut st.slots,
             &mut st.inflight,
@@ -740,11 +678,9 @@ pub async fn ibd_cancellable(
             now,
             &mut st.relative_slow_suspect,
         );
-        // Drop dead st.slots so we do not keep ghost rows (Drop aborts IO if needed).
         st.slots.retain(|s| s.alive);
         expire_addr_cooldown(&mut st.addr_cooldown, now);
 
-        // Collect finished background dials without blocking the event loop.
         if redial_handle
             .as_ref()
             .map(|h| h.is_finished())
@@ -783,8 +719,6 @@ pub async fn ibd_cancellable(
                                 st.slots.iter().filter(|s| s.alive).count()
                             );
                             dark_redial_empty = 0;
-                            // Fresh peers need getheaders when the work path is empty
-                            // (tip=0 / mid-chain peer death wiped slots before responses).
                             if st.ordered.is_empty() && !st.headers_done {
                                 let tips = work_path_tips(&st);
                                 let _ =
@@ -802,12 +736,9 @@ pub async fn ibd_cancellable(
             }
         }
 
-        // Kick a non-blocking redial if under target and none in flight.
         // When *all* peers are dead (network blip), do not wait for the 15s
         // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
-        // Target live peers is independent of pool size; getaddr grows the book
-        // so we can reach `target_peers` even when seeds alone were sparse.
         let target = cfg.target_peers.max(1);
         let redial_interval = if alive_n == 0 {
             Duration::from_secs(0)
@@ -842,8 +773,6 @@ pub async fn ibd_cancellable(
             last_redial = Instant::now();
         }
 
-        // Centralized ~5s operator tick: genuine window rates + progress + perf.
-        // (No separate 1s "chunk size / elapsed" progress path — that lied.)
         if last_status.elapsed() >= Duration::from_secs(5) {
             let now = Instant::now();
             let window_secs = last_status.elapsed().as_secs_f64().max(0.001);
@@ -859,7 +788,6 @@ pub async fn ibd_cancellable(
                 .status_scan_ns
                 .fetch_add(scan_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            // Genuine tip rate over this 5s window (height delta / wall).
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
             let tip_rate = tip_delta as f64 / window_secs;
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
@@ -870,7 +798,6 @@ pub async fn ibd_cancellable(
                 g.inflight.clone()
             };
             let ready_n = confirm::confirm_ready_count(&hub.query, path_lo, &inflight_h);
-            // Class A fks published in tx.idx (dense create_fk high-water).
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
             let (_bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
@@ -881,9 +808,6 @@ pub async fn ibd_cancellable(
             let bq_soft_stop = rbitcoin_query::soft_confirm_window_n(eta_rate);
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
-            // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // ready= BQ resolve-complete; scriptq/writeq `name<0/cap` = empty.
-            // bq soft=n/win RAM=: in-RAM body queue; win = 1-min confirm window at rate.
             let conf_q = confirm::format_conf_q(
                 ready_n,
                 script_q,
@@ -916,7 +840,6 @@ pub async fn ibd_cancellable(
                 .ready_hwm
                 .saturating_sub(prog.tip)
                 .saturating_add(st.inflight.len() as u32);
-            // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
             let conf_q_hwm = confirm_queues.sample_hwm_and_reset();
             let mut conf_pipe = confirm_queues.content_snap();
@@ -949,15 +872,7 @@ pub async fn ibd_cancellable(
             );
             perf_log::log_sample(&perf);
 
-            // Stall watchdog: tip frozen while path looks claim-ready — real confirm
-            // bug only when the **confirm pipeline is idle**. Mid-mainnet batches
-            // load+scripts+write often take 8–15s (and cold restart first batch
-            // longer); peer `inflight` empty is normal with a full body queue.
-            // Do **not** WARN while feed has claims or lookup/load/scripts/write
-            // queues hold work (post-rehydrate cold start used to spam tip stall with
-            // ready=false even though load was live on tip+1).
-            // ready_n is inventory (BQ painted), not occupancy — a blacklist
-            // stall can sit with ready>0 and an idle pipeline.
+            // Stall WARN only if the pipeline is idle. ready_n is BQ inventory, not occupancy.
             let conf_busy = feed_inflight > 0
                 || script_q > 0
                 || write_q > 0
@@ -970,7 +885,6 @@ pub async fn ibd_cancellable(
             {
                 let expect = prog.tip.saturating_add(1);
                 let hth = st.height_to_hash.get(&expect).copied();
-                // Claim-ready includes body-queue pending (not only Class A).
                 let ready = hth
                     .map(|h| claim_ready(hub.as_ref(), &mut st.body, expect, &h))
                     .unwrap_or(false);
@@ -1027,7 +941,6 @@ pub async fn ibd_cancellable(
                 break;
             }
             if header_lag_behind_peers(&st, tip_h) > 2 {
-                // Path empty but peers still ahead — resume header sync.
                 st.headers_done = false;
                 let tips = work_path_tips(&st);
                 let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
@@ -1056,14 +969,10 @@ pub async fn ibd_cancellable(
                         "all peers dead mid catch-up (not complete)",
                     ));
                 }
-                AllPeersDead::WaitRedial => {
-                    // Redial in flight: fall through to select! and wait.
-                }
+                AllPeersDead::WaitRedial => {}
             }
         }
 
-        // Wait for the next peer/archive event or a short tick.
-        // Prefer body path (blocks) over headers so delivered bytes are applied first.
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
         tokio::select! {
@@ -1119,7 +1028,6 @@ pub async fn ibd_cancellable(
                         ConfirmEvent::Accepted { hash } => {
                             last_progress = Instant::now();
                             remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                            // Same release as main-loop drains (wire-path charge).
                             st.body.mark_archived(hash);
                             let tip = hub.tip_height().unwrap_or(0);
                             archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -1157,7 +1065,6 @@ pub async fn ibd_cancellable(
                         );
                         break;
                     }
-                    // Mid catch-up: re-kick headers; never silent Ok-exit.
                     warn!(
                         "ibd: stall with empty path tip={tip_h} max_peer_height={} lag={} peers={} — re-request headers (not complete)",
                         st.max_peer_height,
@@ -1176,23 +1083,16 @@ pub async fn ibd_cancellable(
     let cancelled_exit = cancelled();
     let t_teardown = Instant::now();
 
-    // 1) Network first: stop downloads + disconnect every peer immediately.
-    //    Do this before waiting on confirm/archive so SIGINT is responsive.
     disconnect_all_peers(&mut st);
     if let Some(h) = redial_handle.take() {
         h.abort();
     }
     info!("ibd: peers disconnected in {:?}", t_teardown.elapsed());
 
-    // 2) Signal cooperative stops. Confirm cancel aborts load so
-    //    the engine can exit; we **always join** it before returning (no ghost
-    //    rejects minutes after "clean exit").
+    // Always join confirm before return (no ghost rejects after "clean exit").
     confirm_feed.request_stop();
     hub.query.request_confirm_cancel();
 
-    // Confirm join: wait until the OS thread exits. Cancel makes waits abort in
-    // milliseconds; a mid-wave script check may still take a bit — better that
-    // than logging rejects after "clean exit" from a leaked join.
     info!(
         "ibd: waiting for confirm engine to stop ({:?})…",
         t_teardown.elapsed()

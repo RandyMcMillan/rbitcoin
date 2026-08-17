@@ -132,7 +132,6 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let query = Query::open_or_create_layout(config.store_layout())?;
-    // Mempool is opened in `run_p2p` after ChainHub has `Arc<Query>`.
     Ok(NodeHandle {
         config,
         query,
@@ -154,10 +153,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Index mode selection on restart:
-    // - **shindex + tip-ready** (durable SH covers Class A tip): stay Tip with SH
-    //   write-through — tip-follow only a few blocks behind must not recollect.
-    // - Otherwise Direct IBD: archive tx.head, confirm spends; SH runs only if shindex.
+    // Restart: shindex + tip-ready stays Tip (do not recollect). Else Direct IBD.
     handle.query.set_sh_index_enabled(config.shindex);
     if let Err(e) = handle.query.set_sptweaks_enabled(
         config.sptweaks,
@@ -251,9 +247,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
-    // Tweaks are not write-through in Direct. Backfill only in Tip
-    // (SH-warm restart here; post-IBD after enter_tip_mode). Once so both
-    // sites do not launch two walkers.
+    // Tweaks are not write-through in Direct. Once so both sites do not launch two walkers.
     if config.sptweaks && node.hub.query.index_mode().is_tip() {
         spawn_sptweaks_backfill(
             Arc::clone(&node.hub.query),
@@ -262,7 +256,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    // Persisted peer book (discovered addrs + PeerFlags) under datadir.
     let peers_path = config.datadir.join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -301,12 +294,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else if config.signet_challenge.is_some() && config.connect.is_empty() && addrman.is_empty() {
         warn!("custom signet has no peers; use --connect ADDR or reuse a datadir with known peers");
     }
-    // Shared with IBD so learned addrs/flags flush back on IBD exit.
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
 
     let max_out = config.max_outbound.max(1) as usize;
-    // Seed **candidates** (pool) vs live **target_peers** (max_out). Pool is
-    // larger so connect failures still leave enough live download peers.
     let candidate_n = max_out.saturating_mul(2).clamp(16, 48);
     let targets = if !config.connect.is_empty() {
         config.connect.clone()
@@ -314,11 +304,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         addrman.take_outbound(max_out)
     };
 
-    // Catch-up: concurrent multi-peer download window (libbitcoin-class).
     let ibd_targets = if !config.connect.is_empty() {
         config.connect.clone()
     } else {
-        // Prefer a wide ranked sample (flag-aware, IPv4-first).
         addrman.take_outbound(candidate_n)
     };
     // True only after IBD reports true catch-up (or no peers to dial).
@@ -327,7 +315,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let target_peers = max_out.clamp(8, 32);
         let ibd_cfg = IbdConfig {
-            // Concurrent getdata cap 1024; per-peer in-transit 16 (archive may lead tip).
             window: rbitcoin_net::DEFAULT_IBD_WINDOW,
             per_peer: rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
             target_peers,
@@ -377,7 +364,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 if shutdown.requested() {
                     warn!("signal: IBD cancelled ({e})");
                 } else {
-                    // No alternate sync path: restart resumes catch-up indexes.
                     warn!(
                         "ibd: incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode; restart to resume)",
                         node.tip_height()
@@ -385,7 +371,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }
         }
-        // Pull learned peers/flags from IBD back into local book + disk.
         if let Ok(g) = shared_peers.lock() {
             addrman = g.clone();
         }
@@ -409,13 +394,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         info!("ibd: tip work below -minimumchainwork — following without relay");
     }
 
-    // ── Steady state: tip tracking + block relay ────────────────────────────
-    // After true catch-up: enter tip index mode (always), optionally SH bulk when
-    // shindex, then long-lived follow peers. `tx.head` and spend annotations are
-    // already correct from Direct IBD — tip entry does not re-scan Class A.
-    //
-    // **tip_follow_ready ≠ sh_tip_ready:** follow peers + mempool relay do not
-    // wait on SH materialize. Electrum/Esplora require shindex && sh_tip_ready.
+    // tip_follow_ready ≠ sh_tip_ready: follow/relay do not wait on SH materialize.
     let mut tip_follow_ready = false;
     let mut sh_tip_ready = false;
     if catch_up_complete && !shutdown.requested() {
@@ -434,9 +413,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     Arc::clone(&shutdown.flag),
                 );
             }
-            // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
-            // `-blocksonly` keeps relay off (blocks still follow).
-            // `-minimumchainwork` keeps relay off until tip work meets the floor.
             if !config.blocksonly && tip_meets_min_work(&config, &node.hub) {
                 mempool.set_relay_enabled(true);
             }
@@ -458,10 +434,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    // Persistent follow: stay connected for tip relay after catch-up.
-    // Bound each connect so a single dead seed cannot stall post-IBD for minutes
-    // (OS TCP timeouts are often 2+ min; IBD dial already uses 8s).
-    // Each session actively getheaders from tip.
     if tip_follow_ready && !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
         const FOLLOW_CONNECT_SECS: u64 = 8;
@@ -499,8 +471,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Electrum: share Query + mempool; bridge ChainHub tip events → header push.
-    // Requires shindex and durable SH tip-ready (not tip_follow alone).
     let mut electrum_handles = Vec::new();
     let mut electrum_bridge = None;
     if sh_tip_ready {
@@ -558,9 +528,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Esplora REST + wallet WebSocket (plain HTTP; TLS via reverse proxy).
-    // Tip bridge is independent of Electrum so want:blocks works with Electrum off.
-    // Requires shindex + SH tip-ready — history endpoints need durable scripthash.
     let mut esplora_handles = Vec::new();
     let mut esplora_tip_bridge = None;
     if sh_tip_ready {
@@ -608,9 +575,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }
         }
-    } // sh_tip_ready (esplora)
+    }
 
-    // Core-class JSON-RPC (independent of SH / Electrum). Default off.
     let mut rpc_handle: Option<RpcHandle> = None;
     if let Some(addr) = config.rpc_listen {
         if !shutdown.requested() {
@@ -669,12 +635,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Tip-follow loop until max_run (`Some(0)` = exit after catch-up + tip mode)
-    // or until a shutdown signal.
-    //
-    // Quiet like Core: log **tip updates** only; when tip looks stale open an
-    // extra outbound (log that). No periodic "at tip" heartbeat.
-    // Independent of SH / Electrum readiness.
     if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
         let deadline = config
             .max_run_secs
@@ -683,17 +643,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let mut seed_offset = targets.len().min(max_out.min(3));
         let started = Instant::now();
         let mut last_tip_change = Instant::now();
-        // How long tip may sit still before dialing an extra peer for a higher tip.
-        // Signet ~10m blocks; avoid thrashing.
         const STALE_TIP_SECS: u64 = 600;
-        // How often to re-check staleness when no tip event arrives.
         const STALE_POLL_SECS: u64 = 60;
-        // DEBUG tip: perf cadence (mirror IBD 5s sample-and-reset).
         const TIP_PERF_SECS: u64 = 5;
         let mut tip_rx = node.hub.subscribe_tips();
         let mut perf_tick = tokio::time::interval(Duration::from_secs(TIP_PERF_SECS));
         perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // First tick fires immediately — skip so window is a full 5s.
         perf_tick.tick().await;
         let mut rpc_stop_tick = tokio::time::interval(Duration::from_millis(50));
         rpc_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -726,7 +681,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 &mut stale_poll,
             )
             .await;
-            // RPC `stop` method.
             if let Some(ref h) = rpc_handle {
                 if h.stop.load(Ordering::SeqCst) {
                     info!("rpc: stop — shutting down");
@@ -752,7 +706,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
 
             if matches!(wake, TipFollowWake::Perf) {
-                // Always sample-and-reset so DEBUG-off windows do not accumulate.
                 let mp = mempool.sample_reset_perf();
                 let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
                 let (el_n, el_us, el_max) = rbitcoin_electrum::sample_reset_perf();
@@ -798,10 +751,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             let follow_live = node.follow_live_count();
             let kind = tip_follow_wake_kind(&wake, last_tip);
             if let TipFollowWake::Tip(ev) = &wake {
-                // Prefer event height when present (same as store tip after accept).
                 let h = ev.height;
                 if h != last_tip {
-                    // No blk/s: tip-follow only validates blocks as peers deliver them.
                     info!(
                         "node: tip={h} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                     );
@@ -814,7 +765,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
 
-            // Poll path: tip advance without event (shouldn't be common), or staleness.
             if tip != last_tip {
                 info!(
                     "node: tip={tip} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
@@ -833,9 +783,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
 
-            // Stale tip: dial one more outbound. New sessions always getheaders from
-            // our locator (existing live sessions also re-poll every 2m).
-            last_tip_change = Instant::now(); // rate-limit reconnect attempts
+            last_tip_change = Instant::now();
             let extra = addrman.take_outbound_offset(1, seed_offset);
             seed_offset = seed_offset.saturating_add(1);
             for peer in extra {
@@ -866,8 +814,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         }
                     }
                 } else {
-                    // Catch-up never finished cleanly — re-run IBD against this peer
-                    // (never enter tip mode from a partial download).
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
                     let retry_cfg = catch_up_retry_config(std::sync::Arc::clone(&shared_peers));
                     let cancel = Some(Arc::clone(&shutdown.flag));
@@ -905,7 +851,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    // Final peer book flush (tip-follow may have used stale clone; re-sync from shared).
     if let Ok(g) = shared_peers.lock() {
         addrman.merge_from(&g);
     }
@@ -934,7 +879,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let _ = h.await;
     }
     if let Some(h) = rpc_handle {
-        // Honour RPC `stop` if requested before process signal.
         if h.stop.load(Ordering::SeqCst) {
             info!("rpc: stop requested via JSON-RPC");
         }
@@ -1024,7 +968,6 @@ pub(crate) fn enter_tip_mode(
     shindex: bool,
 ) -> TipModeGates {
     query.set_sh_index_enabled(shindex);
-    // Tip index flags first — follow peers must not wait on SH.
     query.enter_tip_index_mode();
     info!(
         "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
@@ -1039,7 +982,6 @@ pub(crate) fn enter_tip_mode(
         };
     }
 
-    // Fast path: already materialized and watermarks cover tip (near-tip restart).
     if query.sh_is_tip_ready() {
         let _ = query.sync_sh_seal_from_include_hwm();
         info!(
@@ -1053,8 +995,6 @@ pub(crate) fn enter_tip_mode(
         };
     }
 
-    // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
-    // Retries incomplete `*.run.mat` claims / CHECKPOINT / READY from crash/SIGINT.
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");
     let cancel_ref = cancel.as_deref();
     let sh_ok = match query.finalize_sh_runs_cancellable(cancel_ref) {

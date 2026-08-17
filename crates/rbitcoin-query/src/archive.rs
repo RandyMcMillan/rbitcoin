@@ -171,7 +171,6 @@ impl ArchiveWritePlan {
         if new_ranges.len() == self.per_header_ranges.len() {
             return Ok(true);
         }
-        // Compact packed / planned_fks / batch_pin to kept create fks (order preserved).
         let old_packed = std::mem::take(&mut self.packed);
         let old_fks = std::mem::take(&mut self.planned_fks);
         let old_pin = std::mem::take(&mut self.batch_pin);
@@ -217,7 +216,6 @@ impl ArchiveWritePlan {
         if other.is_empty() && other.per_header_ranges.is_empty() {
             return;
         }
-        // Drop residual staging (should be empty after freeze_after_pin).
         other.external_parent_outs.clear();
         other.external_parent_ranges.clear();
         other.external_parent_txids.clear();
@@ -293,7 +291,6 @@ impl Query {
         }
         let mut header_fks = Vec::with_capacity(items.len());
         let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
-        // First occurrence wins inside one plan batch (duplicate peer deliveries).
         let mut seen_headers = crate::FkSet::default();
         for (fk, _header, txs) in items.iter_mut() {
             header_fks.push(*fk);
@@ -302,7 +299,6 @@ impl Query {
                 continue;
             }
             if self.store.header_txs.has_body(*fk)? {
-                // Keep existing first_tx_fk / fence / strong alignment.
                 let _ = std::mem::take(txs);
                 continue;
             }
@@ -393,7 +389,6 @@ impl Query {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
 
-        // Every plan/load pack: header-cache GC from store tip.
         self.on_load_pack()?;
         if need.is_empty() {
             return Ok(ArchiveWritePlan::empty());
@@ -402,9 +397,6 @@ impl Query {
         let mut next_tx = next_tx_start.max(1);
         let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
 
-        // Pass 1: assign contiguous create fks + batch_map (for parent resolve only).
-        // No durable tx.head create reuse; no cross-block body reuse. Duplicate
-        // hash must be dropped before plan (has_body / mid-pipeline).
         let t_assign = Instant::now();
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
@@ -425,7 +417,6 @@ impl Query {
             for ta in txs.drain(..) {
                 let n_in = ta.inputs.len() as u32;
                 let n_out = ta.outputs.len() as u32;
-                // Duplicate txid in one block is a consensus violation — hard error.
                 if !seen_in_block.insert(ta.tx.txid) {
                     return Err(StoreError::Corrupt(
                         "duplicate txid in block body (consensus violation)",
@@ -448,7 +439,6 @@ impl Query {
         }
         let assign_ns = t_assign.elapsed().as_nanos() as u64;
 
-        // Pass 2: unique external prev_txids that still need fk (reads only).
         let t_collect = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         for (_sfk, _tx, inputs, _) in &work {
@@ -473,7 +463,6 @@ impl Query {
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         let mut pin_txid_n = 0u64;
 
-        // In-flight first so pin_txid bulk skips those keys (one walk after).
         let t_inflight = Instant::now();
         let mut still_need: Vec<&[u8; 32]> = Vec::new();
         for t in &need_vec {
@@ -485,7 +474,6 @@ impl Query {
         }
         let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
-        // One lock for all remaining pin_txid keys (not one mutex per txid).
         let t_pin_txid = Instant::now();
         let pin_hits = match parent_store {
             Some(store) if !still_need.is_empty() => {
@@ -529,7 +517,6 @@ impl Query {
                 resolved.len().saturating_add(need_head.len()),
                 Default::default(),
             );
-        // Reverse map for in-flight / pin / head binds already in `resolved`.
         for (txid, fk) in &resolved {
             if let Some(id) = fk.get() {
                 external_parent_txids.insert(id, *txid);
@@ -609,8 +596,6 @@ impl Query {
         );
         crate::archive_phase_stats::note_pin_txid(pin_txid_n, pin_txid_ns);
 
-        // Pass 3: stamp create_fk on inputs; tip spends list; build shared CreatePin.
-        // Outs move into Arc once — packed pin half and batch_pin share that Arc.
         let t_stamp = Instant::now();
         let mut packed: Vec<(CreatePin, Vec<InputRecord>)> = Vec::with_capacity(work.len());
         let mut batch_pin: Vec<CreatePin> = Vec::with_capacity(work.len());
@@ -684,7 +669,6 @@ impl Query {
                     if seen_range.insert(id) {
                         need_range.push(Fk(id));
                     }
-                    // Wire reverse map may already be set; ensure identity key present.
                     if !external_parent_txids.contains_key(&id) {
                         if inp.prev_txid != [0u8; 32] {
                             external_parent_txids.insert(id, inp.prev_txid);
@@ -788,7 +772,6 @@ impl Query {
         if plan.packed.is_empty() {
             return Ok(false);
         }
-        // Skip re-append of headers already linked in header_txs (retry path).
         if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
             return Ok(false);
         }
@@ -801,8 +784,6 @@ impl Query {
             .reserve_append(plan.body_est, plan.packed.len() as u64)?;
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
-        // Body append first (no head), then head insert — separate timers.
-        // Encode from shared CreatePin + inputs (no deep outs reclone).
         let t = Instant::now();
         let got_tx_fks = self
             .store

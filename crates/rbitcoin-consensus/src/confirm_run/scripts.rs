@@ -5,8 +5,6 @@ use super::*;
 pub fn confirm_scripts_phase(
     mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
-    // Test-only: hold the first in-flight wave until a second async submit is
-    // observed (proves production feed-ahead claims during join).
     scripts_feed_test_sync::on_phase_enter();
     let t_work = Instant::now();
     script_wave(&batch.prepared, &batch.script_preverified)?;
@@ -144,7 +142,6 @@ pub fn confirm_scripts_feed_ahead(
     let mut out = Vec::new();
     let mut next = iter.next().map(confirm_scripts_phase_async);
     loop {
-        // Keep offering the following batch while joining current.
         let outcome =
             join_scripts_polling(&current, std::time::Duration::from_micros(200), || {
                 if next.is_none() {
@@ -218,10 +215,8 @@ pub fn scripts_stage_from_load_channel(
             }
             Err(e) => {
                 let cont = on_err(e, meta);
-                // Drop later batch without treating it as write-ready.
-                if let Some((h, m)) = lookahead.take() {
+                if let Some((h, _)) = lookahead.take() {
                     let _ = h.join();
-                    let _ = m; // caller finishes heights via on_err if needed
                 }
                 if !cont {
                     break;
@@ -297,7 +292,6 @@ pub mod scripts_feed_test_sync {
         if !HOLD_FIRST.load(Ordering::SeqCst) {
             return;
         }
-        // Only the first wave holds.
         if FIRST_ENTERED.swap(true, Ordering::SeqCst) {
             return;
         }

@@ -33,6 +33,13 @@ before 1.0).
 
 ### Changed
 
+- **Source-code comments are a smell.** `CONTRIBUTING.md` now states that
+  a comment restating *what* the next code does, *why* it exists, or a
+  *weird* approach usually means names, signatures, or the library fit
+  are unclear. Most `//` comments should not exist; remaining ones name
+  an invariant, protocol, `SAFETY` requirement, or library quirk. First-party
+  production sources were cleaned to that bar.
+
 - **Core debug.log campaign (Step 21).** BIP34/66/65 outdated `nVersion`
   is `bad-version(0x…)`. Connect script fail logs
   `Block validation error: …` (`SIG_DER` / five CLTV parens).

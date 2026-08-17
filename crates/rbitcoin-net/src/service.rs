@@ -125,7 +125,6 @@ impl P2PNode {
                     tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
                 match accept {
                     Ok(Ok((stream, peer_addr))) => {
-                        // Cap concurrent inbound sessions (handshake + serve).
                         let Ok(permit) = inbound_sem.clone().try_acquire_owned() else {
                             rbitcoin_log::warn!(
                                 "p2p: reject inbound {peer_addr} (at max_inbound={max_inbound})"

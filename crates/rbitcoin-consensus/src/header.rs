@@ -28,7 +28,6 @@ pub fn validate_header(
             return Err(ConsensusError::BadPrev);
         }
 
-        // Median-time-past: timestamp must be strictly greater than MTP of prior blocks.
         let mtp = median_time_past(query, prev_height)?;
         if header.time <= mtp {
             return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
@@ -58,13 +57,11 @@ pub fn validate_header(
         }
     }
 
-    // Expected difficulty / bits
     let expected_bits = expected_next_bits(query, params, height)?;
     if header.bits != expected_bits {
         return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
     }
 
-    // Proof of work against claimed bits (and pow limit)
     let target = Target::from_compact(header.bits);
     if target > params.pow_limit {
         return Err(ConsensusError::BadHeader("target above pow limit"));
@@ -294,7 +291,6 @@ pub fn expected_next_bits(
     height: Height,
 ) -> Result<CompactTarget, ConsensusError> {
     if height.0 == 0 {
-        // Genesis bits are fixed by the genesis block itself; callers validate hash.
         let g = crate::params::genesis_block(params);
         return Ok(g.header.bits);
     }

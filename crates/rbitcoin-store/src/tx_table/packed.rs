@@ -72,9 +72,7 @@ impl InputRecord {
             flags |= input_flags::NULL_PREV;
         }
         out.push(flags);
-        if null_prev {
-            // nothing
-        } else {
+        if !null_prev {
             debug_assert!(
                 !self.create_fk.is_null(),
                 "non-coinbase input requires create_fk before encode"
@@ -255,7 +253,6 @@ impl InputRecord {
 
     /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
-        // flags + create_fk(8) + vout + sequence + script + witness (upper bound)
         1 + 8
             + 9
             + 4
@@ -270,9 +267,9 @@ impl InputRecord {
     pub fn encoded_len_exact(&self) -> usize {
         use crate::compact::compact_size_len;
         let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
-        let mut n = 1usize; // flags
+        let mut n = 1usize;
         if !null_prev {
-            n += 8; // create_fk
+            n += 8;
             n += compact_size_len(u64::from(self.prev_index));
         }
         if self.sequence != u32::MAX {

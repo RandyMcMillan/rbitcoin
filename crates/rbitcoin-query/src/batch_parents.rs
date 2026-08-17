@@ -40,7 +40,6 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-// Re-export store identity maps for confirm/query call sites (single source in store).
 pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 
 /// Relative offset sentinel: layout unknown for this out.
@@ -200,7 +199,6 @@ impl SharedParentPin {
     ///
     /// Uses RCU so concurrent widens from peer batches merge correctly.
     fn publish_outs(&self, f: impl Fn(&PinOuts) -> Option<PinOuts>) {
-        // Fast no-op: lock-free load, skip atomic store when already covered.
         let cur = self.outs.load_full();
         if f(cur.as_ref()).is_none() {
             return;
@@ -230,7 +228,6 @@ impl SharedParentPin {
     }
 
     fn merge_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) {
-        // Shared-hit fast path: peer batch already pinned these vouts.
         let snap = self.load_outs();
         if snap.covers_need(checked) && (live.is_empty() || snap.has_all_live(&live)) {
             return;
@@ -455,7 +452,6 @@ impl PipelineParentStore {
         if publish_ids.is_empty() {
             return;
         }
-        // Phase 1 under lock: insert vacant Weaks; collect conflicts to merge outside.
         let mut conflicts: Vec<(u64, Arc<SharedParentPin>, Arc<SharedParentPin>)> = Vec::new();
         {
             let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -485,7 +481,6 @@ impl PipelineParentStore {
                 g.by_txid.retain(|_, w| w.strong_count() > 0);
             }
         }
-        // Phase 2 outside lock: compose local → existing halves, swap batch handle.
         for (id, existing, local) in conflicts {
             let src_outs = local.load_outs();
             let src_lay = local.load_layout();
@@ -598,7 +593,6 @@ impl BatchParents {
         if self.publish_ids.is_empty() {
             return;
         }
-        // Dedup in case the same id was vacant-inserted twice (should not happen).
         self.publish_ids.sort_unstable();
         self.publish_ids.dedup();
         store.bulk_publish_ids(&mut self.pins, &self.publish_ids);
@@ -651,7 +645,6 @@ impl BatchParents {
         match self.pins.entry(id) {
             std::collections::hash_map::Entry::Occupied(o) => {
                 let p = o.get();
-                // One outs snap: skip merge_outs entirely when need already covered.
                 let outs = p.load_outs();
                 let need_outs = !checked.is_empty()
                     && !(outs.covers_need(&checked)
@@ -667,7 +660,6 @@ impl BatchParents {
                     drop(outs);
                     self.invalidate_sticky(id);
                 } else {
-                    // Outs already cover — layout/coinbase only (no outs Arc touch).
                     let _ = live;
                     p.apply_meta_only(coinbase, body_range, &spender_rels);
                 }
@@ -797,9 +789,6 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        // Outs half only if checked must grow; layout half for denserels.
-        // Never clones outs when only layout changes (split halves).
-        //
         // RCU must recompute checked from `cur` (not a stale pre-load snap):
         // concurrent prep merge_outs can add peer need-vouts between load and
         // publish; replacing with a snap-built list clobbered those vouts.
@@ -830,7 +819,6 @@ impl BatchParents {
             need_for_sparse = e.load_outs().checked.clone();
         }
         let sparse = sparse_spender_rels(dense_rels, &need_for_sparse);
-        // No-op when layout already complete for this range+rels (batch ensure).
         let lay = e.load_layout();
         if lay.body_range == Some(body_range) && lay.already_covers(Some(body_range), &sparse) {
             return;
@@ -1022,7 +1010,6 @@ impl BatchParents {
                     v.insert(src);
                 }
                 std::collections::hash_map::Entry::Occupied(o) => {
-                    // Same Arc or two Arcs for same fk (no store) — compose into one.
                     if !Arc::ptr_eq(o.get(), &src) {
                         let src_outs = src.load_outs();
                         let src_lay = src.load_layout();

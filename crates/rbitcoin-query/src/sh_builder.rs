@@ -64,11 +64,9 @@ pub fn select_sh_tip_materialize_mode(
             return ShTipMaterializeMode::ColdResume { next_shard: ns };
         }
     }
-    // Finished durable head + residual runs: warm only (never wipe — sticky FORCE too).
     if !head_empty || entry_count > 0 {
         return ShTipMaterializeMode::WarmOnly;
     }
-    // Empty head: need stream inputs.
     if stream_run_count == 0 {
         return ShTipMaterializeMode::WarmOnly;
     }
@@ -192,22 +190,16 @@ pub fn plan_sh_pre_materialize(
             // to durable maintenance (bootstrap HWM / clamp SEAL / Noop). Gap recollect
             // after this plan fills any floor↔tip lag via WarmOnly residual.
         } else if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
-            // Stale high SEAL + tiny tail, or empty/consumed catalog with no head.
             return ShPreMaterializeAction::ForceFullRebuild;
         } else {
-            // Usable catalog (complete mass, or high SEAL with real run rows even if
-            // tip advanced past SH_SEAL_LAG_OK during recollect). Keep runs/SEAL;
-            // reinit head only. Gap recollect fills seal→tip before FullCold.
             return ShPreMaterializeAction::ForceColdFromExistingCatalog;
         }
     } else if !head_durable {
-        // Empty / wiped head: decide whether on-disk runs can seed FullCold.
         if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
             return ShPreMaterializeAction::ResetCatalogFullRecollect;
         }
         return ShPreMaterializeAction::Noop;
     }
-    // Durable head (FORCE sticky or not): HWM (or SEAL if HWM missing) is floor.
     let floor = durable_sh_inclusion_floor(include_hwm, seal);
     if include_hwm == 0 && seal > 0 {
         return ShPreMaterializeAction::BootstrapIncludeHwm { seal: floor };
@@ -222,7 +214,6 @@ pub fn plan_sh_pre_materialize(
         if run_records > 0 {
             return ShPreMaterializeAction::Noop;
         }
-        // No runs left: creates above HWM are not on disk — recollect from HWM.
         return ShPreMaterializeAction::ClampSealTo { floor };
     }
     ShPreMaterializeAction::Noop
@@ -244,11 +235,9 @@ fn empty_head_needs_full_class_a_recollect(seal: u64, tip_max: u64, run_records:
     if tip_max == 0 {
         return false;
     }
-    // Catch-up-only runs under a stale high SEAL (FORCE / wipe recovery).
     if sh_catalog_is_stale_tail(seal, run_records) {
         return true;
     }
-    // No runs left and SEAL does not cover tip — nothing to cold-load.
     if run_records == 0 && !sh_catalog_seal_covers_tip(seal, tip_max) {
         return true;
     }
@@ -293,7 +282,7 @@ const DEFAULT_TARGET_RUN_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MERGE_FANIN: usize = 64;
 /// Promote L0→catalog only when merged body ≥ this fraction of target (except finalize).
 const PROMOTE_FRAC_NUM: u64 = 3;
-const PROMOTE_FRAC_DEN: u64 = 4; // 0.75
+const PROMOTE_FRAC_DEN: u64 = 4;
 /// Wall interval for cold bulk-materialize INFO heartbeats (time-based only).
 const MATERIALIZE_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 /// Mid-key clock sample stride. A megakey stays on one scripthash for tens of
@@ -433,8 +422,6 @@ fn encode_sh_run_body_sorted_unique(pairs: &mut [([u8; 32], Fk)]) -> Vec<u8> {
     body
 }
 
-// ── SEAL (max durable create_fk in cataloged runs) ───────────────────────────
-
 fn seal_path(runs_dir: &Path) -> PathBuf {
     runs_dir.join("SEAL")
 }
@@ -492,8 +479,6 @@ fn max_fk_in_body(body: &[u8]) -> u64 {
     }
     max
 }
-
-// ── Memtable / builder ───────────────────────────────────────────────────────
 
 struct Inner {
     pending: Vec<([u8; 32], Fk)>,
@@ -617,7 +602,6 @@ impl ShRunBuilder {
         }
         let sealed = load_seal(&self.runs_dir);
         self.sealed_fk.store(sealed, Ordering::Release);
-        // Steady Direct IBD: worker may compact crumbs single-threaded.
         self.ibd_catalog_compact.store(true, Ordering::Release);
         let inner_w = Arc::clone(&self.inner);
         let cv_w = Arc::clone(&self.cv);
@@ -674,7 +658,6 @@ impl ShRunBuilder {
             if rec.create_tx_fk.is_null() {
                 continue;
             }
-            // Already durable in a sealed run — skip.
             if rec.create_tx_fk.0 <= sealed {
                 continue;
             }
@@ -812,8 +795,6 @@ impl ShRunBuilder {
             let path = next_run_path(&runs_dir, next_seq);
             next_seq = next_seq.saturating_add(1);
             let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
-            // Per-spill detail is noisy on long recollect (~1k spills); status line
-            // carries aggregates. Keep path for debug forensics.
             debug!(
                 "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
                 run.count,
@@ -907,7 +888,6 @@ impl ShRunBuilder {
         {
             let mut g = self.inner.lock().unwrap();
             g.ctrl.next_seq = next_seq;
-            // force_all should leave nothing; keep any remainder for safety.
             for r in leftover {
                 g.l0_bytes = g.l0_bytes.saturating_add(run_body_bytes(&r));
                 g.l0.push(r);
@@ -933,10 +913,8 @@ impl ShRunBuilder {
         store: &Store,
         cancel: Option<&AtomicBool>,
     ) -> Result<u64, StoreError> {
-        // Tip path: no IBD catalog compact (k-way the runs as-is).
         self.set_ibd_catalog_compact(false);
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        // Drain any leftover pending + L0 (worker may have stopped with L0 in RAM).
         self.drain_spills()?;
 
         let (runs_dir, runs_io) = {
@@ -985,7 +963,6 @@ impl ShRunBuilder {
                 // Old mats may still exist if not yet deleted by chunk merges.
                 claimed.append(&mut prior);
             } else {
-                // Fresh materialize: claim everything.
                 let _ = std::fs::remove_dir_all(&merge_dir);
                 if !prior.is_empty() {
                     info!(
@@ -1007,7 +984,6 @@ impl ShRunBuilder {
                 clear_runs_dir(&runs_dir);
                 return Ok(0);
             }
-            // Only deferred new runs — apply warm without cold reinit.
             info!(
                 "node: scripthash apply {} deferred run(s) to empty/live head (no cold reduce)",
                 pending_after.len()
@@ -1042,7 +1018,6 @@ impl ShRunBuilder {
                 .map(|r| r.count.saturating_mul(u64::from(r.rec_len)))
                 .sum();
             if !resume_checkpoint && claimed.len() <= max_direct {
-                // Primary path: stream claimed mats directly (no intermediate rewrite).
                 direct_kway = true;
                 info!(
                     "node: scripthash tip direct k-way claimed={} workers={workers} \
@@ -1119,7 +1094,6 @@ impl ShRunBuilder {
             progress.as_ref().map(|p| p.next_shard),
         );
 
-        // ── Warm-only: residual runs against a live index (never reinit) ─────
         if matches!(mode, ShTipMaterializeMode::WarmOnly) {
             info!(
                 "node: scripthash warm apply residual runs={} (protecting durable head; no reinit)",
@@ -1134,7 +1108,6 @@ impl ShRunBuilder {
                 }
             }
             let n_warm = apply_runs_to_live_sh(store, &stream_inputs, cancel)?;
-            // Deferred catch-up catalog runs (not claimed into stream).
             let mut n_deferred = 0u64;
             if !pending_after.is_empty() {
                 info!(
@@ -1170,7 +1143,6 @@ impl ShRunBuilder {
             return Ok(n_warm.saturating_add(n_deferred));
         }
 
-        // ── Cold path (full or resume) ───────────────────────────────────────
         let resume_from = match &mode {
             ShTipMaterializeMode::ColdResume { next_shard } => *next_shard as usize,
             _ => 0,
@@ -1226,7 +1198,6 @@ impl ShRunBuilder {
             if tx_fk.is_null() {
                 return Ok(());
             }
-            // Resume: skip complete prefix bands (already installed head shards).
             if prefix_shard_of(&sh, n_shards) < resume_from {
                 return Ok(());
             }
@@ -1431,7 +1402,6 @@ fn apply_runs_to_live_sh(
             return Ok(());
         }
         recs_seen = recs_seen.saturating_add(1);
-        // Already included in durable head at last materialize / tip write.
         if include_hwm > 0 && tx_fk.0 <= include_hwm {
             recs_skipped_hwm = recs_skipped_hwm.saturating_add(1);
             return Ok(());
@@ -1500,7 +1470,6 @@ fn coalesce_l0_to_catalog(
         if chunk.is_empty() {
             break;
         }
-        // Single small input and not finalizing: keep in L0 without rewrite.
         if !force_all && chunk.len() == 1 && bytes < promote_min {
             leftover.push(chunk[0].clone());
             continue;
@@ -1516,8 +1485,6 @@ fn coalesce_l0_to_catalog(
             let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
             let max_fk = merged.max_u64_at_32;
             let merged = merged.run;
-            // Promote is steady IBD traffic — debug only; ~10s recollect/materialize
-            // status lines cover long work. Compact (rare) stays at info.
             debug!(
                 "ibd: SH catalog promote runs_in={} body≈{:.1}MiB path={}",
                 chunk.len(),
@@ -1532,7 +1499,6 @@ fn coalesce_l0_to_catalog(
                 }
             }
         } else {
-            // Merge undersized chunk back into one L0 file to reduce file count.
             let l0_dir = runs_dir.join("l0");
             std::fs::create_dir_all(&l0_dir).map_err(|e| StoreError::io(&l0_dir, e))?;
             let out = next_run_path(&l0_dir, *next_seq);
@@ -1578,7 +1544,7 @@ pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 ///
 /// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so ~128 MiB spills are never
 /// candidates. Tip direct k-way can open thousands of FDs without rewriting them.
-pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4; // 96 MiB
+pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
 
 /// True if a catalog run body should be eligible for undersized compact.
 ///
@@ -1611,7 +1577,6 @@ fn compact_catalog_undersized(
         return Ok(());
     }
     runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    // Count small runs; if ≤1, done.
     let small: Vec<_> = runs
         .iter()
         .filter(|r| catalog_run_is_compact_candidate(run_body_bytes(r), target))
@@ -1638,7 +1603,6 @@ fn compact_catalog_undersized(
         }
         let out = next_run_path(runs_dir, *next_seq);
         *next_seq += 1;
-        // Crumb compact is IBD-worker-only (confirm hot) — paced like promotes.
         let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
         let max_fk = merged.max_u64_at_32;
         let merged = merged.run;
@@ -1666,7 +1630,6 @@ fn sh_worker_loop(
     sealed: Arc<AtomicU64>,
     ibd_catalog_compact: Arc<AtomicBool>,
 ) {
-    // Yield disk/CPU to confirm Class A under contention (idle ioprio + nice 19).
     set_thread_idle_io_priority();
     let target = target_run_bytes();
     let fanin = merge_fanin();

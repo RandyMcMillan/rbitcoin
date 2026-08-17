@@ -589,8 +589,6 @@ impl ChainHub {
     }
 
     fn note_confirmed_tip(&self, need_meta: &[(u32, BlockHash)]) -> Result<(), NetError> {
-        // Mempool strip only when tip-mode relay is on. During IBD catch-up,
-        // remove_for_block is a no-op (relay off); purge runs at set_relay_enabled.
         if let Some(mp) = self.mempool() {
             if mp.relay_enabled() {
                 for &(_height, hash) in need_meta {
@@ -890,7 +888,6 @@ impl ChainHub {
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
     pub fn accept_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
-        // Fast path without lock (common AlreadyHave).
         if self.tip_hash() == Some(hash) || self.has_block(&hash) {
             return Ok(AcceptOutcome::AlreadyHave);
         }
@@ -924,7 +921,6 @@ impl ChainHub {
                     return Ok(AcceptOutcome::Accepted { height });
                 }
 
-                // Parent on best chain?
                 let Some(parent_h) = self
                     .query
                     .height_of_hash(&prev.to_byte_array())
@@ -939,7 +935,6 @@ impl ChainHub {
                 }
 
                 if new_height == tip_h {
-                    // Competing tip at same height — reorg if more work.
                     let cur = self
                         .block_at_height(tip_h)?
                         .ok_or(NetError::Protocol("missing current tip block"))?;
@@ -954,8 +949,6 @@ impl ChainHub {
                     return Ok(AcceptOutcome::IgnoredWeaker);
                 }
 
-                // Extends an ancestor — single block cannot beat a longer chain alone.
-                // Caller should use accept_branch with the full better path.
                 Err(NetError::Protocol(
                     "side block; use accept_branch for reorg",
                 ))
@@ -977,7 +970,6 @@ impl ChainHub {
         }
         let fork_prev = blocks[0].header.prev_blockhash;
         let fork_h = if fork_prev.to_byte_array() == [0u8; 32] {
-            // Branch starts at genesis — only if we have no chain or reorg entire chain.
             if self.tip_height().is_none() {
                 for (i, b) in blocks.iter().enumerate() {
                     self.connect_at(i as u32, b.clone())?;
@@ -985,7 +977,6 @@ impl ChainHub {
                 let h = (blocks.len() - 1) as u32;
                 return Ok(AcceptOutcome::Accepted { height: h });
             }
-            // Replacing from genesis
             None
         } else {
             Some(
@@ -998,10 +989,8 @@ impl ChainHub {
 
         let fork_height = fork_h.map(|h| h.0);
 
-        // Work on new path (header work only — same ranking as most_work helpers).
         let new_work = sum_work(blocks.iter().map(|b| b.header.work()));
 
-        // Work on our path from fork+1..=tip (wire headers; no full body load).
         let our_work = self.work_from_fork_to_tip(fork_height)?;
 
         let branch_tip = blocks.last().map(Block::block_hash);
@@ -1015,7 +1004,6 @@ impl ChainHub {
             return Ok(AcceptOutcome::IgnoredWeaker);
         }
 
-        // Snapshot old tip path for restore if connect fails mid-branch.
         let tip_h = self.tip_height().unwrap_or(0);
         let mut old_path: Vec<Block> = Vec::new();
         if let Some(fh) = fork_height {
@@ -1031,8 +1019,6 @@ impl ChainHub {
 
         // Once-confirmed losers stay in Class A (`reconstruct_archived_block`).
         // Do not copy `old_path` into the held-body map (that is a block index).
-
-        // Reorg: disconnect down to fork, then connect branch.
         if let Some(fh) = fork_height {
             self.disconnect_to(fh)?;
         } else {
@@ -1287,7 +1273,6 @@ impl ChainHub {
             .mempool()
             .map(|mp| mp.script_preverified_txids())
             .unwrap_or_default();
-        // Phase 0 tip SH measure: clear window so this block's stats are clean.
         tip_accept_stats_reset();
         let t_wall = std::time::Instant::now();
         let now = self.clock.now_secs();
@@ -1311,7 +1296,6 @@ impl ChainHub {
         })?;
         self.header_tips.write().unwrap().remove(&hash);
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
-        // Tip-mode only: remove_for_block no-ops while relay is off (IBD).
         if let Some(mp) = self.mempool() {
             let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
             let spent: Vec<_> = block
@@ -1326,7 +1310,6 @@ impl ChainHub {
             }
         }
         self.confirmed.write().unwrap().insert(hash);
-        // Move block into tip-window cache (no full-history clone).
         let n_tx = block.txdata.len();
         let _ = self.cache.push_best(block);
         // Tip-follow / wire accept path: log every accepted tip block (Core-like
@@ -1346,7 +1329,6 @@ impl ChainHub {
     }
 
     fn disconnect_to(&self, keep_height: u32) -> Result<(), NetError> {
-        // Collect disconnected block bodies for mempool re-accept (best-effort).
         let mut disconnected_txs: Vec<Transaction> = Vec::new();
         loop {
             let tip = match self.query.tip_height() {
@@ -1527,13 +1509,12 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
 
 /// Sample meters after tip accept and emit INFO `tip: accept …` (SH breakdown).
 fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
-    // confirm_phase_stats::sample_and_reset also clears class_c STRONG/SCRIPTHASH/TIP.
     let (
         _recon,
         _wire,
         connect_ns,
         script_ns,
-        _class_c_ns, // tables-only after fix; we recompute from strong+tip below
+        _class_c_ns,
         strong_ns,
         _sh_sum,
         tip_ns,
@@ -1551,7 +1532,6 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
         _struct_create_h,
         _struct_bip68,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
-    // SH substeps/counts (FILTER/COLLECT/…/CREATE_N) — not cleared by sample_and_reset.
     let sh = rbitcoin_query::class_c_phase_stats::sample_tip_sh_and_reset();
     let ca = rbitcoin_query::archive_phase_stats::sample_and_reset();
     // class_c = strong + tip only (parallel SH is not Class C table time).
@@ -1560,7 +1540,6 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
         height,
         n_tx,
         wall_ns,
-        // pin (LOAD_NS) + assemble (CONNECT_NS)
         load_ns: load_ns.saturating_add(connect_ns),
         script_ns,
         class_a_ns: ca.write_total_ns,
@@ -1615,11 +1594,9 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
             t0.elapsed()
         );
     };
-    // Prefer the node runtime's blocking pool (no dedicated OS thread).
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(run);
     } else {
-        // Sync constructors / tests without a runtime.
         std::thread::Builder::new()
             .name("confirmed-seed".into())
             .spawn(run)

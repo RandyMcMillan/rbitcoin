@@ -76,7 +76,6 @@ impl LoadAheadState {
     fn publish_mem_stats(&self) {
         let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
         let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-        // Occasional aggressive Weak GC so dead slots don't retain the map.
         if weak > live.saturating_mul(2) && weak > 4096 {
             self.parent_store.gc_dead_weaks();
             let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
@@ -110,7 +109,6 @@ impl LoadAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        // Publish an immutable layer — never mutates prior layers (load may hold them).
         let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
             rbitcoin_query::InFlightLayer::from_plan_pins(
                 plan.planned_fks
@@ -119,7 +117,6 @@ impl LoadAheadState {
                     .map(|(fk, pin)| (*fk, pin)),
             )
         } else {
-            // Partial plans: pin half is already CreatePin Arc on packed.
             rbitcoin_query::InFlightLayer::from_plan_pins(
                 plan.packed
                     .iter()
@@ -188,7 +185,6 @@ impl LoadAheadState {
 
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
-        // Arc-swap store so in-flight load/write batches keep their Arcs.
         self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
         self.publish_mem_stats();
         self.last_loaded = None;
@@ -247,7 +243,6 @@ impl ConfirmFeed {
         if g.inflight.contains(&height) {
             return;
         }
-        // Prefer keeping wire if we already have it (test helpers only).
         match g.ready.get_mut(&height) {
             Some(e) => {
                 if e.1.is_none() && block.is_some() {
@@ -561,7 +556,6 @@ impl ConfirmQueueDepths {
 
     #[inline]
     fn note_depth_hwm(hwm: &AtomicUsize, depth_after: usize) {
-        // AtomicUsize::fetch_max is stable; Relaxed is enough for perf.
         let _ = hwm.fetch_max(depth_after, Ordering::Relaxed);
     }
 
@@ -718,7 +712,7 @@ fn drain_script_ok_write_queue(
                         parts = parts.saturating_add(1);
                     }
                     Err(leftover) => {
-                        // Height gap or length invariant — write batch first.
+                        // Height gap / leftover union — write the contiguous prefix first.
                         warn!(
                             "ibd: write batch drain gap after parts={parts} leftover_blks={}",
                             leftover.len()
@@ -875,7 +869,6 @@ pub(crate) fn spawn_confirm_engine(
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
     let caps = confirm_queue_caps();
-    // scriptq: load → scripts; writeq: scripts → write.
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
@@ -886,7 +879,6 @@ pub(crate) fn spawn_confirm_engine(
     // Class A partial commit does not drift next_tx_start.
     let load_ahead_reset = Arc::new(AtomicBool::new(false));
 
-    // Write: structural + class_c + annotate; emits tip events.
     let hub_wb = Arc::clone(&hub);
     let feed_wb = Arc::clone(&feed);
     let event_tx_wb = event_tx.clone();
@@ -898,8 +890,7 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-write".into())
         .spawn(move || {
             info!("ibd: confirm write on dedicated OS thread");
-            // Non-contiguous drain leftover (invariant breach); write next iter.
-            // Leftover was already note_write_recv'd when first drained.
+            // Non-contig leftover already note_write_recv'd; write it next iter.
             let mut leftover: Option<rbitcoin_consensus::ScriptOkBatch> = None;
             loop {
                 let t_recv = Instant::now();
@@ -916,9 +907,6 @@ pub(crate) fn spawn_confirm_engine(
                         Err(_) => break,
                     },
                 };
-                // Drain everything already in the scripts→write queue into one
-                // batch: larger Class A / Class C / tip advance → fewer fsyncs.
-                // Scripts send height-ordered FIFO; append_contiguous enforces that.
                 let (batch, parts, next_left) =
                     drain_script_ok_write_queue(first, &write_rx, |b| {
                         let n = b.len();
@@ -939,7 +927,6 @@ pub(crate) fn spawn_confirm_engine(
                     Ok(_outcomes) => {
                         for (height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
-                            // Durable queue: drop payload only after confirm-write.
                             if let Err(e) = hub_wb.query.block_queue_dequeue_height(*height) {
                                 rbitcoin_log::debug!(
                                     "ibd: block_queue dequeue h={height}: {e}"
@@ -1014,10 +1001,7 @@ pub(crate) fn spawn_confirm_engine(
                             feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                             continue;
                         }
-                        // Write reject — clear inflight (reject event handles
-                        // wire soft re-get vs permanent blacklist). Invalidate
-                        // load-ahead caches so reserved create fks / last_loaded
-                        // do not drift.
+                        // Reset load-ahead so reserved create fks / last_loaded do not drift.
                         load_ahead_reset_wb.store(true, Ordering::Release);
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_wb
@@ -1038,11 +1022,7 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-write");
 
-    // Scripts: loaded batch → script verify (coordinators + rbtc-scripts) → write queue.
-    // **Feed-ahead (depth-1 safe):** while joining batch N, poll load `try_recv`
-    // and submit N+1 to a coordinator *during* the wait — not only once before a blocking
-    // join (that left the pool idle under a tight scriptq cap).
-    // Write handoff stays height-ordered (join N then N+1).
+    // Feed-ahead: submit N+1 while joining N (blocking join left the pool idle).
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
     let event_tx_sc = event_tx.clone();
@@ -1070,7 +1050,6 @@ pub(crate) fn spawn_confirm_engine(
                 q_sc.note_script_recv(n, load_wire, script_parents);
                 let meta =
                     rbitcoin_consensus::ScriptsBatchMeta::from_batch(&mat_batch, mat_ns);
-                // Non-blocking submit onto a scripts coordinator.
                 let handle = rbitcoin_consensus::confirm_scripts_phase_async(mat_batch);
                 Inflight { handle, meta }
             }
@@ -1081,7 +1060,6 @@ pub(crate) fn spawn_confirm_engine(
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
                     break;
                 }
-                // Fill current (blocking claim).
                 if current.is_none() {
                     let t_recv = Instant::now();
                     let (mat_batch, mat_ns) = match mat_rx.recv() {
@@ -1098,7 +1076,6 @@ pub(crate) fn spawn_confirm_engine(
                     Some(i) => i,
                     None => break,
                 };
-                // Poll claim while waiting on N — start N+1 mid-join.
                 let result = rbitcoin_consensus::join_scripts_polling(
                     &inflight.handle,
                     std::time::Duration::from_micros(200),
@@ -1206,7 +1183,6 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Load: claim resolve-complete BQ heights → stamp (BQ hits + in-flight + TipOnly) → pin → scripts; prune after handoff.
     let hub_load = Arc::clone(&hub);
     let feed_load = Arc::clone(&feed);
     let event_tx_load = event_tx.clone();
@@ -1270,8 +1246,6 @@ pub(crate) fn spawn_confirm_engine(
                             let soft_inputs = confirm_batch_max_inputs();
                             let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
                             drop(g);
-                            // 32 is Vec prealloc only — pack size is 8000 inputs
-                            // (typically 1–3 dense blocks), not 32 heights.
                             let mut run: Vec<(u32, BlockHash, bitcoin::Block)> =
                                 Vec::with_capacity(hard_blocks.min(32));
                             let mut sum_inputs = 0u32;
@@ -1287,7 +1261,6 @@ pub(crate) fn spawn_confirm_engine(
                                     let Some(entry) = gg.ready.get(&h).cloned() else {
                                         break;
                                     };
-                                    // BQ-ahead: wait for lookup wave unless test-injected wire.
                                     if entry.1.is_none()
                                         && !hub_load.query.block_queue_is_resolve_complete(h)
                                     {
@@ -1498,13 +1471,11 @@ pub(crate) fn spawn_confirm_engine(
                         self.stats.confirm_end();
                     }
                 }
-                // Load live: block count known; inputs already accounted on lookup live.
                 loop_stats_load.confirm_begin(expect_h, heights_hashes.len() as u32, 0);
                 let _live_guard = LiveGuard {
                     stats: &loop_stats_load,
                 };
 
-                // Pin denserels (Allow) + assemble using owned stamped plan — no re-lookup.
                 let t_work = Instant::now();
                 let mat_res = hub_load.confirm_wire_load_from_plan(stamped, Some(&pipe));
                 confirm_thr_stats::add_load_work(t_work.elapsed());
@@ -1589,8 +1560,7 @@ pub(crate) fn spawn_confirm_engine(
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
-                // After pin / scripts handoff (or load reject): drain+fence
-                // layers are TipOnly's. Next claim must not see those outs.
+                // Disconnect prune: drain+fence layers are TipOnly; next claim must not see those outs.
                 lookup_ahead.prune_committed(&hub_load);
             }
             drop(mat_tx);
@@ -1599,7 +1569,6 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-load");
 
-    // Lookup: BQ-ahead TipOnly head_fk only (does not claim).
     let queues_lookup = Arc::clone(&queues);
     let lookup_join = std::thread::Builder::new()
         .name("ibd-confirm-lookup".into())
@@ -1733,7 +1702,6 @@ pub(crate) fn offer_confirm_ready(
             break; // missing header on work path
         };
         if hub.has_block(&hash) {
-            // Already confirmed; keep walking (tip may lag the RAM set briefly).
             continue;
         }
         if body.is_rejected(&hash) {
@@ -1752,7 +1720,6 @@ pub(crate) fn offer_confirm_ready(
             }
             break;
         }
-        // Body-queue wire only — break on first hole so tip densify is not starved.
         if !super::progress::claim_ready(hub, body, ht, &hash) {
             break;
         }

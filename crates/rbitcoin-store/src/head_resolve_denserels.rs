@@ -113,8 +113,6 @@ fn is_uring_unavailable(err: &StoreError) -> bool {
     }
 }
 
-// ── pread: two-wave (hot → ID; cold survivors → ID) ─────────────────────────
-
 fn resolve_fk_and_range_pread(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -139,8 +137,6 @@ fn resolve_fk_and_range_pread(
     let mut cands_total = 0u64;
 
     // Leftover write-behind is load-owned; TipOnly is durable head only.
-
-    // Wave 1: hot (cacheable) head segments.
     let t_probe = Instant::now();
     let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
@@ -186,7 +182,6 @@ fn resolve_fk_and_range_pread(
         &mut had_id,
     )?;
 
-    // Wave 2: cold depth for keys that are still unfinished.
     // With tip-aware resolve, "unconnected hot hit" is not finished.
     let mut need_cold = false;
     let mut active = vec![false; txids.len()];
@@ -534,7 +529,6 @@ fn id_idx_wave(
         id_map.extend(more);
     }
 
-    // Pick + one IDX page-grouped fill. Fence pick is before idx.
     let mut chosen_kis: Vec<usize> = Vec::new();
     let mut chosen_fks: Vec<Fk> = Vec::new();
     for ki in 0..n {
@@ -622,8 +616,6 @@ fn record_chosen_idx_ranges(
     Ok(())
 }
 
-// ── uring probe path (ID stage is page-grouped bulk, shared with pread) ─────
-
 fn resolve_fk_and_range_uring(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -671,7 +663,6 @@ fn resolve_fk_and_range_uring_on(
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
 
-    // ── Wave 1: hot head pages (uring) + page-grouped ID/IDX ──────────────
     let t_probe = Instant::now();
     let hot_cands = table
         .head
@@ -721,7 +712,6 @@ fn resolve_fk_and_range_uring_on(
         &mut had_id,
     )?;
 
-    // ── Wave 2: full cold head for unfinished keys + ID/IDX ───────────────
     let mut need_cold = false;
     let mut active = vec![false; txids.len()];
     for i in 0..txids.len() {

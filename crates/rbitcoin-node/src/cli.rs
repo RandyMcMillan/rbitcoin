@@ -724,7 +724,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         rbitcoin_log::debug!("node: RLIMIT_NOFILE soft={soft} hard={hard}");
     }
 
-    // CLI overrides conf (Core-style).
     if datadir_set {
         config.datadir = datadir;
     }
@@ -825,7 +824,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     // Unstable env is an input when CLI/conf omitted inbound — never set_var.
     config.absorb_inbound_env();
 
-    // Hold for process lifetime; drop after run_node / run_p2p returns.
     let _suspend_inhibit = if config.inhibit_suspend {
         match SuspendInhibit::try_start("rbitcoin-node running (IBD / tip follow)") {
             Some(g) => Some(g),
@@ -843,7 +841,6 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
         config.max_run_secs = max_run_secs;
     }
 
-    // Create --datadir (and store/mempool) before opening the store.
     if let Err(e) = config.ensure_datadir() {
         error!("{e}");
         return ExitCode::FAILURE;

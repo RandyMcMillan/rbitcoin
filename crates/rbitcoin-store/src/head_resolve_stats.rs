@@ -200,7 +200,6 @@ pub fn sealed_age_for_fk(first_fks: &[u64], fk: u64) -> Option<u32> {
     if first_fks.is_empty() || fk == 0 {
         return None;
     }
-    // Largest si with first_fks[si] <= fk.
     let mut lo = 0usize;
     let mut hi = first_fks.len();
     while lo + 1 < hi {

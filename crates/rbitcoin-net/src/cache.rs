@@ -133,7 +133,6 @@ impl BlockCache {
         }
         g.by_hash.insert(hash, block);
         g.chain.push(hash);
-        // Drop full bodies outside the tip window (keep hash chain for locators).
         let depth = self.body_depth;
         if g.chain.len() > depth {
             let drop_to = g.chain.len() - depth;

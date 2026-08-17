@@ -109,7 +109,6 @@ impl IbdReorgState {
             }
         }
         self.held_bodies.insert(h, block);
-        // Filled need → drop from explore densify list.
         self.explore_need.retain(|x| *x != h);
     }
 
@@ -249,7 +248,6 @@ pub fn rank_candidates(
     if candidates.is_empty() {
         return Ok(SelectOutcome::IgnoreWeaker);
     }
-    // Use the first candidate's LCA for best-path work (callers group by LCA).
     let lca_h = candidates[0].lca_height;
     let tip_h = hub.tip_height().unwrap_or(0);
     let mut our = Vec::new();
@@ -276,7 +274,6 @@ pub fn apply_reorg_branch(
     blocks: &[Block],
     reorg: &mut IbdReorgState,
 ) -> Result<AcceptOutcome, NetError> {
-    // Layer-1 gate before mutating tip (same rule as accept_branch work check).
     if !candidate_header_work_better(hub, blocks)? {
         return Ok(AcceptOutcome::IgnoredWeaker);
     }
@@ -290,7 +287,6 @@ pub fn apply_reorg_branch(
         }
         Ok(o) => Ok(o),
         Err(e) => {
-            // Mark path invalid so we do not thrash (tip restore is accept_branch).
             for b in blocks {
                 reorg.invalid.mark(b.block_hash().to_byte_array());
             }
@@ -325,7 +321,6 @@ pub fn try_apply_best_candidate(
     if built.is_empty() {
         return Ok(None);
     }
-    // Bounded re-rank loop: each failed/ignored candidate is invalid-marked.
     for _ in 0..built.len().saturating_add(1) {
         let cands: Vec<WorkCandidate> = built
             .iter()
@@ -349,11 +344,8 @@ pub fn try_apply_best_candidate(
                     Ok(o @ AcceptOutcome::Accepted { .. }) => return Ok(Some(o)),
                     Ok(_) => {
                         reorg.invalid.mark(candidate_tip);
-                        // re-rank remaining
                     }
-                    Err(_) => {
-                        // apply_reorg_branch already marked the path invalid
-                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -552,7 +544,6 @@ fn connecting_hashes_heavier_disconnected_n(
     if path.is_empty() {
         return Ok(None);
     }
-    // Join = parent of the first unconfirmed hash.
     let Some(join) = parent_hash_of(hub, path[0])? else {
         return Ok(Some(path));
     };

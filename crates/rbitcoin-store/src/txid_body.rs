@@ -156,7 +156,6 @@ impl TxidBody {
             ));
         }
         if (rc as usize) != 32 {
-            // Short — complete via plain pread.
             self.file.pread_at(off, &mut buf)?;
         }
         Ok(buf)
@@ -263,8 +262,7 @@ impl TxidBody {
         }
         unique.sort_unstable();
 
-        // Group sorted fks by OS page of entry_offset.
-        let mut groups: Vec<(u64, Vec<u64>)> = Vec::new(); // (page, fks)
+        let mut groups: Vec<(u64, Vec<u64>)> = Vec::new();
         for id in unique {
             let page = Self::entry_page(id)?;
             match groups.last_mut() {
@@ -273,7 +271,6 @@ impl TxidBody {
             }
         }
 
-        // Build page jobs: (first_fk, blob).
         let mut jobs: Vec<(u64, Vec<u8>, Vec<u64>)> = Vec::with_capacity(groups.len());
         for (_page, group) in groups {
             debug_assert!(

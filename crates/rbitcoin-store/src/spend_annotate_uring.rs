@@ -61,7 +61,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
     let body_path = txs.spent.body_file_path().to_path_buf();
     let body_pub = txs.spent.body_published_len();
 
-    // Work list; OOB goes straight to cold.
     let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
     let mut work: Vec<(u64, Fk, u32, Fk)> = Vec::with_capacity(edges.len());
     for &(abs, cfk, vout, sfk) in edges {
@@ -78,11 +77,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
         session.begin_batch();
         let epoch = session.epoch();
-        // Pending edge indices not yet started.
         let mut pending: VecDeque<usize> = (0..work.len()).collect();
-        // Abs offsets with an RMW in flight (serialize same-outpoint).
         let mut abs_busy: U64Set = U64Set::default();
-        // Optional FIFO of waiters when abs is busy: abs → edge indices.
         let mut abs_wait: U64Map<VecDeque<usize>> = U64Map::default();
 
         let mut free_slots: Vec<usize> = (0..MAX_SLOTS).collect();
@@ -101,7 +97,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
                    body_fd: RawFd|
          -> Result<(), StoreError> {
             while *in_flight < MAX_SLOTS && session.free_sq() > 0 && !free_slots.is_empty() {
-                // Prefer a waiter whose abs is free, else next pending with free abs.
                 let edge_i = if let Some(ei) = next_ready(pending, abs_busy, abs_wait, work) {
                     ei
                 } else {
@@ -184,14 +179,12 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         let (new_multi, new_field, skip_write) = if !multi && field.is_null() {
                             (false, spend_fk, false)
                         } else if !multi && field == spend_fk {
-                            (false, field, true) // idempotent
+                            (false, field, true)
                         } else if !multi {
-                            // Promote sole → multi (reorg / second annotate).
                             let e1 = spenders.append(field, Fk::NULL)?;
                             let e2 = spenders.append(spend_fk, e1)?;
                             (true, e2, false)
                         } else {
-                            // Already multi: prepend list node.
                             let e = spenders.append(spend_fk, field)?;
                             (true, e, false)
                         };
@@ -199,7 +192,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         if skip_write {
                             free_slots.push(slot);
                             abs_busy.remove(&abs);
-                            // Release waiter for this abs.
                             if let Some(q) = abs_wait.get_mut(&abs) {
                                 if let Some(next_ei) = q.pop_front() {
                                     pending.push_front(next_ei);
@@ -266,7 +258,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
             let _ = session.submit();
         }
 
-        // Any never-started edges (shouldn't happen) → cold.
         while let Some(ei) = pending.pop_front() {
             let (_, cfk, vout, sfk) = work[ei];
             cold.push((cfk, vout, sfk));
@@ -289,7 +280,6 @@ fn next_ready(
     abs_wait: &mut U64Map<VecDeque<usize>>,
     work: &[(u64, Fk, u32, Fk)],
 ) -> Option<usize> {
-    // Drain pending: start if free, else park on wait list.
     while let Some(ei) = pending.pop_front() {
         let abs = work[ei].0;
         if !abs_busy.contains(&abs) {
@@ -299,8 +289,6 @@ fn next_ready(
     }
     None
 }
-
-// ── Pure-write annotate (structural-known meta; no body pread) ─────────────
 
 /// Annotate backend for pure-write path (Class A body never mmap'd).
 ///
@@ -343,13 +331,11 @@ fn decide_annotate(
         return Ok(AnnotateOp::Skip);
     }
     if !multi {
-        // Promote sole → multi.
         let e1 = spenders.append(field, Fk::NULL)?;
         let e2 = spenders.append(spend_fk, e1)?;
         let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e2)?;
         return Ok(AnnotateOp::Write(meta));
     }
-    // Already multi: prepend list node.
     let e = spenders.append(spend_fk, field)?;
     let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e)?;
     Ok(AnnotateOp::Write(meta))
@@ -482,13 +468,11 @@ pub fn put_spend_batch_by_abs_meta_known(
         }
     }
 
-    // Build write list sorted by abs (mmap page locality).
     let mut order: Vec<usize> = (0..abs_edges.len()).collect();
     order.sort_unstable_by_key(|&i| abs_edges[i].0);
 
     let body_pub = txs.spent.body_published_len();
     let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
-    // (abs, create_fk, vout, spend_fk, payload) for non-skip
     let mut writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])> = Vec::with_capacity(order.len());
 
     for &i in &order {

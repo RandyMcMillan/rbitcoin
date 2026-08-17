@@ -248,7 +248,6 @@ impl Query {
         let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
         let to_excl = filter.to_height;
         for rec in creates {
-            // Upper-bound early-out: create and any of its spends sit at height ≥ create.
             if let Some(to) = to_excl {
                 if i64::from(rec.create_height) >= to {
                     continue;

@@ -538,12 +538,10 @@ async fn on_mempool_announce(
         }
     }
 
-    // New accept: address and tx tracks.
     let Some(m) = mp else {
         return Ok(());
     };
     let Some(tx) = m.get_tx(&ann.txid) else {
-        // Still update track-tx if listed.
         if conn.txids.contains(&ann.txid) {
             push_tx_status(st, conn, &ann.txid, sink).await?;
         }
@@ -581,10 +579,6 @@ async fn push_tx_status(
         .and_then(|c| c.as_bool())
         .unwrap_or(false);
     let prev = conn.last_confirmed.get(txid).copied();
-    if prev == Some(confirmed) {
-        // Still push first time after track (prev None) — only skip identical re-push.
-        // First observation: prev is None → push.
-    }
     if prev == Some(confirmed) {
         return Ok(());
     }
@@ -648,7 +642,6 @@ async fn on_tip(
         }
     }
 
-    // Tracked tx confirmation status transitions.
     let tracked: Vec<Txid> = conn.txids.iter().copied().collect();
     for t in tracked {
         push_tx_status(st, conn, &t, sink).await?;

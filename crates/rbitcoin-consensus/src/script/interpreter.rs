@@ -49,10 +49,20 @@ pub(crate) enum SigVersion {
 fn is_disabled_legacy(code: u8) -> bool {
     matches!(
         code,
-        0x7e | 0x7f | 0x80 | 0x81 | // CAT SUBSTR LEFT RIGHT
-        0x83 | 0x84 | 0x85 | 0x86 | // INVERT AND OR XOR
-        0x8d | 0x8e | // 2MUL 2DIV
-        0x95 | 0x96 | 0x97 | 0x98 | 0x99 // MUL DIV MOD LSHIFT RSHIFT
+        0x7e | 0x7f
+            | 0x80
+            | 0x81
+            | 0x83
+            | 0x84
+            | 0x85
+            | 0x86
+            | 0x8d
+            | 0x8e
+            | 0x95
+            | 0x96
+            | 0x97
+            | 0x98
+            | 0x99
     )
 }
 
@@ -86,7 +96,6 @@ pub(crate) fn tapscript_has_op_success(script: &Script) -> bool {
     let mut i = 0usize;
     while i < bytes.len() {
         let op = bytes[i];
-        // Direct push 1..=75
         if (1..=75).contains(&op) {
             let n = op as usize;
             i = i.saturating_add(1).saturating_add(n);
@@ -94,7 +103,6 @@ pub(crate) fn tapscript_has_op_success(script: &Script) -> bool {
         }
         match op {
             0x4c => {
-                // OP_PUSHDATA1
                 if i + 1 >= bytes.len() {
                     break;
                 }
@@ -319,7 +327,6 @@ pub(crate) fn eval_script_sig_pushes(
                 if n == 0x00 {
                     push(stack, vec![])?;
                 } else if n == 0x4f {
-                    // OP_1NEGATE
                     push(stack, vec![0x81])?;
                 } else if (0x51..=0x60).contains(&n) {
                     push(stack, vec![n - 0x50])?;
@@ -351,7 +358,7 @@ pub(crate) fn eval_script(
     }
 
     let mut altstack: Vec<Vec<u8>> = Vec::new();
-    let mut if_stack: Vec<bool> = Vec::new(); // whether this branch is executing
+    let mut if_stack: Vec<bool> = Vec::new();
     let mut op_count = 0usize;
     let enforce_op_limit = ctx.sig_version != SigVersion::TapScript;
     // TapScript always MINIMALIF. SCRIPT_VERIFY_MINIMALIF applies to witness v0
@@ -399,10 +406,9 @@ pub(crate) fn eval_script(
                     }
                 }
 
-                // OP_IF / NOTIF / ELSE / ENDIF always process structure.
+                // IF/ELSE/ENDIF must run even when skipped (structure, not value).
                 match code {
                     0x63 => {
-                        // OP_IF
                         let mut cond = false;
                         if executing {
                             let v = pop(stack)?;
@@ -415,7 +421,6 @@ pub(crate) fn eval_script(
                         continue;
                     }
                     0x64 => {
-                        // OP_NOTIF
                         let mut cond = false;
                         if executing {
                             let v = pop(stack)?;
@@ -428,7 +433,6 @@ pub(crate) fn eval_script(
                         continue;
                     }
                     0x67 => {
-                        // OP_ELSE
                         if if_stack.is_empty() {
                             return Err(ConsensusError::Script("OP_ELSE".into()));
                         }
@@ -437,7 +441,6 @@ pub(crate) fn eval_script(
                         continue;
                     }
                     0x68 => {
-                        // OP_ENDIF
                         if if_stack.pop().is_none() {
                             return Err(ConsensusError::Script("OP_ENDIF".into()));
                         }
@@ -467,25 +470,21 @@ pub(crate) fn eval_script(
 
                 let rm = ctx.minimal_data;
                 match code {
-                    0x00 => push(stack, vec![])?,                                    // OP_0
-                    0x4f => push(stack, vec![0x81])?, // OP_1NEGATE (-1)
-                    n if (0x51..=0x60).contains(&n) => push(stack, vec![n - 0x50])?, // OP_1..OP_16
+                    0x00 => push(stack, vec![])?,
+                    0x4f => push(stack, vec![0x81])?,
+                    n if (0x51..=0x60).contains(&n) => push(stack, vec![n - 0x50])?,
 
-                    // OP_RESERVED — fail if executed (tapscript SUCCESS80 handled above).
                     0x50 => {
                         return Err(ConsensusError::Script("OP_RESERVED".into()));
                     }
-                    0x61 => {} // OP_NOP
-                    // OP_VER — fails if executed (tapscript SUCCESS98 handled above).
+                    0x61 => {}
                     0x62 => {
                         return Err(ConsensusError::Script("OP_VER".into()));
                     }
-                    // OP_VERIF / OP_VERNOTIF always fail if reached when executing.
                     0x65 | 0x66 => {
                         return Err(ConsensusError::Script("OP_VERIF".into()));
                     }
                     0x69 => {
-                        // OP_VERIFY
                         let v = pop(stack)?;
                         if !cast_to_bool(&v) {
                             return Err(ConsensusError::Script("OP_VERIFY".into()));
@@ -494,24 +493,20 @@ pub(crate) fn eval_script(
                     0x6a => return Err(ConsensusError::Script("OP_RETURN".into())),
 
                     0x6b => {
-                        // OP_TOALTSTACK
                         let v = pop(stack)?;
                         altstack.push(v);
                     }
                     0x6c => {
-                        // OP_FROMALTSTACK
                         let v = altstack
                             .pop()
                             .ok_or_else(|| ConsensusError::Script("altstack empty".into()))?;
                         push(stack, v)?;
                     }
                     0x6d => {
-                        // OP_2DROP
                         pop(stack)?;
                         pop(stack)?;
                     }
                     0x6e => {
-                        // OP_2DUP
                         require_n(stack, 2)?;
                         let a = stack[stack.len() - 2].clone();
                         let b = stack[stack.len() - 1].clone();
@@ -519,7 +514,6 @@ pub(crate) fn eval_script(
                         push(stack, b)?;
                     }
                     0x6f => {
-                        // OP_3DUP
                         require_n(stack, 3)?;
                         let a = stack[stack.len() - 3].clone();
                         let b = stack[stack.len() - 2].clone();
@@ -529,7 +523,6 @@ pub(crate) fn eval_script(
                         push(stack, c)?;
                     }
                     0x70 => {
-                        // OP_2OVER
                         require_n(stack, 4)?;
                         let a = stack[stack.len() - 4].clone();
                         let b = stack[stack.len() - 3].clone();
@@ -537,7 +530,6 @@ pub(crate) fn eval_script(
                         push(stack, b)?;
                     }
                     0x71 => {
-                        // OP_2ROT: (x1 x2 x3 x4 x5 x6 -- x3 x4 x5 x6 x1 x2)
                         require_n(stack, 6)?;
                         let n = stack.len();
                         let x1 = stack[n - 6].clone();
@@ -549,14 +541,12 @@ pub(crate) fn eval_script(
                         stack[n - 1] = x2;
                     }
                     0x72 => {
-                        // OP_2SWAP
                         require_n(stack, 4)?;
                         let n = stack.len();
                         stack.swap(n - 4, n - 2);
                         stack.swap(n - 3, n - 1);
                     }
                     0x73 => {
-                        // OP_IFDUP
                         require_n(stack, 1)?;
                         if cast_to_bool(stack.last().unwrap()) {
                             let v = stack.last().unwrap().clone();
@@ -564,34 +554,29 @@ pub(crate) fn eval_script(
                         }
                     }
                     0x74 => {
-                        // OP_DEPTH
                         let d = stack.len() as i64;
                         push(stack, scriptnum_encode(d))?;
                     }
                     0x75 => {
                         pop(stack)?;
-                    } // OP_DROP
+                    }
                     0x76 => {
-                        // OP_DUP
                         require_n(stack, 1)?;
                         let v = stack.last().unwrap().clone();
                         push(stack, v)?;
                     }
                     0x77 => {
-                        // OP_NIP
                         require_n(stack, 2)?;
                         let top = pop(stack)?;
                         pop(stack)?;
                         push(stack, top)?;
                     }
                     0x78 => {
-                        // OP_OVER
                         require_n(stack, 2)?;
                         let v = stack[stack.len() - 2].clone();
                         push(stack, v)?;
                     }
                     0x79 => {
-                        // OP_PICK
                         let n = scriptnum_decode(&pop(stack)?, rm)?;
                         if n < 0 || n as usize >= stack.len() {
                             return Err(ConsensusError::Script("OP_PICK".into()));
@@ -600,7 +585,6 @@ pub(crate) fn eval_script(
                         push(stack, v)?;
                     }
                     0x7a => {
-                        // OP_ROLL
                         let n = scriptnum_decode(&pop(stack)?, rm)?;
                         if n < 0 || n as usize >= stack.len() {
                             return Err(ConsensusError::Script("OP_ROLL".into()));
@@ -610,20 +594,17 @@ pub(crate) fn eval_script(
                         push(stack, v)?;
                     }
                     0x7b => {
-                        // OP_ROT
                         require_n(stack, 3)?;
                         let n = stack.len();
                         stack.swap(n - 3, n - 2);
                         stack.swap(n - 2, n - 1);
                     }
                     0x7c => {
-                        // OP_SWAP
                         require_n(stack, 2)?;
                         let n = stack.len();
                         stack.swap(n - 1, n - 2);
                     }
                     0x7d => {
-                        // OP_TUCK
                         require_n(stack, 2)?;
                         let v = stack[stack.len() - 1].clone();
                         stack.insert(stack.len() - 2, v);
@@ -632,77 +613,63 @@ pub(crate) fn eval_script(
                         }
                     }
                     0x82 => {
-                        // OP_SIZE
                         require_n(stack, 1)?;
                         let sz = stack.last().unwrap().len() as i64;
                         push(stack, scriptnum_encode(sz))?;
                     }
-                    // OP_RESERVED1 / OP_RESERVED2
                     0x89 | 0x8a => {
                         return Err(ConsensusError::Script("OP_RESERVED".into()));
                     }
                     0x87 => {
-                        // OP_EQUAL
                         let a = pop(stack)?;
                         let b = pop(stack)?;
                         push(stack, bool_encode(a == b))?;
                     }
                     0x88 => {
-                        // OP_EQUALVERIFY
                         let a = pop(stack)?;
                         let b = pop(stack)?;
                         if a != b {
                             return Err(ConsensusError::Script("OP_EQUALVERIFY".into()));
                         }
                     }
-                    // Numeric unary — full set (1ADD/1SUB/NEGATE/ABS).
                     0x8b => {
-                        // OP_1ADD
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.saturating_add(1)))?;
                     }
                     0x8c => {
-                        // OP_1SUB
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.saturating_sub(1)))?;
                     }
                     0x8f => {
-                        // OP_NEGATE
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(-v))?;
                     }
                     0x90 => {
-                        // OP_ABS
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(v.abs()))?;
                     }
                     0x91 => {
-                        // OP_NOT
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(v == 0))?;
                     }
                     0x92 => {
-                        // OP_0NOTEQUAL
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(v != 0))?;
                     }
                     0x93 => bin_arith(stack, rm, |a, b| a + b)?,
                     0x94 => bin_arith(stack, rm, |a, b| a - b)?,
                     0x9a => {
-                        // OP_BOOLAND
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(a != 0 && b != 0))?;
                     }
                     0x9b => {
-                        // OP_BOOLOR
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(a != 0 || b != 0))?;
                     }
                     0x9c => bin_cmp(stack, rm, |a, b| a == b)?,
                     0x9d => {
-                        // OP_NUMEQUALVERIFY
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
                         if a != b {
@@ -715,68 +682,55 @@ pub(crate) fn eval_script(
                     0xa1 => bin_cmp(stack, rm, |a, b| a <= b)?,
                     0xa2 => bin_cmp(stack, rm, |a, b| a >= b)?,
                     0xa3 => {
-                        // OP_MIN
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(a.min(b)))?;
                     }
                     0xa4 => {
-                        // OP_MAX
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, scriptnum_encode(a.max(b)))?;
                     }
                     0xa5 => {
-                        // OP_WITHIN
                         let max = scriptnum_decode(&pop(stack)?, rm)?;
                         let min = scriptnum_decode(&pop(stack)?, rm)?;
                         let x = scriptnum_decode(&pop(stack)?, rm)?;
                         push(stack, bool_encode(x >= min && x < max))?;
                     }
                     0xa6 => {
-                        // OP_RIPEMD160
                         let v = pop(stack)?;
                         use bitcoin::hashes::ripemd160;
                         push(stack, ripemd160::Hash::hash(&v).to_byte_array().to_vec())?;
                     }
                     0xa7 => {
-                        // OP_SHA1 (consensus-enabled; was stubbed → would fail post-milestone)
+                        // OP_SHA1 is consensus-enabled (was stubbed → would fail post-milestone).
                         let v = pop(stack)?;
                         push(stack, crypto::sha1(&v).to_vec())?;
                     }
                     0xa8 => {
-                        // OP_SHA256
                         let v = pop(stack)?;
                         push(stack, crypto::sha256(&v).to_vec())?;
                     }
                     0xa9 => {
-                        // OP_HASH160
                         let v = pop(stack)?;
                         push(stack, crypto::hash160(&v).to_vec())?;
                     }
                     0xaa => {
-                        // OP_HASH256
                         let v = pop(stack)?;
                         use bitcoin::hashes::sha256d;
                         push(stack, sha256d::Hash::hash(&v).to_byte_array().to_vec())?;
                     }
                     0xab => {
-                        // OP_CODESEPARATOR:
-                        // - CONST_SCRIPTCODE: reject in Base (even unexecuted).
-                        // - Tapscript (BIP342): instruction index for leaf sighash.
-                        // - Base / WitnessV0: subsequent CHECKSIG* use scriptCode =
-                        //   everything **after** this opcode (Core pbegincodehash).
+                        // Tapscript: instruction index. Base/v0: scriptCode after this opcode.
                         if ctx.const_scriptcode && ctx.sig_version == SigVersion::Base {
                             return Err(ConsensusError::Script("OP_CODESEPARATOR".into()));
                         }
                         ctx.codeseparator_pos.set(this_pos);
-                        // One-byte opcode; suffix starts at the next byte.
                         ctx.codeseparator_script_off
                             .set(Some(byte_index.saturating_add(1)));
                     }
                     0xac => op_checksig(stack, ctx, false)?,
                     0xad => op_checksig(stack, ctx, true)?,
-                    // BIP342 OP_CHECKSIGADD (0xba) — tapscript only.
                     0xba => {
                         if ctx.sig_version != SigVersion::TapScript {
                             return Err(ConsensusError::Script("unknown opcode 0xba".into()));
@@ -801,7 +755,7 @@ pub(crate) fn eval_script(
                         op_checkmultisig(stack, ctx, true, &mut op_count)?;
                     }
                     0xb1 => {
-                        // OP_CHECKLOCKTIMEVERIFY (BIP65). Pre-activation: NOP.
+                        // BIP65: pre-activation is NOP.
                         if !ctx.bip65_active {
                             continue;
                         }
@@ -812,7 +766,6 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("CLTV negative".into()));
                         }
                         let tx_lock = ctx.tx.lock_time.to_consensus_u32() as i64;
-                        // Type mismatch: both height or both time
                         let lock_is_time = locktime >= 500_000_000;
                         let tx_is_time = tx_lock >= 500_000_000;
                         if lock_is_time != tx_is_time {
@@ -826,9 +779,8 @@ pub(crate) fn eval_script(
                         }
                     }
                     0xb2 => {
-                        // OP_CHECKSEQUENCEVERIFY (BIP112). Pre-activation: NOP.
-                        // Core order: decode (5-byte) → disable-flag NOP → version < 2 fails
-                        // (not NOP). See docs/external_findings/004-csv-nop-and-scriptnum-width.md.
+                        // BIP112: decode (5-byte) → disable-flag NOP → version < 2 fails
+                        // (not NOP). docs/external_findings/004-csv-nop-and-scriptnum-width.md
                         if !ctx.bip112_active {
                             continue;
                         }
@@ -850,14 +802,11 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("CSV".into()));
                         }
                     }
-                    // OP_NOP1, OP_NOP4-OP_NOP10
                     0xb0 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 => {}
                     _ => {
-                        // Tapscript OP_SUCCESS should have short-circuited above; belt-and-suspenders.
                         if ctx.sig_version == SigVersion::TapScript && is_op_success(code) {
                             return Ok(false);
                         }
-                        // Legacy / v0: disabled opcodes are consensus-invalid if executed.
                         if ctx.sig_version != SigVersion::TapScript && is_disabled_legacy(code) {
                             return Err(ConsensusError::Script(format!(
                                 "disabled opcode 0x{code:02x}"
@@ -879,19 +828,17 @@ pub(crate) fn eval_script(
     if !if_stack.is_empty() {
         return Err(ConsensusError::Script("unbalanced IF".into()));
     }
-    Ok(true) // caller applies true-top / cleanstack by policy
+    Ok(true)
 }
 
 fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
-    // BIP112 sequence comparison (tx.nVersion >= 2 checked at opcode).
     let seq_n = seq.to_consensus_u32();
     if seq_n & (1 << 31) != 0 {
         return false; // SEQUENCE_LOCKTIME_DISABLE_FLAG on input
     }
-    let mask = 0x0000_ffff | (1 << 22); // type flag + value
+    let mask = 0x0000_ffff | (1 << 22);
     let seq_masked = seq_n & mask;
     let csv_masked = csv & mask;
-    // Same type (height vs time)
     let type_flag = 1 << 22;
     if (seq_masked ^ csv_masked) & type_flag != 0 {
         return false;
@@ -926,16 +873,14 @@ fn op_checksigadd(stack: &mut Vec<Vec<u8>>, ctx: &EvalContext<'_>) -> Result<(),
     let pubkey = pop(stack)?;
     let n_raw = pop(stack)?;
     let sig = pop(stack)?;
-    // CScriptNum n must be ≤4 bytes (scriptnum_decode enforces).
     let n = scriptnum_decode(&n_raw, ctx.minimal_data)?;
     match tapscript_sig_result(&sig, &pubkey, ctx)? {
         TapSigResult::EmptySig => {
-            // Push n unchanged.
             push(stack, scriptnum_encode(n))?;
         }
         TapSigResult::Valid => {
             push(stack, scriptnum_encode(n.saturating_add(1)))?;
-        } // Invalid non-empty already failed inside tapscript_sig_result.
+        }
     }
     Ok(())
 }
@@ -978,7 +923,6 @@ fn tapscript_sig_result(
     pubkey: &[u8],
     ctx: &EvalContext<'_>,
 ) -> Result<TapSigResult, ConsensusError> {
-    // Empty public key → hard fail.
     if pubkey.is_empty() {
         return Err(ConsensusError::Script("tapscript empty pubkey".into()));
     }
@@ -992,7 +936,6 @@ fn tapscript_sig_result(
     if sig.is_empty() {
         return Ok(TapSigResult::EmptySig);
     }
-    // Non-empty: must verify Schnorr; failure terminates the script.
     if !checksig_schnorr(sig, pubkey, ctx)? {
         return Err(ConsensusError::Script("tapscript CHECKSIG failed".into()));
     }
@@ -1024,16 +967,13 @@ fn op_checkmultisig(
     if m < 0 || m > n {
         return Err(ConsensusError::Script("multisig m".into()));
     }
-    // Pop m sigs: first pop is top = last pushed = Core's first evaluated sig.
     let mut sigs = Vec::with_capacity(m as usize);
     for _ in 0..m {
         sigs.push(pop(stack)?);
     }
     let dummy = pop(stack)?;
-    // BIP147 NULLDUMMY: extra stack element must be empty.
-    // Always required for Witness v0; for Base when SCRIPT_VERIFY_NULLDUMMY is set.
-    // (Independent of CSV: Core treats the flags separately even though they
-    // co-activated on mainnet.)
+    // BIP147: required for Witness v0; Base only when SCRIPT_VERIFY_NULLDUMMY.
+    // Independent of CSV (Core treats the flags separately).
     if !dummy.is_empty() && (ctx.sig_version == SigVersion::WitnessV0 || ctx.null_dummy) {
         return Err(ConsensusError::Script("NULLDUMMY".into()));
     }
@@ -1075,7 +1015,6 @@ fn op_checkmultisig(
         }
     }
 
-    // NULLFAIL: failed CMS with any non-empty signature hard-fails.
     if !f_success && ctx.nullfail && sigs.iter().any(|s| !s.is_empty()) {
         return Err(ConsensusError::Script("NULLFAIL".into()));
     }
@@ -1186,7 +1125,6 @@ fn strip_op_codeseparator(script: &[u8]) -> Vec<u8> {
         let op = script[i];
         i += 1;
         if op == 0xab {
-            // OP_CODESEPARATOR — omit from legacy sighash scriptCode.
             continue;
         }
         out.push(op);
@@ -1269,7 +1207,6 @@ fn checksig_legacy(
     if ctx.strictenc && !crypto::is_compressed_or_uncompressed_pubkey(pubkey) {
         return Err(ConsensusError::Script("PUBKEYTYPE".into()));
     }
-    // WITNESS_PUBKEYTYPE: only compressed keys in witness/v0 scripts.
     if ctx.witness_pubkeytype
         && ctx.sig_version == SigVersion::WitnessV0
         && !crypto::is_compressed_pubkey(pubkey)
@@ -1299,7 +1236,6 @@ fn checksig_legacy(
     };
     let owned: Vec<u8>;
     let script_bytes: &[u8] = if let Some(sc) = script_code_override {
-        // CMS pre-deleted scriptCode; CONST_SCRIPTCODE checked at delete site.
         sc
     } else {
         let base = script_code_bytes(ctx);
@@ -1393,8 +1329,7 @@ fn sighash_for_script(
     let script_code = Script::from_bytes(script_bytes);
     match ctx.sig_version {
         SigVersion::Base => {
-            // Raw hashtype (0 is not the same as SIGHASH_ALL=1).
-            // Strip OP_CODESEPARATOR from scriptCode (Core SerializeScriptCode).
+            // Raw hashtype 0 is not SIGHASH_ALL=1.
             let stripped = strip_op_codeseparator(script_bytes);
             let script_code = Script::from_bytes(&stripped);
             let h = ctx
@@ -1491,26 +1426,22 @@ fn scriptnum_encode(mut n: i64) -> Vec<u8> {
 /// Core `CheckMinimalPush`: data must use the shortest opcode form.
 fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
     if data.is_empty() {
-        // Should use OP_0.
         return opcode == 0x00;
     }
     if data.len() == 1 && data[0] >= 1 && data[0] <= 16 {
-        // OP_1 .. OP_16
         return opcode == 0x50 + data[0];
     }
     if data.len() == 1 && data[0] == 0x81 {
-        // OP_1NEGATE
         return opcode == 0x4f;
     }
     if data.len() <= 75 {
-        // Direct push: opcode == length
         return opcode as usize == data.len();
     }
     if data.len() <= 255 {
-        return opcode == 0x4c; // OP_PUSHDATA1
+        return opcode == 0x4c;
     }
     if data.len() <= 65535 {
-        return opcode == 0x4d; // OP_PUSHDATA2
+        return opcode == 0x4d;
     }
     true
 }
@@ -1542,7 +1473,6 @@ fn scriptnum_decode_width(
         result |= (b as i64) << (8 * i);
     }
     if v.last().unwrap() & 0x80 != 0 {
-        // negative
         result &= !(0x80i64 << (8 * (v.len() - 1)));
         result = -result;
     }

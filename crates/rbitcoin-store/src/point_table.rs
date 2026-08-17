@@ -63,13 +63,11 @@ pub fn put_spend_on_create_at(
         return Ok(());
     }
     if !multi {
-        // Promote sole → multi list (field was previous spending_tx_fk).
         // IBD first-spend path is sole-only; multi is rare (reorg / double annotate).
         let e1 = spenders.append(field, Fk::NULL)?;
         let e2 = spenders.append(spending_tx_fk, e1)?;
         return set(true, e2);
     }
-    // Already multi: prepend.
     let e = spenders.append(spending_tx_fk, field)?;
     set(true, e)
 }

@@ -31,7 +31,6 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
 pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
     let wire = query.reconstruct_tx(tx_fk)?;
     let status = tx_status_json(query, tx_fk)?;
-    // Store order: (meta, inputs, outputs).
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
 
     let mut vin = Vec::with_capacity(wire.input.len());

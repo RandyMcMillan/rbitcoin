@@ -18,7 +18,6 @@ pub(crate) fn verify(
     let keyhash = &spk[2..22];
 
     let input = &tx.input[input_index];
-    // Witness: <sig> <pubkey>
     if input.witness.len() != 2 {
         return Err(ConsensusError::Script("p2wpkh witness len".into()));
     }

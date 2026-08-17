@@ -1,8 +1,7 @@
 //! Write / Class C commit stage.
 
-use super::*;
-// Parent imports these from phases; access by path for non-glob private imports.
 use super::phases::{class_c_commit, post_commit, structural_run};
+use super::*;
 
 pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     match tip {
@@ -49,7 +48,6 @@ pub fn confirm_write_phase(
 
     let t_wall = Instant::now();
 
-    // Single commit era: durable Class A for this batch before spentness RMW.
     // Keep create pins for SH collect (Class C) — same Arcs as layout fill; avoid
     // re-preading Class A bodies under RES=0 when residency is empty.
     let mut write_create_pins: FkMap<rbitcoin_query::CreatePin> = FkMap::default();
@@ -57,8 +55,6 @@ pub fn confirm_write_phase(
     let mut ensure_ns = 0u64;
     if let Some(plan) = batch.archive_plan.take() {
         if !plan.is_empty() {
-            // Shared CreatePin Arcs only (refcount) for post-commit layout fill —
-            // no whole-plan packed deep clone of outs.
             let planned_fks = plan.planned_fks.clone();
             let pins: Vec<rbitcoin_query::CreatePin> =
                 if plan.batch_pin.len() == plan.planned_fks.len() {
@@ -92,11 +88,6 @@ pub fn confirm_write_phase(
             }
         }
     }
-    // Ensure abs before structural + annotate (sole spent.idx stamper):
-    // - archived parents (load pin no longer idx-batches the set)
-    // - same-batch creates (range after Class A commit + fill_planned)
-    // - load-ahead parents that had no spent.idx stem at pin
-    // - retry after partial write
     {
         let t_ens = Instant::now();
         ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;
@@ -117,7 +108,6 @@ pub fn confirm_write_phase(
             let drain = scope.spawn(move || query.store().txs.head_insert_queued(&queued));
 
             // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
-            // Structural fills meta_by_abs for pure-write annotate (no second body pread).
             let mut meta_by_abs: rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)> =
                 rbitcoin_query::U64Map::default();
             let t_struct = Instant::now();
@@ -185,7 +175,7 @@ pub fn confirm_write_phase(
         confirm_phase_stats::TWEAK_NS.fetch_add(tweak_ns, Ordering::Relaxed);
     }
 
-    // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
+    // No tip GC of sparse pins (dropped with ScriptOkBatch).
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     confirm_phase_stats::note_last_write(confirm_phase_stats::LastWritePhases {
         n_blocks: n_blocks as u32,
@@ -219,7 +209,6 @@ pub(super) fn fill_planned_create_layout_after_commit(
     if planned_fks.is_empty() || pins.is_empty() {
         return Ok(());
     }
-    // Only parents actually pinned for spends and still missing abs layout.
     let missing: U64Set = batch_parents
         .fks_missing_layout()
         .into_iter()

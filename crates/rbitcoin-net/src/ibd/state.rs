@@ -242,7 +242,6 @@ impl IbdWorkState {
         if self.known_headers.len() > live.len().saturating_add(4096) {
             self.known_headers
                 .retain(|h| live.contains(h) || inflight.contains_key(h));
-            // Drop height/fk for headers we just pruned from known.
             self.header_fks.retain(|h, _| {
                 live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
             });

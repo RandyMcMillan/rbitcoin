@@ -37,7 +37,8 @@ impl Level {
     }
 
     /// Parse `error|warn|info|debug|trace` (case-insensitive). Also accepts
-    /// `warning` and single-letter forms `e|w|i|d|t`.
+    /// `warning` and single-letter forms `e|w|i|d|t`. `off`/`none`/`0` is
+    /// not a level (`None`) — callers that want silence use [`init_off`].
     pub fn parse(s: &str) -> Option<Level> {
         match s.trim().to_ascii_lowercase().as_str() {
             "error" | "e" => Some(Level::Error),
@@ -45,7 +46,6 @@ impl Level {
             "info" | "i" => Some(Level::Info),
             "debug" | "d" => Some(Level::Debug),
             "trace" | "t" => Some(Level::Trace),
-            // Off: only never emit (set max below Error).
             "off" | "none" | "0" => None,
             _ => None,
         }
@@ -104,7 +104,6 @@ pub fn init_from_env() -> bool {
         init(level);
         return true;
     }
-    // Explicit off.
     if raw.trim().eq_ignore_ascii_case("off")
         || raw.trim().eq_ignore_ascii_case("none")
         || raw.trim() == "0"
@@ -123,7 +122,6 @@ pub fn parse_level_spec(spec: &str) -> Option<Level> {
         if part.is_empty() {
             continue;
         }
-        // `crate=level` or bare `level`
         let token = part.rsplit('=').next().unwrap_or(part).trim();
         if let Some(l) = Level::parse(token) {
             found = Some(l);
@@ -150,7 +148,7 @@ fn civil_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let h = (hours % 24) as u32;
     let days = hours / 24;
 
-    // Days since 1970-01-01 → year/month/day (Howard Hinnant algorithm).
+    // Howard Hinnant civil-from-days (not the naive 365.25 approximation).
     let z = days as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -186,7 +184,6 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     }
     let ts = format_timestamp(SystemTime::now());
     let mut stderr = io::stderr().lock();
-    // Bold only on interactive stderr so `> file` / pipes stay plain text.
     let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
     if bold {
         let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{args}\x1b[0m");

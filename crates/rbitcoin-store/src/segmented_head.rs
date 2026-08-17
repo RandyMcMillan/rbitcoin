@@ -687,7 +687,7 @@ impl SegmentedTxHead {
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };
-            // Keys that pass fuse for this segment → one page-coalesced probe batch.
+
             let mut pass_i: Vec<usize> = Vec::new();
             let mut pass_keys: Vec<[u8; 32]> = Vec::new();
             for (i, m) in mixed.iter().enumerate() {
@@ -773,7 +773,7 @@ impl SegmentedTxHead {
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
             let mut new_list = (**guard).clone();
-            // Drop empty unsealed tail if present.
+
             if let Some(last) = new_list.last() {
                 if !last.sealed && last.count.load(Ordering::Relaxed) == 0 {
                     let fid = last.file_id;
@@ -785,7 +785,7 @@ impl SegmentedTxHead {
             *guard = Arc::new(new_list);
         }
         ROLLS.fetch_add(1, Ordering::Relaxed);
-        // Roll opens one new empty tail — compact one-liner (startup open is multi-seg).
+
         rbitcoin_log::info!(
             "store: tx.head roll open file_id={file_id} first_fk={first_fk} bits={} slots={}",
             self.layout.bits,
@@ -834,7 +834,7 @@ impl SegmentedTxHead {
         fuse.write_to(&fuse_path)?;
         last.head.flush()?;
         let fuse_bytes = fuse.fingerprint_bytes();
-        // Replace tail with sealed Arc.
+
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
             let mut new_list = (**guard).clone();

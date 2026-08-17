@@ -119,7 +119,6 @@ fn random_cookie_password() -> String {
         .as_nanos()
         .hash(&mut h);
     std::process::id().hash(&mut h);
-    // 32 hex chars — enough entropy for local cookie auth.
     format!(
         "{:016x}{:016x}",
         h.finish(),

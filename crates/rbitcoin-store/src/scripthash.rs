@@ -351,7 +351,7 @@ impl ScriptHashTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash)?;
         let payload0 = payload_start(FILE_HEADER_LEN);
-        let need = payload0; // header + empty alloc page
+        let need = payload0;
         body.ensure_capacity(need)?;
         body.set_logical_len(need)?;
         let state = AllocState {
@@ -383,7 +383,6 @@ impl ScriptHashTable {
         let body = TableFile::open(dir.join("scripthash.body"), TableKind::ScriptHash)?;
         let head_path = dir.join("scripthash.head");
         let expected = shard_count_for_role(HeadRole::ScriptHash);
-        // Detect legacy multi-shard layouts before open (e.g. 16-way → 64-way).
         if expected > 1 {
             if let Some(on_disk) = count_sh_head_shards(&head_path)? {
                 if on_disk != expected {
@@ -418,7 +417,6 @@ impl ScriptHashTable {
     ) -> Result<Self, StoreError> {
         let (state, alloc_ver) = read_alloc_header(&body)?;
         let sealed = dir.join(MAIN_SEALED_NAME).is_file();
-        // Opens segmented `scripthash.ovf/`; wipes legacy full-size ovf.head.
         let overflow = ShOverflowStack::open(dir)?;
         let n_shards = head.shard_count();
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
@@ -1047,7 +1045,6 @@ impl ScriptHashTable {
         order.sort_by(|&a, &b| recs[a].scripthash.cmp(&recs[b].scripthash));
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
-        // Track which segment each key already lives on (main append vs overflow).
         let mut home: HashMap<[u8; 32], KeyHome> = HashMap::new();
 
         let t_seed = std::time::Instant::now();
@@ -1116,7 +1113,6 @@ impl ScriptHashTable {
         }
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        // Walk scripthash-sorted order; per key: sort FKs, skip ≤ max, append.
         let t_body = std::time::Instant::now();
         let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
         let mut written = 0usize;
@@ -1196,7 +1192,6 @@ impl ScriptHashTable {
     ) -> Result<(), StoreError> {
         let mut main_try: Vec<([u8; 32], ShHeadValue)> = Vec::new();
         let mut ovf_new: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        // Home-segment updates (id → upserts).
         let mut ovf_home: HashMap<u32, Vec<([u8; 32], ShHeadValue)>> = HashMap::new();
 
         let sealed = self.main_is_sealed();
@@ -1326,7 +1321,6 @@ impl ScriptHashTable {
         }
         let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::Fuse8)?;
         self.sealed_ovf.lock().unwrap().push(sealed);
-        // Replace ingest with a fresh empty OA.
         let p = ingest_path(&self.store_dir);
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file({
@@ -1434,7 +1428,6 @@ impl ScriptHashTable {
             self.free_if_paged(alloc, old)?;
             return Ok(ShHeadValue::Empty);
         }
-        // Ensure sorted before pack.
         for w in live.windows(2) {
             if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
                 return Err(StoreError::Corrupt(
@@ -1634,7 +1627,6 @@ impl ScriptHashTable {
         self.body.read_at(last, &mut page)?;
         for e in tail {
             if !sh_page_try_append(&mut page, e.create_tx_fk)? {
-                // Roll: write full page once with next set, start empty successor.
                 let new_off = self.alloc_page(alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 self.body.write_at(last, &page)?;
@@ -1643,7 +1635,6 @@ impl ScriptHashTable {
                 last = new_off;
             }
         }
-        // Single write of the open last page (was per-FK write_at before).
         self.body.write_at(last, &page)?;
         Ok(last)
     }
@@ -2423,7 +2414,6 @@ impl<'a> ScriptHashBulkSession<'a> {
         if let Ok(mut g) = self.table.alloc.lock() {
             *g = state;
         }
-        // Progress file already has next_shard from last complete install.
         self.finished = true;
         rbitcoin_log::info!(
             "store: scripthash bulk session abandoned incomplete; \

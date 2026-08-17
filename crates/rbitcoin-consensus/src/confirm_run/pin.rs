@@ -58,12 +58,9 @@ pub(super) fn pin_for_wire_batch(
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let mut n_same_batch = 0u32;
 
-    // id → Arc pin (tx, outs, dense denserels). Spent parents only (after thin pass).
     let mut plan_by_id: U64Map<
         std::sync::Arc<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     > = U64Map::default();
-    // batch_pin by create id (Arc — preferred same-batch pin source).
-    // packed pin half shares the same Arc; no separate outs clone.
     let mut batch_pin_by_id: U64Map<
         &std::sync::Arc<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     > = U64Map::default();
@@ -98,7 +95,6 @@ pub(super) fn pin_for_wire_batch(
                         create_fk: Some(pid),
                         prev_index: inp.prev_index,
                     });
-                    // Same-batch or external parent — only spent creates need pin.
                     parent_vouts.entry(pid).or_default().push(inp.prev_index);
                 } else {
                     edges.push(ThinInput {
@@ -150,8 +146,6 @@ pub(super) fn pin_for_wire_batch(
         vouts.dedup();
     }
 
-    // Build plan/in-flight pin sources only for spent parents (not every create).
-    // 1) Prior uncommitted plans (Arc pin — no deep clone).
     if let Some(ifo) = in_flight {
         for (id, need) in &parent_vouts {
             if plan_by_id.contains_key(id) {
@@ -163,9 +157,6 @@ pub(super) fn pin_for_wire_batch(
             }
         }
     }
-    // 2) External sparse pins are applied after adopt (not dense CreatePin).
-    // 2b deferred: range denserels after free pins are in batch_parents (sparse API).
-    // 3) Same-batch creates: shared batch_pin / packed CreatePin Arc.
     for (id, _need) in &parent_vouts {
         if plan_by_id.contains_key(id) {
             continue;
@@ -183,8 +174,6 @@ pub(super) fn pin_for_wire_batch(
         ),
         None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
     };
-    // One store lock: adopt live shared pins (writeq / peer load overlap) so free
-    // path can skip OutputRecord clones when need is already covered.
     let t_adopt = Instant::now();
     if pipeline_parent_store.is_some() {
         batch_parents.adopt_from_store(parent_vouts.keys().copied());
@@ -193,14 +182,11 @@ pub(super) fn pin_for_wire_batch(
     let mut still_need: U64Map<Vec<u32>> = U64Map::default();
     let mut n_plan_pin = 0u64;
 
-    // Plan / in-flight / same-batch free pins → BatchParents (local HashMap put;
-    // store mutex only at adopt/publish — not per parent).
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
-        // Cross-batch share hit: pin already covers need after adopt.
-        // Pure hit: only refresh meta when plan/layout material is present
-        // (skip empty refresh_pin_meta and avoid redundant outs loads).
+        // Pure adopt hit: refresh meta only when plan/layout material is present
+        // (skip empty refresh_pin_meta — it would reload outs).
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
                 let (tx, _outs) = pin.as_ref();
@@ -218,7 +204,6 @@ pub(super) fn pin_for_wire_batch(
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
             } else if let Some(plan) = plan {
-                // Sparse external: layout/coinbase only from plan-local pin.
                 if let Some(ext) = plan.external_parent_outs.get(id) {
                     let (tx, _live) = ext.as_ref();
                     let cb = if tx.input_count != 1 {
@@ -239,7 +224,6 @@ pub(super) fn pin_for_wire_batch(
             n_plan_pin = n_plan_pin.saturating_add(1);
             continue;
         }
-        // Sparse external parent pin (need-vouts only — no dense CreatePin).
         if let Some(plan) = plan {
             if let Some(ext) = plan.external_parent_outs.get(id) {
                 let (tx, live_all) = ext.as_ref();
@@ -271,7 +255,6 @@ pub(super) fn pin_for_wire_batch(
                     n_plan_pin = n_plan_pin.saturating_add(1);
                     continue;
                 }
-                // Incomplete sparse pin — fall through to range / cold.
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -311,11 +294,10 @@ pub(super) fn pin_for_wire_batch(
         }
     }
     let plan_pin_ns = t_plan.elapsed().as_nanos() as u64;
-    // Batch-local cold walls/counts for last-pin / slow-load logs.
     let mut cold_range_batch_ns = 0u64;
     let mut n_range_new = 0u64;
 
-    // 2b) Body denserels by range for still_need (lookup-stamped ranges only).
+    // Body denserels by range for still_need: lookup-stamped ranges only.
     {
         let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
@@ -403,9 +385,7 @@ pub(super) fn pin_for_wire_batch(
         }
     }
 
-    // Load IO contract: txout outs only via body-by-range (above) or plan/in-flight
-    // offline pins. **Never** `tx.idx` / head cold denserels on load (idx is lookup).
-    // `spent.idx` range stamp is write `ensure_spend_abs_layouts` (not here).
+    // Never `tx.idx` / head cold denserels on load. `spent.idx` is write ensure.
     let n_cold = 0u64;
     let cold_io_ns = 0u64;
     let cold_decode_ns = 0u64;
@@ -415,9 +395,7 @@ pub(super) fn pin_for_wire_batch(
         )));
     }
 
-    // Pin contract: every spent parent is in BatchParents with need outs.
-    // Same-batch / load-ahead creates may still lack spent_range until write
-    // (idx miss here; `fill_planned_create_layout_after_commit` + ensure).
+    // Same-batch / load-ahead creates may still lack spent_range until write.
     let t_contract = Instant::now();
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
@@ -434,7 +412,6 @@ pub(super) fn pin_for_wire_batch(
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;
 
-    // One store lock: publish Weaks so peer load/writeq can adopt the same Arc.
     let t_publish = Instant::now();
     batch_parents.publish_to_store();
     let publish_ns = t_publish.elapsed().as_nanos() as u64;
@@ -496,7 +473,6 @@ pub(super) fn pin_for_wire_batch(
     }
 
     let warm = DenserelsWarmStats {
-        // External parents only (unique spent creates not same-batch offline).
         parents: parent_vouts.len().saturating_sub(n_same_batch as usize) as u32,
         already: n_plan_pin.saturating_sub(n_same_batch as u64) as u32,
         cold: n_cold as u32,
@@ -506,14 +482,6 @@ pub(super) fn pin_for_wire_batch(
     Ok((batch_parents, batch_thin, warm))
 }
 
-/// SCRIPTS STAGE: pure verification of jobs already assembled at load.
-///
-/// **No store / Query / side effects.** Input is a [`LoadedBatch`] (script jobs
-/// hold prevouts + txs + softfork flags); output is a [`ScriptOkBatch`] for the
-/// write queue. Clears jobs after success so write carries spends/fees only.
-///
-/// Uses rayon for CPU parallelism only — does not touch disk or process-global
-/// tables (aside from the rayon pool and script phase timers).
 /// Ensure spend abs for every spend edge on the write batch.
 ///
 /// Sole owner of `spent.idx` range stamp for write. Covers:
@@ -579,14 +547,11 @@ pub(super) fn ensure_spend_abs_layouts(
         }
     }
 
-    // 1) Pin denserels + body_range already on BatchParents — no body IO.
     let mut ensure_res = 0u64;
     let mut still: U64Map<Vec<u32>> = U64Map::default();
-    // Pin has denserels but still no body_range — idx only (not denserels IO).
-    let mut range_only: Vec<rbitcoin_primitives::Fk> = Vec::new();
+    let mut need_idx_body_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need_v) in &need {
         let fk = rbitcoin_primitives::Fk(*id);
-        // Pin already complete for this create — skip.
         if batch_parents.has_abs_layout(fk)
             && (need_v.is_empty()
                 || need_v
@@ -596,7 +561,6 @@ pub(super) fn ensure_spend_abs_layouts(
             ensure_res = ensure_res.saturating_add(1);
             continue;
         }
-        // Range-only: denserels already on pin — do not cold-load Class A denserels body.
         if batch_parents.has_spender_rels(fk) {
             if batch_parents.has_abs_layout(fk)
                 && (need_v.is_empty()
@@ -607,30 +571,29 @@ pub(super) fn ensure_spend_abs_layouts(
                 ensure_res = ensure_res.saturating_add(1);
                 continue;
             }
-            range_only.push(fk);
+            need_idx_body_range.push(fk);
             continue;
         }
         still.insert(*id, need_v.clone());
     }
 
-    // 1b) Idx body ranges for pin denserels without range (cheap; no denserels body).
-    if !range_only.is_empty() {
-        range_only.sort_unstable_by_key(|f| f.0);
-        range_only.dedup();
+    if !need_idx_body_range.is_empty() {
+        need_idx_body_range.sort_unstable_by_key(|f| f.0);
+        need_idx_body_range.dedup();
         let ranges = query
             .store()
-            .tx_body_range_batch(&range_only)
+            .tx_body_range_batch(&need_idx_body_range)
             .map_err(ConsensusError::from)?;
         let spent = query
             .store()
-            .tx_spent_range_batch(&range_only)
+            .tx_spent_range_batch(&need_idx_body_range)
             .map_err(ConsensusError::from)?;
-        for (fk, sr) in range_only.iter().zip(spent.into_iter()) {
+        for (fk, sr) in need_idx_body_range.iter().zip(spent.into_iter()) {
             if let Some(range) = sr {
                 batch_parents.set_spent_range_only(*fk, range);
             }
         }
-        for (fk, opt) in range_only.iter().zip(ranges.into_iter()) {
+        for (fk, opt) in need_idx_body_range.iter().zip(ranges.into_iter()) {
             let Some(range) = opt else {
                 // No idx range yet (e.g. parent not committed) — hard fail at post-condition
                 // if spend still needs abs; leave for invariant.
@@ -655,14 +618,13 @@ pub(super) fn ensure_spend_abs_layouts(
     }
     confirm_phase_stats::ENSURE_RES_HIT.fetch_add(ensure_res, Ordering::Relaxed);
 
-    // 2) Class A denserels body for remainder only (must not re-load pin denserels hits).
+    // Class A denserels body for remainder only — must not re-load pin denserels hits.
     if !still.is_empty() {
         let fks: Vec<rbitcoin_primitives::Fk> = still
             .keys()
             .map(|id| rbitcoin_primitives::Fk(*id))
             .collect();
         confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
-        // Structural denserels fill for pin gaps (cold Class A).
         let loaded = rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::Outs)
             .map_err(ConsensusError::from)?;
         let secret = query.store().txs.store_secret();
@@ -676,7 +638,6 @@ pub(super) fn ensure_spend_abs_layouts(
             let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
                 dec
             } else {
-                // load_creates_once OutsDenserels should always fill decoded_outs.
                 rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
                     .map_err(|_| {
                         ConsensusError::Store(StoreError::Corrupt(
@@ -687,7 +648,6 @@ pub(super) fn ensure_spend_abs_layouts(
             // Write ensure may read txid.body (not load stage).
             tx.txid = known_create_txid_lookup(query, id, None)?;
             if batch_parents.contains(c.fk) {
-                // Layout-only publish with already_covers short-circuit (batched style).
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
                 continue;
             }
@@ -719,7 +679,6 @@ pub(super) fn ensure_spend_abs_layouts(
             };
             batch_parents.insert_owned(c.fk, tx, live, checked, cb, Some(c.body_range), sparse);
         }
-        // Cold inserts are new pins — stamp spent ranges onto them too.
         let mut spent_fks: Vec<rbitcoin_primitives::Fk> = still
             .keys()
             .map(|id| rbitcoin_primitives::Fk(*id))
@@ -738,7 +697,6 @@ pub(super) fn ensure_spend_abs_layouts(
         }
     }
 
-    // Post-condition: every non-null spend edge has abs — no structural cold paper.
     for p in prepared {
         for &(_txid, vout, sfk, cfk) in &p.spends {
             if sfk.is_null() || cfk.is_null() {

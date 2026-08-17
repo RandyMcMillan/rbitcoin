@@ -13,8 +13,6 @@ use bitcoin::consensus::deserialize;
 use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::Magic;
 
-// ── Core-aligned P2P limits ───────────────────────────────────────────────
-
 /// Bitcoin Core `MAX_PROTOCOL_MESSAGE_LENGTH` — max P2P payload bytes.
 ///
 /// Note: rust-bitcoin's `MAX_MSG_SIZE` is 5_000_000; Core enforces 4_000_000.
@@ -30,8 +28,6 @@ pub const MAX_HEADERS_RESULTS: usize = 2_000;
 /// Bitcoin Core `MAX_LOCATOR_SZ` — max block locator hashes.
 pub const MAX_LOCATOR_SZ: usize = 101;
 
-// ── Encode cost hints ─────────────────────────────────────────────────────
-
 /// Whether encoding this payload is heavy enough to keep off async I/O workers.
 #[inline]
 pub fn encode_is_cpu_heavy(payload: &NetworkMessage) -> bool {
@@ -43,8 +39,6 @@ pub fn encode_is_cpu_heavy(payload: &NetworkMessage) -> bool {
         _ => false,
     }
 }
-
-// ── Framed message (I/O result without payload deserialize) ───────────────
 
 /// One fully framed P2P message: header fields + raw payload bytes.
 ///
@@ -166,7 +160,6 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
         if seen_null {
             return false; // non-zero after null padding
         }
-        // Match Core: printable ASCII, not control bytes.
         if !b.is_ascii_graphic() && b != b' ' {
             return false;
         }

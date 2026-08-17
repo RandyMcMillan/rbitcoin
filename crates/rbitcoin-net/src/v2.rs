@@ -29,8 +29,6 @@ pub type V2Reader = ProtocolReader<BufReader<OwnedReadHalf>>;
 /// Async write half after BIP324 handshake.
 pub type V2Writer = ProtocolWriter<OwnedWriteHalf>;
 
-// ── BIP324 short message type IDs (Core `V2_MESSAGE_IDS` / BIP324 table) ──
-
 /// Short ID → command name. Index 0 is the long-form escape (not a real message).
 /// Matches Bitcoin Core `V2_MESSAGE_IDS` (net.cpp).
 const SHORT_IDS: &[&str] = &[
@@ -76,7 +74,6 @@ const SHORT_IDS: &[&str] = &[
 ];
 
 fn short_id_for_command(cmd: &str) -> Option<u8> {
-    // Skip index 0 (long-form marker).
     SHORT_IDS
         .iter()
         .enumerate()
@@ -123,7 +120,6 @@ fn command_from_12(cmd12: &[u8; 12]) -> Result<String, NetError> {
 
 /// Encode a P2P application message as BIP324 packet contents (short/long type + payload).
 pub fn encode_v2_contents(payload: NetworkMessage) -> Result<Vec<u8>, NetError> {
-    // Cap outbound inventory-style messages so we never emit Core-rejected sizes.
     match &payload {
         NetworkMessage::Inv(v) | NetworkMessage::GetData(v) | NetworkMessage::NotFound(v) => {
             if v.len() > MAX_INV_SIZE {
@@ -190,7 +186,6 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
         }
         let mut cmd12 = [0u8; 12];
         cmd12.copy_from_slice(&contents[1..13]);
-        // Validate padding / charset.
         if command_from_12(&cmd12).is_err() {
             rbitcoin_log::info!("{}", v2_invalid_message_type_log());
             return Err(NetError::Protocol("invalid message command"));

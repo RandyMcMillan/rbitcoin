@@ -187,8 +187,6 @@ pub(crate) async fn spawn_peer(
         &ua,
     )
     .await?;
-    // Peer's advertised chain height — used as IBD progress horizon when our
-    // local header path has not yet reached the network tip.
     let peer_height = u32::try_from(ver.start_height).unwrap_or(0);
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
@@ -245,7 +243,6 @@ pub(crate) async fn spawn_peer(
                             touch_block_progress(&progress_io);
                         }
 
-                        // Block frames: raw payload → body queue (no peer full decode).
                         if frame.is_block() {
                             match frame.block_hash_from_header() {
                                 Some(hash) if frame.payload.len() >= 80 => {
@@ -260,7 +257,6 @@ pub(crate) async fn spawn_peer(
                                         .send_body(PeerEvent::BlockDecodeFailed { peer: id, hash });
                                 }
                                 None => {
-                                    // Truncated / unusable block frame — nothing to re-get by hash.
                                     rbitcoin_log::debug!(
                                         "ibd: peer[{id}] block frame without usable header hash"
                                     );

@@ -56,17 +56,14 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             continue;
         }
         if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
-            // height > tip but already flagged done — keep payload, still note feed.
             kept_above_tip_flag = kept_above_tip_flag.saturating_add(1);
         }
-        // Minimal integrity: rec must have non-empty payload_len; full decode at confirm load.
         if qb.payload_len == 0 {
             empty_skip = empty_skip.saturating_add(1);
             let _ = hub.query.block_queue_dequeue_height(qb.height);
             continue;
         }
         let wire_bytes = qb.payload_len;
-        // Queue-owned: pending so densify will not re-getdata; no soft charge.
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
             st.record_height(hash, qb.height);
@@ -76,14 +73,12 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             st.header_fks.insert(hash, header_fk);
         }
         if qb.height != u32::MAX {
-            // Readiness only — prep reloads wire from body queue.
             confirm_feed.note(qb.height, hash);
             bytes = bytes.saturating_add(wire_bytes);
             h_min = h_min.min(qb.height);
             h_max = h_max.max(qb.height);
             n = n.saturating_add(1);
         } else {
-            // Unknown height: cannot feed confirm path.
             st.body.mark_missing(hash);
             unknown_h = unknown_h.saturating_add(1);
         }
@@ -117,7 +112,6 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         }
     }
 
-    // One summary line for partial-IBD restart (no per-rec spam).
     if n > 0 || dropped_done > 0 || empty_skip > 0 || unknown_h > 0 || gap_marked > 0 {
         let mib = bytes / (1024 * 1024);
         if n > 0 {
@@ -197,7 +191,6 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
         if st.body.is_rejected(&hash) {
             break;
         }
-        // Already have body-queue wire.
         if hub.query.block_queue_has_height(ht) {
             st.body.mark_pending(hash);
             confirm_feed.note(ht, hash);
@@ -206,11 +199,9 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
             h_max = h_max.max(ht);
             continue;
         }
-        // Zombie pending without BQ — clear and try Class A rehydrate / re-get.
         if st.body.is_pending(&hash) {
             st.body.mark_missing(hash);
         }
-        // Need Class A on disk (seed `mark_archived` and/or store probe).
         let has_class_a = st.body.is_known_archived(&hash)
             || hub
                 .query

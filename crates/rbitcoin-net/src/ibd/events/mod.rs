@@ -85,7 +85,6 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     let t0 = Instant::now();
     let mut events = 0u64;
 
-    // 1) Body path: framed block wire — drain until empty or soft time budget.
     let body_t0 = Instant::now();
     loop {
         if body_t0.elapsed() >= BODY_DRAIN_TIME_BUDGET {
@@ -108,7 +107,6 @@ pub(crate) fn drain_ready_peer_and_archive_events(
         }
     }
 
-    // 2) Headers / other control — budgeted (never drop; resume next turn).
     let ctrl_t0 = Instant::now();
     let mut ctrl_n = 0u64;
     while ctrl_n < CTRL_DRAIN_EVENT_BUDGET && ctrl_t0.elapsed() < CTRL_DRAIN_TIME_BUDGET {
@@ -150,8 +148,7 @@ pub(crate) fn apply_peer_event(
         PeerEvent::Headers { peer, headers } => {
             let batch_len = headers.len();
             let mut added = 0usize;
-            // Sequential height walk: after tip drains `ordered` + hygiene, mid-batch
-            // parents are often only known via the previous header in this message.
+            // Mid-batch parents are often only the previous header in this message.
             let mut batch_prev: Option<(BlockHash, u32)> = None;
             for hdr in headers {
                 let hash = hdr.block_hash();
@@ -180,7 +177,6 @@ pub(crate) fn apply_peer_event(
                     batch_prev = Some((hash, h));
                 }
                 if !already_known {
-                    // Persist header row once and cache fk — Block path must not re-hit store.
                     if !st.header_fks.contains_key(&hash) {
                         if let Ok(fk) = hub.ensure_header_fk(&hdr) {
                             st.header_fks.insert(hash, fk);
@@ -188,12 +184,9 @@ pub(crate) fn apply_peer_event(
                     }
                 }
                 if hub.has_block(&hash) {
-                    // Still record height (above) so the next header in the batch can
-                    // chain parent_height after hygiene wiped hash_height of past tip.
                     st.known_headers.insert(hash);
                     continue;
                 }
-                // Confirm-rejected bodies stay blacklisted for this run.
                 if st.body.is_rejected(&hash) {
                     continue;
                 }
@@ -205,14 +198,10 @@ pub(crate) fn apply_peer_event(
                     continue;
                 }
                 st.known_headers.insert(hash);
-                // Refuse to put a hash on the confirm path without a height — offer
-                // needs ht==tip+1; unknown-height entries used to stall tip silently.
+                // Offer needs a height (ht==tip+1); unknown-height used to stall tip silently.
                 if !st.hash_height.contains_key(&hash) {
                     continue;
                 }
-                // Re-admit known hashes after tip-drain/hygiene emptied `ordered`
-                // (mainnet 292k). Skip inflight / pending / at-or-below tip —
-                // those 1-header announces are tip chatter, not new work.
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {
                     continue;
                 }
@@ -254,7 +243,6 @@ pub(crate) fn apply_peer_event(
                         request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
                 }
             } else if batch_len == 0 {
-                // True empty headers message only — not "already known" batches.
                 st.empty_header_streak = st.empty_header_streak.saturating_add(1);
                 let tip_h = hub.tip_height().unwrap_or(0);
                 let lag = header_lag_behind_peers(st, tip_h);
@@ -280,8 +268,6 @@ pub(crate) fn apply_peer_event(
                     }
                     st.headers_done = false;
                     if should_rerequest_headers_on_empty_lag(st.empty_header_streak) {
-                        // Full store resume walks **all** headers (~300ms on mainnet).
-                        // Re-seed sparsely; getheaders still every 8 empties.
                         if should_reseed_work_path_on_empty_lag(st.empty_header_streak) {
                             super::path::seed_work_path_from_store(st, hub);
                         }
@@ -328,23 +314,16 @@ pub(crate) fn apply_peer_event(
             hash,
             payload,
         } => {
-            // Raw frame payload → in-RAM body queue (no peer full Block decode;
-            // block hash already known from framing; parse/txids on confirm pack).
             let wire_bytes = payload.len();
             note_block_rx(&mut st.slots, peer, wire_bytes);
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-            // Drop only permanent reject / already-confirmed. Class A
-            // `is_known_archived` alone is **not** claim-ready (confirm needs BQ
-            // wire). Resume seed marks Class A known without BQ — still accept
-            // peer wire so tip can claim after re-getdata.
+            // Class A `is_known_archived` is not claim-ready (needs BQ wire).
             if st.body.is_rejected(&hash) || hub.has_block(&hash) {
                 return;
             }
-            // Prefer RAM-cached fk from getheaders (no store lock on hot path).
             let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
                 fk
             } else {
-                // Header only (first 80 payload bytes) — not a full block decode.
                 let header = match decode_block_header_prefix(&payload) {
                     Some(h) => h,
                     None => {
@@ -367,7 +346,6 @@ pub(crate) fn apply_peer_event(
             let tip_h = hub.tip_height().unwrap_or(0);
             let height = st.hash_height.get(&hash).copied();
             let Some(height) = height else {
-                // Headers map not ready yet — re-get after height is known.
                 st.body.mark_missing(hash);
                 return;
             };
@@ -391,13 +369,11 @@ pub(crate) fn apply_peer_event(
                     }
                 }
             }
-            // Already have wire for this height — keep first copy only.
             if hub.query.block_queue_has_height(height) {
                 st.body.mark_pending(hash);
                 if let Some(feed) = confirm_feed {
                     feed.note(height, hash);
                 }
-                // Still may complete reorg if this hash filled awaiting need via hold.
                 let _ = try_complete_awaiting_reorg(st, hub);
                 return;
             }
@@ -407,7 +383,6 @@ pub(crate) fn apply_peer_event(
                 .block_queue_offer(height, raw, header_fk.0, &payload)
             {
                 Ok(_offer) => {
-                    // Tip+1 wire may unlock awaiting reorg once winner is held.
                     let _ = try_complete_awaiting_reorg(st, hub);
                 }
                 Err(e) => {
@@ -518,33 +493,13 @@ pub(crate) fn apply_confirm_reject(
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    // Soft re-getdata / re-offer: **not permanent blacklist**.
-    //
-    // - Wire-only: wrong/corrupt body (`unexpected previous header`) — drop
-    //   payload and densify. Mainnet tip freeze at 125653 blacklisted this.
-    // - **Competing path BadPrev** (wire prev is a known non-tip header): try
-    //   most-work reorg before soft re-get.
-    // - Header window: `missing retarget first header` can race when a large
-    //   pack needs a retarget base that is not yet visible to `header_at_height`
-    //   (or was briefly absent). Permanent blacklist freezes tip+1 forever
-    //   (signet partial IBD @~42k). Requeue without blacklisting; claim will
-    //   retry once headers/plans catch up.
-    //
-    // Soft re-getdata **only** for bad wire / missing header window — not for
-    // store invariants or tip-ahead races. Soft-requeue of "parent unresolved" /
-    // "fk mismatch" hid real bugs and livelocked tip; a corrupt store or bad
-    // block must permanent-blacklist so the operator sees the failure.
-    //
-    // Soft re-get: bad **wire** or **corrupt Class A reconstruct** (merkle).
-    // The block *hash* is fine — never permanent-blacklist; clear bad association
-    // so densify/getdata can refill. Mainnet tip+1 stall: Class A body for
-    // tip+1 failed merkle, hash was blacklisted, tip froze with hole=0.
+    // Soft re-get only for bad wire / missing header window / merkle reconstruct.
+    // Never soft-requeue "parent unresolved" / "fk mismatch" (hides store bugs).
     let soft_wire = err.contains("unexpected previous header")
         || err.contains("unexpected previous")
         || err.contains("missing retarget first header")
         || err.contains("merkle root mismatch");
     if soft_wire {
-        // Competing-path BadPrev: attempt reorg before soft re-get livelock.
         if super::reorg::is_bad_prev_err(err) {
             if let Some(h) = hub {
                 if try_reorg_on_bad_prev(st, h, height, hash) {
@@ -553,12 +508,9 @@ pub(crate) fn apply_confirm_reject(
             }
         }
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-        // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
             let _ = q.block_queue_dequeue_height(height);
             if err.contains("merkle root mismatch") {
-                // Corrupt Class A association — drop so rehydrate will not
-                // reconstruct the same bad body on the next restart.
                 match q.clear_archived_body(hash.as_byte_array()) {
                     Ok(true) => warn!(
                         "ibd: cleared corrupt Class A body for {hash} @{height} (merkle mismatch)"
@@ -569,7 +521,6 @@ pub(crate) fn apply_confirm_reject(
             }
         }
         st.body.mark_missing(hash);
-        // Ensure densify can re-request: not archived-known after Class A clear.
         st.body.demote_known(hash);
         warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
         return;
@@ -580,7 +531,6 @@ pub(crate) fn apply_confirm_reject(
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    // Rate-limit follow-up noise; the confirm engine already logged the reject.
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_multiple_of(50) {
@@ -667,7 +617,6 @@ fn try_reorg_on_bad_prev(
     let Some(tip) = hub.tip_hash() else {
         return false;
     };
-    // Ext body: BQ at reject height, held map, Class A, or BQ-by-hash.
     let ext = hub
         .query
         .block_queue_payload(height)
@@ -690,7 +639,6 @@ fn try_reorg_on_bad_prev(
             info!(
                 "ibd: BadPrev competing path @{height}: tip={losing_tip} wire_prev={winning_prev} — trying most-work reorg"
             );
-            // Full path tip→LCA (oldest-first), e.g. [d1e0, 02022e, 1574b].
             let path = match header_hashes_to_best_ancestor(hub, hash) {
                 Ok(p) if !p.is_empty() => p,
                 Ok(_) => vec![winning_prev, hash],
@@ -704,7 +652,6 @@ fn try_reorg_on_bad_prev(
             let mut need = Vec::new();
             for (i, h) in path.iter().enumerate() {
                 let hgt = height.saturating_sub((path.len() - 1 - i) as u32);
-                // Keep height_to_hash in sync so assign/BlockFramed resolve mids.
                 st.record_height(*h, hgt);
                 st.known_headers.insert(*h);
                 if *h == hash {
@@ -722,12 +669,10 @@ fn try_reorg_on_bad_prev(
                 }
             }
             if !need.is_empty() {
-                // Awaiting feeds need_getdata (assign 1b). Return true so soft
-                // path does **not** mark_missing/re-get tip+1 (mainnet livelock).
+                // Return true so soft path does not mark_missing/re-get tip+1 (livelock).
                 st.reorg.set_awaiting(ext.clone(), need.clone());
                 let _ = hub.query.block_queue_dequeue_height(height);
                 clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-                // Keep tip+1 out of tip-hole re-get while mids densify.
                 st.body.mark_pending(hash);
                 warn!(
                     "ibd: competing reorg awaiting {} body/bodies on path to LCA (held tip+1 {hash}) need={need:?}",
@@ -738,7 +683,6 @@ fn try_reorg_on_bad_prev(
             match try_apply_best_candidate(hub, &bodies, &[hash], &mut st.reorg) {
                 Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
                     info!("ibd: most-work reorg after BadPrev → tip_h={new_h}");
-                    // Prefer reject-height dequeue (BQ slot) even if hash_height lags.
                     let _ = hub.query.block_queue_dequeue_height(height);
                     on_reorg_accepted(st, hub, hash, path.iter().copied(), Some(losing_tip));
                     true
@@ -776,7 +720,6 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
         return false;
     }
 
-    // Cheap gate: any registered need still missing → skip (no store probes).
     let need: Vec<BlockHash> = st.reorg.explore_need_hashes().to_vec();
     for &h in &need {
         if !reorg_body_ready_cheap(st, hub, h) {
@@ -793,8 +736,6 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
         bodies.insert(h, b);
     }
 
-    // Load only the contiguous path from each explore tip back to best chain
-    // (header prev walk) — not every ordered/hash_height entry.
     for &tip in &tips {
         let mut cur = tip;
         for _ in 0..10_000 {
@@ -830,7 +771,6 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
     match try_apply_best_candidate(hub, &bodies, &tips, &mut st.reorg) {
         Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
             info!("ibd: most-work reorg after exploration gather → tip_h={new_h}");
-            // Accepted advances tip; fall back to explore tip if query lags.
             let tip = hub.tip_hash().or(apply_tip);
             if let Some(tip) = tip {
                 on_reorg_accepted(st, hub, tip, bodies.keys().copied(), losing);
@@ -890,7 +830,6 @@ pub(crate) fn try_complete_awaiting_reorg(
     let Some(awaiting) = st.reorg.awaiting().cloned() else {
         return false;
     };
-    // Full path from held tip (rejected tip+1) to LCA, plus any remaining need.
     let tip_hash = awaiting.held_tip.block_hash();
     let held_tip = awaiting.held_tip.clone();
     let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();

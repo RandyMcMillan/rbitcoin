@@ -154,7 +154,6 @@ impl Store {
     /// revalidate still walks the tip window.
     pub fn publish_tip_seal(&self) -> Result<(), StoreError> {
         let Some(tip) = self.confirmed.tip_height() else {
-            // Empty chain: remove seal if present.
             let p = TipSeal::path(self.path());
             let _ = std::fs::remove_file(&p);
             return Ok(());
@@ -261,7 +260,6 @@ impl Store {
         if report.bodies_cleared > 0 {
             self.header_txs.flush()?;
         }
-        // Refresh seal to match post-revalidate tip (best-effort).
         let _ = self.publish_tip_seal();
         Ok(report)
     }
@@ -284,7 +282,6 @@ impl Store {
             Err(_) => return Err("header load"),
         };
 
-        // S1: prev link + hash identity against conf parent.
         if height.0 == 0 {
             if !rec.prev_fk.is_null() {
                 return Err("genesis prev_fk non-null");
@@ -330,7 +327,6 @@ impl Store {
             }
         }
 
-        // S2: header_txs bounds; S3: merkle from txid.body when body present.
         match self.header_txs.get_range(fk) {
             Ok(None) => Ok(()), // no body — ok for structural tip (unarchived tip rare)
             Ok(Some((first, count))) => {
@@ -345,7 +341,6 @@ impl Store {
                     report.bodies_cleared = report.bodies_cleared.saturating_add(1);
                     return Err("header_txs range OOB");
                 }
-                // S3: merkle from dense txid sidefile (no full body decode).
                 let leaves = match self.txs.body_txid_range(first.0, last) {
                     Ok(v) if v.len() == count as usize => v,
                     Ok(_) => {
@@ -394,7 +389,6 @@ impl Store {
             _ => {}
         }
 
-        // Disconnect from tip down until target (or empty).
         let mut cur = tip.0;
         loop {
             let keep = match target_tip {

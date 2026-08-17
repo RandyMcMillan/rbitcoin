@@ -17,12 +17,10 @@ pub(crate) fn verify(
 ) -> Result<(), ConsensusError> {
     let _ = tx;
     let spk = job.prevouts[input_index].script_pubkey.as_bytes();
-    // 76 a9 14 <20> 88 ac
     debug_assert!(spk.len() == 25);
     let keyhash = &spk[3..23];
 
     let input = &tx.input[input_index];
-    // scriptSig: <sig> <pubkey>
     let (sig_raw, pubkey_raw) = parse_two_pushes(input.script_sig.as_script())?;
 
     let pk_hash = crypto::hash160(&pubkey_raw);
@@ -51,7 +49,6 @@ fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), ConsensusErro
         match ins.map_err(|_| ConsensusError::Script("p2pkh scriptSig".into()))? {
             Instruction::PushBytes(b) => items.push(b.as_bytes().to_vec()),
             Instruction::Op(op) if op.to_u8() >= 0x51 && op.to_u8() <= 0x60 => {
-                // OP_1..OP_16 — not expected for P2PKH sig/pubkey
                 return Err(ConsensusError::Script("p2pkh scriptSig op".into()));
             }
             Instruction::Op(_) => {

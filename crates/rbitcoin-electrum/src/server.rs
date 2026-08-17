@@ -59,7 +59,7 @@ fn meter_dispatch_wall(us: u64) {
 /// Max simultaneous query-surface clients (Electrum / future Esplora).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// Max request payload bytes (Electrum: one JSON-RPC line incl. `\n`; Esplora: body).
-pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576; // 1 MiB
+pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576;
 /// Alias for shared docs / Esplora body cap ([`DEFAULT_MAX_LINE_BYTES`]).
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 /// Max scripthash subscriptions per Electrum connection (notify fan-out).
@@ -222,7 +222,6 @@ pub async fn run_electrum(
             let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
             match accept {
                 Ok(Ok((stream, peer))) => {
-                    // Cap concurrent clients — refuse when saturated (DoS).
                     let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
                         rbitcoin_log::warn!(
                             "electrum: reject {peer} (at max_connections={max_conn})"
@@ -238,7 +237,7 @@ pub async fn run_electrum(
                     let mp = mempool.clone();
                     let stop = shutdown_c.clone();
                     let h = tokio::spawn(async move {
-                        let _permit = permit; // held until client task ends
+                        let _connection_slot = permit;
                         let how = handle_client(stream, peer, q, cfg, p, tip_rx, mp, stop).await;
                         match how {
                             Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
@@ -302,13 +301,11 @@ where
             }
             buf.extend_from_slice(&available[..take]);
             reader.consume(take);
-            // Strip trailing \n / \r\n
             while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
                 buf.pop();
             }
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
         }
-        // No newline in this chunk.
         if buf.len().saturating_add(available.len()) > max_bytes {
             let n = available.len();
             reader.consume(n);
@@ -406,11 +403,9 @@ where
                 let line = match line {
                     Ok(Ok(Some(l))) => l,
                     Ok(Ok(None)) => {
-                        // EOF
                         return Ok(());
                     }
                     Ok(Err(e)) => {
-                        // Oversize line: best-effort error then drop client.
                         if e.kind() == std::io::ErrorKind::InvalidData {
                             let resp = json!({
                                 "jsonrpc":"2.0","id": null,
@@ -658,7 +653,6 @@ where
                                 }
                             }
                         }
-                        // Re-poll load after handling ping (do not advance next).
                         continue;
                     }
                     Ok(Ok(None)) => return Ok(()),
@@ -866,7 +860,6 @@ fn dispatch(
                     })
                 })
                 .collect();
-            // Mempool outputs matching scripthash that are not spent by another mempool tx.
             if let Some(mp) = mempool {
                 for item in mp.scripthash_mempool(&sh) {
                     let tid = bitcoin::Txid::from_byte_array(item.txid);
@@ -934,7 +927,6 @@ fn dispatch(
                 .and_then(|a| a.get(1))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            // Confirmed first.
             if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
                 let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                 if verbose {
@@ -945,7 +937,6 @@ fn dispatch(
                 }
                 return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
             }
-            // Mempool fallback.
             if let Some(mp) = mempool {
                 use bitcoin::hashes::Hash;
                 let tid = bitcoin::Txid::from_byte_array(txid);
@@ -1109,7 +1100,6 @@ fn parse_get_history_window(params: &Value) -> Result<(HistoryFilter, bool), Str
             (Some(to), false)
         }
     } else {
-        // Default to_height = -1 → tip + mempool.
         (None, true)
     };
     Ok((HistoryFilter::height_window(from, to_excl), include_mempool))

@@ -17,8 +17,6 @@ use std::time::{Duration, Instant};
 /// How long to avoid redialing an address after a stall disconnect.
 pub(crate) const STALL_ADDR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
-// --- Relative-slow disconnect (outliers only; see plan) ---
-
 /// max/min bps within this factor → tight pack, never relative-disconnect.
 pub(crate) const RELATIVE_SLOW_CLUSTER_SPREAD: u64 = 2;
 /// Disconnect only if peer bps ≤ median / this (default 2 → half median).
@@ -86,7 +84,6 @@ pub(crate) fn relative_slow_pick(
     bps.sort_unstable();
     let lo = bps[0];
     let hi = bps[bps.len() - 1];
-    // Gate A — tight cluster (also when all equal / all zero).
     if lo == 0 {
         if hi == 0 {
             return None;
@@ -245,7 +242,6 @@ pub(crate) async fn dial_batch(
             .unwrap_or(false)
     };
 
-    // Prefer untried / fast / known-good; deprioritize failed/incompatible.
     let candidates = book.take_dial_candidates(book.len().max(count), &already);
     let mut handles = Vec::new();
     for addr in candidates {

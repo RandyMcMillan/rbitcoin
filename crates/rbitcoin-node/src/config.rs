@@ -272,25 +272,10 @@ impl NodeConfig {
                     .into(),
             ));
         }
-        if let Some(addr) = self.rpc_listen {
-            let has_user_pass = self.rpc_user.is_some() && self.rpc_password.is_some();
-            let loopback = addr.ip().is_loopback();
-            if !loopback && !has_user_pass {
-                // Cookie will be written for loopback; non-loopback needs explicit creds
-                // or we still write cookie — Core writes cookie always. Plan: refuse
-                // unbound public without cookie OR user/pass. Cookie counts as auth.
-                // Non-loopback is OK if we always generate cookie when listen set.
-                // Stricter plan: "If bind is not loopback and neither cookie nor user/pass
-                // configured → refuse". Cookie is auto when listen set, so always OK.
-                // Keep check only when both user and password partially set.
-                let _ = has_user_pass;
-            }
-            if self.rpc_user.is_some() ^ self.rpc_password.is_some() {
-                return Err(NodeError::Config(
-                    "rpcuser and rpcpassword must both be set (or both unset for cookie auth)"
-                        .into(),
-                ));
-            }
+        if self.rpc_listen.is_some() && (self.rpc_user.is_some() ^ self.rpc_password.is_some()) {
+            return Err(NodeError::Config(
+                "rpcuser and rpcpassword must both be set (or both unset for cookie auth)".into(),
+            ));
         }
         Ok(())
     }

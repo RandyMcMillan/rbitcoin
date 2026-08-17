@@ -18,8 +18,6 @@ use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::str::FromStr;
 
-// --- Block summary / raw / status / lists ---
-
 /// Best-chain wire block for Esplora (archived reconstruct; no extra PoW rehash gate).
 fn best_chain_block(
     query: &Query,
@@ -160,7 +158,6 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    // Unknown entirely → 404 (match other block routes).
     if st.query.get_header_by_hash(&hash).ok().flatten().is_none() {
         return not_found();
     }
@@ -263,8 +260,6 @@ fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
     Json(out).into_response()
 }
 
-// --- Block listing ---
-
 pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
@@ -334,8 +329,6 @@ fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
         Err(e) => store_err(e),
     }
 }
-
-// --- Merkle + outspends ---
 
 pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
@@ -502,8 +495,6 @@ fn outspend_json(
     }))
 }
 
-// --- Address / scripthash ---
-
 pub async fn address_info(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None) {
@@ -589,7 +580,6 @@ fn sh_stats_json(
         "spent_txo_count": 0,
         "spent_txo_sum": 0,
     });
-    // Mempool stats: optional refine when hub present (count mempool touches).
     let mempool_stats = if let Some(mp) = st.mempool.as_ref() {
         let items = mp.scripthash_mempool(sh);
         json!({
@@ -614,8 +604,6 @@ fn sh_stats_json(
     }
     Ok(obj)
 }
-
-// --- History pages ---
 
 pub async fn scripthash_txs_chain(
     State(st): State<AppState>,
@@ -686,7 +674,6 @@ fn chain_page_sh(st: &AppState, sh: &[u8; 32], after: Option<[u8; 32]>) -> Respo
 
 fn combined_txs(st: &AppState, sh: &[u8; 32]) -> Response {
     let mut out = Vec::new();
-    // Mempool first (up to 50), then first chain page.
     if let Some(mp) = st.mempool.as_ref() {
         for item in mp.scripthash_mempool(sh).into_iter().take(50) {
             if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
@@ -734,8 +721,6 @@ fn hist_to_tx_json(st: &AppState, items: &[rbitcoin_query::ScriptHashHistoryItem
     }
     Json(out).into_response()
 }
-
-// --- Mempool / fees / broadcast ---
 
 pub async fn mempool_info(State(st): State<AppState>) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
@@ -788,9 +773,8 @@ pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     } else {
         for (t, btc_kb) in pairs {
             let sat_vb = if btc_kb < 0.0 {
-                1.0 // floor when empty
+                1.0
             } else {
-                // BTC/kB → sat/vB: * 1e8 / 1000
                 btc_kb * 100_000.0
             };
             obj.insert(t.to_string(), json!(sat_vb));

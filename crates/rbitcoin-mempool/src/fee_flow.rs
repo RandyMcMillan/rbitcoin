@@ -4,9 +4,9 @@ use crate::fee_est::{bucket_count, bucket_index};
 use std::time::Instant;
 
 /// Admit EMA half-life (seconds).
-pub const ADMIT_HALF_LIFE_SECS: f64 = 150.0; // 2.5 minutes
+pub const ADMIT_HALF_LIFE_SECS: f64 = 150.0;
 /// Confirm EMA half-life (seconds) — spikier.
-pub const CONFIRM_HALF_LIFE_SECS: f64 = 420.0; // 7 minutes
+pub const CONFIRM_HALF_LIFE_SECS: f64 = 420.0;
 /// Warm after this many wall seconds.
 pub const WARM_AFTER_SECS: f64 = 60.0;
 /// Warm after this many admit events.

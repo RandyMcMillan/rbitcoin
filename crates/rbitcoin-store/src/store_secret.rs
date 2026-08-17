@@ -77,7 +77,7 @@ impl StoreSecret {
         let mut bytes = [0u8; SECRET_LEN];
         f.read_exact(&mut bytes)
             .map_err(|e| StoreError::io(&path, e))?;
-        // Ensure no trailing junk.
+
         let mut extra = [0u8; 1];
         match f.read(&mut extra) {
             Ok(0) => {}

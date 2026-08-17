@@ -381,7 +381,6 @@ impl TxGraph {
         self.invalidate_chunk_cache();
         let txid = entry.txid;
         let weight = entry.weight;
-        // Wire parents that already exist.
         let parents: BTreeSet<Txid> = tx
             .input
             .iter()
@@ -507,7 +506,6 @@ impl TxGraph {
         extra_count: usize,
         extra_weight: u64,
     ) -> bool {
-        // Union of clusters of all parents, plus the new tx.
         let mut members = BTreeSet::new();
         for p in parent_txids {
             if let Some(c) = self.cluster_of(p) {
@@ -538,7 +536,7 @@ impl TxGraph {
         let mut done: HashSet<Txid> = HashSet::new();
         let mut out = Vec::with_capacity(members.len());
         while !remaining.is_empty() {
-            let mut best: Option<(u64, i64, Txid)> = None; // rate, fee, txid
+            let mut best_rate_fee_txid: Option<(u64, i64, Txid)> = None;
             for t in &remaining {
                 let e = match self.entries.get(t) {
                     Some(e) => e,
@@ -559,17 +557,17 @@ impl TxGraph {
                 };
                 let key = (rate, mf, *t);
                 // Maximize rate, then fee; for equal, smaller txid for stability.
-                let better = match &best {
+                let better = match &best_rate_fee_txid {
                     None => true,
                     Some((br, bf, bt)) => {
                         rate > *br || (rate == *br && (mf > *bf || (mf == *bf && t < bt)))
                     }
                 };
                 if better {
-                    best = Some(key);
+                    best_rate_fee_txid = Some(key);
                 }
             }
-            let pick = match best {
+            let pick = match best_rate_fee_txid {
                 Some((_, _, t)) => t,
                 None => {
                     // Cycle or bug — emit remaining in txid order.
@@ -772,7 +770,7 @@ impl TxGraph {
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
         // Representative = min member txid of cluster.
         let mut seen = HashSet::new();
-        let mut worst: Option<(u64, Txid, Chunk)> = None; // rate, rep, chunk
+        let mut worst_rate_rep_chunk: Option<(u64, Txid, Chunk)> = None;
         for txid in self.entries.keys() {
             if seen.contains(txid) {
                 continue;
@@ -784,16 +782,16 @@ impl TxGraph {
             let rep = *c.members.iter().next()?;
             for ch in c.chunks {
                 let rate = ch.fee_rate_sat_per_kvb();
-                let better = match &worst {
+                let better = match &worst_rate_rep_chunk {
                     None => true,
                     Some((wr, _, _)) => rate < *wr,
                 };
                 if better {
-                    worst = Some((rate, rep, ch));
+                    worst_rate_rep_chunk = Some((rate, rep, ch));
                 }
             }
         }
-        worst.map(|(_, rep, ch)| (rep, ch))
+        worst_rate_rep_chunk.map(|(_, rep, ch)| (rep, ch))
     }
 
     /// Rebuild helper: clear and re-insert from an ordered list (parents first best-effort).
@@ -804,7 +802,6 @@ impl TxGraph {
         self.conflicts.clear();
         self.created.clear();
         self.total_weight = 0;
-        // Multi-pass: insert when parents are satisfied or not in the set.
         let mut pending: BTreeMap<Txid, (TxEntry, Transaction)> =
             items.into_iter().map(|(e, tx)| (e.txid, (e, tx))).collect();
         let all: HashSet<Txid> = pending.keys().copied().collect();

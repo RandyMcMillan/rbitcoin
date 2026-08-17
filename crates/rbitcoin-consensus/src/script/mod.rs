@@ -99,11 +99,9 @@ pub(crate) fn verify_input(
         }
     }
 
-    // Single classify for non-program (or witness flag off) path.
     let kind = classify::classify(spk);
     if job.witness_active && has_witness && !(matches!(kind, ScriptKind::P2sh) && job.bip16_active)
     {
-        // Non-witness program with non-empty witness (P2SH nested still allowed).
         return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
     }
 
@@ -131,14 +129,11 @@ pub(crate) fn verify_input(
             if let Some(res) = nested::try_p2sh_nested_segwit(job, input_index, tx, cache) {
                 return res;
             }
-            // Witness non-empty on non-nested P2SH → unexpected if witness active.
             if job.witness_active && has_witness {
                 return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
             }
             nested::verify_p2sh_legacy(job, input_index, tx)
         }
-        // Bare + (when !witness_active) native program templates as ordinary scripts.
-        // When witness_active, P2wpkh/P2wsh/P2tr were already handled above.
         ScriptKind::Bare | ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr => {
             verify_bare(job, input_index, tx, prevout)
         }
@@ -166,7 +161,6 @@ fn verify_native_witness(
         )),
         (1, 32) if job.taproot_active => p2tr::verify(job, input_index, tx, cache),
         _ => {
-            // Unknown version (pre-taproot v1, v2..v16, v1 wrong length).
             if job.discourage_upgradable_witness {
                 return Err(ConsensusError::Script(
                     "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
@@ -224,7 +218,6 @@ fn verify_bare(
         interpreter::SigVersion::Base,
     );
     if interpreter::eval_script(spk, &mut stack, &ctx)? {
-        // Legacy bare: true top (not witness cleanstack).
         interpreter::require_true_top(&stack)?;
     }
     Ok(())
@@ -315,14 +308,12 @@ pub(crate) mod crypto {
         if len_r + len_s + 7 != sig.len() {
             return false;
         }
-        // R: not negative; no excessive padding.
         if sig[4] & 0x80 != 0 {
             return false;
         }
         if len_r > 1 && sig[4] == 0x00 && (sig[5] & 0x80) == 0 {
             return false;
         }
-        // S: not negative; no excessive padding.
         let s0 = 6 + len_r;
         if sig[s0] & 0x80 != 0 {
             return false;

@@ -48,7 +48,6 @@ pub mod script_bench {
     }
 
     pub fn verify_job(job: &JobBytes) -> Result<(), ConsensusError> {
-        // Zero-copy view — mirrors production (`&ScriptCheckJob` from connect).
         let j = ScriptCheckJob::new(
             job.prevouts.clone(),
             job.tx.clone(),
@@ -80,7 +79,6 @@ pub mod script_bench {
 
     pub fn verify_jobs_pool(jobs: &[JobBytes]) -> Result<(), ConsensusError> {
         let owned = owned_jobs(jobs);
-        // Prefer the owned-slice entry point (no intermediate `Vec<&_>`).
         crate::block::verify_scripts_pool(&owned)
     }
 
@@ -94,7 +92,6 @@ pub mod script_bench {
     }
 }
 
-// Re-export job type for benches that drive parallel strategies.
 pub use block::ScriptCheckJob;
 
 /// Consensus script verify for a single tx on the shared `rbtc-scripts` path.
@@ -205,7 +202,6 @@ pub mod confirm_phase_stats {
     pub static ASM_PREV_COLD_N: AtomicU64 = AtomicU64::new(0);
     /// Time in `tx_fk_by_txid` / durable head lookup on cold prevout path.
     pub static ASM_PREV_FK_NS: AtomicU64 = AtomicU64::new(0);
-    // ── N1: why assemble took cold Class A after pin ─────────────────
     /// Cold success with **no** `prev_fk_hint` (thin + pending + head miss at assemble).
     pub static ASM_PREV_COLD_NULL_FK_N: AtomicU64 = AtomicU64::new(0);
     /// Cold success: had fk, batch pin miss (pin did not cover parent/vout).
@@ -259,7 +255,6 @@ pub mod confirm_phase_stats {
     pub static CACHE_TIP_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
-    // ── Last completed write batch (for slow-write logs; not window-summed) ──
     static LAST_WRITE_N: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_ENSURE_NS: AtomicU64 = AtomicU64::new(0);
@@ -633,7 +628,6 @@ pub fn accept_and_connect_block_preverified(
     preverified: &ScriptPreverified,
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
     let hash = block.block_hash().to_byte_array();
-    // Already tip at this height — skip re-archive / re-confirm.
     if let Some(h) = query.height_of_hash(&hash).map_err(ConsensusError::from)? {
         if h == height {
             if let Some((fk, _)) = query
@@ -701,7 +695,6 @@ pub fn commit_class_a_run(
     let mut items = Vec::with_capacity(blocks.len());
     for (_, block) in blocks {
         let (header, txs) = prepare_block_for_archive(query, params, block)?;
-        // Later headers resolve prev_fk from this header.
         query.ensure_header(&header).map_err(ConsensusError::from)?;
         items.push((header, txs));
     }

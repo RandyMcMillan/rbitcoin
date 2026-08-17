@@ -30,7 +30,7 @@ pub struct TxRecord {
 
 impl TxRecord {
     /// Upper bound for buffer estimates (schema-15 16 B; v17 typical is 3).
-    pub const BODY_META_LEN: usize = 4 + 4 + 4 + 4; // 16
+    pub const BODY_META_LEN: usize = 4 + 4 + 4 + 4;
     /// Full in-memory encode size (txid + body meta); used for estimates only.
     pub const ENCODED_LEN: usize = 32 + Self::BODY_META_LEN;
 
@@ -768,7 +768,6 @@ impl TxTable {
         crate::head_resolve_stats::add_keys(1);
         crate::head_resolve_stats::add_cands(cands.len() as u64);
         for (i, fk) in cands.into_iter().enumerate() {
-            // body_txid increments body_lookups + body_ns.
             if self.body_txid(fk)? == *txid {
                 crate::head_resolve_stats::add_hit_rank((i as u64).saturating_add(1));
                 return Ok(Some(fk));
@@ -1005,7 +1004,7 @@ impl TxTable {
                 }
             }
         }
-        // --- pwrite fallback (same sole/multi semantics) ---
+
         let body_pub = self.spent.body_published_len();
         let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
         for &(abs, create_fk, vout, spend_fk) in abs_edges {
@@ -1440,7 +1439,6 @@ impl TxTable {
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
-        // Probe + body_txid only; full decode only on match.
         let Some(fk) = self.get_fk_by_txid(txid)? else {
             return Ok(None);
         };
@@ -1720,7 +1718,7 @@ impl TxTable {
                     .map(|(f, _)| f)
                     .unwrap_or(mixed[i].1 .0)
             };
-            // Take consecutive entries while body span from wave_first stays ≤ soft.
+
             let mut j = i;
             while j < mixed.len() {
                 if j > i && self.body_span_bytes(wave_first, mixed[j].1 .0)? > soft {

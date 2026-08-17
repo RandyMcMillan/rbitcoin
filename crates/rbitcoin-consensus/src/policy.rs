@@ -34,8 +34,6 @@ impl PolicyResult {
     }
 }
 
-// ── Libre-relay-class admission (the only mempool admit policy) ─────────────
-
 /// Virtual size in vbytes: `(weight + 3) / 4`.
 #[inline]
 pub fn get_virtual_size(weight: u64) -> u64 {
@@ -72,11 +70,9 @@ pub fn is_annex_standard(annex: &[u8]) -> bool {
     if annex.is_empty() {
         return true;
     }
-    // Not tagged as annex — not our concern here.
     if annex[0] != 0x50 {
         return true;
     }
-    // Tag only, or first data byte is 0x00.
     annex.len() == 1 || annex[1] == 0x00
 }
 
@@ -88,7 +84,6 @@ pub fn is_annex_standard(annex: &[u8]) -> bool {
 pub fn check_libre_annex(tx: &Transaction) -> PolicyResult {
     for inp in &tx.input {
         let stack = inp.witness.to_vec();
-        // Match consensus `bip341_annex`: need ≥2 items.
         if stack.len() < 2 {
             continue;
         }

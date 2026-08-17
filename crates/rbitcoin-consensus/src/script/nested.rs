@@ -46,7 +46,6 @@ pub(crate) fn try_p2sh_nested_segwit(
     }
     let redeem = items.last().unwrap().as_slice();
     let Some((version, program)) = classify::witness_program(Script::from_bytes(redeem)) else {
-        // Not a witness program → legacy P2SH (multi-push multisig, OP_TRUE, …).
         return None;
     };
 
@@ -164,7 +163,6 @@ fn split_script_sig_redeem(script: &Script) -> Result<(Vec<Vec<u8>>, Vec<u8>), C
         match ins.map_err(|_| ConsensusError::Script("p2sh scriptSig".into()))? {
             Instruction::PushBytes(b) => items.push(push_item_checked(b.as_bytes())?),
             Instruction::Op(op) => {
-                // Small integers as pushes for multisig stack
                 let n = op.to_u8();
                 if n == 0x00 {
                     items.push(vec![]);

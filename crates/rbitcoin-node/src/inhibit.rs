@@ -34,7 +34,7 @@ impl SuspendInhibit {
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => return None, // no binary / not Linux
+            Err(_) => return None,
         };
 
         // Keep child.stdin open so `cat` blocks until Drop.

@@ -46,7 +46,6 @@ pub fn shard_count_for_role(role: HeadRole) -> usize {
 ///
 /// Override with `RBITCOIN_HEAD_SLOTS_*` as **per-shard** slot count when set.
 pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
-    // Explicit env = per-shard slots (power of two).
     if initial_slots_for(role) != HeadScale::from_env().initial_slots(role) {
         return initial_slots_for(role).max(2).next_power_of_two();
     }

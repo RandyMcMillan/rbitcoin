@@ -79,16 +79,13 @@ pub fn validate_block_structure_hashed(
         }
     }
 
-    // Weight / size limits (segwit-aware)
     let weight = block.weight();
     if weight.to_wu() > 4_000_000 {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
-    // Cheap witness scan (no hashing) so we only pay wtxid when needed.
     let has_witness = block_has_witness(block);
 
-    // Single pass: txid per tx (dup set + merkle leaves). Optional wtxid pass after.
     let n = block.txdata.len();
     let mut txids = Vec::with_capacity(n);
     let mut seen = std::collections::HashSet::with_capacity(n);
@@ -100,22 +97,17 @@ pub fn validate_block_structure_hashed(
         txids.push(id);
     }
 
-    // Merkle root from precomputed txids (same tree as bitcoin core / rust-bitcoin).
     let merkle = merkle_root_bytes(&txids);
     if merkle != block.header.merkle_root.to_byte_array() {
         return Err(ConsensusError::BadBlock("merkle root mismatch"));
     }
 
-    // BIP34: coinbase scriptSig must start with the block height **after** the
-    // network's buried activation height (mainnet 227931; signet/testnet4 1;
-    // regtest effectively never — see `bitcoin::consensus::Params`).
-    // Enforcing from height 1 rejects mainnet block 1 immediately.
-    // Skipped on archive prep (`enforce_height_gates = false`); confirm re-checks.
+    // BIP34 only after the network's buried height (mainnet 227931). From
+    // height 1 this rejects mainnet block 1.
     if ctx.enforce_height_gates && ctx.params.bip34_active_at(ctx.height.0) {
         check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
     }
 
-    // Coinbase scriptSig length 2..=100 (Core consensus).
     {
         let cb_ss = block.txdata[0].input[0].script_sig.as_bytes().len();
         if cb_ss < 2 || cb_ss > 100 {
@@ -123,7 +115,6 @@ pub fn validate_block_structure_hashed(
         }
     }
 
-    // MAX_MONEY on every output (and sum checked during connect for fees).
     const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
     for tx in &block.txdata {
         let mut out_sum = 0u64;
@@ -139,28 +130,19 @@ pub fn validate_block_structure_hashed(
         }
     }
 
-    // Legacy + P2SH sigops cost (scaled); reject if over MAX_BLOCK_SIGOPS_COST.
-    // Full witness sigop counting is conservative: we charge legacy*4 + P2SH accurate.
+    // Structure charges legacy×4 only. P2SH/witness sigops need prevouts (connect).
     {
         const WITNESS_SCALE: u64 = 4;
         const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
         let mut cost = 0u64;
         for tx in &block.txdata {
             cost = cost.saturating_add(legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE));
-            if !tx.is_coinbase() {
-                // P2SH sigops need prevouts; charge only scriptSig/scriptPubKey legacy here.
-                // Accurate P2SH is applied during connect when prevouts are known — see
-                // `check_block_sigops_with_prevouts` if wired later.
-            }
         }
         if cost > MAX_BLOCK_SIGOPS_COST {
             return Err(ConsensusError::BadBlock("bad-blk-sigops"));
         }
     }
 
-    // Witness: commitment always required when any input has witness data.
-    // Pre-segwit ban only with reliable height (confirm / known height).
-    // Archive prep must not ban witness: signet SegwitHeight=1 + BIP325.
     if has_witness {
         if ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
@@ -172,9 +154,7 @@ pub fn validate_block_structure_hashed(
         check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
 
-    // BIP325 signet solution is **not** checked here — structure/archive must stay
-    // cheap for IBD. Full challenge verify runs on tip confirm only
-    // (`confirm_wire_run` / connect). Invalid signet blocks never become tip.
+    // BIP325 signet solution is not checked here — tip confirm only.
 
     Ok(txids)
 }
@@ -252,10 +232,8 @@ fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
             let push = u32::from_le_bytes(script[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
             i = i.saturating_add(4 + push);
         } else if opcode == 0xac || opcode == 0xad {
-            // OP_CHECKSIG / VERIFY
             n = n.saturating_add(1);
         } else if opcode == 0xae || opcode == 0xaf {
-            // OP_CHECKMULTISIG / VERIFY
             if accurate && last_opcode >= 0x51 && last_opcode <= 0x60 {
                 n = n.saturating_add(u64::from(last_opcode - 0x50));
             } else {
@@ -344,7 +322,6 @@ fn witness_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
             continue;
         };
         let mut program = prev.script_pubkey.as_bytes();
-        // Nested P2SH-P2W*: redeem in scriptSig is the witness program.
         if is_p2sh_script(program) {
             if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
                 program = redeem;
@@ -355,7 +332,6 @@ fn witness_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
         if is_p2wpkh_program(program) {
             n = n.saturating_add(1);
         } else if is_p2wsh_program(program) {
-            // Witness script is last stack item.
             let wit = &inp.witness;
             if let Some(ws) = wit.last() {
                 n = n.saturating_add(script_sigop_count(ws, true));
@@ -383,7 +359,6 @@ fn check_witness_commitment_with_wtxids(
     block: &Block,
     precomputed_non_cb: &[[u8; 32]],
 ) -> Result<(), ConsensusError> {
-    // Commitment header: 0x6a24aa21a9ed || 32-byte hash
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     let coinbase = &block.txdata[0];
     let mut commitment: Option<[u8; 32]> = None;
@@ -403,13 +378,11 @@ fn check_witness_commitment_with_wtxids(
     if precomputed_non_cb.len() != block.txdata.len().saturating_sub(1) {
         return Err(ConsensusError::BadBlock("wtxid count mismatch"));
     }
-    // witness root: merkle of wtxids with coinbase wtxid = zeros
+    // Witness merkle: coinbase wtxid is 32 zero bytes.
     let mut leaves = Vec::with_capacity(block.txdata.len());
-    leaves.push([0u8; 32]); // coinbase wtxid
+    leaves.push([0u8; 32]);
     leaves.extend_from_slice(precomputed_non_cb);
     let witness_root = merkle_root_bytes(&leaves);
-    // BIP141 / Core: when commitment is present, coinbase witness must be
-    // exactly one 32-byte reserved value (bad-witness-nonce-size otherwise).
     let wit = &coinbase.input[0].witness;
     if wit.len() != 1 {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
@@ -420,7 +393,6 @@ fn check_witness_commitment_with_wtxids(
     if reserved.len() != 32 {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
     }
-    // commitment hash = SHA256D(witness_root || witness_reserved_value)
     let mut buf = [0u8; 64];
     buf[0..32].copy_from_slice(&witness_root);
     buf[32..64].copy_from_slice(reserved);
@@ -483,13 +455,11 @@ fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), Conse
 pub fn bip34_height_script(height: u32) -> Vec<u8> {
     let n = height as i64;
     if n == 0 {
-        return vec![0x00]; // OP_0
+        return vec![0x00];
     }
     if (1..=16).contains(&n) {
-        // OP_1 = 0x51 … OP_16 = 0x60
         return vec![0x50 + n as u8];
     }
-    // CScriptNum::serialize (minimal signed little-endian) + push length prefix.
     let mut num = Vec::new();
     let mut abs = n;
     let neg = abs < 0;
@@ -539,7 +509,6 @@ pub fn validate_block_connect(
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
 ) -> Result<(), ConsensusError> {
-    // BIP325 on connect/confirm only (not structure/archive).
     if ctx.height.0 > 0 {
         if let Some(challenge) = ctx.params.signet_challenge.as_ref() {
             crate::signet::validate_signet_block_solution(block, challenge.as_script())?;
@@ -547,20 +516,16 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    // Unit-test path: no load pin stage (production uses confirm_wire_run).
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::default();
-    // Sole hash for this unit-test connect surface.
     let create_txids: Vec<[u8; 32]> = block
         .txdata
         .iter()
         .map(|t| t.compute_txid().to_byte_array())
         .collect();
     let block_hash = block.header.block_hash().to_byte_array();
-    // Unit connect: one prev-MTP resolve here (no triple re-walk inside assemble).
     let prev_mtp = if ctx.height.0 == 0 {
         0
     } else {
@@ -580,14 +545,12 @@ pub fn validate_block_connect(
         prev_mtp,
         &block_hash,
         bip16_active,
-        None, // unit connect: owned job txs
+        None,
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    // Structural: re-walk with durable spentness (fresh pending for this single block).
-    // Note: empty BatchParents → missing abs → Err (cold forbidden). Callers that
-    // need connect without pin must use confirm_write_phase with full pin.
+    // Empty BatchParents → missing abs → Err (cold forbidden).
     let mut structural_pending = std::collections::HashSet::new();
     let mut mtp_cache = U32Map::default();
     let mut meta_by_abs = U64Map::default();
@@ -637,7 +600,6 @@ pub(crate) fn bip16_active_from_prev_mtp(
     block_hash: &[u8; 32],
     prev_mtp: u32,
 ) -> bool {
-    // Exception block: never SCRIPT_VERIFY_P2SH.
     if *block_hash == BIP16_EXCEPTION_MAINNET {
         return false;
     }
@@ -873,8 +835,7 @@ impl ScriptCheckJob {
             nullfail: false,
             low_s: false,
             strictenc: false,
-            // BIP147 / WITNESS co-activate with segwit. Confirm overwrites via
-            // [`Self::with_segwit`] from `ChainParams::segwit_active_at`.
+            // Default overwritten by `with_segwit` from `segwit_active_at`.
             null_dummy: true,
             minimal_data: false,
             witness_pubkeytype: false,
@@ -922,7 +883,6 @@ pub(crate) fn assemble_block_prevouts(
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
-    // Precomputed create txids (structure / plan); required, same order as txdata.
     create_txids: &[[u8; 32]],
     prev_mtp: u32,
     block_hash: &[u8; 32],
@@ -931,14 +891,13 @@ pub(crate) fn assemble_block_prevouts(
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
-        // Spends: (prev_txid, vout, spending_tx_fk, create_tx_fk).
         Vec<(
             [u8; 32],
             u32,
             rbitcoin_primitives::Fk,
             rbitcoin_primitives::Fk,
         )>,
-        i64, // total fees
+        i64,
     ),
     ConsensusError,
 > {
@@ -1015,37 +974,28 @@ fn assemble_block_prevouts_mode(
     let n_tx = block.txdata.len();
     let mut block_spends: std::collections::HashSet<OutPoint> =
         std::collections::HashSet::with_capacity(n_tx.saturating_mul(2));
-    // Full-block txid → index (create_txids, same order as block.txdata). Used to
-    // reject spends of later same-block parents (Core topological order).
-    // `same_block` below only holds *earlier* txs already walked.
     let mut txid_index: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     for (i, id) in create_txids.iter().enumerate() {
         txid_index.insert(*id, i);
     }
-    // txid → index into `block.txdata` for txs already validated in this walk.
     let mut same_block: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     let mut fees = 0i64;
-    // Skip job materialization when scripts are skipped — pure waste below the
-    // milestone. Prevouts still resolve for fees + full sigop cost.
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
     } else {
         Vec::new()
     };
-    // BIP141/BIP16 full block sigop cost (structure only counts legacy×4).
     const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
     let mut block_sigops_cost = legacy_sigop_count(&block.txdata[0]).saturating_mul(4);
-    // (prev_txid, vout, spending_tx_fk, create_tx_fk).
     let mut spends: Vec<(
         [u8; 32],
         u32,
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
     )> = Vec::with_capacity(n_tx.saturating_mul(2));
-    // Coinbase height cache spans the whole block (was recreated per tx).
     let mut coinbase_height_cache: FkMap<Option<u32>> =
         FkMap::with_capacity_and_hasher(64, Default::default());
 
@@ -1053,8 +1003,7 @@ fn assemble_block_prevouts_mode(
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    // BIP113 absolute finality cutoff: **once per block**, from caller prev_mtp
-    // (same value as header MTP check — no second median_time_past walk).
+    // BIP113: caller prev_mtp (same as header MTP — no second walk).
     let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
         if ctx.height.0 == 0 {
             block.header.time
@@ -1065,7 +1014,6 @@ fn assemble_block_prevouts_mode(
         block.header.time
     };
 
-    // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
         // Sole pipeline identity — structure/plan computed once; never re-hash here.
@@ -1083,10 +1031,8 @@ fn assemble_block_prevouts_mode(
             }
 
             let mut value_in = 0i64;
-            // Prevouts for fees, sigop cost, and (optionally) script jobs.
             let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
             let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
-            // Thin create_fk edges from this confirm batch (batch-local).
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
 
             let t_prev = Instant::now();
@@ -1099,22 +1045,17 @@ fn assemble_block_prevouts_mode(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                // Topological order (Core CheckTxInputs walk): a same-block
-                // parent must appear *before* this tx. Archive batch_thin stamps
-                // create_fk for the whole block at once; using that edge would
-                // accept child-before-parent
+                // Same-block parent must appear *before* this tx. batch_thin
+                // stamps the whole block; using that edge accepts child-before-parent
                 // (docs/external_findings/005-non-topological-block-accepted.md).
                 if let Some(&pj) = txid_index.get(&key.0) {
                     if pj >= ti {
                         return Err(ConsensusError::MissingPrevout);
                     }
                 }
-                // Load pin / thin create_fk is a **promise**: pin denserels must
-                // carry identity matching wire prev_txid (resolve hard-misses
-                // wrong pin; load fills schema-13 identity from plan RAM or
-                // txid.body). Do not treat thin as a soft spentness hint.
-                // Same-block parents (pj < ti) resolve via same_block only —
-                // thin still ok if pin matches; order already enforced above.
+                // Thin create_fk is a promise (identity matches wire prev_txid).
+                // Do not treat thin as a soft spentness hint. Same-block (pj < ti)
+                // resolves via same_block only.
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))
@@ -1168,7 +1109,6 @@ fn assemble_block_prevouts_mode(
                         }
                     }
                 }
-                // Same-run / provisional double-spend tracking (both modes).
                 pending_spent.insert(key);
                 spends.push((
                     key.0,
@@ -1196,15 +1136,11 @@ fn assemble_block_prevouts_mode(
             confirm_phase_stats::ASM_SIGOP_NS
                 .fetch_add(t_sig.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            // BIP113 absolute finality (uses block-level lock_time_cutoff).
             let t_fin = Instant::now();
             if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
                 return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
             }
-            // BIP68 relative locks need per-input create heights (fence).
-            // Optimistic/confirm defers that IO to structural write; Full does it here.
-            // Reuse the same prev-block MTP as BIP113 when CSV is active (already
-            // computed once as lock_time_cutoff for height > 0).
+            // Full mode only: Optimistic defers BIP68 to structural. Reuse BIP113 MTP.
             if mode == AssembleMode::Full && ctx.params.csv_active_at(ctx.height.0) {
                 let mut coin_mtps = Vec::with_capacity(input_create_heights.len());
                 for &ch in &input_create_heights {
@@ -1253,7 +1189,6 @@ fn assemble_block_prevouts_mode(
             if build_script_jobs {
                 let t_job = Instant::now();
                 // Reuse A1 wire txid — scripts stage must not re-hash for preverified.
-                // Confirm: share wire Arc (no Transaction clone). Unit connect: own.
                 let job = if let Some(w) = wire {
                     ScriptCheckJob::with_shared_tx(
                         txid,
@@ -1286,7 +1221,6 @@ fn assemble_block_prevouts_mode(
             }
         }
 
-        // `txid` computed once from wire at top of loop (A1).
         let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
         for (v, _) in tx.output.iter().enumerate() {
             if !create_fk.is_null() {
@@ -1367,28 +1301,20 @@ pub(crate) fn structural_validate_spends(
     fees: i64,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     batch_parents: &rbitcoin_query::BatchParents,
-    // MTP by end-height, shared across blocks in one write run.
     mtp_cache: &mut U32Map<u32>,
-    // Structural disk meta for pure-write annotate: abs → (field, flags).
     meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,
-    // Same confirm-run creates (not yet in Class C). Keyed by create fk.
     run_create_height: &FkMap<u32>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::collections::HashSet;
     use std::time::Instant;
 
-    // create_fk → create height (BIP68), filled in create-height phase.
     let mut create_height_by_fk: FkMap<u32> =
         FkMap::with_capacity_and_hasher(spends.len().min(256), BuildHasherDefault::default());
     let maturity = ctx.params.coinbase_maturity();
 
-    // BIP30: Core skips once BIP34 is active. Before that, a connected
-    // instance with any unspent output may not be overwritten — except the
-    // two mainnet `IsBIP30Repeat` hashes (91842 / 91880), which overwrite
-    // unspent coinbases and are grandfathered.
-    // One TipOnly batch for the block's create txids — not a per-tx head probe.
-    // Just-archived self is unconnected, so it is not a hit; only a real
-    // connected sibling comes back.
+    // BIP30: after BIP34, skipped. Before that, a connected instance with any
+    // unspent output may not be overwritten — except mainnet 91842 / 91880.
+    // Just-archived self is unconnected (not a hit); only a live sibling is.
     if !ctx.params.bip34_active_at(ctx.height.0)
         && !ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
     {
@@ -1433,12 +1359,9 @@ pub(crate) fn structural_validate_spends(
         }
     }
 
-    // ── Spentness (durable + same-run pending) ─────────────────────────────
-    // Authority is on-disk spender meta (bulk mmap). Pin only supplies abs.
-    // Cold body walk is forbidden on write — spent_cold must stay 0.
+    // On-disk spender meta is authority; pin only supplies abs. No cold body walk.
     let t_spent = Instant::now();
 
-    // Unique create_fk → sorted unique vouts.
     let mut vouts_by_create: U64Map<Vec<u32>> = U64Map::default();
     let mut null_create_keys: Vec<([u8; 32], u32)> = Vec::new();
     for &(prev_txid, vout, _sfk, create_fk) in spends {
@@ -1455,10 +1378,8 @@ pub(crate) fn structural_validate_spends(
         vouts.dedup();
     }
 
-    // abs_jobs: (create_id, vout, abs_off) — every non-null create must have abs.
-    // Load promises denserels for every external spend edge; missing abs is a
-    // load bug, not a soft cold spentness path (no unpinned “wire-corrected”
-    // recovery for stamp/identity bugs).
+    // Every non-null create must have pin abs. Missing abs is a load bug —
+    // not a soft cold spentness path.
     let t_abs = Instant::now();
     let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
     for (id, vouts) in &vouts_by_create {
@@ -1479,9 +1400,6 @@ pub(crate) fn structural_validate_spends(
 
     let tip = query.tip_height().map(|h| h.0);
 
-    // Hot path: bulk 8-byte spender meta at pin offsets (on-disk authority).
-    // Serial with create_h heights below — combined multi-fd wave was measured
-    // neutral/worse (body peeks + height slots).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
@@ -1526,7 +1444,7 @@ pub(crate) fn structural_validate_spends(
                 continue;
             }
             if field.is_null() {
-                continue; // unspent
+                continue;
             }
             let strong = query
                 .store()
@@ -1560,22 +1478,15 @@ pub(crate) fn structural_validate_spends(
             .as_nanos()
             .saturating_sub(multi_list_ns as u128) as u64;
     }
-    // abs ≈ collect + meta pread (not strong loop / multi walk).
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
-    // Null create_fk = same-block spend (resolve sets NULL). Double-spend is
-    // **only** `pending_spent` within this confirm run — do **not** probe durable
-    // store by wire txid. Already-archived Class A rehydrate (plan=None) already
-    // holds those creates under the same txids before Class C tip; durable lookup
-    // can false-hit Class A rows / BIP30 siblings and reject valid same-block
-    // edges (mainnet 961461 tip stall).
-    let _ = null_create_keys; // same-block keys: pending only (no durable probe)
-                              // Multi-list walks are protocol cold; same-block no longer probes store.
+    // Null create_fk = same-block. Double-spend is only `pending_spent` — do
+    // not probe durable store by wire txid (plan=None rehydrate false-hits
+    // Class A / BIP30 siblings; mainnet 961461 tip stall).
+    let _ = null_create_keys; // same-block: pending only (no durable probe)
+                              // Multi-list walks are the only "cold" spentness (protocol, not body).
     let spent_cold_ns = multi_list_ns;
 
-    // Order-sensitive pending double-spend + durable rejection.
-    // create_fk is load-established (pin denserels + identity); durable_spent is
-    // keyed by that create. Same-block (null create_fk): pending only.
     let t_pending = Instant::now();
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
@@ -1583,9 +1494,8 @@ pub(crate) fn structural_validate_spends(
             return Err(ConsensusError::PrevoutSpent);
         }
         let spent = if create_fk.is_null() {
-            false // same-block: pending_spent only
+            false
         } else if let Some(id) = create_fk.get() {
-            // Present in durable_spent ⇒ confirmed-strong spent.
             durable_spent.contains(&(id, vout))
         } else {
             false
@@ -1598,9 +1508,7 @@ pub(crate) fn structural_validate_spends(
     let spent_pending_ns = t_pending.elapsed().as_nanos() as u64;
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
-    // ── Create height + coinbase maturity (durable Class C only) ──────────
-    // Heights: bulk fence. Coinbase: create_fk == first_tx_fk of block at
-    // that height — **never** `tx.body`. Pin may short-circuit non-coinbase.
+    // Coinbase = create_fk == first_tx_fk at that height — never `tx.body`.
     let t_create = Instant::now();
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
         let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
@@ -1626,7 +1534,6 @@ pub(crate) fn structural_validate_spends(
         })
         .collect();
 
-    // height → coinbase Class A fk (first tx of that confirmed block).
     let mut height_list: Vec<u32> = height_by_id.values().copied().collect();
     height_list.sort_unstable();
     height_list.dedup();
@@ -1651,14 +1558,11 @@ pub(crate) fn structural_validate_spends(
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
 
-        // Pin-proven non-coinbase: height only (no body).
         if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
             create_height_by_fk.insert(create_fk, durable_h);
             continue;
         }
 
-        // Coinbase if pin says so, else create_fk == first_tx_fk of block at H
-        // (confirmed + header_txs_first) — never open tx.body for vin0.
         let is_cb = batch_parents.get_parent_coinbase(create_fk) == Some(true)
             || coinbase_fk_by_height
                 .get(&durable_h)
@@ -1670,9 +1574,7 @@ pub(crate) fn structural_validate_spends(
     }
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
 
-    // ── BIP68 relative sequence locks (CSV package) ────────────────────────
-    // Skip height/MTP prep for version < 2 (sequence_locks early-out).
-    // Resolve coin MTP only for time-type relative locks (TYPE_FLAG).
+    // v1 txs skip BIP68. Coin MTP only for time-type (TYPE_FLAG) relative locks.
     let t_bip68 = Instant::now();
     if ctx.params.csv_active_at(ctx.height.0) {
         const DISABLE: u32 = 1 << 31;
@@ -1683,7 +1585,6 @@ pub(crate) fn structural_validate_spends(
             mtp_at(query, Height(ctx.height.0 - 1), mtp_cache)?
         };
         let mut si = 0usize;
-        // Reuse buffers across txs (write-local).
         let mut prev_heights: Vec<u32> = Vec::new();
         let mut coin_mtps: Vec<u32> = Vec::new();
         for tx in block.txdata.iter().skip(1) {
@@ -1696,7 +1597,6 @@ pub(crate) fn structural_validate_spends(
             let tx_spends = &spends[si..si + n_in];
             si += n_in;
 
-            // version < 2 (unsigned): relative locks inactive.
             if !bip68_active_for_tx(tx) {
                 continue;
             }
@@ -1714,7 +1614,6 @@ pub(crate) fn structural_validate_spends(
                 };
                 prev_heights.push(ch);
                 let seq = inp.sequence.to_consensus_u32();
-                // Coin MTP only when a time-type relative lock is active.
                 let need_mtp = seq & DISABLE == 0 && seq & TYPE_FLAG != 0;
                 let mtp = if !need_mtp || ch == 0 {
                     0
@@ -1792,7 +1691,6 @@ fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
             return true;
         }
     }
-    // All pure OP_TRUE + empty scriptSig/witness — nothing to evaluate.
     false
 }
 
@@ -1844,7 +1742,6 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -
     } else if lt < lock_time_cutoff {
         return true;
     }
-    // Still final if every input sequence is SEQUENCE_FINAL (0xffffffff).
     tx.input.iter().all(|i| i.sequence.is_final())
 }
 
@@ -1885,10 +1782,8 @@ pub fn sequence_locks_satisfied(
         if seq & DISABLE != 0 {
             continue;
         }
-        // Missing or zero coin height/MTP is unresolved (genesis CB is
-        // unspendable). Defaulting to 0 fails *open* for time locks (epoch MTP
-        // is below any real prev MTP). Callers pass spend height / prev MTP for
-        // same-block creates — never 0.
+        // Missing/zero coin height is unresolved. Defaulting to 0 fails *open*
+        // for time locks (epoch MTP). Same-block callers pass spend height — never 0.
         let Some(&coin_h) = prev_heights.get(i) else {
             return false;
         };
@@ -1922,15 +1817,12 @@ fn resolve_prevout(
     query: &Query,
     block: &Block,
     op: OutPoint,
-    // Prefer thin create_fk from load (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: &std::collections::HashMap<[u8; 32], usize>,
     coinbase_height_cache: &mut FkMap<Option<u32>>,
     batch_parents: &rbitcoin_query::BatchParents,
-    // Height of the block being validated (same-block BIP68 coin height).
     spend_height: u32,
-    // When false (optimistic confirm load): only prevout value/script — no
-    // height fence / coinbase body walks. BIP68 + maturity run in structural.
+    // Optimistic: prevout value/script only. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use std::sync::atomic::Ordering;
@@ -1954,8 +1846,6 @@ fn resolve_prevout(
         }
     }
 
-    // Same-block spend of an earlier output in this block.
-    // Clone script only for the spent vout (not every create in the block).
     if let Some(&ti) = same_block.get(&prev_txid) {
         let tx = block.txdata.get(ti).ok_or(ConsensusError::MissingPrevout)?;
         let v = op.vout as usize;
@@ -1994,7 +1884,6 @@ fn resolve_prevout(
         match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
             Some((value, script, parent_txid)) if parent_txid == prev_txid => {
                 let (cb_h, create_height) = if resolve_create_heights {
-                    // Need TxRecord only for coinbase/maturity path (Full mode).
                     let prev_rec = batch_parents
                         .get_parent_tx(prev_fk)
                         .ok_or(ConsensusError::MissingPrevout)?;
@@ -2021,7 +1910,6 @@ fn resolve_prevout(
                     },
                     coinbase_height: cb_h,
                     create_height,
-                    // Pin row matched wire prev_txid — denserels create_fk is trusted.
                     create_fk: prev_fk,
                 });
             }
@@ -2046,13 +1934,10 @@ fn resolve_prevout(
                     "invariant: pin incomplete outs for spent parent vout",
                 )));
             }
-            None => {
-                // Hint not in pin — cold Class A below (Allow pin / unit empty pin).
-            }
+            None => {}
         }
     }
 
-    // Cold path: create-fk candidates (thin → durable head / store).
     let t_fk = Instant::now();
     let head_fk = query
         .tx_fk_by_txid_tip(&prev_txid)
@@ -2122,7 +2007,6 @@ fn resolve_prevout(
             },
             coinbase_height: cb_h,
             create_height,
-            // Cold candidate whose Class A body txid matches the wire prevout.
             create_fk: prev_fk,
         });
     }
@@ -2170,7 +2054,6 @@ fn coinbase_height_for_maturity(
     if cb_h.is_some() {
         return Ok(cb_h);
     }
-    // Last resort: height fence.
     Ok(query
         .store()
         .tx_height_get(prev_fk)
@@ -2252,7 +2135,6 @@ fn find_output(
     if vout >= prev_rec.output_count {
         return Err(ConsensusError::MissingPrevout);
     }
-    // Cold path: always use create fk (packed body + head-off catch-up).
     query
         .tx_output_at_fk(prev_fk, prev_rec, vout)
         .map_err(ConsensusError::from)

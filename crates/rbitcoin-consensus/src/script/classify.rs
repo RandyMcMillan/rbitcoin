@@ -25,7 +25,7 @@ pub(crate) enum ScriptKind {
 /// scriptSig (CLTV/CSV may live there). Callers must evaluate scriptSig first
 /// or use the bare path.
 pub(crate) fn is_anyone_can_spend(script: &Script) -> bool {
-    script.as_bytes() == [0x51] // OP_TRUE
+    script.as_bytes() == [0x51]
 }
 
 /// BIP141 witness program: `OP_0`/`OP_1`..`OP_16` + a single push of 2..=40 bytes.
@@ -36,8 +36,8 @@ pub(crate) fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
         return None;
     }
     let version = match b[0] {
-        0x00 => 0u8,                 // OP_0
-        v @ 0x51..=0x60 => v - 0x50, // OP_1..OP_16 → 1..16
+        0x00 => 0u8,
+        v @ 0x51..=0x60 => v - 0x50,
         _ => return None,
     };
     let push_len = b[1] as usize;
@@ -48,7 +48,6 @@ pub(crate) fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
     if b.len() != 2 + push_len {
         return None;
     }
-    // b[1] must itself be the push opcode (data length for small pushes).
     if b[1] != push_len as u8 {
         return None;
     }
@@ -57,19 +56,15 @@ pub(crate) fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
 
 pub(crate) fn classify(script: &Script) -> ScriptKind {
     let b = script.as_bytes();
-    // P2WPKH: 00 14 <20>
     if b.len() == 22 && b[0] == 0x00 && b[1] == 0x14 {
         return ScriptKind::P2wpkh;
     }
-    // P2WSH: 00 20 <32>
     if b.len() == 34 && b[0] == 0x00 && b[1] == 0x20 {
         return ScriptKind::P2wsh;
     }
-    // P2TR: 51 20 <32>
     if b.len() == 34 && b[0] == 0x51 && b[1] == 0x20 {
         return ScriptKind::P2tr;
     }
-    // P2PKH: 76 a9 14 <20> 88 ac
     if b.len() == 25
         && b[0] == 0x76
         && b[1] == 0xa9
@@ -79,11 +74,9 @@ pub(crate) fn classify(script: &Script) -> ScriptKind {
     {
         return ScriptKind::P2pkh;
     }
-    // P2SH: a9 14 <20> 87
     if b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87 {
         return ScriptKind::P2sh;
     }
-    // Empty / non-template: bare EvalScript(scriptSig)+EvalScript(spk).
     ScriptKind::Bare
 }
 

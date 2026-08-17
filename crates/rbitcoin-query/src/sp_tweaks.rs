@@ -191,7 +191,6 @@ impl Query {
             return Ok(Vec::new());
         }
 
-        // Flatten eligible create fks for one idx→body wave + txid batch.
         let mut elig_fks: Vec<Fk> = Vec::new();
         let mut tag: Vec<(usize, usize)> = Vec::new(); // (plan_i, elig_i)
         for (pi, p) in plans.iter().enumerate() {

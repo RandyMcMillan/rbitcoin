@@ -44,8 +44,6 @@ fn io_err(path: &Path, e: std::io::Error) -> StoreError {
     StoreError::io(path, e)
 }
 
-// ── CRC-32 (ISO-HDLC / Ethernet polynomial) ─────────────────────────────────
-
 fn crc32_table() -> &'static [u32; 256] {
     use std::sync::OnceLock;
     static T: OnceLock<[u32; 256]> = OnceLock::new();
@@ -95,8 +93,6 @@ fn crc32_file_body(path: &Path, body_len: u64) -> Result<u32, StoreError> {
     Ok(c ^ 0xFFFF_FFFF)
 }
 
-// ── Run path ────────────────────────────────────────────────────────────────
-
 /// One immutable sorted run on disk.
 #[derive(Debug, Clone)]
 pub struct SortedRunPath {
@@ -125,8 +121,6 @@ fn seq_from_path(path: &Path) -> Option<u64> {
 pub fn next_run_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{seq:06}.run"))
 }
-
-// ── Manifest ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestEntry {
@@ -287,8 +281,6 @@ fn rebuild_manifest_from_runs(dir: &Path, runs: &[SortedRunPath]) -> Result<(), 
     mf.entries.sort_by_key(|e| e.seq);
     save_manifest(dir, &mf)
 }
-
-// ── Write / open ────────────────────────────────────────────────────────────
 
 /// Sync / cache / pacing policy for sorted-run file writes.
 ///
@@ -635,7 +627,6 @@ pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, St
             Ordering::Less => lo = mid + 1,
             Ordering::Greater => hi = mid,
             Ordering::Equal => {
-                // Walk left to first equal (stable first).
                 let mut i = mid;
                 while i > 0 {
                     let poff = HEADER_LEN as u64 + (i - 1) * rec_len;
@@ -655,8 +646,6 @@ pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, St
     }
     Ok(None)
 }
-
-// ── Merge ───────────────────────────────────────────────────────────────────
 
 /// Read-ahead page for merge cursors (~256 KiB; many fixed-width records).
 const RUN_CURSOR_PAGE: usize = 256 * 1024;
@@ -720,7 +709,7 @@ impl RunCursor {
         self.cur = 0;
         let space = self.page.len().saturating_sub(self.page_len);
         let max_from_file = (self.remaining as usize).saturating_mul(self.rec_len);
-        // Only pull whole records.
+
         let to_read = (space.min(max_from_file) / self.rec_len).saturating_mul(self.rec_len);
         if to_read == 0 {
             return Ok(());
@@ -1193,7 +1182,6 @@ fn open_checkpoint_path(work_dir: &Path, encoded: &str) -> Result<SortedRunPath,
     } else if let Some(abs) = encoded.strip_prefix("a:") {
         PathBuf::from(abs)
     } else if !encoded.contains('/') && !encoded.contains('\\') {
-        // bare basename → work_dir
         work_dir.join(encoded)
     } else {
         PathBuf::from(encoded)
@@ -1561,7 +1549,6 @@ pub fn reduce_runs_to_fanin_cancellable(
     status.chunks_done = done_outputs.len();
     status.maybe_log(true);
 
-    // Pre-split remaining into independent chunks (single pass).
     let mut jobs: Vec<(Vec<SortedRunPath>, PathBuf)> = Vec::with_capacity(n_chunks);
     let mut rem = remaining;
     while !rem.is_empty() {
@@ -1572,7 +1559,6 @@ pub fn reduce_runs_to_fanin_cancellable(
         jobs.push((chunk, out_path));
     }
 
-    // Shared progress for parallel workers.
     use std::sync::Mutex;
     let pending_inputs: Vec<SortedRunPath> =
         jobs.iter().flat_map(|(c, _)| c.iter().cloned()).collect();
@@ -1802,8 +1788,6 @@ pub fn merge_runs_with_policy(
     }
     Ok(merged)
 }
-
-// ── List ────────────────────────────────────────────────────────────────────
 
 fn scan_run_paths(dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
     if !dir.exists() {

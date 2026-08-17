@@ -34,14 +34,19 @@ before 1.0).
   conflict and its descendants. `wallet_txn_*` reorgs need this.
 - **Mempool accessors:** `getmempoolancestors` / `getmempooldescendants` /
   `getmempoolfeeratediagram` / `submitpackage` / `gettxspendingprevout`.
-  `-limitclustercount` / `-limitclustersize` overlay the live graph.
-  Cluster overflow is `too-large-cluster`. `getmempoolinfo.optimal` is
-  true (we linearize on insert).
+  `-limitclustercount` / `-limitclustersize` overlay the live graph
+  and survive `maybe_compact` rebuilds. Cluster overflow is
+  `too-large-cluster`. `getmempoolinfo.optimal` is true (we linearize
+  on insert). `sendrawtransaction` of a live mempool tx returns the
+  txid (Core no-op), not `-26 txn-already-in-mempool`.
 - **GBT proposal:** Core reject needles without writing UTXO / requiring
   PoW. `submitblock` maps `high-hash` / `prev-blk-not-found`.
-- **BIP152 / inbound:** `sendcmpct` version 2 only (v1 ignored).
-  `getpeerinfo` reports `bip152_hb_to` / `bip152_hb_from`. Feeler
-  outbounds send `relay=0` and close after version.
+- **BIP152 / inbound:** handshake `sendcmpct` is v2 low-bandwidth;
+  HB (`send_compact: true`) is selected when we accept a tip from the
+  peer (max 3). Announce compact with coinbase prefill. `getpeerinfo`
+  reports `bip152_hb_to` / `bip152_hb_from`. Feeler outbounds send
+  `relay=0` and close after version. Empty-locator `getheaders` is a
+  single-hashstop request.
 
 - **No leftover pending map.** Parent identity is in-flight until
   drain-fk **and** fence after pin + scripts handoff (n−1 outs).

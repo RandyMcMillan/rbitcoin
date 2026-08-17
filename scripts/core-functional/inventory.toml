@@ -433,9 +433,7 @@ analog = "follow-up: wtxid accept"
 
 [[test]]
 name = "mempool_cluster.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "accessors/RBF/size-limit green; 10-way merge-size still over-admits"
+status = "run"
 
 [[test]]
 name = "mempool_compatibility.py"
@@ -497,7 +495,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "timelock/sendraw green; submitblock 20-block side fork does not accept_branch"
+analog = "submitblock 20-block fork accept_branch green; invalidateblock does not evict immature coinbase spends"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -603,6 +601,7 @@ reason = "core-log"
 name = "p2p_compactblocks.py"
 status = "skip"
 reason = "core-log"
+analog = "cmpct v2 + coinbase prefill + getblocktxn + low-work log; full script not unmodified-green"
 
 [[test]]
 name = "p2p_compactblocks_blocksonly.py"
@@ -614,7 +613,7 @@ analog = "follow-up: compact + blocksonly"
 name = "p2p_compactblocks_hb.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: compact high-bandwidth"
+analog = "HB slot select + sendcmpct drain shipped; script not unmodified-green"
 
 [[test]]
 name = "p2p_disconnect_ban.py"
@@ -809,7 +808,7 @@ reason = "core-log"
 name = "p2p_sendheaders.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: sendheaders"
+analog = "part 1 inv-before-sendheaders green; part 2+ headers/reorg/direct-fetch still red"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"

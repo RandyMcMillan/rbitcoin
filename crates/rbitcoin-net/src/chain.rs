@@ -135,6 +135,28 @@ impl ChainHub {
         }
     }
 
+    /// Core `-minimumchainwork` floor (32-byte BE), if set.
+    pub fn min_chain_work_floor(&self) -> Option<[u8; 32]> {
+        *self.minimum_chain_work.read().unwrap()
+    }
+
+    /// Sum wire-header work from genesis through `height` (inclusive) on the tip chain.
+    pub fn work_through_height(&self, height: u32) -> Result<Work, NetError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(Work::from_be_bytes([0u8; 32]));
+        };
+        let end = height.min(tip);
+        let mut works = Vec::new();
+        for h in 0..=end {
+            let hdr = self
+                .query
+                .wire_header_at_height(Height(h))
+                .map_err(|e| NetError::Consensus(e.to_string()))?;
+            works.push(hdr.work());
+        }
+        Ok(sum_work(works.into_iter()))
+    }
+
     /// Core `nMaxTipAge` (24h): tip time vs [`Self::clock`].
     pub fn tip_is_stale_for_ibd(&self) -> bool {
         const MAX_TIP_AGE: u64 = 24 * 60 * 60;

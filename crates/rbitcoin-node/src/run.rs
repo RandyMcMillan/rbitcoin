@@ -259,6 +259,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(t) = config.mock_time {
         node.hub.clock.set_mock(t);
     }
+    if let Some(h) = node.hub.query.tip_height() {
+        if let Ok(Some((_, rec))) = node.hub.query.header_at_height(h) {
+            if crate::error::tip_too_far_in_future(rec.timestamp, node.hub.clock.now_secs()) {
+                // Core InitError / ThreadSafeQuestion recover text (rpc_blockchain).
+                eprintln!("{}", crate::error::FUTURE_BLOCK_DB_MSG);
+                return Err(NodeError::FutureTip);
+            }
+        }
+    }
     if let Some(v) = config.block_version {
         node.hub.set_block_version(v);
     }

@@ -416,6 +416,26 @@ impl TxGraph {
         }
         self.total_weight = self.total_weight.saturating_add(weight);
         self.entries.insert(txid, e);
+        // Children accepted while we were confirmed (reorg re-accept).
+        for (vout, _) in tx.output.iter().enumerate() {
+            let op = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            let Some(child_id) = self.conflicts.get(&op).copied() else {
+                continue;
+            };
+            if child_id == txid {
+                continue;
+            }
+            if let Some(ce) = self.entries.get_mut(&child_id) {
+                ce.parents.insert(txid);
+            }
+            if let Some(pe) = self.entries.get_mut(&txid) {
+                pe.children.insert(child_id);
+            }
+            self.spends.insert(op, child_id);
+        }
     }
 
     /// Remove a tx and unlink edges. Returns the removed entry if present.
@@ -1053,6 +1073,20 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn insert_parent_after_child_wires_reorg_edges() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let pid = parent.compute_txid();
+        let child = make_tx(Some((pid, 0)), 1, 3);
+        let cid = child.compute_txid();
+        g.insert(entry_for(&child, 1000, 0), &child);
+        assert_eq!(g.graph_stats(&cid).unwrap().ancestorcount, 1);
+        g.insert(entry_for(&parent, 1000, 1), &parent);
+        assert_eq!(g.graph_stats(&cid).unwrap().ancestorcount, 2);
+        assert_eq!(g.graph_stats(&pid).unwrap().descendantcount, 2);
     }
 
     #[test]

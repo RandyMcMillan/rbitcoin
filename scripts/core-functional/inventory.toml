@@ -490,8 +490,8 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 [[test]]
 name = "mempool_reorg.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "rust pin: invalidate evicts immature coinbase spends; unmodified test_reorg_relay not locally proven"
+reason = "core-net-policy"
+analog = "official: unannounced getdata served tx not notfound (test_reorg_relay); immature eviction + ancestorcount after reorg are production"
 
 [[test]]
 name = "mempool_resurrect.py"

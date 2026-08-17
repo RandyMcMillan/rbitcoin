@@ -131,6 +131,7 @@ analog = "crash-recovery / HWM publish tests"
 name = "feature_dersig.py"
 status = "skip"
 reason = "core-log"
+analog = "rust pin: v2 at dersig@102 is bad-version(0x00000002); SIG_DER → Non-canonical DER + reject-details; unmodified MiniWallet RAW_P2PK path not locally proven"
 
 [[test]]
 name = "feature_dirsymlinks.py"

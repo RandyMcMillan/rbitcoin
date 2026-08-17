@@ -351,7 +351,7 @@ fn check_bip34_helper_and_expected_bits_no_retarget() {
     };
     let block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0; 32]),
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
             time: 1,
@@ -573,7 +573,7 @@ fn expected_bits_extending_height0_and_no_retarget() {
     };
     let block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0; 32]),
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
             time: 1,
@@ -1544,7 +1544,7 @@ fn store_start_states_lookup_load_confirm() {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time,
@@ -1569,7 +1569,7 @@ fn store_start_states_lookup_load_confirm() {
         txs.extend(extra);
         let mut block = Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: prev,
                 merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time,
@@ -2164,7 +2164,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
     };
     let mut block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time: 1_300_000_000,

@@ -21,3 +21,11 @@ emit = ['previous compact block reconstruction attempt failed']
 [[rule]]
 match = 'Ignoring low-work compact block from peer (\d+)'
 emit = ['[net] Ignoring low-work compact block from peer {1}']
+
+[[rule]]
+match = 'Block validation error: (.+)'
+emit = ['Block validation error: {1}']
+
+[[rule]]
+match = '([0-9a-f]{64}), bad-version\(0x([0-9a-f]{8})\)'
+emit = ['{1}, bad-version(0x{2})']

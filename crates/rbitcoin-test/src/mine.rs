@@ -129,7 +129,7 @@ pub fn mine_regtest_block(
 
     let bits = CompactTarget::from_consensus(0x207f_ffff);
     let header = Header {
-        version: Version::ONE,
+        version: Version::from_consensus(4),
         prev_blockhash: prev_hash,
         merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
         time,

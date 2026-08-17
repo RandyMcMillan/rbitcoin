@@ -1367,7 +1367,7 @@ mod tests {
         use bitcoin::block::{Header, Version};
         use bitcoin::{CompactTarget, TxMerkleNode};
         let header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
             merkle_root: TxMerkleNode::from_byte_array([1u8; 32]),
             time: 1,
@@ -1530,7 +1530,7 @@ mod tests {
         };
         let mut bad = bitcoin::Block {
             header: Header {
-                version: BlockVersion::ONE,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: tip,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
                 time: tip_block.header.time + 600,
@@ -1714,7 +1714,7 @@ mod tests {
             use bitcoin::block::{Header, Version};
             use bitcoin::{CompactTarget, TxMerkleNode};
             let child = Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: gen.block_hash(),
                 merkle_root: TxMerkleNode::from_byte_array([2u8; 32]),
                 time: gen.time + 1,
@@ -2325,7 +2325,7 @@ mod tests {
         };
         let mut block = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: hub.tip_hash().unwrap(),
                 merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1,
@@ -2414,7 +2414,7 @@ mod tests {
             let bits = CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: Header {
-                    version: BlockVersion::ONE,
+                    version: BlockVersion::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,
@@ -2499,7 +2499,7 @@ mod tests {
             let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: bitcoin::block::Header {
-                    version: bitcoin::block::Version::ONE,
+                    version: bitcoin::block::Version::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,
@@ -2572,7 +2572,7 @@ mod tests {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut orphan = bitcoin::Block {
             header: Header {
-                version: BlockVersion::ONE,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: missing_parent,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1_300_000_100,
@@ -2660,7 +2660,7 @@ mod tests {
             let bits = CompactTarget::from_consensus(0x207f_ffff);
             let mut block = bitcoin::Block {
                 header: Header {
-                    version: BlockVersion::ONE,
+                    version: BlockVersion::from_consensus(4),
                     prev_blockhash: prev,
                     merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                     time,

@@ -149,7 +149,7 @@ fn fat_block_with_txs(nonce_seed: u32, extra_txs: usize) -> Block {
     let bits = CompactTarget::from_consensus(0x207f_ffff);
     let mut block = Block {
         header: Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
             time: 1_700_000_000 + nonce_seed,

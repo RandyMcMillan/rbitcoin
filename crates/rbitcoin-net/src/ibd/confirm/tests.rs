@@ -334,7 +334,7 @@ fn block_input_count_sums_tx_inputs() {
         }],
     };
     let header = Header {
-        version: Version::ONE,
+        version: Version::from_consensus(4),
         prev_blockhash: BlockHash::from_byte_array([0; 32]),
         merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
         time: 1,

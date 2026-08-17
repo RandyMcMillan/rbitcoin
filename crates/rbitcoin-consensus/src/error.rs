@@ -12,6 +12,8 @@ pub enum ConsensusError {
     PrevoutSpent,
     InvalidPow,
     BadPrev,
+    /// BIP34/66/65 outdated `nVersion` (`bad-version(0x…)`).
+    BadVersion(i32),
 }
 
 impl fmt::Display for ConsensusError {
@@ -26,6 +28,7 @@ impl fmt::Display for ConsensusError {
             ConsensusError::PrevoutSpent => f.write_str("prevout already spent on best chain"),
             ConsensusError::InvalidPow => f.write_str("pow invalid"),
             ConsensusError::BadPrev => f.write_str("unexpected previous header"),
+            ConsensusError::BadVersion(v) => write!(f, "bad-version(0x{v:08x})"),
         }
     }
 }
@@ -53,6 +56,21 @@ impl From<StoreError> for ConsensusError {
     }
 }
 
+/// Core `SCRIPT_VERIFY_*` parenthetical for `*-script-verify-flag-failed (…)`.
+pub fn script_flag_paren(token: &str) -> &str {
+    let inner = token.split(" txid=").next().unwrap_or(token);
+    match inner {
+        "CSV negative" | "CLTV negative" => "Negative locktime",
+        "CSV" | "CSV version" | "CLTV" | "CLTV type" | "CLTV final sequence" => {
+            "Locktime requirement not satisfied"
+        }
+        "stack empty" | "stack size" => "Operation not valid with the current stack size",
+        "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
+        "SIG_DER" => "Non-canonical DER signature",
+        other => other,
+    }
+}
+
 /// Core `BlockValidationState` / `debug.log` reject needle for a confirm error.
 ///
 /// P2P `assert_debug_log` and `submitblock` share this. Script messages keep
@@ -77,20 +95,20 @@ pub fn block_reject_reason(err: &ConsensusError) -> String {
         ConsensusError::MissingPrevout | ConsensusError::PrevoutSpent => {
             "bad-txns-inputs-missingorspent".into()
         }
+        ConsensusError::BadVersion(v) => format!("bad-version(0x{v:08x})"),
         ConsensusError::Script(s) => {
-            let inner = s.split(" txid=").next().unwrap_or(s.as_str());
-            let paren = match inner {
-                "CSV negative" | "CLTV negative" => "Negative locktime",
-                "CSV" | "CSV version" | "CLTV" | "CLTV type" | "CLTV final sequence" => {
-                    "Locktime requirement not satisfied"
-                }
-                "stack empty" | "stack size" => "Operation not valid with the current stack size",
-                "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
-                other => other,
-            };
-            format!("block-script-verify-flag-failed ({paren})")
+            format!("block-script-verify-flag-failed ({})", script_flag_paren(s))
         }
         other => other.to_string(),
+    }
+}
+
+/// Core debug.log line for a rejected block (`feature_dersig` / `feature_cltv`).
+pub fn block_reject_log_line(hash: impl std::fmt::Display, reason: &str) -> String {
+    if reason.starts_with("bad-version") {
+        format!("{hash}, {reason}")
+    } else {
+        format!("Block validation error: {reason}")
     }
 }
 
@@ -120,6 +138,7 @@ mod tests {
             ),
             (ConsensusError::InvalidPow, "pow invalid"),
             (ConsensusError::BadPrev, "unexpected previous header"),
+            (ConsensusError::BadVersion(2), "bad-version(0x00000002)"),
         ];
         for (err, needle) in cases {
             assert_eq!(err.to_string(), *needle);
@@ -183,6 +202,25 @@ mod tests {
         assert_eq!(
             block_reject_reason(&ConsensusError::InvalidPow),
             "high-hash"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::Script("SIG_DER".into())),
+            "block-script-verify-flag-failed (Non-canonical DER signature)"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadVersion(2)),
+            "bad-version(0x00000002)"
+        );
+        assert_eq!(
+            block_reject_log_line("abcd", "bad-version(0x00000002)"),
+            "abcd, bad-version(0x00000002)"
+        );
+        assert_eq!(
+            block_reject_log_line(
+                "abcd",
+                "block-script-verify-flag-failed (Non-canonical DER signature)"
+            ),
+            "Block validation error: block-script-verify-flag-failed (Non-canonical DER signature)"
         );
     }
 }

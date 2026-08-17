@@ -1076,7 +1076,7 @@ mod tests {
         let bits = CompactTarget::from_consensus(0x207f_ffff);
         let mut held = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: gen,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1_300_000_200,
@@ -1248,7 +1248,7 @@ mod tests {
         assert!(!hub.query.block_queue_has_hash(&need.to_byte_array()));
         let mut held = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: gen,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1_300_000_300,
@@ -1465,7 +1465,7 @@ mod tests {
         // Minimal held tip block for awaiting state (payload not used by assign).
         let mut held = bitcoin::Block {
             header: Header {
-                version: Version::ONE,
+                version: Version::from_consensus(4),
                 prev_blockhash: gen,
                 merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
                 time: 1_300_000_100,

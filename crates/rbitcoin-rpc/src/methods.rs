@@ -1216,14 +1216,28 @@ fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
         let rest = rest
             .strip_prefix("script verification failed: ")
             .unwrap_or(rest);
-        let token = rest.split(" txid=").next().unwrap_or(rest);
-        let paren = match token {
-            "NULLDUMMY" => "Dummy CHECKMULTISIG argument must be zero",
-            other => other,
-        };
+        let paren = rbitcoin_consensus::script_flag_paren(rest);
         return format!("mempool-script-verify-flag-failed ({paren})");
     }
     s.to_string()
+}
+
+/// Core `reject-details` for a script-verify mempool reject.
+fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Option<String> {
+    let reason = accept_reject_reason(e);
+    if !reason.starts_with("mempool-script-verify-flag-failed") {
+        return None;
+    }
+    let vin = 0usize;
+    let inp = tx.input.get(vin)?;
+    let prev = inp.previous_output;
+    Some(format!(
+        "{reason}, input {vin} of {} (wtxid {}), spending {}:{}",
+        tx.compute_txid(),
+        tx.compute_wtxid(),
+        prev.txid,
+        prev.vout
+    ))
 }
 
 fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1271,12 +1285,16 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             }
             Err(e) => {
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
-                out.push(json!({
+                let mut row = json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": false,
                     "reject-reason": accept_reject_reason(&e),
-                }));
+                });
+                if let Some(details) = accept_reject_details(&e, &tx) {
+                    row["reject-details"] = json!(details);
+                }
+                out.push(row);
             }
         }
     }
@@ -4473,6 +4491,46 @@ mod tests {
         assert_eq!(e["message"], "Block not available (not fully downloaded)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn testmempoolaccept_script_reject_maps_dersig_and_details() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let err = "script: script verification failed: SIG_DER";
+        let reason = accept_reject_reason(&err);
+        assert_eq!(
+            reason,
+            "mempool-script-verify-flag-failed (Non-canonical DER signature)"
+        );
+        let prev = Txid::from_byte_array([0x11; 32]);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let details = accept_reject_details(&err, &tx).expect("script reject has details");
+        let want = format!(
+            "{reason}, input 0 of {} (wtxid {}), spending {}:0",
+            tx.compute_txid(),
+            tx.compute_wtxid(),
+            prev
+        );
+        assert_eq!(details, want);
     }
 
     #[test]

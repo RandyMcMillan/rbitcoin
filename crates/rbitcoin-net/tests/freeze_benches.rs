@@ -47,7 +47,7 @@ fn temp_hub() -> (TempStore, Arc<ChainHub>) {
 
 fn dummy_header(prev: BlockHash, nonce: u32) -> Header {
     Header {
-        version: Version::ONE,
+        version: Version::from_consensus(4),
         prev_blockhash: prev,
         merkle_root: bitcoin::TxMerkleNode::from_byte_array([nonce as u8; 32]),
         time: 1_700_000_000 + nonce,

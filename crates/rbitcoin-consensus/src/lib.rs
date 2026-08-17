@@ -587,7 +587,7 @@ pub use confirm_run::{
     scripts_feed_test_sync, scripts_stage_from_load_channel, BqResolveWaveStats,
     ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch, PlanStampOutcome,
     ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle, WireLoadPipeline,
-    BQ_RESOLVE_WAVE_MAX_BLOCKS,
+    BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

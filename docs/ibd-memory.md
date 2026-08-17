@@ -10,7 +10,7 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 |-----------|-------------|---------------------------|
 | **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); confirm pack **decodes** by height; confirm-write **dequeues** after tip advance. **RAM-only by design** — avoids double-writing every block (queue + Class A). Restart empties the queue; **tip-batch Class A is reconstructed into BQ** (`rehydrate_class_a_into_body_queue`, ≤`TIP_HOLE_MAX`) so claim does not wait on re-getdata when bodies are already packed. Logs: `bq soft=n/win RAM=`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary gate is soft assign (100 MiB free / 1 min confirm window). |
-| **Confirm feed** | readiness (height/hash), no wire retain | **Load** packs tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (hardcoded **8000**, overshoot block included) or hard **144** blocks. At dense mainnet heights **8000 inputs ≈ a few blocks** (often 1–3; early chain can pack many tiny blocks up to 144). Do not treat ~32 as pack size. IBD **lookup** TipOnly-resolves at most **8** BQ-ready heights per wave. Requeue / finish on outcome |
+| **Confirm feed** | readiness (height/hash), no wire retain | **Load** packs tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (hardcoded **8000**, overshoot block included) or hard **144** blocks. At dense mainnet heights **8000 inputs ≈ a few blocks** (often 1–3; early chain can pack many tiny blocks up to 144). Do not treat ~32 as pack size. IBD **lookup** TipOnly-resolves at most **16000** inputs or **1080** BQ-ready heights per wave. Requeue / finish on outcome |
 
 ## Soft budgets (unified body-queue path)
 
@@ -26,7 +26,7 @@ do not hold both a decoded `Block` and the wire bytes.
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Published identity union** | Unique parents in still-queued BQ heights (lookup `live_union` + one `ArcSwap` snapshot) | Dequeue enqueues a height forget; lookup applies at next wave-end snapshot. Disconnect stores `None`. Not a process FIFO. |
+| **Published identity union** | Unique parents in still-queued BQ heights (lookup `live_union` + `ArcSwap` of the layer-chain head) | Lookup drops a layer once that height has left the BQ. Disconnect stores `None`. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range) |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |

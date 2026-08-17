@@ -400,13 +400,12 @@ mod tests {
         let mut live = LiveUnion::new();
         let mut hits = IdMap::new();
         hits.insert([0xAAu8; 32], (Fk(9), (8, 16)));
-        live.note_height(q.parent_id_forget(), 3, &hits);
+        live.note_height(3, &hits);
         live.publish(q.published_ids());
         assert_eq!(q.published_ids().get(&[0xAAu8; 32]), Some((Fk(9), (8, 16))));
         assert_eq!(q.block_queue_dequeue_height(3).unwrap(), 1);
         assert!(!q.block_queue_is_resolve_complete(3));
-        // Dequeue only enqueues; snapshot updates at the next wave-end publish.
-        live.note_height(q.parent_id_forget(), 4, &IdMap::new());
+        live.keep_heights(|h| q.block_queue_has_height(h));
         live.publish(q.published_ids());
         assert!(q.published_ids().get(&[0xAAu8; 32]).is_none());
         let _ = std::fs::remove_dir_all(dir);

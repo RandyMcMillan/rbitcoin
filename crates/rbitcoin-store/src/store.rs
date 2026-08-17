@@ -2765,7 +2765,7 @@ mod tests {
             let mid = s
                 .txs
                 .head
-                .probe_candidates_batch_sealed_hot(&mixed)
+                .probe_candidates_batch_sealed_hot(&mixed, &[true])
                 .unwrap();
             let mut hot = open;
             hot[0].extend(mid[0].iter().copied());

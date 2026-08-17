@@ -150,7 +150,7 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 
 At **info**, progress + perf already expose load/write bottlenecks (schema 16). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
-`pin_txid%` is stamp `txid→create_fk` from the published `live_union` snapshot vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
+`pin_txid%` is stamp `txid→create_fk` from the published `live_union` chain vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next claim-ready body. Tip-batch getdata races up to 4 peers
@@ -208,7 +208,7 @@ pages after annotate does not protect `txout`. See
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. Legacy mono-head datadirs require reindex |
-| Confirm stages | **lookup · load · scripts · write** | Real queues **scriptq=4 · writeq=20**. **`ready=`** is BQ resolve-complete inventory (no lookup→load channel). **Load** packs tip-contiguous runs by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch (not ~32). IBD **lookup** TipOnly-resolves at most **8** BQ-ready heights per wave. |
+| Confirm stages | **lookup · load · scripts · write** | Real queues **scriptq=4 · writeq=20**. **`ready=`** is BQ resolve-complete inventory (no lookup→load channel). **Load** packs tip-contiguous runs by soft **Σ inputs 8000** or hard **144** blocks — dense mainnet usually a few blocks per batch (not ~32). IBD **lookup** TipOnly-resolves at most **16000** inputs or **1080** BQ-ready heights per wave. |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

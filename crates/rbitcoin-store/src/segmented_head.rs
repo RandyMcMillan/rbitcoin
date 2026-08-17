@@ -623,21 +623,29 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Open, None)
     }
 
-    /// Wave 2: sealed ages `1..=3`.
+    /// Wave 2: sealed ages `1..=3`. Inactive keys (`active[i] == false`) get
+    /// empty cand lists, same as cold.
     pub(crate) fn probe_candidates_batch_sealed_hot(
         &self,
         mixed: &[[u8; 32]],
+        active: &[bool],
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::SealedHot, None)
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::SealedHot, Some(active))
     }
 
     /// Wave 2 on a held plan TLS session.
     pub(crate) fn probe_candidates_batch_sealed_hot_on_session(
         &self,
         mixed: &[[u8; 32]],
+        active: &[bool],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::SealedHot, None)
+        self.probe_candidates_batch_inner(
+            mixed,
+            Some(session),
+            HeadProbeWave::SealedHot,
+            Some(active),
+        )
     }
 
     /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where

@@ -1,12 +1,43 @@
 //! Newest-first identity pick for head resolve (BIP30 / fence).
 //!
-//! After a wave fetches every cand's `txid.body`, walk the cand list (deepest
-//! first) and take the first `body==want` that is fence-connected (or the first
-//! body match when no fence).
+//! A wave fills identities in at most two page-grouped `txid.body` shots
+//! (first [`ID_FILL_CHUNK`] cands, then the rest). Walk the filled prefix
+//! deepest-first and take the first `body==want` that is fence-connected
+//! (or the first body match when no fence).
 
 use crate::height_fence::HeightFence;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
+
+/// First identity shot size. Later cands wait for shot B only if the key is
+/// still unfinished (no connected win; unconnected body match is not enough).
+pub(crate) const ID_FILL_CHUNK: usize = 4;
+
+/// Unread prefix of `take` cands for keys that are not `skip`.
+pub(crate) fn next_id_shot(
+    cands_by_key: &[Vec<Fk>],
+    filled: &[usize],
+    skip: &[bool],
+    take: usize,
+) -> Vec<Fk> {
+    let mut need = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (ki, cands) in cands_by_key.iter().enumerate() {
+        if skip.get(ki).copied().unwrap_or(false) {
+            continue;
+        }
+        let start = filled.get(ki).copied().unwrap_or(0);
+        for &fk in cands.iter().skip(start).take(take) {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if seen.insert(id) {
+                need.push(fk);
+            }
+        }
+    }
+    need
+}
 
 /// First txid match that is fence-connected, or first txid match if `heights` is None.
 ///
@@ -231,5 +262,55 @@ mod tests {
         let cands = [Fk(1), Fk(2)];
         let map = ids(&[(1, [0x00; 32]), (2, want)]);
         assert_eq!(miss_peeks_in_prefix(&cands, 2, &want, &map), 1);
+    }
+
+    #[test]
+    fn next_id_shot_first_chunk_then_rest() {
+        let cands = vec![vec![Fk(10), Fk(20), Fk(30), Fk(40), Fk(50), Fk(60)]];
+        let filled = vec![0usize];
+        let skip = vec![false];
+        let a = next_id_shot(&cands, &filled, &skip, ID_FILL_CHUNK);
+        assert_eq!(a, vec![Fk(10), Fk(20), Fk(30), Fk(40)]);
+        let filled = vec![ID_FILL_CHUNK];
+        let b = next_id_shot(&cands, &filled, &skip, usize::MAX);
+        assert_eq!(b, vec![Fk(50), Fk(60)]);
+    }
+
+    #[test]
+    fn two_shot_skips_tail_after_connected_in_chunk() {
+        let want = [0xAAu8; 32];
+        let cands = vec![vec![Fk(10), Fk(20), Fk(30), Fk(40), Fk(50)]];
+        let mut filled = vec![0usize];
+        let mut skip = vec![false];
+        let shot_a = next_id_shot(&cands, &filled, &skip, ID_FILL_CHUNK);
+        assert_eq!(shot_a.len(), ID_FILL_CHUNK);
+        filled[0] = ID_FILL_CHUNK;
+        let map = ids(&[(10, want), (20, want)]);
+        let ht = fence_on(&[20]);
+        assert!(pick_winner(&cands[0], filled[0], &want, &map, Some(&ht)).is_some());
+        skip[0] = true;
+        let shot_b = next_id_shot(&cands, &filled, &skip, usize::MAX);
+        assert!(
+            shot_b.is_empty(),
+            "connected in shot A must not fetch the tail"
+        );
+    }
+
+    #[test]
+    fn two_shot_unconnected_body_match_still_takes_rest() {
+        let want = [0xAAu8; 32];
+        let cands = vec![vec![Fk(10), Fk(20), Fk(30), Fk(40), Fk(50)]];
+        let mut filled = vec![0usize];
+        let skip = vec![false];
+        let _shot_a = next_id_shot(&cands, &filled, &skip, ID_FILL_CHUNK);
+        filled[0] = ID_FILL_CHUNK;
+        let map = ids(&[(10, want)]);
+        let ht = fence_on(&[50]);
+        assert!(
+            pick_winner(&cands[0], filled[0], &want, &map, Some(&ht)).is_none(),
+            "unconnected match in the chunk is not a fence win"
+        );
+        let shot_b = next_id_shot(&cands, &filled, &skip, usize::MAX);
+        assert_eq!(shot_b, vec![Fk(50)]);
     }
 }

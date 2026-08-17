@@ -1605,11 +1605,7 @@ pub(crate) fn spawn_confirm_engine(
                         &hub.query,
                         &hub.params,
                         &wave_h,
-                        Some((
-                            &mut live_union,
-                            hub.query.published_ids().as_ref(),
-                            hub.query.parent_id_forget().as_ref(),
-                        )),
+                        Some((&mut live_union, hub.query.published_ids().as_ref())),
                     ) {
                         Ok(st) if st.heights > 0 => {
                             did = true;

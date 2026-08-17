@@ -33,8 +33,8 @@ spk hash    ──► scripthash.head/NN   sealed sorted main after tip bulk (`S
 ## Lookup path (txid → create_fk)
 
 1. Live pipeline pin by prev_txid (same Weak as outs).
-2. **Open** wave: unsealed tail (age 0) — probe, fetch every cand `txid.body`, walk newest-first.
-3. Unfinished keys: **sealed-hot** (ages 1..=3), same fetch-all + walk.
+2. **Open** wave: unsealed tail (age 0) — probe, two-shot `txid.body`, walk newest-first.
+3. Unfinished keys: **sealed-hot** (ages 1..=3), same two-shot + walk.
 4. Still unfinished or **unconnected** after those: **cold** (sealed ages ≥4).
 
 `TipThenAny` / `TipOnly` still run later waves after an unconnected earlier
@@ -50,8 +50,8 @@ is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
 
 | Stage | Head contact |
 |-------|----------------|
-| **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **3-wave** open / sealed-hot / cold). Skip keys already in lookup `live_union`. Publish one `Arc<HashMap>` snapshot (`PublishedIds`) at wave end. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
-| **load** | Stamp from in-flight + published union (`published.load()`, no mutex), then TipOnly leftover. Pins `txout` by stamped range or in-flight outs. Does **not** `spent.idx`-batch. In-flight holds planned creates until **after pin + scripts handoff**, when drain inserted the fk span **and** `covers_fk_span`. |
+| **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **3-wave** open / sealed-hot / cold; sealed-hot and cold only unfinished keys). Skip keys already in lookup `live_union`. Publish one `IdLayer` (`lo..=hi`) at wave end; drop a layer when no height in its span is still on the BQ. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
+| **load** | Stamp from in-flight + published union (`published.get()`, no mutex), then TipOnly leftover. Pins `txout` by stamped range or in-flight outs. Does **not** `spent.idx`-batch. In-flight holds planned creates until **after pin + scripts handoff**, when drain inserted the fk span **and** `covers_fk_span`. |
 | **scripts** | No store. |
 | **write** | Sole Class A appender **and** sole `spent.idx` stamper (`ensure_spend_abs_layouts`). `head_insert_many` write-behind. Drain ∥ Class C. Write queued is insert-only. In-flight is the RAM home until drain+fence after the next bind. RPC `get_fk_by_txid` hits durable head only until drain. |
 

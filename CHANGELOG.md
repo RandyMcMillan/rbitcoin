@@ -11,9 +11,14 @@ before 1.0).
 
 ### Added
 
+- **`generateblock submit=false`:** mine one block without connecting it
+  and return `{hash,hex}` for `submitheader`. `output` accepts `raw()`
+  descriptors.
+
 - **`getblockstats`:** reconstruct the block and return Core fee / UTXO /
   weight fields (`hash_or_height`, `stats`). Genesis is excluded from
-  actual UTXO counts; `OP_RETURN` is unspendable.
+  actual UTXO counts; `OP_RETURN` is unspendable. Even `medianfee` is the
+  integer mean of the two middle scores (Core `CalculateTruncatedMedian`).
 
 - **`docs/errata.md`:** RAM leftover maps are one fk per txid. Pre-BIP30
   clobber is correct enough; post-BIP30 a disconnected sibling in those
@@ -40,6 +45,11 @@ before 1.0).
   an invariant, protocol, `SAFETY` requirement, or library quirk. First-party
   production sources were cleaned to that bar.
 
+- **Core functional Wave A.** Official unmodified
+  `feature_dersig.py` / `feature_cltv.py` / `p2p_ping.py` /
+  `feature_minchainwork.py` / `tool_rpcauth.py` are now `run` (28
+  inventory run names). Compact block filters stay skip.
+
 - **Core debug.log campaign (Step 21).** BIP34/66/65 outdated `nVersion`
   is `bad-version(0x…)`. Connect script fail logs
   `Block validation error: …` (`SIG_DER` / five CLTV parens).
@@ -47,10 +57,7 @@ before 1.0).
   `Short payload` / `Nonce mismatch` / `Nonce zero` / `ping timeout`
   and `getpeerinfo` RTT fields. Confirming an unbroadcast local tx
   logs Core's removal line. V2 unknown type and redundant version
-  log the `p2p_invalid_messages` needles. Official `feature_dersig` /
-  `feature_cltv` / `p2p_ping` / `mempool_unbroadcast` /
-  `p2p_invalid_messages` / `p2p_unrequested_blocks` / headers-sync /
-  `rpc_net` stay skip with tighter analogs.
+  log the `p2p_invalid_messages` needles.
 
 - **Height fence extend is fail-closed.** Missing or empty `header_txs` for
   the header is `Corrupt`, not `Ok` with a live `height_of` hole (TipOnly
@@ -61,13 +68,17 @@ before 1.0).
 - **Invalidate evicts immature coinbase spends.** `QueryUtxoProvider`
   now ORs the input-null coinbase signal with first-in-block, so
   `evict_after_reorg` sees `ImmatureCoinbase` after `invalidateblock`
-  drops tip below maturity.
+  drops tip below maturity. Creates whose Class A height is above tip
+  are not chain coins, so children of a reorged spend leave too.
+  Re-accepting a disconnected parent wires edges to children that were
+  already live (`ancestorcount` 2).
 
 - **`-minimumchainwork` is live on P2P.** Below the floor: stay in IBD
   (also if tip age > 24h), do not announce blocks, ignore inbound
   `getheaders`. Tip-follow still runs so later blocks can raise work.
   `getblockheader` / `getblockchaininfo` report real header `chainwork`
-  (regtest 2 per block), not `""`.
+  (regtest 2 per block), not `""`. Download (getdata/accept) waits until
+  the peer's best-known path meets the floor.
 
 - **IBD leftover miss names the table:** stamp reject lines include
   `miss_on=head|body|idx|fence` and `miss_cands=` so a TipOnly miss is not

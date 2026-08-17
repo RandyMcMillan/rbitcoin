@@ -502,13 +502,24 @@ fn pwrite_batch_on_session(
         }
     }
 
+    let ok = finish_pwrite_wave(ops);
+    let _ = session.drain_all();
+    ok
+}
+
+/// Unfilled or failed pwrite ops are not success. Caller libc-retries.
+fn finish_pwrite_wave(ops: &mut [WriteOp<'_>]) -> bool {
+    let mut any_fail = false;
     for op in ops.iter_mut() {
         if !op.buf.is_empty() && op.result == i32::MIN {
             op.result = -5;
+            any_fail = true;
+        }
+        if op.result < 0 {
+            any_fail = true;
         }
     }
-    let _ = session.drain_all();
-    true
+    !any_fail
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -839,6 +850,21 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn pwrite_batch_fail_unfilled_is_not_success() {
+        let buf = [1u8; 4];
+        let mut ops = [WriteOp {
+            fd: 0,
+            offset: 0,
+            buf: &buf,
+            result: i32::MIN,
+        }];
+        assert!(!finish_pwrite_wave(&mut ops));
+        assert_eq!(ops[0].result, -5);
+        ops[0].result = 4;
+        assert!(finish_pwrite_wave(&mut ops));
+    }
 
     /// Dense surface: empty ops, empty bufs, serial RMW, multi-worker fallback,
     /// workers/io_uring helpers (without racing env with parallel tests for mode).

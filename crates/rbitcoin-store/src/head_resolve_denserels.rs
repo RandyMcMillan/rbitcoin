@@ -296,7 +296,7 @@ fn resolve_fk_and_range_core(
         &mut idx_ns,
         &first_fks,
         &mut local_age,
-        session.as_deref_mut(),
+        &mut session,
         &mut had_id,
     )?;
 
@@ -324,7 +324,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            session.as_mut().map(|s| &mut **s),
+            &mut session,
             &mut had_id,
         )?;
     }
@@ -357,7 +357,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            session.as_mut().map(|s| &mut **s),
+            &mut session,
             &mut had_id,
         )?;
     }
@@ -635,7 +635,7 @@ fn id_idx_wave(
     idx_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-    mut session: Option<&mut UringSession>,
+    session: &mut Option<&mut UringSession>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
     use crate::head_resolve_pick::{miss_peeks_in_prefix, pick_winner};
@@ -664,7 +664,7 @@ fn id_idx_wave(
     let (id_map, _pages) = if need.is_empty() {
         (HashMap::new(), 0)
     } else {
-        match &mut session {
+        match session.as_mut() {
             Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
             None => side.get_many_page_grouped(&need)?,
         }
@@ -703,7 +703,10 @@ fn id_idx_wave(
         }
     }
     let t_idx = Instant::now();
-    let ranges = body_ranges_batched(table, &chosen_fks, session)?;
+    let ranges = match session.as_mut() {
+        Some(sess) => body_ranges_batched(table, &chosen_fks, Some(sess))?,
+        None => body_ranges_batched(table, &chosen_fks, None)?,
+    };
     record_chosen_idx_ranges(
         &chosen_kis,
         &chosen_fks,

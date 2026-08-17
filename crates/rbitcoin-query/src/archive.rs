@@ -352,7 +352,14 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_batch_from_store(need, start, &crate::InFlightView::empty(), None, None)
+        self.archive_plan_batch_from_store(
+            need,
+            start,
+            &crate::InFlightView::empty(),
+            None,
+            None,
+            None,
+        )
     }
 
     /// Like [`Self::archive_plan_batch_owned`], but assign create fks from
@@ -371,13 +378,13 @@ impl Query {
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None)
+        self.archive_plan_batch_from_store(need, next_tx_start, in_flight, None, None, None)
     }
 
     /// [`Self::archive_plan_batch_from`] plus live [`crate::PipelineParentStore`]
-    /// (`txid → create_fk` + range) and optional BQ-ahead hits before `tx.head`.
-    /// Remaining externals after those caches take a TipOnly batch — they are
-    /// not an invariant miss.
+    /// (`txid → create_fk` + range), optional BQ-ahead hits, and the published
+    /// identity union before `tx.head`. Remaining externals take a TipOnly
+    /// batch — they are not an invariant miss.
     pub fn archive_plan_batch_from_store(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
@@ -385,6 +392,7 @@ impl Query {
         in_flight: &crate::InFlightView,
         parent_store: Option<&crate::PipelineParentStore>,
         pre_resolved: Option<&rbitcoin_store::BqParentHits>,
+        published: Option<&crate::PublishedIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -475,16 +483,9 @@ impl Query {
         let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
         let t_pin_txid = Instant::now();
-        let pin_hits = match parent_store {
-            Some(store) if !still_need.is_empty() => {
-                store.bulk_lookup_txid(still_need.iter().copied())
-            }
-            _ => HashMap::new(),
-        };
-        let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
-
+        let _ = parent_store;
         for t in still_need {
-            if let Some(&(fk, range)) = pin_hits.get(t) {
+            if let Some((fk, range)) = published.unwrap_or(self.published_ids.as_ref()).get(t) {
                 resolved.insert(*t, fk);
                 if let Some(id) = fk.get() {
                     pin_ranges.push((id, range));
@@ -503,6 +504,7 @@ impl Query {
             }
             need_head.push(*t);
         }
+        let pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
@@ -1589,9 +1591,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Live pipeline pin supplies create_fk + range without `tx.head`.
+    /// Live pipeline pin is outs-only: stamp does not use `bulk_lookup_txid`.
     #[test]
-    fn archive_plan_batch_from_store_hits_pin_txid() {
+    fn archive_plan_batch_from_store_pstore_is_not_stamp_source() {
         use crate::{BatchParents, PipelineParentStore};
         use std::sync::Arc;
         let (dir, q) = temp_query("pin-txid-stamp");
@@ -1650,20 +1652,104 @@ mod tests {
         let mut need = vec![(Fk(1), vec![child])];
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
-            let plan = q
+            let err = q
                 .archive_plan_batch_from_store(
                     &mut need,
                     1,
                     &crate::InFlightView::empty(),
                     Some(store.as_ref()),
                     None,
+                    None,
                 )
-                .expect("pin-txid stamp");
-            assert_eq!(plan.packed[0].1[0].create_fk, Fk(99));
-            assert_eq!(plan.external_parent_ranges.get(&99), Some(&(5000, 40)));
+                .expect_err("pstore pin is not a stamp source");
+            assert!(
+                err.to_string().contains("parent create_fk unresolved"),
+                "got: {err}"
+            );
             let mix = crate::archive_phase_stats::sample_and_reset();
-            assert_eq!(mix.pin_txid_n, 1);
-            assert_eq!(mix.head_need, 0);
+            assert_eq!(mix.pin_txid_n, 0);
+            assert!(mix.head_need > 0, "pstore-only parent must leftover");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BQ-ahead hits supply create_fk + range with no live pin and no head row.
+    #[test]
+    fn archive_plan_batch_from_store_hits_bq_parent_hits() {
+        use std::collections::HashMap;
+        let (dir, q) = temp_query("bq-hits-stamp");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x33;
+            t
+        };
+        let mut hits = HashMap::new();
+        hits.insert(parent_txid, (Fk(77), (4000, 32)));
+        let child = child_spend(parent_txid, 0x44);
+        let mut need = vec![(Fk(1), vec![child])];
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let plan = q
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    1,
+                    &crate::InFlightView::empty(),
+                    None,
+                    Some(&hits),
+                    None,
+                )
+                .expect("bq parent_hits stamp");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(77));
+            assert_eq!(plan.external_parent_ranges.get(&77), Some(&(4000, 32)));
+            assert_eq!(plan.external_parent_txid(77), Some(parent_txid));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.pin_txid_n, 0, "bq hits must not count as pin_txid");
+            assert_eq!(mix.head_need, 0, "bq hits must skip leftover TipOnly");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Published union supplies create_fk + range with no pin, BQ hits, or head row.
+    #[test]
+    fn archive_plan_batch_from_store_hits_published_ids() {
+        use crate::IdMap;
+        use std::sync::Arc;
+        let (dir, q) = temp_query("published-ids-stamp");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x55;
+            t
+        };
+        let published = q.published_ids();
+        let mut m = IdMap::new();
+        m.insert(parent_txid, (Fk(66), (3000, 24)));
+        published.publish(Arc::new(m));
+        let child = child_spend(parent_txid, 0x66);
+        let mut need = vec![(Fk(1), vec![child])];
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let plan = q
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    1,
+                    &crate::InFlightView::empty(),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("published union stamp");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
+            assert_eq!(plan.external_parent_ranges.get(&66), Some(&(3000, 24)));
+            assert_eq!(plan.external_parent_txid(66), Some(parent_txid));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(
+                mix.pin_txid_n, 1,
+                "published union hits use the id_cache meter"
+            );
+            assert_eq!(
+                mix.head_need, 0,
+                "published union must skip leftover TipOnly"
+            );
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

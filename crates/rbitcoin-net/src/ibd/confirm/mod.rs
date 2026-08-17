@@ -23,6 +23,8 @@ struct LoadAheadState {
     in_flight: rbitcoin_query::InFlightLog,
     /// Shared sparse parent pins for concurrent load/scripts/write batches.
     parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
+    /// Lookup-published identity union (wave hits still live in the BQ window).
+    published: std::sync::Arc<rbitcoin_query::PublishedIds>,
     /// Last height successfully loaded (still in pipeline or already committed).
     last_loaded: Option<(u32, [u8; 32])>,
     /// Last applied [`Query::take_disconnect`] generation.
@@ -36,6 +38,7 @@ impl LoadAheadState {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+            published: std::sync::Arc::clone(hub.query.published_ids()),
             last_loaded: None,
             disconnect_gen_seen: 0,
         }
@@ -45,6 +48,7 @@ impl LoadAheadState {
     fn apply_disconnect(&mut self, hub: &ChainHub) {
         if let Some(h) = hub.query.take_disconnect(&mut self.disconnect_gen_seen) {
             self.in_flight.drop_from_height(h);
+            self.published.unpublish();
             self.publish_mem_stats();
         }
     }
@@ -99,6 +103,7 @@ impl LoadAheadState {
             next_tx_start: self.next_tx_start,
             in_flight: self.in_flight.snapshot(),
             parent_store: std::sync::Arc::clone(&self.parent_store),
+            published: std::sync::Arc::clone(&self.published),
         }
     }
 
@@ -860,7 +865,7 @@ pub(crate) mod confirm_thr_stats {
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
-/// from BQ hits + in-flight + TipOnly `tx.head` + pin + assemble) → scriptq →
+/// from in-flight + published union + TipOnly `tx.head` + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
@@ -1378,12 +1383,6 @@ pub(crate) fn spawn_confirm_engine(
                     })
                     .collect();
                 confirm_thr_stats::add_lookup_clone(t_clone.elapsed());
-                let mut merged = rbitcoin_store::BqParentHits::default();
-                for (h, _, _) in &wire_batch {
-                    if let Some(hits) = hub_load.query.block_queue_parent_hits(*h) {
-                        merged.extend(hits);
-                    }
-                }
                 let t_stamp = Instant::now();
                 let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp_with_hits(
                     &hub_load.query,
@@ -1391,11 +1390,7 @@ pub(crate) fn spawn_confirm_engine(
                     hub_load.milestone,
                     &plan_items,
                     if use_pipe { Some(&pipe) } else { None },
-                    if merged.is_empty() {
-                        None
-                    } else {
-                        Some(&merged)
-                    },
+                    None,
                 );
                 confirm_thr_stats::add_load_work(t_stamp.elapsed());
                 let stamped = match plan_res {
@@ -1576,9 +1571,15 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!("ibd: confirm lookup on dedicated OS thread (BQ-ahead TipOnly head_fk)");
             let _ = queues_lookup;
+            let mut live_union = rbitcoin_query::LiveUnion::new();
+            let mut disco_seen = 0u64;
             loop {
                 if feed.stopped() {
                     break;
+                }
+                if hub.query.take_disconnect(&mut disco_seen).is_some() {
+                    live_union = rbitcoin_query::LiveUnion::new();
+                    hub.query.published_ids().unpublish();
                 }
                 let t_sel = Instant::now();
                 let skip: std::collections::HashSet<u32> = {
@@ -1600,10 +1601,15 @@ pub(crate) fn spawn_confirm_engine(
                 let mut did = false;
                 if !wave_h.is_empty() {
                     let t_wave = Instant::now();
-                    match rbitcoin_consensus::confirm_bq_resolve_wave(
+                    match rbitcoin_consensus::confirm_bq_resolve_wave_with_ids(
                         &hub.query,
                         &hub.params,
                         &wave_h,
+                        Some((
+                            &mut live_union,
+                            hub.query.published_ids().as_ref(),
+                            hub.query.parent_id_forget().as_ref(),
+                        )),
                     ) {
                         Ok(st) if st.heights > 0 => {
                             did = true;

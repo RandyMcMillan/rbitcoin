@@ -26,6 +26,7 @@ do not hold both a decoded `Block` and the wire bytes.
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
+| **Published identity union** | Unique parents in still-queued BQ heights (lookup `live_union` + one `ArcSwap` snapshot) | Dequeue enqueues a height forget; lookup applies at next wave-end snapshot. Disconnect stores `None`. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` / plan-local external parents only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into plan-local maps |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |

@@ -424,6 +424,14 @@ pub(super) fn stamp_parent_pin_archived(
                 }
             }
         }
+        if let Some((fk, range)) = query.published_ids().get(tid) {
+            if let Some(id) = fk.get() {
+                stamp.create_by_txid.insert(*tid, id);
+                stamp.txids.insert(id, *tid);
+                stamp.ranges.insert(id, range);
+            }
+            continue;
+        }
         need_head.push(*tid);
     }
     need_head.sort_unstable();
@@ -716,6 +724,7 @@ pub(super) fn wire_lookup_phase(
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
                     pre_resolved,
+                    Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -725,6 +734,7 @@ pub(super) fn wire_lookup_phase(
                     &rbitcoin_query::InFlightView::empty(),
                     None,
                     pre_resolved,
+                    None,
                 )
                 .map_err(ConsensusError::from)?,
         };

@@ -9,6 +9,7 @@ mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
 mod in_flight;
+mod published_ids;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -130,6 +131,7 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
+pub use published_ids::{ForgetQueue, IdMap, LiveUnion, PublishedIds};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -1070,6 +1072,10 @@ pub struct Query {
     disconnect_height: AtomicU32,
     /// Bumped on each [`Self::disconnect_tip`]. Load drops in-flight layers.
     disconnect_gen: AtomicU64,
+    /// Lookup-published parent identity union (wave hits still in the BQ window).
+    published_ids: std::sync::Arc<crate::PublishedIds>,
+    /// Heights dequeued since the last lookup wave-end snapshot.
+    parent_id_forget: std::sync::Arc<crate::ForgetQueue>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1147,6 +1153,8 @@ impl Query {
             head_drain_fk: AtomicU64::new(0),
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
+            published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
+            parent_id_forget: std::sync::Arc::new(crate::ForgetQueue::new()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -1434,7 +1442,20 @@ impl Query {
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
     pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
         let mut g = self.block_queue.lock().unwrap();
-        Ok(g.dequeue_height(height)?)
+        let n = g.dequeue_height(height)?;
+        drop(g);
+        self.parent_id_forget.enqueue(height);
+        Ok(n)
+    }
+
+    /// Published wave-identity snapshot for load stamp.
+    pub fn published_ids(&self) -> &std::sync::Arc<crate::PublishedIds> {
+        &self.published_ids
+    }
+
+    /// Forget queue: dequeue enqueues; lookup applies at wave end.
+    pub fn parent_id_forget(&self) -> &std::sync::Arc<crate::ForgetQueue> {
+        &self.parent_id_forget
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -1519,16 +1540,6 @@ impl Query {
         g.hash_at_height(height)
     }
 
-    /// Attach TipOnly parent hits on the BQ record (lookup wave). Height must be queued.
-    pub fn block_queue_attach_parent_hits(
-        &self,
-        height: u32,
-        hits: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>,
-    ) -> Result<(), QueryError> {
-        let mut g = self.block_queue.lock().unwrap();
-        Ok(g.attach_parent_hits(height, hits)?)
-    }
-
     /// Lookup finished TipOnly for this height (even if some keys missed).
     pub fn block_queue_mark_resolve_complete(&self, height: u32) -> Result<(), QueryError> {
         let mut g = self.block_queue.lock().unwrap();
@@ -1538,12 +1549,6 @@ impl Query {
     pub fn block_queue_is_resolve_complete(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();
         g.is_resolve_complete(height)
-    }
-
-    /// Clone of attached hits (`None` if height not queued).
-    pub fn block_queue_parent_hits(&self, height: u32) -> Option<rbitcoin_store::BqParentHits> {
-        let g = self.block_queue.lock().unwrap();
-        g.parent_hits(height).cloned()
     }
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.

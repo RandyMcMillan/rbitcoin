@@ -46,7 +46,10 @@ mod pin;
 mod scripts;
 mod write;
 
-pub use bq_resolve::{confirm_bq_resolve_wave, BqResolveWaveStats, BQ_RESOLVE_WAVE_MAX_BLOCKS};
+pub use bq_resolve::{
+    confirm_bq_resolve_wave, confirm_bq_resolve_wave_with_ids, BqResolveWaveStats,
+    BQ_RESOLVE_WAVE_MAX_BLOCKS,
+};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
@@ -137,6 +140,8 @@ pub struct WireLoadPipeline {
     /// Pipeline-wide sparse parent pin store (Weak map; load get-or-insert only).
     /// Batches hold `Arc` handles so concurrent stages share one payload per create.
     pub parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
+    /// Lookup-published parent identity union (wave hits still live in the BQ window).
+    pub published: std::sync::Arc<rbitcoin_query::PublishedIds>,
 }
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
@@ -366,6 +371,7 @@ pub fn confirm_wire_load_phase_pipelined(
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
                     None,
+                    Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -373,6 +379,7 @@ pub fn confirm_wire_load_phase_pipelined(
                     &mut need,
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
+                    None,
                     None,
                     None,
                 )

@@ -38,6 +38,10 @@ before 1.0).
 
 ### Changed
 
+- **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
+  `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
+  never. Stratum / wallet keys stay non-goals.
+
 - **Head resolve is three waves, no rank rounds.** Probe+identity is
   open, then sealed ages 1..=3, then sealed age ≥4. Each wave fetches
   every cand `txid.body` once and walks newest-first (fence-connected

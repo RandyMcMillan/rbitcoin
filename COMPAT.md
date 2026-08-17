@@ -40,7 +40,8 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve | v1/v2 high-bandwidth |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | Package relay wire | `accept_package` + experimental `rbtpkg` | BIP331 |
-| Pruning / GUI / mining | Not supported | Supported |
+| Pruning / GUI | Not supported | Supported |
+| Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
 | JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli` | Full Core RPC |
@@ -59,7 +60,8 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | |
 | Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness | **Regtest only** (except `submitblock`). Same confirm/accept path as P2P. `setmocktime` is not a wall-clock hook. |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | done | Disconnect/re-accept; precious = equal-work preference |
-| Wallet / mining / GBT | **never** | Non-goal (no GBT / wallet keys) |
+| Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster` / feerate diagram) | done | Cluster-chunk selector. `rules` must include `segwit`. No stratum, no BIP9 testdummy, no wallet keys |
+| Wallet RPC | **never** | No keystore |
 | `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
 | Full `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB; `raw()` MiniWallet subset is the only scan |
 
@@ -181,8 +183,9 @@ are deferred.
 
 ## Deferred surfaces
 
-Core wallet RPC, mining GBT, fee-estimator research quality, BIP331 native wire
-enum, durable orphans: **out of scope** for this plan.
+Core wallet RPC, fee-estimator research quality, BIP331 native wire enum,
+durable orphans: **out of scope** for this plan. GBT **template RPC** is
+shipped (see above); stratum / pool software is not.
 
 **Permanent non-goals for Electrum/Esplora:** graphical explorer backends
 (address-prefix autocomplete, global search, explorer-only catalogue APIs).

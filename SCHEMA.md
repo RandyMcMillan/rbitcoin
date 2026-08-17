@@ -493,9 +493,12 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
   2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
   (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
   disjoint records). **Do not fold ovf into main.** Body offs are not copied.
-- Lookup (tip / sorted main): **ingest OA → sealed ovf newest→oldest (fuse
-  skip) → main idx → data**. Post-seal new keys live only on overflow, so they
-  skip the main page. A key has **exactly one** home.
+- Lookup (always): **ingest OA → sealed ovf newest→oldest (fuse skip) →
+  sorted main idx → data** (main only if `SHSR` shards exist). Incremental
+  creates (no bulk yet) live on ingest. A leftover live OA at
+  `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`) is **refused** — wipe
+  `store/scripthash*` and restart with `--shindex` to rematerialize. A key
+  has **exactly one** home.
 
 | Mode | When | Value (`w0`, `w1`) |
 |------|------|---------------------|

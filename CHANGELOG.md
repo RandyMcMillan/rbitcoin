@@ -51,6 +51,11 @@ before 1.0).
 
 ### Changed
 
+- **One SH durable dialect.** Incremental creates go to ingest OA (then
+  sealed `SHSR` ovf). Live OA main / `ShOverflowStack` writes are gone.
+  Leftover OA at `scripthash.head` or non-`SHSR` `ovf/NNNNNN` refuses
+  open — wipe `store/scripthash*` and restart with `--shindex`.
+
 - **`getblockchaininfo` disk / progress:** `size_on_disk` is a walk of
   store file lengths (plus cold inwit when split). `verificationprogress`
   is `blocks / headers` (1.0 when headers is 0), not a dummy 0.5 / 1.0.

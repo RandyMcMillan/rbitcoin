@@ -10,16 +10,13 @@ use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
 use crate::scripthash_head::{
     sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead, ShardedScriptHashHead,
-    SH_HEAD_SHARD_COUNT_MISMATCH,
 };
 use crate::scripthash_layout::{
     head_key_from_full, payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
     SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_MAX_SLAB_CLASS,
     SH_PAGE_SLAB_CLASS,
 };
-#[cfg(test)]
-use crate::scripthash_overflow::{ovf_dir, ovf_seg_path};
-use crate::scripthash_overflow::{ovf_segment_slots, ShOverflowStack};
+use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_chunk_ranges, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk, sh_page_pack,
     sh_page_set_next, sh_page_try_append, sh_page_would_append, SH_PAGE_SIZE,
@@ -207,10 +204,6 @@ pub struct ScriptHashTable {
     ingest: Mutex<ScriptHashHead>,
     /// Sealed global ovf (sorted+fuse+idx), newest last.
     sealed_ovf: Mutex<Vec<SortedHead>>,
-    /// Mono OA overflow stack — only when main is still OA (no sorted shards).
-    overflow: Mutex<ShOverflowStack>,
-    /// Main head no longer accepts **new** keys (still updates existing).
-    main_sealed: std::sync::atomic::AtomicBool,
     /// At least one sealed sorted main shard is installed.
     sorted_main_on: std::sync::atomic::AtomicBool,
     alloc: Mutex<AllocState>,
@@ -308,11 +301,43 @@ fn open_or_create_ingest(dir: &Path) -> Result<ScriptHashHead, StoreError> {
     }
 }
 
-const MAIN_SEALED_NAME: &str = "scripthash.main_sealed";
-
 fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
     let n = n_shards.max(1);
     (0..n).any(|i| file_starts_with_shsr(&sorted_main_shard_path(dir, i, n)))
+}
+
+fn leftover_oa_wipe_msg() -> String {
+    "scripthash leftover live OA index; wipe store/scripthash* (head, body, ovf, \
+     runs, include_hwm, cold_progress, main_sealed, oa_stub) and rematerialize \
+     (--shindex rebuilds on start)"
+        .into()
+}
+
+/// Live OA at `scripthash.head` (file or shard dir) that is not sealed `SHSR`.
+fn leftover_live_oa_main(head_path: &Path) -> bool {
+    if !head_path.exists() {
+        return false;
+    }
+    if head_path.is_file() {
+        return !file_starts_with_shsr(head_path);
+    }
+    head_path.is_dir()
+}
+
+/// Non-`SHSR` six-digit files under `scripthash.ovf/` (old OA overflow segs).
+fn leftover_oa_overflow(dir: &Path) -> bool {
+    let ovf = dir.join("scripthash.ovf");
+    let Ok(rd) = std::fs::read_dir(&ovf) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.len() == 6
+            && name.chars().all(|c| c.is_ascii_digit())
+            && e.path().is_file()
+            && !file_starts_with_shsr(&e.path())
+    })
 }
 
 fn open_or_create_oa_stub(
@@ -321,13 +346,7 @@ fn open_or_create_oa_stub(
 ) -> Result<ShardedScriptHashHead, StoreError> {
     let n = n_shards.max(1);
     if stub.exists() {
-        let head = ShardedScriptHashHead::open_for_role(stub, HeadRole::ScriptHash)?;
-        if head.shard_count() == n {
-            return Ok(head);
-        }
-        return Err(StoreError::Corrupt(
-            "scripthash.head.oa_stub shard count mismatch (delete stub and reopen)",
-        ));
+        return ShardedScriptHashHead::open_for_role(stub, HeadRole::ScriptHash);
     }
     ShardedScriptHashHead::create_sharded(stub, n, 64)
 }
@@ -335,12 +354,10 @@ fn open_or_create_oa_stub(
 /// Where a scripthash key lives for head upsert routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyHome {
-    /// Already present on main OA or sealed sorted main.
+    /// Present on sealed sorted main.
     Main,
     /// Present on a sealed sorted global ovf file.
     SealedOvf,
-    /// Present on OA overflow segment `id` (update stays on that segment).
-    OaOverflow(u32),
     /// Present on the global ingest OA.
     Ingest,
     /// Not yet in either head.
@@ -360,11 +377,10 @@ impl ScriptHashTable {
             free_head: [0; SH_MAX_CLASS as usize + 1],
         };
         write_alloc_header(&body, &state)?;
-        let head = ShardedScriptHashHead::create_for_role(
-            dir.join("scripthash.head"),
-            HeadRole::ScriptHash,
-        )?;
-        let n_shards = head.shard_count();
+        // Shard-count handle only — not an index. Live OA at `scripthash.head` is
+        // leftover and refused on open.
+        let n_shards = shard_count_for_role(HeadRole::ScriptHash);
+        let head = open_or_create_oa_stub(&dir.join("scripthash.head.oa_stub"), n_shards)?;
         Ok(Self {
             store_dir: dir.to_path_buf(),
             body,
@@ -372,8 +388,6 @@ impl ScriptHashTable {
             sorted_main: Mutex::new((0..n_shards).map(|_| None).collect()),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(Vec::new()),
-            overflow: Mutex::new(ShOverflowStack::empty(dir)),
-            main_sealed: std::sync::atomic::AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(false),
             alloc: Mutex::new(state),
         })
@@ -381,33 +395,23 @@ impl ScriptHashTable {
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::open(dir.join("scripthash.body"), TableKind::ScriptHash)?;
+        if leftover_oa_overflow(dir) {
+            return Err(StoreError::Layout(leftover_oa_wipe_msg()));
+        }
         let head_path = dir.join("scripthash.head");
         let expected = shard_count_for_role(HeadRole::ScriptHash);
-        if expected > 1 {
-            if let Some(on_disk) = count_sh_head_shards(&head_path)? {
-                if on_disk != expected {
-                    if has_sh_run_rebuild_source(dir) {
-                        return migrate_legacy_sh_head_from_runs(dir, body);
-                    }
-                    return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
-                }
-            }
-        }
         if sorted_main_present(dir, expected) {
             let stub = dir.join("scripthash.head.oa_stub");
             let head = open_or_create_oa_stub(&stub, expected)?;
             return Self::from_body_and_head(dir, body, head);
         }
-        match ShardedScriptHashHead::open_for_role(&head_path, HeadRole::ScriptHash) {
-            Ok(head) => Self::from_body_and_head(dir, body, head),
-            Err(StoreError::Corrupt(msg)) if msg == SH_HEAD_SHARD_COUNT_MISMATCH => {
-                if !has_sh_run_rebuild_source(dir) {
-                    return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
-                }
-                migrate_legacy_sh_head_from_runs(dir, body)
-            }
-            Err(e) => Err(e),
+        if leftover_live_oa_main(&head_path) {
+            return Err(StoreError::Layout(leftover_oa_wipe_msg()));
         }
+        // Ingest-only (no sorted main, no leftover OA at scripthash.head).
+        let stub = dir.join("scripthash.head.oa_stub");
+        let head = open_or_create_oa_stub(&stub, expected)?;
+        Self::from_body_and_head(dir, body, head)
     }
 
     fn from_body_and_head(
@@ -416,8 +420,7 @@ impl ScriptHashTable {
         head: ShardedScriptHashHead,
     ) -> Result<Self, StoreError> {
         let (state, alloc_ver) = read_alloc_header(&body)?;
-        let sealed = dir.join(MAIN_SEALED_NAME).is_file();
-        let overflow = ShOverflowStack::open(dir)?;
+        wipe_legacy_fullsize_overflow(dir)?;
         let n_shards = head.shard_count();
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
@@ -429,8 +432,6 @@ impl ScriptHashTable {
             sorted_main: Mutex::new(sorted_main),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(sealed_ovf),
-            overflow: Mutex::new(overflow),
-            main_sealed: std::sync::atomic::AtomicBool::new(sealed),
             sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
             alloc: Mutex::new(state),
         };
@@ -449,74 +450,6 @@ impl ScriptHashTable {
         }
         Ok(table)
     }
-
-    fn main_accepts_new_key(&self) -> bool {
-        if self.main_sealed.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        match self.head.load_ratio() {
-            Some(r) if r >= ShardedScriptHashHead::SH_SEAL_LOAD => false,
-            _ => true,
-        }
-    }
-
-    fn ensure_overflow(&self) -> Result<(), StoreError> {
-        let mut g = self.overflow.lock().unwrap();
-        if g.segs().last().map(|s| s.is_open()).unwrap_or(false) {
-            return Ok(());
-        }
-        let slots = ovf_segment_slots(&self.head);
-        g.ensure_open(slots)
-    }
-
-    fn maybe_seal_main(&self) -> Result<(), StoreError> {
-        if self.main_sealed.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(());
-        }
-        let Some(r) = self.head.load_ratio() else {
-            return Ok(());
-        };
-        if r < ShardedScriptHashHead::SH_SEAL_LOAD {
-            return Ok(());
-        }
-        let marker = self.store_dir.join(MAIN_SEALED_NAME);
-        let _ = std::fs::write(&marker, b"1");
-        self.main_sealed
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-
-    /// Seal open overflow segment at load ≥ seal threshold (real BF8R + roll).
-    fn maybe_seal_overflow(&self) -> Result<(), StoreError> {
-        let mut g = self.overflow.lock().unwrap();
-        g.maybe_seal_at_load(ShardedScriptHashHead::SH_SEAL_LOAD)
-    }
-
-    /// True when main head is sealed (no new keys; overflow only).
-    pub fn main_is_sealed(&self) -> bool {
-        self.main_sealed.load(std::sync::atomic::Ordering::Acquire) || !self.main_accepts_new_key()
-    }
-}
-
-/// Number of hex-named shard files under `scripthash.head/` (`None` if missing/single-file).
-///
-/// Ignores occupancy sidecars (`00.occ`) and other non-shard files.
-fn count_sh_head_shards(head_path: &Path) -> Result<Option<usize>, StoreError> {
-    if !head_path.is_dir() {
-        return Ok(None);
-    }
-    let mut names: Vec<String> = std::fs::read_dir(head_path)
-        .map_err(|e| StoreError::io(head_path, e))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit()))
-        .collect();
-    names.sort();
-    if names.is_empty() {
-        return Ok(Some(0));
-    }
-    Ok(Some(names.len()))
 }
 
 /// Schema 17 SH run compare key is the full 40-byte `{scripthash\|create_fk}` record.
@@ -580,54 +513,12 @@ fn dir_has_run_files(dir: &Path) -> bool {
     })
 }
 
-/// Replace legacy SH head with empty current-layout head; clear body for cold reload from runs.
-fn migrate_legacy_sh_head_from_runs(
-    store_dir: &Path,
-    body: TableFile,
-) -> Result<ScriptHashTable, StoreError> {
-    let head_path = store_dir.join("scripthash.head");
-    let expected = shard_count_for_role(HeadRole::ScriptHash);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bak: PathBuf = store_dir.join(format!("scripthash.head.legacy-{stamp}"));
-    if head_path.exists() {
-        // Prefer rename (keep bytes for forensics); fall back to remove.
-        if let Err(e) = std::fs::rename(&head_path, &bak) {
-            rbitcoin_log::warn!(
-                "store: could not rename legacy scripthash.head to {}: {e}; removing",
-                bak.display()
-            );
-            if head_path.is_dir() {
-                std::fs::remove_dir_all(&head_path).map_err(|e| StoreError::io(&head_path, e))?;
-            } else {
-                std::fs::remove_file(&head_path).map_err(|e| StoreError::io(&head_path, e))?;
-            }
-        } else {
-            rbitcoin_log::info!(
-                "store: moved legacy scripthash.head → {} (rebuild from scripthash.runs)",
-                bak.display()
-            );
-        }
-    }
-    let head = ShardedScriptHashHead::create_for_role(&head_path, HeadRole::ScriptHash)?;
-    let table = ScriptHashTable::from_body_and_head(store_dir, body, head)?;
-    // Old body slabs are orphaned once head is gone; cold materialize rewrites both.
-    table.reinit_empty_for_cold_materialize()?;
-    rbitcoin_log::info!(
-        "store: scripthash head migrated to {expected}-way empty layout; \
-         tip entry will bulk-materialize from sorted runs (direct k-way / live OA)"
-    );
-    Ok(table)
-}
-
 impl ScriptHashTable {
     pub fn entry_count(&self) -> u64 {
         self.alloc.lock().unwrap().live_count
     }
 
-    /// True when every head shard reports zero occupied slots.
+    /// True when sorted main, ingest, and sealed ovf report no occupied keys.
     pub fn head_is_empty(&self) -> bool {
         if self
             .sorted_main
@@ -638,7 +529,10 @@ impl ScriptHashTable {
         {
             return false;
         }
-        self.head.is_empty()
+        if !self.sealed_ovf.lock().unwrap().is_empty() {
+            return false;
+        }
+        self.ingest.lock().unwrap().is_known_empty()
     }
 
     /// Wipe body alloc + all head slots for a full cold rematerialize.
@@ -732,8 +626,7 @@ impl ScriptHashTable {
         if !self.sealed_ovf.lock().unwrap().is_empty() {
             return true;
         }
-        // Overflow stack present means durable SH index material exists.
-        !self.overflow.lock().unwrap().is_empty()
+        false
     }
 
     /// Head value for a key (process-cache seed / disconnect refresh).
@@ -759,34 +652,23 @@ impl ScriptHashTable {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Option<(ShHeadValue, KeyHome)>, StoreError> {
-        let sorted_on = self.has_sorted_main();
-        if sorted_on {
-            if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
-                return Ok(Some((v, KeyHome::Ingest)));
+        if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
+            return Ok(Some((v, KeyHome::Ingest)));
+        }
+        let hk = head_key_from_full(scripthash);
+        for h in self.sealed_ovf.lock().unwrap().iter().rev() {
+            if let Some(v) = h.get(&hk)? {
+                return Ok(Some((v, KeyHome::SealedOvf)));
             }
-            let hk = head_key_from_full(scripthash);
-            for h in self.sealed_ovf.lock().unwrap().iter().rev() {
+        }
+        if self.has_sorted_main() {
+            let g = self.sorted_main.lock().unwrap();
+            let si = self.head.shard_index(scripthash);
+            if let Some(Some(h)) = g.get(si) {
                 if let Some(v) = h.get(&hk)? {
-                    return Ok(Some((v, KeyHome::SealedOvf)));
+                    return Ok(Some((v, KeyHome::Main)));
                 }
             }
-            {
-                let g = self.sorted_main.lock().unwrap();
-                let si = self.head.shard_index(scripthash);
-                if let Some(Some(h)) = g.get(si) {
-                    if let Some(v) = h.get(&hk)? {
-                        return Ok(Some((v, KeyHome::Main)));
-                    }
-                }
-            }
-            return Ok(None);
-        }
-        if let Some(v) = self.head.get(scripthash)? {
-            return Ok(Some((v, KeyHome::Main)));
-        }
-        let g = self.overflow.lock().unwrap();
-        if let Some((id, v)) = g.get_with_home(scripthash)? {
-            return Ok(Some((v, KeyHome::OaOverflow(id))));
         }
         Ok(None)
     }
@@ -853,24 +735,7 @@ impl ScriptHashTable {
                 })?;
             }
         }
-        if !self.has_sorted_main() {
-            self.head.for_each_occupied(|_key, val| {
-                let entries = self.collect_entries(&_key, &val)?;
-                for e in entries {
-                    f(e.create_tx_fk);
-                }
-                Ok(())
-            })?;
-        }
         self.ingest.lock().unwrap().for_each_occupied(|_key, val| {
-            let entries = self.collect_entries(&_key, &val)?;
-            for e in entries {
-                f(e.create_tx_fk);
-            }
-            Ok(())
-        })?;
-        let g = self.overflow.lock().unwrap();
-        g.for_each_occupied(|_key, val| {
             let entries = self.collect_entries(&_key, &val)?;
             for e in entries {
                 f(e.create_tx_fk);
@@ -1028,8 +893,8 @@ impl ScriptHashTable {
     /// insert. Callers must apply SH batches in non-decreasing block/batch time
     /// order so skipped re-queues do not leave permanent holes.
     ///
-    /// Head upserts use **no rehash**: existing main keys stay on main; new keys
-    /// go to main until seal load (~0.8), then to overflow.
+    /// Head upserts: existing sorted-main / sealed-ovf keys update in place;
+    /// new keys go to ingest OA (seal → `SHSR` ovf at ~0.80).
     pub fn put_create_batch_append(
         &self,
         recs: &[ScriptHashRecord],
@@ -1067,36 +932,12 @@ impl ScriptHashTable {
                 }
             }
             missing.sort_unstable();
-            if self.has_sorted_main() {
-                for key in missing {
-                    if let Some((v, kh)) = self.locate_head(&key)? {
-                        heads.insert(key, v);
-                        home.insert(key, kh);
-                    } else {
-                        home.insert(key, KeyHome::Absent);
-                    }
-                }
-            } else {
-                let seeded = self.head.get_many(&missing)?;
-                let mut still: Vec<[u8; 32]> = Vec::new();
-                for (key, v) in missing.into_iter().zip(seeded.into_iter()) {
-                    if let Some(v) = v {
-                        heads.insert(key, v);
-                        home.insert(key, KeyHome::Main);
-                    } else {
-                        still.push(key);
-                    }
-                }
-                if !still.is_empty() {
-                    let g = self.overflow.lock().unwrap();
-                    for key in still {
-                        if let Some((id, v)) = g.get_with_home(&key)? {
-                            heads.insert(key, v);
-                            home.insert(key, KeyHome::OaOverflow(id));
-                        } else {
-                            home.insert(key, KeyHome::Absent);
-                        }
-                    }
+            for key in missing {
+                if let Some((v, kh)) = self.locate_head(&key)? {
+                    heads.insert(key, v);
+                    home.insert(key, kh);
+                } else {
+                    home.insert(key, KeyHome::Absent);
                 }
             }
         }
@@ -1169,8 +1010,6 @@ impl ScriptHashTable {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
             self.apply_head_upserts(&head_final, flush_each)?;
-            let _ = self.maybe_seal_main();
-            let _ = self.maybe_seal_overflow();
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((written, timing))
@@ -1188,30 +1027,20 @@ impl ScriptHashTable {
     fn apply_head_upserts(
         &self,
         upserts: &[([u8; 32], ShHeadValue, KeyHome)],
-        flush_each: bool,
+        _flush_each: bool,
     ) -> Result<(), StoreError> {
-        let mut main_try: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        let mut ovf_new: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        let mut ovf_home: HashMap<u32, Vec<([u8; 32], ShHeadValue)>> = HashMap::new();
-
-        let sealed = self.main_is_sealed();
-        let sorted_on = self.has_sorted_main();
-
         let mut ingest_ups: Vec<([u8; 32], ShHeadValue)> = Vec::new();
         let mut sealed_ovf_ups: Vec<([u8; 32], ShHeadValue)> = Vec::new();
 
         for (key, val, home) in upserts {
             match home {
-                KeyHome::Ingest => {
+                KeyHome::Ingest | KeyHome::Absent => {
                     ingest_ups.push((*key, val.clone()));
                 }
                 KeyHome::SealedOvf => {
                     sealed_ovf_ups.push((*key, val.clone()));
                 }
-                KeyHome::OaOverflow(id) => {
-                    ovf_home.entry(*id).or_default().push((*key, val.clone()));
-                }
-                KeyHome::Main if sorted_on => {
+                KeyHome::Main => {
                     let hk = head_key_from_full(key);
                     let si = self.head.shard_index(key);
                     let g = self.sorted_main.lock().unwrap();
@@ -1222,42 +1051,9 @@ impl ScriptHashTable {
                     }
                     ingest_ups.push((*key, val.clone()));
                 }
-                KeyHome::Main => {
-                    main_try.push((*key, val.clone()));
-                }
-                KeyHome::Absent if sorted_on => {
-                    ingest_ups.push((*key, val.clone()));
-                }
-                KeyHome::Absent => {
-                    if sealed {
-                        main_try.push((*key, val.clone()));
-                    } else if self.main_accepts_new_key() {
-                        main_try.push((*key, val.clone()));
-                    } else {
-                        ovf_new.push((*key, val.clone()));
-                    }
-                }
             }
         }
 
-        if !main_try.is_empty() {
-            let allow_new = !sealed;
-            let rem = self
-                .head
-                .insert_many_sharded_no_rehash(&main_try, flush_each, allow_new)?;
-            ovf_new.extend(rem);
-        }
-
-        if !ovf_home.is_empty() || !ovf_new.is_empty() {
-            self.ensure_overflow()?;
-            let mut g = self.overflow.lock().unwrap();
-            for (id, batch) in ovf_home {
-                g.insert_on_segment(id, &batch)?;
-            }
-            if !ovf_new.is_empty() {
-                g.insert_new_with_roll(&ovf_new, ShardedScriptHashHead::SH_SEAL_LOAD)?;
-            }
-        }
         if !sealed_ovf_ups.is_empty() {
             let g = self.sealed_ovf.lock().unwrap();
             for (key, val) in &sealed_ovf_ups {
@@ -1735,10 +1531,11 @@ impl ScriptHashTable {
                     }
                 };
                 if !updated_sorted {
+                    let g = self.ingest.lock().unwrap();
                     if new_val.is_empty() {
-                        self.head.clear_key(scripthash)?;
+                        g.clear_key(scripthash)?;
                     } else {
-                        self.head.insert(scripthash, &new_val)?;
+                        g.insert(scripthash, &new_val)?;
                     }
                 }
             }
@@ -1766,19 +1563,6 @@ impl ScriptHashTable {
                     ));
                 }
             }
-            KeyHome::OaOverflow(_) => {
-                let g = self.overflow.lock().unwrap();
-                if g.is_empty() {
-                    return Err(StoreError::Corrupt(
-                        "scripthash: overflow home without overflow stack",
-                    ));
-                }
-                if new_val.is_empty() {
-                    g.clear_key(scripthash)?;
-                } else {
-                    g.insert(scripthash, &new_val)?;
-                }
-            }
         }
         Ok(true)
     }
@@ -1794,8 +1578,6 @@ impl ScriptHashTable {
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
         }
-        let g = self.overflow.lock().unwrap();
-        g.flush()?;
         Ok(())
     }
 
@@ -1810,8 +1592,6 @@ impl ScriptHashTable {
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
         }
-        let g = self.overflow.lock().unwrap();
-        g.flush_async()?;
         Ok(())
     }
 
@@ -2570,42 +2350,11 @@ mod tests {
         ScriptHashRecord::from_fk(sh, Fk(tx))
     }
 
-    /// Create a SH table with **mono 64-slot** main head (suite-speed + env-race safe).
-    ///
-    /// 52-key seal assumes tiny geometry. We rewrite the head to a fixed mono
-    /// layout after create so ovf stack tests stay ≪2 s and deterministic.
-    fn create_tiny_mono_sh(dir: &Path) -> ScriptHashTable {
-        let t = ScriptHashTable::create(dir).unwrap();
-        t.flush().unwrap();
-        drop(t);
-        let head_path = dir.join("scripthash.head");
-        if head_path.is_dir() {
-            let _ = std::fs::remove_dir_all(&head_path);
-        } else if head_path.exists() {
-            let _ = std::fs::remove_file(&head_path);
-        }
-        // 1 shard × 64 slots — same as HeadScale::Tiny SH create.
-        ShardedScriptHashHead::create_sharded(&head_path, 1, 64).unwrap();
-        let t = ScriptHashTable::open(dir).unwrap();
-        assert_eq!(t.head.shard_count(), 1);
-        assert_eq!(t.head.slots_per_shard(), 64);
-        t
-    }
-
-    /// Put unique keys until main seals (tiny mono: ~52 keys).
-    fn fill_until_main_sealed(t: &ScriptHashTable, tag: u8) -> u32 {
-        let mut i = 0u32;
-        while !t.main_is_sealed() {
-            assert!(
-                i < 200,
-                "main did not seal after {i} keys (slots={})",
-                t.head.total_slots()
-            );
+    fn put_unique(t: &ScriptHashTable, tag: u8, n: u32) {
+        for i in 0..n {
             let sh = script_hash(&[tag, (i & 0xff) as u8, (i >> 8) as u8, 0x7e]);
             t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
-            i += 1;
         }
-        i
     }
 
     #[test]
@@ -2659,6 +2408,29 @@ mod tests {
         assert_eq!(t.entries(&sh).unwrap().len(), 1);
         assert!(t.unlink_create(&sh, Fk(3), 0).unwrap());
         assert!(t.entries(&sh).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_absent_lands_on_ingest() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0x51]);
+        t.put_create(&rec(sh, 3, 0)).unwrap();
+        assert_eq!(t.entries(&sh).unwrap().len(), 1);
+        assert!(
+            t.ingest.lock().unwrap().get(&sh).unwrap().is_some(),
+            "new key must live on ingest, not live OA main"
+        );
+        assert!(
+            !dir.join("scripthash.head").exists(),
+            "create must not plant a live OA at scripthash.head"
+        );
+        t.flush().unwrap();
+        drop(t);
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t.entries(&sh).unwrap().len(), 1);
+        assert!(!dir.join("scripthash.head").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2898,357 +2670,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Batch that crosses main capacity: no dual-home, and a main-key **update**
-    /// in the same batch still applies on main (update-only continues after remainder).
     #[test]
-    fn put_create_batch_across_capacity_remainder_and_main_update() {
+    fn leftover_live_oa_main_open_refuses() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
-        // 50 unique keys on main (load 50/64 ≈ 0.78 — still accepts new keys).
-        let mut main_keys = Vec::new();
-        for i in 0..50u32 {
-            let sh = script_hash(&[0xc0, (i & 0xff) as u8, (i >> 8) as u8, 0x11]);
-            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
-            main_keys.push(sh);
+        t.put_create(&rec(script_hash(&[0x01]), 1, 0)).unwrap();
+        t.flush().unwrap();
+        drop(t);
+        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 1, 64).unwrap();
+        match ScriptHashTable::open(&dir) {
+            Ok(_) => panic!("leftover OA main must refuse"),
+            Err(StoreError::Layout(m)) => {
+                assert!(m.contains("scripthash*"), "{m}");
+                assert!(m.contains("wipe") || m.contains("rematerialize"), "{m}");
+            }
+            Err(e) => panic!("expected Layout, got {e}"),
         }
-        let sh_update = main_keys[0];
-        // One public batch: update an existing main key + 20 brand-new keys.
-        // insert sorts by slot; after first new-key NeedSlot, update-only must still
-        // land the main-key append on main (not skip, not dual-home on overflow).
-        let mut batch = vec![rec(sh_update, 99_999, 1)];
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftover_oa_overflow_seg_open_refuses() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        t.put_create(&rec(script_hash(&[0x02]), 1, 0)).unwrap();
+        t.flush().unwrap();
+        drop(t);
+        let ovf = dir.join("scripthash.ovf");
+        std::fs::create_dir_all(&ovf).unwrap();
+        std::fs::write(ovf.join("000000"), b"not-shsr").unwrap();
+        match ScriptHashTable::open(&dir) {
+            Ok(_) => panic!("leftover OA ovf must refuse"),
+            Err(StoreError::Layout(m)) => {
+                assert!(m.contains("scripthash*"), "{m}");
+            }
+            Err(e) => panic!("expected Layout, got {e}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingest_batch_update_and_new_keys() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh0 = script_hash(&[0xc0, 0, 0, 0x11]);
+        t.put_create(&rec(sh0, 1, 0)).unwrap();
+        let mut batch = vec![rec(sh0, 99_999, 1)];
         for i in 0..20u32 {
             let sh = script_hash(&[0xc1, (i & 0xff) as u8, 0x22, 0x33]);
             batch.push(rec(sh, 10_000 + u64::from(i), 0));
         }
-        let n = t.put_create_batch(&batch).unwrap();
-        assert_eq!(n, 21, "1 update append + 20 new");
-
-        // Updated main key: both FKs, on main only.
-        assert!(t.head.get(&sh_update).unwrap().is_some());
-        assert!(t.contains_create(&sh_update, Fk(1)).unwrap());
-        assert!(t.contains_create(&sh_update, Fk(99_999)).unwrap());
-        assert_eq!(t.entries(&sh_update).unwrap().len(), 2);
-        {
-            let g = t.overflow.lock().unwrap();
-            assert!(
-                g.get(&sh_update).unwrap().is_none(),
-                "main update must not dual-home on overflow"
-            );
-        }
-
-        let mut for_each_n = 0u64;
-        t.for_each_live_create(|_| for_each_n += 1).unwrap();
-        // 50 original creates + 1 update FK + 20 new = 71 unique FKs
-        assert_eq!(
-            for_each_n, 71,
-            "for_each must equal unique creates; dual-home would inflate"
-        );
-
-        for rec in batch.iter().skip(1) {
-            assert!(t
-                .contains_create(&rec.scripthash, rec.create_tx_fk)
-                .unwrap());
-            let on_main = t.head.get(&rec.scripthash).unwrap().is_some();
-            let on_ovf = {
-                let g = t.overflow.lock().unwrap();
-                g.get(&rec.scripthash).unwrap().is_some()
-            };
-            assert!(
-                on_main ^ on_ovf,
-                "new key must live on exactly one head (main={on_main} ovf={on_ovf})"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// After seal, new keys go overflow; existing main keys still update on main.
-    #[test]
-    fn sealed_absent_goes_overflow_try_upsert_updates_main() {
-        let dir = tmp();
-        let t = create_tiny_mono_sh(&dir);
-        let _n_main = fill_until_main_sealed(&t, 0xd0);
-        assert!(t.main_is_sealed());
-        let sh0 = script_hash(&[0xd0, 0, 0, 0x7e]);
-
-        let sh_new = script_hash(&[0xd1, 0xaa, 0xbb, 0xcc]);
-        t.put_create(&rec(sh_new, 7_777, 0)).unwrap();
-        assert!(
-            t.head.get(&sh_new).unwrap().is_none(),
-            "sealed absent key must not land on main"
-        );
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        assert!(t.contains_create(&sh_new, Fk(7_777)).unwrap());
-
-        t.put_create(&rec(sh0, 8_888, 1)).unwrap();
-        assert!(t.head.get(&sh0).unwrap().is_some());
+        assert_eq!(t.put_create_batch(&batch).unwrap(), 21);
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-        assert!(t.contains_create(&sh0, Fk(8_888)).unwrap());
-
-        drop(t);
-        let t = ScriptHashTable::open(&dir).unwrap();
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Sealed + try-upsert path (no fuse / fuse maybe): not-present key must
-    /// **not** take free main slots — remainder → overflow only.
-    #[test]
-    fn sealed_try_upsert_absent_key_overflows_not_main_slot() {
-        let dir = tmp();
-        let t = create_tiny_mono_sh(&dir);
-        let n_main = fill_until_main_sealed(&t, 0xe0);
-        assert!(t.main_is_sealed());
-
-        let sh_new = script_hash(&[0xe1, 0x11, 0x22, 0x33]);
-        // Public put: KeyHome::Absent, sealed → try main update-only.
-        t.put_create(&rec(sh_new, 42_042, 0)).unwrap();
-
-        assert!(
-            t.head.get(&sh_new).unwrap().is_none(),
-            "sealed try-upsert must not allocate free main slots for absent keys"
-        );
-        assert!(
-            ovf_seg_path(&dir, 0).exists() || ovf_dir(&dir).is_dir(),
-            "overflow mono segment required for sealed remainder"
-        );
-        {
-            let g = t.overflow.lock().unwrap();
-            assert!(
-                g.get(&sh_new).unwrap().is_some(),
-                "absent sealed key must live on overflow"
-            );
-            assert_eq!(
-                g.open_segment_slots(),
-                Some(t.head.slots_per_shard()),
-                "ovf mono slots == one main shard"
-            );
-        }
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        assert!(t.contains_create(&sh_new, Fk(42_042)).unwrap());
-        // for_each must not double-count (no dual-home).
+        assert!(t.ingest.lock().unwrap().get(&sh0).unwrap().is_some());
         let mut n = 0u64;
         t.for_each_live_create(|_| n += 1).unwrap();
-        assert_eq!(n, u64::from(n_main) + 1, "{n_main} main + 1 overflow only");
+        assert_eq!(n, 22);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Tiny head: 64 slots, seal load 0.80 → after ≥52 unique keys new keys go overflow.
     #[test]
-    fn seal_load_routes_new_keys_to_overflow_main_append_stays() {
+    fn ingest_many_unique_keys_reopen() {
         let dir = tmp();
-        // Fixed mono 64-slot head — not bare create() (env race on HEAD_SCALE).
-        let t = create_tiny_mono_sh(&dir);
-        let mut main_keys = Vec::new();
-        // 52 unique keys → load 52/64 = 0.8125 ≥ SH_SEAL_LOAD.
-        for i in 0..52u32 {
-            let sh = script_hash(&[0xa0, (i & 0xff) as u8, (i >> 8) as u8, 0x01]);
-            t.put_create(&rec(sh, u64::from(i) + 1, 0)).unwrap();
-            main_keys.push(sh);
-        }
-        let ratio = t.head.load_ratio().expect("occupancy known after inserts");
-        assert!(
-            ratio + f64::EPSILON >= ShardedScriptHashHead::SH_SEAL_LOAD,
-            "expected load ≥ seal threshold, got {ratio}"
-        );
-        assert!(
-            t.main_is_sealed(),
-            "main should refuse new keys after seal load"
-        );
-
-        // New key must land in overflow, not main.
-        let sh_new = script_hash(&[0xb0, 0xff, 0xee, 0x02]);
-        t.put_create(&rec(sh_new, 9_001, 0)).unwrap();
-        assert!(
-            t.head.get(&sh_new).unwrap().is_none(),
-            "new key must not occupy main after seal"
-        );
-        assert!(
-            ovf_seg_path(&dir, 0).is_file(),
-            "overflow mono segment file must exist"
-        );
-        {
-            let g = t.overflow.lock().unwrap();
-            assert_eq!(
-                g.open_segment_slots()
-                    .or_else(|| g.segs().first().map(|s| s.slots())),
-                Some(t.head.slots_per_shard()),
-                "ovf slots == one main shard (not full main size)"
-            );
-            assert!(g.get(&sh_new).unwrap().is_some());
-            assert!(
-                g.get(&sh_new).unwrap().is_some() && t.head.get(&sh_new).unwrap().is_none(),
-                "key only on overflow"
-            );
-        }
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        assert!(t.contains_create(&sh_new, Fk(9_001)).unwrap());
-
-        // Existing main key still appends on main (not overflow).
-        let sh0 = main_keys[0];
+        let t = ScriptHashTable::create(&dir).unwrap();
+        put_unique(&t, 0xa0, 80);
+        let sh0 = script_hash(&[0xa0, 0, 0, 0x7e]);
         t.put_create(&rec(sh0, 10_000, 1)).unwrap();
-        assert!(t.head.get(&sh0).unwrap().is_some());
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-        assert!(t.contains_create(&sh0, Fk(10_000)).unwrap());
-
         t.flush().unwrap();
-        assert!(
-            dir.join(MAIN_SEALED_NAME).is_file() || ratio >= ShardedScriptHashHead::SH_SEAL_LOAD,
-            "seal marker or load gate"
-        );
-
         drop(t);
         let t = ScriptHashTable::open(&dir).unwrap();
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
         assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-        assert!(t.main_is_sealed());
-        // for_each sees both main and overflow creates
-        let mut n = 0u64;
-        t.for_each_live_create(|_| n += 1).unwrap();
-        assert_eq!(n, 52 + 1 + 1, "52 main + 1 ovf + 1 main append");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// After main seal, overflow is mono OA with slots == one main shard (not 64-way).
-    #[test]
-    fn ovf_stack_mono_geometry_after_main_seal() {
-        let dir = tmp();
-        let t = create_tiny_mono_sh(&dir);
-        let main_shard_slots = t.head.slots_per_shard();
-        assert_eq!(main_shard_slots, 64);
-        fill_until_main_sealed(&t, 0xf0);
-        assert!(t.main_is_sealed());
-        let sh_new = script_hash(&[0xf1, 0xaa, 0xbb, 0xcc]);
-        t.put_create(&rec(sh_new, 50_001, 0)).unwrap();
-        assert!(t.head.get(&sh_new).unwrap().is_none());
-        assert!(ovf_seg_path(&dir, 0).is_file());
-        assert!(!ovf_seg_path(&dir, 0).is_dir());
-        // No 64-way shard files under ovf/.
-        let names: Vec<_> = std::fs::read_dir(ovf_dir(&dir))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.iter().any(|n| n == "000000"));
-        assert!(!names
-            .iter()
-            .any(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit())));
-        {
-            let g = t.overflow.lock().unwrap();
-            assert_eq!(g.open_segment_slots(), Some(main_shard_slots));
-            assert!(g.get(&sh_new).unwrap().is_some());
-        }
-        assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Fill open overflow until seal+roll: ≥2 segments, real fuse, key on new open.
-    #[test]
-    fn ovf_seal_roll_via_public_put_entries() {
-        let dir = tmp();
-        let t = create_tiny_mono_sh(&dir);
-        let n_main = fill_until_main_sealed(&t, 0xf2);
-        assert!(t.main_is_sealed());
-        let ovf_slots = t.head.slots_per_shard();
-        assert_eq!(ovf_slots, 64);
-        // Open ovf holds ~0.8 * slots unique keys before seal.
-        let n_force = ((ovf_slots as f64 * ShardedScriptHashHead::SH_SEAL_LOAD).ceil() as u32) + 3;
-        let mut ovf_keys = Vec::new();
-        for i in 0..n_force {
-            let sh = script_hash(&[0xf3, (i & 0xff) as u8, ((i >> 8) & 0xff) as u8, 0x55]);
-            t.put_create(&rec(sh, 100_000 + u64::from(i), 0)).unwrap();
-            ovf_keys.push(sh);
-        }
-        {
-            let g = t.overflow.lock().unwrap();
-            assert!(
-                g.segment_count() >= 2,
-                "expected ovf seal+roll, segs={}",
-                g.segment_count()
-            );
-            assert_eq!(g.open_segment_slots(), Some(ovf_slots));
-        }
-        let fuse0 = crate::scripthash_overflow::ovf_fuse_path(&dir, 0);
-        assert!(fuse0.is_file(), "sealed segment 0 must have real fuse file");
-        let fuse = crate::fuse8_filter::SealedFuse8::read_from(&fuse0).expect("BF8R");
-        let mut in_fuse = false;
-        for k in ovf_keys.iter().take(4) {
-            if fuse.contains(crate::scripthash_overflow::sh_ovf_fuse_key(k)) {
-                in_fuse = true;
-                break;
-            }
-        }
-        assert!(in_fuse, "fuse should contain sealed ovf keys");
-        for (i, sh) in ovf_keys.iter().enumerate() {
-            assert_eq!(
-                t.entries(sh).unwrap().len(),
-                1,
-                "missing entries for ovf key {i}"
-            );
-            assert!(t.head.get(sh).unwrap().is_none(), "must not dual-home main");
-        }
-        let mut n = 0u64;
-        t.for_each_live_create(|_| n += 1).unwrap();
-        assert_eq!(n, u64::from(n_main) + u64::from(n_force));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Update a key that lives only on a sealed overflow segment (no dual-home).
-    #[test]
-    fn ovf_update_on_sealed_home_no_dual_home() {
-        let dir = tmp();
-        let t = create_tiny_mono_sh(&dir);
-        let n_main = fill_until_main_sealed(&t, 0xf4);
-        let ovf_slots = t.head.slots_per_shard();
-        let n_force = ((ovf_slots as f64 * ShardedScriptHashHead::SH_SEAL_LOAD).ceil() as u32) + 3;
-        let mut first_ovf = None;
-        for i in 0..n_force {
-            let sh = script_hash(&[0xf5, (i & 0xff) as u8, ((i >> 8) & 0xff) as u8, 0x66]);
-            t.put_create(&rec(sh, 200_000 + u64::from(i), 0)).unwrap();
-            if first_ovf.is_none() {
-                first_ovf = Some(sh);
-            }
-        }
-        let sh0 = first_ovf.expect("at least one ovf key");
-        {
-            let g = t.overflow.lock().unwrap();
-            assert!(
-                g.segment_count() >= 2,
-                "need sealed segment for this test, segs={}",
-                g.segment_count()
-            );
-            let (home_id, _) = g.get_with_home(&sh0).unwrap().expect("on ovf");
-            assert!(
-                !g.segs().iter().find(|s| s.id == home_id).unwrap().is_open(),
-                "first keys should land on sealed segment 0"
-            );
-        }
-        t.put_create(&rec(sh0, 300_001, 1)).unwrap();
-        assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-        assert!(t.contains_create(&sh0, Fk(200_000)).unwrap());
-        assert!(t.contains_create(&sh0, Fk(300_001)).unwrap());
-        assert!(t.head.get(&sh0).unwrap().is_none(), "still not on main");
-        {
-            let g = t.overflow.lock().unwrap();
-            let (id, _) = g.get_with_home(&sh0).unwrap().unwrap();
-            let mut homes = 0u32;
-            for seg in g.segs() {
-                if seg.head.get(&sh0).unwrap().is_some() {
-                    homes += 1;
-                    assert_eq!(seg.id, id);
-                }
-            }
-            assert_eq!(homes, 1, "must not dual-home across ovf segments");
-            if let Some(open) = g.segs().last().filter(|s| s.is_open()) {
-                assert!(
-                    open.head.get(&sh0).unwrap().is_none() || open.id == id,
-                    "sealed update must not place a second open slot"
-                );
-            }
-        }
-        let mut n = 0u64;
-        t.for_each_live_create(|_| n += 1).unwrap();
-        assert_eq!(n, u64::from(n_main) + u64::from(n_force) + 1);
+        assert!(!dir.join("scripthash.head").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3346,7 +2839,7 @@ mod tests {
     fn open_wipes_legacy_fullsize_ovf_head() {
         let dir = tmp();
         {
-            let t = create_tiny_mono_sh(&dir);
+            let t = ScriptHashTable::create(&dir).unwrap();
             t.put_create(&rec(script_hash(&[0x01]), 1, 0)).unwrap();
             t.flush().unwrap();
         }
@@ -3365,14 +2858,6 @@ mod tests {
             .join(crate::scripthash_overflow::LEGACY_OVERFLOW_HEAD)
             .exists());
         assert_eq!(t.entries(&script_hash(&[0x01])).unwrap().len(), 1);
-        // If head was rewritten to mono 64, seal + ovf still works.
-        if t.head.total_slots() <= 256 {
-            fill_until_main_sealed(&t, 0xf6);
-            let sh_new = script_hash(&[0xf7, 0x11, 0x22, 0x33]);
-            t.put_create(&rec(sh_new, 9_999, 0)).unwrap();
-            assert!(ovf_seg_path(&dir, 0).is_file());
-            assert_eq!(t.entries(&sh_new).unwrap().len(), 1);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3868,7 +3353,8 @@ mod tests {
             };
             write_alloc_header(&body, &state).unwrap();
             drop(body);
-            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 4, 256).unwrap();
+            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256)
+                .unwrap();
             let t = ScriptHashTable::open(&dir).unwrap();
             assert_eq!(t.head_shard_count(), 4);
 
@@ -3946,10 +3432,9 @@ mod tests {
 
     #[test]
     fn open_migrates_legacy_head_when_runs_present() {
-        // 16-way head + catalog run → open rewrites to current shard count, keeps runs.
+        // Leftover live OA main is refused even when runs exist (wipe + rematerialize).
         HeadScale::test_with(HeadScale::Mainnet, || {
             let dir = tmp();
-            // Body only (empty alloc), then force 16-way head.
             let body =
                 TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
             let payload0 = payload_start(FILE_HEADER_LEN);
@@ -3973,30 +3458,13 @@ mod tests {
             crate::sorted_run::write_sorted_run(&path, 32, 40, &rec).unwrap();
             assert!(has_sh_run_rebuild_source(&dir));
 
-            let t = ScriptHashTable::open(&dir).unwrap();
-            assert_eq!(t.head_shard_count(), 64);
-            assert!(t.head_is_empty());
-            assert_eq!(t.entry_count(), 0);
-            let catalog = list_runs(&runs_dir).unwrap();
-            assert_eq!(catalog.len(), 1, "runs must survive migration");
-            // Cold materialize from the preserved run.
-            let mut session = t.bulk_session(16).unwrap();
-            session
-                .put_chain(
-                    {
-                        let mut k = [0u8; 32];
-                        k[0] = 0xab;
-                        k
-                    },
-                    &[ShEntry::new(Fk(1))],
-                )
-                .unwrap();
-            let (n, _, _, _) = session.finish().unwrap();
-            assert_eq!(n, 1);
-            assert_eq!(t.entries(&[0xab; 32]).unwrap().len(), 0); // key is 0xab then zeros
-            let mut full = [0u8; 32];
-            full[0] = 0xab;
-            assert_eq!(t.entries(&full).unwrap().len(), 1);
+            match ScriptHashTable::open(&dir) {
+                Ok(_) => panic!("leftover OA must refuse"),
+                Err(StoreError::Layout(m)) => {
+                    assert!(m.contains("scripthash*"), "{m}");
+                }
+                Err(e) => panic!("expected Layout, got {e}"),
+            }
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -4020,8 +3488,10 @@ mod tests {
             ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), 16, 64).unwrap();
             assert!(!has_sh_run_rebuild_source(&dir));
             match ScriptHashTable::open(&dir) {
-                Err(StoreError::Corrupt(m)) if m == SH_HEAD_SHARD_COUNT_MISMATCH => {}
-                Ok(_) => panic!("expected shard mismatch error"),
+                Err(StoreError::Layout(m)) => {
+                    assert!(m.contains("scripthash*"), "{m}");
+                }
+                Ok(_) => panic!("expected leftover OA refuse"),
                 Err(e) => panic!("unexpected error: {e}"),
             }
             let _ = std::fs::remove_dir_all(&dir);

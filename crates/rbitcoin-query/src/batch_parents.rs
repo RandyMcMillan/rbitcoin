@@ -323,8 +323,8 @@ struct PinIndex {
 
 /// Prep-time registry: Weak map so dead pins free when last batch Arc drops.
 ///
-/// Mutex is only for bulk adopt / publish / [`Self::lookup_txid`] — never held
-/// while assemble walks inputs or write fills layout, and **not** on the
+/// Mutex is only for bulk adopt / publish / [`Self::bulk_lookup_txid`] — never
+/// held while assemble walks inputs or write fills layout, and **not** on the
 /// per-parent insert hot path.
 #[derive(Debug, Default)]
 pub struct PipelineParentStore {
@@ -344,20 +344,41 @@ impl PipelineParentStore {
     /// Zero txid is never indexed. Live pin without `body_range` is a miss
     /// (do not half-skip head).
     pub fn lookup_txid(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
-        if *txid == [0u8; 32] {
-            return None;
-        }
+        self.bulk_lookup_txid(std::iter::once(txid))
+            .into_iter()
+            .next()
+            .map(|(_, hit)| hit)
+    }
+
+    /// One lock: [`Self::lookup_txid`] rules for every key.
+    ///
+    /// Dead Weaks are dropped from the txid index. Keys with no live pin,
+    /// zero txid, or no `body_range` are omitted from the map.
+    pub fn bulk_lookup_txid<'a>(
+        &self,
+        txids: impl IntoIterator<Item = &'a [u8; 32]>,
+    ) -> HashMap<[u8; 32], (Fk, (u64, u64))> {
         let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(w) = g.by_txid.get(txid) else {
-            return None;
-        };
-        match w.upgrade() {
-            Some(p) => p.load_layout().body_range.map(|r| (p.fk, r)),
-            None => {
-                g.by_txid.remove(txid);
-                None
+        let mut out = HashMap::new();
+        for txid in txids {
+            if *txid == [0u8; 32] {
+                continue;
+            }
+            let Some(w) = g.by_txid.get(txid) else {
+                continue;
+            };
+            match w.upgrade() {
+                Some(p) => {
+                    if let Some(r) = p.load_layout().body_range {
+                        out.insert(*txid, (p.fk, r));
+                    }
+                }
+                None => {
+                    g.by_txid.remove(txid);
+                }
             }
         }
+        out
     }
 
     /// Live strong pins still reachable via Weak (diagnostics / tests).
@@ -2015,5 +2036,70 @@ mod tests {
             store.lookup_txid(&tid).is_none(),
             "txid index must die with the last pin Arc"
         );
+    }
+
+    /// One lock: live + range hits; dead Weak, missing range, zero txid, and
+    /// unknown keys miss — same as N× [`PipelineParentStore::lookup_txid`].
+    #[test]
+    fn pipeline_parent_store_bulk_lookup_txid() {
+        let store = Arc::new(PipelineParentStore::new());
+        let live_tid = tx(1).txid;
+        let dead_tid = tx(2).txid;
+        let no_range_tid = tx(3).txid;
+        let missing_tid = tx(4).txid;
+        let zero = [0u8; 32];
+
+        let mut live = BatchParents::with_store(Arc::clone(&store), 2);
+        live.insert_owned(
+            Fk(10),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((1000, 80)),
+            Vec::new(),
+        );
+        let mut no_range = BatchParents::with_store(Arc::clone(&store), 1);
+        no_range.insert_owned(
+            Fk(11),
+            tx(3),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let mut dead = BatchParents::with_store(Arc::clone(&store), 1);
+        dead.insert_owned(
+            Fk(12),
+            tx(2),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((2000, 40)),
+            Vec::new(),
+        );
+        live.publish_to_store();
+        no_range.publish_to_store();
+        dead.publish_to_store();
+        drop(dead);
+
+        let keys = [live_tid, dead_tid, no_range_tid, missing_tid, zero];
+        let expected: Vec<Option<(Fk, (u64, u64))>> =
+            keys.iter().map(|t| store.lookup_txid(t)).collect();
+        let bulk = store.bulk_lookup_txid(keys.iter());
+        for (t, exp) in keys.iter().zip(expected.iter()) {
+            assert_eq!(
+                bulk.get(t).copied(),
+                *exp,
+                "bulk must match per-key lookup for {t:?}"
+            );
+        }
+        assert_eq!(bulk.get(&live_tid).copied(), Some((Fk(10), (1000, 80))));
+        assert!(bulk.get(&dead_tid).is_none());
+        assert!(bulk.get(&no_range_tid).is_none());
+        assert!(bulk.get(&missing_tid).is_none());
+        assert!(bulk.get(&zero).is_none());
+        let _keep = (live, no_range);
     }
 }

@@ -27,7 +27,7 @@ pub const HEAD_KEY_LEN: usize = 16;
 const SLOT_SIZE: usize = HEAD_KEY_LEN + 8;
 /// High bit of packed value: multi-list head (else sole create_fk).
 const MULTI_BIT: u64 = 1u64 << 63;
-const MULTI_REC_LEN: usize = 16; // create_fk | next
+const MULTI_REC_LEN: usize = 16;
 const DEFAULT_SLOTS: u64 = 64;
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 /// Slots per page-cache RMW chunk (128 × 24 B = 3 KiB).

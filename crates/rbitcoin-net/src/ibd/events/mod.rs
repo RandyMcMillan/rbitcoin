@@ -744,7 +744,7 @@ fn try_apply_exploration(st: &mut IbdWorkState, hub: &crate::chain::ChainHub) ->
             }
             if !bodies.contains_key(&cur) {
                 let Some(b) = load_reorg_body(st, hub, cur) else {
-                    break; // incomplete path for this tip; try_apply may still use another
+                    break;
                 };
                 st.reorg.hold_body(b.clone());
                 let prev = b.header.prev_blockhash;

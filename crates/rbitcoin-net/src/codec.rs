@@ -158,7 +158,7 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
             continue;
         }
         if seen_null {
-            return false; // non-zero after null padding
+            return false;
         }
         if !b.is_ascii_graphic() && b != b' ' {
             return false;

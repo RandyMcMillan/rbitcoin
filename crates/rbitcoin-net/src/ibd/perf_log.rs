@@ -1120,7 +1120,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_hwm,
         s.conf_write_q_cap,
     ));
-    let _ = thr_lookup_wait; // claim+send already in lookup_thr fields
+    let _ = thr_lookup_wait;
     if s.stamp_struct_ms > 0
         || s.stamp_prepare_ms > 0
         || s.stamp_batch_ms > 0

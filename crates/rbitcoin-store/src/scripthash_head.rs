@@ -32,7 +32,7 @@ const OCC_SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024;
 const OCC_MAGIC: &[u8; 8] = b"SHOCC001";
 
 const DEFAULT_SLOTS: u64 = 64;
-const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
+const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 
 /// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).

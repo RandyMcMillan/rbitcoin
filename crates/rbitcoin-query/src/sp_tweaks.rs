@@ -192,7 +192,7 @@ impl Query {
         }
 
         let mut elig_fks: Vec<Fk> = Vec::new();
-        let mut tag: Vec<(usize, usize)> = Vec::new(); // (plan_i, elig_i)
+        let mut tag: Vec<(usize, usize)> = Vec::new();
         for (pi, p) in plans.iter().enumerate() {
             for (ei, &(tx_i, _)) in p.elig.iter().enumerate() {
                 elig_fks.push(Fk(p.first_id.saturating_add(u64::from(tx_i))));

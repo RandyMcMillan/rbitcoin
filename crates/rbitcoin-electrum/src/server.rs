@@ -844,7 +844,6 @@ fn dispatch(
             let mut arr: Vec<Value> = u
                 .iter()
                 .filter(|x| {
-                    // Drop confirmed UTXOs spent by a live mempool tx.
                     let op = bitcoin::OutPoint {
                         txid: bitcoin::Txid::from_byte_array(x.tx_hash),
                         vout: x.tx_pos,

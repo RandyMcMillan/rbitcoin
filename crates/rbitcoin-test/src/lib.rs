@@ -116,4 +116,68 @@ mod contributing_policy {
             "review checklist must reject restating line comments"
         );
     }
+
+    /// Flagged what-paraphrases must stay gone from shipped production sources.
+    #[test]
+    fn production_line_comments_do_not_restate_flagged_phrases() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let banned = [
+            "compact size vout",
+            "uleb128 value",
+            "Drop confirmed UTXOs spent by a live mempool tx.",
+            "Convert sat/kvB",
+            "Skip DER signatures.",
+            "blocks counted by caller",
+            "load work_ns",
+            "Still need the value from the creator's output for fee calc.",
+        ];
+        let mut hits = Vec::new();
+        walk_rs(&crates, &banned, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "restating production comments still present:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    fn walk_rs(dir: &std::path::Path, banned: &[&str], hits: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if matches!(
+                    name,
+                    "tests" | "benches" | "examples" | "third_party" | "target"
+                ) {
+                    continue;
+                }
+                walk_rs(&p, banned, hits);
+                continue;
+            }
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || name == "tests.rs" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let prod = text.split("#[cfg(test)]").next().unwrap_or(&text);
+            for (i, line) in prod.lines().enumerate() {
+                let s = line.trim();
+                if s.starts_with("///") || s.starts_with("//!") {
+                    continue;
+                }
+                if !s.contains("//") {
+                    continue;
+                }
+                for b in banned {
+                    if s.contains(b) {
+                        hits.push(format!("{}:{}:{s}", p.display(), i + 1));
+                    }
+                }
+            }
+        }
+    }
 }

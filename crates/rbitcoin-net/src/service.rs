@@ -143,7 +143,7 @@ impl P2PNode {
                             Err(_) => our,
                         };
                         tokio::spawn(async move {
-                            let _permit = permit; // held for full session lifetime
+                            let _session_slot = permit;
                             let (ver, reader, writer) = match connect_and_handshake(
                                 stream, magic_c, our, peer_addr, height, true, &ua,
                             )

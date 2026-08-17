@@ -227,7 +227,7 @@ pub fn ensure_external_parent_denserels_from_plan(
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
     lookup_stage_stats::note(
-        0, // blocks counted by caller
+        0,
         st.parents as u64,
         st.already as u64,
         st.cold as u64,

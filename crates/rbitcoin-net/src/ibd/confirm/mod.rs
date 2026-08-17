@@ -869,10 +869,8 @@ pub(crate) fn spawn_confirm_engine(
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
     let caps = confirm_queue_caps();
-    let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
-        rbitcoin_consensus::LoadedBatch,
-        u64, // load work_ns
-    )>(caps.script);
+    type ScriptsIn = (rbitcoin_consensus::LoadedBatch, u64);
+    let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<ScriptsIn>(caps.script);
     let (write_tx, write_rx) =
         std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(caps.write);
     // Write reject: plan drops reserved fks + last_loaded so re-lookup after
@@ -1699,7 +1697,7 @@ pub(crate) fn offer_confirm_ready(
     let mut noted = 0u32;
     for ht in expect..=limit {
         let Some(&hash) = height_to_hash.get(&ht) else {
-            break; // missing header on work path
+            break;
         };
         if hub.has_block(&hash) {
             continue;

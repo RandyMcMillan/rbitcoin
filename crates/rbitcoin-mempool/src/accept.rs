@@ -503,7 +503,6 @@ impl ActiveMempool {
                             .saturating_add(t_utxo.elapsed().as_micros() as u64);
                         return Err(AcceptError::Policy("mempool double-spend"));
                     }
-                    // Still need the value from the creator's output for fee calc.
                 }
                 parent_txids.insert(creator);
                 let parent_tx = self
@@ -578,7 +577,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let _ = (utxos, tip); // reserved for future chain re-query on race
+        let _ = (utxos, tip);
         let txid = tx.compute_txid();
         if self.graph.contains(&txid) {
             return Err(AcceptError::Duplicate(txid));

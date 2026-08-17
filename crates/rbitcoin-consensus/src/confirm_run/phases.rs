@@ -170,7 +170,7 @@ pub(super) fn assemble_run(
             prev_mtp,
             &block_hash,
             bip16_active,
-            Some(block), // share wire Arc — no Transaction clone into jobs
+            Some(block),
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);

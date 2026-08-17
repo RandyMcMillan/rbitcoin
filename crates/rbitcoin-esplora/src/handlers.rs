@@ -744,9 +744,8 @@ pub async fn mempool_info(State(st): State<AppState>) -> Response {
         .fee_histogram()
         .into_iter()
         .map(|(rate_kvb, vs)| {
-            // Convert sat/kvB → sat/vB for Esplora-style histogram.
-            let rate_vb = (rate_kvb as f64) / 1000.0;
-            json!([rate_vb, vs])
+            let rate_sat_per_vb = (rate_kvb as f64) / 1000.0;
+            json!([rate_sat_per_vb, vs])
         })
         .collect();
     Json(json!({

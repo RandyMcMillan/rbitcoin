@@ -320,7 +320,6 @@ pub(super) fn xor_script_regions_in_input(
             return;
         }
         off += 8;
-        // compact size vout
         let Ok((vout, n)) = read_compact_size(&buf[off..]) else {
             return;
         };
@@ -376,7 +375,6 @@ pub(super) fn xor_script_region_in_output(
     }
     let kind = buf[start] & 0x0f;
     let mut off = start + 1;
-    // uleb128 value
     loop {
         if off >= buf.len() {
             return;

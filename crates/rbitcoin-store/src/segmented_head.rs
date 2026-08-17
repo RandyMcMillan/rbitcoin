@@ -134,11 +134,15 @@ impl SegmentedTxHead {
         let mut max_id = 0u32;
         for d in descs {
             let path = segment_head_path(&dir, d.file_id);
-            let head = AddressHead::open(&path)?;
+            let sealed = d.flags & FLAG_SEALED != 0;
+            let head = if sealed {
+                AddressHead::open_immutable(&path)?
+            } else {
+                AddressHead::open(&path)?
+            };
             if head.bits() != bits || head.entry_bytes() != 4 {
                 return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
             }
-            let sealed = d.flags & FLAG_SEALED != 0;
             let (fuse, fuse_needs_rewrite) = if sealed {
                 let fp = segment_fuse_path(&dir, d.file_id);
                 if !fp.exists() {
@@ -270,6 +274,14 @@ impl SegmentedTxHead {
             }
         }
         0
+    }
+
+    /// Per-page seqlock heap. Only the open tail keeps one; sealed segments are 0.
+    pub fn page_seq_resident_bytes(&self) -> u64 {
+        self.segments_snapshot()
+            .iter()
+            .map(|s| s.head.page_seq_resident_bytes())
+            .sum()
     }
 
     /// In-RAM sealed fuse8 fingerprints (process heap, not file RSS).
@@ -834,6 +846,7 @@ impl SegmentedTxHead {
         fuse.write_to(&fuse_path)?;
         last.head.flush()?;
         let fuse_bytes = fuse.fingerprint_bytes();
+        let sealed_head = last.head.without_page_seq()?;
 
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
@@ -844,7 +857,7 @@ impl SegmentedTxHead {
                 count: AtomicU64::new(count),
                 file_id: old.file_id,
                 sealed: true,
-                head: Arc::clone(&old.head),
+                head: Arc::new(sealed_head),
                 fuse: Some(fuse),
                 open_keys: Mutex::new(Vec::new()),
                 fuse_needs_rewrite: false,
@@ -1282,6 +1295,54 @@ mod tests {
         // Sealed fuse never FN on members of first segment.
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sealed segments are immutable: they must not keep a per-page seqlock
+    /// array (128 KiB × N on mainnet). Only the open tail RMW-publishes.
+    #[test]
+    fn sealed_segments_hold_no_page_seq() {
+        let dir = tmp();
+        // 10-bit: 1024 slots = one probe page → 4 B seqlock if allocated.
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let open_seq_bytes = 4u64;
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let n = 820u64;
+        let mut entries = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            entries.push((mixed(i + 1), Fk(i + 1)));
+        }
+        h.insert_many(&mut entries, false).unwrap();
+        assert!(h.sealed_segment_count() >= 1);
+        assert!(h.segment_count() >= 2);
+        assert_eq!(
+            h.page_seq_resident_bytes(),
+            open_seq_bytes,
+            "in-process seal must drop seqlock pages; got {} bytes across {} segs ({} sealed)",
+            h.page_seq_resident_bytes(),
+            h.segment_count(),
+            h.sealed_segment_count()
+        );
+        let cands = h.probe_candidates(&mixed(1)).unwrap();
+        assert!(
+            cands.iter().any(|f| f.0 == 1),
+            "sealed member must still probe, cands={cands:?}"
+        );
+
+        h.flush().unwrap();
+        drop(h);
+        let h2 = SegmentedTxHead::open(&dir).unwrap();
+        assert_eq!(
+            h2.page_seq_resident_bytes(),
+            open_seq_bytes,
+            "reopen must not allocate seqlock on sealed segments; got {} bytes",
+            h2.page_seq_resident_bytes()
+        );
+        let cands = h2.probe_candidates(&mixed(1)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == 1), "reopen sealed probe");
+        let cands = h2.probe_candidates(&mixed(820)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == 820), "reopen open-tail probe");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

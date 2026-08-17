@@ -1060,7 +1060,7 @@ impl AddressHead {
             Ok(())
         })();
 
-        session.drain_all();
+        session.drain_all()?;
         run
     }
 

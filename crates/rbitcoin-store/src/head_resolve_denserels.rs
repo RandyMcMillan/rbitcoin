@@ -215,7 +215,7 @@ fn fill_idx_pages(
             .push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, flags)
             .is_err()
         {
-            sess.drain_all();
+            let _ = sess.drain_all();
             return false;
         }
     }
@@ -227,38 +227,38 @@ fn fill_idx_pages(
         let mut cqes = match sess.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
         };
         if cqes.is_empty() {
             if sess.submit_and_wait_one().is_err() {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
             cqes = match sess.harvest_ready() {
                 Ok(c) => c,
                 Err(_) => {
-                    sess.drain_all();
+                    let _ = sess.drain_all();
                     return false;
                 }
             };
             if cqes.is_empty() {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
         } else if sess.submit().is_err() {
-            sess.drain_all();
+            let _ = sess.drain_all();
             return false;
         }
         for (ud, res) in cqes {
             let (kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
             if kind != UD_KIND_IDX || (slot as usize) >= results.len() {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
             if results[slot as usize] != i32::MIN {
-                sess.drain_all();
+                let _ = sess.drain_all();
                 return false;
             }
             results[slot as usize] = res;

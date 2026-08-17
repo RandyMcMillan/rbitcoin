@@ -213,10 +213,16 @@ impl UringSession {
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
-            self.ring
-                .submit_and_wait(1)
-                .map_err(|_| StoreError::Corrupt("io_uring submit_and_wait failed"))?;
-            Ok(())
+            loop {
+                match self.ring.submit_and_wait(1) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        if let Some(err) = map_enter_err(&e) {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -249,6 +255,10 @@ impl UringSession {
     pub fn harvest_ready(&mut self) -> Result<Vec<(u64, i32)>, StoreError> {
         #[cfg(target_os = "linux")]
         {
+            {
+                let cq = self.ring.completion();
+                cq_overflow_result(cq.overflow())?;
+            }
             self.ring.completion().sync();
             let mut out = Vec::new();
             let mut unexpected = false;
@@ -277,33 +287,47 @@ impl UringSession {
     /// buffers are dropped (error unwind, end of probe batch). A shallow
     /// harvest of only-ready CQEs is not enough — the kernel may still write
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
-    pub fn drain_all(&mut self) {
+    pub fn drain_all(&mut self) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
-            // Bound spin: entries cap × small factor; never hang forever.
+            // Timed waits: leftover phantom pending must not block forever.
+            // EINTR retries; other enter errors still spin until the bound.
             let mut spins = 0u32;
             let max_spins = self.entries.saturating_mul(4).max(64);
             while !self.pending.is_empty() && spins < max_spins {
                 spins += 1;
-                let _ = self.ring.submit_and_wait(1);
+                let ts = io_uring::types::Timespec::new().nsec(1_000_000);
+                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                match self.ring.submitter().submit_with_args(1, &args) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if map_enter_err(&e).is_some() {
+                            let _ = self.ring.submit();
+                        }
+                    }
+                }
                 self.ring.completion().sync();
                 for cqe in self.ring.completion() {
                     let _ = self.pending.expect_cqe(cqe.user_data());
                 }
             }
-            // Best-effort final harvest if the kernel is wedged.
             let _ = self.ring.submit();
             self.ring.completion().sync();
             for cqe in self.ring.completion() {
                 let _ = self.pending.expect_cqe(cqe.user_data());
             }
+            self.pending.assert_drained()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.pending.assert_drained()
         }
     }
 }
 
 impl Drop for UringSession {
     fn drop(&mut self) {
-        self.drain_all();
+        let _ = self.drain_all();
     }
 }
 /// Run `f` with this **OS thread's** long-lived io_uring session.
@@ -372,7 +396,7 @@ pub fn with_thread_local<R>(
                 if need_open {
                     if let Some(mut old) = slot.take() {
                         if old.in_flight() != 0 {
-                            old.drain_all();
+                            old.drain_all()?;
                         }
                         drop(old);
                     }
@@ -381,9 +405,13 @@ pub fn with_thread_local<R>(
                 }
                 let session = slot.as_mut().expect("session just ensured");
                 if session.in_flight() != 0 {
-                    session.drain_all();
+                    session.drain_all()?;
                 }
-                Ok(f(session))
+                let out = f(session);
+                if session.in_flight() != 0 {
+                    session.drain_all()?;
+                }
+                Ok(out)
             });
             out
         })
@@ -478,6 +506,32 @@ impl UringPending {
         }
         Ok(())
     }
+
+    /// After drain: leftover pending SQEs are an invariant, not a silent OK.
+    pub fn assert_drained(&self) -> Result<(), StoreError> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("invariant: io_uring undrained"))
+        }
+    }
+}
+
+pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
+    if overflow == 0 {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt("invariant: io_uring cq overflow"))
+    }
+}
+
+/// `None` → retry the enter (EINTR). `Some` → hard fail.
+pub(crate) fn map_enter_err(err: &std::io::Error) -> Option<StoreError> {
+    if err.raw_os_error() == Some(libc::EINTR) {
+        None
+    } else {
+        Some(StoreError::Corrupt("io_uring submit_and_wait failed"))
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +584,41 @@ mod tests {
             other => panic!("expected unexpected-cqe Corrupt, got {other:?}"),
         }
         assert!(p.is_empty(), "duplicate must not resurrect a slot");
+    }
+
+    #[test]
+    fn drain_all_reports_undrained_on_leftover_pending() {
+        let mut p = UringPending::new();
+        p.insert(1).unwrap();
+        match p.assert_drained() {
+            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
+            other => panic!("expected undrained Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_all_ok_when_empty() {
+        assert!(UringPending::new().assert_drained().is_ok());
+    }
+
+    #[test]
+    fn harvest_reports_cq_overflow() {
+        match cq_overflow_result(1) {
+            Err(StoreError::Corrupt("invariant: io_uring cq overflow")) => {}
+            other => panic!("expected overflow Corrupt, got {other:?}"),
+        }
+        assert!(cq_overflow_result(0).is_ok());
+    }
+
+    #[test]
+    fn enter_eintr_is_retry_not_corrupt() {
+        let e = std::io::Error::from_raw_os_error(libc::EINTR);
+        assert!(map_enter_err(&e).is_none());
+        let other = std::io::Error::from_raw_os_error(libc::EIO);
+        match map_enter_err(&other) {
+            Some(StoreError::Corrupt("io_uring submit_and_wait failed")) => {}
+            other => panic!("expected submit Corrupt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -618,7 +707,7 @@ mod tests {
         let _ = session.submit();
         assert!(session.in_flight() > 0);
         // Buffers still live — drain must complete every CQE into them.
-        session.drain_all();
+        session.drain_all().expect("drain");
         assert_eq!(session.in_flight(), 0);
         for b in &bufs {
             assert_eq!(b[0], 0xAB);

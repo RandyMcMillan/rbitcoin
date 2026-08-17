@@ -263,7 +263,7 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
     match with_bulk_session(|session| {
         #[cfg(test)]
         if test_force_session_false() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
         pread_batch_on_session_inner(session, ops, total_nonempty)
@@ -339,7 +339,7 @@ fn pread_batch_on_session_inner(
             // SAFETY: caller owns each `buf` until `pread_batch` returns.
             if session.push_pread(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 break;
@@ -355,28 +355,28 @@ fn pread_batch_on_session_inner(
         let mut cqes = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         };
         if cqes.is_empty() {
             if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
             cqes = match session.harvest_ready() {
                 Ok(c) => c,
                 Err(_) => {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
             };
             if cqes.is_empty() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
@@ -400,7 +400,7 @@ fn pread_batch_on_session_inner(
             any_fail = true;
         }
     }
-    session.drain_all();
+    let _ = session.drain_all();
     // Signal caller to fall back to pread if any SQE failed.
     !any_fail
 }
@@ -445,7 +445,7 @@ fn pwrite_batch_on_session(
             let ud = next as u64;
             if session.push_pwrite(fd, offset, ops[next].buf, ud).is_err() {
                 if session.in_flight() == 0 {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 break;
@@ -461,28 +461,28 @@ fn pwrite_batch_on_session(
         let mut cqes = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         };
         if cqes.is_empty() {
             if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
             cqes = match session.harvest_ready() {
                 Ok(c) => c,
                 Err(_) => {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
             };
             if cqes.is_empty() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
@@ -500,7 +500,7 @@ fn pwrite_batch_on_session(
             op.result = -5;
         }
     }
-    session.drain_all();
+    let _ = session.drain_all();
     true
 }
 
@@ -601,19 +601,19 @@ fn page_rmw_on_session(
         let mut events = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
         };
         if events.is_empty() {
             if session.submit_and_wait_one().is_err() {
-                session.drain_all();
+                let _ = session.drain_all();
                 return false;
             }
             events = match session.harvest_ready() {
                 Ok(c) => c,
                 Err(_) => {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
             };
@@ -621,7 +621,7 @@ fn page_rmw_on_session(
                 continue;
             }
         } else if session.submit().is_err() {
-            session.drain_all();
+            let _ = session.drain_all();
             return false;
         }
 
@@ -632,14 +632,14 @@ fn page_rmw_on_session(
             }
             if ud & RMW_WRITE_BIT != 0 {
                 if res < 0 || res as usize != pages[i].buf.len() {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 state[i] = 4;
                 done += 1;
             } else {
                 if res < 0 || res as usize != pages[i].buf.len() {
-                    session.drain_all();
+                    let _ = session.drain_all();
                     return false;
                 }
                 let dirty = apply(i, pages[i].buf);
@@ -654,7 +654,7 @@ fn page_rmw_on_session(
         }
     }
 
-    session.drain_all();
+    let _ = session.drain_all();
     done == n && need_read == 0 && need_write == 0
 }
 

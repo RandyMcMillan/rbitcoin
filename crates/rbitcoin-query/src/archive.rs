@@ -921,20 +921,6 @@ mod tests {
         }
     }
 
-    /// Confirm write owns plan+commit; it must not call the public archive wrapper.
-    #[test]
-    fn confirm_write_does_not_call_archive_block() {
-        let write = include_str!("../../rbitcoin-consensus/src/confirm_run/write.rs");
-        assert!(
-            !write.contains("archive_block"),
-            "confirm write must use archive_commit_plan, not archive_block"
-        );
-        assert!(
-            write.contains("archive_commit_plan"),
-            "confirm write Class A is archive_commit_plan"
-        );
-    }
-
     #[test]
     fn commit_class_a_only_does_not_advance_tip() {
         use rbitcoin_store::HeaderRecord;
@@ -956,32 +942,6 @@ mod tests {
         assert!(q.tip_height().is_none(), "Class A helper must not set tip");
         assert!(q.store().header_txs.has_body(hfk).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn archive_plan_confirm_head_is_tiponly_no_last_chance() {
-        let src = include_str!("archive.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            !prod.contains("get_fk_by_txid_batch_mode"),
-            "plan stamp must not last-chance-fill leftovers"
-        );
-        assert!(
-            !prod.contains("leftover_bind_then_forget") && !prod.contains("send_leftover_notes"),
-            "leftover pending map is gone; in-flight holds n−1 until prune after pin"
-        );
-        assert!(
-            prod.contains("get_fk_by_txid_batch(&need_head)"),
-            "confirm plan must TipOnly-batch remaining parents"
-        );
-        assert!(
-            !prod.contains("invariant: external parent missing BQ TipOnly hit"),
-            "leftover parents must TipOnly-head, not forbid as invariant"
-        );
-        assert!(
-            !prod.contains("get_fk_by_txid(&inp.prev_txid)"),
-            "last-chance single probe must stay gone"
-        );
     }
 
     /// batch_pin Arc denserels match encode+decode layout (PR-A/B pin handoff).

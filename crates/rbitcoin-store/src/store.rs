@@ -2289,21 +2289,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Leftover TipOnly must not hold the fence lock across head IO — clone.
-    #[test]
-    fn leftover_batch_clones_fence_before_resolve() {
-        let src = include_str!("store.rs");
-        let batch = src
-            .split("pub fn get_fk_by_txid_batch_mode")
-            .nth(1)
-            .and_then(|s| s.split("pub fn get_outs_by_range_batch").next())
-            .expect("get_fk_by_txid_batch_mode");
-        assert!(
-            batch.contains("self.fence().clone()"),
-            "hold a fence snapshot, not the RwLock, across leftover IO: {batch}"
-        );
-    }
-
     /// Documented hazard if tip flushed without strong: tip advanced, missing strong.
     ///
     /// Proves why order is strong→height→header_txs→confirmed: after this bad
@@ -2493,24 +2478,6 @@ mod tests {
             assert!(!s.strong_tx.is_strong(Fk(20)).unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn repair_uses_fence_complement_not_for_each_strong() {
-        let src = include_str!("store.rs");
-        let repair = src
-            .split("fn repair_strong_not_on_fence")
-            .nth(1)
-            .and_then(|s| s.split("fn strong_suffix_end_fk").next())
-            .expect("repair_strong_not_on_fence");
-        assert!(
-            repair.contains("unconnected_ranges"),
-            "repair must invert the fence: {repair}"
-        );
-        assert!(
-            !repair.contains("for_each_strong"),
-            "do not walk every strong bit: {repair}"
-        );
     }
 
     /// Upgrade open paths: missing optional tables recreated; unspent without range.

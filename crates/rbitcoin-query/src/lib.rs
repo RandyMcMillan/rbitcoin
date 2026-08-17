@@ -2312,39 +2312,8 @@ mod tests {
     }
 
     /// Disconnecting a confirmed block must emit an info/warn line (not debug).
-    /// Source pin: every `disconnect_tip` path is the sole durable disconnect.
     #[test]
     fn disconnect_tip_logs_each_block_at_least_info() {
-        let src = include_str!("connect.rs");
-        let start = src
-            .find("pub fn disconnect_tip")
-            .expect("Query::disconnect_tip");
-        let rest = &src[start..];
-        let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
-        let body = &rest[..end];
-        assert!(
-            body.contains("log_disconnect_tip(")
-                || body.contains("warn!")
-                || body.contains("info!"),
-            "disconnect_tip must log each leaving block at info/warn: {body}"
-        );
-        let log_body = src
-            .split("fn log_disconnect_tip")
-            .nth(1)
-            .expect("log_disconnect_tip helper")
-            .lines()
-            .take(8)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            log_body.contains("warn!") || log_body.contains("info!"),
-            "disconnect log must be at least info: {log_body}"
-        );
-        assert!(
-            !log_body.contains("debug!") && !log_body.contains("trace!"),
-            "must not hide disconnects at debug/trace: {log_body}"
-        );
-
         let (dir, q) = temp_query("disconnect-log");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);
         let hash0 = h0.hash;

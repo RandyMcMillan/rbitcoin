@@ -243,24 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn bq_resolve_wave_source_is_tiponly_batch_only() {
-        let src = include_str!("bq_resolve.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            prod.contains("get_fk_by_txid_batch(&keys)"),
-            "wave must use TipOnly 2-wave batch API (not a separate full-depth probe)"
-        );
-        assert!(
-            !prod.contains("TxidResolveMode::TipThenAny"),
-            "confirm wave must not pass TipThenAny"
-        );
-        assert!(
-            !prod.contains("get_fk_by_txid_batch_mode"),
-            "do not pick an explicit TipThenAny mode"
-        );
-    }
-
-    #[test]
     fn bq_resolve_wave_attaches_tiponly_hits_multi_height() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();

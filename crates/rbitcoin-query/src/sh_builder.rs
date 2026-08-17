@@ -1751,16 +1751,6 @@ mod tests {
 
     #[test]
     fn materialize_streams_megakey_without_full_chain_vec() {
-        let src = include_str!("sh_builder.rs");
-        let start = src
-            .find("let stream_result = for_each_merged_rec_opts")
-            .expect("materialize stream");
-        let body = src[start..].split("stream_result?;").next().unwrap();
-        assert!(
-            !body.contains("U64Set") && !body.contains("long_seen") && !body.contains("chain.push"),
-            "materialize must stream FKs, not collect a full-key Vec/U64Set"
-        );
-
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

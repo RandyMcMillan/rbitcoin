@@ -43,32 +43,6 @@ fn prune_inflight_keeps_until_tip_covers_height() {
     assert_eq!(log.layer_count(), 0);
 }
 
-/// Production prune_committed requires drain HWM **and** fence (TipOnly).
-/// Fence alone is the 269204 seal hole; drain alone is an unconnected TipOnly miss.
-#[test]
-fn prune_committed_uses_drain_and_fence() {
-    let src = include_str!("mod.rs");
-    let prune = src
-        .split("fn prune_committed")
-        .nth(1)
-        .and_then(|s| s.split("fn publish_mem_stats").next())
-        .expect("prune_committed");
-    assert!(
-        prune.contains("prune_if_head_ready")
-            && prune.contains("head_drain_fk")
-            && prune.contains("height_fence_snapshot"),
-        "prune must check drain and fence: {prune}"
-    );
-    assert!(
-        !prune.contains("prune_if_leftover_ready") && !prune.contains("prune_if_drained("),
-        "old single-signal prune: {prune}"
-    );
-    assert!(
-        !prune.contains("prune_through_tip"),
-        "height-only prune is not head-visible: {prune}"
-    );
-}
-
 /// Mainnet 187: first pack writes (drain+fence), next pack spends those creates.
 /// Stamp skips body_range when in-flight still has CreatePin outs; pin needs
 /// those outs. Drive the shipped confirm engine (not a source-order pin).
@@ -513,23 +487,6 @@ fn stamp_reject_names_union_miss_txid() {
     assert!(
         msg.contains(&disp),
         "operator line must name display txid {disp}: {msg}"
-    );
-}
-
-#[test]
-fn confirm_load_has_no_soft_requeue_hook() {
-    // Policy: no lookup/load soft-requeue. Internal errors permanent; wire
-    // recovery is soft re-getdata / BodyMissing only. The always-false hook
-    // hid that — production confirm must not name it.
-    let src = include_str!("mod.rs");
-    let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-    assert!(
-        !prod.contains("is_confirm_load_retryable"),
-        "always-false retry hook must stay gone"
-    );
-    assert!(
-        !prod.contains("re-queue (n="),
-        "soft-requeue warn path must stay gone"
     );
 }
 

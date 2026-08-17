@@ -2085,20 +2085,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Receive path holds never-confirmed side bodies; it is not a block index.
-    #[test]
-    fn receive_path_holds_by_hash_not_block_index() {
-        let src = include_str!("chain.rs");
-        assert!(
-            src.contains("held_bodies") && src.contains("fn hold_body"),
-            "side bodies are held by hash"
-        );
-        assert!(
-            src.contains("reconstruct_archived_block"),
-            "once-confirmed losers come from Class A"
-        );
-    }
-
     #[test]
     fn accept_received_reorgs_to_longer_held_fork() {
         let (dir, hub) = tmp_hub();

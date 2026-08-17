@@ -29,6 +29,9 @@ before 1.0).
 
 ### Changed
 
+- **IBD leftover miss names the table:** stamp reject lines include
+  `miss_on=head|body|idx|fence` and `miss_cands=` so a TipOnly miss is not
+  read as a bare missing prevout (`body` is `txid.body` identity).
 - **Load pin hygiene (scriptq feed).** Sparse need-vouts are binary-searched
   (sorted decode outs). Stamp maps move off the plan (`take_from_plan`)
   instead of cloning two ~100k U64Maps. Archive bind is one walk
@@ -39,7 +42,6 @@ before 1.0).
   `pread_skip` on write may drop; `scriptq` is the customer. Leftover
   TipOnly vs BQ leakage is still a host spike (no pending map, no
   soft-requeue).
-
 - **io_uring harvest is fail-closed.** Unmatched/duplicate CQEs, leftover
   undrained SQEs, CQ overflow, and identity-without-idx-range are
   `Corrupt("invariant: io_uring …")` / `idx range missing after identity`,

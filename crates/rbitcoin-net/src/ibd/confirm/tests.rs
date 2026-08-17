@@ -502,11 +502,13 @@ fn stamp_reject_names_union_miss_txid() {
     raw[0] = 0xab;
     raw[31] = 0xcd;
     rbitcoin_query::archive_phase_stats::note_resolve_counts(1, 1, 1914, 1913, 0, 0);
-    rbitcoin_query::archive_phase_stats::note_union_miss(raw, 1, true);
+    rbitcoin_query::archive_phase_stats::note_union_miss(raw, 1, true, Some("head"), 0);
     let msg = stamp_reject_operator_msg("missing prevout");
     assert!(msg.contains("miss_n=1"), "{msg}");
     assert!(msg.contains("miss_txid="), "{msg}");
     assert!(msg.contains("pending=1"), "{msg}");
+    assert!(msg.contains("miss_on=head"), "{msg}");
+    assert!(msg.contains("miss_cands=0"), "{msg}");
     let disp = bitcoin::Txid::from_byte_array(raw).to_string();
     assert!(
         msg.contains(&disp),

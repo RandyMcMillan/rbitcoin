@@ -11,6 +11,12 @@ before 1.0).
 
 ### Changed
 
+- **`ibd: perf` load/script tokens:** `load=` is pin+assemble only.
+  `load_thr pack/stamp/pin/asm/prune` is the load OS thread (leftover
+  TipOnly is `stamp=`; in-flight drop after scriptq is `prune=`). `script=`
+  is verify ns (`jobs=`/`skip=`), not submit-to-join. `lookup_thr keep=`
+  times live-union splice.
+
 - **Store completion session:** `IoSession` backends — Linux `io_uring`
   (default), portable `RBITCOIN_IO=pool` (Darwin default), Windows IOCP.
   Spend-annotate, head-resolve, and bulk fill stay multi-stage machines.

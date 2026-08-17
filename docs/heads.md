@@ -34,24 +34,24 @@ spk hash    ──► scripthash.head/     ScriptHashHead shards (64-way mainnet
 ## Lookup path (txid → create_fk)
 
 1. Live pipeline pin by prev_txid (same Weak as outs).
-2. **Hot** wave: open segment (age 0) + sealed ages **≤3**.
-3. `txid.body` identity + `txout.idx` for remaining keys.
-4. Unfinished or **unconnected-hot** keys then **cold** wave (sealed ages **≥4**).
+2. **Open** wave: unsealed tail (age 0) — probe, fetch every cand `txid.body`, walk newest-first.
+3. Unfinished keys: **sealed-hot** (ages 1..=3), same fetch-all + walk.
+4. Still unfinished or **unconnected** after those: **cold** (sealed ages ≥4).
 
-`TipThenAny` / `TipOnly` still run wave 2 after an unconnected hot hit so a
-connected sibling in a cold age can win.
+`TipThenAny` / `TipOnly` still run later waves after an unconnected earlier
+hit so a connected sibling in an older age can win.
 
-## Two-wave probe (not page-cache)
+## Three-wave probe (not page-cache)
 
-`sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) decides which
-`tx.head` segments are probed first. It is not an IO flag. `RWF_DONTCACHE`
+`sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) splits sealed-hot vs
+cold. Open is its own wave. It is not an IO flag. `RWF_DONTCACHE`
 is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
 
 ## Confirm stages (pointer)
 
 | Stage | Head contact |
 |-------|----------------|
-| **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **2-wave** hot then cold). Hits live on the BQ record. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
+| **lookup** | BQ-ahead TipOnly `get_fk_by_txid_batch` (same **3-wave** open / sealed-hot / cold). Hits live on the BQ record. Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is &lt;60%. |
 | **load** | Stamp from BQ hits + in-flight / pins (`bulk_lookup_txid`, one lock), then TipOnly (connected head). Pins `txout` by stamped range or in-flight outs. Does **not** `spent.idx`-batch. In-flight holds planned creates until **after pin + scripts handoff**, when drain inserted the fk span **and** `covers_fk_span`. |
 | **scripts** | No store. |
 | **write** | Sole Class A appender **and** sole `spent.idx` stamper (`ensure_spend_abs_layouts`). `head_insert_many` write-behind. Drain ∥ Class C. Write queued is insert-only. In-flight is the RAM home until drain+fence after the next bind. RPC `get_fk_by_txid` hits durable head only until drain. |

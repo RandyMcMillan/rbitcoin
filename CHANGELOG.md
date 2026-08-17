@@ -38,6 +38,12 @@ before 1.0).
 
 ### Changed
 
+- **Head resolve is three waves, no rank rounds.** Probe+identity is
+  open, then sealed ages 1..=3, then sealed age ≥4. Each wave fetches
+  every cand `txid.body` once and walks newest-first (fence-connected
+  wins). Unconnected identity still continues to later waves. TipOnly
+  still strips unconnected at the end.
+
 - **Leftover probe dump.** A leftover miss (load leftover, not lookup /
   BQ-ahead TipOnly) logs hop + every cand (`txid.body` prefix, match,
   rel/abs fk) once. The reject line adds `diag=1`.

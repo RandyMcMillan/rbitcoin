@@ -2729,7 +2729,14 @@ mod tests {
             );
 
             let mixed = [s.txs.secret.mix_txid(&txid)];
-            let hot = s.txs.head.probe_candidates_batch_hot(&mixed).unwrap();
+            let open = s.txs.head.probe_candidates_batch_open(&mixed).unwrap();
+            let mid = s
+                .txs
+                .head
+                .probe_candidates_batch_sealed_hot(&mixed)
+                .unwrap();
+            let mut hot = open;
+            hot[0].extend(mid[0].iter().copied());
             let cold = s
                 .txs
                 .head
@@ -2737,7 +2744,7 @@ mod tests {
                 .unwrap();
             assert!(
                 hot[0].iter().any(|f| *f == new) && !hot[0].iter().any(|f| *f == old),
-                "hot={:?} new={new:?} old={old:?}",
+                "open∪sealed_hot={:?} new={new:?} old={old:?}",
                 hot[0]
             );
             assert!(

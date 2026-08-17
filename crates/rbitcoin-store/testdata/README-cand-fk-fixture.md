@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Dev A/B for page-grouped `txid.body` identity vs per-cand depth-first.
+Dev A/B for page-grouped `txid.body` identity (one fetch per wave) vs serial peeks.
 **Not** a CI gate. Agent VM must not open production mainnet datadir.
 
 ## Checked-in sample

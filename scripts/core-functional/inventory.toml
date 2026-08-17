@@ -970,7 +970,7 @@ status = "run"
 name = "rpc_net.py"
 status = "skip"
 reason = "core-log"
-analog = "getpeerinfo ping fields shipped; SetNetworkActive / getnettotals / received: addr / addnode/getaddednodeinfo / getnodeaddresses unmapped"
+analog = "official: getconnectioncount is 1 not 2 after connect_nodes both ways (rpc_net.py:100); -proxy/-deprecatedrpc ignored; addrman/getnettotals/setnetworkactive still missing"
 
 [[test]]
 name = "rpc_orphans.py"

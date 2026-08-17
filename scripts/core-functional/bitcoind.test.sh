@@ -124,7 +124,7 @@ OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
   -testactivationheight=csv@102 -permitbaremultisig=0 -maxconnections=8 \
   -minimumchainwork=0x65 -limitancestorcount=5 -blockversion=1337 -mocktime=1296688602 \
-  -blockmintxfee=0.00000001 \
+  -blockmintxfee=0.00000001 -proxy=127.0.0.1:1 -deprecatedrpc=startingheight \
   2>/dev/null)" || OUTX=""
 if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
   && printf '%s' "$OUTX" | grep -q -- "--whitelist=noban@127.0.0.1" \
@@ -137,7 +137,9 @@ if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
   && printf '%s' "$OUTX" | grep -q -- "--blockmintxfee=0.00000001" \
   && ! printf '%s' "$OUTX" | grep -q -- "limitancestor" \
   && ! printf '%s' "$OUTX" | grep -q -- "txindex" \
-  && ! printf '%s' "$OUTX" | grep -q -- "fastprune"; then
+  && ! printf '%s' "$OUTX" | grep -q -- "fastprune" \
+  && ! printf '%s' "$OUTX" | grep -q -- "proxy" \
+  && ! printf '%s' "$OUTX" | grep -q -- "deprecatedrpc"; then
   echo "ok - consensus/mempool/peer flags forwarded"
   PASS=$((PASS + 1))
 else

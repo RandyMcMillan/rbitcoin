@@ -1,24 +1,25 @@
-//! Published parent identity (`txid → fk + range`) as a height-layered chain.
+//! Published parent identity (`txid → fk + range`) as a wave-layered chain.
 //!
-//! Lookup prepends one [`IdLayer`] per BQ height and [`publish`](LiveUnion::publish)
-//! stores the chain head (`Arc` bump). Load [`get`](PublishedIds::get) walks
-//! newest → older with no mutex. Layers whose heights have left the body queue
-//! are spliced out at the next wave end. [`unpublish`](PublishedIds::unpublish)
-//! (store `None`) drops visibility for new readers; a reader holding the old
-//! `Arc` still sees hits.
+//! Lookup prepends one [`IdLayer`] per resolve wave (a span of BQ heights)
+//! and [`publish`](LiveUnion::publish) stores the chain head (`Arc` bump).
+//! Load [`get`](PublishedIds::get) walks newest → older with no mutex. A
+//! layer stays until **no** height in its span is still on the body queue.
+//! [`unpublish`](PublishedIds::unpublish) (store `None`) drops visibility
+//! for new readers; a reader holding the old `Arc` still sees hits.
 
 use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Immutable `txid → (create_fk, body_range)` for one height.
+/// Immutable `txid → (create_fk, body_range)` for one resolve wave.
 pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64))>;
 
-/// One BQ height's hits plus the older chain.
+/// One lookup wave's hits (`lo..=hi` BQ heights) plus the older chain.
 #[derive(Debug)]
 pub struct IdLayer {
-    pub height: u32,
+    pub lo: u32,
+    pub hi: u32,
     pub hits: Arc<IdMap>,
     pub older: Option<Arc<IdLayer>>,
 }
@@ -61,7 +62,8 @@ impl PublishedIds {
     /// Replace the chain with a single layer (tests / one-shot stamp).
     pub fn publish(&self, map: Arc<IdMap>) {
         self.inner.store(Some(Arc::new(IdLayer {
-            height: 0,
+            lo: 0,
+            hi: 0,
             hits: map,
             older: None,
         })));
@@ -142,15 +144,16 @@ impl LiveUnion {
         }
     }
 
-    /// Drop layers whose heights fail `keep`. Does not swap published.
+    /// Drop layers whose span has no remaining queued height. Does not swap.
     pub fn keep_heights(&mut self, keep: impl Fn(u32) -> bool) {
         self.head = splice_kept(self.head.take(), keep);
         self.reindex();
     }
 
-    /// Prepend this height (replacing a prior layer at the same height).
-    pub fn note_height(&mut self, height: u32, hits: &IdMap) {
-        self.head = splice_kept(self.head.take(), |h| h != height);
+    /// Prepend one layer covering `lo..=hi` (inclusive).
+    pub fn note_span(&mut self, lo: u32, hi: u32, hits: &IdMap) {
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        self.head = splice_kept(self.head.take(), |h| h < lo || h > hi);
         let mut layer_hits = IdMap::new();
         for (t, &v) in hits {
             if *t == [0u8; 32] {
@@ -160,7 +163,8 @@ impl LiveUnion {
         }
         if !layer_hits.is_empty() {
             self.head = Some(Arc::new(IdLayer {
-                height,
+                lo,
+                hi,
                 hits: Arc::new(layer_hits),
                 older: self.head.take(),
             }));
@@ -168,12 +172,17 @@ impl LiveUnion {
         self.reindex();
     }
 
-    /// Arc-bump the chain head. Call once after a wave's [`note_height`]s.
+    /// Prepend a single-height layer (tests / one-shot).
+    pub fn note_height(&mut self, height: u32, hits: &IdMap) {
+        self.note_span(height, height, hits);
+    }
+
+    /// Arc-bump the chain head. Call once after a wave's [`note_span`].
     pub fn publish(&self, published: &PublishedIds) {
         published.publish_head(self.head.clone());
     }
 
-    /// Insert hits under a synthetic height, publish the chain head.
+    /// Insert hits under a synthetic single-height wave, publish the chain head.
     pub fn finish_wave(&mut self, hits: &IdMap, published: &PublishedIds) -> u32 {
         let height = self.next_wave;
         self.next_wave = self.next_wave.saturating_add(1);
@@ -183,8 +192,13 @@ impl LiveUnion {
     }
 }
 
-/// Rebuild the chain keeping nodes that pass `keep`. Kept hit maps are
-/// `Arc`-cloned; suffix nodes whose `older` pointer is unchanged are reused.
+fn span_kept(lo: u32, hi: u32, keep: &impl Fn(u32) -> bool) -> bool {
+    (lo..=hi).any(keep)
+}
+
+/// Rebuild the chain keeping nodes that still have a queued height in span.
+/// Kept hit maps are `Arc`-cloned; suffix nodes whose `older` is unchanged
+/// are reused.
 fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option<Arc<IdLayer>> {
     let mut nodes = Vec::new();
     let mut cur = head;
@@ -195,7 +209,7 @@ fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option
     }
     let mut new_head: Option<Arc<IdLayer>> = None;
     for n in nodes.into_iter().rev() {
-        if !keep(n.height) {
+        if !span_kept(n.lo, n.hi, &keep) {
             continue;
         }
         let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
@@ -207,7 +221,8 @@ fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option
             new_head = Some(n);
         } else {
             new_head = Some(Arc::new(IdLayer {
-                height: n.height,
+                lo: n.lo,
+                hi: n.hi,
                 hits: Arc::clone(&n.hits),
                 older: new_head,
             }));
@@ -325,11 +340,32 @@ mod tests {
         );
         assert_eq!(published.get(&tid(3)), Some((Fk(12), (5, 6))));
         let head = published.load().expect("w2 remains");
-        assert_eq!(head.height, w2);
+        assert_eq!((head.lo, head.hi), (w2, w2));
         assert!(head.older.is_none(), "dropped layer must leave the chain");
         assert!(
             Arc::ptr_eq(&head.hits, &kept_hits),
             "kept layer hit map must not be cloned"
+        );
+    }
+
+    #[test]
+    fn keep_span_while_any_height_in_range_queued() {
+        let published = PublishedIds::new();
+        let mut live = LiveUnion::new();
+        live.note_span(3, 5, &hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.publish(&published);
+        live.keep_heights(|h| h != 3);
+        live.publish(&published);
+        assert_eq!(
+            published.get(&tid(1)),
+            Some((Fk(10), (1, 2))),
+            "layer 3..=5 must stay while 4 or 5 is still queued"
+        );
+        live.keep_heights(|h| h > 5);
+        live.publish(&published);
+        assert!(
+            published.get(&tid(1)).is_none(),
+            "layer must drop when no height in the span remains"
         );
     }
 

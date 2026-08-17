@@ -11,11 +11,13 @@ before 1.0).
 
 ### Changed
 
-- **Confirm parent identity:** lookup prepends one `IdLayer` per BQ height
-  and `Arc`-bumps the chain head (`PublishedIds`). Load stamp is in-flight →
-  published union → TipOnly leftover. Layers drop when that height has left
-  the body queue. Disconnect stores `None` immediately. `pin_txid=` counts
-  published-union hits.
+- **Confirm parent identity:** lookup prepends one `IdLayer` per resolve
+  wave (`lo..=hi`) and `Arc`-bumps the chain head (`PublishedIds`). Load
+  stamp is in-flight → published union → TipOnly leftover. A layer stays
+  until no height in its span is still on the body queue. Disconnect stores
+  `None` immediately. `pin_txid=` counts published-union hits. IBD lookup
+  TipOnly-resolves up to **16000** inputs (include-overshoot) or **1080**
+  blocks per wave (4× load's 144-block cap; ~1 week of 10-minute blocks).
 
 - **Head resolve identity:** each probe wave fills `txid.body` in two shots
   (first four cands, then the rest if still unfinished). A connected win

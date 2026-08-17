@@ -19,7 +19,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Load claim pack size:** soft **Σ `tx.input`** budget (hardcoded **8000**; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do **not** treat ~32 as pack size (that was 8000/250 mid-chain, not fat-era).
 
-**IBD lookup resolve wave:** TipOnly `head_fk` over at most **8** BQ-ready heights (or 64 k keys), then mark those complete for load to claim. Small on purpose so complete slices arrive steadily; raise only after host A/B.
+**IBD lookup resolve wave:** TipOnly `head_fk` over at most **1080** BQ-ready heights or soft **16000** inputs (include-overshoot; 64 k unique-key safety cap), then mark those complete for load to claim. One published identity layer per wave so early-IBD stamp walks tens of layers, not tens of thousands of heights.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. Selector / apply / invalid-heavy: [`architecture.md`](./architecture.md#most-work-chain-selection-ibd--tip-follow).
 

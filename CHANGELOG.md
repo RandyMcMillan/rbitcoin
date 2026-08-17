@@ -75,6 +75,15 @@ before 1.0).
   an invariant, protocol, `SAFETY` requirement, or library quirk. First-party
   production sources were cleaned to that bar.
 
+- **Core functional Wave B.** Official unmodified
+  `mempool_unbroadcast.py` is now `run` (29 inventory run names).
+  Unbroadcast set persists across restart; `mockscheduler` re-INVs it.
+  GBT/submitheader field zoo, `-blockversion` / `-blockmintxfee`, and
+  GBT sigops shipped. `mining_basic.py` stays skip (first remaining
+  official failure is `test_block_max_weight` empty mempool /
+  reserved-weight). `rpc_net.py` / `rpc_getblockfrompeer.py` /
+  `rpc_blockchain.py` stay skip with first-failure analogs.
+
 - **Core functional Wave A.** Official unmodified
   `feature_dersig.py` / `feature_cltv.py` / `p2p_ping.py` /
   `feature_minchainwork.py` / `tool_rpcauth.py` are now `run` (28

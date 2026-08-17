@@ -861,7 +861,7 @@ reason = "core-net-policy"
 name = "rpc_blockchain.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "chainwork real; still missing gettxoutsetinfo/muhash, prune, getchaintxstats, getnetworkhashps"
+analog = "official: assert_start_raises_init_error missing 'The block database contains a block which appears to be from the future.' (rpc_blockchain.py:125); getnetworkhashps shipped; prune/muhash/getchaintxstats still later"
 
 [[test]]
 name = "rpc_createmultisig.py"

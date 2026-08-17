@@ -114,7 +114,9 @@ a LevelDB bag.
 
 The node follows the **fully valid** chain with **strictly most cumulative
 work** (Bitcoin rule). Header work only **ranks candidates**; full block
-connect decides the tip.
+connect decides the tip. IBD reorg depth is **any** (DoS/RAM caps only).
+Tip-follow pending cap is **128** (`MAX_PENDING_BLOCKS`) so a ≥99-block
+divergence can still be assembled.
 
 ```text
 headers / BQ / pending (download window)
@@ -125,16 +127,37 @@ headers / BQ / pending (download window)
          mid-branch fail restores prior tip; mark invalid; re-rank)
 ```
 
+Two layers:
+
+```text
+# Layer 1 — candidate ranking (headers only)
+prefer A over B iff sum(header.work() along A) > sum(header.work() along B)
+  and no apply-path hash is invalid-marked
+
+# Layer 2 — most-work *valid* (full blocks)
+apply only if every block connects. On fail: restore tip; mark path invalid; re-rank.
+```
+
 | Path | Behavior |
 |------|----------|
 | **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). A competing work-path tip+1 (parent ≠ tip) **searches connecting hashes** (shortest work-winning prefix) after the walk reaches a **connected** LCA. A far linear header horizon is not a fork. Side-branch bodies are held **by hash** (BQ is height first-wins). |
-| **Tip-follow** | Pending cap ≥128 (download window). Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
-| **Resume** | Prefer deeper/more-work header children; Class A body only tie-breaks. |
-| **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). |
+| **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
+| **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. Body preference alone must never re-elect an archived losing fork. |
+| **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |
 
-Normative detail: [`design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md).
-(Brief history: an earlier soft-only BadPrev path could livelock on a losing
-sibling tip; that is replaced by the design above.)
+```text
+L = current tip, valid, work 100
+M = peer header chain, work 150, connect fails mid-path
+N = other peer chain, work 120, all blocks valid
+Attempt M → fail → tip restored to L; M invalid-marked → re-rank → tip = N
+```
+
+Never disconnect until bodies are gathered. Orchestration only (IBD main loop /
+peer session) — never confirm lookup/load/scripts/write. Code: `most_work`,
+`ChainHub::accept_branch`, `ibd::reorg`.
+
+Do **not** reintroduce soft-only BadPrev handling for a **known competing**
+prev — that livelocked confirm on a losing sibling tip.
 
 ### Identity without fat keys
 
@@ -228,7 +251,6 @@ libre-class mempool policy — see COMPAT and the experimental mainnet runbook.
 | [`docs/crash-recovery.md`](./crash-recovery.md) | Tip commit, SEAL/HWM, crash resume |
 | [`docs/concurrency.md`](./concurrency.md) | Who may write which table |
 | [`docs/heads.md`](./heads.md) | Which head file / module (tx / header / SH) |
-| [`docs/design-ibd-most-work-reorg.md`](./design-ibd-most-work-reorg.md) | Most-work reorg design (selector, apply, invalid-heavy, resume) |
 | [`docs/experimental-mainnet.md`](./experimental-mainnet.md) | Lab mainnet ops |
 | [`OPERATOR.md`](../OPERATOR.md) | Knobs, logging, memory budgets |
 | [`COMPAT.md`](../COMPAT.md) | Product surface vs Core / Electrum methods |

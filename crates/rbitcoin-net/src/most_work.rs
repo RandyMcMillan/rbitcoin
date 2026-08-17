@@ -1,7 +1,8 @@
 //! Most-work ranking helpers (header work sums, LCA on a parent graph).
 //!
-//! Layer 1 of [`docs/design-ibd-most-work-reorg.md`]: candidate ranking uses
-//! header work only. Apply/validation is separate (`ChainHub::accept_branch`).
+//! Layer 1 of most-work selection (`docs/architecture.md`): candidate
+//! ranking uses header work only. Apply/validation is separate
+//! (`ChainHub::accept_branch`).
 
 use bitcoin::Work;
 

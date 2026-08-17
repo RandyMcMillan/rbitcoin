@@ -378,7 +378,7 @@ reason = "no-core-rest"
 name = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "HTTP 1.x/2.0 status, notifications (204), getrpcinfo logpath/active_commands, -rpcworkqueue"
+analog = "official: getrpcinfo active_commands is [] not [getrpcinfo]; HTTP 1.x/2.0, notifications 204, logpath, -rpcworkqueue still missing"
 
 [[test]]
 name = "interface_usdt_coinselection.py"
@@ -900,7 +900,8 @@ analog = "follow-up: estimatesmartfee exists; Core multi-horizon text"
 [[test]]
 name = "rpc_generate.py"
 status = "skip"
-reason = "no-wallet"
+reason = "rpc-missing"
+analog = "official: getblock(verbose=2) has no scriptPubKey.address; generate hidden -32601 and getblock verbose alias shipped"
 
 [[test]]
 name = "rpc_getblockfilter.py"

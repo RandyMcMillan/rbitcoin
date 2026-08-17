@@ -492,7 +492,6 @@ const METHOD_LIST: &[&str] = &[
     "generatetoaddress",
     "generatetodescriptor",
     "generateblock",
-    "generate",
     "scantxoutset",
     "gettxout",
     "getindexinfo",
@@ -541,8 +540,7 @@ fn method_help(m: &str) -> String {
              Regtest harness only. One block paying output (address or hex script). \
              submit=false returns {hash,hex} without connecting the block."
             .into(),
-        "generate" => "generate nblocks (maxtries)\n\
-             Regtest harness only. Mines to OP_TRUE (no wallet)."
+        "generate" => "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
             .into(),
         "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
              Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
@@ -781,9 +779,12 @@ fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String {
 }
 
 fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["blockhash", "verbosity"])?;
+    params.reject_unknown(&["blockhash", "verbosity", "verbose"])?;
     let hash_hex = params.req_str(0, "blockhash")?;
-    let verbosity = opt_verbosity(params, 1, "verbosity")?;
+    let verbosity = match params.get(1, "verbosity") {
+        Some(_) => opt_verbosity(params, 1, "verbosity")?,
+        None => opt_verbosity(params, 1, "verbose")?,
+    };
     let hash = parse_hash32_display(hash_hex)?;
     let height = ctx
         .query
@@ -1386,10 +1387,7 @@ fn decode_output_script(ctx: &RpcContext, s: &str) -> Result<ScriptBuf, Value> {
         match a.require_network(btc_net) {
             Ok(addr) => return Ok(addr.script_pubkey()),
             Err(_) => {
-                return Err(rpc_error(
-                    ERR_INVALID_PARAMS,
-                    "address is not valid for this network",
-                ));
+                return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Invalid address"));
             }
         }
     }
@@ -1485,8 +1483,14 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     Ok(json!({ "hash": hash.to_string() }))
 }
 
+const GENERATE_REPLACED: &str =
+    "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n";
+
 fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["nblocks", "maxtries"])?;
+    if params.get(0, "nblocks").is_none() {
+        return Err(rpc_error(ERR_METHOD_NOT_FOUND, GENERATE_REPLACED));
+    }
     let _miner = require_regtest_miner(ctx, "generate")?;
     let nblocks = params.req_u64(0, "nblocks")? as u32;
     let _maxtries = params.opt_u64(1, "maxtries")?;

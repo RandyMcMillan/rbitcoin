@@ -214,8 +214,12 @@ impl TxGraph {
     }
 
     /// Txid that created `op` if it is still a live mempool output (possibly spent).
+    ///
+    /// Prefer the created-outpoint set; fall back to a live body with this
+    /// txid so a 10-input merger still unions parent clusters if a vout was
+    /// missed in `created` (MiniWallet `new_utxo` / padded extra outputs).
     pub fn creator(&self, op: &OutPoint) -> Option<Txid> {
-        if self.created.contains(op) {
+        if self.created.contains(op) || self.entries.contains_key(&op.txid) {
             Some(op.txid)
         } else {
             None

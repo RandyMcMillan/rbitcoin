@@ -283,6 +283,9 @@ pub struct ActiveMempool {
     /// Stage µs for the most recent top-level [`Self::accept_tx`] / package member
     /// (includes nested orphan promote for that accept). Sampled by MempoolHub.
     pub last_accept_stages: AcceptStageUs,
+    /// Overlay from `-limitclustercount` / `-limitclustersize` (re-applied after compact).
+    cluster_count_overlay: Option<u32>,
+    cluster_size_kvb_overlay: Option<u32>,
 }
 
 impl ActiveMempool {
@@ -299,6 +302,12 @@ impl ActiveMempool {
 
     /// Overlay Core `-limitclustercount` / `-limitclustersize`.
     pub fn set_cluster_limits(&mut self, count: Option<u32>, size_kvb: Option<u32>) {
+        if count.is_some() {
+            self.cluster_count_overlay = count;
+        }
+        if size_kvb.is_some() {
+            self.cluster_size_kvb_overlay = size_kvb;
+        }
         self.graph.set_cluster_limits(count, size_kvb);
     }
 
@@ -340,6 +349,8 @@ impl ActiveMempool {
             max_weight,
             orphanage: Orphanage::new(),
             last_accept_stages: AcceptStageUs::default(),
+            cluster_count_overlay: None,
+            cluster_size_kvb_overlay: None,
         })
     }
 
@@ -382,6 +393,7 @@ impl ActiveMempool {
             items.push((entry, tx));
         }
         graph.rebuild_from(items);
+        graph.set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
         self.graph = graph;
         self.bodies = bodies;
         self.store.set_live_count(live);
@@ -661,6 +673,8 @@ impl ActiveMempool {
             .sum();
         // Core `-limitclustersize` is kvB of (Σ weight + 3) / 4 — same as
         // the functional test's `weight_to_vsize(clusterweight)`.
+        // Do not also sum per-tx vsizes: that over-rejects size-limit small_tx
+        // (each floor wastes up to 3 WU; 10 parents make remaining look too small).
         let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
         if members.len() + 1 > self.graph.cluster_count_limit()
             || combined_vsize > self.graph.cluster_vsize_limit()
@@ -1050,16 +1064,20 @@ impl ActiveMempool {
                     continue;
                 };
                 let mut chain_coins = Vec::with_capacity(tx.input.len());
+                let mut missing_chain = false;
                 for inp in &tx.input {
                     if self.graph.creator(&inp.previous_output).is_some() {
                         chain_coins.push(None);
                     } else if let Some(c) = utxos.get_coin(&inp.previous_output) {
                         chain_coins.push(Some(c));
                     } else {
-                        chain_coins.push(None);
+                        // Parent is neither live nor a confirmed coin — reorg
+                        // made the input disappear (or we just evicted it).
+                        missing_chain = true;
+                        break;
                     }
                 }
-                if check_mempool_structural(&tx, &chain_coins, tip).is_err() {
+                if missing_chain || check_mempool_structural(&tx, &chain_coins, tip).is_err() {
                     let _ = self.remove_txid(&id);
                     removed = true;
                 }
@@ -2058,6 +2076,28 @@ mod tests {
         mp.flush().unwrap();
         let mp2 = ActiveMempool::open_or_create(&dir).unwrap();
         assert_eq!(mp2.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mempool_cluster.py` cleanup mines the mempool empty and `maybe_compact`
+    /// rebuilds the graph. Overlay limits must survive that rebuild.
+    #[test]
+    fn compact_preserves_cluster_size_overlay() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let txid = tx.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(None, Some(10));
+        assert_eq!(mp.graph.cluster_vsize_limit(), 10_000);
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+        mp.remove_for_block(&[txid]).unwrap();
+        let _ = mp.maybe_compact().unwrap();
+        assert_eq!(
+            mp.graph.cluster_vsize_limit(),
+            10_000,
+            "compact must keep -limitclustersize overlay"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

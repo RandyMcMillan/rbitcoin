@@ -435,7 +435,7 @@ analog = "follow-up: wtxid accept"
 name = "mempool_cluster.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "ancestors/submitpackage/limits shipped; merge-size still over-admits"
+analog = "accessors/RBF/size-limit green; 10-way merge-size still over-admits"
 
 [[test]]
 name = "mempool_compatibility.py"
@@ -497,7 +497,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: reorg + mempool"
+analog = "timelock/sendraw green; submitblock 20-block side fork does not accept_branch"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -550,8 +550,7 @@ status = "run"
 
 [[test]]
 name = "mining_template_verification.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "p2p_1p1c_network.py"
@@ -562,8 +561,8 @@ analog = "follow-up: 1p1c + generate + addconnection"
 [[test]]
 name = "p2p_add_connections.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: addconnection types (RPC exists)"
+reason = "v1-only"
+analog = "inbound/outbound/feeler v2 green; last VersionSender is advertise_v2=false"
 
 [[test]]
 name = "p2p_addr_relay.py"
@@ -940,7 +939,7 @@ reason = "no-wallet"
 name = "rpc_gettxspendingprevout.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: gettxspendingprevout"
+analog = "gettxspendingprevout shipped; Core field/error zoo"
 
 [[test]]
 name = "rpc_help.py"

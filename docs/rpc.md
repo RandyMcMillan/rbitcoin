@@ -82,7 +82,7 @@ still wait for durable SH when shindex is on.
 | `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
 | `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes `select_block_txs`, then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. |
-| `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting. Version is `VERSIONBITS_TOP_BITS` only (no testdummy). `longpollid` waits until the tip or mempool update counter changes. |
+| `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting and returns Core reject needles (`bad-cb-missing`, `bad-diffbits`, `time-too-old`, …). Version is `VERSIONBITS_TOP_BITS` only (no testdummy). `longpollid` waits until the tip or mempool update counter changes. |
 | `prioritisetransaction` / `getprioritisedtransactions` | All networks. Local mining fee delta (sat). Dummy must be 0. Selector honors modified fee. |
 | `getmempoolcluster` | All networks. Cluster weight / chunks from the live graph (modified fees). Same prefix-maximal chunks as mining selection. |
 | `getmempoolancestors` / `getmempooldescendants` | All networks. Exclusive walks of the live cluster graph. `verbose` reuses `getmempoolentry` fields. |

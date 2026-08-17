@@ -37,6 +37,11 @@ before 1.0).
   `-limitclustercount` / `-limitclustersize` overlay the live graph.
   Cluster overflow is `too-large-cluster`. `getmempoolinfo.optimal` is
   true (we linearize on insert).
+- **GBT proposal:** Core reject needles without writing UTXO / requiring
+  PoW. `submitblock` maps `high-hash` / `prev-blk-not-found`.
+- **BIP152 / inbound:** `sendcmpct` version 2 only (v1 ignored).
+  `getpeerinfo` reports `bip152_hb_to` / `bip152_hb_from`. Feeler
+  outbounds send `relay=0` and close after version.
 
 - **No leftover pending map.** Parent identity is in-flight until
   drain-fk **and** fence after pin + scripts handoff (n−1 outs).

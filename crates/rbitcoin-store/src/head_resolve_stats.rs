@@ -121,7 +121,7 @@ pub struct LeftoverProbeDiag {
 static LAST_PROBE_DIAG: std::sync::Mutex<Option<LeftoverProbeDiag>> = std::sync::Mutex::new(None);
 static LAST_PROBE_DIAG_SET: AtomicU64 = AtomicU64::new(0);
 
-/// True when the last TipOnly miss recorded a probe dump (`diag=1` on the reject line).
+/// True when leftover (not lookup) recorded a probe dump (`diag=1` on the reject line).
 pub fn leftover_probe_diag_ready() -> bool {
     LAST_PROBE_DIAG_SET.load(Ordering::Relaxed) != 0
 }

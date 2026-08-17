@@ -542,24 +542,26 @@ impl SegmentedTxHead {
     }
 }
 
-/// Wave-1 sealed-age cap: open (age 0) + sealed ages `1..=` this.
+/// Sealed-hot wave: ages `1..=` this. Open is its own wave (age 0).
 pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
 
-/// Which head segments to probe (two-wave resolve vs full baseline).
+/// Which head segments to probe (three-wave resolve vs full baseline).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadProbeWave {
     /// Open + all sealed (legacy full probe).
     All,
-    /// Open + sealed ages ≤ [`HEAD_PROBE_HOT_MAX_AGE`].
-    Hot,
+    /// Unsealed tail only (age 0).
+    Open,
+    /// Sealed ages `1..=` [`HEAD_PROBE_HOT_MAX_AGE`] (sealed age 0 if tail sealed).
+    SealedHot,
     /// Sealed ages > [`HEAD_PROBE_HOT_MAX_AGE`].
     Cold,
 }
 
 impl HeadProbeWave {
     #[inline]
-    fn includes_hot(self) -> bool {
-        matches!(self, HeadProbeWave::All | HeadProbeWave::Hot)
+    fn includes_open(self) -> bool {
+        matches!(self, HeadProbeWave::All | HeadProbeWave::Open)
     }
 
     /// `age` = [`crate::head_resolve_stats::sealed_age_from_index`] for the seg.
@@ -567,7 +569,8 @@ impl HeadProbeWave {
     fn includes_sealed_age(self, age: u32) -> bool {
         match self {
             HeadProbeWave::All => true,
-            HeadProbeWave::Hot => age <= HEAD_PROBE_HOT_MAX_AGE,
+            HeadProbeWave::Open => false,
+            HeadProbeWave::SealedHot => age <= HEAD_PROBE_HOT_MAX_AGE,
             HeadProbeWave::Cold => age > HEAD_PROBE_HOT_MAX_AGE,
         }
     }
@@ -603,21 +606,38 @@ impl SegmentedTxHead {
         self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::All, None)
     }
 
-    /// Two-wave resolve: probe only **hot** (open + sealed ages ≤3) for all keys.
-    pub(crate) fn probe_candidates_batch_hot(
+    /// Wave 1: unsealed open tail only.
+    pub(crate) fn probe_candidates_batch_open(
         &self,
         mixed: &[[u8; 32]],
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Hot, None)
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Open, None)
     }
 
-    /// Two-wave resolve: hot probe on a held plan TLS session.
-    pub(crate) fn probe_candidates_batch_hot_on_session(
+    /// Wave 1 on a held plan TLS session.
+    pub(crate) fn probe_candidates_batch_open_on_session(
         &self,
         mixed: &[[u8; 32]],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Hot, None)
+        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Open, None)
+    }
+
+    /// Wave 2: sealed ages `1..=3`.
+    pub(crate) fn probe_candidates_batch_sealed_hot(
+        &self,
+        mixed: &[[u8; 32]],
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::SealedHot, None)
+    }
+
+    /// Wave 2 on a held plan TLS session.
+    pub(crate) fn probe_candidates_batch_sealed_hot_on_session(
+        &self,
+        mixed: &[[u8; 32]],
+        session: &mut crate::uring_session::UringSession,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::SealedHot, None)
     }
 
     /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where
@@ -668,7 +688,7 @@ impl SegmentedTxHead {
         let n_segs = segs.len();
         let last = segs.last().unwrap();
         // Open is always age 0 → wave 1 only (not cold).
-        if !last.sealed && wave.includes_hot() {
+        if !last.sealed && wave.includes_open() {
             let mut pass_i: Vec<usize> = Vec::new();
             let mut pass_keys: Vec<[u8; 32]> = Vec::new();
             for i in 0..n {

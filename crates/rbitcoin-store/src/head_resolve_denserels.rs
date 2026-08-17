@@ -1,12 +1,15 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
-//! Schema **13+** two waves on probe (uring when available):
-//! 1. **Hot probe** — open + sealed ages ≤3 → cands
-//! 2. **ID / IDX** — page-grouped `txid.body` identity fill, then depth-first BIP30
-//!    match in RAM + **one** page-grouped `txout.idx` fill for chosen fks
-//! 3. If any key still unmatched **or** (fence on and hot hit unconnected):
-//!    **cold probe** (sealed ages ≥4) for those keys → ID/IDX again
-//!    (`TipThenAny` can still take a connected sibling in cold)
+//! Three probe+identity waves (uring when available):
+//! 1. **Open** — unsealed tail (age 0)
+//! 2. **Sealed-hot** — sealed ages 1..=3
+//! 3. **Cold** — sealed ages ≥4 (only keys still unfinished)
+//!
+//! Each wave: probe that slice → **one** page-grouped `txid.body` fetch of every
+//! cand → newest-first walk (`body==want`, fence-connected if a fence is on) →
+//! one `tx.idx` fill for chosen fks. Unconnected identity does **not** skip
+//! later waves. TipOnly strips unconnected winners at the end.
+//!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
 //! idx, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
@@ -51,8 +54,6 @@ pub fn resolve_fk_and_range_batch_with_tip(
 }
 
 fn note_first_leftover_miss(
-    table: &TxTable,
-    txids: &[[u8; 32]],
     tip_only: bool,
     winner: &[Option<(Fk, (u64, u64))>],
     connected: &[bool],
@@ -70,15 +71,6 @@ fn note_first_leftover_miss(
         let on =
             crate::head_resolve_pick::classify_leftover_miss(n_cands[i], had_id[i], connected[i]);
         crate::head_resolve_stats::note_leftover_miss(on, n_cands[i] as u64);
-        match diagnose_txid_probe(table, &txids[i]) {
-            Ok(d) => {
-                rbitcoin_log::warn!("store: {}", format_leftover_probe_diag(&d));
-                crate::head_resolve_stats::note_leftover_probe_diag(d);
-            }
-            Err(e) => {
-                rbitcoin_log::warn!("store: leftover probe diag failed: {e}");
-            }
-        }
         return;
     }
 }
@@ -127,6 +119,19 @@ fn format_leftover_probe_diag(d: &crate::head_resolve_stats::LeftoverProbeDiag) 
         ));
     }
     s
+}
+
+/// Hop + cand dump for a leftover miss only (not lookup / BQ-ahead TipOnly).
+pub(crate) fn diagnose_and_note_leftover_probe(table: &TxTable, txid: &[u8; 32]) {
+    match diagnose_txid_probe(table, txid) {
+        Ok(d) => {
+            rbitcoin_log::warn!("store: {}", format_leftover_probe_diag(&d));
+            crate::head_resolve_stats::note_leftover_probe_diag(d);
+        }
+        Err(e) => {
+            rbitcoin_log::warn!("store: leftover probe diag failed: {e}");
+        }
+    }
 }
 
 fn diagnose_txid_probe(
@@ -235,11 +240,21 @@ fn is_uring_unavailable(err: &StoreError) -> bool {
     }
 }
 
-fn resolve_fk_and_range_pread(
+fn add_wave_cands(n_cands: &mut [usize], cands: &[Vec<Fk>]) -> u64 {
+    let mut n = 0u64;
+    for (i, c) in cands.iter().enumerate() {
+        n_cands[i] = n_cands[i].saturating_add(c.len());
+        n = n.saturating_add(c.len() as u64);
+    }
+    n
+}
+
+fn resolve_fk_and_range_core(
     table: &TxTable,
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
+    mut session: Option<&mut UringSession>,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
@@ -258,93 +273,95 @@ fn resolve_fk_and_range_pread(
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
 
-    // Leftover write-behind is load-owned; TipOnly is durable head only.
     let t_probe = Instant::now();
-    let hot_cands = table.head.probe_candidates_batch_hot(&mixed)?;
+    let open = match session.as_mut() {
+        Some(s) => table
+            .head
+            .probe_candidates_batch_open_on_session(&mixed, s)?,
+        None => table.head.probe_candidates_batch_open(&mixed)?,
+    };
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-    cands_total = cands_total.saturating_add(hot_cands.iter().map(|c| c.len() as u64).sum());
-    for (i, c) in hot_cands.iter().enumerate() {
-        n_cands[i] = n_cands[i].saturating_add(c.len());
-    }
-    let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
+    cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &open));
     id_idx_wave(
         table,
         txids,
-        &age0,
+        &open,
         side,
         &mut winner,
         &mut connected,
         heights,
-        /*skip_if_won=*/ false,
         &mut body_lookups,
         &mut miss_peeks,
         &mut id_ns,
         &mut idx_ns,
         &first_fks,
         &mut local_age,
-        None,
-        &mut had_id,
-    )?;
-    id_idx_wave(
-        table,
-        txids,
-        &older_hot,
-        side,
-        &mut winner,
-        &mut connected,
-        heights,
-        /*skip_if_won=*/ true,
-        &mut body_lookups,
-        &mut miss_peeks,
-        &mut id_ns,
-        &mut idx_ns,
-        &first_fks,
-        &mut local_age,
-        None,
+        &mut session,
         &mut had_id,
     )?;
 
-    // With tip-aware resolve, "unconnected hot hit" is not finished.
-    let mut need_cold = false;
-    let mut active = vec![false; txids.len()];
-    for i in 0..txids.len() {
-        let done = if heights.is_some() {
-            connected[i]
-        } else {
-            winner[i].is_some()
-        };
-        if !done {
-            active[i] = true;
-            need_cold = true;
-        }
-    }
-    if need_cold {
+    if any_unfinished(&winner, &connected, heights) {
         let t_probe = Instant::now();
-        let cold_cands = table.head.probe_candidates_batch_cold(&mixed, &active)?;
+        let mid = match session.as_mut() {
+            Some(s) => table
+                .head
+                .probe_candidates_batch_sealed_hot_on_session(&mixed, s)?,
+            None => table.head.probe_candidates_batch_sealed_hot(&mixed)?,
+        };
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        cands_total = cands_total.saturating_add(cold_cands.iter().map(|c| c.len() as u64).sum());
-        for (i, c) in cold_cands.iter().enumerate() {
-            n_cands[i] = n_cands[i].saturating_add(c.len());
-        }
+        cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &mid));
         id_idx_wave(
             table,
             txids,
-            &cold_cands,
+            &mid,
             side,
             &mut winner,
             &mut connected,
             heights,
-            /*skip_if_won=*/ true,
             &mut body_lookups,
             &mut miss_peeks,
             &mut id_ns,
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            None,
+            &mut session,
             &mut had_id,
         )?;
     }
+
+    if any_unfinished(&winner, &connected, heights) {
+        let mut active = vec![false; txids.len()];
+        for i in 0..txids.len() {
+            active[i] = !key_finished(i, &winner, &connected, heights);
+        }
+        let t_probe = Instant::now();
+        let cold = match session.as_mut() {
+            Some(s) => table
+                .head
+                .probe_candidates_batch_cold_on_session(&mixed, &active, s)?,
+            None => table.head.probe_candidates_batch_cold(&mixed, &active)?,
+        };
+        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+        cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cold));
+        id_idx_wave(
+            table,
+            txids,
+            &cold,
+            side,
+            &mut winner,
+            &mut connected,
+            heights,
+            &mut body_lookups,
+            &mut miss_peeks,
+            &mut id_ns,
+            &mut idx_ns,
+            &first_fks,
+            &mut local_age,
+            &mut session,
+            &mut had_id,
+        )?;
+    }
+
     if tip_only && heights.is_some() {
         for (i, w) in winner.iter_mut().enumerate() {
             if !connected[i] {
@@ -352,9 +369,7 @@ fn resolve_fk_and_range_pread(
             }
         }
     }
-    note_first_leftover_miss(
-        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
-    );
+    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_cands(cands_total);
@@ -369,6 +384,15 @@ fn resolve_fk_and_range_pread(
         .enumerate()
         .map(|(i, t)| (*t, winner[i]))
         .collect())
+}
+
+fn resolve_fk_and_range_pread(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    heights: Option<&HeightFence>,
+    tip_only: bool,
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+    resolve_fk_and_range_core(table, txids, heights, tip_only, None)
 }
 
 /// Kind tag for idx-page SQEs on the held plan session (`pack_ud` kind byte).
@@ -576,22 +600,25 @@ fn body_ranges_batched(
 ///
 /// When `session` is `Some`, ID + IDX page preads ride that **already-held**
 /// plan ring. When `None`, libc pread for ID and unique idx pages.
-fn key_done(
+fn key_finished(
     ki: usize,
-    skip_if_won: bool,
     winner: &[Option<(Fk, (u64, u64))>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
-    // Pending / prior-wave winner: do not ID older cands.
-    if winner[ki].is_some() && (heights.is_none() || connected[ki]) {
-        return true;
-    }
     if heights.is_some() {
         connected[ki]
     } else {
-        skip_if_won && winner[ki].is_some()
+        winner[ki].is_some()
     }
+}
+
+fn any_unfinished(
+    winner: &[Option<(Fk, (u64, u64))>],
+    connected: &[bool],
+    heights: Option<&HeightFence>,
+) -> bool {
+    (0..winner.len()).any(|i| !key_finished(i, winner, connected, heights))
 }
 
 fn id_idx_wave(
@@ -602,88 +629,73 @@ fn id_idx_wave(
     winner: &mut [Option<(Fk, (u64, u64))>],
     connected: &mut [bool],
     heights: Option<&HeightFence>,
-    skip_if_won: bool,
     body_lookups: &mut u64,
     miss_peeks: &mut u64,
     id_ns: &mut u64,
     idx_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-    mut session: Option<&mut UringSession>,
+    session: &mut Option<&mut UringSession>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
-    use crate::head_resolve_pick::{miss_peeks_in_prefix, next_id_cand, pick_winner};
+    use crate::head_resolve_pick::{miss_peeks_in_prefix, pick_winner};
     use std::collections::HashMap;
 
     let n = cands_by_key.len();
-    let mut filled = vec![0usize; n];
-    let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
-
-    // Rank rounds: identity-fill cand[r] across unfinished keys, then stop a
-    // key once it has a connected (or no-fence first) txid match. Older cands
-    // stay out of the ID set. Newer unconnected still do not win (BIP30).
-    loop {
-        let mut round: Vec<Fk> = Vec::new();
+    let mut need: Vec<Fk> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
         for ki in 0..n {
-            if key_done(ki, skip_if_won, winner, connected, heights) {
+            if key_finished(ki, winner, connected, heights) {
                 continue;
             }
-            let Some(fk) =
-                next_id_cand(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
-            else {
-                continue;
-            };
-            filled[ki] = filled[ki].saturating_add(1);
-            if let Some(id) = fk.get() {
-                if !id_map.contains_key(&id) {
-                    round.push(fk);
+            for &fk in &cands_by_key[ki] {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                if seen.insert(id) {
+                    need.push(fk);
                 }
             }
         }
-        if round.is_empty() {
-            break;
-        }
-        let t_id = Instant::now();
-        let (more, _pages) = match session.as_deref_mut() {
-            Some(sess) => side.get_many_page_grouped_on_session(&round, sess)?,
-            None => side.get_many_page_grouped(&round)?,
-        };
-        *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
-        *body_lookups = body_lookups.saturating_add(more.len() as u64);
-        id_map.extend(more);
     }
+
+    let t_id = Instant::now();
+    let (id_map, _pages) = if need.is_empty() {
+        (HashMap::new(), 0)
+    } else {
+        match session.as_mut() {
+            Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
+            None => side.get_many_page_grouped(&need)?,
+        }
+    };
+    *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
+    *body_lookups = body_lookups.saturating_add(id_map.len() as u64);
 
     let mut chosen_kis: Vec<usize> = Vec::new();
     let mut chosen_fks: Vec<Fk> = Vec::new();
     for ki in 0..n {
-        if key_done(ki, skip_if_won, winner, connected, heights) {
+        if key_finished(ki, winner, connected, heights) {
             continue;
         }
-        *miss_peeks = miss_peeks.saturating_add(miss_peeks_in_prefix(
-            &cands_by_key[ki],
-            filled[ki],
-            &txids[ki],
-            &id_map,
-        ));
-        if pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, None).is_some() {
+        let cands = &cands_by_key[ki];
+        let filled = cands.len();
+        *miss_peeks =
+            miss_peeks.saturating_add(miss_peeks_in_prefix(cands, filled, &txids[ki], &id_map));
+        if pick_winner(cands, filled, &txids[ki], &id_map, None).is_some() {
             had_id[ki] = true;
         }
-        if let Some((fk, rank)) =
-            pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, heights)
-        {
+        if let Some((fk, rank)) = pick_winner(cands, filled, &txids[ki], &id_map, heights) {
             crate::head_resolve_stats::add_hit_rank(rank);
             chosen_kis.push(ki);
             chosen_fks.push(fk);
             continue;
         }
-        // No connected hit. TipThenAny: first txid match in the filled prefix.
         if heights.is_some() {
             if winner[ki].is_some() {
                 continue;
             }
-            if let Some((fk, rank)) =
-                pick_winner(&cands_by_key[ki], filled[ki], &txids[ki], &id_map, None)
-            {
+            if let Some((fk, rank)) = pick_winner(cands, filled, &txids[ki], &id_map, None) {
                 crate::head_resolve_stats::add_hit_rank(rank);
                 chosen_kis.push(ki);
                 chosen_fks.push(fk);
@@ -691,7 +703,10 @@ fn id_idx_wave(
         }
     }
     let t_idx = Instant::now();
-    let ranges = body_ranges_batched(table, &chosen_fks, session)?;
+    let ranges = match session.as_mut() {
+        Some(sess) => body_ranges_batched(table, &chosen_fks, Some(sess))?,
+        None => body_ranges_batched(table, &chosen_fks, None)?,
+    };
     record_chosen_idx_ranges(
         &chosen_kis,
         &chosen_fks,
@@ -746,169 +761,9 @@ fn resolve_fk_and_range_uring(
     heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
-    crate::head_resolve_stats::add_keys(txids.len() as u64);
-
-    let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
-    let mut connected = vec![false; txids.len()];
-    let mut n_cands = vec![0usize; txids.len()];
-    let mut had_id = vec![false; txids.len()];
-
-    let out = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        resolve_fk_and_range_uring_on(
-            session,
-            table,
-            txids,
-            heights,
-            tip_only,
-            &mut winner,
-            &mut connected,
-            &mut n_cands,
-            &mut had_id,
-        )
-    })??;
-    note_first_leftover_miss(
-        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
-    );
-    Ok(out)
-}
-
-fn resolve_fk_and_range_uring_on(
-    session: &mut UringSession,
-    table: &TxTable,
-    txids: &[[u8; 32]],
-    heights: Option<&HeightFence>,
-    tip_only: bool,
-    winner: &mut [Option<(Fk, (u64, u64))>],
-    connected: &mut [bool],
-    n_cands: &mut [usize],
-    had_id: &mut [bool],
-) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
-    let side = table.txid_sidefile();
-    let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
-    let first_fks = table.head.first_fks_snapshot();
-    let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
-
-    let mut body_lookups = 0u64;
-    let mut miss_peeks = 0u64;
-    let mut id_ns = 0u64;
-    let mut idx_ns = 0u64;
-    let mut probe_ns = 0u64;
-    let mut cands_total = 0u64;
-
-    let t_probe = Instant::now();
-    let hot_cands = table
-        .head
-        .probe_candidates_batch_hot_on_session(&mixed, session)?;
-    probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-    cands_total = cands_total.saturating_add(hot_cands.iter().map(|v| v.len() as u64).sum());
-    for (i, c) in hot_cands.iter().enumerate() {
-        n_cands[i] = n_cands[i].saturating_add(c.len());
-    }
-    debug_assert_eq!(session.in_flight(), 0);
-
-    let (age0, older_hot) = crate::head_resolve_pick::partition_cands_age0(&hot_cands, &first_fks);
-    id_idx_wave(
-        table,
-        txids,
-        &age0,
-        side,
-        winner,
-        connected,
-        heights,
-        /*skip_if_won=*/ false,
-        &mut body_lookups,
-        &mut miss_peeks,
-        &mut id_ns,
-        &mut idx_ns,
-        &first_fks,
-        &mut local_age,
-        Some(session),
-        had_id,
-    )?;
-    id_idx_wave(
-        table,
-        txids,
-        &older_hot,
-        side,
-        winner,
-        connected,
-        heights,
-        /*skip_if_won=*/ true,
-        &mut body_lookups,
-        &mut miss_peeks,
-        &mut id_ns,
-        &mut idx_ns,
-        &first_fks,
-        &mut local_age,
-        Some(session),
-        had_id,
-    )?;
-
-    let mut need_cold = false;
-    let mut active = vec![false; txids.len()];
-    for i in 0..txids.len() {
-        let done = if heights.is_some() {
-            connected[i]
-        } else {
-            winner[i].is_some()
-        };
-        if !done {
-            active[i] = true;
-            need_cold = true;
-        }
-    }
-    if need_cold {
-        let t_probe = Instant::now();
-        let cold_cands = table
-            .head
-            .probe_candidates_batch_cold_on_session(&mixed, &active, session)?;
-        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        cands_total = cands_total.saturating_add(cold_cands.iter().map(|v| v.len() as u64).sum());
-        for (i, c) in cold_cands.iter().enumerate() {
-            n_cands[i] = n_cands[i].saturating_add(c.len());
-        }
-        debug_assert_eq!(session.in_flight(), 0);
-
-        id_idx_wave(
-            table,
-            txids,
-            &cold_cands,
-            side,
-            winner,
-            connected,
-            heights,
-            /*skip_if_won=*/ true,
-            &mut body_lookups,
-            &mut miss_peeks,
-            &mut id_ns,
-            &mut idx_ns,
-            &first_fks,
-            &mut local_age,
-            Some(session),
-            had_id,
-        )?;
-    }
-    if tip_only && heights.is_some() {
-        for (i, w) in winner.iter_mut().enumerate() {
-            if !connected[i] {
-                *w = None;
-            }
-        }
-    }
-
-    crate::head_resolve_stats::add_probe(probe_ns);
-    crate::head_resolve_stats::add_idx(idx_ns);
-    crate::head_resolve_stats::add_body(id_ns);
-    crate::head_resolve_stats::add_cands(cands_total);
-    crate::head_resolve_stats::add_body_lookups(body_lookups);
-    crate::head_resolve_stats::add_miss_peeks(miss_peeks);
-    crate::head_resolve_stats::add_hit_ages(&local_age);
-
-    Ok(txids
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, winner[i]))
-        .collect())
+    uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
+        resolve_fk_and_range_core(table, txids, heights, tip_only, Some(session))
+    })?
 }
 
 #[cfg(test)]
@@ -1173,29 +1028,39 @@ mod tests {
         });
     }
 
-    /// On a small (no cold segs) store, hot∪cold cands equal full probe.
+    fn merge_cands(parts: &[Vec<Vec<Fk>>]) -> Vec<Vec<Fk>> {
+        let n = parts[0].len();
+        let mut out = vec![Vec::new(); n];
+        for part in parts {
+            for (i, c) in part.iter().enumerate() {
+                out[i].extend(c.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// On a small (no cold segs) store, open∪sealed_hot∪cold equals full probe.
     #[test]
-    fn hot_plus_cold_cands_match_full_probe() {
+    fn three_waves_cands_match_full_probe() {
         let (dir, t, txids) = seed_table(24);
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
-        let hot = t.head.probe_candidates_batch_hot(&mixed).unwrap();
+        let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
+        let mid = t.head.probe_candidates_batch_sealed_hot(&mixed).unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
-        assert_eq!(full.len(), hot.len());
-        for i in 0..full.len() {
-            let mut merged = hot[i].clone();
-            merged.extend(cold[i].iter().copied());
-            assert_eq!(merged, full[i], "key {i}");
-        }
-        // Tiny store: everything is hot; cold must be empty.
-        assert!(cold.iter().all(|c| c.is_empty()));
+        let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
+        assert_eq!(merged, full);
+        assert!(
+            mid.iter().all(|c| c.is_empty()) && cold.iter().all(|c| c.is_empty()),
+            "tiny store is open-only"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Wave 1 is open + sealed ages ≤3; ages ≥4 are cold only. hot∪cold = full.
+    /// Open / sealed-hot (ages 1..=3) / cold (age ≥4); union = full.
     #[test]
-    fn hot_wave_is_open_plus_three_sealed() {
+    fn three_waves_partition_by_sealed_age() {
         use crate::address_head::HeadLayout;
         use crate::segmented_head::HEAD_PROBE_HOT_MAX_AGE;
         let dir = tmp("hot-open-plus-3");
@@ -1233,20 +1098,24 @@ mod tests {
         );
         let first = t.head.first_fks_snapshot();
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
-        let hot = t.head.probe_candidates_batch_hot(&mixed).unwrap();
+        let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
+        let mid = t.head.probe_candidates_batch_sealed_hot(&mixed).unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
+        let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
+        assert_eq!(merged, full, "open∪sealed_hot∪cold must equal full probe");
         let mut saw_cold = false;
         for i in 0..txids.len() {
-            let mut merged = hot[i].clone();
-            merged.extend(cold[i].iter().copied());
-            assert_eq!(merged, full[i], "hot∪cold must equal full probe i={i}");
-            for &fk in &hot[i] {
+            for &fk in &open[i] {
+                let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
+                assert_eq!(age, 0, "open cand fk={} age={age}", fk.0);
+            }
+            for &fk in &mid[i] {
                 let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
                 assert!(
                     age <= HEAD_PROBE_HOT_MAX_AGE,
-                    "hot cand fk={} age={age}",
+                    "sealed-hot cand fk={} age={age}",
                     fk.0
                 );
             }
@@ -1264,8 +1133,8 @@ mod tests {
         let oldest = crate::head_resolve_stats::sealed_age_for_fk(&first, 1).unwrap();
         assert!(oldest > HEAD_PROBE_HOT_MAX_AGE, "oldest age={oldest}");
         assert!(
-            !hot[0].iter().any(|f| f.0 == 1),
-            "oldest create must not be in hot"
+            !open[0].iter().any(|f| f.0 == 1) && !mid[0].iter().any(|f| f.0 == 1),
+            "oldest create must not be in open or sealed-hot"
         );
         assert!(
             cold[0].iter().any(|f| f.0 == 1),

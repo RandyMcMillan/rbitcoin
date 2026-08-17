@@ -580,6 +580,8 @@ impl Query {
                 crate::archive_phase_stats::note_union_miss(
                     tid, miss_n, pending, miss_on, miss_cands,
                 );
+                // One hop dump per leftover miss pack — not lookup / BQ TipOnly.
+                self.store.diagnose_leftover_probe(&tid);
             } else {
                 crate::archive_phase_stats::note_union_miss([0u8; 32], 0, false, None, 0);
             }
@@ -1334,6 +1336,21 @@ mod tests {
             .archive_plan_batch_from(&mut need_b, 2, &empty)
             .expect("TipOnly must stamp after fence, without leftover pending");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leftover miss (unknown parent) hop-dumps once. Lookup TipOnly does not.
+    #[test]
+    fn leftover_miss_dumps_probe_diag() {
+        let (dir, q) = temp_query("leftover-miss-diag");
+        let empty = crate::InFlightView::empty();
+        let ghost = [0xDDu8; 32];
+        let mut need = vec![(Fk(1), vec![child_spend(ghost, 0xaa)])];
+        let _ = q.archive_plan_batch_from(&mut need, 1, &empty);
+        assert!(
+            rbitcoin_store::leftover_probe_diag_ready(),
+            "leftover miss must hop-dump once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

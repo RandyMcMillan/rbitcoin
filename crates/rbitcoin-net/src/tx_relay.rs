@@ -100,20 +100,23 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .ok()
             .flatten()
             .unwrap_or(0);
-        // Coinbase: first tx in its confirmed block, or a null-prevout input.
-        let is_coinbase = if create_height > 0 {
-            self.query
+        // Coinbase: null prevout on input 0, or first tx in its confirmed block.
+        // Either signal is enough — `block_tx_fks` can miss after a disconnect
+        // while the input record still says coinbase (`mempool_reorg`).
+        let input_cb = self
+            .query
+            .tx_input_at_fk(fk, &rec, 0)
+            .ok()
+            .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+            .unwrap_or(false);
+        let first_in_block = create_height > 0
+            && self
+                .query
                 .block_tx_fks(rbitcoin_primitives::Height(create_height))
                 .ok()
                 .and_then(|fks| fks.first().copied())
-                == Some(fk)
-        } else {
-            self.query
-                .tx_input_at_fk(fk, &rec, 0)
-                .ok()
-                .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-                .unwrap_or(false)
-        };
+                == Some(fk);
+        let is_coinbase = input_cb || first_in_block;
         let create_mtp = if create_height == 0 {
             0
         } else {

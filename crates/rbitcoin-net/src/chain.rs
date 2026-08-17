@@ -1592,6 +1592,7 @@ mod tests {
         Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
     };
     use rbitcoin_consensus::{confirm_scripts_phase, ChainParams, Milestone};
+    use rbitcoin_mempool::UtxoProvider;
     use rbitcoin_query::Query;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2180,6 +2181,65 @@ mod tests {
         let b_next = mine(tip, 1_300_001_200, tip_h + 1);
         hub.accept_block(b_next).unwrap();
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `mempool_reorg.py`: invalidate below coinbase maturity must empty the spend.
+    #[test]
+    fn invalidate_evicts_immature_coinbase_spend() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let hashes = hub
+            .generate_to_script(103, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad to mature coinbase");
+        assert_eq!(hashes.len(), 103);
+        assert_eq!(hub.tip_height(), Some(103));
+        let b1 = hub.block_at_height(1).unwrap().expect("height 1");
+        let cb = b1.txdata[0].compute_txid();
+
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(mp.clone()).is_ok());
+
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&spend).expect("mature coinbase spend");
+        assert_eq!(mp.live_count(), 1);
+
+        // QueryUtxoProvider must see a coinbase at height 1 (same path evict uses).
+        let coin = crate::tx_relay::QueryUtxoProvider {
+            query: hub.query.as_ref(),
+        }
+        .get_coin(&OutPoint { txid: cb, vout: 0 })
+        .expect("coinbase still a chain coin");
+        assert!(coin.is_coinbase, "shipped get_coin must mark coinbase");
+        assert_eq!(coin.create_height, 1);
+
+        let h10 = hub.block_at_height(10).unwrap().expect("height 10");
+        hub.invalidate_block(h10.block_hash())
+            .expect("invalidate height 10");
+        assert_eq!(hub.tip_height(), Some(9));
+        assert_eq!(
+            mp.live_count(),
+            0,
+            "invalidate below maturity must evict the coinbase spend"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

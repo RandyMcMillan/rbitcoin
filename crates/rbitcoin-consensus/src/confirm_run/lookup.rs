@@ -716,6 +716,7 @@ pub(super) fn wire_lookup_phase(
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
                     pre_resolved,
+                    Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -725,6 +726,7 @@ pub(super) fn wire_lookup_phase(
                     &rbitcoin_query::InFlightView::empty(),
                     None,
                     pre_resolved,
+                    None,
                 )
                 .map_err(ConsensusError::from)?,
         };

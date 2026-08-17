@@ -26,6 +26,8 @@ pub struct BqResolveWaveStats {
     pub heights: u32,
     pub keys: u32,
     pub hits: u32,
+    /// Keys already in [`rbitcoin_query::LiveUnion`] — no TipOnly this wave.
+    pub skipped: u32,
     pub work_ns: u64,
 }
 
@@ -66,10 +68,27 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 /// Skips missing / already-complete / undecodable heights. Marks each
 /// processed height resolve-complete even when some keys miss (same-batch /
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
+///
+/// When `ids` is `Some`, skip TipOnly for keys already in the live union and
+/// publish one snapshot at wave end.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
     heights: &[u32],
+) -> Result<BqResolveWaveStats, ConsensusError> {
+    confirm_bq_resolve_wave_with_ids(query, params, heights, None)
+}
+
+/// [`confirm_bq_resolve_wave`] with a lookup-owned live union.
+pub fn confirm_bq_resolve_wave_with_ids(
+    query: &Query,
+    params: &ChainParams,
+    heights: &[u32],
+    mut ids: Option<(
+        &mut rbitcoin_query::LiveUnion,
+        &rbitcoin_query::PublishedIds,
+        &rbitcoin_query::ForgetQueue,
+    )>,
 ) -> Result<BqResolveWaveStats, ConsensusError> {
     let t0 = Instant::now();
     let mut stats = BqResolveWaveStats::default();
@@ -101,15 +120,23 @@ pub fn confirm_bq_resolve_wave(
         }
     }
 
-    let mut keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
+    let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
     stats.keys = keys.len() as u32;
-    keys.sort_unstable_by_key(|txid| query.store().txs.head_primary_slot(txid));
+    let (mut hit_map, need): (BqParentHits, Vec<[u8; 32]>) = match ids.as_mut() {
+        Some((live, _, _)) => {
+            let (known, need) = live.partition(keys.iter());
+            stats.skipped = known.len() as u32;
+            (known, need)
+        }
+        None => (HashMap::new(), keys),
+    };
+    let mut need = need;
+    need.sort_unstable_by_key(|txid| query.store().txs.head_primary_slot(txid));
 
-    let mut hit_map: BqParentHits = HashMap::new();
-    if !keys.is_empty() {
+    if !need.is_empty() {
         let rows = query
             .store()
-            .get_fk_by_txid_batch(&keys)
+            .get_fk_by_txid_batch(&need)
             .map_err(ConsensusError::from)?;
         for (txid, row) in rows {
             if let Some((fk, range)) = row {
@@ -118,6 +145,9 @@ pub fn confirm_bq_resolve_wave(
         }
     }
     stats.hits = hit_map.len() as u32;
+    if let Some((live, published, forget)) = ids.as_mut() {
+        live.finish_wave(forget, &hit_map, published);
+    }
 
     for (h, need) in &per_height {
         let attach: Vec<([u8; 32], rbitcoin_primitives::Fk, (u64, u64))> = need
@@ -283,6 +313,56 @@ mod tests {
     }
 
     #[test]
+    fn second_wave_skips_live_union_parent() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let g_cb = genesis.txdata[0].compute_txid();
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        let b2 = mine_with_txs(
+            b1.block_hash(),
+            b1.header.time + 600,
+            2,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(48_0000_0000))],
+        );
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+            .unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
+            .unwrap();
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let published = rbitcoin_query::PublishedIds::new();
+        let forget = rbitcoin_query::ForgetQueue::new();
+        let st1 = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            &[1],
+            Some((&mut live, &published, &forget)),
+        )
+        .unwrap();
+        assert_eq!(st1.skipped, 0);
+        assert!(st1.hits >= 1);
+        assert!(published.get(&g_cb.to_byte_array()).is_some());
+        let st2 = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            &[2],
+            Some((&mut live, &published, &forget)),
+        )
+        .unwrap();
+        assert!(
+            st2.skipped >= 1,
+            "second wave must skip genesis parent already in live_union"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
     fn bq_resolve_wave_skips_claimed_height() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
@@ -395,6 +475,7 @@ mod tests {
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: view,
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+            published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let empty = rbitcoin_store::BqParentHits::default();
         let items = [(Height(1), std::sync::Arc::new(b1))];
@@ -495,6 +576,7 @@ mod tests {
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: log.snapshot(),
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+            published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let empty = rbitcoin_store::BqParentHits::default();
         let items = [(Height(1), std::sync::Arc::new(b1))];
@@ -607,6 +689,7 @@ mod tests {
                 &rbitcoin_query::InFlightView::empty(),
                 None,
                 Some(&rbitcoin_store::BqParentHits::default()),
+                None,
             )
             .expect_err("disconnected leftover must not TipThenAny-fill");
         let msg = err.to_string();

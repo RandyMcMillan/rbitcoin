@@ -2140,6 +2140,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         next_tx_start: q.tx_body_count().saturating_add(1).max(1),
         in_flight: rbitcoin_query::InFlightView::empty(),
         parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+        published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
     };
     let mat_a = confirm_wire_load_phase_pipelined(
         &q,

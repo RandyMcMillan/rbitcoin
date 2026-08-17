@@ -9,6 +9,14 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **Confirm parent identity:** lookup publishes one `live_union` snapshot
+  (`PublishedIds` / `ArcSwap`) at wave end. Load stamp is in-flight →
+  published union → TipOnly leftover. Body-queue `parent_hits` and stamp
+  `bulk_lookup_txid` are gone. Dequeue enqueues a height forget; disconnect
+  stores `None` immediately. `pin_txid=` now counts published-union hits.
+
 ### Added
 
 - **`generateblock submit=false`:** mine one block without connecting it

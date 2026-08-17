@@ -865,7 +865,7 @@ pub(crate) mod confirm_thr_stats {
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
-/// from BQ hits + in-flight + TipOnly `tx.head` + pin + assemble) → scriptq →
+/// from in-flight + published union + TipOnly `tx.head` + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(

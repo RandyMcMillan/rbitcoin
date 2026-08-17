@@ -7,8 +7,8 @@ Durable confirm still uses TipOnly (connected instance). See
 
 ## RAM leftover maps: one fk per txid
 
-In-flight `creates`, BQ `parent_hits`, and pipeline pin `by_txid` are
-`txid → one fk` (last write / newest layer). A second
+In-flight `creates`, the published `live_union` snapshot, and pipeline pin
+`by_txid` are `txid → one fk` (last write / newest layer). A second
 `create_fk` for the same txid **clobbers** the first in that map. Do
 not stall the pipeline on a second fk (forget cannot run).
 

@@ -17,9 +17,9 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::io_handle::IoHandle;
 use crate::tx_idx::TxIdx;
 use rbitcoin_primitives::{Fk, TableKind};
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -257,7 +257,7 @@ impl VarTable {
 
     /// Segmented idx: resolve ranges via page-coalesced batch APIs, then body pread.
     #[inline]
-    pub(crate) fn body_read_fd(&self) -> std::os::fd::RawFd {
+    pub(crate) fn body_read_fd(&self) -> IoHandle {
         self.body.read_fd()
     }
 
@@ -503,7 +503,7 @@ impl VarTable {
         }))
     }
 
-    pub(crate) fn body_write_fd(&self) -> RawFd {
+    pub(crate) fn body_write_fd(&self) -> IoHandle {
         self.body.read_fd()
     }
 

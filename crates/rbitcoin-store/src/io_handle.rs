@@ -36,6 +36,20 @@ impl IoHandle {
         self.handle
     }
 
+    /// Borrow a positional handle from an open file (does not take ownership).
+    pub fn from_file(file: &std::fs::File) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            Self::from_raw_fd(file.as_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            Self::from_raw_handle(file.as_raw_handle() as isize)
+        }
+    }
+
     /// One-shot positional read. Returns bytes transferred or negated errno.
     pub fn pread(self, offset: u64, buf: &mut [u8]) -> i32 {
         if buf.is_empty() {

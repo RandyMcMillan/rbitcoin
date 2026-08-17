@@ -28,7 +28,7 @@
 //! Machines stay staged; they do not flatten to one-shot `pread`. See
 //! `docs/io-modality.md` and `docs/concurrency.md`.
 
-use std::os::fd::RawFd;
+use crate::io_handle::IoHandle;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// SQ/CQ depth for bulk batch sessions.
@@ -36,7 +36,7 @@ const RING_ENTRIES: u32 = crate::uring_session::DEFAULT_ENTRIES;
 
 /// One independent pread. Caller owns `buf` for the full submit/wait.
 pub struct ReadOp<'a> {
-    pub fd: RawFd,
+    pub fd: IoHandle,
     pub offset: u64,
     pub buf: &'a mut [u8],
     /// Filled: bytes read (≥0) or negated errno on failure.
@@ -45,7 +45,7 @@ pub struct ReadOp<'a> {
 
 /// One independent pwrite. Caller owns `buf` for the full submit/wait.
 pub struct WriteOp<'a> {
-    pub fd: RawFd,
+    pub fd: IoHandle,
     pub offset: u64,
     pub buf: &'a [u8],
     /// Filled: bytes written (≥0) or negated errno on failure.
@@ -57,7 +57,7 @@ pub struct WriteOp<'a> {
 /// Test / reusable primitive only — production `tx.head` insert uses other paths.
 #[cfg(test)]
 pub struct PageRmw<'a> {
-    pub fd: RawFd,
+    pub fd: IoHandle,
     pub offset: u64,
     pub buf: &'a mut [u8],
 }
@@ -187,7 +187,7 @@ pub fn pread_batch(ops: &mut [ReadOp<'_>]) {
 
 /// One pread (uring when available). Returns bytes read (≥0) or negated errno.
 #[inline]
-pub fn pread_single(fd: RawFd, offset: u64, buf: &mut [u8]) -> i32 {
+pub fn pread_single(fd: IoHandle, offset: u64, buf: &mut [u8]) -> i32 {
     if buf.is_empty() {
         return 0;
     }
@@ -772,16 +772,9 @@ fn pread_one(op: &mut ReadOp<'_>) {
     }
     let mut got = 0usize;
     while got < op.buf.len() {
-        let n = unsafe {
-            libc::pread(
-                op.fd,
-                op.buf[got..].as_mut_ptr() as *mut libc::c_void,
-                op.buf.len() - got,
-                (op.offset + got as u64) as i64,
-            )
-        };
+        let n = op.fd.pread(op.offset + got as u64, &mut op.buf[got..]);
         if n < 0 {
-            op.result = -std::io::Error::last_os_error().raw_os_error().unwrap_or(5) as i32;
+            op.result = n;
             return;
         }
         if n == 0 {
@@ -806,16 +799,9 @@ fn pwrite_one(op: &mut WriteOp<'_>) {
     }
     let mut got = 0usize;
     while got < op.buf.len() {
-        let n = unsafe {
-            libc::pwrite(
-                op.fd,
-                op.buf[got..].as_ptr() as *const libc::c_void,
-                op.buf.len() - got,
-                (op.offset + got as u64) as i64,
-            )
-        };
+        let n = op.fd.pwrite(op.offset + got as u64, &op.buf[got..]);
         if n < 0 {
-            op.result = -std::io::Error::last_os_error().raw_os_error().unwrap_or(5) as i32;
+            op.result = n;
             return;
         }
         if n == 0 {
@@ -878,13 +864,23 @@ pub fn page_rmw_serial(
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
+
+    fn dummy_handle() -> IoHandle {
+        #[cfg(unix)]
+        {
+            IoHandle::from_raw_fd(0)
+        }
+        #[cfg(windows)]
+        {
+            IoHandle::from_raw_handle(0)
+        }
+    }
 
     #[test]
     fn pwrite_batch_fail_unfilled_is_not_success() {
         let buf = [1u8; 4];
         let mut ops = [WriteOp {
-            fd: 0,
+            fd: dummy_handle(),
             offset: 0,
             buf: &buf,
             result: i32::MIN,
@@ -928,7 +924,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
 
         // Empty bufs
         let mut empty = [];
@@ -1037,7 +1033,7 @@ mod tests {
         f.write_all(&data).unwrap();
         f.flush().unwrap();
         let f = std::fs::File::open(&path).unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
 
         let mut b0 = [0u8; 50];
         let mut b1 = [0u8; 50];
@@ -1113,7 +1109,7 @@ mod tests {
             f.write_all(b"pool-session-bytes!!").unwrap();
             f.flush().unwrap();
             let f = std::fs::File::open(&path).unwrap();
-            let fd = f.as_raw_fd();
+            let fd = crate::io_handle::IoHandle::from_file(&f);
             let mut b = [0u8; 4];
             let mut ops = [ReadOp {
                 fd,
@@ -1164,7 +1160,7 @@ mod tests {
         f.write_all(b"hello-fallback-path!!").unwrap();
         f.flush().unwrap();
         let f = std::fs::File::open(&path).unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut b = [0u8; 5];
         let mut ops = [ReadOp {
             fd,
@@ -1203,7 +1199,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
         let d0 = [1u8; 50];
         let d1 = [2u8; 50];
         let d2 = [3u8; 50];
@@ -1232,7 +1228,7 @@ mod tests {
             assert!(op.result >= 50, "result={}", op.result);
         }
         let mut got = vec![0u8; 150];
-        let n = unsafe { libc::pread(fd, got.as_mut_ptr() as *mut libc::c_void, 150, 0) };
+        let n = fd.pread(0, &mut got);
         assert_eq!(n, 150);
         assert_eq!(&got[0..50], &d0[..]);
         assert_eq!(&got[50..100], &d1[..]);
@@ -1267,7 +1263,7 @@ mod tests {
         assert!(rmw_ok);
         drop(pages);
         let mut got2 = vec![0u8; 150];
-        let n2 = unsafe { libc::pread(fd, got2.as_mut_ptr() as *mut libc::c_void, 150, 0) };
+        let n2 = fd.pread(0, &mut got2);
         assert_eq!(n2, 150);
         assert_eq!(got2[0], 11);
         assert_eq!(got2[50], 12);
@@ -1306,7 +1302,7 @@ mod tests {
             f.flush().unwrap();
         }
         let f = std::fs::File::open(&path).unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
 
         // Inject Some(false) through the real pread_batch_uring match.
         TEST_FORCE_SESSION_FALSE.with(|c| c.set(true));
@@ -1369,7 +1365,7 @@ mod tests {
             f.flush().unwrap();
         }
         let f = std::fs::File::open(&path).unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
 
         // Three waves — first opens TL ring; later waves must reuse it correctly.
         for wave in 0..3u64 {
@@ -1445,7 +1441,7 @@ mod tests {
             f.flush().unwrap();
         }
         let f = std::fs::File::open(&path).unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
 
         let mut bufs: Vec<[u8; 1]> = (0..N).map(|_| [0u8; 1]).collect();
         let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(|b| &mut b[..]).collect();

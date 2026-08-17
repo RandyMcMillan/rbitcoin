@@ -15,13 +15,13 @@
 
 use crate::compact::output_flags;
 use crate::error::StoreError;
+use crate::io_handle::IoHandle;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::{decode_spent_slot_v17, encode_spent_slot_v17, OutputRecord, TxTable};
 use crate::uring_session::{self, UringSession};
 use crate::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
-use std::os::fd::RawFd;
 
 const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
 const MAX_SLOTS: usize = 128;
@@ -57,7 +57,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
     }
 
-    let body_fd: RawFd = txs.spent.body_read_fd();
+    let body_fd: IoHandle = txs.spent.body_read_fd();
     let body_path = txs.spent.body_file_path().to_path_buf();
     let body_pub = txs.spent.body_published_len();
 
@@ -94,7 +94,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                    abs_wait: &mut U64Map<VecDeque<usize>>,
                    work: &[(u64, Fk, u32, Fk)],
                    in_flight: &mut usize,
-                   body_fd: RawFd|
+                   body_fd: IoHandle|
          -> Result<(), StoreError> {
             while *in_flight < MAX_SLOTS && session.free_sq() > 0 && !free_slots.is_empty() {
                 let edge_i = if let Some(ei) = next_ready(pending, abs_busy, abs_wait, work) {
@@ -538,7 +538,7 @@ fn put_spend_batch_pure_write_uring(
     if groups.is_empty() {
         return Ok(cold);
     }
-    let body_fd: RawFd = txs.spent.body_read_fd();
+    let body_fd: IoHandle = txs.spent.body_read_fd();
     let body_path = txs.spent.body_file_path().to_path_buf();
 
     struct PageSlot {
@@ -564,7 +564,7 @@ fn put_spend_batch_pure_write_uring(
                    pending: &mut VecDeque<usize>,
                    groups: &[SpentPageGroup],
                    in_flight: &mut usize,
-                   body_fd: RawFd|
+                   body_fd: IoHandle|
          -> Result<(), StoreError> {
             while *in_flight < slots.len() && session.free_sq() > 0 && !free_slots.is_empty() {
                 let Some(gi) = pending.pop_front() else {

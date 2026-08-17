@@ -81,3 +81,39 @@ impl TestDatadir {
         self.path().join("store")
     }
 }
+
+#[cfg(test)]
+mod contributing_policy {
+    #[test]
+    fn contributing_treats_restating_comments_as_smell() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CONTRIBUTING.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            text.contains("Source-code comments are a smell"),
+            "principle 7 must state comments are a smell"
+        );
+        assert!(
+            lower.contains("what") && text.contains("not clear"),
+            "what-restating smell: the code is not clear"
+        );
+        assert!(
+            lower.contains("why")
+                && (lower.contains("signature") || lower.contains("function name")),
+            "why-restating smell: names or signatures are not carrying the contract"
+        );
+        assert!(
+            lower.contains("weird") && (lower.contains("library") || lower.contains("framework")),
+            "weird-approach smell: language, library, or framework is a poor fit"
+        );
+        assert!(
+            lower.contains("invariant") && (lower.contains("quirk") || lower.contains("safety")),
+            "remaining comments are a specific invariant, protocol, SAFETY, or quirk"
+        );
+        assert!(
+            text.contains("No restating `//` comments"),
+            "review checklist must reject restating line comments"
+        );
+    }
+}

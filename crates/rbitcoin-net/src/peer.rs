@@ -121,6 +121,43 @@ pub async fn connect_and_handshake(
     Ok((their_version, reader, writer))
 }
 
+/// Feeler: send version (relay=0), read their version, close. No verack, no session.
+pub async fn run_feeler(
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    user_agent: &str,
+) -> Result<(), NetError> {
+    let (mut reader, mut writer) = open_v2(stream, magic, false).await?;
+    let services = local_service_flags();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let version = VersionMessage {
+        version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
+        services,
+        timestamp: now,
+        receiver: Address::new(&their_addr, ServiceFlags::NONE),
+        sender: Address::new(&our_addr, services),
+        nonce: rand_nonce(),
+        user_agent: user_agent.to_string(),
+        start_height,
+        relay: false,
+    };
+    write_v2_msg(&mut writer, NetworkMessage::Version(version)).await?;
+    loop {
+        let frame = read_v2_frame(&mut reader, magic).await?;
+        let msg = frame.decode();
+        if matches!(msg.payload(), NetworkMessage::Version(_)) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Perform the version/verack exchange over an established BIP324 session.
 async fn application_handshake(
     reader: &mut V2Reader,
@@ -434,6 +471,7 @@ pub async fn peer_session_with(
                         &mut pending_cmpct,
                         &mut from_this_peer,
                         &mut ban_score,
+                        session.as_deref(),
                     )
                     .await?;
                     if ban_score >= BAN_SCORE_THRESHOLD {
@@ -555,6 +593,7 @@ async fn handle_peer_frame(
     pending_cmpct: &mut HashMap<BlockHash, PendingCmpct>,
     from_this_peer: &mut HashMap<bitcoin::Txid, ()>,
     ban_score: &mut u32,
+    session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
     let msg = decode_framed_offload(frame).await?;
     match msg.payload() {
@@ -566,10 +605,15 @@ async fn handle_peer_frame(
             *peer_wants_headers = true;
         }
         NetworkMessage::SendCmpct(sc) => {
-            // High-bandwidth mode: announce new tips as cmpctblock (version 1 or 2).
-            if sc.version == 1 || sc.version == 2 {
+            // Segwit networks: only version 2 (wtxid short-ids) enables HB.
+            // Version 1 and version > 2 are ignored (p2p_compactblocks).
+            if sc.version == 2 {
+                // They asked us to send compact (or cancelled). That is hb_from.
                 *peer_send_cmpct = sc.send_compact;
-                *peer_cmpct_version = sc.version as u32;
+                *peer_cmpct_version = 2;
+                if let Some(sess) = session {
+                    sess.set_hb_from(sc.send_compact);
+                }
             }
         }
         NetworkMessage::WtxidRelay => {
@@ -577,6 +621,9 @@ async fn handle_peer_frame(
             *peer_wtxid_relay = true;
         }
         NetworkMessage::GetHeaders(gh) => {
+            if let Some(s) = session {
+                s.headers_paused.store(false, Ordering::Relaxed);
+            }
             let headers = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)?;
             queue_out(out_tx, NetworkMessage::Headers(headers))?;
         }
@@ -642,6 +689,7 @@ async fn handle_peer_frame(
                     }
                 }
                 if bad {
+                    rbitcoin_log::debug!("getblocktxn with out-of-bounds tx indices");
                     *ban_score = ban_score.saturating_add(20);
                 } else {
                     queue_out(
@@ -663,7 +711,11 @@ async fn handle_peer_frame(
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                        if !hub.is_connected(h) && !pending_blocks.contains_key(h) {
+                        if hub.is_connected(h) {
+                            if let Some(s) = session {
+                                s.headers_paused.store(false, Ordering::Relaxed);
+                            }
+                        } else if !pending_blocks.contains_key(h) {
                             want.push(Inventory::WitnessBlock(*h));
                         }
                     }
@@ -822,6 +874,9 @@ async fn handle_peer_frame(
                         drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                     }
                     Err(()) => {
+                        rbitcoin_log::debug!(
+                            "previous compact block reconstruction attempt failed"
+                        );
                         *ban_score = ban_score.saturating_add(10);
                         queue_out(
                             out_tx,
@@ -1326,6 +1381,7 @@ mod tests {
                     &mut pending_cmpct,
                     &mut from_peer,
                     &mut ban,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1373,6 +1429,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1394,6 +1451,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1433,6 +1491,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1454,6 +1513,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1476,6 +1536,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1504,6 +1565,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1529,6 +1591,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1556,6 +1619,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1583,6 +1647,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1607,6 +1672,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1628,6 +1694,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1649,6 +1716,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1673,6 +1741,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1692,6 +1761,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1719,6 +1789,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1756,6 +1827,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1777,6 +1849,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1851,6 +1924,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1878,6 +1952,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1916,6 +1991,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();
@@ -1939,6 +2015,7 @@ mod tests {
                 &mut pending_cmpct,
                 &mut from_peer,
                 &mut ban,
+                None,
             )
             .await
             .unwrap();

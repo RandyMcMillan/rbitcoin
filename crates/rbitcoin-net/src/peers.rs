@@ -60,6 +60,15 @@ pub struct LivePeer {
     pub startingheight: i32,
     pub conn_type: PeerConnType,
     pub stop: AtomicBool,
+    /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
+    pub hb_to: AtomicBool,
+    /// They announce new tips as `cmpctblock` to us (`sendcmpct` they sent).
+    pub hb_from: AtomicBool,
+    /// Session should send `sendcmpct`: 0 = none, 1 = off, 2 = on.
+    pub pending_sendcmpct: std::sync::atomic::AtomicU8,
+    /// After a large reorg, announce inv until the peer getheaders/inv's us.
+    pub headers_paused: AtomicBool,
+    owner: std::sync::Weak<PeerHub>,
     recv: Mutex<HashMap<String, u64>>,
     sent: Mutex<HashMap<String, u64>>,
 }
@@ -89,6 +98,21 @@ impl LivePeer {
         self.stop.store(true, Ordering::SeqCst);
     }
 
+    pub fn set_hb_to(&self, v: bool) {
+        self.hb_to.store(v, Ordering::Relaxed);
+    }
+
+    pub fn set_hb_from(&self, v: bool) {
+        self.hb_from.store(v, Ordering::Relaxed);
+    }
+
+    /// We just accepted a new tip from this peer — consider them for HB.
+    pub fn maybe_select_as_hb(&self) {
+        if let Some(hub) = self.owner.upgrade() {
+            hub.maybe_select_hb(self.id);
+        }
+    }
+
     fn snapshot(&self) -> PeerInfo {
         PeerInfo {
             id: self.id,
@@ -101,6 +125,8 @@ impl LivePeer {
             bytesrecv_per_msg: self.recv.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             bytessent_per_msg: self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             conn_type: self.conn_type,
+            bip152_hb_to: self.hb_to.load(Ordering::Relaxed),
+            bip152_hb_from: self.hb_from.load(Ordering::Relaxed),
         }
     }
 }
@@ -128,6 +154,8 @@ pub struct PeerInfo {
     pub bytesrecv_per_msg: HashMap<String, u64>,
     pub bytessent_per_msg: HashMap<String, u64>,
     pub conn_type: PeerConnType,
+    pub bip152_hb_to: bool,
+    pub bip152_hb_from: bool,
 }
 
 /// Thread-safe session table + addnode remembered addrs.
@@ -136,6 +164,8 @@ pub struct PeerHub {
     live: RwLock<HashMap<u64, Arc<LivePeer>>>,
     added: Mutex<HashSet<SocketAddr>>,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
+    /// Peers we asked to send us compact (BIP152 HB, max 3, prefer outbound).
+    hb_selected: Mutex<Vec<u64>>,
 }
 
 impl PeerHub {
@@ -145,6 +175,7 @@ impl PeerHub {
             live: RwLock::new(HashMap::new()),
             added: Mutex::new(HashSet::new()),
             dial_tx: Mutex::new(None),
+            hb_selected: Mutex::new(Vec::new()),
         })
     }
 
@@ -153,7 +184,7 @@ impl PeerHub {
     }
 
     pub fn register(
-        &self,
+        self: &Arc<Self>,
         addr: SocketAddr,
         addrbind: SocketAddr,
         ver: &VersionMessage,
@@ -172,6 +203,11 @@ impl PeerHub {
             startingheight: ver.start_height,
             conn_type,
             stop: AtomicBool::new(false),
+            hb_to: AtomicBool::new(false),
+            hb_from: AtomicBool::new(false),
+            pending_sendcmpct: std::sync::atomic::AtomicU8::new(0),
+            headers_paused: AtomicBool::new(false),
+            owner: Arc::downgrade(self),
             recv: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
         });
@@ -229,6 +265,48 @@ impl PeerHub {
             }
             other => Err(format!("unknown addnode command {other}")),
         }
+    }
+
+    /// Select `id` as a BIP152 high-bandwidth peer (we send them sendcmpct(1)).
+    /// Evicts the oldest inbound if we already have 3; never evict the last outbound
+    /// when adding an inbound.
+    pub fn maybe_select_hb(&self, id: u64) {
+        let Some(peer) = self.get(id) else {
+            return;
+        };
+        let inbound = peer.inbound;
+        let mut sel = self.hb_selected.lock().unwrap_or_else(|e| e.into_inner());
+        if sel.contains(&id) {
+            return;
+        }
+        if sel.len() >= 3 {
+            let evict_at = if inbound {
+                // Prefer evicting an inbound; keep a lone outbound.
+                let outbounds: Vec<usize> = sel
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pid)| self.get(**pid).is_some_and(|p| !p.inbound))
+                    .map(|(i, _)| i)
+                    .collect();
+                if outbounds.len() == 1 && outbounds[0] == 0 {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if evict_at < sel.len() {
+                let evicted = sel.remove(evict_at);
+                if let Some(p) = self.get(evicted) {
+                    p.set_hb_to(false);
+                    p.pending_sendcmpct.store(1, Ordering::Relaxed);
+                }
+            }
+        }
+        sel.push(id);
+        peer.set_hb_to(true);
+        peer.pending_sendcmpct.store(2, Ordering::Relaxed);
     }
 
     pub fn addconnection(&self, addr: SocketAddr, typ: PeerConnType) -> Result<(), String> {

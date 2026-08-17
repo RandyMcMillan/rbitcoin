@@ -355,6 +355,11 @@ async fn run_outbound_session(
     follow_live: Arc<AtomicUsize>,
     typ: PeerConnType,
 ) -> Result<(), NetError> {
+    if typ == PeerConnType::Feeler {
+        let stream = TcpStream::connect(peer).await?;
+        let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
+        return crate::peer::run_feeler(stream, magic, local, peer, height, &user_agent).await;
+    }
     let stream = TcpStream::connect(peer).await?;
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);

@@ -838,6 +838,7 @@ impl MempoolHub {
                 let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
                 let w = tx.compute_wtxid();
                 self.relay_seq.lock().unwrap().insert(w, seq);
+                self.reorg_servable.lock().unwrap().remove(&w);
                 let at = self.mock_now.load(Ordering::Relaxed);
                 self.accept_at.lock().unwrap().insert(w, at);
                 Ok(r)
@@ -1137,6 +1138,11 @@ impl MempoolHub {
             .unwrap()
             .get(wtxid)
             .is_some_and(|s| *s < last_inv_seq)
+    }
+
+    /// Entry sequence for a live wtxid, if we assigned one.
+    pub fn relay_seq_of(&self, wtxid: &Wtxid) -> Option<u64> {
+        self.relay_seq.lock().unwrap().get(wtxid).copied()
     }
 
     /// Drop live txs that are non-final / immature at the new tip (invalidate

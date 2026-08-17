@@ -703,20 +703,27 @@ fn queue_due_tx_invs(
         return;
     }
     let mut n = 0u32;
+    let mut max_ann = session.last_inv_sequence();
     for (txid, _, _, tx) in live {
         if from_this_peer.contains_key(&txid) {
             continue;
         }
         let w = tx.compute_wtxid();
-        if !mp.tx_inv_due(&w) {
+        if session.has_announced_wtx(&w) || !mp.tx_inv_due(&w) {
             continue;
         }
         session.note_announced_wtx(w);
         let _ = queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
         n += 1;
+        if let Some(seq) = mp.relay_seq_of(&w) {
+            max_ann = max_ann.max(seq.saturating_add(1));
+        }
     }
     if n > 0 {
-        session.note_tx_inv_seq(mp.current_relay_seq());
+        // Core `m_last_inv_sequence`: only txs that existed at INV time.
+        // Never snap to current_relay_seq() — a later accept can race in
+        // and make the new entry servable (mempool_reorg.py:122).
+        session.note_tx_inv_seq(max_ann.max(session.last_inv_sequence()));
     }
 }
 
@@ -844,14 +851,14 @@ async fn handle_peer_frame(
                                 let w = tx.compute_wtxid();
                                 let announced = session.is_some_and(|s| s.has_announced_wtx(&w));
                                 let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
-                                if announced
-                                    || mp.is_reorg_servable(&w)
-                                    || mp.is_relay_servable(&w, last_inv)
-                                {
+                                // Core FindTxForGetData: info_for_relay (seq < last
+                                // INV) plus announced-to-this-peer. Reorg-reaccept
+                                // uses seq=0 (servable while last_inv starts at 1);
+                                // do not keep a sticky reorg set — a later regular
+                                // accept of the same wtxid must notfound
+                                // (mempool_reorg.py:122).
+                                if announced || mp.is_relay_servable(&w, last_inv) {
                                     mp.mark_broadcast(txid);
-                                    if let Some(s) = session {
-                                        s.note_announced_wtx(w);
-                                    }
                                     queue_out(out_tx, NetworkMessage::Tx(tx))?;
                                 } else {
                                     queue_out(
@@ -869,14 +876,8 @@ async fn handle_peer_frame(
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
                                 let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
                                 let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
-                                if announced
-                                    || mp.is_reorg_servable(wtxid)
-                                    || mp.is_relay_servable(wtxid, last_inv)
-                                {
+                                if announced || mp.is_relay_servable(wtxid, last_inv) {
                                     mp.mark_broadcast(&tx.compute_txid());
-                                    if let Some(s) = session {
-                                        s.note_announced_wtx(*wtxid);
-                                    }
                                     queue_out(out_tx, NetworkMessage::Tx(tx))?;
                                 } else {
                                     queue_out(
@@ -3175,6 +3176,61 @@ mod tests {
                     assert_eq!(tx.compute_wtxid(), disconnected.compute_wtxid())
                 }
                 other => panic!("reorg-servable must serve without INV, got {other:?}"),
+            }
+
+            // mempool_reorg.py:122 — a later regular submit (even of a
+            // wtxid that was once reorg-reaccepted) must notfound until
+            // this peer's last INV sequence passes the new entry seq.
+            sess.note_tx_inv_seq(hub.mempool().unwrap().current_relay_seq());
+            let cb3 = hub
+                .query
+                .reconstruct_block_at_height(Height(3))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let later = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb3, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            hub.mempool()
+                .unwrap()
+                .accept_tx(&later)
+                .expect("accept later");
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    later.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(sess.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(later.compute_wtxid())]);
+                }
+                other => panic!("just-submitted tx must notfound, got {other:?}"),
             }
 
             let _ = std::fs::remove_dir_all(dir);

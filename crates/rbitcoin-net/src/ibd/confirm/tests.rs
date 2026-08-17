@@ -69,24 +69,135 @@ fn prune_committed_uses_drain_and_fence() {
     );
 }
 
-/// n−1: bind (stamp) must run before drain+fence prune.
+/// Mainnet 187: first pack writes (drain+fence), next pack spends those creates.
+/// Stamp skips body_range when in-flight still has CreatePin outs; pin needs
+/// those outs. Drive the shipped confirm engine (not a source-order pin).
 #[test]
-fn prune_committed_runs_after_stamp() {
-    let src = include_str!("mod.rs");
-    let stamp = src
-        .find("confirm_wire_lookup_stamp_with_hits")
-        .expect("stamp");
-    let prune = src
-        .rfind("lookup_ahead.prune_committed")
-        .expect("prune after stamp");
-    assert!(
-        stamp < prune,
-        "prune_committed must run after leftover bind"
+fn confirm_engine_pins_spend_of_just_written_pack() {
+    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
+    use crate::chain::ChainHub;
+    use crate::ibd::status::LoopStats;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use rbitcoin_consensus::{mine_regtest_paying, pad_empty_from, ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-engine-187-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let q = Query::open_or_create(dir.join("store")).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let hub = Arc::new(ChainHub::new(q, params.clone(), Milestone::NONE));
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().expect("genesis");
+    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let maturity = params.coinbase_maturity();
+    let (tip, tip_time, cbs) =
+        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
+    let matured = cbs[0];
+    let spend = |prev: Txid, val: Amount| Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: val,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let h_parent = maturity + 2;
+    let parent = mine_regtest_paying(
+        tip,
+        tip_time + 600,
+        h_parent,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend(matured, Amount::from_sat(49_0000_0000))],
     );
-    assert!(
-        src.contains("apply_disconnect"),
-        "reorg drop is before bind, not leftover_drop_txids"
+    let parent_spend_txid = parent.txdata[1].compute_txid();
+    let child = mine_regtest_paying(
+        parent.block_hash(),
+        parent.header.time + 600,
+        h_parent + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
     );
+    let child_h = h_parent + 1;
+    let child_hash = child.block_hash();
+
+    let feed = Arc::new(ConfirmFeed::new());
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    let accepted = Arc::new(AtomicU32::new(0));
+    let (engine, _queues) = spawn_confirm_engine(
+        Arc::clone(&hub),
+        Arc::clone(&feed),
+        ev_tx,
+        accepted,
+        Arc::new(LoopStats::default()),
+    );
+
+    let wait_tip = |want: u32| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if hub.tip_height() == Some(want) {
+                return;
+            }
+            match ev_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(ConfirmEvent::Reject { height, err, .. }) => {
+                    panic!("confirm reject @{height}: {err}");
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "timeout waiting for tip={want} (have {:?})",
+                            hub.tip_height()
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "confirm engine exited before tip={want} (have {:?})",
+                        hub.tip_height()
+                    );
+                }
+            }
+        }
+    };
+
+    // Two packs: write parent (drain+fence) before the child is even offered.
+    feed.note_wire(h_parent, parent.block_hash(), Some(parent));
+    wait_tip(h_parent);
+    feed.note_wire(child_h, child_hash, Some(child));
+    wait_tip(child_h);
+
+    feed.request_stop();
+    feed.notify();
+    let _ = engine.join();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.

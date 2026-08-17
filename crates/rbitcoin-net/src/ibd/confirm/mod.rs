@@ -51,8 +51,9 @@ impl LoadAheadState {
 
     /// Drop packs TipOnly can see: drain inserted **and** fence covers.
     ///
-    /// Call **after** stamp/bind so n−1 still hits this map. Either signal
-    /// alone keeps the layer.
+    /// Call **after** pin + scripts handoff so n−1 still has CreatePin outs
+    /// for load (stamp skips body_range when `get_out`). Either signal alone
+    /// keeps the layer.
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
@@ -1189,7 +1190,7 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Load: claim resolve-complete BQ heights → stamp (BQ hits + leftover TipOnly) → pin → scripts.
+    // Load: claim resolve-complete BQ heights → stamp (BQ hits + in-flight + TipOnly) → pin → scripts; prune after handoff.
     let hub_load = Arc::clone(&hub);
     let feed_load = Arc::clone(&feed);
     let event_tx_load = event_tx.clone();
@@ -1460,7 +1461,6 @@ pub(crate) fn spawn_confirm_engine(
                         .collect();
                     lookup_ahead.note_archived_creates(&hub_load, &hh);
                 }
-                lookup_ahead.prune_committed(&hub_load);
                 let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
                 let plan_ns = stamped.work_ns;
                 let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
@@ -1569,6 +1569,9 @@ pub(crate) fn spawn_confirm_engine(
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
+                // After pin / scripts handoff (or load reject): drain+fence
+                // layers are TipOnly's. Next claim must not see those outs.
+                lookup_ahead.prune_committed(&hub_load);
             }
             drop(mat_tx);
             let _ = scripts.join();

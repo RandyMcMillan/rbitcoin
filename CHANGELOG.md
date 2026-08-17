@@ -58,6 +58,9 @@ before 1.0).
   README no longer hardcodes `0.1.0`; shipped strings stay
   `workspace.package.version`.
 
+- **Quality:** **Q-47** closed (honest chaininfo). **Q-48** is BIP331 when
+  rust-bitcoin grows the types — no private `rbtpkg` stand-in.
+
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
   `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
   never. Stratum / wallet keys stay non-goals.
@@ -85,7 +88,6 @@ before 1.0).
   that miss. The 250 ms odd-page `Corrupt` aborted lookup waves and dumped
   more work onto leftover. Per-page `AtomicU32`s are gone; insert is again
   sole-writer page-coalesced `pwrite`.
->>>>>>> pr-87
 
 - **Tests assert behavior, not the repo.** Default-suite tests no longer
   `include_str!` production sources or `CONTRIBUTING.md` to grep

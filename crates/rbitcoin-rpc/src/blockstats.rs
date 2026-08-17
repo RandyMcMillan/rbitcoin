@@ -31,7 +31,7 @@ pub fn txout_serialized_size(out: &TxOut) -> i64 {
     buf.len() as i64
 }
 
-/// Core `CalculateTruncatedMedian`: even length takes the lower middle, not the mean.
+/// Core `CalculateTruncatedMedian`: even length is the integer mean of the two middles.
 pub fn truncated_median(mut scores: Vec<i64>) -> i64 {
     let n = scores.len();
     if n == 0 {
@@ -39,7 +39,7 @@ pub fn truncated_median(mut scores: Vec<i64>) -> i64 {
     }
     scores.sort_unstable();
     if n.is_multiple_of(2) {
-        scores[n / 2 - 1]
+        (scores[n / 2 - 1] + scores[n / 2]) / 2
     } else {
         scores[n / 2]
     }
@@ -470,11 +470,13 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn truncated_median_even_takes_lower_middle() {
+    fn truncated_median_even_averages_two_middles() {
         assert_eq!(truncated_median(vec![]), 0);
         assert_eq!(truncated_median(vec![3]), 3);
         assert_eq!(truncated_median(vec![1, 2, 3]), 2);
         assert_eq!(truncated_median(vec![1, 2, 3, 4]), 2);
+        // rpc_getblockstats.py height 103: (2880 + 36600) / 2
+        assert_eq!(truncated_median(vec![2880, 2880, 36600, 43200]), 19740);
     }
 
     #[test]

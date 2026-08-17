@@ -40,12 +40,14 @@ before 1.0).
   `RBITCOIN_IO=pread` still disables the session.
 
 - **Confirm parent identity:** lookup prepends one `IdLayer` per resolve
-  wave (`lo..=hi`) and `Arc`-bumps the chain head (`PublishedIds`). Load
-  stamp is in-flight → published union → TipOnly leftover. A layer stays
-  until no height in its span is still on the body queue. Disconnect stores
-  `None` immediately. `pin_txid=` counts published-union hits. IBD lookup
-  TipOnly-resolves up to **16000** inputs (include-overshoot) or **1080**
-  blocks per wave (4× load's 144-block cap; ~1 week of 10-minute blocks).
+  wave (`lo..=hi`) and `Arc`-bumps the chain head (`PublishedIds`). Get
+  walks the chain (txid identity hasher; no union `reindex`). Drop is
+  splice when no height in the span remains on the BQ. While `ready` is
+  over half the 1-min BQ window, lookup holds short waves so it does not
+  mint one layer per newly fetched block. Disconnect stores `None`
+  immediately. `pin_txid=` counts published-union hits. IBD lookup
+  TipOnly-resolves up to **64000** inputs (include-overshoot) or **1080**
+  blocks per wave (8× load's 8000-input cap; ~1 week of 10-minute blocks).
 
 - **Head resolve identity:** each probe wave fills `txid.body` in two shots
   (first four cands, then the rest if still unfinished). A connected win

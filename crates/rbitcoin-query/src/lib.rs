@@ -1042,6 +1042,8 @@ pub struct Query {
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
     /// Last soft-assign restricted flag (over free-byte floor; cache for meters).
     block_queue_pressure: AtomicBool,
+    /// Last 1-min confirm window (`bq soft=n/win` `win`). 0 = rate unknown.
+    soft_confirm_window: AtomicU32,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -1136,6 +1138,7 @@ impl Query {
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             block_queue_pressure: AtomicBool::new(false),
+            soft_confirm_window: AtomicU32::new(0),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -1379,12 +1382,21 @@ impl Query {
     /// to the confirm-time window). Does **not** affect peer reads or
     /// [`Self::block_queue_offer`]. `rate_blocks_per_s` is accepted for call-site
     /// compatibility; restriction is byte-only (window size is separate).
-    pub fn block_queue_update_soft_pressure(&self, _rate_blocks_per_s: Option<f64>) -> bool {
+    pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
+        self.soft_confirm_window.store(
+            soft_confirm_window_n(rate_blocks_per_s),
+            AtomicOrdering::Relaxed,
+        );
         let depth_bytes = self.block_queue.lock().unwrap().bytes();
         let restricted = soft_assign_restricted(depth_bytes);
         self.block_queue_pressure
             .store(restricted, AtomicOrdering::Relaxed);
         restricted
+    }
+
+    /// Last published 1-min confirm window (`bq soft=n/win`). 0 if rate unknown.
+    pub fn soft_confirm_window(&self) -> u32 {
+        self.soft_confirm_window.load(AtomicOrdering::Relaxed)
     }
 
     /// Current soft-assign restricted flag (over free-byte floor).

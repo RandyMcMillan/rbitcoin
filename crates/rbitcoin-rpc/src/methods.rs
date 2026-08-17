@@ -356,6 +356,7 @@ pub fn dispatch(
         "submitblock" => submitblock(ctx, &params),
         "submitheader" => submitheader(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
+        "mockscheduler" => mockscheduler(ctx, &params),
         "invalidateblock" => invalidateblock(ctx, &params),
         "reconsiderblock" => reconsiderblock(ctx, &params),
         "preciousblock" => preciousblock(ctx, &params),
@@ -541,6 +542,9 @@ fn method_help(m: &str) -> String {
              submit=false returns {hash,hex} without connecting the block."
             .into(),
         "generate" => "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+            .into(),
+        "mockscheduler" => "mockscheduler delta_seconds\n\
+             Regtest harness only. Advance the scheduler; rebroadcast unbroadcast txs."
             .into(),
         "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
              Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
@@ -1899,6 +1903,18 @@ fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+fn mockscheduler(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["delta_seconds"])?;
+    require_regtest(ctx, "mockscheduler")?;
+    let delta = params.req_u64(0, "delta_seconds")?;
+    if delta > 0 {
+        if let Some(mp) = ctx.mempool.as_ref() {
+            mp.rebroadcast_unbroadcast();
+        }
+    }
+    Ok(Value::Null)
 }
 
 fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -4258,6 +4274,22 @@ mod tests {
         let miss = dispatch(&ctx, "invalidateblock", vec![json!("00".repeat(32))]).unwrap_err();
         assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
         assert_eq!(miss["message"], "Block not found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mockscheduler_rebroadcasts_unbroadcast() {
+        let (ctx, dir) = ctx_empty();
+        let e = dispatch(&ctx, "mockscheduler", vec![]).unwrap_err();
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delta_seconds"),
+            "{e}"
+        );
+        let r = dispatch(&ctx, "mockscheduler", vec![json!(900)]).unwrap();
+        assert!(r.is_null(), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1143,6 +1143,10 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
             mp.note_unbroadcast(r.txid);
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
+        // Core sendraw of a live mempool tx is a no-op success (returns txid).
+        Err(e) if e.to_string().starts_with("duplicate ") => {
+            Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
+        }
         Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),
     }
 }

@@ -324,7 +324,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            session.as_deref_mut(),
+            session.as_mut().map(|s| &mut **s),
             &mut had_id,
         )?;
     }
@@ -357,7 +357,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            session.as_deref_mut(),
+            session.as_mut().map(|s| &mut **s),
             &mut had_id,
         )?;
     }
@@ -664,7 +664,7 @@ fn id_idx_wave(
     let (id_map, _pages) = if need.is_empty() {
         (HashMap::new(), 0)
     } else {
-        match session.as_deref_mut() {
+        match &mut session {
             Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
             None => side.get_many_page_grouped(&need)?,
         }

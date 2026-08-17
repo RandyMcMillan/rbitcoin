@@ -309,6 +309,7 @@ pub fn dispatch(
         "getblockhash" => getblockhash(ctx, &params),
         "getblockheader" => getblockheader(ctx, &params),
         "getblock" => getblock(ctx, &params),
+        "getblockstats" => crate::blockstats::getblockstats(ctx, &params),
         "getdifficulty" => {
             params.reject_unknown(&[])?;
             getdifficulty(ctx)
@@ -462,6 +463,7 @@ const METHOD_LIST: &[&str] = &[
     "getblockhash",
     "getblockheader",
     "getblock",
+    "getblockstats",
     "getdifficulty",
     "getnetworkinfo",
     "getconnectioncount",
@@ -515,7 +517,11 @@ fn method_help(m: &str) -> String {
                 .into()
         }
         "getblockchaininfo" => "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
-             chainwork, size_on_disk, and verificationprogress are placeholders."
+             chainwork is summed header work (regtest 2/block). size_on_disk and \
+             verificationprogress are placeholders."
+            .into(),
+        "getblockstats" => "getblockstats hash_or_height ( stats )\n\
+             Reconstruct the block and return fee / UTXO / weight statistics."
             .into(),
         "generatetoaddress" => "generatetoaddress nblocks address (maxtries)\n\
              Regtest harness only. Mines nblocks paying address via the P2P accept path."
@@ -647,7 +653,7 @@ fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         "difficulty": difficulty_at_tip(ctx).unwrap_or(0.0),
         "verificationprogress": if ibd { 0.5 } else { 1.0 },
         "initialblockdownload": ibd,
-        "chainwork": "",
+        "chainwork": chainwork_hex(ctx, ctx.query.tip_height()),
         "size_on_disk": 0,
         "pruned": false,
         "warnings": "",
@@ -735,9 +741,31 @@ fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
         "nonce": rec.nonce,
         "bits": format!("{:08x}", rec.bits),
         "difficulty": difficulty_from_bits(rec.bits),
+        "chainwork": chainwork_hex(ctx, Some(height)),
         "previousblockhash": prev,
         "nTx": ctx.query.block_tx_fks(height).map(|v| v.len()).unwrap_or(0),
     }))
+}
+
+/// 32-byte BE chainwork hex (regtest = 2 per block). Empty store → 64 zeros.
+fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String {
+    let Some(tip) = through.or_else(|| ctx.query.tip_height()) else {
+        return "00".repeat(32);
+    };
+    if let Some(hub) = ctx.chain.as_ref() {
+        if ctx.query.tip_height() == Some(tip) {
+            if let Ok(w) = hub.chain_work() {
+                return hex_encode(w.to_be_bytes());
+            }
+        }
+    }
+    let mut works = Vec::new();
+    for h in 0..=tip.0 {
+        if let Ok(hdr) = ctx.query.wire_header_at_height(Height(h)) {
+            works.push(hdr.work());
+        }
+    }
+    hex_encode(rbitcoin_net::sum_work(works.into_iter()).to_be_bytes())
 }
 
 fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2757,8 +2785,8 @@ mod tests {
         assert_eq!(info["chain"], "regtest");
         assert_eq!(info["blocks"], 0);
         assert_eq!(info["initialblockdownload"], false);
-        // Documented placeholders — not computed (Q-15).
-        assert_eq!(info["chainwork"], "");
+        // No headers → zero work. `size_on_disk` stays a placeholder.
+        assert_eq!(info["chainwork"], "00".repeat(32));
         assert_eq!(info["size_on_disk"], 0);
         assert_eq!(info["verificationprogress"], 1.0);
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
@@ -4231,6 +4259,219 @@ mod tests {
             msg.contains("future") || msg.contains("timestamp") || msg.contains("time-too-new"),
             "future header vs mock now: {r}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getblockheader_chainwork_is_real_regtest_work() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let gen = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+        let hdr0 = dispatch(&ctx, "getblockheader", vec![gen]).unwrap();
+        let w0 = hdr0["chainwork"].as_str().unwrap();
+        assert_eq!(w0.len(), 64);
+        assert_eq!(&w0[62..], "02", "genesis work is 2: {w0}");
+        dispatch(&ctx, "generate", vec![json!(50)]).unwrap();
+        let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        let hdr = dispatch(&ctx, "getblockheader", vec![best]).unwrap();
+        let w = hdr["chainwork"].as_str().unwrap();
+        // 51 headers (0..=50) × 2 = 102 = 0x66
+        assert_eq!(&w[62..], "66", "tip work {w}");
+        let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(info["chainwork"], hdr["chainwork"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getblockstats_coinbase_only_and_op_return_match_helper() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let got = dispatch(&ctx, "getblockstats", vec![json!(1)]).unwrap();
+        let block = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
+        let want = crate::blockstats::compute_block_stats(
+            1,
+            &block,
+            rbitcoin_consensus::median_time_past(hub.query.as_ref(), Height(1))
+                .unwrap_or(block.header.time),
+            rbitcoin_consensus::block_subsidy(1, &hub.params),
+            |op| {
+                for tx in &block.txdata {
+                    if tx.compute_txid() == op.txid {
+                        return tx.output.get(op.vout as usize).cloned();
+                    }
+                }
+                None
+            },
+        )
+        .unwrap();
+        assert_eq!(got, want.to_json());
+        assert_eq!(got["txs"], 1);
+        assert_eq!(got["ins"], 0);
+        assert_eq!(got["subsidy"], 50_0000_0000u64);
+        assert_eq!(got["totalfee"], 0);
+
+        let genesis = dispatch(&ctx, "getblockstats", vec![json!(0)]).unwrap();
+        assert_eq!(
+            genesis["blockhash"],
+            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+        );
+        assert_eq!(genesis["utxo_increase"], 1);
+        assert_eq!(genesis["utxo_size_inc"], 117);
+        assert_eq!(genesis["utxo_increase_actual"], 0);
+        assert_eq!(genesis["utxo_size_inc_actual"], 0);
+
+        dispatch(&ctx, "generate", vec![json!(100)]).unwrap();
+        let h1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![h1, json!(2)]).unwrap();
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let cb_val =
+            (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(cb_val - 2_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x21]),
+                },
+            ],
+        };
+        dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(&spend)))],
+        )
+        .unwrap();
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let tip_h = dispatch(&ctx, "getblockcount", vec![]).unwrap();
+        let got = dispatch(&ctx, "getblockstats", vec![tip_h.clone()]).unwrap();
+        let h = tip_h.as_u64().unwrap() as u32;
+        let block = hub.query.reconstruct_block_at_height(Height(h)).unwrap();
+        let want = crate::blockstats::compute_block_stats(
+            h,
+            &block,
+            rbitcoin_consensus::median_time_past(hub.query.as_ref(), Height(h))
+                .unwrap_or(block.header.time),
+            rbitcoin_consensus::block_subsidy(h, &hub.params),
+            |op| {
+                for tx in &block.txdata {
+                    if tx.compute_txid() == op.txid {
+                        return tx.output.get(op.vout as usize).cloned();
+                    }
+                }
+                let (fk, rec) = hub.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
+                let out = hub.query.tx_output_at_fk(fk, &rec, op.vout).ok()?;
+                Some(TxOut {
+                    value: Amount::from_sat(out.value.max(0) as u64),
+                    script_pubkey: ScriptBuf::from_bytes(out.script),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(got, want.to_json());
+        assert_eq!(got["txs"], 2);
+        assert_eq!(got["ins"], 1);
+        assert!(
+            got["utxo_increase_actual"].as_i64().unwrap() < got["utxo_increase"].as_i64().unwrap(),
+            "OP_RETURN excluded from actual: {got}"
+        );
+        assert_eq!(got["totalfee"], 2_000);
+
+        let mut named = serde_json::Map::new();
+        named.insert("hash_or_height".into(), got["blockhash"].clone());
+        let by_hash = dispatch(&ctx, "getblockstats", RpcParams::named(named)).unwrap();
+        assert_eq!(by_hash, got);
+        let mut named = serde_json::Map::new();
+        named.insert("hash_or_height".into(), json!(h));
+        named.insert("stats".into(), json!(["minfee"]));
+        let one = dispatch(&ctx, "getblockstats", RpcParams::named(named)).unwrap();
+        assert_eq!(
+            one.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["minfee"]
+        );
+        assert_eq!(one["minfee"], got["minfee"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getblockstats_core_error_needles() {
+        use bitcoin::consensus::encode::serialize;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+
+        let e = dispatch(&ctx, "getblockstats", vec![json!(2)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Target block height 2 after current tip 1"),
+            "{e}"
+        );
+        let e = dispatch(&ctx, "getblockstats", vec![json!(-1)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Target block height -1 is negative"),
+            "{e}"
+        );
+        let e = dispatch(&ctx, "getblockstats", vec![json!(1), json!(["asdfghjkl"])]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert_eq!(e["message"], "Invalid selected statistic 'asdfghjkl'");
+        let e = dispatch(
+            &ctx,
+            "getblockstats",
+            vec![json!(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(e["message"], "Block not found");
+        let e = dispatch(&ctx, "getblockstats", vec![]).unwrap_err();
+        assert_eq!(e["code"], ERR_MISC);
+        assert_eq!(e["message"], "getblockstats hash_or_height ( stats )");
+        let e = dispatch(&ctx, "getblockstats", vec![json!("00"), json!(1), json!(2)]).unwrap_err();
+        assert_eq!(e["code"], ERR_MISC);
+        assert_eq!(e["message"], "getblockstats hash_or_height ( stats )");
+
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let child = mine_regtest_paying(prev, time, 2, script, vec![]);
+        let hex = rbitcoin_primitives::hex_encode(serialize(&child));
+        dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
+        let e = dispatch(
+            &ctx,
+            "getblockstats",
+            vec![json!(child.block_hash().to_string())],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_MISC);
+        assert_eq!(e["message"], "Block not available (not fully downloaded)");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3,6 +3,7 @@
 //! See `docs/rpc.md` for methods, auth, and permanent gaps.
 
 mod auth;
+mod blockstats;
 mod methods;
 mod server;
 

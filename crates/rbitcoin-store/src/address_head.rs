@@ -309,6 +309,13 @@ pub fn entry_from_page_buf(buf: &[u8], local: u64, entry_bytes: u8) -> Option<u6
     })
 }
 
+/// Two loads + hop of one probe page (leftover-miss dump).
+pub(crate) struct PageHopDump {
+    pub scan: ProbeRegionScan,
+    pub hop_equal_second: bool,
+    pub occupied: u32,
+}
+
 /// Result of hopping through one loaded page.
 #[derive(Debug, Clone)]
 pub struct ProbeRegionScan {
@@ -746,6 +753,67 @@ impl AddressHead {
             }
         }
         Ok(need)
+    }
+
+    fn load_page_slots_read_at(
+        &self,
+        page_base: u64,
+        n_slots: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, StoreError> {
+        let es = self.layout.entry_bytes as usize;
+        if es != 4 && es != 8 {
+            return Err(StoreError::Corrupt("address head entry_bytes"));
+        }
+        let mut need = (n_slots as usize).saturating_mul(es);
+        if need > buf.len() {
+            return Err(StoreError::Corrupt("probe page buffer short"));
+        }
+        let off = self.entry_off(page_base);
+        let avail = self.file.data_len().saturating_sub(off) as usize;
+        need = (need.min(avail) / es) * es;
+        if need == 0 {
+            return Ok(0);
+        }
+        self.file.read_at(off, &mut buf[..need])?;
+        Ok(need)
+    }
+
+    /// Load the probe page twice and hop. Leftover-miss dump only.
+    pub(crate) fn dump_page_hop(&self, mixed: &[u8; 32]) -> Result<PageHopDump, StoreError> {
+        let bits = self.layout.bits;
+        let page_base = page_base_for_txid(mixed, bits);
+        let page_slots = page_slot_count(bits);
+        let es = self.layout.entry_bytes;
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        let n = self.load_page_slots_read_at(page_base, page_slots, &mut buf)?;
+        let es_u = es as usize;
+        if n < es_u {
+            return Ok(PageHopDump {
+                scan: hop_scan_page(&[], es, 0, 1, 0, MAX_PROBE),
+                hop_equal_second: true,
+                occupied: 0,
+            });
+        }
+        let nslots = (n / es_u) as u64;
+        let h1 = h1_in_page(mixed, bits);
+        let h2 = h2_in_page(mixed, bits);
+        let scan = hop_scan_page(&buf[..n], es, h1, h2, nslots, MAX_PROBE);
+        let mut occupied = 0u32;
+        for i in 0..nslots {
+            if entry_from_page_buf(&buf[..n], i, es).unwrap_or(0) != 0 {
+                occupied = occupied.saturating_add(1);
+            }
+        }
+        let mut buf2 = [0u8; PROBE_REGION_BYTES];
+        let n2 = self.load_page_slots_read_at(page_base, page_slots, &mut buf2)?;
+        let nslots2 = (n2 / es_u) as u64;
+        let scan2 = hop_scan_page(&buf2[..n2.min(buf2.len())], es, h1, h2, nslots2, MAX_PROBE);
+        Ok(PageHopDump {
+            hop_equal_second: scan.cands == scan2.cands && scan.hit_empty == scan2.hit_empty,
+            scan,
+            occupied,
+        })
     }
 
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {

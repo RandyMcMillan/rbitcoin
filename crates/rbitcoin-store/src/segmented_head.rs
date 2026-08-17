@@ -290,6 +290,32 @@ impl SegmentedTxHead {
         (self.open_keys_len() as u64).saturating_mul(8)
     }
 
+    /// Open-tail page hop dump for leftover-miss diagnostics.
+    pub(crate) fn leftover_open_hop(
+        &self,
+        mixed: &[u8; 32],
+    ) -> Result<(u32, u64, crate::address_head::PageHopDump), StoreError> {
+        let segs = self.segments_snapshot();
+        let Some(last) = segs.last() else {
+            return Ok((
+                0,
+                0,
+                crate::address_head::PageHopDump {
+                    scan: crate::address_head::ProbeRegionScan {
+                        cands: Vec::new(),
+                        hit_empty: true,
+                        depth_end: 0,
+                        empty_local: 0,
+                    },
+                    hop_equal_second: true,
+                    occupied: 0,
+                },
+            ));
+        };
+        let dump = last.head.dump_page_hop(mixed)?;
+        Ok((last.file_id, last.first_fk, dump))
+    }
+
     /// Open (unsealed) tail: `(first_fk, count)`. `None` if no segments or tail sealed.
     pub fn open_tail_range(&self) -> Option<(u64, u64)> {
         let segs = self.segments_snapshot();

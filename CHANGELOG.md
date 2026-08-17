@@ -38,6 +38,10 @@ before 1.0).
 
 ### Changed
 
+- **Leftover probe dump.** The first TipOnly leftover miss in a pack logs
+  hop + every cand (`txid.body` prefix, match, rel/abs fk) once. The reject
+  line adds `diag=1`.
+
 - **Withdrawn: open `tx.head` page seqlock (#82 / #84).** Leftover misses
   are old parent txids with a long hop of cands (`miss_on=body`, ~25–34).
   A torn old/new page still holds those occupants; seqlock cannot explain

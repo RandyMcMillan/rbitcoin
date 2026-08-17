@@ -678,6 +678,9 @@ pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
             if let Some(on) = miss.miss_on {
                 s.push_str(&format!(" miss_on={} miss_cands={}", on, miss.miss_cands));
             }
+            if rbitcoin_store::leftover_probe_diag_ready() {
+                s.push_str(" diag=1");
+            }
         }
         s.push(')');
         s

@@ -51,6 +51,8 @@ pub fn resolve_fk_and_range_batch_with_tip(
 }
 
 fn note_first_leftover_miss(
+    table: &TxTable,
+    txids: &[[u8; 32]],
     tip_only: bool,
     winner: &[Option<(Fk, (u64, u64))>],
     connected: &[bool],
@@ -68,8 +70,128 @@ fn note_first_leftover_miss(
         let on =
             crate::head_resolve_pick::classify_leftover_miss(n_cands[i], had_id[i], connected[i]);
         crate::head_resolve_stats::note_leftover_miss(on, n_cands[i] as u64);
+        match diagnose_txid_probe(table, &txids[i]) {
+            Ok(d) => {
+                rbitcoin_log::warn!("store: {}", format_leftover_probe_diag(&d));
+                crate::head_resolve_stats::note_leftover_probe_diag(d);
+            }
+            Err(e) => {
+                rbitcoin_log::warn!("store: leftover probe diag failed: {e}");
+            }
+        }
         return;
     }
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len().saturating_mul(2));
+    for &x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn format_leftover_probe_diag(d: &crate::head_resolve_stats::LeftoverProbeDiag) -> String {
+    let age = d
+        .sealed_age
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "-".into());
+    let mut s = format!(
+        "leftover probe diag txid={} mix={} page_base={} bits={} file_id={} first_fk={} age={} \
+         hit_empty={} depth_end={} empty_local={} occ={} hop2eq={} ncand={}",
+        hex_bytes(&d.txid),
+        hex_bytes(&d.mixed_prefix),
+        d.page_base,
+        d.bits,
+        d.file_id,
+        d.first_fk,
+        age,
+        u8::from(d.hit_empty),
+        d.depth_end,
+        d.empty_local,
+        d.page_occupied,
+        u8::from(d.hop_equal_second),
+        d.cands.len(),
+    );
+    for c in &d.cands {
+        s.push_str(&format!(
+            " | d={} loc={} rel={} abs={} body={} match={}",
+            c.depth,
+            c.local,
+            c.rel,
+            c.abs_fk,
+            hex_bytes(&c.body_prefix),
+            u8::from(c.body_match),
+        ));
+    }
+    s
+}
+
+fn diagnose_txid_probe(
+    table: &TxTable,
+    txid: &[u8; 32],
+) -> Result<crate::head_resolve_stats::LeftoverProbeDiag, StoreError> {
+    use crate::address_head::{h1_in_page, h2_in_page, page_base_for_txid, PAGE_SLOTS};
+    use crate::head_resolve_stats::{LeftoverProbeCand, LeftoverProbeDiag};
+
+    let mixed = table.secret.mix_txid(txid);
+    let bits = table.head.bits();
+    let page_base = page_base_for_txid(&mixed, bits);
+    let first_fks = table.head.first_fks_snapshot();
+    let (file_id, first_fk, hop) = table.head.leftover_open_hop(&mixed)?;
+    let abs_cands = table.head.probe_candidates(&mixed)?;
+    let side = table.txid_sidefile();
+    let mask = if bits <= crate::address_head::PAGE_SLOT_BITS {
+        (1u64 << bits) - 1
+    } else {
+        PAGE_SLOTS - 1
+    };
+    let h1 = h1_in_page(&mixed, bits);
+    let h2 = h2_in_page(&mixed, bits);
+    let mut rel_meta = std::collections::HashMap::new();
+    for &(d, rel) in &hop.scan.cands {
+        let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
+        rel_meta.insert(rel, (d, local));
+    }
+    let mut cands = Vec::with_capacity(abs_cands.len());
+    for fk in abs_cands {
+        let Some(id) = fk.get() else {
+            continue;
+        };
+        let rel = if id >= first_fk { id - first_fk + 1 } else { 0 };
+        let (depth, local) = rel_meta.get(&rel).copied().unwrap_or((u32::MAX, 0));
+        let body = side.get_read_at(fk).unwrap_or_default();
+        let mut body_prefix = [0u8; 8];
+        body_prefix.copy_from_slice(&body[..8]);
+        cands.push(LeftoverProbeCand {
+            depth,
+            local,
+            rel,
+            abs_fk: id,
+            body_prefix,
+            body_match: body == *txid,
+        });
+    }
+    let sealed_age = crate::head_resolve_stats::sealed_age_for_fk(&first_fks, first_fk);
+    let mut mixed_prefix = [0u8; 8];
+    mixed_prefix.copy_from_slice(&mixed[..8]);
+    Ok(LeftoverProbeDiag {
+        txid: *txid,
+        mixed_prefix,
+        page_base,
+        bits,
+        file_id,
+        first_fk,
+        sealed_age,
+        hit_empty: hop.scan.hit_empty,
+        depth_end: hop.scan.depth_end,
+        empty_local: hop.scan.empty_local,
+        page_occupied: hop.occupied,
+        hop_equal_second: hop.hop_equal_second,
+        cands,
+    })
 }
 
 fn resolve_fk_and_range_batch_opts(
@@ -230,7 +352,9 @@ fn resolve_fk_and_range_pread(
             }
         }
     }
-    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
+    note_first_leftover_miss(
+        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
+    );
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_cands(cands_total);
@@ -626,8 +750,10 @@ fn resolve_fk_and_range_uring(
 
     let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
     let mut connected = vec![false; txids.len()];
+    let mut n_cands = vec![0usize; txids.len()];
+    let mut had_id = vec![false; txids.len()];
 
-    uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
+    let out = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
         resolve_fk_and_range_uring_on(
             session,
             table,
@@ -636,8 +762,14 @@ fn resolve_fk_and_range_uring(
             tip_only,
             &mut winner,
             &mut connected,
+            &mut n_cands,
+            &mut had_id,
         )
-    })?
+    })??;
+    note_first_leftover_miss(
+        table, txids, tip_only, &winner, &connected, &n_cands, &had_id,
+    );
+    Ok(out)
 }
 
 fn resolve_fk_and_range_uring_on(
@@ -648,13 +780,13 @@ fn resolve_fk_and_range_uring_on(
     tip_only: bool,
     winner: &mut [Option<(Fk, (u64, u64))>],
     connected: &mut [bool],
+    n_cands: &mut [usize],
+    had_id: &mut [bool],
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
-    let mut n_cands = vec![0usize; txids.len()];
-    let mut had_id = vec![false; txids.len()];
 
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
@@ -691,7 +823,7 @@ fn resolve_fk_and_range_uring_on(
         &first_fks,
         &mut local_age,
         Some(session),
-        &mut had_id,
+        had_id,
     )?;
     id_idx_wave(
         table,
@@ -709,7 +841,7 @@ fn resolve_fk_and_range_uring_on(
         &first_fks,
         &mut local_age,
         Some(session),
-        &mut had_id,
+        had_id,
     )?;
 
     let mut need_cold = false;
@@ -753,7 +885,7 @@ fn resolve_fk_and_range_uring_on(
             &first_fks,
             &mut local_age,
             Some(session),
-            &mut had_id,
+            had_id,
         )?;
     }
     if tip_only && heights.is_some() {
@@ -763,7 +895,6 @@ fn resolve_fk_and_range_uring_on(
             }
         }
     }
-    note_first_leftover_miss(tip_only, winner, connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_idx(idx_ns);

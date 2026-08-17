@@ -68,6 +68,8 @@ fn miss_on_from_code(code: u64) -> Option<LeftoverMissOn> {
 pub fn clear_leftover_miss() {
     LAST_MISS_ON.store(0, Ordering::Relaxed);
     LAST_MISS_CANDS.store(0, Ordering::Relaxed);
+    LAST_PROBE_DIAG_SET.store(0, Ordering::Relaxed);
+    *LAST_PROBE_DIAG.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Record the first leftover miss in this batch (later calls ignored).
@@ -85,6 +87,56 @@ pub fn take_leftover_miss() -> Option<(LeftoverMissOn, u64)> {
     let code = LAST_MISS_ON.swap(0, Ordering::Relaxed);
     let cands = LAST_MISS_CANDS.swap(0, Ordering::Relaxed);
     miss_on_from_code(code).map(|on| (on, cands))
+}
+
+/// One hop cand on the leftover-miss dump (shipped resolve path).
+#[derive(Debug, Clone)]
+pub struct LeftoverProbeCand {
+    pub depth: u32,
+    pub local: u64,
+    pub rel: u64,
+    pub abs_fk: u64,
+    pub body_prefix: [u8; 8],
+    pub body_match: bool,
+}
+
+/// Failure-time hop + identity dump for the first leftover miss.
+#[derive(Debug, Clone)]
+pub struct LeftoverProbeDiag {
+    pub txid: [u8; 32],
+    pub mixed_prefix: [u8; 8],
+    pub page_base: u64,
+    pub bits: u32,
+    pub file_id: u32,
+    pub first_fk: u64,
+    pub sealed_age: Option<u32>,
+    pub hit_empty: bool,
+    pub depth_end: u32,
+    pub empty_local: u64,
+    pub page_occupied: u32,
+    pub hop_equal_second: bool,
+    pub cands: Vec<LeftoverProbeCand>,
+}
+
+static LAST_PROBE_DIAG: std::sync::Mutex<Option<LeftoverProbeDiag>> = std::sync::Mutex::new(None);
+static LAST_PROBE_DIAG_SET: AtomicU64 = AtomicU64::new(0);
+
+/// True when the last TipOnly miss recorded a probe dump (`diag=1` on the reject line).
+pub fn leftover_probe_diag_ready() -> bool {
+    LAST_PROBE_DIAG_SET.load(Ordering::Relaxed) != 0
+}
+
+pub fn take_leftover_probe_diag() -> Option<LeftoverProbeDiag> {
+    LAST_PROBE_DIAG_SET.store(0, Ordering::Relaxed);
+    LAST_PROBE_DIAG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+pub(crate) fn note_leftover_probe_diag(diag: LeftoverProbeDiag) {
+    LAST_PROBE_DIAG_SET.store(1, Ordering::Relaxed);
+    *LAST_PROBE_DIAG.lock().unwrap_or_else(|e| e.into_inner()) = Some(diag);
 }
 
 /// Winner sealed-age histogram (index = age from tip; last bucket is tail).

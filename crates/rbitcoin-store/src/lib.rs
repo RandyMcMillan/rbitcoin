@@ -62,7 +62,7 @@ pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
 pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
 pub use head_resolve_pick::{classify_leftover_miss, LeftoverMissOn};
-pub use head_resolve_stats::Sample as HeadResolveSample;
+pub use head_resolve_stats::{leftover_probe_diag_ready, Sample as HeadResolveSample};
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
 pub use height_fence::{FenceRun, HeightFence};
 pub use idx_body_pipeline::{run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob};

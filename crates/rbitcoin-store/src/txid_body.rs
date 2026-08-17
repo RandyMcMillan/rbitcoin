@@ -139,6 +139,19 @@ impl TxidBody {
         Ok(())
     }
 
+    /// `txid.body` peek via libc `pread` (safe under a held TLS ring).
+    pub fn get_read_at(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let n = self.count();
+        if id > n {
+            return Err(StoreError::NotFound);
+        }
+        let off = Self::entry_offset(id)?;
+        let mut buf = [0u8; 32];
+        self.file.read_at(off, &mut buf)?;
+        Ok(buf)
+    }
+
     /// Read txid for create_fk (bulk pread).
     pub fn get(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;

@@ -158,9 +158,15 @@ class RpcProxy:
                     "id": item.get("id"),
                 }
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # Core wait_for_rpc_connection retries -28 / -342 only. A
+            # forwarded "node not listening yet" must look like warmup, not
+            # a fatal -1 (restart_node races the proxy vs rbitcoin-node).
             return {
                 "result": None,
-                "error": {"code": -1, "message": f"node unreachable: {e}"},
+                "error": {
+                    "code": -28,
+                    "message": f"Loading... ({e})",
+                },
                 "id": item.get("id"),
             }
         try:

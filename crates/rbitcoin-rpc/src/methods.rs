@@ -4224,7 +4224,7 @@ mod tests {
         let r = dispatch(&ctx, "submitblock", vec![json!(hex)]).unwrap();
         let msg = r.as_str().unwrap_or("");
         assert!(
-            msg.contains("future") || msg.contains("timestamp"),
+            msg.contains("future") || msg.contains("timestamp") || msg.contains("time-too-new"),
             "future header vs mock now: {r}"
         );
         let _ = std::fs::remove_dir_all(&dir);

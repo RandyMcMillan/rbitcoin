@@ -36,6 +36,11 @@ before 1.0).
   `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
   and into min-relay admission (free tx + delta can enter).
 
+### Removed
+
+- **`rbtpkg` P2P command.** Homegrown len-prefixed package inject is gone.
+  Packages stay on RPC `submitpackage` and Esplora `POST /txs/package`.
+
 ### Changed
 
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /

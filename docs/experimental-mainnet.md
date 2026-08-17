@@ -105,8 +105,9 @@ when the peer enabled high-bandwidth mode.
 **WTx (BIP339):** handshake sends `wtxidrelay` (protocol ≥70016). When the peer
 also sends it, we announce and request `MSG_WTX` inventory.
 
-**Packages:** `accept_package` is implemented; experimental wire command `rbtpkg`
-(len-prefixed). Full BIP331 `NetworkMessage` needs a rust-bitcoin upgrade.
+**Packages:** `accept_package` via RPC `submitpackage` / Esplora
+`POST /txs/package`. No P2P package command. BIP331 `NetworkMessage` needs a
+rust-bitcoin upgrade.
 
 **Misbehavior:** per-session ban score (threshold 100) for unsolicited/bad compact
 payloads and oversized pending-cmpct pressure; disconnects the peer.

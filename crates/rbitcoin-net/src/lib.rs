@@ -45,8 +45,7 @@ pub use seeds::{
 };
 pub use service::{magic_for, magic_for_params, NetConfig, P2PHandle, P2PNode};
 pub use tx_relay::{
-    decode_len_prefixed_package, ElectrumMempoolItem, MempoolAnnounce, MempoolHub,
-    MempoolPerfSample, QueryUtxoProvider,
+    ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample, QueryUtxoProvider,
 };
 
 /// Default number of **live download peers** during IBD (`IbdConfig::target_peers`

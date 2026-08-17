@@ -39,7 +39,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
 | Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve | v1/v2 high-bandwidth |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
-| Package relay wire | `accept_package` + experimental `rbtpkg` | BIP331 |
+| Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
 | Pruning / GUI | Not supported | Supported |
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |

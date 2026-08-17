@@ -357,8 +357,9 @@ Do **not** wipe `store/` for mempool slot/full errors.
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
-- Package accept: `ActiveMempool::accept_package`; experimental wire command `rbtpkg`
-  (BIP331 not yet in rust-bitcoin 0.32 `NetworkMessage`).
+- Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
+  Esplora `POST /txs/package`. No P2P package command (BIP331 is not in
+  rust-bitcoin 0.32).
 
 ## Scripthash index (`--shindex`)
 

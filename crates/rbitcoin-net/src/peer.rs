@@ -1068,28 +1068,7 @@ async fn handle_peer_frame(
         NetworkMessage::GetAddr => {
             queue_out(out_tx, NetworkMessage::Addr(vec![]))?;
         }
-        NetworkMessage::Unknown { command, payload } => {
-            // BIP331 family not in rust-bitcoin 0.32 enum — accept len-prefixed package
-            // under experimental command "rbtpkg" for local/tests.
-            if command.to_string() == "rbtpkg" {
-                if let Some(mp) = hub.mempool() {
-                    if mp.relay_enabled() {
-                        if let Ok(txs) = crate::tx_relay::decode_len_prefixed_package(payload) {
-                            match mp.accept_package(&txs) {
-                                Ok(rs) => {
-                                    for r in rs {
-                                        from_this_peer.insert(r.txid, ());
-                                    }
-                                }
-                                Err(e) => {
-                                    rbitcoin_log::debug!("txrelay: package reject: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        NetworkMessage::Unknown { .. } => {}
         _ => {}
     }
     Ok(())
@@ -2150,7 +2129,7 @@ mod tests {
             // Genesis is already known so "already have" arm.
             let _ = out_rx.try_recv();
 
-            // Unknown rbtpkg with no mempool is a no-op.
+            // Unknown command (including the retired rbtpkg name) is a no-op.
             handle_peer_frame(
                 frame_for(NetworkMessage::Unknown {
                     command: bitcoin::p2p::message::CommandString::try_from("rbtpkg").unwrap(),
@@ -2504,11 +2483,34 @@ mod tests {
             // Origin map is filled before accept result.
             assert!(from_peer.contains_key(&junk_txid));
 
-            // rbtpkg with mempool + relay; empty/invalid payload is a quiet no-op.
+            // Retired rbtpkg name with mempool + relay: still unknown, no admit
+            // even when the payload is the old len-prefixed encoding.
+            let pkg_tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([2u8; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[vec![1]]),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let pkg_txid = pkg_tx.compute_txid();
+            let raw = bitcoin::consensus::encode::serialize(&pkg_tx);
+            let mut payload = Vec::with_capacity(4 + raw.len());
+            payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&raw);
             handle_peer_frame(
                 frame_for(NetworkMessage::Unknown {
                     command: bitcoin::p2p::message::CommandString::try_from("rbtpkg").unwrap(),
-                    payload: vec![0x00], // empty package count
+                    payload,
                 }),
                 &hub,
                 &out_tx,
@@ -2526,6 +2528,8 @@ mod tests {
             )
             .await
             .unwrap();
+            assert!(!from_peer.contains_key(&pkg_txid));
+            assert_eq!(hub.mempool().unwrap().live_count(), 0);
 
             let _ = std::fs::remove_dir_all(dir);
         });

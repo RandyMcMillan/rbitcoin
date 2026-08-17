@@ -437,18 +437,14 @@ fn thr_stats_sample_and_reset() {
     use super::confirm_thr_stats;
     use std::time::Duration;
     let _ = confirm_thr_stats::sample_and_reset(); // clear
-    confirm_thr_stats::add_lookup_clone(Duration::from_millis(5));
+    confirm_thr_stats::add_load_clone(Duration::from_millis(5));
     confirm_thr_stats::add_load_recv_wait(Duration::from_millis(20));
     let s = confirm_thr_stats::sample_and_reset();
-    assert!(s.lookup_clone_ns >= 5_000_000);
+    assert!(s.load_clone_ns >= 5_000_000);
     assert!(s.load_recv_wait_ns >= 20_000_000);
-    let busy = s
-        .lookup_clone_ns
-        .saturating_add(s.lookup_stamp_ns)
-        .saturating_add(s.lookup_other_ns);
-    assert_eq!(busy, s.lookup_clone_ns);
+    assert_eq!(s.lookup_stamp_ns, 0);
     let z = confirm_thr_stats::sample_and_reset();
-    assert_eq!(z.lookup_clone_ns, 0);
+    assert_eq!(z.load_clone_ns, 0);
 }
 
 #[test]
@@ -764,12 +760,16 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
 
     let d = Duration::from_nanos(1_000);
     confirm_thr_stats::add_lookup_claim(d);
-    confirm_thr_stats::add_lookup_clone(d);
     confirm_thr_stats::add_lookup_stamp(d);
     confirm_thr_stats::add_lookup_other(d);
     confirm_thr_stats::add_lookup_send_wait(d);
     confirm_thr_stats::add_load_recv_wait(d);
-    confirm_thr_stats::add_load_work(d);
+    confirm_thr_stats::add_load_pack(d);
+    confirm_thr_stats::add_load_clone(d);
+    confirm_thr_stats::add_load_stamp(d);
+    confirm_thr_stats::add_load_pin(d);
+    confirm_thr_stats::add_load_asm(d);
+    confirm_thr_stats::add_load_prune(d);
     confirm_thr_stats::add_load_send_wait(d);
     confirm_thr_stats::add_script_recv_wait(d);
     confirm_thr_stats::add_script_work(d);
@@ -778,18 +778,25 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     confirm_thr_stats::add_write_work(d);
     let s = confirm_thr_stats::sample_and_reset();
     assert!(s.lookup_claim_ns >= 1_000);
-    assert!(s.lookup_clone_ns >= 1_000);
     assert!(s.lookup_stamp_ns >= 1_000);
     assert!(s.lookup_other_ns >= 1_000);
     assert!(s.lookup_send_wait_ns >= 1_000);
     assert!(s.load_recv_wait_ns >= 1_000);
-    assert!(s.load_work_ns >= 1_000);
+    assert!(s.load_pack_ns >= 1_000);
+    assert!(s.load_clone_ns >= 1_000);
+    assert!(s.load_stamp_ns >= 1_000);
+    assert!(s.load_pin_ns >= 1_000);
+    assert!(s.load_asm_ns >= 1_000);
+    assert!(s.load_prune_ns >= 1_000);
     assert!(s.load_send_wait_ns >= 1_000);
     assert!(s.script_recv_wait_ns >= 1_000);
     assert!(s.script_work_ns >= 1_000);
     assert!(s.script_send_wait_ns >= 1_000);
     assert!(s.write_recv_wait_ns >= 1_000);
     assert!(s.write_work_ns >= 1_000);
+    confirm_thr_stats::add_script_work(confirm_thr_stats::script_work_from_verify_ns(2_000));
+    let sw = confirm_thr_stats::sample_and_reset();
+    assert_eq!(sw.script_work_ns, 2_000);
 
     // note_wire: prefer keeping wire when already noted without; ignore inflight.
     let feed = ConfirmFeed::new();

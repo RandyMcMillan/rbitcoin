@@ -21,6 +21,8 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **IBD lookup resolve wave:** TipOnly `head_fk` over at most **1080** BQ-ready heights or soft **16000** inputs (include-overshoot; 64 k unique-key safety cap), then mark those complete for load to claim. One published identity layer per wave so early-IBD stamp walks tens of layers, not tens of thousands of heights.
 
+**`ibd: perf`:** `load=` is pin+assemble only. Load OS-thread leftover TipOnly is `load_thr stamp=`; post-scriptq in-flight drop is `prune=`. `script=` is verify ns (`jobs=`/`skip=`), not feed-ahead join. `ready>0` + `scriptq=1` + high `stamp=` means leftover on load, not a hungry script pool.
+
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. Selector / apply / invalid-heavy: [`architecture.md`](./architecture.md#most-work-chain-selection-ibd--tip-follow).
 
 **Wire retained on the pipeline batch only:** lookup/load pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Split Class A (`txout` / `inwit` / `spent`) is planned once and committed in the write stage.

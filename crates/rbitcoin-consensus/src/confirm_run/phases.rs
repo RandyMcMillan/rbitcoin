@@ -285,6 +285,7 @@ pub(super) fn script_wave(
     if n_skip > 0 {
         confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.fetch_add(n_skip, Ordering::Relaxed);
     }
+    confirm_phase_stats::SCRIPT_JOBS.fetch_add(all_jobs.len() as u64, Ordering::Relaxed);
     if !all_jobs.is_empty() {
         crate::block::verify_scripts_pool_jobs(&all_jobs)?;
     }

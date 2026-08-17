@@ -713,9 +713,15 @@ fn script_wave_skips_preverified_txids() {
         archive_plan: None,
     };
     let before = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
+    let jobs_before = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
     confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
     let after = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
+    let jobs_after = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
     assert!(after > before, "skip counter should bump");
+    assert_eq!(
+        jobs_after, jobs_before,
+        "skipped job must not count as a pool job"
+    );
 }
 
 /// Cold-range pin then pstore adopt: first pin reads body, second does not.

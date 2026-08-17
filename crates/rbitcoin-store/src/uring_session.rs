@@ -503,7 +503,9 @@ pub const KIND_SPEND_META_READ: u8 = 5;
 pub const KIND_SPEND_META_WRITE: u8 = 6;
 pub const KIND_SPEND_PAGE_READ: u8 = 7;
 pub const KIND_SPEND_PAGE_WRITE: u8 = 8;
+#[cfg(test)]
 pub const KIND_RMW_READ: u8 = 9;
+#[cfg(test)]
 pub const KIND_RMW_WRITE: u8 = 10;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
@@ -526,7 +528,7 @@ pub fn unpack_ud(ud: u64) -> (u8, u16, u32) {
 
 /// Process counters for harvest invariants (tests + operator logs).
 #[derive(Default)]
-pub struct UringMeters {
+pub(crate) struct UringMeters {
     pub unexpected_cqe: std::sync::atomic::AtomicU64,
     pub undrained: std::sync::atomic::AtomicU64,
     pub cq_overflow: std::sync::atomic::AtomicU64,
@@ -596,7 +598,8 @@ pub(crate) fn note_uring_invariant(kind: UringInvariant) {
     }
 }
 
-pub fn uring_meters() -> &'static UringMeters {
+#[cfg(test)]
+pub(crate) fn uring_meters() -> &'static UringMeters {
     &URING_METERS
 }
 

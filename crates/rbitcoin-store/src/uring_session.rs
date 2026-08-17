@@ -7,7 +7,7 @@
 //! - [`crate::bulk_io`] pread/pwrite batches and page RMW
 //!
 //! Backends: Linux `io_uring`, portable [`crate::io_session_pool`] (Darwin
-//! default + `RBITCOIN_IO=pool`), Windows IOCP / IoRing.
+//! default + `RBITCOIN_IO=pool`), Windows IOCP.
 //!
 //! **Lifetime:** one long-lived session per OS thread (TLS). **Nested**
 //! [`with_thread_local`] on the same OS thread is a **hard error** (panic) —
@@ -30,7 +30,7 @@ pub const DEFAULT_ENTRIES: u32 = 128;
 /// Which completion backend [`UringSession`] opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
-    /// Linux io_uring / Windows IoRing.
+    /// Linux io_uring. On Windows this still opens IOCP (no IoRing engine yet).
     Uring,
     /// Worker-pool completion ring (Darwin default; Linux `RBITCOIN_IO=pool`).
     Pool,

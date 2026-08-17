@@ -191,9 +191,10 @@ Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 pages after annotate does not protect `txout`. See
 [`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze).
 
-- **uring** — Linux io_uring (ring depth **128**); Windows IoRing when present.
+- **uring** — Linux io_uring (ring depth **128**). On Windows this still
+  opens IOCP until an IoRing submit engine exists.
 - **pool** — worker-pool completion session (Darwin default).
-- **iocp** — Windows IOCP completion session.
+- **iocp** — Windows IOCP (Windows default).
 - **pread** / **pwrite** — libc positional IO (session off).
 - Class A **`txout` / `inwit` / `spent` + `*.idx` linear appends always pwrite**.
 

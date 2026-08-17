@@ -1,8 +1,7 @@
 //! Windows IoRing probe (Win11 / Server 2022+).
 //!
-//! When the API is present we still submit through IOCP unless a future
-//! host A/B shows IoRing wins for 8 B RMW. Probe only selects the default
-//! [`crate::uring_session::SessionKind`].
+//! Probe only. Default Windows session is IOCP until a real submit engine
+//! exists. Do not treat `ioring_available()` as “we are on IoRing.”
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

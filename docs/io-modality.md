@@ -20,16 +20,18 @@ Legacy token `mmap` demotes to **pread** with a one-time warning.
 
 | Token | Backend |
 |-------|---------|
-| `uring` / `io_uring` / `ioring` | Linux `io_uring`; Windows IoRing when the probe succeeds |
+| `uring` / `io_uring` / `ioring` | Linux `io_uring`. On Windows the token still opens **IOCP** (IoRing is probe-only; no submit engine yet) |
 | `pool` | Worker-pool completion ring (Darwin **default**; Linux CI pin) |
-| `iocp` | Windows IOCP |
+| `iocp` | Windows IOCP (Windows **default**) |
 | `pread` / `fd` / `libc` / `pwrite` | Disable session; libc positional IO (+ workers for reads) |
 
 **Defaults:** Linux `io_uring` if the ring opens, else pool. Darwin **pool**.
-Windows IoRing if `CreateIoRing` resolves, else IOCP (pool if that fails).
+Windows **IOCP**.
 
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
-`read` still blocks. The pool session is the honest completion ring there.
+`read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also
+thread pools (`kern.aiomax` default 16) — same class as `pool`, not an
+SQ/CQ. The pool session is the honest Darwin completion ring.
 
 Harvest invariants (TLS session): every SQE is tracked by packed
 `(kind, epoch, slot)`. A CQE that is unmatched, duplicate, or from a
@@ -40,7 +42,7 @@ op; libc fail is `StoreError::io`. `RBITCOIN_IO=pread` is the only
 whole-batch pread fallback (session unavailable also falls back).
 
 Machines (spend-annotate RMW, fused head-resolve, pipelined bulk fill)
-stay **multi-stage**. Pool/IOCP/IoRing are session backends — they do
+stay **multi-stage**. Pool/IOCP are session backends — they do
 not flatten those loops to one-shot `pread_batch`.
 
 ---
@@ -74,7 +76,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 
 Default: Linux uring if the ring opens else pool; Darwin pool; Windows
-IoRing/IOCP. Ring depth **128**. `RBITCOIN_IO=pread` forces libc.
+IOCP. Ring depth **128**. `RBITCOIN_IO=pread` forces libc.
 
 ### Table transport (all fd)
 

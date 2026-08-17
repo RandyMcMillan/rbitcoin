@@ -184,12 +184,15 @@ fn worker_loop(shared: Arc<Shared>) {
                     return;
                 }
                 if let Some(j) = q.pop_front() {
+                    // Count as in-flight *before* releasing jobs so idle()
+                    // cannot see empty+running==0 between pop and the old
+                    // post-unlock increment (drain would Corrupt / UAF).
+                    shared.running.fetch_add(1, Ordering::AcqRel);
                     break j;
                 }
                 q = shared.job_cv.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
-        shared.running.fetch_add(1, Ordering::AcqRel);
         let buf = unsafe { std::slice::from_raw_parts_mut(job.ptr, job.len) };
         let res = if job.write {
             job.handle.pwrite(job.offset, buf)

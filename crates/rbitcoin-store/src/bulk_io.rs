@@ -24,7 +24,7 @@
 //! # Non-Linux
 //!
 //! Darwin default is the **pool** completion session (kqueue is not a
-//! regular-file backend). Windows uses IOCP (IoRing when the probe succeeds).
+//! regular-file backend). Windows uses IOCP.
 //! Machines stay staged; they do not flatten to one-shot `pread`. See
 //! `docs/io-modality.md` and `docs/concurrency.md`.
 
@@ -145,11 +145,7 @@ fn default_session_kind() -> crate::uring_session::SessionKind {
     }
     #[cfg(windows)]
     {
-        if crate::io_session_ioring::ioring_available() {
-            SessionKind::Uring
-        } else {
-            SessionKind::Iocp
-        }
+        SessionKind::Iocp
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

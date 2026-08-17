@@ -494,6 +494,26 @@ fn stamp_reject_names_leftover_unresolved() {
     );
 }
 
+/// 257581: leftover_n/hit is not enough — we need the missing prev_txid and
+/// whether write-behind still holds it (TipOnly is durable head only).
+#[test]
+fn stamp_reject_names_union_miss_txid() {
+    let mut raw = [0u8; 32];
+    raw[0] = 0xab;
+    raw[31] = 0xcd;
+    rbitcoin_query::archive_phase_stats::note_resolve_counts(1, 1, 1914, 1913, 0, 0);
+    rbitcoin_query::archive_phase_stats::note_union_miss(raw, 1, true);
+    let msg = stamp_reject_operator_msg("missing prevout");
+    assert!(msg.contains("miss_n=1"), "{msg}");
+    assert!(msg.contains("miss_txid="), "{msg}");
+    assert!(msg.contains("pending=1"), "{msg}");
+    let disp = bitcoin::Txid::from_byte_array(raw).to_string();
+    assert!(
+        msg.contains(&disp),
+        "operator line must name display txid {disp}: {msg}"
+    );
+}
+
 #[test]
 fn confirm_load_has_no_soft_requeue_hook() {
     // Policy: no lookup/load soft-requeue. Internal errors permanent; wire

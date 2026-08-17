@@ -667,10 +667,23 @@ impl ConfirmQueueDepths {
 pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
     if err == "missing prevout" {
         let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
-        format!(
-            "{err} (leftover parent create_fk unresolved leftover_n={} leftover_hit={})",
+        let miss = rbitcoin_query::archive_phase_stats::last_union_miss();
+        let mut s = format!(
+            "{err} (leftover parent create_fk unresolved leftover_n={} leftover_hit={}",
             last.head_need, last.head_hit
-        )
+        );
+        if miss.n > 0 {
+            s.push_str(&format!(" miss_n={}", miss.n));
+            if let Some(raw) = miss.txid {
+                s.push_str(&format!(
+                    " miss_txid={}",
+                    bitcoin::Txid::from_byte_array(raw)
+                ));
+            }
+            s.push_str(&format!(" pending={}", u8::from(miss.pending)));
+        }
+        s.push(')');
+        s
     } else {
         err.to_string()
     }
@@ -1434,8 +1447,12 @@ pub(crate) fn spawn_confirm_engine(
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
                         let log_msg = stamp_reject_operator_msg(&msg);
+                        let (if_l, if_n, _) = lookup_ahead.in_flight.size_snapshot();
+                        let drain_fk = hub_load.query.head_drain_fk();
+                        let fence_h = hub_load.query.fence_tip_height();
                         warn!(
-                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {log_msg}"
+                            "ibd: confirm load stamp reject {first_hash} @ {expect_h}: {log_msg} \
+                             iflight={if_l}L/{if_n} drain_fk={drain_fk} fence_h={fence_h:?}"
                         );
                         let _ = event_tx_load.send(ConfirmEvent::Reject {
                             height: expect_h,

@@ -1668,6 +1668,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// BQ-ahead hits supply create_fk + range with no live pin and no head row.
+    #[test]
+    fn archive_plan_batch_from_store_hits_bq_parent_hits() {
+        use std::collections::HashMap;
+        let (dir, q) = temp_query("bq-hits-stamp");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x33;
+            t
+        };
+        let mut hits = HashMap::new();
+        hits.insert(parent_txid, (Fk(77), (4000, 32)));
+        let child = child_spend(parent_txid, 0x44);
+        let mut need = vec![(Fk(1), vec![child])];
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let plan = q
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    1,
+                    &crate::InFlightView::empty(),
+                    None,
+                    Some(&hits),
+                )
+                .expect("bq parent_hits stamp");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(77));
+            assert_eq!(plan.external_parent_ranges.get(&77), Some(&(4000, 32)));
+            assert_eq!(plan.external_parent_txid(77), Some(parent_txid));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.pin_txid_n, 0, "bq hits must not count as pin_txid");
+            assert_eq!(mix.head_need, 0, "bq hits must skip leftover TipOnly");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Freeze + append: batch-merge is vector concat of frozen commit halves;
     /// external staging maps are dropped (not union-mutated).
     #[test]

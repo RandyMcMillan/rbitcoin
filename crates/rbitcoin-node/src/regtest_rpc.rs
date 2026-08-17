@@ -144,6 +144,10 @@ impl RpcRegtest for HubRegtest {
 
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
         use bitcoin::Target;
+        let hash = block.block_hash();
+        if self.0.is_block_invalid(&hash) {
+            return SubmitBlockOutcome::Rejected("duplicate-invalid".into());
+        }
         let target = Target::from_compact(block.header.bits);
         if block.header.validate_pow(target).is_err() {
             return SubmitBlockOutcome::Rejected("high-hash".into());
@@ -168,11 +172,24 @@ impl RpcRegtest for HubRegtest {
         if let Some(reason) = cheap_submit_tx_reject(self.0.query.as_ref(), &block) {
             return SubmitBlockOutcome::Rejected(reason);
         }
-        match self.0.accept_received_block(block) {
+        match self.0.accept_received_block(block.clone()) {
             Ok(AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
             Ok(AcceptOutcome::AlreadyHave) => SubmitBlockOutcome::Duplicate,
             Ok(AcceptOutcome::IgnoredWeaker) => SubmitBlockOutcome::IgnoredWeaker,
-            Err(e) => SubmitBlockOutcome::Rejected(submit_reject_reason(&e.to_string())),
+            Err(e) => {
+                let reason = submit_reject_reason(&e.to_string());
+                // Mutated merkle / missing parent stay retryable. Other
+                // consensus rejects mark the hash so a second submit is
+                // `duplicate-invalid` and children get `bad-prevblk`.
+                if reason != "bad-txnmrklroot"
+                    && reason != "high-hash"
+                    && reason != "prev-blk-not-found"
+                {
+                    self.0.note_invalid_block(hash);
+                    let _ = self.0.ensure_header(&block.header);
+                }
+                SubmitBlockOutcome::Rejected(reason)
+            }
         }
     }
 

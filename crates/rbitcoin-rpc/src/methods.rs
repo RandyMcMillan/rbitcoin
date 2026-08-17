@@ -111,6 +111,8 @@ pub const ERR_TYPE_ERROR: i64 = -3;
 pub const ERR_INVALID_ADDRESS_OR_KEY: i64 = -5;
 /// Core `RPC_DESERIALIZATION_ERROR`.
 pub const ERR_DESERIALIZATION: i64 = -22;
+/// Core `RPC_VERIFY_ERROR` (`submitheader` / header validation).
+pub const ERR_VERIFY_ERROR: i64 = -25;
 /// Core `RPC_CLIENT_NODE_NOT_CONNECTED`.
 pub const ERR_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 /// Core `RPC_INVALID_PARAMETER` (unknown named param, mocktime range, …).
@@ -247,6 +249,17 @@ fn json_i64(v: &Value) -> Option<i64> {
         .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
 }
 
+/// Exact BTC amount (8 decimals) so Core `Decimal` compares match sat/kvB.
+fn json_btc_amount(sat: u64) -> Value {
+    let whole = sat / 100_000_000;
+    let frac = sat % 100_000_000;
+    let s = format!("{whole}.{frac:08}");
+    match s.parse::<serde_json::Number>() {
+        Ok(n) => Value::Number(n),
+        Err(_) => json!(sat as f64 / 100_000_000.0),
+    }
+}
+
 /// Core `getblock` verbosity: integer, or bool (`false` → 0, `true` → 1).
 fn opt_verbosity(params: &RpcParams, index: usize, name: &str) -> Result<u32, Value> {
     match params.get(index, name) {
@@ -356,6 +369,8 @@ pub fn dispatch(
         "submitblock" => submitblock(ctx, &params),
         "submitheader" => submitheader(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
+        "mockscheduler" => mockscheduler(ctx, &params),
+        "getnetworkhashps" => getnetworkhashps(ctx, &params),
         "invalidateblock" => invalidateblock(ctx, &params),
         "reconsiderblock" => reconsiderblock(ctx, &params),
         "preciousblock" => preciousblock(ctx, &params),
@@ -502,6 +517,7 @@ const METHOD_LIST: &[&str] = &[
     "waitfornewblock",
     "getblocktemplate",
     "getmininginfo",
+    "getnetworkhashps",
     "prioritisetransaction",
     "getprioritisedtransactions",
     "getmempoolcluster",
@@ -541,6 +557,9 @@ fn method_help(m: &str) -> String {
              submit=false returns {hash,hex} without connecting the block."
             .into(),
         "generate" => "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+            .into(),
+        "mockscheduler" => "mockscheduler delta_seconds\n\
+             Regtest harness only. Advance the scheduler; rebroadcast unbroadcast txs."
             .into(),
         "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
              Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
@@ -1408,10 +1427,54 @@ fn hashes_json(hashes: &[BlockHash]) -> Value {
 }
 
 fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
-    ctx.mempool
+    let txs = ctx
+        .mempool
         .as_ref()
         .map(|mp| mp.select_block_txs())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let min = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.block_min_tx_fee_sat_kvb())
+        .unwrap_or(1);
+    filter_block_min_fee(ctx, txs, min)
+}
+
+/// Whether modified fee meets `-blockmintxfee` as a true sat/kvB floor
+/// (`fee * 1000 >= min * vsize`). Zero min admits free txs.
+fn meets_block_min_feerate(modified_sat: i64, weight_wu: u64, min_sat_kvb: u64) -> bool {
+    if min_sat_kvb == 0 {
+        return true;
+    }
+    if modified_sat <= 0 {
+        return false;
+    }
+    let vsize = weight_wu.saturating_add(3) / 4;
+    if vsize == 0 {
+        return false;
+    }
+    (modified_sat as u64).saturating_mul(1000) >= min_sat_kvb.saturating_mul(vsize)
+}
+
+fn filter_block_min_fee(
+    ctx: &RpcContext,
+    txs: Vec<Transaction>,
+    min_sat_kvb: u64,
+) -> Vec<Transaction> {
+    if min_sat_kvb == 0 {
+        return txs;
+    }
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return txs;
+    };
+    txs.into_iter()
+        .filter(|tx| {
+            let tid = tx.compute_txid();
+            let fee = mp.get_live_meta(&tid).map(|(f, _)| f).unwrap_or(0);
+            let modified = (fee as i64).saturating_add(mp.fee_delta(&tid));
+            meets_block_min_feerate(modified, tx.weight().to_wu(), min_sat_kvb)
+        })
+        .collect()
 }
 
 fn drain_mempool(ctx: &RpcContext, txs: &[Transaction]) {
@@ -1433,6 +1496,9 @@ fn generate_with_mempool(
         .generate_to_script(nblocks, script, extras.clone())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
     drain_mempool(ctx, &extras);
+    if let Some(c) = ctx.chain.as_ref() {
+        c.note_gbt_assembled();
+    }
     Ok(hashes_json(&hashes))
 }
 
@@ -1901,6 +1967,18 @@ fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value>
     }
 }
 
+fn mockscheduler(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["delta_seconds"])?;
+    require_regtest(ctx, "mockscheduler")?;
+    let delta = params.req_u64(0, "delta_seconds")?;
+    if delta > 0 {
+        if let Some(mp) = ctx.mempool.as_ref() {
+            mp.rebroadcast_unbroadcast();
+        }
+    }
+    Ok(Value::Null)
+}
+
 fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["timestamp"])?;
     require_regtest(ctx, "setmocktime")?;
@@ -1976,25 +2054,22 @@ fn submitheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     let hub = require_chain(ctx)?;
     let hex = params.req_str(0, "hexdata")?;
     let header = decode_header_hex(hex)?;
-    hub.ensure_header(&header)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    hub.process_submitted_header(&header)
+        .map_err(|e| rpc_error(ERR_VERIFY_ERROR, e))?;
     Ok(Value::Null)
 }
 
 fn decode_header_hex(hex: &str) -> Result<bitcoin::block::Header, Value> {
-    let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+    let raw = hex_decode(hex)
+        .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block header decode failed"))?;
     if raw.len() >= 80 {
         if let Ok(h) = deserialize::<bitcoin::block::Header>(&raw[..80]) {
             return Ok(h);
         }
     }
-    let block: Block = deserialize(&raw).map_err(|e| {
-        rpc_error(
-            ERR_DESERIALIZATION,
-            format!("Block header decode failed: {e}"),
-        )
-    })?;
-    Ok(block.header)
+    deserialize::<Block>(&raw)
+        .map(|b| b.header)
+        .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block header decode failed"))
 }
 
 fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2149,11 +2224,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     } else {
         rbitcoin_consensus::median_time_past(ctx.query.as_ref(), Height(tip_h)).unwrap_or(tip_time)
     };
-    let selected = ctx
-        .mempool
-        .as_ref()
-        .map(|mp| mp.select_block_txs())
-        .unwrap_or_default();
+    let selected = mempool_block_txs(ctx);
     let mut fees = 0u64;
     let mut tx_json = Vec::with_capacity(selected.len());
     let ids: Vec<Txid> = selected.iter().map(Transaction::compute_txid).collect();
@@ -2178,16 +2249,28 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
             "hash": tx.compute_wtxid().to_string(),
             "depends": depends,
             "fee": fee,
-            "sigops": 0,
+            "sigops": rbitcoin_consensus::tx_gbt_sigops(tx),
             "weight": tx.weight().to_wu(),
         }));
     }
     let subsidy = rbitcoin_consensus::block_subsidy(next_h, &params) as u64;
     let longpollid = gbt_longpoll_id(ctx);
     let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
+    if let Some(c) = ctx.chain.as_ref() {
+        c.note_gbt_assembled();
+    }
+    let wtxids: Vec<[u8; 32]> = selected
+        .iter()
+        .map(|tx| tx.compute_wtxid().to_byte_array())
+        .collect();
+    let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids);
     Ok(json!({
         "capabilities": ["proposal"],
-        "version": GBT_VERSION,
+        "version": ctx
+            .chain
+            .as_ref()
+            .map(|c| c.gbt_block_version())
+            .unwrap_or(GBT_VERSION | (1 << 28)),
         "previousblockhash": prev_hex,
         "transactions": tx_json,
         "coinbaseaux": { "flags": "" },
@@ -2204,6 +2287,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         "bits": format!("{bits:08x}"),
         "height": next_h,
         "rules": ["segwit"],
+        "default_witness_commitment": hex_encode(witness_commit),
     }))
 }
 
@@ -2388,16 +2472,87 @@ fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
         .as_ref()
         .map(|m| m.list_live_meta().len())
         .unwrap_or(0);
-    Ok(json!({
-        "blocks": tip,
-        "currentblockweight": 8_000,
-        "currentblocktx": 0,
-        "difficulty": difficulty_at_tip(ctx).unwrap_or(0.0),
-        "networkhashps": 0,
-        "pooledtx": pooledtx,
-        "chain": chain_name(ctx.network),
-        "warnings": "",
-    }))
+    let bits = tip_bits(ctx).unwrap_or(0x207f_ffff);
+    let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
+    let difficulty = difficulty_from_bits(bits);
+    let mut m = serde_json::Map::new();
+    m.insert("blocks".into(), json!(tip));
+    if ctx.chain.as_ref().is_some_and(|c| c.gbt_assembled()) {
+        m.insert("currentblockweight".into(), json!(8_000));
+        m.insert("currentblocktx".into(), json!(0));
+    }
+    m.insert("difficulty".into(), json!(difficulty));
+    m.insert(
+        "networkhashps".into(),
+        json!(network_hash_ps(ctx, 120, -1).unwrap_or(0.0)),
+    );
+    m.insert("pooledtx".into(), json!(pooledtx));
+    let min_sat = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.block_min_tx_fee_sat_kvb())
+        .unwrap_or(1);
+    m.insert("blockmintxfee".into(), json_btc_amount(min_sat));
+    m.insert("chain".into(), json!(chain_name(ctx.network)));
+    m.insert("bits".into(), json!(format!("{bits:08x}")));
+    m.insert("target".into(), json!(format!("{target:064x}")));
+    m.insert(
+        "next".into(),
+        json!({
+            "height": tip.saturating_add(1),
+            "bits": format!("{bits:08x}"),
+            "target": format!("{target:064x}"),
+            "difficulty": difficulty,
+        }),
+    );
+    m.insert("warnings".into(), json!(""));
+    Ok(Value::Object(m))
+}
+
+fn tip_bits(ctx: &RpcContext) -> Option<u32> {
+    let tip = ctx.query.tip_height()?;
+    let (_, rec) = ctx.query.header_at_height(tip).ok().flatten()?;
+    Some(rec.bits)
+}
+
+fn getnetworkhashps(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["nblocks", "height"])?;
+    let nblocks = params.opt_u64(0, "nblocks")?.unwrap_or(120) as i64;
+    let height = match params.get(1, "height") {
+        None | Some(Value::Null) => -1,
+        Some(v) => {
+            json_i64(v).ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "height must be an integer"))?
+        }
+    };
+    Ok(json!(network_hash_ps(ctx, nblocks, height)?))
+}
+
+fn network_hash_ps(ctx: &RpcContext, nblocks: i64, height: i64) -> Result<f64, Value> {
+    let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
+    if tip == 0 {
+        return Ok(0.0);
+    }
+    let end = if height < 0 || height as u32 > tip {
+        tip
+    } else {
+        height as u32
+    };
+    let n = if nblocks <= 0 { 120u32 } else { nblocks as u32 };
+    let start = end.saturating_sub(n);
+    let t0 = header_time(ctx, start).unwrap_or(0);
+    let t1 = header_time(ctx, end).unwrap_or(t0);
+    let dt = t1.saturating_sub(t0).max(1) as f64;
+    let work = f64::from(end.saturating_sub(start).saturating_mul(2));
+    Ok(work / dt)
+}
+
+fn header_time(ctx: &RpcContext, h: u32) -> Option<u32> {
+    let (_, rec) = ctx
+        .query
+        .header_at_height(rbitcoin_primitives::Height(h))
+        .ok()
+        .flatten()?;
+    Some(rec.timestamp)
 }
 
 fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -2700,9 +2855,9 @@ fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexdata", "dummy"])?;
     let miner = require_regtest_miner(ctx, "submitblock")?;
     let hex = params.req_str(0, "hexdata")?;
-    let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    let block: Block = deserialize(&raw)
-        .map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("block decode: {e}")))?;
+    let raw = hex_decode(hex).map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
+    let block: Block =
+        deserialize(&raw).map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
     match miner.submit_block(block) {
         SubmitBlockOutcome::Accepted => Ok(Value::Null),
         SubmitBlockOutcome::Duplicate => Ok(json!("duplicate")),
@@ -3520,6 +3675,10 @@ mod tests {
 
         fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
             use bitcoin::Target;
+            let hash = block.block_hash();
+            if self.0.is_block_invalid(&hash) {
+                return SubmitBlockOutcome::Rejected("duplicate-invalid".into());
+            }
             let target = Target::from_compact(block.header.bits);
             if block.header.validate_pow(target).is_err() {
                 return SubmitBlockOutcome::Rejected("high-hash".into());
@@ -3539,7 +3698,7 @@ mod tests {
             if !known {
                 return SubmitBlockOutcome::Rejected("prev-blk-not-found".into());
             }
-            match self.0.accept_received_block(block) {
+            match self.0.accept_received_block(block.clone()) {
                 Ok(rbitcoin_net::AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
                 Ok(rbitcoin_net::AcceptOutcome::AlreadyHave) => SubmitBlockOutcome::Duplicate,
                 Ok(rbitcoin_net::AcceptOutcome::IgnoredWeaker) => SubmitBlockOutcome::IgnoredWeaker,
@@ -3575,6 +3734,13 @@ mod tests {
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| s.to_string())
                     };
+                    if mapped != "bad-txnmrklroot"
+                        && mapped != "high-hash"
+                        && mapped != "prev-blk-not-found"
+                    {
+                        self.0.note_invalid_block(hash);
+                        let _ = self.0.ensure_header(&block.header);
+                    }
                     SubmitBlockOutcome::Rejected(mapped)
                 }
             }
@@ -3928,11 +4094,13 @@ mod tests {
         dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
         let tmpl = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
         assert_eq!(tmpl["height"], 2);
-        assert_eq!(tmpl["version"], 0x2000_0000);
+        assert_eq!(tmpl["version"], 0x2000_0000 | (1 << 28));
         assert!(tmpl["transactions"].as_array().unwrap().is_empty());
         let info = dispatch(&ctx, "getmininginfo", vec![]).unwrap();
         assert_eq!(info["blocks"], 1);
         assert_eq!(info["pooledtx"], 0);
+        let min_fee = info["blockmintxfee"].as_f64().expect("blockmintxfee");
+        assert!((min_fee - 1e-8).abs() < 1e-15, "blockmintxfee={min_fee}");
 
         dispatch(&ctx, "generate", vec![json!(100)]).unwrap();
         let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
@@ -3958,7 +4126,8 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(cb_val - 1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                // OP_CHECKSIG: Core GBT sigops = 1 * WITNESS_SCALE_FACTOR.
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
             }],
         };
         let tid = dispatch(
@@ -3971,6 +4140,7 @@ mod tests {
         let txs = tmpl["transactions"].as_array().unwrap();
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0]["txid"], tid);
+        assert_eq!(txs[0]["sigops"], 4);
         let lp1 = tmpl["longpollid"].as_str().unwrap().to_string();
         let tmpl2 = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
         assert_eq!(tmpl2["longpollid"], lp1);
@@ -4233,6 +4403,149 @@ mod tests {
     }
 
     #[test]
+    fn block_min_fee_matches_core_getfee() {
+        // 200 vB paying 1 sat meets 1 sat/kvB (1e3 >= 200) and any zero floor.
+        assert!(meets_block_min_feerate(1, 800, 1));
+        assert!(meets_block_min_feerate(1, 800, 0));
+        // 250 vB at 1000 sat/kvB needs 250 sat.
+        assert!(meets_block_min_feerate(250, 1000, 1000));
+        assert!(!meets_block_min_feerate(249, 1000, 1000));
+        // 40 sat/kvB on 111 vB (5 sat) must not meet a 50 sat/kvB floor.
+        assert!(!meets_block_min_feerate(5, 444, 50));
+    }
+
+    #[test]
+    fn submitheader_decode_and_prev_needles() {
+        use bitcoin::consensus::encode::serialize;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let bad_hex = "xx".repeat(80);
+        let e = dispatch(&ctx, "submitheader", vec![json!(bad_hex)]).unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Block header decode failed"),
+            "{e}"
+        );
+        let short = "ff".repeat(78);
+        let e = dispatch(&ctx, "submitheader", vec![json!(short)]).unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Block header decode failed"),
+            "{e}"
+        );
+
+        let orphan = serialize(&bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0x12; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        });
+        let e = dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(orphan))],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_VERIFY_ERROR);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Must submit previous header"),
+            "{e}"
+        );
+
+        let (addr, _) = p2wpkh_regtest();
+        dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
+        let tip = hub.tip_hash().unwrap();
+        let mut old = hub.tip_header().unwrap();
+        old.prev_blockhash = tip;
+        old.time = 1;
+        let e = dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(&old)))],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_VERIFY_ERROR);
+        assert!(
+            e["message"].as_str().unwrap().contains("time-too-old"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submitheader_invalid_parent_keeps_one_header_tip() {
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::Amount;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let mut parent = mine_regtest_paying(prev, time, 1, script.clone(), vec![]);
+        // Too-large coinbase → submitblock rejects after headers are known.
+        parent.txdata[0].output[0].value = Amount::from_sat(100 * 100_000_000);
+        parent.header.merkle_root = parent.compute_merkle_root().unwrap();
+        let target = bitcoin::Target::from_compact(parent.header.bits);
+        for nonce in 0..u32::MAX {
+            parent.header.nonce = nonce;
+            if parent.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let child = mine_regtest_paying(parent.block_hash(), time + 1, 2, script, vec![]);
+        dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(
+                &parent.header
+            )))],
+        )
+        .unwrap();
+        dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(
+                &child.header
+            )))],
+        )
+        .unwrap();
+        let before = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        let n_before = before.as_array().unwrap().len();
+        dispatch(
+            &ctx,
+            "submitblock",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(&parent)))],
+        )
+        .unwrap();
+        let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        assert_eq!(
+            tips.as_array().unwrap().len(),
+            n_before,
+            "rejecting the parent body must not add a second tip: {tips}"
+        );
+        assert!(
+            tips.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["status"] == "invalid"),
+            "{tips}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn submitheader_child_is_headers_only() {
         use bitcoin::consensus::encode::serialize;
         use rbitcoin_consensus::mine_regtest_paying;
@@ -4258,6 +4571,22 @@ mod tests {
         let miss = dispatch(&ctx, "invalidateblock", vec![json!("00".repeat(32))]).unwrap_err();
         assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
         assert_eq!(miss["message"], "Block not found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mockscheduler_rebroadcasts_unbroadcast() {
+        let (ctx, dir) = ctx_empty();
+        let e = dispatch(&ctx, "mockscheduler", vec![]).unwrap_err();
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delta_seconds"),
+            "{e}"
+        );
+        let r = dispatch(&ctx, "mockscheduler", vec![json!(900)]).unwrap();
+        assert!(r.is_null(), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

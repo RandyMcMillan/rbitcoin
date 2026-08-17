@@ -17,7 +17,7 @@ use rbitcoin_mempool::{
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -26,6 +26,28 @@ use tokio::sync::broadcast;
 /// Max age of a published fee snapshot before refresh (request path is still Arc-load only
 /// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
 const FEE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
+
+fn load_unbroadcast_file(dir: &Path) -> HashSet<Txid> {
+    let Ok(bytes) = std::fs::read(dir.join("unbroadcast")) else {
+        return HashSet::new();
+    };
+    bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(c);
+            Txid::from_byte_array(a)
+        })
+        .collect()
+}
+
+fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
+    let mut buf = Vec::with_capacity(set.len() * 32);
+    for t in set {
+        buf.extend_from_slice(&t.to_byte_array());
+    }
+    let _ = std::fs::write(dir.join("unbroadcast"), buf);
+}
 
 /// Esplora `/fee-estimates` keys + common Electrum depths (after 0–2 → default map).
 const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
@@ -280,6 +302,8 @@ pub struct MempoolHub {
     meter_list_live_meta: AtomicU64,
     /// Live mempool txs by Electrum scripthash (updated on accept/remove).
     sh_index: Mutex<MempoolShIndex>,
+    /// `{datadir}/mempool` — sidecar `unbroadcast` lives here.
+    dir: PathBuf,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
@@ -309,10 +333,17 @@ impl MempoolHub {
         max_weight_wu: u64,
         persist: bool,
     ) -> Result<Arc<Self>, String> {
+        let dir_buf = dir.as_ref().to_path_buf();
         let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
+        let unbroadcast = if persist {
+            load_unbroadcast_file(&dir_buf)
+        } else {
+            HashSet::new()
+        };
         let hub = Self {
+            dir: dir_buf,
             inner: RwLock::new(mp),
             query,
             relay_enabled: AtomicBool::new(false),
@@ -341,10 +372,14 @@ impl MempoolHub {
             meter_list_live: AtomicU64::new(0),
             meter_list_live_meta: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
-            unbroadcast: Mutex::new(HashSet::new()),
+            unbroadcast: Mutex::new(unbroadcast),
             fee_deltas: Mutex::new(HashMap::new()),
             template_updates: AtomicU64::new(0),
         };
+        {
+            let mut u = hub.unbroadcast.lock().unwrap();
+            u.retain(|t| hub.contains(t));
+        }
         hub.reindex_live_scripthashes();
         Ok(Arc::new(hub))
     }
@@ -401,7 +436,9 @@ impl MempoolHub {
 
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
-        if self.unbroadcast.lock().unwrap().remove(txid) {
+        let mut u = self.unbroadcast.lock().unwrap();
+        if u.remove(txid) {
+            persist_unbroadcast_file(&self.dir, &u);
             rbitcoin_log::info!("{}", Self::unbroadcast_removed_log(txid));
         }
     }
@@ -1135,6 +1172,11 @@ impl MempoolHub {
             .set_cluster_limits(count, size_kvb);
     }
 
+    /// Core `-minrelaytxfee` overlay (sat/kvB). `0` admits any non-negative fee.
+    pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
+        self.inner.write().unwrap().set_min_relay_sat_kvb(sat_kvb);
+    }
+
     /// In-mempool ancestors of `txid`, **excluding** itself (Core RPC).
     pub fn ancestor_txids(&self, txid: &Txid) -> Option<Vec<Txid>> {
         let g = self.inner.read().unwrap();
@@ -1203,13 +1245,35 @@ impl MempoolHub {
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
     pub fn note_unbroadcast(&self, txid: Txid) {
         if self.inner.read().unwrap().graph.contains(&txid) {
-            self.unbroadcast.lock().unwrap().insert(txid);
+            let mut u = self.unbroadcast.lock().unwrap();
+            u.insert(txid);
+            persist_unbroadcast_file(&self.dir, &u);
         }
     }
 
     /// Peer getdata served this txid — it is no longer unbroadcast.
     pub fn mark_broadcast(&self, txid: &Txid) {
-        self.unbroadcast.lock().unwrap().remove(txid);
+        let mut u = self.unbroadcast.lock().unwrap();
+        if u.remove(txid) {
+            persist_unbroadcast_file(&self.dir, &u);
+        }
+    }
+
+    /// Core `mockscheduler`: re-INV still-unbroadcast local txs (15m due-now).
+    pub fn rebroadcast_unbroadcast(&self) {
+        let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().iter().copied().collect();
+        for txid in ids {
+            if !self.contains(&txid) {
+                continue;
+            }
+            let _ = self.announce.send(MempoolAnnounce {
+                txid,
+                replaced: Vec::new(),
+                replaced_scripthashes: Vec::new(),
+                scripthashes: Vec::new(),
+            });
+            self.meter_announce.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// How many locally submitted txs have not been requested by a peer.
@@ -1522,6 +1586,73 @@ mod tests {
                 "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
             )
         );
+    }
+
+    #[test]
+    fn unbroadcast_persists_and_mockscheduler_rebroadcasts() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        hub.accept_tx(&tx).expect("accept");
+        hub.note_unbroadcast(tx.compute_txid());
+        assert_eq!(hub.unbroadcast_count(), 1);
+        hub.flush().expect("shutdown flush");
+        drop(hub);
+
+        let q2 = Query::open_or_create(&store_dir).unwrap();
+        let hub2 = MempoolHub::open(&mp_dir, Arc::new(q2)).unwrap();
+        hub2.set_relay_enabled(true);
+        assert_eq!(
+            hub2.unbroadcast_count(),
+            1,
+            "unbroadcast set must reload from sidecar"
+        );
+        let mut rx = hub2.subscribe_announces();
+        hub2.rebroadcast_unbroadcast();
+        let got = rx.try_recv().expect("mockscheduler rebroadcast");
+        assert_eq!(got.txid, tx.compute_txid());
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Accept → persist → reopen rebuilds the scripthash index; remove unindexes.

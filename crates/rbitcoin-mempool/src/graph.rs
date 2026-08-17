@@ -697,7 +697,8 @@ impl TxGraph {
     }
 
     /// Like [`Self::select_block_txids`], ranking by `base_fee + delta(txid)`.
-    /// Chunks whose modified fee is ≤ 0 are skipped (not mined).
+    /// Chunks whose modified fee is **negative** are skipped. Zero-fee txs stay
+    /// selectable so `-blockmintxfee=0` can include them (GBT filters after).
     pub fn select_block_txids_delta(
         &self,
         max_weight_wu: u64,
@@ -713,7 +714,7 @@ impl TxGraph {
                 let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
                 mf = mf.saturating_add(base.saturating_add(i128::from(delta(*t))));
             }
-            if mf <= 0 {
+            if mf < 0 {
                 continue;
             }
             let fee = mf as u64;
@@ -728,7 +729,7 @@ impl TxGraph {
             let mut add = Vec::new();
             for t in &ch.txids {
                 let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
-                if base.saturating_add(i128::from(delta(*t))) <= 0 {
+                if base.saturating_add(i128::from(delta(*t))) < 0 {
                     continue;
                 }
                 self.collect_selected_with_ancestors(*t, &selected, &mut add);
@@ -1007,7 +1008,19 @@ mod tests {
                 0
             }
         });
-        assert_eq!(depri, vec![lid], "zero modified fee is not mined");
+        assert_eq!(
+            depri,
+            vec![lid, hid],
+            "zero modified fee stays selectable; hotter lid ranks first"
+        );
+        let depri_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+            if id == hid {
+                -10_001
+            } else {
+                0
+            }
+        });
+        assert_eq!(depri_neg, vec![lid], "negative modified fee is not mined");
         let bump = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
             if id == lid {
                 86 * 100_000_000
@@ -1050,8 +1063,20 @@ mod tests {
         });
         assert_eq!(
             only_p,
+            vec![pid, cid],
+            "zero-modified child stays selectable with parent"
+        );
+        let only_p_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+            if id == cid {
+                -1_001
+            } else {
+                0
+            }
+        });
+        assert_eq!(
+            only_p_neg,
             vec![pid],
-            "zero-modified child is not mined with parent"
+            "negative-modified child is not mined with parent"
         );
     }
 

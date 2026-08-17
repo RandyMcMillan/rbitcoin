@@ -15,7 +15,7 @@ use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, Notify};
@@ -76,6 +76,12 @@ pub struct ChainHub {
     announce_reorg_len: AtomicU32,
     /// Core `-minimumchainwork` (32-byte BE). `None` = no extra floor.
     minimum_chain_work: RwLock<Option<[u8; 32]>>,
+    /// Core `-blockversion`. `0` = default (TOP_BITS | testdummy).
+    block_version: AtomicI32,
+    /// True after generate/GBT in this process (getmininginfo currentblock*).
+    gbt_assembled: AtomicBool,
+    /// Core `-blockmintxfee` in sat/kvB. Default 1.
+    block_min_tx_fee_sat_kvb: AtomicU64,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -115,7 +121,43 @@ impl ChainHub {
             header_tips: RwLock::new(HashMap::new()),
             announce_reorg_len: AtomicU32::new(0),
             minimum_chain_work: RwLock::new(None),
+            block_version: AtomicI32::new(0),
+            gbt_assembled: AtomicBool::new(false),
+            block_min_tx_fee_sat_kvb: AtomicU64::new(1),
         }
+    }
+
+    pub fn note_gbt_assembled(&self) {
+        self.gbt_assembled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn gbt_assembled(&self) -> bool {
+        self.gbt_assembled.load(Ordering::Relaxed)
+    }
+
+    /// Core `-blockversion`. Non-zero overrides GBT `version`.
+    pub fn set_block_version(&self, v: i32) {
+        self.block_version.store(v, Ordering::Relaxed);
+    }
+
+    /// GBT `version`: `-blockversion` or Core TOP_BITS | testdummy (bit 28).
+    pub fn gbt_block_version(&self) -> i32 {
+        let v = self.block_version.load(Ordering::Relaxed);
+        if v != 0 {
+            v
+        } else {
+            0x2000_0000 | (1 << 28)
+        }
+    }
+
+    /// Core `-blockmintxfee` (sat/kvB). Default 1.
+    pub fn set_block_min_tx_fee_sat_kvb(&self, sat_kvb: u64) {
+        self.block_min_tx_fee_sat_kvb
+            .store(sat_kvb, Ordering::Relaxed);
+    }
+
+    pub fn block_min_tx_fee_sat_kvb(&self) -> u64 {
+        self.block_min_tx_fee_sat_kvb.load(Ordering::Relaxed)
     }
 
     /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
@@ -316,7 +358,13 @@ impl ChainHub {
         }
         {
             let headers = self.header_tips.read().unwrap();
+            // Only header *tips* (a later submitblock of an ancestor must not
+            // re-list that ancestor alongside its descendant).
+            let covered: HashSet<BlockHash> = headers.values().map(|(prev, _)| *prev).collect();
             for hash in headers.keys().copied() {
+                if covered.contains(&hash) {
+                    continue;
+                }
                 let status = if self.header_ancestry_invalid(hash) {
                     "invalid"
                 } else {
@@ -465,6 +513,59 @@ impl ChainHub {
     pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
         let _ = self.ensure_header_fk(header)?;
         Ok(())
+    }
+
+    /// Whether `hash` is marked invalid (`invalidateblock` or rejected `submitblock`).
+    pub fn is_block_invalid(&self, hash: &BlockHash) -> bool {
+        self.invalidated.read().unwrap().contains(hash) || self.header_ancestry_invalid(*hash)
+    }
+
+    /// Remember a consensus-invalid block (not a mutated merkle).
+    pub fn note_invalid_block(&self, hash: BlockHash) {
+        self.invalidated.write().unwrap().insert(hash);
+    }
+
+    /// Core `submitheader`: decode already succeeded. Missing parent, invalid
+    /// parent, and MTP are reject strings (`RPC_VERIFY_ERROR` / `-25`).
+    pub fn process_submitted_header(&self, header: &Header) -> Result<(), String> {
+        let hash = header.block_hash();
+        if self
+            .query
+            .get_header_by_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()
+            .is_some()
+            || self.header_tips.read().unwrap().contains_key(&hash)
+            || self.is_connected(&hash)
+        {
+            return Ok(());
+        }
+        let prev = header.prev_blockhash;
+        let prev_bytes = prev.to_byte_array();
+        let prev_known = prev_bytes == [0u8; 32]
+            || self
+                .query
+                .get_header_by_hash(&prev_bytes)
+                .ok()
+                .flatten()
+                .is_some()
+            || self.header_tips.read().unwrap().contains_key(&prev)
+            || self.is_connected(&prev)
+            || self.held_body(&prev).is_some();
+        if !prev_known {
+            return Err("Must submit previous header".into());
+        }
+        if self.is_block_invalid(&prev) {
+            return Err("bad-prevblk".into());
+        }
+        if let Some(ph) = self.query.height_of_hash(&prev_bytes).ok().flatten() {
+            if let Ok(mtp) = rbitcoin_consensus::median_time_past(self.query.as_ref(), ph) {
+                if header.time <= mtp {
+                    return Err("time-too-old".into());
+                }
+            }
+        }
+        self.ensure_header(header).map_err(|e| e.to_string())
     }
 
     /// Like [`ensure_header`], but returns the header fk for the archive writer
@@ -1162,12 +1263,16 @@ impl ChainHub {
                 }
             }
             Err(e) => {
-                if self
-                    .query
-                    .get_header_by_hash(&hash.to_byte_array())
-                    .ok()
-                    .flatten()
-                    .is_some()
+                let s = e.to_string();
+                // Merkle mismatch is Core "mutated": do not mark BLOCK_FAILED.
+                let mutated = s.contains("merkle") || s.contains("bad-txnmrklroot");
+                if !mutated
+                    && self
+                        .query
+                        .get_header_by_hash(&hash.to_byte_array())
+                        .ok()
+                        .flatten()
+                        .is_some()
                 {
                     self.invalidated.write().unwrap().insert(hash);
                 }

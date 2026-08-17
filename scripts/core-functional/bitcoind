@@ -53,6 +53,9 @@ FORWARD_FLAGS = frozenset(
         "limitclustersize",
         "peertimeout",
         "minimumchainwork",
+        "mocktime",
+        "blockversion",
+        "blockmintxfee",
     }
 )
 
@@ -79,6 +82,12 @@ IGNORE_FLAGS = frozenset(
         "limitancestorsize",
         "fastprune",
         "prune",
+        # Test-only: refuse public outbound (we already --no-seeds + explicit
+        # connect). Not an operator proxy implementation.
+        "proxy",
+        # Surface-selection flag; getpeerinfo startingheight is implemented
+        # separately if the official script names it.
+        "deprecatedrpc",
         "txospenderindex",
         "datacarrier",
         "datacarriersize",
@@ -213,6 +222,7 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
             "peertimeout",
             "maxconnections",
             "minimumchainwork",
+            "blockmintxfee",
         ):
             i += 1
             if i >= len(argv):

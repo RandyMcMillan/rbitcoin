@@ -286,6 +286,8 @@ pub struct ActiveMempool {
     /// Overlay from `-limitclustercount` / `-limitclustersize` (re-applied after compact).
     cluster_count_overlay: Option<u32>,
     cluster_size_kvb_overlay: Option<u32>,
+    /// Core `-minrelaytxfee` in sat/kvB (default Libre 100).
+    min_relay_sat_kvb: u64,
 }
 
 impl ActiveMempool {
@@ -309,6 +311,11 @@ impl ActiveMempool {
             self.cluster_size_kvb_overlay = size_kvb;
         }
         self.graph.set_cluster_limits(count, size_kvb);
+    }
+
+    /// Overlay Core `-minrelaytxfee` (sat/kvB). `0` admits any non-negative fee.
+    pub fn set_min_relay_sat_kvb(&mut self, sat_kvb: u64) {
+        self.min_relay_sat_kvb = sat_kvb;
     }
 
     /// `persist=false` abandons any on-disk live set (Core `-persistmempool=0`).
@@ -350,6 +357,7 @@ impl ActiveMempool {
             last_accept_stages: AcceptStageUs::default(),
             cluster_count_overlay: None,
             cluster_size_kvb_overlay: None,
+            min_relay_sat_kvb: rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
         })
     }
 
@@ -551,7 +559,7 @@ impl ActiveMempool {
         let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
-        match policy::check_libre_admission(tx, admit_fee, weight) {
+        match policy::check_libre_admission_at(tx, admit_fee, weight, self.min_relay_sat_kvb) {
             PolicyResult::Standard => {}
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
         }

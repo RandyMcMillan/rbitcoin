@@ -4484,6 +4484,68 @@ mod tests {
     }
 
     #[test]
+    fn submitheader_invalid_parent_keeps_one_header_tip() {
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::Amount;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        let (_, script) = p2wpkh_regtest();
+        let prev = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let mut parent = mine_regtest_paying(prev, time, 1, script.clone(), vec![]);
+        // Too-large coinbase → submitblock rejects after headers are known.
+        parent.txdata[0].output[0].value = Amount::from_sat(100 * 100_000_000);
+        parent.header.merkle_root = parent.compute_merkle_root().unwrap();
+        let target = bitcoin::Target::from_compact(parent.header.bits);
+        for nonce in 0..u32::MAX {
+            parent.header.nonce = nonce;
+            if parent.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let child = mine_regtest_paying(parent.block_hash(), time + 1, 2, script, vec![]);
+        dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(
+                &parent.header
+            )))],
+        )
+        .unwrap();
+        dispatch(
+            &ctx,
+            "submitheader",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(
+                &child.header
+            )))],
+        )
+        .unwrap();
+        let before = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        let n_before = before.as_array().unwrap().len();
+        dispatch(
+            &ctx,
+            "submitblock",
+            vec![json!(rbitcoin_primitives::hex_encode(serialize(&parent)))],
+        )
+        .unwrap();
+        let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+        assert_eq!(
+            tips.as_array().unwrap().len(),
+            n_before,
+            "rejecting the parent body must not add a second tip: {tips}"
+        );
+        assert!(
+            tips.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["status"] == "invalid"),
+            "{tips}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn submitheader_child_is_headers_only() {
         use bitcoin::consensus::encode::serialize;
         use rbitcoin_consensus::mine_regtest_paying;

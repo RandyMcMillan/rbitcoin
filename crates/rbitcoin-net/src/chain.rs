@@ -358,7 +358,13 @@ impl ChainHub {
         }
         {
             let headers = self.header_tips.read().unwrap();
+            // Only header *tips* (a later submitblock of an ancestor must not
+            // re-list that ancestor alongside its descendant).
+            let covered: HashSet<BlockHash> = headers.values().map(|(prev, _)| *prev).collect();
             for hash in headers.keys().copied() {
+                if covered.contains(&hash) {
+                    continue;
+                }
                 let status = if self.header_ancestry_invalid(hash) {
                     "invalid"
                 } else {

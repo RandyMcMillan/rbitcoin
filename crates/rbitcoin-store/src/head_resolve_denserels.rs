@@ -60,12 +60,33 @@ fn resolve_fk_and_range_batch_opts(
         return Ok(Vec::new());
     }
     match io_backend::read_io_backend() {
-        ReadIoBackend::Uring => match resolve_fk_and_range_uring(table, txids, heights, tip_only) {
-            Ok(v) => Ok(v),
-            // Ring open fail (agent 9p / disabled): sync depth-first fallback.
-            Err(_) => resolve_fk_and_range_pread(table, txids, heights, tip_only),
-        },
+        ReadIoBackend::Uring => map_uring_resolve(
+            resolve_fk_and_range_uring(table, txids, heights, tip_only),
+            || resolve_fk_and_range_pread(table, txids, heights, tip_only),
+        ),
         ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
+    }
+}
+
+/// Fallback to pread only when the ring cannot be opened. Harvest invariants
+/// (`Corrupt` / `Io` from a live machine) must not be swallowed.
+fn map_uring_resolve<T>(
+    uring: Result<T, StoreError>,
+    pread: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    match uring {
+        Ok(v) => Ok(v),
+        Err(e) if is_uring_unavailable(&e) => pread(),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_uring_unavailable(err: &StoreError) -> bool {
+    match err {
+        StoreError::Corrupt("io_uring unavailable")
+        | StoreError::Corrupt("io_uring is Linux-only") => true,
+        StoreError::Io { path, .. } if path.as_os_str() == "io_uring" => true,
+        _ => false,
     }
 }
 
@@ -794,6 +815,32 @@ mod tests {
         }
         let _fks = t.put_full_batch_indexed(&items, true).unwrap();
         (dir, t, txids)
+    }
+
+    #[test]
+    fn resolve_uring_no_swallow_corrupt() {
+        let err = StoreError::Corrupt("invariant: io_uring unexpected cqe");
+        let mut pread_hits = 0u32;
+        match map_uring_resolve(Err(err), || {
+            pread_hits += 1;
+            Ok(Vec::<([u8; 32], Option<(Fk, (u64, u64))>)>::new())
+        }) {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("Corrupt must propagate, got {other:?}"),
+        }
+        assert_eq!(pread_hits, 0);
+    }
+
+    #[test]
+    fn resolve_uring_unavailable_falls_back_to_pread() {
+        let mut pread_hits = 0u32;
+        let out = map_uring_resolve(Err(StoreError::Corrupt("io_uring unavailable")), || {
+            pread_hits += 1;
+            Ok(vec![([0u8; 32], None::<(Fk, (u64, u64))>)])
+        })
+        .unwrap();
+        assert_eq!(pread_hits, 1);
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

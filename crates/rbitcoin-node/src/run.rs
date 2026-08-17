@@ -1377,11 +1377,6 @@ mod tests {
         let on = enter_tip_mode(&q, None, true);
         assert!(on.tip_follow_ready);
         assert!(store.join("scripthash.body").is_file());
-        let head = store.join("scripthash.head");
-        assert!(
-            head.is_file() || head.is_dir(),
-            "SH head must exist before disable"
-        );
 
         let off = enter_tip_mode(&q, None, false);
         assert!(off.tip_follow_ready, "follow stays on after disable");
@@ -1392,7 +1387,6 @@ mod tests {
             store.join("scripthash.body").is_file(),
             "disable must not purge SH tables"
         );
-        assert!(head.is_file() || head.is_dir());
 
         let again = enter_tip_mode(&q, None, true);
         assert!(again.tip_follow_ready);

@@ -1304,6 +1304,10 @@ mod tests {
             cake_server.to_ascii_lowercase().contains("rbitcoin"),
             "version[0] must still identify rbitcoin, got {cake_server:?}"
         );
+        assert!(
+            cake_server.contains(env!("CARGO_PKG_VERSION")),
+            "version[0] must track workspace.package.version, got {cake_server:?}"
+        );
 
         assert!(dispatch(
             "server.ping",

@@ -53,6 +53,11 @@ before 1.0).
 - **SH on/off:** COMPAT and README point at the OPERATOR cost table.
   Disable-after-on leaves SH files on disk; tip follow stays up.
 
+- **Electrum `electrs` UA + versions:** COMPAT documents why
+  `server.version[0]` contains `electrs` (Cake `getNodeIsElectrs()`).
+  README no longer hardcodes `0.1.0`; shipped strings stay
+  `workspace.package.version`.
+
 - **COMPAT GBT:** template RPCs (`getblocktemplate` / `getmininginfo` /
   `prioritisetransaction`) are shipped. COMPAT no longer lists GBT as
   never. Stratum / wallet keys stay non-goals.

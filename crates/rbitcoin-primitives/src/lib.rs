@@ -331,4 +331,11 @@ mod tests {
             .unwrap_err()
             .contains("exceeds maximum"));
     }
+
+    #[test]
+    fn live_version_feeds_subversion() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        let s = rbitcoin_subversion(VERSION, &[] as &[&str]).unwrap();
+        assert_eq!(s, format!("/rbitcoin:{VERSION}/"));
+    }
 }

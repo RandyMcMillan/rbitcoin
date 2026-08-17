@@ -74,7 +74,7 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()` will probe tweaks |
+| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below |
 | blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; outs from `txout`). Isolate may still hardcode `electrs.cakewallet.com` |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full** |
@@ -83,6 +83,15 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | transaction.broadcast | done | Mempool accept + P2P inv |
 | relayfee / estimatefee / histogram | done | Libre min + live median |
 | TLS | external | terminate at reverse proxy; node is plain TCP |
+
+### Why `server.version` says electrs
+
+We are **not** electrs. Cake Wallet `getNodeIsElectrs()` lowercases
+`version[0]` and requires the substring `electrs` before it will call
+`blockchain.tweaks.subscribe`. The first element is therefore
+`rbitcoin-electrs <ver>` (`ver` from `workspace.package.version`) so Cake
+will probe tweaks. Isolate may still hardcode `electrs.cakewallet.com`
+after a passing probe.
 | DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
 
 ## Esplora REST surface

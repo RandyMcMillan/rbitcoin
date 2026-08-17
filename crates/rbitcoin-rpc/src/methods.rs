@@ -3354,7 +3354,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(true)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -3395,7 +3399,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(1)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -3860,7 +3868,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: Some(Arc::new(TestMiner(Arc::clone(&hub)))),
             peers: None,
             chain: Some(Arc::clone(&hub)),
@@ -5190,7 +5202,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             initial_block_download: Arc::new(AtomicBool::new(false)),
-            subversion: "/rbitcoin:0.1.0/".into(),
+            subversion: rbitcoin_primitives::rbitcoin_subversion(
+                env!("CARGO_PKG_VERSION"),
+                &[] as &[&str],
+            )
+            .unwrap(),
             regtest: None,
             peers: None,
             chain: None,
@@ -5210,6 +5226,11 @@ mod tests {
         assert_eq!(
             net["version"].as_u64(),
             Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),
+        );
+        assert_eq!(
+            net["subversion"].as_str().unwrap(),
+            rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str],)
+                .unwrap()
         );
         assert_eq!(
             rpc_client_version("0.1.0"),

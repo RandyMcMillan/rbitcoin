@@ -15,7 +15,7 @@ consensus/script** path.
 | | |
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
-| **Version** | 0.1.0 experimental ([`CHANGELOG.md`](./CHANGELOG.md)) |
+| **Version** | experimental 0.x — see [`Cargo.toml`](./Cargo.toml) / [`CHANGELOG.md`](./CHANGELOG.md) |
 | **Platform** | **Linux first** (io_uring + map-free fd store; other OSes unproven) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |

@@ -426,6 +426,9 @@ security model by itself.
 
 **Requires `--shindex`.** Without it the node refuses to start.
 
+`server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()`
+will probe silent-payment tweaks. We are **not** electrs — see `COMPAT.md`.
+
 **Not a graphical explorer.** We serve clients that already know their
 scripthashes / txids; we do **not** aim to back block-explorer search UIs.
 

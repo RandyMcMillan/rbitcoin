@@ -100,13 +100,20 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .ok()
             .flatten()
             .unwrap_or(0);
-        // Coinbase: first input null prevout when we can load inputs; else height-0 heuristic.
-        let is_coinbase = self
-            .query
-            .tx_input_at_fk(fk, &rec, 0)
-            .ok()
-            .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-            .unwrap_or(false);
+        // Coinbase: first tx in its confirmed block, or a null-prevout input.
+        let is_coinbase = if create_height > 0 {
+            self.query
+                .block_tx_fks(rbitcoin_primitives::Height(create_height))
+                .ok()
+                .and_then(|fks| fks.first().copied())
+                == Some(fk)
+        } else {
+            self.query
+                .tx_input_at_fk(fk, &rec, 0)
+                .ok()
+                .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+                .unwrap_or(false)
+        };
         let create_mtp = if create_height == 0 {
             0
         } else {
@@ -1000,6 +1007,16 @@ impl MempoolHub {
             .into_iter()
             .filter(|r| r.is_ok())
             .count()
+    }
+
+    /// Drop live txs that are non-final / immature at the new tip (invalidate
+    /// of empty blocks still has to evict mempool coinbase spends).
+    pub fn evict_after_reorg(&self) {
+        let utxo = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        let tip = self.chain_tip_ctx();
+        self.inner.write().unwrap().evict_nonfinal(&utxo, tip);
     }
 
     /// Block template / generate selection: mining-order live txs that fit

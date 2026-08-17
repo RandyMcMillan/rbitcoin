@@ -82,6 +82,7 @@ pub struct PlanStampOutcome {
 /// IBD **lookup** stage: structure + stamp create_fk + parent body ranges.
 ///
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
+/// Parent create_fk: in-flight → published `live_union` → TipOnly leftover.
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
 /// cloning full `Block` payloads into stamp.
 pub fn confirm_wire_lookup_stamp(
@@ -91,25 +92,10 @@ pub fn confirm_wire_lookup_stamp(
     blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
-    confirm_wire_lookup_stamp_with_hits(query, params, milestone, blocks, pipeline, None)
-}
-
-/// Like [`confirm_wire_lookup_stamp`] with BQ-ahead hits.
-///
-/// IBD load stamps from those hits plus in-flight / live pins, then TipOnly
-/// `tx.head` for remaining parents (open head / ages ≤3 sealed). Not TipThenAny.
-pub fn confirm_wire_lookup_stamp_with_hits(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[(Height, Arc<Block>)],
-    pipeline: Option<&WireLoadPipeline>,
-    pre_resolved: Option<&rbitcoin_store::BqParentHits>,
-) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
     query.on_load_pack().map_err(ConsensusError::from)?;
     let (mut plan, metas, wire_blocks, plan_ns) =
-        wire_lookup_phase(query, params, milestone, blocks, pipeline, pre_resolved)?;
+        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
@@ -339,7 +325,6 @@ pub(super) fn wire_lookup_phase(
     milestone: Milestone,
     blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WireLoadPipeline>,
-    pre_resolved: Option<&rbitcoin_store::BqParentHits>,
 ) -> Result<
     (
         Option<rbitcoin_query::ArchiveWritePlan>,
@@ -490,7 +475,6 @@ pub(super) fn wire_lookup_phase(
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
-                    pre_resolved,
                     Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
@@ -500,7 +484,6 @@ pub(super) fn wire_lookup_phase(
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
                     None,
-                    pre_resolved,
                     None,
                 )
                 .map_err(ConsensusError::from)?,

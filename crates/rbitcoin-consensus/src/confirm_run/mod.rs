@@ -53,8 +53,8 @@ pub use bq_resolve::{
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{
-    confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_wire_lookup_stamp_with_hits,
-    DenserelsWarmStats, ParentPinStamp, PlanStampOutcome,
+    confirm_wire_load_from_plan, confirm_wire_lookup_stamp, DenserelsWarmStats, ParentPinStamp,
+    PlanStampOutcome,
 };
 use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
 use phases::{assemble_run, script_wave};
@@ -369,7 +369,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.parent_store.as_ref()),
-                    None,
                     Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
@@ -378,7 +377,6 @@ pub fn confirm_wire_load_phase_pipelined(
                     &mut need,
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
-                    None,
                     None,
                     None,
                 )

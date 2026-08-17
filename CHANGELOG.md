@@ -20,6 +20,10 @@ before 1.0).
 
 ### Changed
 
+- **Stamp identity union:** load/plan stamp no longer accepts a BQ-ahead
+  hits map. Facts come from in-flight → published `live_union` → TipOnly.
+  Deleted `BqParentHits` and `confirm_wire_lookup_stamp_with_hits`.
+
 - **Core functional Wave D leftovers.** Official unmodified
   `interface_rpc.py` and `mempool_reorg.py` are now `run` (33 inventory
   run names). HTTP JSON-RPC 2.0 batch, notifications (204), and

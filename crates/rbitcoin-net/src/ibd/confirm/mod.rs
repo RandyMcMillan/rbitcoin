@@ -1421,13 +1421,12 @@ pub(crate) fn spawn_confirm_engine(
                     .collect();
                 confirm_thr_stats::add_load_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
-                let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp_with_hits(
+                let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp(
                     &hub_load.query,
                     &hub_load.params,
                     hub_load.milestone,
                     &plan_items,
                     if use_pipe { Some(&pipe) } else { None },
-                    None,
                 );
                 confirm_thr_stats::add_load_stamp(t_stamp.elapsed());
                 let stamped = match plan_res {

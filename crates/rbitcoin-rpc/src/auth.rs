@@ -108,22 +108,17 @@ pub fn parse_basic_auth(header: &str) -> Option<(String, String)> {
     Some((u.to_string(), p.to_string()))
 }
 
+/// 32-byte CSPRNG password as lowercase hex (64 chars). Same entropy class as
+/// `store.secret` — not `DefaultHasher(time, pid)`.
 fn random_cookie_password() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut h = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut h);
-    std::process::id().hash(&mut h);
-    format!(
-        "{:016x}{:016x}",
-        h.finish(),
-        h.finish().wrapping_mul(0x9e37)
-    )
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("CSPRNG for RPC cookie");
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -149,6 +144,40 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.user, "__cookie__");
         assert!(!a.password.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Cookie password must be 32 bytes of CSPRNG entropy as lowercase hex
+    /// (not DefaultHasher(time,pid) — that was only 32 hex chars and guessable).
+    #[test]
+    fn cookie_password_is_csprng_hex() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..32 {
+            let path = dir.join(format!(".cookie-{i}"));
+            let a = write_cookie_file(&path).unwrap();
+            assert_eq!(
+                a.password.len(),
+                64,
+                "expected 32-byte CSPRNG as 64 hex chars, got len={}",
+                a.password.len()
+            );
+            assert!(
+                a.password.chars().all(|c| c.is_ascii_hexdigit()),
+                "password must be hex: {}",
+                a.password
+            );
+            assert!(
+                a.password.chars().all(|c| !c.is_ascii_uppercase()),
+                "password must be lowercase hex"
+            );
+            assert!(
+                seen.insert(a.password.clone()),
+                "duplicate cookie password (not CSPRNG?): {}",
+                a.password
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

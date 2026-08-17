@@ -9,3 +9,15 @@ emit = ['Bound to 127.0.0.1:{1}']
 [[rule]]
 match = 'rbitcoin-node listening on 127\.0\.0\.1:(\d+)'
 emit = ['Bound to 127.0.0.1:{1}']
+
+[[rule]]
+match = 'getblocktxn with out-of-bounds tx indices'
+emit = ['getblocktxn with out-of-bounds tx indices']
+
+[[rule]]
+match = 'previous compact block reconstruction attempt failed'
+emit = ['previous compact block reconstruction attempt failed']
+
+[[rule]]
+match = 'Ignoring low-work compact block from peer (\d+)'
+emit = ['[net] Ignoring low-work compact block from peer {1}']

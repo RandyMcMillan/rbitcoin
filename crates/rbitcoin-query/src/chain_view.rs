@@ -168,6 +168,17 @@ impl Query {
             return Ok(Vec::new());
         };
         let limit = limit.min(2000);
+        // Empty locator: Core treats hashstop as a single-block request
+        // (`p2p_sendheaders` null-locator). Unknown / zero stop → no headers.
+        if locator.is_empty() {
+            if stop.to_byte_array() == [0u8; 32] {
+                return Ok(Vec::new());
+            }
+            return match self.height_of_hash(&stop.to_byte_array())? {
+                Some(h) => Ok(vec![self.wire_header_at_height(h)?]),
+                None => Ok(Vec::new()),
+            };
+        }
         let mut start = 0u32;
         'outer: for loc in locator {
             if loc.to_byte_array() == [0u8; 32] {

@@ -15,6 +15,7 @@ use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, Notify};
@@ -25,6 +26,9 @@ pub struct TipEvent {
     pub height: u32,
     pub hash: BlockHash,
     pub header: Header,
+    /// New-branch length when this tip came from `accept_branch` (0 = tip-extend).
+    /// `p2p_sendheaders`: >8 → announce inv and pause headers.
+    pub reorg_branch_len: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +72,8 @@ pub struct ChainHub {
     /// Header-only tips (`submitheader` / P2P headers): hash → (prev, height).
     /// Not a block index — no bodies, no status machine.
     header_tips: RwLock<HashMap<BlockHash, (BlockHash, u32)>>,
+    /// Set around `accept_branch` connect so each `TipEvent` carries branch length.
+    announce_reorg_len: AtomicU32,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -105,6 +111,7 @@ impl ChainHub {
             precious: RwLock::new(None),
             fork_tips: RwLock::new(HashSet::new()),
             header_tips: RwLock::new(HashMap::new()),
+            announce_reorg_len: AtomicU32::new(0),
         }
     }
 
@@ -584,6 +591,7 @@ impl ChainHub {
                     height,
                     hash,
                     header: hdr,
+                    reorg_branch_len: 0,
                 });
             }
         }
@@ -676,6 +684,9 @@ impl ChainHub {
         self.disconnect_to(keep)?;
         drop(_guard);
         let _ = self.try_apply_after_invalidate()?;
+        if let Some(mp) = self.mempool() {
+            mp.evict_after_reorg();
+        }
         Ok(())
     }
 
@@ -1009,8 +1020,11 @@ impl ChainHub {
         }
 
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
+        self.announce_reorg_len
+            .store(blocks.len() as u32, Ordering::Relaxed);
         for (i, b) in blocks.iter().enumerate() {
             if let Err(e) = self.connect_at(base + i as u32, b.clone()) {
+                self.announce_reorg_len.store(0, Ordering::Relaxed);
                 // Mid-branch connect fail: restore pre-attempt tip (not leave LCA).
                 if let Some(fh) = fork_height {
                     if let Err(disc) = self.disconnect_to(fh) {
@@ -1029,6 +1043,7 @@ impl ChainHub {
                 return Err(e);
             }
         }
+        self.announce_reorg_len.store(0, Ordering::Relaxed);
         let height = base + (blocks.len() as u32) - 1;
         {
             let mut held = self.held_bodies.write().unwrap();
@@ -1291,6 +1306,7 @@ impl ChainHub {
             height,
             hash,
             header,
+            reorg_branch_len: self.announce_reorg_len.load(Ordering::Relaxed),
         };
         let _ = self.tip_tx.send(event);
         self.notify.notify_waiters();
@@ -1331,6 +1347,9 @@ impl ChainHub {
                     );
                 }
             }
+            // Even when the disconnected blocks were empty, mempool txs that
+            // spend now-immature coinbases must leave (`mempool_reorg`).
+            mp.evict_after_reorg();
         }
         Ok(())
     }

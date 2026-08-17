@@ -135,4 +135,5 @@ if [[ ! -d "${RBITCOIN_CACHE}/store" ]]; then
 fi
 
 export BITCOIND="$SHIM"
+export BITCOINCLI="${HERE}/bitcoin-cli"
 exec "${CMD[@]}"

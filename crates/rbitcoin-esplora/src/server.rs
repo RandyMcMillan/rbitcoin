@@ -1031,6 +1031,7 @@ mod tests {
                 height: 1,
                 hash: bitcoin::BlockHash::from_byte_array(tip_hash),
                 header,
+                reorg_branch_len: 0,
             })
             .expect("tip send");
         assert!(n >= 1, "expected at least one tip subscriber, got {n}");
@@ -1261,6 +1262,7 @@ mod tests {
                 height: 101,
                 hash: bitcoin::BlockHash::from_byte_array(tip_hash),
                 header,
+                reorg_branch_len: 0,
             })
             .expect("tip send");
 
@@ -1413,6 +1415,7 @@ mod tests {
                     bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
                     nonce: 101,
                 },
+                reorg_branch_len: 0,
             })
             .unwrap();
 

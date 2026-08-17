@@ -230,6 +230,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.persist_mempool,
     )
     .map_err(|e| NodeError::Config(e))?;
+    mempool.set_cluster_limits(config.limit_cluster_count, config.limit_cluster_size_kvb);
     node.hub
         .attach_mempool(mempool.clone())
         .map_err(|_| NodeError::Config("mempool already attached".into()))?;

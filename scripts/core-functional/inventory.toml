@@ -433,9 +433,7 @@ analog = "follow-up: wtxid accept"
 
 [[test]]
 name = "mempool_cluster.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: cluster limits"
+status = "run"
 
 [[test]]
 name = "mempool_compatibility.py"
@@ -497,7 +495,7 @@ analog = "core_analogs::analog_mempool_persist_reopen"
 name = "mempool_reorg.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: reorg + mempool"
+analog = "submitblock 20-block fork accept_branch green; invalidateblock does not evict immature coinbase spends"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -550,8 +548,7 @@ status = "run"
 
 [[test]]
 name = "mining_template_verification.py"
-status = "skip"
-reason = "no-mining-product"
+status = "run"
 
 [[test]]
 name = "p2p_1p1c_network.py"
@@ -562,8 +559,8 @@ analog = "follow-up: 1p1c + generate + addconnection"
 [[test]]
 name = "p2p_add_connections.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: addconnection types (RPC exists)"
+reason = "v1-only"
+analog = "inbound/outbound/feeler v2 green; last VersionSender is advertise_v2=false"
 
 [[test]]
 name = "p2p_addr_relay.py"
@@ -604,6 +601,7 @@ reason = "core-log"
 name = "p2p_compactblocks.py"
 status = "skip"
 reason = "core-log"
+analog = "cmpct v2 + coinbase prefill + getblocktxn + low-work log; full script not unmodified-green"
 
 [[test]]
 name = "p2p_compactblocks_blocksonly.py"
@@ -615,7 +613,7 @@ analog = "follow-up: compact + blocksonly"
 name = "p2p_compactblocks_hb.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: compact high-bandwidth"
+analog = "HB slot select + sendcmpct drain shipped; script not unmodified-green"
 
 [[test]]
 name = "p2p_disconnect_ban.py"
@@ -810,7 +808,7 @@ reason = "core-log"
 name = "p2p_sendheaders.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: sendheaders"
+analog = "part 1 inv-before-sendheaders green; part 2+ headers/reorg/direct-fetch still red"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"
@@ -940,7 +938,7 @@ reason = "no-wallet"
 name = "rpc_gettxspendingprevout.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: gettxspendingprevout"
+analog = "gettxspendingprevout shipped; Core field/error zoo"
 
 [[test]]
 name = "rpc_help.py"

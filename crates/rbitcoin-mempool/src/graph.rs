@@ -106,7 +106,7 @@ pub struct MempoolGraphStats {
 }
 
 /// Live-set graph. Proportional to mempool size, not file size.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TxGraph {
     entries: HashMap<Txid, TxEntry>,
     /// Mempool-created outpoints spent by another mempool tx.
@@ -122,11 +122,57 @@ pub struct TxGraph {
     chunks_rebuilds: AtomicU64,
     /// Best-first chunks; `None` after mutate until next build.
     chunk_cache: Mutex<Option<Vec<Chunk>>>,
+    /// Core `-limitclustercount` (default [`MAX_CLUSTER_COUNT`]).
+    cluster_count_limit: usize,
+    /// Core `-limitclustersize` as vbytes (default [`MAX_CLUSTER_VSIZE`]).
+    cluster_vsize_limit: u64,
+    /// Same cap in WU (vsize × 4). Kept for call sites that sum weight.
+    cluster_weight_limit: u64,
+}
+
+impl Default for TxGraph {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            spends: HashMap::new(),
+            conflicts: HashMap::new(),
+            created: HashSet::new(),
+            total_weight: 0,
+            chunks_rebuilds: AtomicU64::new(0),
+            chunk_cache: Mutex::new(None),
+            cluster_count_limit: MAX_CLUSTER_COUNT,
+            cluster_vsize_limit: MAX_CLUSTER_VSIZE,
+            cluster_weight_limit: MAX_CLUSTER_WEIGHT,
+        }
+    }
 }
 
 impl TxGraph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Overlay Core `-limitclustercount` / `-limitclustersize` (kvB → WU).
+    pub fn set_cluster_limits(&mut self, count: Option<u32>, size_kvb: Option<u32>) {
+        if let Some(n) = count {
+            self.cluster_count_limit = (n as usize).max(1);
+        }
+        if let Some(kvb) = size_kvb {
+            self.cluster_vsize_limit = (kvb as u64).saturating_mul(1000).max(1);
+            self.cluster_weight_limit = self.cluster_vsize_limit.saturating_mul(4);
+        }
+    }
+
+    pub fn cluster_count_limit(&self) -> usize {
+        self.cluster_count_limit
+    }
+
+    pub fn cluster_vsize_limit(&self) -> u64 {
+        self.cluster_vsize_limit
+    }
+
+    pub fn cluster_weight_limit(&self) -> u64 {
+        self.cluster_weight_limit
     }
 
     pub fn len(&self) -> usize {
@@ -168,8 +214,12 @@ impl TxGraph {
     }
 
     /// Txid that created `op` if it is still a live mempool output (possibly spent).
+    ///
+    /// Prefer the created-outpoint set; fall back to a live body with this
+    /// txid so a 10-input merger still unions parent clusters if a vout was
+    /// missed in `created` (MiniWallet `new_utxo` / padded extra outputs).
     pub fn creator(&self, op: &OutPoint) -> Option<Txid> {
-        if self.created.contains(op) {
+        if self.created.contains(op) || self.entries.contains_key(&op.txid) {
             Some(op.txid)
         } else {
             None
@@ -422,8 +472,24 @@ impl TxGraph {
             .iter()
             .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
             .sum();
-        let linearization = self.linearize(&members);
-        let chunks = self.chunkify(&linearization);
+        self.cluster_from_members(members, total_weight, |_| 0)
+    }
+
+    /// Same as [`Self::cluster_of`] ranking/chunking by `base_fee + delta(txid)`.
+    pub fn cluster_of_delta(&self, txid: &Txid, delta: impl Fn(Txid) -> i64) -> Option<Cluster> {
+        let c = self.cluster_of(txid)?;
+        let total_weight = c.total_weight;
+        self.cluster_from_members(c.members, total_weight, delta)
+    }
+
+    fn cluster_from_members(
+        &self,
+        members: BTreeSet<Txid>,
+        total_weight: u64,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Option<Cluster> {
+        let linearization = self.linearize_delta(&members, &delta);
+        let chunks = self.chunkify_delta(&linearization, &delta);
         Some(Cluster {
             members,
             total_weight,
@@ -453,19 +519,26 @@ impl TxGraph {
             .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
             .sum();
         let count = members.len() + extra_count;
-        let weight = base_weight.saturating_add(extra_weight);
-        // Core limits are count + vsize (101 kvB). Weight is 4× vsize (WU).
-        count > MAX_CLUSTER_COUNT || weight > MAX_CLUSTER_WEIGHT
+        let vsize = base_weight.saturating_add(extra_weight).saturating_add(3) / 4;
+        count > self.cluster_count_limit || vsize > self.cluster_vsize_limit
     }
 
     /// Topo linearization: among ready txs (parents already emitted or outside
     /// cluster), pick highest fee_rate, then higher fee, then txid.
-    fn linearize(&self, members: &BTreeSet<Txid>) -> Vec<Txid> {
+    fn modified_fee(&self, t: &Txid, delta: &impl Fn(Txid) -> i64) -> i64 {
+        self.entries
+            .get(t)
+            .map(|e| e.fee_sat as i64)
+            .unwrap_or(0)
+            .saturating_add(delta(*t))
+    }
+
+    fn linearize_delta(&self, members: &BTreeSet<Txid>, delta: &impl Fn(Txid) -> i64) -> Vec<Txid> {
         let mut remaining: BTreeSet<Txid> = members.clone();
         let mut done: HashSet<Txid> = HashSet::new();
         let mut out = Vec::with_capacity(members.len());
         while !remaining.is_empty() {
-            let mut best: Option<(u64, u64, Txid)> = None; // rate, fee, txid
+            let mut best: Option<(u64, i64, Txid)> = None; // rate, fee, txid
             for t in &remaining {
                 let e = match self.entries.get(t) {
                     Some(e) => e,
@@ -478,14 +551,18 @@ impl TxGraph {
                 if !ready {
                     continue;
                 }
-                let rate = e.fee_rate_sat_per_kvb();
-                let key = (rate, e.fee_sat, *t);
+                let mf = self.modified_fee(t, delta);
+                let rate = if mf <= 0 {
+                    0
+                } else {
+                    rbitcoin_consensus::policy::fee_rate_sat_per_kvb(mf as u64, e.weight)
+                };
+                let key = (rate, mf, *t);
                 // Maximize rate, then fee; for equal, smaller txid for stability.
                 let better = match &best {
                     None => true,
                     Some((br, bf, bt)) => {
-                        rate > *br
-                            || (rate == *br && (e.fee_sat > *bf || (e.fee_sat == *bf && t < bt)))
+                        rate > *br || (rate == *br && (mf > *bf || (mf == *bf && t < bt)))
                     }
                 };
                 if better {
@@ -512,25 +589,25 @@ impl TxGraph {
     /// Each chunk is the longest remaining prefix whose combined feerate is
     /// maximal. A cheap parent plus hot children is one chunk (CPFP); a hot
     /// parent plus a cheap descendant stays split so the parent is not diluted.
-    fn chunkify(&self, lin: &[Txid]) -> Vec<Chunk> {
+    fn chunkify_delta(&self, lin: &[Txid], delta: &impl Fn(Txid) -> i64) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         let mut i = 0;
         while i < lin.len() {
-            let mut acc_fee = 0u64;
+            let mut acc_fee = 0i128;
             let mut acc_w = 0u64;
             let mut best_end = i;
-            let mut best_fee = 0u64;
+            let mut best_fee = 0i128;
             let mut best_w = 0u64;
             for (j, t) in lin.iter().enumerate().skip(i) {
                 let Some(e) = self.entries.get(t) else {
                     continue;
                 };
-                acc_fee = acc_fee.saturating_add(e.fee_sat);
+                acc_fee = acc_fee.saturating_add(i128::from(self.modified_fee(t, delta)));
                 acc_w = acc_w.saturating_add(e.weight);
                 // acc/acc_w >= best/best_w  (longest prefix on a tie).
                 let better = best_w == 0
-                    || (acc_fee as u128).saturating_mul(best_w as u128)
-                        >= (best_fee as u128).saturating_mul(acc_w as u128);
+                    || acc_fee.saturating_mul(i128::from(best_w))
+                        >= best_fee.saturating_mul(i128::from(acc_w));
                 if better {
                     best_end = j;
                     best_fee = acc_fee;
@@ -539,7 +616,7 @@ impl TxGraph {
             }
             chunks.push(Chunk {
                 txids: lin[i..=best_end].to_vec(),
-                fee_sat: best_fee,
+                fee_sat: best_fee.max(0) as u64,
                 weight: best_w,
             });
             i = best_end + 1;
@@ -1087,6 +1164,24 @@ mod tests {
         // New child would exceed count.
         let parents: BTreeSet<Txid> = [last].into_iter().collect();
         assert!(g.cluster_would_exceed(&parents, 1, 100));
+    }
+
+    #[test]
+    fn cluster_limits_overlay_count() {
+        let mut g = TxGraph::new();
+        g.set_cluster_limits(Some(1), None);
+        let parent = make_tx(None, 1, 1);
+        let pe = entry_for(&parent, 100, 0);
+        let pid = pe.txid;
+        g.insert(pe, &parent);
+        let mut parents = BTreeSet::new();
+        parents.insert(pid);
+        assert!(
+            g.cluster_would_exceed(&parents, 1, 400),
+            "count limit 1 must reject a child"
+        );
+        g.set_cluster_limits(Some(2), None);
+        assert!(!g.cluster_would_exceed(&parents, 1, 400));
     }
 
     #[test]

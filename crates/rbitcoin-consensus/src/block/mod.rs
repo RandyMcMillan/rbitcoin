@@ -1071,6 +1071,9 @@ fn assemble_block_prevouts_mode(
         // Sole pipeline identity — structure/plan computed once; never re-hash here.
         let txid = create_txids[ti];
 
+        if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
+            return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
+        }
         if ti > 0 {
             if tx.input.is_empty() {
                 return Err(ConsensusError::BadTx("no inputs"));

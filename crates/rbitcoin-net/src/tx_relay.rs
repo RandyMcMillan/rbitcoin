@@ -100,13 +100,20 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .ok()
             .flatten()
             .unwrap_or(0);
-        // Coinbase: first input null prevout when we can load inputs; else height-0 heuristic.
-        let is_coinbase = self
-            .query
-            .tx_input_at_fk(fk, &rec, 0)
-            .ok()
-            .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-            .unwrap_or(false);
+        // Coinbase: first tx in its confirmed block, or a null-prevout input.
+        let is_coinbase = if create_height > 0 {
+            self.query
+                .block_tx_fks(rbitcoin_primitives::Height(create_height))
+                .ok()
+                .and_then(|fks| fks.first().copied())
+                == Some(fk)
+        } else {
+            self.query
+                .tx_input_at_fk(fk, &rec, 0)
+                .ok()
+                .map(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+                .unwrap_or(false)
+        };
         let create_mtp = if create_height == 0 {
             0
         } else {
@@ -1002,6 +1009,16 @@ impl MempoolHub {
             .count()
     }
 
+    /// Drop live txs that are non-final / immature at the new tip (invalidate
+    /// of empty blocks still has to evict mempool coinbase spends).
+    pub fn evict_after_reorg(&self) {
+        let utxo = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        let tip = self.chain_tip_ctx();
+        self.inner.write().unwrap().evict_nonfinal(&utxo, tip);
+    }
+
     /// Block template / generate selection: mining-order live txs that fit
     /// in a block (best chunks first). Same helper GBT will use.
     pub fn select_block_txs(&self) -> Vec<Transaction> {
@@ -1104,22 +1121,75 @@ impl MempoolHub {
         Some((stats, a_mod, d_mod, chunk_fee, chunk_w))
     }
 
+    /// Core `-limitclustercount` / `-limitclustersize` overlay (None = keep default).
+    pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
+        self.inner
+            .write()
+            .unwrap()
+            .set_cluster_limits(count, size_kvb);
+    }
+
+    /// In-mempool ancestors of `txid`, **excluding** itself (Core RPC).
+    pub fn ancestor_txids(&self, txid: &Txid) -> Option<Vec<Txid>> {
+        let g = self.inner.read().unwrap();
+        let mut set = g.graph.ancestor_set(txid)?;
+        set.remove(txid);
+        Some(set.into_iter().collect())
+    }
+
+    /// In-mempool descendants of `txid`, **excluding** itself (Core RPC).
+    pub fn descendant_txids(&self, txid: &Txid) -> Option<Vec<Txid>> {
+        let g = self.inner.read().unwrap();
+        let mut set = g.graph.descendant_set(txid)?;
+        set.remove(txid);
+        Some(set.into_iter().collect())
+    }
+
+    /// Prefix-maximal mining chunks as `{weight, fee}` points (decreasing feerate).
+    pub fn feerate_diagram(&self) -> Vec<(u64, i64)> {
+        let deltas = self.fee_deltas.lock().unwrap().clone();
+        let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
+        let g = self.inner.read().unwrap();
+        let mut scored: Vec<(u64, i64, u64)> = Vec::new();
+        for ch in g.graph.mining_chunks_best_first() {
+            let mut fee = 0i64;
+            for t in &ch.txids {
+                let base = g.graph.get(t).map(|e| e.fee_sat as i64).unwrap_or(0);
+                fee = fee.saturating_add(base.saturating_add(d(*t)));
+            }
+            if fee <= 0 {
+                continue;
+            }
+            let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee as u64, ch.weight);
+            scored.push((rate, fee, ch.weight));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        scored.into_iter().map(|(_, fee, w)| (w, fee)).collect()
+    }
+
+    /// Live mempool spender of `op`, if any.
+    pub fn spending_txid(&self, op: &OutPoint) -> Option<Txid> {
+        self.inner.read().unwrap().graph.conflict_txid(op)
+    }
+
+    /// Sequential submitpackage: keep successes, report per-tx errors. No rollback.
+    pub fn submit_package_rpc(
+        &self,
+        txs: &[Transaction],
+    ) -> Vec<Result<AcceptResult, AcceptError>> {
+        txs.iter().map(|tx| self.accept_tx(tx)).collect()
+    }
+
     /// `getmempoolcluster` payload from the live graph.
     pub fn cluster_rpc(&self, txid: &Txid) -> Option<(u64, usize, Vec<(i64, u64, Vec<Txid>)>)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
         let g = self.inner.read().unwrap();
-        let c = g.graph.cluster_of(txid)?;
+        let c = g.graph.cluster_of_delta(txid, d)?;
         let chunks = c
             .chunks
             .iter()
-            .map(|ch| {
-                let fee = ch.txids.iter().fold(0i64, |acc, t| {
-                    let base = g.graph.get(t).map(|e| e.fee_sat as i64).unwrap_or(0);
-                    acc.saturating_add(base.saturating_add(d(*t)))
-                });
-                (fee, ch.weight, ch.txids.clone())
-            })
+            .map(|ch| (ch.fee_sat as i64, ch.weight, ch.txids.clone()))
             .collect();
         Some((c.total_weight, c.members.len(), chunks))
     }

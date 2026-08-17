@@ -1,7 +1,7 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+use crate::graph::{TxEntry, TxGraph};
 use crate::orphanage::Orphanage;
 use crate::store::Mempool;
 use bitcoin::consensus::encode::serialize;
@@ -160,9 +160,7 @@ impl std::fmt::Display for AcceptError {
             AcceptError::MissingPrevout(op) => write!(f, "missing prevout {op}"),
             AcceptError::Orphaned(t) => write!(f, "orphaned {t}"),
             AcceptError::Duplicate(t) => write!(f, "duplicate {t}"),
-            AcceptError::ClusterTooLarge { count, weight } => {
-                write!(f, "cluster too large count={count} weight={weight}")
-            }
+            AcceptError::ClusterTooLarge { .. } => f.write_str("too-large-cluster"),
             AcceptError::PackageTooLarge { count, weight } => {
                 write!(f, "package too large count={count} weight={weight}")
             }
@@ -285,6 +283,9 @@ pub struct ActiveMempool {
     /// Stage µs for the most recent top-level [`Self::accept_tx`] / package member
     /// (includes nested orphan promote for that accept). Sampled by MempoolHub.
     pub last_accept_stages: AcceptStageUs,
+    /// Overlay from `-limitclustercount` / `-limitclustersize` (re-applied after compact).
+    cluster_count_overlay: Option<u32>,
+    cluster_size_kvb_overlay: Option<u32>,
 }
 
 impl ActiveMempool {
@@ -297,6 +298,17 @@ impl ActiveMempool {
         max_weight: u64,
     ) -> Result<Self, MempoolError> {
         Self::open_with_limit_persist(dir, max_weight, true)
+    }
+
+    /// Overlay Core `-limitclustercount` / `-limitclustersize`.
+    pub fn set_cluster_limits(&mut self, count: Option<u32>, size_kvb: Option<u32>) {
+        if count.is_some() {
+            self.cluster_count_overlay = count;
+        }
+        if size_kvb.is_some() {
+            self.cluster_size_kvb_overlay = size_kvb;
+        }
+        self.graph.set_cluster_limits(count, size_kvb);
     }
 
     /// `persist=false` abandons any on-disk live set (Core `-persistmempool=0`).
@@ -337,6 +349,8 @@ impl ActiveMempool {
             max_weight,
             orphanage: Orphanage::new(),
             last_accept_stages: AcceptStageUs::default(),
+            cluster_count_overlay: None,
+            cluster_size_kvb_overlay: None,
         })
     }
 
@@ -379,6 +393,7 @@ impl ActiveMempool {
             items.push((entry, tx));
         }
         graph.rebuild_from(items);
+        graph.set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
         self.graph = graph;
         self.bodies = bodies;
         self.store.set_live_count(live);
@@ -644,18 +659,26 @@ impl ActiveMempool {
             .filter(|p| !conflict_set.contains(p))
             .collect();
 
-        if self.graph.cluster_would_exceed(&parent_txids, 1, weight) {
-            let mut members = BTreeSet::new();
-            for p in &parent_txids {
-                if let Some(c) = self.graph.cluster_of(p) {
-                    members.extend(c.members);
-                }
+        // Size the cluster *after* RBF: replaced txs do not count.
+        let mut members = BTreeSet::new();
+        for p in &parent_txids {
+            if let Some(c) = self.graph.cluster_of(p) {
+                members.extend(c.members);
             }
-            members.retain(|m| !conflict_set.contains(m));
-            let base_w: u64 = members
-                .iter()
-                .filter_map(|t| self.graph.get(t).map(|e| e.weight))
-                .sum();
+        }
+        members.retain(|m| !conflict_set.contains(m));
+        let base_w: u64 = members
+            .iter()
+            .filter_map(|t| self.graph.get(t).map(|e| e.weight))
+            .sum();
+        // Core `-limitclustersize` is kvB of (Σ weight + 3) / 4 — same as
+        // the functional test's `weight_to_vsize(clusterweight)`.
+        // Do not also sum per-tx vsizes: that over-rejects size-limit small_tx
+        // (each floor wastes up to 3 WU; 10 parents make remaining look too small).
+        let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
+        if members.len() + 1 > self.graph.cluster_count_limit()
+            || combined_vsize > self.graph.cluster_vsize_limit()
+        {
             return Err(AcceptError::ClusterTooLarge {
                 count: members.len() + 1,
                 weight: base_w.saturating_add(weight),
@@ -701,7 +724,9 @@ impl ActiveMempool {
         self.bodies.insert(txid, tx.clone());
 
         if let Some(c) = self.graph.cluster_of(&txid) {
-            if c.members.len() > MAX_CLUSTER_COUNT || c.total_weight > MAX_CLUSTER_WEIGHT {
+            if c.members.len() > self.graph.cluster_count_limit()
+                || c.total_weight.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
+            {
                 self.graph.remove(&txid, tx);
                 self.bodies.remove(&txid);
                 let _ = self.store.mark_slot_dead(slot);
@@ -1039,16 +1064,20 @@ impl ActiveMempool {
                     continue;
                 };
                 let mut chain_coins = Vec::with_capacity(tx.input.len());
+                let mut missing_chain = false;
                 for inp in &tx.input {
                     if self.graph.creator(&inp.previous_output).is_some() {
                         chain_coins.push(None);
                     } else if let Some(c) = utxos.get_coin(&inp.previous_output) {
                         chain_coins.push(Some(c));
                     } else {
-                        chain_coins.push(None);
+                        // Parent is neither live nor a confirmed coin — reorg
+                        // made the input disappear (or we just evicted it).
+                        missing_chain = true;
+                        break;
                     }
                 }
-                if check_mempool_structural(&tx, &chain_coins, tip).is_err() {
+                if missing_chain || check_mempool_structural(&tx, &chain_coins, tip).is_err() {
                     let _ = self.remove_txid(&id);
                     removed = true;
                 }
@@ -1149,6 +1178,7 @@ pub fn rbf_allows_replacement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
@@ -1692,6 +1722,143 @@ mod tests {
     }
 
     #[test]
+    fn rbf_cluster_count_excludes_replaced() {
+        let dir = tmp_dir();
+        let mut map = HashMap::new();
+        let mut parents = Vec::new();
+        let mut children = Vec::new();
+        for i in 0u8..3 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i; 32]),
+                vout: 0,
+            };
+            let out = TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            map.insert(op, coin(out));
+            parents.push(op);
+        }
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(Some(4), None);
+        let mut parent_outs = Vec::new();
+        for op in &parents {
+            let p = spend_tx(*op, 90_000);
+            mp.accept_tx(&p, &utxos, TIP_OK).unwrap();
+            let pout = OutPoint {
+                txid: p.compute_txid(),
+                vout: 0,
+            };
+            parent_outs.push(pout);
+            let c = spend_tx(pout, 80_000);
+            mp.accept_tx(&c, &utxos, TIP_OK).unwrap();
+            children.push(c.compute_txid());
+        }
+        assert_eq!(mp.live_count(), 6);
+        // Merger spends the three parent outputs (replaces the three children).
+        // After RBF: 3 parents + 1 merger = 4, at the cap.
+        let merger = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: parent_outs
+                .iter()
+                .map(|op| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&merger, &utxos, TIP_OK)
+            .expect("RBF must not count replaced children toward the cluster cap");
+        assert_eq!(mp.live_count(), 4);
+        for id in &children {
+            assert!(!mp.graph.contains(id));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mempool_cluster.py` `test_cluster_merging_size`: 10 singletons plus a
+    /// merger padded to remaining+4 vB must trip `too-large-cluster`.
+    #[test]
+    fn cluster_merge_size_ten_way_rejects() {
+        let dir = tmp_dir();
+        let limit_vb = 10_000u64;
+        let mut map = HashMap::new();
+        let mut parent_ops = Vec::new();
+        for i in 0u8..10 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i; 32]),
+                vout: 0,
+            };
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(1_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+            parent_ops.push(op);
+        }
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(None, Some(10)); // 10 kvB
+        let mut spent = Vec::new();
+        let mut parent_vsize = 0u64;
+        for op in &parent_ops {
+            let tx = spend_tx(*op, 900_000);
+            parent_vsize += tx.weight().to_wu().saturating_add(3) / 4;
+            let tid = tx.compute_txid();
+            mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+            spent.push(OutPoint { txid: tid, vout: 0 });
+        }
+        let remaining = limit_vb.saturating_sub(parent_vsize);
+        assert!(remaining >= 500, "fixture remaining={remaining}");
+        let mut merger = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: spent
+                .iter()
+                .map(|op| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+                },
+            ],
+        };
+        let target = remaining + 4;
+        while (merger.vsize() as u64) < target {
+            let mut pad = merger.output[1].script_pubkey.to_bytes();
+            pad.push(0x61);
+            merger.output[1].script_pubkey = ScriptBuf::from_bytes(pad);
+        }
+        let err = mp.accept_tx(&merger, &utxos, TIP_OK).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { .. }),
+            "ten-way merger vsize={} remaining={remaining} got {err}",
+            merger.vsize()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reorg_reaccept() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
@@ -1909,6 +2076,28 @@ mod tests {
         mp.flush().unwrap();
         let mp2 = ActiveMempool::open_or_create(&dir).unwrap();
         assert_eq!(mp2.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mempool_cluster.py` cleanup mines the mempool empty and `maybe_compact`
+    /// rebuilds the graph. Overlay limits must survive that rebuild.
+    #[test]
+    fn compact_preserves_cluster_size_overlay() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let txid = tx.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(None, Some(10));
+        assert_eq!(mp.graph.cluster_vsize_limit(), 10_000);
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+        mp.remove_for_block(&[txid]).unwrap();
+        let _ = mp.maybe_compact().unwrap();
+        assert_eq!(
+            mp.graph.cluster_vsize_limit(),
+            10_000,
+            "compact must keep -limitclustersize overlay"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

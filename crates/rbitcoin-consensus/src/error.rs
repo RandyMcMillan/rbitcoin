@@ -61,8 +61,22 @@ pub fn block_reject_reason(err: &ConsensusError) -> String {
     match err {
         ConsensusError::BadTx("not final" | "bad-txns-nonfinal") => "bad-txns-nonfinal".into(),
         ConsensusError::BadTx(s) => (*s).into(),
+        ConsensusError::BadBlock("no transactions") => "bad-blk-length".into(),
+        ConsensusError::BadBlock("first tx not coinbase") => "bad-cb-missing".into(),
+        ConsensusError::BadBlock("coinbase not first") => "bad-txns-duplicate".into(),
+        ConsensusError::BadBlock("duplicate txid") => "bad-txns-duplicate".into(),
+        ConsensusError::BadBlock("merkle root mismatch") => "bad-txnmrklroot".into(),
         ConsensusError::BadBlock(s) => (*s).into(),
+        ConsensusError::BadHeader("timestamp <= median-time-past") => "time-too-old".into(),
+        ConsensusError::BadHeader("timestamp too far in future") => "time-too-new".into(),
+        ConsensusError::BadHeader("incorrect proof of work bits" | "target above pow limit") => {
+            "bad-diffbits".into()
+        }
         ConsensusError::BadHeader(s) => (*s).into(),
+        ConsensusError::InvalidPow => "high-hash".into(),
+        ConsensusError::MissingPrevout | ConsensusError::PrevoutSpent => {
+            "bad-txns-inputs-missingorspent".into()
+        }
         ConsensusError::Script(s) => {
             let inner = s.split(" txid=").next().unwrap_or(s.as_str());
             let paren = match inner {
@@ -153,6 +167,22 @@ mod tests {
         assert_eq!(
             block_reject_reason(&ConsensusError::Script("CSV".into())),
             "block-script-verify-flag-failed (Locktime requirement not satisfied)"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadBlock("no transactions")),
+            "bad-blk-length"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadBlock("first tx not coinbase")),
+            "bad-cb-missing"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadHeader("incorrect proof of work bits")),
+            "bad-diffbits"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::InvalidPow),
+            "high-hash"
         );
     }
 }

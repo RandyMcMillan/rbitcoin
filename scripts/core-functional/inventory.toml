@@ -912,7 +912,7 @@ analog = "none (no compact filters)"
 name = "rpc_getblockfrompeer.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "IBD hole-fill / tip-follow getdata"
+analog = "official: getchaintips has no headers-only row for competing short tip after connect (rpc_getblockfrompeer.py:59); getblockfrompeer not reached"
 
 [[test]]
 name = "rpc_getblockstats.py"

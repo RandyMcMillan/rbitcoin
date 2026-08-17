@@ -156,23 +156,21 @@ Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 | `rbitcoin-node` | Node binary |
 | `rbitcoin-test` | High-level test harness |
 
-## Documentation index
+## Documentation
 
-| Doc | Audience |
-|-----|----------|
-| [`docs/architecture.md`](./docs/architecture.md) | Design uniqueness (start here) |
-| [`docs/heads.md`](./docs/heads.md) | Which head file (tx / header / scripthash) |
-| [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md) | Lab mainnet runbook |
-| [`OPERATOR.md`](./OPERATOR.md) | Day-to-day ops, env knobs |
-| [`SCHEMA.md`](./SCHEMA.md) | On-disk schema |
-| [`docs/concurrency.md`](./docs/concurrency.md) | Writer roles / lock-free publish |
-| [`COMPAT.md`](./COMPAT.md) | Intentional differences vs Core / Electrum methods |
-| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev workflow and coverage bar |
-| [`docs/quality.md`](./docs/quality.md) | Living quality roadmap (one Open list + one Completed list) |
-| [`docs/how-we-plan.md`](./docs/how-we-plan.md) | Red→Green→Refactor planning |
-| [`SECURITY.md`](./SECURITY.md) | Vulnerability reporting |
-| [`CHANGELOG.md`](./CHANGELOG.md) | Release notes |
-| [`docs/reproducible-builds.md`](./docs/reproducible-builds.md) | Pinned Nix byte-identical builds |
+Full map (one owner per fact): **[`docs/README.md`](./docs/README.md)**.
+
+| Audience | Start |
+|----------|-------|
+| Operator | [`OPERATOR.md`](./OPERATOR.md) |
+| Product / interop | [`COMPAT.md`](./COMPAT.md) |
+| Contributor | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
+| Agent | [`AGENTS.md`](./AGENTS.md) |
+| On-disk | [`SCHEMA.md`](./SCHEMA.md) |
+| Tests | [`TESTING.md`](./TESTING.md) |
+
+Design uniqueness: [`docs/architecture.md`](./docs/architecture.md).
+Security contact: [`SECURITY.md`](./SECURITY.md).
 
 ## What this is not
 

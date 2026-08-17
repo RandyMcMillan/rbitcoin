@@ -1,5 +1,7 @@
 # Agent notes
 
+Documentation map (one owner per fact): [`docs/README.md`](docs/README.md).
+
 ## Plain technical language
 
 This is an engineering project. Write **clear, concrete technical English** in

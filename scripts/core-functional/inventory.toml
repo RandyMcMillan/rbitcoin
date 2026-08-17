@@ -526,7 +526,8 @@ analog = "follow-up: reorg package"
 [[test]]
 name = "mining_basic.py"
 status = "skip"
-reason = "no-mining-product"
+reason = "rpc-missing"
+analog = "official: test_block_max_weight getrawmempool() is 1 not 0 (mining_basic.py:296); submitheader/sigops/blockmintxfee shipped; -blockmaxweight/-blockreservedweight/prune not this wave"
 
 [[test]]
 name = "mining_getblocktemplate_longpoll.py"

@@ -1169,6 +1169,105 @@ fn pin_takes_external_create_pin_arc_then_clear_for_write_queue() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Need a high vout from a multi-out sparse pin (binary search, not linear find).
+#[test]
+fn pin_sparse_need_high_vout_only() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query, SparseExternalPin};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-sparse-high-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let parent_id = 1u64;
+    let parent_tx = TxRecord {
+        txid: [0x33u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 4,
+    };
+    let external: SparseExternalPin = Arc::new((
+        parent_tx.clone(),
+        vec![
+            (0, OutputRecord::unspent(1, vec![0x00])),
+            (1, OutputRecord::unspent(2, vec![0x01])),
+            (2, OutputRecord::unspent(3, vec![0x02])),
+            (3, OutputRecord::unspent(4, vec![0xaa])),
+        ],
+    ));
+    let spend_tx = TxRecord {
+        txid: [0x44u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_ins = vec![InputRecord {
+        prev_txid: parent_tx.txid,
+        create_fk: Fk(parent_id),
+        prev_index: 3,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let spend_pin: CreatePin = Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])]));
+    let plan = ArchiveWritePlan {
+        packed: vec![(Arc::clone(&spend_pin), spend_ins)],
+        planned_fks: vec![Fk(2)],
+        per_header_ranges: vec![],
+        spends: vec![],
+        batch_creates: vec![],
+        external_parent_outs: {
+            let mut m = rbitcoin_query::U64Map::default();
+            m.insert(parent_id, external);
+            m
+        },
+        external_parent_ranges: Default::default(),
+        external_parent_txids: Default::default(),
+        batch_pin: vec![Arc::clone(&spend_pin)],
+        index_tx: false,
+        body_est: 0,
+    };
+    let (parents, _thin, _warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &ParentPinStamp::from_plan(&plan),
+        &[],
+        &[],
+        None,
+        None,
+    )
+    .expect("pin high vout");
+    assert!(parents.get_parent_out(Fk(parent_id), 3).is_some());
+    assert!(
+        parents.get_parent_out(Fk(parent_id), 1).is_none(),
+        "must not pin unneeded vouts"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Range-fill this window is `PIN_NEW`, not `PIN_CACHE_BODY` / `warm.already`.
 ///
 /// Adopt 1 + cold-range 2 → `already=1` (cache), not 3. `pin_hit%` is

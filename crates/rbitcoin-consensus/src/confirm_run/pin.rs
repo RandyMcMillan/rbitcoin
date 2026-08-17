@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Select `need` vouts from a sorted sparse `(vout, out)` list.
+///
+/// `None` if any need vout is missing. Empty `need` with a non-empty list
+/// returns a clone of the full list (legacy layout-only pin).
+pub(super) fn take_need_outs(
+    live_all: &[(u32, rbitcoin_store::OutputRecord)],
+    need: &[u32],
+) -> Option<Vec<(u32, rbitcoin_store::OutputRecord)>> {
+    debug_assert!(
+        live_all.windows(2).all(|w| w[0].0 < w[1].0),
+        "sparse outs must be strictly increasing by vout"
+    );
+    if need.is_empty() {
+        return Some(live_all.to_vec());
+    }
+    let mut live = Vec::with_capacity(need.len());
+    for &v in need {
+        match live_all.binary_search_by_key(&v, |(ov, _)| *ov) {
+            Ok(i) => live.push((v, live_all[i].1.clone())),
+            Err(_) => return None,
+        }
+    }
+    Some(live)
+}
+
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight offline denserels → **txout body by range** from
@@ -219,23 +244,9 @@ pub(super) fn pin_for_wire_batch(
         if let Some(plan) = plan {
             if let Some(ext) = plan.external_parent_outs.get(id) {
                 let (tx, live_all) = ext.as_ref();
-                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                    .iter()
-                    .filter_map(|&v| {
-                        live_all
-                            .iter()
-                            .find(|(ov, _)| *ov == v)
-                            .map(|(_, o)| (v, o.clone()))
-                    })
-                    .collect();
-                if live.len() == need.len() || (need.is_empty() && !live_all.is_empty()) {
-                    let live = if need.is_empty() {
-                        live_all.clone()
-                    } else {
-                        live
-                    };
+                if let Some(live) = take_need_outs(live_all, need) {
                     let checked = if need.is_empty() {
-                        live_all.iter().map(|(v, _)| *v).collect()
+                        live.iter().map(|(v, _)| *v).collect()
                     } else {
                         need.clone()
                     };
@@ -309,17 +320,19 @@ pub(super) fn pin_for_wire_batch(
     {
         let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> =
             Vec::new();
-        for (id, need) in &still_need {
+        let pending = std::mem::take(&mut still_need);
+        for (id, need) in pending {
             let range = parent_pin
                 .ranges
-                .get(id)
+                .get(&id)
                 .copied()
-                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
+                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(&id).copied()));
             let Some(range) = range else {
+                still_need.insert(id, need);
                 continue;
             };
-            let tid = parent_pin.create_txid(*id).or_else(|| {
-                plan.and_then(|p| p.external_parent_txid(*id))
+            let tid = parent_pin.create_txid(id).or_else(|| {
+                plan.and_then(|p| p.external_parent_txid(id))
                     .filter(|t| *t != [0u8; 32])
             });
             let Some(tid) = tid else {
@@ -327,7 +340,7 @@ pub(super) fn pin_for_wire_batch(
                     "invariant: lookup stage miss (load parent create identity not stamped)",
                 )));
             };
-            range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
+            range_jobs.push((rbitcoin_primitives::Fk(id), range, tid, need));
         }
         if !range_jobs.is_empty() {
             let n_range = range_jobs.len() as u64;
@@ -763,4 +776,25 @@ pub(super) fn ensure_spend_abs_layouts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod take_need_outs_tests {
+    use super::take_need_outs;
+    use rbitcoin_store::OutputRecord;
+
+    #[test]
+    fn take_need_outs_binary_search_high_vout() {
+        let live = vec![
+            (0, OutputRecord::unspent(1, vec![0x00])),
+            (1, OutputRecord::unspent(2, vec![0x01])),
+            (2, OutputRecord::unspent(3, vec![0x02])),
+            (3, OutputRecord::unspent(4, vec![0x03])),
+        ];
+        let got = take_need_outs(&live, &[0, 3]).expect("need 0 and 3");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 0);
+        assert_eq!(got[1].0, 3);
+        assert!(take_need_outs(&live, &[7]).is_none());
+    }
 }

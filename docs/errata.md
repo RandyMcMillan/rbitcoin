@@ -21,7 +21,7 @@ The only realistic overlap is a **disconnected** Class A sibling (reorg,
 same tx on the new tip) still sitting in a RAM map while the new fk is
 noted. Last-write could hide one of them — a *possible* identity
 visibility hole. Unlikely: both rows stay on disk; TipOnly still picks
-connected; n−1 is held in in-flight until after the child bind.
+connected; n−1 is held in in-flight until after the child pin.
 
 Do not grow these maps to `Vec<Fk>` unless a mainnet miss is shown to
 be this case.

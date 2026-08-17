@@ -7,9 +7,10 @@
 //! snapshot.
 //!
 //! **Prune:** drop a layer only when **both** drain has inserted its create-fk
-//! span (`fk_hi <= drain_fk`) **and** the fence covers that span. TipOnly
-//! leftover is fence-connected; drain alone is not a home. Either signal
-//! alone keeps the layer (Class C ∥ drain/seal).
+//! span (`fk_hi <= drain_fk`) **and** the fence covers that span. TipOnly is
+//! fence-connected; drain alone is not a home. Either signal alone keeps the
+//! layer (Class C ∥ drain/seal). Call after pin — stamp skips `body_range`
+//! when this map still has CreatePin outs.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
 //! L is bounded by pipeline queue depth.
@@ -138,10 +139,11 @@ impl InFlightLog {
         self.layers.shrink_to_fit();
     }
 
-    /// Drop layers visible to leftover TipOnly: inserted **and** fenced.
+    /// Drop layers TipOnly can see: inserted **and** fenced.
     ///
-    /// Call **after** leftover bind so n−1 still resolves from this map.
-    /// `drain_fk == 0` keeps every layer. Empty-span layers stay.
+    /// Call **after** pin (scripts handoff) so n−1 still has CreatePin outs.
+    /// Stamp skips `body_range` when `get_out` hits. `drain_fk == 0` keeps
+    /// every layer. Empty-span layers stay.
     pub fn prune_if_head_ready(&mut self, fence: &rbitcoin_store::HeightFence, drain_fk: u64) {
         if self.layers.is_empty() || drain_fk == 0 {
             return;

@@ -307,6 +307,10 @@ pub async fn peer_session_with(
     });
 
     // Bootstrap: ask for anything above our tip (critical after IBD disconnect).
+    if let Some(s) = meta.session.as_ref() {
+        let h = hub.tip_height().unwrap_or(0);
+        rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
+    }
     if let Err(e) = queue_getheaders(&out_tx, hub.as_ref()) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
@@ -673,6 +677,13 @@ async fn handle_peer_frame(
 ) -> Result<(), NetError> {
     let msg = decode_framed_offload(frame).await?;
     match msg.payload() {
+        NetworkMessage::Version(_) => {
+            if let Some(s) = session {
+                rbitcoin_log::info!("redundant version message from peer={}", s.id);
+            } else {
+                rbitcoin_log::info!("redundant version message from peer");
+            }
+        }
         NetworkMessage::Ping(n) => {
             queue_out(out_tx, NetworkMessage::Pong(*n))?;
         }

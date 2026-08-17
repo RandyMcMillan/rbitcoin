@@ -1434,6 +1434,23 @@ impl ChainHub {
 ///
 /// Format is intentionally close to Bitcoin Core `UpdateTip` so operators can
 /// grep one line per height. IBD does not call this for every confirm batch.
+/// `p2p_unrequested_blocks.py` needle when minchainwork rejects an unrequested header.
+pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
+    format!(
+        "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
+    )
+}
+
+/// `p2p_headers_sync_with_minchainwork.py` low-work skip.
+pub fn ignoring_low_work_chain_log(height: u32) -> String {
+    format!("[net] Ignoring low-work chain (height={height})")
+}
+
+/// `p2p_initial_headers_sync.py` first getheaders after connect.
+pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
+    format!("initial getheaders ({locator_height}) to peer={peer}")
+}
+
 pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
     let time = header.time;
     let ver = header.version.to_consensus();
@@ -1695,6 +1712,25 @@ mod tests {
             }
         }
         block
+    }
+
+    #[test]
+    fn core_log_helpers_match_step21_needles() {
+        let h = BlockHash::from_byte_array([0x11; 32]);
+        assert_eq!(
+            accept_block_header_nodos_log(h),
+            format!(
+                "AcceptBlockHeader: not adding new block header {h}, missing anti-dos proof-of-work validation"
+            )
+        );
+        assert_eq!(
+            ignoring_low_work_chain_log(14),
+            "[net] Ignoring low-work chain (height=14)"
+        );
+        assert_eq!(
+            initial_getheaders_log(0, 0),
+            "initial getheaders (0) to peer=0"
+        );
     }
 
     #[test]

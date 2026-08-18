@@ -64,6 +64,8 @@ pub struct LivePeer {
     pub services: u64,
     pub startingheight: i32,
     pub conn_type: PeerConnType,
+    /// Their `version.relay`. False or `block-relay-only` → `relaytxes=false`.
+    pub relay: bool,
     pub stop: AtomicBool,
     /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
     pub hb_to: AtomicBool,
@@ -447,6 +449,7 @@ impl LivePeer {
             bytesrecv_per_msg: self.recv.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             bytessent_per_msg: self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             conn_type: self.conn_type,
+            relay: self.relay,
             bip152_hb_to: self.hb_to.load(Ordering::Relaxed),
             bip152_hb_from: self.hb_from.load(Ordering::Relaxed),
             pingtime,
@@ -502,6 +505,7 @@ pub struct PeerInfo {
     pub bytesrecv_per_msg: HashMap<String, u64>,
     pub bytessent_per_msg: HashMap<String, u64>,
     pub conn_type: PeerConnType,
+    pub relay: bool,
     pub bip152_hb_to: bool,
     pub bip152_hb_from: bool,
     pub pingtime: Option<f64>,
@@ -531,6 +535,8 @@ pub struct PeerHub {
     last_inv_headers_sync: Mutex<Option<BlockHash>>,
     /// Core whitelist `noban` — do not disconnect a stalling headers-sync peer.
     noban: AtomicBool,
+    /// Core whitelist `relay` — accept txs even when the node is `-blocksonly`.
+    relay_perm: AtomicBool,
     /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
     cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
 }
@@ -547,6 +553,7 @@ impl PeerHub {
             n_sync_started: AtomicU64::new(0),
             last_inv_headers_sync: Mutex::new(None),
             noban: AtomicBool::new(false),
+            relay_perm: AtomicBool::new(false),
             cmpct_fills: Mutex::new(HashMap::new()),
         })
     }
@@ -583,6 +590,15 @@ impl PeerHub {
     /// Core whitelist `noban` — bypass low-work header anti-DoS.
     pub fn is_noban(&self) -> bool {
         self.noban.load(Ordering::Relaxed)
+    }
+
+    pub fn set_relay_perm(&self, v: bool) {
+        self.relay_perm.store(v, Ordering::Relaxed);
+    }
+
+    /// Core whitelist `relay` — P2P txs allowed while `-blocksonly`.
+    pub fn is_relay_perm(&self) -> bool {
+        self.relay_perm.load(Ordering::Relaxed)
     }
 
     fn is_preferred_download(p: &LivePeer) -> bool {
@@ -684,6 +700,14 @@ impl PeerHub {
             .unwrap_or(0)
     }
 
+    /// Ask every live session to flush due tx INVs (`p2p_blocksonly` RPC relay).
+    pub fn request_all_tx_inv(&self) {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        for p in g.values() {
+            p.request_tx_inv();
+        }
+    }
+
     pub fn set_mock_now(&self, ts: u64) {
         self.mock_now.store(ts, Ordering::Relaxed);
         let g = self.live.read().unwrap_or_else(|e| e.into_inner());
@@ -724,6 +748,7 @@ impl PeerHub {
             services,
             startingheight: ver.start_height,
             conn_type,
+            relay: ver.relay,
             stop: AtomicBool::new(false),
             hb_to: AtomicBool::new(false),
             hb_from: AtomicBool::new(false),

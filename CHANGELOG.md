@@ -74,7 +74,10 @@ before 1.0).
   (`:112`). `p2p_invalid_messages.py` stays skip at empty addrv2 Core
   logs (`:203`). `p2p_unrequested_blocks.py` stays skip at
   wait_for_disconnect on an immature-coinbase fork (`:275`). Known-header
-  INV does not getdata (sendheaders `inv_node`). Q-41 is 36/267.
+  INV does not getdata (sendheaders `inv_node`). `-blocksonly` reports
+  `localrelay=false`, disconnects P2P txs/tx-invs, and exposes
+  `relaytxes`; RPC sendraw is still accepted. `p2p_blocksonly.py` stays
+  skip at inbound wait_for_tx (`:48`). Q-41 is 36/267.
 
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`

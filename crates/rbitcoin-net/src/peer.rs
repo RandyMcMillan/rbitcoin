@@ -58,6 +58,19 @@ pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
 /// Per-session misbehavior score that triggers disconnect (Core-like order).
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
 
+/// `-blocksonly` (relay off, no whitelist `relay`) or a block-relay-only
+/// session must not receive txs / tx invs (`p2p_blocksonly`).
+fn reject_unsolicited_tx(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) -> bool {
+    if session.is_some_and(|s| s.conn_type == crate::peers::PeerConnType::BlockRelay) {
+        return true;
+    }
+    let node_relay = hub.mempool().is_none_or(|m| m.relay_enabled());
+    if node_relay {
+        return false;
+    }
+    !session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()))
+}
+
 /// BIP152 HB is only for tx-relay peers. `-blocksonly` must not send
 /// `sendcmpct(announce=1)` (`p2p_compactblocks_blocksonly`).
 fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) {
@@ -486,10 +499,13 @@ pub async fn peer_session_with(
                                     continue;
                                 }
                                 if let Some(mp) = hub.mempool() {
-                                    let inbound = session.as_ref().is_some_and(|s| s.inbound);
-                                    if mp.relay_enabled()
+                                    let peer_ok = session.as_ref().is_none_or(|s| {
+                                        s.conn_type != crate::peers::PeerConnType::BlockRelay
+                                            && (s.relay || mp.is_unbroadcast(&txid))
+                                    });
+                                    if peer_ok
                                         && mp.contains(&txid)
-                                        && (mp.immediate_relay() || !inbound)
+                                        && (mp.relay_enabled() || mp.is_unbroadcast(&txid))
                                     {
                                         let inv = if let Some(tx) = mp.get_tx(&txid) {
                                             Inventory::WTx(tx.compute_wtxid())
@@ -772,9 +788,10 @@ fn queue_due_tx_invs(
     let Some(mp) = hub.mempool() else {
         return;
     };
-    if !mp.relay_enabled() {
+    if session.conn_type == crate::peers::PeerConnType::BlockRelay {
         return;
     }
+    // `-blocksonly` still INV locally submitted (unbroadcast) txs.
     let now = session.clock_now();
     let clock_due = session.take_tx_inv_due(now);
     let live = mp.list_live();
@@ -790,8 +807,17 @@ fn queue_due_tx_invs(
         if from_this_peer.contains_key(&txid) {
             continue;
         }
+        if session.conn_type == crate::peers::PeerConnType::BlockRelay {
+            continue;
+        }
+        if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
+            continue;
+        }
         let w = tx.compute_wtxid();
-        if session.has_announced_wtx(&w) || !mp.tx_inv_due(&w) {
+        if session.has_announced_wtx(&w) {
+            continue;
+        }
+        if !clock_due && !mp.tx_inv_due(&w) {
             continue;
         }
         session.note_announced_wtx(w);
@@ -987,6 +1013,9 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::WTx(wtxid) => {
+                        if let Some(s) = session {
+                            rbitcoin_log::info!("received getdata for: wtx {wtxid} peer={}", s.id);
+                        }
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
                                 let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
@@ -1070,7 +1099,9 @@ async fn handle_peer_frame(
             let mut want = Vec::new();
             let mut inv_tx_n = 0u64;
             let mut need_headers = false;
-            let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false);
+            let mut tx_inv_hex: Option<String> = None;
+            let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
+                || session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()));
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
@@ -1096,6 +1127,9 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                        if tx_inv_hex.is_none() {
+                            tx_inv_hex = Some(txid.to_string());
+                        }
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains(txid) {
@@ -1106,6 +1140,9 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::WTx(wtxid) => {
+                        if tx_inv_hex.is_none() {
+                            tx_inv_hex = Some(wtxid.to_string());
+                        }
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains_wtxid(wtxid) {
@@ -1132,6 +1169,15 @@ async fn handle_peer_frame(
                     })
                     .count() as u64;
                 mp.note_getdata_tx(gd_tx);
+            }
+            if let Some(hx) = tx_inv_hex {
+                if reject_unsolicited_tx(hub, session) {
+                    rbitcoin_log::info!(
+                        "transaction ({hx}) inv sent in violation of protocol, disconnecting peer"
+                    );
+                    punish_disconnect(ban_score, session);
+                    return Ok(());
+                }
             }
             if need_headers {
                 let _ = queue_getheaders(out_tx, hub, session, true);
@@ -1492,8 +1538,18 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Tx(tx) => {
+            if reject_unsolicited_tx(hub, session) {
+                let id = session.map(|s| s.id).unwrap_or(0);
+                rbitcoin_log::info!(
+                    "transaction sent in violation of protocol, disconnecting peer={id}"
+                );
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
             if let Some(mp) = hub.mempool() {
-                if mp.relay_enabled() {
+                if mp.relay_enabled()
+                    || session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()))
+                {
                     let txid = tx.compute_txid();
                     from_this_peer.insert(txid, ());
                     match mp.accept_tx(tx) {
@@ -2672,6 +2728,125 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(dir);
             let _ = std::fs::remove_dir_all(dir2);
+        });
+    }
+
+    #[test]
+    fn blocksonly_tx_and_inv_raise_ban() {
+        // p2p_blocksonly: relay off → P2P tx / wtx inv is a protocol violation.
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use std::sync::Arc;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::consensus::encode::serialize;
+            use bitcoin::p2p::message::RawNetworkMessage;
+            use bitcoin::Network;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        let dummy_tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-tx");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+            assert!(reject_unsolicited_tx(&hub, None));
+
+            let (out_tx, _out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(dummy_tx)),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                ban >= BAN_SCORE_THRESHOLD,
+                "blocksonly tx must disconnect, ban={ban}"
+            );
+
+            ban = 0;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::WTx(
+                    bitcoin::Wtxid::from_byte_array([
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ]),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                ban >= BAN_SCORE_THRESHOLD,
+                "blocksonly wtx inv must disconnect, ban={ban}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
         });
     }
 

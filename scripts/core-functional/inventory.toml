@@ -588,6 +588,7 @@ reason = "core-log"
 name = "p2p_blocksonly.py"
 status = "skip"
 reason = "core-log"
+analog = "official: after localrelay=false + P2P tx/inv disconnect + relaytxes, sendraw tx not received by inbound peer (p2p_blocksonly.py:48 wait_for_tx); whitelist permissions + block-relay-only later"
 
 [[test]]
 name = "p2p_compactblocks.py"

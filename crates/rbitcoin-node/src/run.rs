@@ -292,6 +292,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         mempool.set_immediate_relay(true);
         node.peers.set_noban(true);
     }
+    if config.whitelist.iter().any(|w| w.contains("relay")) {
+        node.peers.set_relay_perm(true);
+    }
     if let Some(s) = config.min_relay_fee_btc.as_deref() {
         if let Some(sat) = parse_btc_to_sat(s) {
             mempool.set_min_relay_sat_kvb(sat);

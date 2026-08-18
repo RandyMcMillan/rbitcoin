@@ -85,3 +85,15 @@ emit = ['SetNetworkActive: {1}']
 [[rule]]
 match = 'received: addr'
 emit = ['received: addr']
+
+[[rule]]
+match = 'transaction sent in violation of protocol, disconnecting peer=(\d+)'
+emit = ['transaction sent in violation of protocol, disconnecting peer={1}']
+
+[[rule]]
+match = 'transaction \(([0-9a-f]+)\) inv sent in violation of protocol, disconnecting peer'
+emit = ['transaction ({1}) inv sent in violation of protocol, disconnecting peer']
+
+[[rule]]
+match = 'received getdata for: wtx ([0-9a-f]+) peer'
+emit = ['received getdata for: wtx {1} peer']

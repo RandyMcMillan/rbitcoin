@@ -17,28 +17,8 @@ bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 # Parallel script checks use in-crate `script_pool` (std threads) — no rayon.
 
-[[bench]]
-name = "script_pool"
-harness = false
-
-[[bench]]
-name = "script_verify"
-harness = false
-
-[[bench]]
-name = "confirm_waste"
-harness = false
-
-[[bench]]
-name = "script_hotpath"
-harness = false
-
 [dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "confirm_stage_cpu"
-harness = false

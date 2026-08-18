@@ -55,14 +55,13 @@ for signet/mainnet sync. **Not** CLI.
 |-----|-----|
 | `RBITCOIN_HEAD_SCALE` | Tiny heads under `cargo test` (honored if exported — do not set on operators) |
 | `RBITCOIN_TEST_*` | Node/store test fixtures (`TEST_DROP_STORE`, `TEST_NO_SUCH_CAP`) |
-| `RBITCOIN_DIAG_DATADIR` | Offline diagnostic tests |
-| `RBITCOIN_CAND_FK_FIXTURE` | Store fixture |
 | `RBITCOIN_CORE_DATA` | Directory of Core JSON corpora for consensus tests |
 
 ## Deleted / do not reintroduce
 
 | Env | Note |
 |-----|------|
+| `RBITCOIN_DIAG_DATADIR` / `RBITCOIN_CAND_FK_FIXTURE` | Host-forensics tests deleted |
 | `RBITCOIN_RESIDENCY_BYTES` / create pin FIFO | Feature removed |
 | Per-path bulk IO matrix | Collapsed to `RBITCOIN_IO` |
 | Confirm queue env overrides | Hardcoded depths |

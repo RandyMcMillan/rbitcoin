@@ -31,6 +31,14 @@ before 1.0).
   `--smoke` until `store/scripthash.body` exists. Darwin zips are ad-hoc
   `codesign -s -` (not notarized).
 
+### Removed
+
+- **Host forensics and cargo benches:** `examples/diag_*`, `dump_wit`,
+  all `[[bench]]`, `rbitcoin-store-bench`, `freeze_benches`,
+  `reader_contention`, `diag_tip961461`, and ignored page-group / SH-head
+  wall microbenches. Default graph is product + suite
+  (`scripts/check_default_targets.test.sh`). Host A/B is musl + `ibd: perf`.
+
 ### Changed
 
 - **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when

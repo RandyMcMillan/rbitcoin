@@ -22,22 +22,10 @@ Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 | **xorf + bincode + serde** removed from store | Sealed fuse8 is in-tree (`binary_fuse8` + hand LE layout **v2**). Drops a serde-heavy path from store rebuilds. |
 | **fuse8 v1 → v2 on open** | Legacy fuse files soft-migrate (always-probe + rewrite from Class A); **do not** wipe `tx.head` for fuse payload-only changes. |
 
-## Diagnostic examples (ad-hoc, not CI)
-
-One-off script/script-failure probes live as **crate examples** (run with
-`cargo run -p CRATE --example NAME -- …`). Prefer these over pasting ad-hoc
-main files into the tree.
-
-| Example | Crate | Purpose |
-|---------|-------|---------|
-| `diag_tip182692` | `rbitcoin-test` | Signet tip stall / PrevoutSpent on a store path |
-| `diag_block_script` | `rbitcoin-consensus` | Which script fails in a wire block (signet API prevouts) |
-| `diag_mainnet_block` | `rbitcoin-consensus` | Mainnet block script probes (blockstream API) |
-| `diag_fail` / `diag_fail_tx` / `diag_sh` | `rbitcoin-consensus` | Historical script failure forensics |
-| `dump_wit` | `rbitcoin-consensus` | Dump witness stack from a local block bin |
-
-IBD progress/rejects belong in node logs (`ibd: confirm reject`, `ibd: archive reject`);
-do not re-home those into examples.
+Host forensics and `cargo bench` one-offs are **not** in the tree. IBD
+progress/rejects belong in node logs (`ibd: confirm reject`, `ibd: archive
+reject`); host A/B is musl + `ibd: perf`. Default compile graph is pinned
+by `scripts/check_default_targets.test.sh`.
 
 ## Running tests
 
@@ -75,7 +63,6 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 | **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **tier A multi-node IBD** (8-block single-hop + cold reconstruct) + reorg + short IBD error-path smokes. Agents use targeted `-p` tests locally; this suite runs on the PR. |
 | **CI multinode job** | same as tier A filters | Required job after fmt/clippy/test (coverage cadence) |
 | **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
-| **Ignored benches** | `cargo test -p rbitcoin-net --test freeze_benches -- --ignored` etc. | Optional perf / contention probes |
 
 ### Suite speed budgets (default tier)
 
@@ -152,8 +139,8 @@ All workspace members that contain production code:
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
 
-**Excluded by default:** third-party crates, `src/main.rs` trampolines, and the
-host-only `store_bench` binary. Dependencies are not attributed to us.
+**Excluded by default:** third-party crates and `src/main.rs` trampolines.
+Dependencies are not attributed to us.
 
 ### Philosophy
 

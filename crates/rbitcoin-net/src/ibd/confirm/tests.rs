@@ -280,6 +280,37 @@ fn pack_confirm_run_len_policy() {
 }
 
 #[test]
+fn split_wave_into_load_batches_is_eight_by_8000() {
+    use super::{
+        split_wave_into_load_batches, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS,
+        LOAD_QUEUE_CAP_DEFAULT,
+    };
+    assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 8);
+    assert_eq!(super::confirm_queue_caps().load, LOAD_QUEUE_CAP_DEFAULT);
+    assert_eq!(super::load_queue_cap(), LOAD_QUEUE_CAP_DEFAULT);
+    assert!(super::LoadBatch { items: vec![] }.items.is_empty());
+    // 8 × 8001 inputs (each block overshoots 8000) → 8 batches of one.
+    let wave: Vec<u32> = vec![8001; 8];
+    let parts =
+        split_wave_into_load_batches(&wave, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS);
+    assert_eq!(parts, vec![1, 1, 1, 1, 1, 1, 1, 1]);
+    // Exactly 8000 does not stop; two 8000-input blocks are one batch.
+    assert_eq!(
+        split_wave_into_load_batches(&[8000, 8000], 8000, 144),
+        vec![2]
+    );
+    // Empty / single megablock.
+    assert!(split_wave_into_load_batches(&[], 8000, 144).is_empty());
+    assert_eq!(split_wave_into_load_batches(&[50_000], 8000, 144), vec![1]);
+    // 144 thin blocks then 144 more → two hard-cap batches.
+    let thin = vec![1u32; 288];
+    assert_eq!(
+        split_wave_into_load_batches(&thin, 8000, 144),
+        vec![144, 144]
+    );
+}
+
+#[test]
 fn block_input_count_sums_tx_inputs() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};

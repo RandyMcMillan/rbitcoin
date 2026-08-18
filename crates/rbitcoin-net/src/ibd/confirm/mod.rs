@@ -384,15 +384,54 @@ pub(crate) fn pack_stored_hash_ok(stored: &[u8; 32], expect: &BlockHash) -> bool
     *stored == expect.to_byte_array()
 }
 
+/// Default lookup→load depth (`loadq`): one lookup-wave of prefetch (8×8000).
+pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
 
-/// Resolved script / write queue capacities. Load claims BQ; no lookup→load channel.
+/// One load-sized run produced by lookup (decoded wire + pres, height-ordered).
+pub(crate) struct LoadBatch {
+    pub items: Vec<(u32, [u8; 32], rbitcoin_query::ResolvedWire)>,
+}
+
+/// Split a lookup-wave input-count run into load-sized batch lengths.
+///
+/// Uses the same [`pack_stop_after`] rule as load pack (soft 8000 / hard 144).
+pub(crate) fn split_wave_into_load_batches(
+    input_counts: &[u32],
+    soft_max_inputs: u32,
+    hard_max_blocks: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < input_counts.len() {
+        let rest = &input_counts[i..];
+        let mut sum = 0u32;
+        let mut n = 0usize;
+        for &c in rest {
+            sum = sum.saturating_add(c);
+            n += 1;
+            if pack_stop_after(sum, n, soft_max_inputs, hard_max_blocks) {
+                break;
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        out.push(n);
+        i += n;
+    }
+    out
+}
+
+/// Resolved lookup→load / script / write queue capacities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
+    /// lookup→load (`loadq`)
+    pub load: usize,
     /// load→scripts (`scriptq`)
     pub script: usize,
     /// scripts→write (`writeq`)
@@ -403,6 +442,7 @@ pub(crate) struct ConfirmQueueCaps {
 ///
 /// | Queue | Default |
 /// |-------|---------|
+/// | lookup→load (`loadq`) | **8** |
 /// | load→scripts (`scriptq`) | **4** |
 /// | scripts→write (`writeq`) | **20** |
 ///
@@ -410,11 +450,16 @@ pub(crate) struct ConfirmQueueCaps {
 #[inline]
 pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     ConfirmQueueCaps {
+        load: LOAD_QUEUE_CAP_DEFAULT,
         script: SCRIPT_QUEUE_CAP_DEFAULT,
         write: WRITE_QUEUE_CAP_DEFAULT,
     }
 }
 
+/// Lookup→load (`loadq`) capacity.
+pub(crate) fn load_queue_cap() -> usize {
+    confirm_queue_caps().load
+}
 /// Load→scripts (`scriptq`) capacity.
 pub(crate) fn script_queue_cap() -> usize {
     confirm_queue_caps().script
@@ -441,7 +486,7 @@ pub(crate) fn write_drain_max_parts(writeq_cap: usize) -> usize {
 /// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
-    let q = c.script.saturating_add(c.write);
+    let q = c.load.saturating_add(c.script).saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
 }
 

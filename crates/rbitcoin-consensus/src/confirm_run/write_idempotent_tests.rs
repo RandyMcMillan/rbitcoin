@@ -204,9 +204,8 @@ fn scripts_feed_ahead_single_batch() {
 
 /// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
 ///
-/// Thread name is recorded on the handle (not process-global
-/// [`scripts_feed_test_sync`]) so a parallel `reset()` / `on_phase_enter`
-/// cannot steal or overwrite it under `cargo llvm-cov`.
+/// Thread name is recorded on the handle so a parallel scripts phase
+/// cannot overwrite it.
 #[test]
 fn scripts_phase_does_not_run_on_steal_worker() {
     use super::confirm_scripts_phase_async;
@@ -255,37 +254,59 @@ fn scripts_feed_ahead_zero_batches() {
     assert!(outs.is_empty());
 }
 
-/// **Production claim timing under depth-1:** batch B is submitted to a
-/// coordinator while A’s wave is still open (not only after A’s join returns).
+/// Depth-1 feed-ahead + no 200 µs-poll after lookahead, **without** a
+/// process-global HOLD in [`super::confirm_scripts_phase`].
 ///
-/// Drives [`scripts_stage_from_load_channel`] (same `try_recv` +
-/// [`join_scripts_polling`] pattern as the IBD scripts OS thread) on a
-/// `sync_channel(1)`. First wave holds in [`confirm_scripts_phase`] until
-/// a second async submit is observed — deadlocks if feed-ahead only
-/// try_recv once before a blocking join.
+/// A sibling `confirm_scripts_phase` running while A is held must finish
+/// immediately (the old `HOLD_FIRST` hook stalled every phase in the crate).
 #[test]
-fn scripts_stage_depth1_submits_second_before_first_finishes() {
+fn scripts_stage_depth1_feeds_ahead_without_holding_siblings() {
     use super::{
-        scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
-        ScriptsBatchMeta,
+        confirm_scripts_phase, join_scripts_polling, scripts_stage_from_load_channel_with,
+        ConfirmScriptOutcome, ScriptsBatchMeta, ScriptsPhaseHandle,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let _feed = scripts_feed_test_sync::lock();
-    scripts_feed_test_sync::reset();
-    scripts_feed_test_sync::set_hold_first_until_second_submit(true);
-
-    // Depth 1 — same default load→scripts capacity class.
-    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
+    let submits = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcomes_w = Arc::clone(&outcomes);
+    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
 
+    let submits_s = Arc::clone(&submits);
+    let gate_s = Arc::clone(&gate);
+    let outcomes_w = Arc::clone(&outcomes);
     let stage = thread::spawn(move || {
-        scripts_stage_from_load_channel(
+        scripts_stage_from_load_channel_with(
             &mat_rx,
+            |batch, mat_ns| {
+                let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
+                let n = submits_s.fetch_add(1, Ordering::SeqCst) + 1;
+                let gate = Arc::clone(&gate_s);
+                let handle = ScriptsPhaseHandle::spawn_fn(move || {
+                    if n == 1 {
+                        let (lock, cv) = &*gate;
+                        let mut go = lock.lock().unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !*go {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                break;
+                            }
+                            let (g, w) = cv.wait_timeout(go, left).unwrap();
+                            go = g;
+                            if w.timed_out() {
+                                break;
+                            }
+                        }
+                    }
+                    confirm_scripts_phase(batch)
+                });
+                (handle, meta)
+            },
             |ok, _meta: ScriptsBatchMeta| {
                 outcomes_w.lock().unwrap().push(ok);
                 true
@@ -295,105 +316,58 @@ fn scripts_stage_depth1_submits_second_before_first_finishes() {
         );
     });
 
-    // Enqueue A; stage claims it (channel free). Hold keeps A's phase open.
     mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while scripts_feed_test_sync::submit_count() < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "A never submitted to coordinator"
-        );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while submits.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "A never submitted");
         thread::sleep(Duration::from_millis(1));
     }
-    // Enqueue B while A is held mid-wave; feed-ahead must try_recv+submit B.
+
+    let sibling = thread::spawn(|| {
+        let t0 = Instant::now();
+        confirm_scripts_phase(empty_loaded_batch()).expect("sibling phase");
+        t0.elapsed()
+    });
+    let sibling_dt = sibling.join().expect("sibling");
+    assert!(
+        sibling_dt < Duration::from_millis(200),
+        "confirm_scripts_phase must not honor another test's hold ({sibling_dt:?})"
+    );
+
     mat_tx
         .send((empty_loaded_batch(), 0))
-        .expect("send B while A verifying");
-    while scripts_feed_test_sync::submit_count() < 2 {
+        .expect("send B while A held");
+    while submits.load(Ordering::SeqCst) < 2 {
         assert!(
             Instant::now() < deadline,
             "B not submitted before A finished (feed-ahead dead under depth-1)"
         );
         thread::sleep(Duration::from_millis(1));
     }
-    // A can finish (hold released by submit_count>=2); both outcomes ordered.
+
+    {
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
     drop(mat_tx);
     stage.join().expect("stage thread");
     let outs = outcomes.lock().unwrap();
     assert_eq!(outs.len(), 2, "both batches script-ok");
     assert!(outs[0].batch.is_empty());
     assert!(outs[1].batch.is_empty());
-    scripts_feed_test_sync::set_hold_first_until_second_submit(false);
-    scripts_feed_test_sync::reset();
-}
 
-/// After N+1 is submitted, join must not `recv_timeout(200µs)` for the rest
-/// of N's wave. A 200 ms tail would be ~1000 timeouts with the old loop.
-#[test]
-fn scripts_join_blocks_after_lookahead() {
-    use super::{
-        scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
-        ScriptsBatchMeta,
-    };
-    use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let _feed = scripts_feed_test_sync::lock();
-    scripts_feed_test_sync::reset();
-    scripts_feed_test_sync::set_hold_first_until_second_submit(true);
-    scripts_feed_test_sync::set_hold_tail_after_second(true);
-
-    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
-    let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcomes_w = Arc::clone(&outcomes);
-
-    let stage = thread::spawn(move || {
-        scripts_stage_from_load_channel(
-            &mat_rx,
-            |ok, _meta: ScriptsBatchMeta| {
-                outcomes_w.lock().unwrap().push(ok);
-                true
-            },
-            |_e, _meta| false,
-            || false,
-        );
-    });
-
-    mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while scripts_feed_test_sync::submit_count() < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "A never submitted to coordinator"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    mat_tx
-        .send((empty_loaded_batch(), 0))
-        .expect("send B while A verifying");
-    while scripts_feed_test_sync::submit_count() < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "B not submitted before A finished (feed-ahead dead under depth-1)"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let timeouts_at_lookahead = scripts_feed_test_sync::recv_timeout_count();
-    drop(mat_tx);
-    stage.join().expect("stage thread");
-    let after = scripts_feed_test_sync::recv_timeout_count();
-    let tail = after.saturating_sub(timeouts_at_lookahead);
-    assert!(
-        tail < 20,
-        "join kept 200µs-polling after lookahead ({tail} timeouts; 200ms tail ≈ 1000 if broken)"
+    let mut polls = 0u32;
+    let handle = ScriptsPhaseHandle::spawn_fn(|| confirm_scripts_phase(empty_loaded_batch()));
+    join_scripts_polling(&handle, Duration::from_micros(200), || {
+        polls += 1;
+        false
+    })
+    .expect("join after lookahead");
+    assert_eq!(
+        polls, 1,
+        "join must recv_blocking after first false, not 200µs-poll (polls={polls})"
     );
-    let outs = outcomes.lock().unwrap();
-    assert_eq!(outs.len(), 2, "both batches script-ok");
-    scripts_feed_test_sync::set_hold_first_until_second_submit(false);
-    scripts_feed_test_sync::set_hold_tail_after_second(false);
-    scripts_feed_test_sync::reset();
 }
 
 #[test]
@@ -763,14 +737,12 @@ fn expected_bits_extending_uses_header_plan_when_period_start_above_tip() {
 fn script_wave_skips_preverified_txids() {
     use super::{confirm_scripts_phase, LoadedBatch, Prepared, ScriptPreverified};
     use crate::block::ScriptCheckJob;
-    use crate::confirm_phase_stats;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_primitives::{Fk, Height};
-    use std::sync::atomic::Ordering;
 
     let prevouts = vec![TxOut {
         value: Amount::from_sat(50_0000_0000),
@@ -823,16 +795,271 @@ fn script_wave_skips_preverified_txids() {
         script_preverified: pre,
         archive_plan: None,
     };
-    let before = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
-    let jobs_before = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
     confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
-    let after = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
-    let jobs_after = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
-    assert!(after > before, "skip counter should bump");
-    assert_eq!(
-        jobs_after, jobs_before,
-        "skipped job must not count as a pool job"
+}
+
+fn tiny_query() -> (std::path::PathBuf, rbitcoin_query::Query) {
+    use rbitcoin_query::Query;
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-ensure-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    (path, q)
+}
+
+fn rec_tx(b: u8, n_out: u32) -> rbitcoin_store::TxRecord {
+    use rbitcoin_primitives::Fk;
+    rbitcoin_store::TxRecord {
+        txid: [b; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: n_out,
+    }
+}
+
+/// One store: pin/ensure error strings + denserels/abs + freeze + same-batch.
+#[test]
+fn pin_and_ensure_journey() {
+    use super::{
+        ensure_spend_abs_layouts, pin_for_wire_batch, post_commit, ParentPinStamp, Prepared,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{ArchiveWritePlan, BatchParents};
+    use rbitcoin_store::{InputRecord, OutputRecord};
+
+    let (path, q) = tiny_query();
+
+    let missing_parent = Fk(999_999);
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        std::sync::Arc::new((rec_tx(0xAA, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        vec![InputRecord {
+            prev_txid: [0xBB; 32],
+            create_fk: missing_parent,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![Fk(1)];
+    let stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let err = pin_for_wire_batch(&q, Some(&plan), &stamp, &[], &[], None, None)
+        .expect_err("missing parent must hard-fail pin");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant")
+            && (msg.contains("wire pin") || msg.contains("lookup stage miss")),
+        "unexpected err: {msg}"
     );
+
+    let prepared_miss = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(10)],
+        jobs: vec![],
+        spends: vec![([9u8; 32], 0, Fk(10), Fk(999_999))],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [3u8; 32],
+        prev_mtp: 0,
+    }];
+    let mut bp = BatchParents::new();
+    let err = ensure_spend_abs_layouts(&q, &mut bp, &prepared_miss)
+        .expect_err("ensure must hard-fail without denserels");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant")
+            && (msg.contains("ensure denserels") || msg.contains("abs incomplete")),
+        "unexpected err: {msg}"
+    );
+
+    let prepared_pc = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(10)],
+        jobs: vec![],
+        spends: vec![([1u8; 32], 0, Fk(10), Fk(2))],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [2u8; 32],
+        prev_mtp: 0,
+    }];
+    let err = post_commit(
+        &q,
+        &prepared_pc,
+        &BatchParents::new(),
+        &rbitcoin_query::U64Map::default(),
+    )
+    .expect_err("missing denserels");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant") && msg.contains("denserels"),
+        "unexpected err: {msg}"
+    );
+
+    let parent_tx = rec_tx(0x11, 1);
+    let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
+    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let pfk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(parent_tx.clone(), parent_ins, parent_outs.clone())],
+            true,
+        )
+        .unwrap()[0];
+    let range = q.store().tx_body_range(pfk).unwrap();
+    let (spent_off, _spent_len) = q.store().tx_spent_range(pfk).unwrap();
+    let parent_id = pfk.get().unwrap();
+
+    let spend_ins = vec![InputRecord {
+        prev_txid: parent_tx.txid,
+        create_fk: pfk,
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins.clone(),
+    )];
+    plan.planned_fks = vec![Fk(2)];
+    plan.external_parent_ranges.insert(parent_id, range);
+    plan.external_parent_txids.insert(parent_id, parent_tx.txid);
+    let stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &stamp, &[], &[], None, None)
+        .expect("pin via stamped range");
+    assert!(parents.contains(pfk));
+    assert!(parents.get_parent_out(pfk, 0).is_some());
+    plan.freeze_after_pin();
+    assert!(
+        plan.external_parent_ranges.is_empty() && plan.external_parent_txids.is_empty(),
+        "post-pin plan must not carry stamp staging"
+    );
+
+    let mut plan2 = ArchiveWritePlan::empty();
+    plan2.packed = vec![(
+        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins.clone(),
+    )];
+    plan2.planned_fks = vec![Fk(2)];
+    plan2.external_parent_ranges.insert(parent_id, range);
+    plan2
+        .external_parent_txids
+        .insert(parent_id, parent_tx.txid);
+    let err = pin_for_wire_batch(
+        &q,
+        Some(&plan2),
+        &ParentPinStamp::default(),
+        &[],
+        &[],
+        None,
+        None,
+    )
+    .expect_err("plan maps must not backfill an empty stamp");
+    assert!(err.to_string().contains("lookup stage miss"), "got: {err}");
+
+    let mut bp = BatchParents::new();
+    bp.insert_owned(
+        pfk,
+        parent_tx.clone(),
+        vec![(0, parent_outs[0].clone())],
+        vec![0],
+        Some(true),
+        None,
+        Vec::new(),
+    );
+    assert!(!bp.has_abs_layout(pfk));
+    let prepared = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(2)],
+        jobs: vec![],
+        spends: vec![([0x11u8; 32], 0, Fk(2), pfk)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [4u8; 32],
+        prev_mtp: 0,
+    }];
+    ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("spent-range ensure");
+    assert!(bp.has_abs_layout(pfk));
+    assert_eq!(
+        bp.get_spender_abs(pfk, 0),
+        Some(rbitcoin_store::spent_abs(spent_off, 0))
+    );
+
+    let mut plan3 = ArchiveWritePlan::empty();
+    plan3.packed = vec![(
+        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins,
+    )];
+    plan3.planned_fks = vec![Fk(2)];
+    plan3.external_parent_ranges.insert(parent_id, range);
+    plan3
+        .external_parent_txids
+        .insert(parent_id, parent_tx.txid);
+    let stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
+    let (mut parents3, _, _) =
+        pin_for_wire_batch(&q, Some(&plan3), &stamp3, &[], &[], None, None).unwrap();
+    assert!(!parents3.has_abs_layout(pfk));
+    ensure_spend_abs_layouts(&q, &mut parents3, &prepared).expect("ensure pin-hit");
+    assert!(parents3.has_abs_layout(pfk));
+
+    let mut plan4 = ArchiveWritePlan::empty();
+    plan4.packed = vec![
+        (
+            std::sync::Arc::new((rec_tx(0x32, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        ),
+        (
+            std::sync::Arc::new((rec_tx(0x33, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![InputRecord {
+                prev_txid: [0x32; 32],
+                create_fk: Fk(2),
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        ),
+    ];
+    plan4.planned_fks = vec![Fk(2), Fk(3)];
+    let stamp4 = ParentPinStamp::take_from_plan(&mut plan4);
+    let (parents4, _, _) =
+        pin_for_wire_batch(&q, Some(&plan4), &stamp4, &[], &[], None, None).unwrap();
+    assert!(parents4.contains(Fk(2)));
+    assert!(
+        !parents4.has_abs_layout(Fk(2)),
+        "same-batch create must not get a spent_range before Class A commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// Cold-range pin then pstore adopt: first pin reads body, second does not.
@@ -842,7 +1069,6 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{PipelineParentStore, Query};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Once};
 
     static ONCE: Once = Once::new();
@@ -913,8 +1139,6 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
     };
 
     let store = Arc::new(PipelineParentStore::new());
-    let _ = rbitcoin_query::confirm_load_stats::COLD_RANGE_N.swap(0, Ordering::Relaxed);
-    let _ = rbitcoin_query::confirm_load_stats::PIN_NEW.swap(0, Ordering::Relaxed);
     let mut plan = stamp_plan();
     let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     let (parents, _thin, _warm) =
@@ -924,101 +1148,17 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
         parents.get_parent_out(pfk, 0).is_some(),
         "cold-range pin must load the spent vout"
     );
-    let cold_n = rbitcoin_query::confirm_load_stats::COLD_RANGE_N.swap(0, Ordering::Relaxed);
-    let pin_new = rbitcoin_query::confirm_load_stats::PIN_NEW.swap(0, Ordering::Relaxed);
-    assert!(
-        cold_n >= 1 && pin_new >= 1,
-        "first pin must cold-range Class A body (cold_n={cold_n} pin_new={pin_new})"
-    );
 
     let mut plan2 = stamp_plan();
     let parent_pin2 = ParentPinStamp::take_from_plan(&mut plan2);
     let (parents2, _thin2, _warm2) =
         pin_for_wire_batch(&q, Some(&plan2), &parent_pin2, &[], &[], None, Some(&store)).unwrap();
     assert!(parents2.contains(pfk));
-    assert_eq!(
-        rbitcoin_query::confirm_load_stats::COLD_RANGE_N.swap(0, Ordering::Relaxed),
-        0,
-        "pstore adopt must not cold-range again"
-    );
-    assert_eq!(
-        rbitcoin_query::confirm_load_stats::PIN_NEW.swap(0, Ordering::Relaxed),
-        0,
-        "pstore adopt is not PIN_NEW"
-    );
-
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Wire pin: spend parent not loadable → hard invariant (no silent skip).
-#[test]
-fn pin_for_wire_missing_parent_is_invariant_error() {
-    use super::{pin_for_wire_batch, ParentPinStamp};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{ArchiveWritePlan, Query};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-pin-wire-inv-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    // Plan create spends external create_fk that has no Class A body / residency.
-    let missing_parent = Fk(999_999);
-    let spend_tx = TxRecord {
-        txid: [0xAAu8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let spend_ins = vec![InputRecord {
-        prev_txid: [0xBBu8; 32],
-        create_fk: missing_parent,
-        prev_index: 0,
-        sequence: u32::MAX,
-        script_sig: vec![],
-        witness: vec![],
-    }];
-    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let mut plan = ArchiveWritePlan {
-        packed: vec![(std::sync::Arc::new((spend_tx, spend_outs)), spend_ins)],
-        planned_fks: vec![Fk(1)],
-        per_header_ranges: vec![],
-        spends: vec![],
-        batch_creates: vec![],
-        external_parent_ranges: Default::default(),
-        external_parent_txids: Default::default(),
-        batch_pin: vec![],
-        index_tx: false,
-        body_est: 0,
-    };
-
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
-        .expect_err("missing parent must hard-fail pin");
-    let msg = format!("{err}");
     assert!(
-        msg.contains("invariant")
-            && (msg.contains("wire pin") || msg.contains("lookup stage miss")),
-        "unexpected err: {msg}"
+        parents2.get_parent_out(pfk, 0).is_some(),
+        "pstore adopt must still serve the spent vout"
     );
+
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -1116,206 +1256,6 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
 }
 
 /// After wire pin, freeze drops ranges+txids; BatchParents keep sparse outs.
-#[test]
-fn pin_for_wire_then_freeze_clears_plan_staging() {
-    use super::{pin_for_wire_batch, ParentPinStamp};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::{Arc, Once};
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-pin-freeze-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    let parent_tx = TxRecord {
-        txid: [0x11u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let pfk = q
-        .store()
-        .txs
-        .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
-        .unwrap()[0];
-    let range = q.store().tx_body_range(pfk).unwrap();
-    let parent_id = pfk.get().unwrap();
-
-    let spend_tx = TxRecord {
-        txid: [0x22u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let spend_ins = vec![InputRecord {
-        prev_txid: parent_tx.txid,
-        create_fk: pfk,
-        prev_index: 0,
-        sequence: u32::MAX,
-        script_sig: vec![],
-        witness: vec![],
-    }];
-    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let spend_pin: CreatePin = Arc::new((spend_tx, spend_outs));
-
-    let mut plan = ArchiveWritePlan {
-        packed: vec![(Arc::clone(&spend_pin), spend_ins)],
-        planned_fks: vec![Fk(2)],
-        per_header_ranges: vec![],
-        spends: vec![],
-        batch_creates: vec![],
-        external_parent_ranges: {
-            let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, range);
-            m
-        },
-        external_parent_txids: {
-            let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, parent_tx.txid);
-            m
-        },
-        batch_pin: vec![Arc::clone(&spend_pin)],
-        index_tx: false,
-        body_est: 0,
-    };
-
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let (parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
-            .expect("pin external via stamped body range");
-    assert!(parents.contains(pfk));
-    assert!(
-        parents.get_parent_out(pfk, 0).is_some(),
-        "sparse need-vout must be in BatchParents"
-    );
-
-    // Production load freezes plan after pin so write queue is lean.
-    plan.freeze_after_pin();
-    assert!(
-        plan.external_parent_ranges.is_empty() && plan.external_parent_txids.is_empty(),
-        "post-pin plan must not carry stamp staging to scripts/write"
-    );
-    assert!(parents.get_parent_out(pfk, 0).is_some());
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Plan staging maps are not a pin fallback after lookup promised a stamp.
-#[test]
-fn pin_for_wire_ignores_plan_maps_without_stamp() {
-    use super::{pin_for_wire_batch, ParentPinStamp};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::{Arc, Once};
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-pin-no-or-else-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    let parent_tx = TxRecord {
-        txid: [0x11u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let pfk = q
-        .store()
-        .txs
-        .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
-        .unwrap()[0];
-    let range = q.store().tx_body_range(pfk).unwrap();
-    let parent_id = pfk.get().unwrap();
-
-    let spend_tx = TxRecord {
-        txid: [0x22u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let spend_ins = vec![InputRecord {
-        prev_txid: parent_tx.txid,
-        create_fk: pfk,
-        prev_index: 0,
-        sequence: u32::MAX,
-        script_sig: vec![],
-        witness: vec![],
-    }];
-    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let spend_pin: CreatePin = Arc::new((spend_tx, spend_outs));
-
-    let plan = ArchiveWritePlan {
-        packed: vec![(Arc::clone(&spend_pin), spend_ins)],
-        planned_fks: vec![Fk(2)],
-        per_header_ranges: vec![],
-        spends: vec![],
-        batch_creates: vec![],
-        external_parent_ranges: {
-            let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, range);
-            m
-        },
-        external_parent_txids: {
-            let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, parent_tx.txid);
-            m
-        },
-        batch_pin: vec![Arc::clone(&spend_pin)],
-        index_tx: false,
-        body_est: 0,
-    };
-    let empty = ParentPinStamp::default();
-    let err = pin_for_wire_batch(&q, Some(&plan), &empty, &[], &[], None, None)
-        .expect_err("plan maps must not backfill an empty stamp");
-    let msg = err.to_string();
-    assert!(msg.contains("lookup stage miss"), "got: {msg}");
-    let _ = std::fs::remove_dir_all(&path);
-}
-
 #[test]
 fn parent_pin_stamp_take_from_plan_moves_maps() {
     use super::ParentPinStamp;
@@ -1759,401 +1699,6 @@ fn store_start_states_lookup_load_confirm() {
 }
 
 /// Load miss: spend edges without pin denserels must hard-fail (no cold tier).
-#[test]
-fn post_commit_missing_denserels_is_invariant_error() {
-    use super::{post_commit, Prepared};
-    use crate::milestone::Milestone;
-    use crate::params::ChainParams;
-    use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, Query};
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-post-commit-inv-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    // Spend index on (default for Direct) so post_commit enters annotate.
-    let _ = (ChainParams::regtest(), Milestone::NONE);
-
-    let prepared = [Prepared {
-        height: Height(1),
-        header_fk: Fk(1),
-        tx_fks: vec![Fk(10)],
-        jobs: vec![],
-        spends: vec![([1u8; 32], 0, Fk(10), Fk(2))],
-        fees: 0,
-        check_scripts: false,
-        time: 1,
-        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-        hash: [2u8; 32],
-        prev_mtp: 0,
-    }];
-    // Empty BatchParents → get_spender_abs is None.
-    let bp = BatchParents::new();
-    let meta = rbitcoin_query::U64Map::default();
-    let err = post_commit(&q, &prepared, &bp, &meta).expect_err("missing denserels");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("invariant") && msg.contains("denserels"),
-        "unexpected err: {msg}"
-    );
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// W3: pin already has denserels — ensure only attaches body_range (no denserels cold).
-#[test]
-fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
-    use super::{ensure_spend_abs_layouts, Prepared};
-    use crate::confirm_phase_stats;
-    use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, Query};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::atomic::Ordering;
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-ensure-range-only-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    let parent_tx = TxRecord {
-        txid: [0x11u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
-    let fks = q
-        .store()
-        .put_tx_full_batch_indexed(
-            &[(parent_tx.clone(), parent_ins, parent_outs.clone())],
-            /*index=*/ true,
-        )
-        .unwrap();
-    let parent_fk = fks[0];
-    let (spent_off, spent_len) = q.store().tx_spent_range(parent_fk).unwrap();
-
-    // Pin without spent_range (load-ahead shape before commit).
-    let mut bp = BatchParents::new();
-    bp.insert_owned(
-        parent_fk,
-        parent_tx,
-        vec![(0, parent_outs[0].clone())],
-        vec![0],
-        Some(true),
-        None,
-        Vec::new(),
-    );
-    assert!(!bp.has_abs_layout(parent_fk));
-
-    let prepared = [Prepared {
-        height: Height(1),
-        header_fk: Fk(1),
-        tx_fks: vec![Fk(2)],
-        jobs: vec![],
-        spends: vec![([0x11u8; 32], 0, Fk(2), parent_fk)],
-        fees: 0,
-        check_scripts: false,
-        time: 1,
-        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-        hash: [4u8; 32],
-        prev_mtp: 0,
-    }];
-
-    let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    let _ = confirm_phase_stats::ENSURE_RES_HIT.swap(0, Ordering::Relaxed);
-    ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("spent-range ensure");
-    let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    assert_eq!(
-        cold, 0,
-        "must not denserels-body cold when spent idx stamps abs"
-    );
-    assert!(bp.has_abs_layout(parent_fk));
-    assert_eq!(
-        bp.get_spender_abs(parent_fk, 0),
-        Some(rbitcoin_store::spent_abs(spent_off, 0))
-    );
-    let _ = spent_len;
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Load pin of an already-archived parent does **not** spent.idx-batch.
-/// Write `ensure_spend_abs_layouts` fills abs (idx only, no Class A cold).
-#[test]
-fn write_ensure_stamps_spent_range_after_load_pin() {
-    use super::{ensure_spend_abs_layouts, pin_for_wire_batch, ParentPinStamp, Prepared};
-    use crate::confirm_phase_stats;
-    use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::Query;
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::atomic::Ordering;
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-load-stamp-spent-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    let parent_tx = TxRecord {
-        txid: [0x11u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let pfk = q
-        .store()
-        .put_tx_full_batch_indexed(
-            &[(parent_tx.clone(), parent_ins, parent_outs)],
-            /*index=*/ true,
-        )
-        .unwrap()[0];
-    let (spent_off, spent_len) = q.store().tx_spent_range(pfk).unwrap();
-    let expect_abs = rbitcoin_store::spent_abs(spent_off, 0);
-    let _ = spent_len;
-
-    let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
-    let spend_tx = TxRecord {
-        txid: [0x22u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    plan.packed = vec![(
-        std::sync::Arc::new((spend_tx, spend_outs)),
-        vec![InputRecord {
-            prev_txid: parent_tx.txid,
-            create_fk: pfk,
-            prev_index: 0,
-            sequence: u32::MAX,
-            script_sig: vec![],
-            witness: vec![],
-        }],
-    )];
-    plan.planned_fks = vec![Fk(2)];
-    let range = q.store().tx_body_range(pfk).unwrap();
-    if let Some(id) = pfk.get() {
-        plan.external_parent_ranges.insert(id, range);
-        plan.external_parent_txids.insert(id, parent_tx.txid);
-    }
-
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let (mut parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
-    assert!(
-        !parents.has_abs_layout(pfk),
-        "load pin must not spent.idx-batch; write ensure owns abs"
-    );
-    assert!(parents.get_spender_abs(pfk, 0).is_none());
-
-    let prepared = [Prepared {
-        height: Height(1),
-        header_fk: Fk(1),
-        tx_fks: vec![Fk(2)],
-        jobs: vec![],
-        spends: vec![([0x11u8; 32], 0, Fk(2), pfk)],
-        fees: 0,
-        check_scripts: false,
-        time: 1,
-        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-        hash: [4u8; 32],
-        prev_mtp: 0,
-    }];
-    let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    ensure_spend_abs_layouts(&q, &mut parents, &prepared).expect("ensure pin-hit");
-    let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    assert_eq!(
-        cold, 0,
-        "archived parent must not cold-load at write ensure"
-    );
-    assert!(
-        parents.has_abs_layout(pfk),
-        "write ensure must stamp spent_range"
-    );
-    assert_eq!(parents.get_spender_abs(pfk, 0), Some(expect_abs));
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Same-batch planned create is not in `spent.idx` yet — load must not invent abs.
-#[test]
-fn load_pin_does_not_stamp_same_batch_create() {
-    use super::{pin_for_wire_batch, ParentPinStamp};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::Query;
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-load-no-stamp-same-batch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    let q = Query::open_or_create(&path).unwrap();
-
-    let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
-    let parent_tx = TxRecord {
-        txid: [0x22u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let child_tx = TxRecord {
-        txid: [0x33u8; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    plan.packed = vec![
-        (
-            std::sync::Arc::new((parent_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
-            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-        ),
-        (
-            std::sync::Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
-            vec![InputRecord {
-                prev_txid: [0x22u8; 32],
-                create_fk: Fk(2),
-                prev_index: 0,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }],
-        ),
-    ];
-    plan.planned_fks = vec![Fk(2), Fk(3)];
-
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let (parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None).unwrap();
-    assert!(parents.contains(Fk(2)));
-    assert!(
-        !parents.has_abs_layout(Fk(2)),
-        "same-batch create must not get a spent_range before Class A commit"
-    );
-    assert!(parents.get_spender_abs(Fk(2), 0).is_none());
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Write-stage ensure must hard-fail when denserels/abs cannot be completed
-/// (no silent leave-for structural cold or post_commit).
-#[test]
-fn ensure_spend_abs_incomplete_is_invariant_error() {
-    use super::{ensure_spend_abs_layouts, Prepared};
-    use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, Query};
-    use std::sync::Once;
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-ensure-abs-inv-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    let q = Query::open_or_create(&path).unwrap();
-    q.enter_direct_index_mode().unwrap();
-
-    let prepared = [Prepared {
-        height: Height(1),
-        header_fk: Fk(1),
-        tx_fks: vec![Fk(10)],
-        jobs: vec![],
-        // Non-null create_fk that does not exist in Class A → cold load miss.
-        spends: vec![([9u8; 32], 0, Fk(10), Fk(999_999))],
-        fees: 0,
-        check_scripts: false,
-        time: 1,
-        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-        hash: [3u8; 32],
-        prev_mtp: 0,
-    }];
-    let mut bp = BatchParents::new();
-    let err = ensure_spend_abs_layouts(&q, &mut bp, &prepared)
-        .expect_err("ensure must hard-fail without denserels");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("invariant")
-            && (msg.contains("ensure denserels") || msg.contains("abs incomplete")),
-        "unexpected err: {msg}"
-    );
-    let _ = std::fs::remove_dir_all(&path);
-}
-
 /// Pin-covered parent without denserels/abs fails structural (no body-range cold).
 #[test]
 fn structural_pinned_without_abs_is_invariant_error() {

@@ -5,7 +5,6 @@ use super::*;
 pub fn confirm_scripts_phase(
     mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
-    scripts_feed_test_sync::on_phase_enter();
     let t_work = Instant::now();
     script_wave(&batch.prepared, &batch.script_preverified)?;
     for p in &mut batch.prepared {
@@ -51,6 +50,23 @@ impl ScriptsPhaseHandle {
         })
     }
 
+    /// Run `work` on a coordinator. Test-local hold lives in `work`, not in
+    /// [`confirm_scripts_phase`].
+    #[cfg(test)]
+    pub fn spawn_fn(
+        work: impl FnOnce() -> Result<ConfirmScriptOutcome, ConsensusError> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let phase_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&phase_thread);
+        crate::script_pool::spawn_coordinator(move || {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(std::thread::current().name().unwrap_or("").to_string());
+            let _ = tx.send(work());
+        });
+        Self { rx, phase_thread }
+    }
+
     /// Join and return the coordinator thread name recorded for **this** handle.
     #[cfg(test)]
     pub fn join_with_phase_thread(self) -> Result<(ConfirmScriptOutcome, String), ConsensusError> {
@@ -81,7 +97,6 @@ impl ScriptsPhaseHandle {
 /// The OS scripts thread must keep claiming N+1 **while** waiting on N’s
 /// [`ScriptsPhaseHandle::recv_timeout`] (not only once before a blocking join).
 pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
-    scripts_feed_test_sync::on_async_submit();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     #[cfg(test)]
     let phase_thread = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -125,7 +140,6 @@ where
         match handle.recv_timeout(poll) {
             Ok(r) => return r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                scripts_feed_test_sync::on_recv_timeout();
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -180,18 +194,33 @@ pub fn confirm_scripts_feed_ahead(
 /// `sync_channel(1)` timing.
 pub fn scripts_stage_from_load_channel(
     mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
+    on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
+    on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
+    should_stop: impl FnMut() -> bool,
+) {
+    scripts_stage_from_load_channel_with(
+        mat_rx,
+        |batch, mat_ns| {
+            let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
+            (confirm_scripts_phase_async(batch), meta)
+        },
+        on_ok,
+        on_err,
+        should_stop,
+    );
+}
+
+/// Same claim/feed-ahead loop as [`scripts_stage_from_load_channel`], with an
+/// injectable start (tests hold the first wave locally).
+pub fn scripts_stage_from_load_channel_with(
+    mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
+    mut start: impl FnMut(LoadedBatch, u64) -> (ScriptsPhaseHandle, ScriptsBatchMeta),
     mut on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
     mut on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
     mut should_stop: impl FnMut() -> bool,
 ) {
     let mut current: Option<(ScriptsPhaseHandle, ScriptsBatchMeta)> = None;
     let mut lookahead: Option<(ScriptsPhaseHandle, ScriptsBatchMeta)> = None;
-
-    let start = |batch: LoadedBatch, mat_ns: u64| -> (ScriptsPhaseHandle, ScriptsBatchMeta) {
-        let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
-        let handle = confirm_scripts_phase_async(batch);
-        (handle, meta)
-    };
 
     loop {
         if should_stop() {
@@ -272,84 +301,6 @@ impl ScriptsBatchMeta {
             heights_hashes,
             mat_ns,
             t0: Instant::now(),
-        }
-    }
-}
-
-/// Test-only sync so unit tests can prove N+1 was submitted while N’s wave is still open.
-pub mod scripts_feed_test_sync {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
-    use std::time::{Duration, Instant};
-
-    static FEED_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
-    static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
-    static HOLD_TAIL: AtomicBool = AtomicBool::new(false);
-    static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
-    static RECV_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-
-    /// Hold across a feed-ahead timing test so a parallel `reset()` cannot
-    /// clear HOLD_* while another test is mid-wave (`cargo llvm-cov`).
-    pub fn lock() -> MutexGuard<'static, ()> {
-        FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Reset counters (call at start of each feed-ahead timing test).
-    pub fn reset() {
-        SUBMIT_COUNT.store(0, Ordering::SeqCst);
-        HOLD_FIRST.store(false, Ordering::SeqCst);
-        HOLD_TAIL.store(false, Ordering::SeqCst);
-        FIRST_ENTERED.store(false, Ordering::SeqCst);
-        RECV_TIMEOUTS.store(0, Ordering::SeqCst);
-    }
-
-    /// When true, the first [`super::confirm_scripts_phase`] waits until
-    /// [`submit_count`] ≥ 2 (second async submit happened mid-wave).
-    pub fn set_hold_first_until_second_submit(hold: bool) {
-        HOLD_FIRST.store(hold, Ordering::SeqCst);
-        FIRST_ENTERED.store(false, Ordering::SeqCst);
-    }
-
-    /// After N+1 is submitted, keep the first wave open ~200 ms so a 200 µs
-    /// join loop would accumulate hundreds of timeouts.
-    pub fn set_hold_tail_after_second(hold: bool) {
-        HOLD_TAIL.store(hold, Ordering::SeqCst);
-    }
-
-    pub fn submit_count() -> u64 {
-        SUBMIT_COUNT.load(Ordering::SeqCst)
-    }
-
-    pub fn recv_timeout_count() -> u64 {
-        RECV_TIMEOUTS.load(Ordering::SeqCst)
-    }
-
-    pub(super) fn on_recv_timeout() {
-        RECV_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn on_async_submit() {
-        SUBMIT_COUNT.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(super) fn on_phase_enter() {
-        if !HOLD_FIRST.load(Ordering::SeqCst) {
-            return;
-        }
-        if FIRST_ENTERED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while submit_count() < 2 {
-            if Instant::now() > deadline {
-                // Avoid hanging the suite if feed-ahead is broken.
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if HOLD_TAIL.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

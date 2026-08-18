@@ -81,8 +81,9 @@ async fn two_node_header_and_block_sync() {
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
-/// (tier A — default + CI multinode).
+/// (CI **multinode** job only — `coverage.sh` also skips this name).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "multinode job"]
 async fn serve_after_restart_via_reconstruct() {
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
@@ -206,8 +207,9 @@ async fn ibd_two_peers() {
 }
 
 /// Multi-peer IBD: dead address + live seeder (dial book tries both).
+/// Slim (4 blocks) — required **multinode** job (`coverage.sh` also skips).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "dial-book dead peer; run via scripts/integration.sh"]
+#[ignore = "multinode job"]
 async fn ibd_skips_dead_peer() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();

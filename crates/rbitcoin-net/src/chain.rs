@@ -156,12 +156,6 @@ impl ChainHub {
             || self.asked_blocks.read().unwrap().contains(hash)
     }
 
-    /// Getdata already in flight (process-wide). Held unprocessed bodies are
-    /// not asked — `p2p_unrequested_blocks` INV still requests them.
-    pub fn asked_block(&self, hash: &BlockHash) -> bool {
-        self.asked_blocks.read().unwrap().contains(hash)
-    }
-
     pub fn note_gbt_assembled(&self) {
         self.gbt_assembled.store(true, Ordering::Relaxed);
     }
@@ -1493,6 +1487,9 @@ impl ChainHub {
                 if let NetError::Consensus(s) = &e {
                     if !reject_is_mutated(s) && !s.to_ascii_lowercase().contains("not found") {
                         self.note_invalid_block(hash);
+                        // Keep the body so `getblock` can return confirmations=-1
+                        // (`p2p_unrequested_blocks` step 8).
+                        self.hold_body(block);
                     }
                 }
                 Err(e)

@@ -820,7 +820,7 @@ analog = "follow-up: tx privacy"
 name = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
-analog = "official: after 288-window + ignored completing block, INV of fork tip getdata[0] is not headers-only parent h1f (p2p_unrequested_blocks.py:225); invalid-fork disconnect + node1 sync later"
+analog = "official: after reorg-to-290, wait_for_disconnect on immature-coinbase block_291 (p2p_unrequested_blocks.py:275); then invalid-chain header + node1 sync"
 
 [[test]]
 name = "p2p_v2_encrypted.py"

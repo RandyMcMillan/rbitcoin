@@ -72,8 +72,9 @@ before 1.0).
   may getdata missing bodies on that path. `p2p_headers_sync_with_minchainwork.py`
   stays skip at the ~2032-block `generatetoaddress` 120s timeout
   (`:112`). `p2p_invalid_messages.py` stays skip at empty addrv2 Core
-  logs (`:203`). `p2p_unrequested_blocks.py` stays skip at INV
-  getdata[0] ≠ headers-only parent (`:225`). Q-41 is 36/267.
+  logs (`:203`). `p2p_unrequested_blocks.py` stays skip at
+  wait_for_disconnect on an immature-coinbase fork (`:275`). Known-header
+  INV does not getdata (sendheaders `inv_node`). Q-41 is 36/267.
 
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`

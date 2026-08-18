@@ -180,6 +180,18 @@ mod tests {
     }
 
     #[test]
+    fn two_height_notes_are_two_fifo_rows() {
+        let r = RecentCreates::new();
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        r.note(11, [(tid(2), Fk(2), (3, 4))]);
+        assert_eq!(
+            r.size_snapshot(),
+            (2, 2),
+            "one fifo row per prepared height, not one per write batch"
+        );
+    }
+
+    #[test]
     fn note_makes_get_visible() {
         let r = RecentCreates::new();
         assert!(r.get(&tid(1)).is_none());

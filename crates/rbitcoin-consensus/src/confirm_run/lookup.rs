@@ -572,6 +572,10 @@ pub mod lookup_stage_stats {
     pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NS: AtomicU64 = AtomicU64::new(0);
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
+    /// Lookup-wave `consensus_decode` of still-raw BQ payloads.
+    pub static DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Lookup-wave `TxPrecompute::from_tx` after decode.
+    pub static PRECOMPUTE_NS: AtomicU64 = AtomicU64::new(0);
 
     pub fn note(
         blocks: u64,
@@ -613,6 +617,19 @@ pub mod lookup_stage_stats {
         }
     }
 
+    /// Accrue lookup-wave decode / precompute / key-collect (named `ibd: perf`).
+    pub fn note_wave_decode(decode_ns: u64, precompute_ns: u64, collect_ns: u64) {
+        if decode_ns > 0 {
+            DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
+        }
+        if precompute_ns > 0 {
+            PRECOMPUTE_NS.fetch_add(precompute_ns, Ordering::Relaxed);
+        }
+        if collect_ns > 0 {
+            COLLECT_NS.fetch_add(collect_ns, Ordering::Relaxed);
+        }
+    }
+
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub blocks: u64,
@@ -624,6 +641,8 @@ pub mod lookup_stage_stats {
         pub collect_ns: u64,
         pub head_ns: u64,
         pub cold_io_ns: u64,
+        pub decode_ns: u64,
+        pub precompute_ns: u64,
     }
 
     pub fn sample_and_reset() -> Sample {
@@ -637,6 +656,8 @@ pub mod lookup_stage_stats {
             collect_ns: COLLECT_NS.swap(0, Ordering::Relaxed),
             head_ns: HEAD_NS.swap(0, Ordering::Relaxed),
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
+            decode_ns: DECODE_NS.swap(0, Ordering::Relaxed),
+            precompute_ns: PRECOMPUTE_NS.swap(0, Ordering::Relaxed),
         }
     }
 }

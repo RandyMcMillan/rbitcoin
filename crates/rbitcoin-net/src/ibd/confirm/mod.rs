@@ -369,6 +369,21 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
+/// Empty pack that is not a body-missing reject: wait on `feed.cv` (lookup
+/// `notify` after resolve-complete). Do **not** busy-spin while tip+1 sits
+/// in `ready` but BQ is not resolve-complete — that hammers feed + BQ locks.
+#[inline]
+pub(crate) fn pack_empty_waits_for_lookup(run_n: usize, body_missing_n: usize) -> bool {
+    run_n == 0 && body_missing_n == 0
+}
+
+/// Happy-path pack hash check: compare the **stored** BQ/feed hash. Do not
+/// `block.block_hash()` when lookup already stored the hash.
+#[inline]
+pub(crate) fn pack_stored_hash_ok(stored: &[u8; 32], expect: &BlockHash) -> bool {
+    *stored == expect.to_byte_array()
+}
+
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
@@ -1294,61 +1309,110 @@ pub(crate) fn spawn_confirm_engine(
                             let mut run: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> =
                                 Vec::with_capacity(hard_blocks.min(32));
                             let mut sum_inputs = 0u32;
-                            let mut h = expect;
                             let mut body_missing: Vec<(u32, BlockHash)> = Vec::new();
                             let t_pack_io = Instant::now();
-                            while run.len() < hard_blocks && h <= claim_hi {
-                                let (hash, opt_wire) = {
-                                    let mut gg = feed_load.inner.lock().unwrap();
+                            let candidates: Vec<(
+                                u32,
+                                BlockHash,
+                                Option<bitcoin::Block>,
+                            )> = {
+                                let gg = feed_load.inner.lock().unwrap();
+                                let mut out = Vec::new();
+                                let mut h = expect;
+                                while out.len() < hard_blocks && h <= claim_hi {
                                     if gg.inflight.contains(&h) {
                                         break;
                                     }
-                                    let Some(entry) = gg.ready.get(&h).cloned() else {
+                                    let Some(entry) = gg.ready.get(&h) else {
                                         break;
                                     };
-                                    if entry.1.is_none()
-                                        && !hub_load.query.block_queue_is_resolve_complete(h)
-                                    {
-                                        break;
-                                    }
-                                    gg.ready.remove(&h);
-                                    entry
-                                };
-                                if hub_load.has_block(&hash) {
+                                    out.push((h, entry.0, entry.1.clone()));
                                     h = h.saturating_add(1);
+                                }
+                                out
+                            };
+                            let need_bq: Vec<u32> = candidates
+                                .iter()
+                                .filter(|(_, _, w)| w.is_none())
+                                .map(|(h, _, _)| *h)
+                                .collect();
+                            let snaps = hub_load.query.block_queue_pack_snapshot(&need_bq);
+                            let mut snap_by_h: HashMap<u32, rbitcoin_query::BlockQueuePackSnap> =
+                                snaps.into_iter().map(|s| (s.height, s)).collect();
+                            let mut take: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> =
+                                Vec::new();
+                            let mut skip_have: Vec<u32> = Vec::new();
+                            for (h, hash, opt_wire) in candidates {
+                                if hub_load.has_block(&hash) {
+                                    skip_have.push(h);
                                     continue;
                                 }
                                 let block = if let Some(b) = opt_wire {
                                     Arc::new(b)
                                 } else {
-                                    match load_decode_bq_block(&hub_load, h, &hash) {
-                                        Ok(b) => b,
-                                        Err(PackWireErr::Missing) => {
-                                            body_missing.push((h, hash));
+                                    match snap_by_h.remove(&h) {
+                                        Some(s) if !s.resolve_complete => {
                                             break;
                                         }
-                                        Err(PackWireErr::HashMismatch | PackWireErr::Decode) => {
+                                        Some(s) if !pack_stored_hash_ok(&s.hash, &hash) => {
                                             body_missing.push((h, hash));
                                             let _ = hub_load.query.block_queue_dequeue_height(h);
+                                            break;
+                                        }
+                                        Some(s) => {
+                                            if let Some(b) = s.block {
+                                                b
+                                            } else {
+                                                match load_decode_bq_block(&hub_load, h, &hash)
+                                                {
+                                                    Ok(b) => b,
+                                                    Err(PackWireErr::Missing) => {
+                                                        body_missing.push((h, hash));
+                                                        break;
+                                                    }
+                                                    Err(
+                                                        PackWireErr::HashMismatch
+                                                        | PackWireErr::Decode,
+                                                    ) => {
+                                                        body_missing.push((h, hash));
+                                                        let _ = hub_load
+                                                            .query
+                                                            .block_queue_dequeue_height(h);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            body_missing.push((h, hash));
                                             break;
                                         }
                                     }
                                 };
                                 let inputs = block_input_count(block.as_ref());
-                                {
-                                    let mut gg = feed_load.inner.lock().unwrap();
-                                    gg.inflight.insert(h);
-                                }
-                                run.push((h, hash, block));
+                                take.push((h, hash, block));
                                 sum_inputs = sum_inputs.saturating_add(inputs);
-                                h = h.saturating_add(1);
                                 if pack_stop_after(
                                     sum_inputs,
-                                    run.len(),
+                                    take.len(),
                                     soft_inputs,
                                     hard_blocks,
                                 ) {
                                     break;
+                                }
+                            }
+                            {
+                                let mut gg = feed_load.inner.lock().unwrap();
+                                for h in skip_have {
+                                    gg.ready.remove(&h);
+                                }
+                                for (h, hash, block) in take {
+                                    if gg.inflight.contains(&h) {
+                                        continue;
+                                    }
+                                    gg.ready.remove(&h);
+                                    gg.inflight.insert(h);
+                                    run.push((h, hash, block));
                                 }
                             }
                             confirm_thr_stats::add_load_pack(t_pack_io.elapsed());
@@ -1364,6 +1428,18 @@ pub(crate) fn spawn_confirm_engine(
                                 break Some((run, sum_inputs));
                             }
                             g = feed_load.inner.lock().unwrap();
+                            if pack_empty_waits_for_lookup(run.len(), body_missing.len()) {
+                                let t_idle = Instant::now();
+                                let (gg, wait_res) = feed_load
+                                    .cv
+                                    .wait_timeout(g, Duration::from_millis(20))
+                                    .unwrap();
+                                confirm_thr_stats::add_load_recv_wait(t_idle.elapsed());
+                                g = gg;
+                                if wait_res.timed_out() {
+                                    break None;
+                                }
+                            }
                             continue;
                         }
                         let t_idle = Instant::now();

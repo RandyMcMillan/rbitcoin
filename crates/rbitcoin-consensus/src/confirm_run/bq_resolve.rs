@@ -99,6 +99,12 @@ pub struct BqResolveWaveStats {
     /// Keys already in [`rbitcoin_query::LiveUnion`] — no TipOnly this wave.
     pub skipped: u32,
     pub work_ns: u64,
+    /// `consensus_decode` of still-raw BQ payloads (this wave).
+    pub decode_ns: u64,
+    /// `TxPrecompute::from_tx` after decode (this wave).
+    pub precompute_ns: u64,
+    /// `collect_resolve_keys` (this wave).
+    pub collect_ns: u64,
 }
 
 /// Collect unique external prev_txids (+ pre-BIP34 create txids) from a wire block.
@@ -150,8 +156,9 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
 ///
 /// When `ids` is `Some`, skip TipOnly for keys already in the live union and
-/// publish **one** layer for the whole wave (`lo..=hi`). The layer stays until
-/// no height in that span is still on the body queue.
+/// publish **one** layer for the whole wave (`lo..=hi`). The layer stays while
+/// any height in the span is still on the BQ **or** `hi` is inside the
+/// RecentCreates horizon (`2×soft_win`).
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
@@ -196,10 +203,18 @@ pub fn confirm_bq_resolve_wave_with_ids(
             let Some(payload) = slot.0 else {
                 continue;
             };
+            let t_dec = Instant::now();
             let Some(block) = decode_bq_block(&payload) else {
                 continue;
             };
+            stats.decode_ns = stats
+                .decode_ns
+                .saturating_add(t_dec.elapsed().as_nanos() as u64);
+            let t_pre = Instant::now();
             let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+            stats.precompute_ns = stats
+                .precompute_ns
+                .saturating_add(t_pre.elapsed().as_nanos() as u64);
             let charge = decoded_charge(payload.len() as u64, pres.len());
             let pres = Arc::<[TxPrecompute]>::from(pres);
             let block = Arc::new(block);
@@ -213,7 +228,11 @@ pub fn confirm_bq_resolve_wave_with_ids(
             ));
             (block, pres)
         };
+        let t_col = Instant::now();
         let need = collect_resolve_keys(params, h, block.as_ref(), pres.as_ref());
+        stats.collect_ns = stats
+            .collect_ns
+            .saturating_add(t_col.elapsed().as_nanos() as u64);
         if all_keys.len().saturating_add(need.len()) > BQ_RESOLVE_WAVE_MAX_KEYS
             && !per_height.is_empty()
         {
@@ -266,6 +285,11 @@ pub fn confirm_bq_resolve_wave_with_ids(
             more_remain,
         ) {
             stats.work_ns = t0.elapsed().as_nanos() as u64;
+            lookup_stage_stats::note_wave_decode(
+                stats.decode_ns,
+                stats.precompute_ns,
+                stats.collect_ns,
+            );
             return Ok(stats);
         }
     }
@@ -312,7 +336,9 @@ pub fn confirm_bq_resolve_wave_with_ids(
         }
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
-        live.keep_queued_heights(&queued);
+        let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
+        let horizon = rbitcoin_query::recent_creates_horizon(query.soft_confirm_window());
+        live.keep_queued_or_horizon(&queued, tip, horizon);
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -324,6 +350,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         .map_err(ConsensusError::from)?;
     stats.heights = done.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
+    lookup_stage_stats::note_wave_decode(stats.decode_ns, stats.precompute_ns, stats.collect_ns);
     Ok(stats)
 }
 
@@ -468,6 +495,13 @@ mod tests {
         assert_eq!(st.heights, 2);
         assert!(st.keys >= 1);
         assert!(st.hits >= 1);
+        assert!(
+            st.decode_ns > 0 && st.precompute_ns > 0 && st.collect_ns > 0,
+            "raw-payload wave must meter decode=/precompute=/collect= (decode={} pre={} collect={})",
+            st.decode_ns,
+            st.precompute_ns,
+            st.collect_ns
+        );
         assert!(
             q.published_ids().get(&g_cb.to_byte_array()).is_some(),
             "genesis coinbase must be a TipOnly hit in the published union"

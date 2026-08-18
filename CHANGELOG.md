@@ -33,6 +33,17 @@ before 1.0).
 
 ### Changed
 
+- **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when
+  tip+1 is ready but BQ resolve is incomplete (no retain+BQ spin). Write
+  notes RecentCreates **per prepared height**; published identity layers
+  stay while `tip − hi < 2×soft_win` after the span leaves the BQ.
+  In-flight / pstore `size_snapshot` is O(1) occupancy (no per-pack pin
+  script walk). Lookup wave names `decode=` / `precompute=` / `collect=`
+  under `lookup_thr wave=`. BQ keeps a height→id map; load pack takes
+  one feed collect, one `block_queue_pack_snapshot`, one inflight mark
+  (stored hash vs feed; no happy-path `block.block_hash()`). Script
+  steal is unchanged — decode stays on the lookup thread.
+
 - **Lookup wave min 8000 inputs:** do not publish a TipOnly layer under
   8000 Σ `tx.input` when more unresolved BQ heights can still join,
   including `ready=0` / load-frontier / unknown window. Last available

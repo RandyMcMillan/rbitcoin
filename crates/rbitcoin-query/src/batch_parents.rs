@@ -386,28 +386,14 @@ impl PipelineParentStore {
 
     /// Occupancy: weak map slots, live strong pins, approx bytes of live pin outs.
     pub fn size_snapshot(&self) -> (usize, usize, u64) {
+        // O(slots) strong_count only — no Weak upgrade / ArcSwap / script walk
+        // on the load prune path.
         let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         let weak_slots = g.by_fk.len();
-        let mut live = 0usize;
-        let mut bytes = 0u64;
-        for w in g.by_fk.values() {
-            if let Some(p) = w.upgrade() {
-                live = live.saturating_add(1);
-                let outs = p.load_outs();
-                // SharedParentPin: outs half scripts + layout rels + shell.
-                bytes = bytes.saturating_add(96);
-                for (_v, o) in &outs.outs {
-                    bytes = bytes
-                        .saturating_add(24)
-                        .saturating_add(o.script.len() as u64);
-                }
-                bytes = bytes.saturating_add(outs.checked.len().saturating_mul(4) as u64);
-                let lay = p.load_layout();
-                bytes = bytes.saturating_add(lay.spender_rels.len().saturating_mul(8) as u64);
-            }
-        }
-        // Weak map overhead (~24 B / slot including dead Weaks).
-        bytes = bytes.saturating_add((weak_slots as u64).saturating_mul(24));
+        let live = g.by_fk.values().filter(|w| w.strong_count() > 0).count();
+        let bytes = (weak_slots as u64)
+            .saturating_mul(24)
+            .saturating_add((live as u64).saturating_mul(256));
         (weak_slots, live, bytes)
     }
 
@@ -1933,7 +1919,13 @@ mod tests {
         let (weak, live, bytes) = store.size_snapshot();
         assert_eq!(weak, 2);
         assert_eq!(live, 2);
-        assert!(bytes > 0);
+        assert_eq!(
+            bytes,
+            (weak as u64)
+                .saturating_mul(24)
+                .saturating_add((live as u64).saturating_mul(256)),
+            "O(1) slot estimate — must not walk pin scripts"
+        );
 
         // Grow checked via extra_need, then fill sparse layout.
         bp.set_layout_sparse(Fk(1), (200, 50), vec![(0, 7), (1, 8)], &[1]);

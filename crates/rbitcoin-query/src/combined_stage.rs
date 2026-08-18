@@ -412,6 +412,46 @@ mod tests {
     }
 
     #[test]
+    fn block_queue_pack_snapshot_complete_and_not() {
+        use crate::ResolvedWire;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode};
+        use std::sync::Arc;
+
+        let (dir, q) = temp_query();
+        q.block_queue_enqueue(7, [7u8; 32], 1, b"wire-7").unwrap();
+        q.block_queue_enqueue(8, [8u8; 32], 2, b"wire-8").unwrap();
+        let block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::from_byte_array([0; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: 0,
+            },
+            txdata: vec![],
+        };
+        let wire = ResolvedWire {
+            block: Arc::new(block),
+            pres: Arc::from(Vec::new()),
+        };
+        q.block_queue_promote_wave(vec![(7, wire, 64)]).unwrap();
+        q.block_queue_mark_resolve_complete(7).unwrap();
+        let snap = q.block_queue_pack_snapshot(&[7, 8, 9]);
+        assert_eq!(snap.len(), 2, "missing height 9 is omitted");
+        assert_eq!(snap[0].height, 7);
+        assert!(snap[0].resolve_complete);
+        assert!(snap[0].block.is_some());
+        assert_eq!(snap[0].hash, [7u8; 32]);
+        assert_eq!(snap[1].height, 8);
+        assert!(!snap[1].resolve_complete);
+        assert!(snap[1].block.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn block_queue_unresolved_heights_via_query() {
         use std::collections::HashSet;
         let (dir, q) = temp_query();

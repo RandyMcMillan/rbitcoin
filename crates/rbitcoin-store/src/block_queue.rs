@@ -20,7 +20,7 @@
 //! (`u64::MAX`) aside from OOM.
 
 use crate::error::StoreError;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,6 +83,8 @@ pub struct BlockQueue {
     next_id: AtomicU64,
     /// id → entry (payload owned)
     index: BTreeMap<u64, IndexEntry>,
+    /// First-wins height → id. Height APIs must not walk `index.values()`.
+    height_to_id: HashMap<u32, u64>,
     bytes: u64,
 }
 
@@ -133,6 +135,7 @@ impl BlockQueue {
             budget,
             next_id: AtomicU64::new(1),
             index: BTreeMap::new(),
+            height_to_id: HashMap::new(),
             bytes: 0,
         })
     }
@@ -197,6 +200,7 @@ impl BlockQueue {
                 resolve_complete: false,
             },
         );
+        self.height_to_id.entry(height).or_insert(id);
         Ok(id)
     }
 
@@ -230,22 +234,23 @@ impl BlockQueue {
             return Ok(false);
         };
         self.bytes = self.bytes.saturating_sub(e.body.charge());
+        if self.height_to_id.get(&e.height) == Some(&id) {
+            self.height_to_id.remove(&e.height);
+            if let Some((&nid, _)) = self.index.iter().find(|(_, x)| x.height == e.height) {
+                self.height_to_id.insert(e.height, nid);
+            }
+        }
         Ok(true)
     }
 
     /// Dequeue all records for a confirmed height (may be 0 or 1 in normal path).
     pub fn dequeue_height(&mut self, height: u32) -> Result<usize, StoreError> {
-        let ids: Vec<u64> = self
-            .index
-            .iter()
-            .filter(|(_, e)| e.height == height)
-            .map(|(id, _)| *id)
-            .collect();
         let mut n = 0usize;
-        for id in ids {
-            if self.dequeue(id)? {
-                n += 1;
+        while let Some(&id) = self.height_to_id.get(&height) {
+            if !self.dequeue(id)? {
+                break;
             }
+            n += 1;
         }
         Ok(n)
     }
@@ -302,15 +307,15 @@ impl BlockQueue {
     ///
     /// Does **not** dequeue — confirm-write / permanent reject removes the rec.
     pub fn get_by_height(&self, height: u32) -> Result<Option<QueuedBlock>, StoreError> {
-        let Some((&id, _)) = self.index.iter().find(|(_, e)| e.height == height) else {
+        let Some(&id) = self.height_to_id.get(&height) else {
             return Ok(None);
         };
         self.get(id)
     }
 
-    /// True if any rec exists for `height` (O(n) index walk).
+    /// True if any rec exists for `height`.
     pub fn contains_height(&self, height: u32) -> bool {
-        self.index.values().any(|e| e.height == height)
+        self.height_to_id.contains_key(&height)
     }
 
     /// Heights currently on the queue.
@@ -330,17 +335,22 @@ impl BlockQueue {
 
     /// First queue id for `height`, if any.
     pub fn id_for_height(&self, height: u32) -> Option<u64> {
-        self.index
-            .iter()
-            .find(|(_, e)| e.height == height)
-            .map(|(&id, _)| id)
+        self.height_to_id.get(&height).copied()
+    }
+
+    fn entry_for_height(&self, height: u32) -> Option<&IndexEntry> {
+        self.height_to_id
+            .get(&height)
+            .and_then(|id| self.index.get(id))
     }
 
     fn entry_mut_for_height(&mut self, height: u32) -> Result<&mut IndexEntry, StoreError> {
-        self.index
-            .values_mut()
-            .find(|e| e.height == height)
-            .ok_or(StoreError::NotFound)
+        let id = self
+            .height_to_id
+            .get(&height)
+            .copied()
+            .ok_or(StoreError::NotFound)?;
+        self.index.get_mut(&id).ok_or(StoreError::NotFound)
     }
 
     /// Lookup finished this height: every external parent has a hit (or none exist).
@@ -350,17 +360,26 @@ impl BlockQueue {
     }
 
     pub fn is_resolve_complete(&self, height: u32) -> bool {
-        self.index
-            .values()
-            .any(|e| e.height == height && e.resolve_complete)
+        self.entry_for_height(height)
+            .map(|e| e.resolve_complete)
+            .unwrap_or(false)
     }
 
     /// Hash of the first queue entry at `height`, if any (no payload clone).
     pub fn hash_at_height(&self, height: u32) -> Option<[u8; 32]> {
-        self.index
-            .values()
-            .find(|e| e.height == height)
-            .map(|e| e.hash)
+        self.entry_for_height(height).map(|e| e.hash)
+    }
+
+    /// One-pass height list for a load pack: stored hash + resolve-complete.
+    /// Missing heights are omitted (caller treats as body-missing).
+    pub fn pack_snapshot(&self, heights: &[u32]) -> Vec<(u32, [u8; 32], bool)> {
+        let mut out = Vec::with_capacity(heights.len());
+        for &h in heights {
+            if let Some(e) = self.entry_for_height(h) {
+                out.push((h, e.hash, e.resolve_complete));
+            }
+        }
+        out
     }
 
     /// Raw wire for `heights` still holding payload. One pass; skips promoted.
@@ -383,14 +402,17 @@ impl BlockQueue {
     pub fn promote_wave(&mut self, items: &[(u32, u64)]) -> Result<usize, StoreError> {
         let mut n = 0usize;
         for &(height, charge) in items {
-            let Some(e) = self.index.values_mut().find(|e| e.height == height) else {
-                continue;
+            let old = {
+                let Ok(e) = self.entry_mut_for_height(height) else {
+                    continue;
+                };
+                if matches!(e.body, QueuedBody::Promoted { .. }) {
+                    continue;
+                }
+                let old = e.body.charge();
+                e.body = QueuedBody::Promoted { charge };
+                old
             };
-            if matches!(e.body, QueuedBody::Promoted { .. }) {
-                continue;
-            }
-            let old = e.body.charge();
-            e.body = QueuedBody::Promoted { charge };
             self.bytes = self.bytes.saturating_sub(old).saturating_add(charge);
             n += 1;
         }
@@ -405,12 +427,13 @@ impl BlockQueue {
     }
 
     pub fn mark_resolve_complete_wave(&mut self, heights: &[u32]) -> Result<usize, StoreError> {
-        let want: HashSet<u32> = heights.iter().copied().collect();
         let mut n = 0usize;
-        for e in self.index.values_mut() {
-            if want.contains(&e.height) && !e.resolve_complete {
-                e.resolve_complete = true;
-                n += 1;
+        for &h in heights {
+            if let Ok(e) = self.entry_mut_for_height(h) {
+                if !e.resolve_complete {
+                    e.resolve_complete = true;
+                    n += 1;
+                }
             }
         }
         Ok(n)
@@ -705,6 +728,35 @@ mod tests {
         assert_eq!(q.bytes(), 8 + 1);
         assert_eq!(q.promoted_count(), 1);
         assert!(q.get_by_height(10).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn height_index_survives_promote_and_dequeue() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(10, [10u8; 32], 1, b"a").unwrap();
+        q.enqueue(11, [11u8; 32], 2, b"b").unwrap();
+        q.enqueue(12, [12u8; 32], 3, b"c").unwrap();
+        assert_eq!(q.id_for_height(11), Some(2));
+        assert!(q.contains_height(11));
+        q.mark_resolve_complete(11).unwrap();
+        assert!(q.is_resolve_complete(11));
+        assert!(!q.is_resolve_complete(10));
+        assert_eq!(q.promote_wave(&[(11, 32)]).unwrap(), 1);
+        assert_eq!(q.hash_at_height(11), Some([11u8; 32]));
+        let snap = q.pack_snapshot(&[10, 11, 12, 99]);
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0], (10, [10u8; 32], false));
+        assert_eq!(snap[1], (11, [11u8; 32], true));
+        assert_eq!(snap[2], (12, [12u8; 32], false));
+        assert_eq!(q.dequeue_height(11).unwrap(), 1);
+        assert!(!q.contains_height(11));
+        assert!(!q.is_resolve_complete(11));
+        assert!(q.contains_height(10));
+        assert!(q.contains_height(12));
+        assert_eq!(q.id_for_height(10), Some(1));
+        assert_eq!(q.id_for_height(12), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -31,6 +31,8 @@ pub struct InFlightLayer {
     /// Inclusive create-fk span (drain + fence prune).
     fk_lo: Option<u64>,
     fk_hi: Option<u64>,
+    /// Occupancy bytes computed at build (no per-pack script walk).
+    approx_bytes: u64,
 }
 
 impl InFlightLayer {
@@ -48,12 +50,14 @@ impl InFlightLayer {
                 fk_hi = Some(fk_hi.map_or(id, |h| h.max(id)));
             }
         }
+        let approx_bytes = layer_approx_bytes(&creates, &outs);
         Self {
             creates,
             outs,
             max_height: None,
             fk_lo,
             fk_hi,
+            approx_bytes,
         }
     }
 
@@ -79,12 +83,15 @@ impl InFlightLayer {
                 fk_hi = Some(fk_hi.map_or(id, |h| h.max(id)));
             }
         }
+        let outs = U64Map::default();
+        let approx_bytes = layer_approx_bytes(&creates, &outs);
         Self {
             creates,
-            outs: U64Map::default(),
+            outs,
             max_height: None,
             fk_lo,
             fk_hi,
+            approx_bytes,
         }
     }
 
@@ -103,6 +110,14 @@ impl InFlightLayer {
     pub fn outs_len(&self) -> usize {
         self.outs.len()
     }
+}
+
+fn layer_approx_bytes(creates: &HashMap<[u8; 32], Fk>, outs: &U64Map<CreatePin>) -> u64 {
+    let mut bytes = (creates.len().saturating_add(outs.len()) as u64).saturating_mul(40);
+    for pin in outs.values() {
+        bytes = bytes.saturating_add(crate::archive::create_pin_approx_bytes(pin) as u64);
+    }
+    bytes
 }
 
 /// Plan-owned append-only log of immutable layers.
@@ -196,13 +211,7 @@ impl InFlightLog {
         let mut bytes = 0u64;
         for layer in &self.layers {
             entries = entries.saturating_add(layer.outs.len());
-            for pin in layer.outs.values() {
-                bytes = bytes.saturating_add(crate::archive::create_pin_approx_bytes(pin) as u64);
-            }
-            // HashMap overhead (rough): ~32 B / entry for creates + outs keys.
-            bytes = bytes.saturating_add(
-                (layer.outs.len().saturating_add(layer.creates.len()) as u64).saturating_mul(40),
-            );
+            bytes = bytes.saturating_add(layer.approx_bytes);
         }
         (self.layers.len(), entries, bytes)
     }
@@ -310,6 +319,12 @@ mod tests {
         assert_eq!(s.inflight_pins, 2);
         assert_eq!(s.pstore_weak, 10);
         assert_eq!(s.pstore_live, 2);
+        let again = log.size_snapshot();
+        assert_eq!(
+            (layers, entries, bytes),
+            again,
+            "size_snapshot must reuse layer-cached bytes (no per-pack pin walk)"
+        );
     }
 
     #[test]

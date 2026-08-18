@@ -171,6 +171,17 @@ impl LiveUnion {
         self.head = splice_queued(self.head.take(), queued);
     }
 
+    /// Keep layers that still overlap the BQ **or** whose `hi` is inside
+    /// `tip − horizon` (RecentCreates window). Identity only.
+    pub fn keep_queued_or_horizon(
+        &mut self,
+        queued: &std::collections::BTreeSet<u32>,
+        tip: u32,
+        horizon: u32,
+    ) {
+        self.head = splice_queued_or_horizon(self.head.take(), queued, tip, horizon);
+    }
+
     /// Prepend one layer covering `lo..=hi` (inclusive).
     pub fn note_span(&mut self, lo: u32, hi: u32, hits: &IdMap) {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
@@ -256,9 +267,31 @@ fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option
     new_head
 }
 
+fn layer_in_horizon(hi: u32, tip: u32, horizon: u32) -> bool {
+    horizon > 0 && tip.saturating_sub(hi) < horizon
+}
+
+fn splice_queued_or_horizon(
+    head: Option<Arc<IdLayer>>,
+    queued: &std::collections::BTreeSet<u32>,
+    tip: u32,
+    horizon: u32,
+) -> Option<Arc<IdLayer>> {
+    splice_queued_pred(head, |lo, hi| {
+        span_overlaps_queued(lo, hi, queued) || layer_in_horizon(hi, tip, horizon)
+    })
+}
+
 fn splice_queued(
     head: Option<Arc<IdLayer>>,
     queued: &std::collections::BTreeSet<u32>,
+) -> Option<Arc<IdLayer>> {
+    splice_queued_pred(head, |lo, hi| span_overlaps_queued(lo, hi, queued))
+}
+
+fn splice_queued_pred(
+    head: Option<Arc<IdLayer>>,
+    keep_span: impl Fn(u32, u32) -> bool,
 ) -> Option<Arc<IdLayer>> {
     let mut nodes = Vec::new();
     let mut cur = head;
@@ -269,7 +302,7 @@ fn splice_queued(
     }
     let mut new_head: Option<Arc<IdLayer>> = None;
     for n in nodes.into_iter().rev() {
-        if !span_overlaps_queued(n.lo, n.hi, queued) {
+        if !keep_span(n.lo, n.hi) {
             continue;
         }
         let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
@@ -440,6 +473,28 @@ mod tests {
         assert!(span_overlaps_queued(0, 1079, &q));
         assert!(!span_overlaps_queued(0, 499, &q));
         assert!(!span_overlaps_queued(501, 1079, &q));
+    }
+
+    #[test]
+    fn keep_queued_or_horizon_holds_after_bq_drop() {
+        let published = PublishedIds::new();
+        let mut live = LiveUnion::new();
+        live.note_span(10, 12, &hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.publish(&published);
+        let empty = std::collections::BTreeSet::new();
+        live.keep_queued_or_horizon(&empty, 20, 16);
+        live.publish(&published);
+        assert_eq!(
+            published.get(&tid(1)),
+            Some((Fk(10), (1, 2))),
+            "layer hi=12 must stay while tip-hi < horizon"
+        );
+        live.keep_queued_or_horizon(&empty, 40, 16);
+        live.publish(&published);
+        assert!(
+            published.get(&tid(1)).is_none(),
+            "layer must drop once tip-hi >= horizon and BQ empty"
+        );
     }
 
     #[test]

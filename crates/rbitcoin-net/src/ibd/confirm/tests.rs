@@ -855,6 +855,13 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     assert!(super::pack_stop_after(0, 144, 8000, 144));
     assert!(super::pack_stop_after(8001, 1, 8000, 144));
     assert!(!super::pack_stop_after(8000, 1, 8000, 144));
+    assert!(super::pack_empty_waits_for_lookup(0, 0));
+    assert!(!super::pack_empty_waits_for_lookup(1, 0));
+    assert!(!super::pack_empty_waits_for_lookup(0, 1));
+    let expect =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+    assert!(super::pack_stored_hash_ok(&expect.to_byte_array(), &expect));
+    assert!(!super::pack_stored_hash_ok(&[0u8; 32], &expect));
     assert_eq!(
         super::confirm_batch_max_inputs(),
         super::CONFIRM_BATCH_INPUTS_DEFAULT

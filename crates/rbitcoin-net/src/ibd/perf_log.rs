@@ -19,7 +19,8 @@
 //! (pin+assemble) → **scripts** → **write** (sole Class A append + Class C / spends / tip).
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
-//! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`)
+//! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`
+//!   with nested `decode=` / `precompute=` / `collect=`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
 //!   clone, and post-scriptq prune (`load_thr pack/stamp/pin/asm/prune`).
@@ -320,6 +321,10 @@ pub(crate) struct IbdPerfSample {
     pub plan_collect_ms: u64,
     pub plan_head_ms: u64,
     pub plan_cold_io_ms: u64,
+    /// Lookup-wave `consensus_decode` (`decode=`).
+    pub lookup_decode_ms: u64,
+    /// Lookup-wave `TxPrecompute::from_tx` (`precompute=`).
+    pub lookup_precompute_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
     pub plan_cold: u64,
@@ -567,6 +572,8 @@ impl Default for IbdPerfSample {
             plan_collect_ms: 0,
             plan_head_ms: 0,
             plan_cold_io_ms: 0,
+            lookup_decode_ms: 0,
+            lookup_precompute_ms: 0,
             plan_parents: 0,
             plan_already: 0,
             plan_cold: 0,
@@ -999,6 +1006,8 @@ pub(crate) fn sample(
         plan_collect_ms: ns_ms(dens.collect_ns),
         plan_head_ms: ns_ms(dens.head_ns),
         plan_cold_io_ms: ns_ms(dens.cold_io_ns),
+        lookup_decode_ms: ns_ms(dens.decode_ns),
+        lookup_precompute_ms: ns_ms(dens.precompute_ns),
         plan_parents: dens.parents,
         plan_already: dens.already,
         plan_cold: dens.cold,
@@ -1159,7 +1168,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms keep={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms) keep={}ms other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1173,6 +1182,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         thr_lookup_busy,
         s.thr_lookup_claim_ms,
         s.thr_lookup_stamp_ms,
+        s.lookup_decode_ms,
+        s.lookup_precompute_ms,
+        s.plan_collect_ms,
         s.thr_lookup_keep_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
@@ -1245,13 +1257,15 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
             s.plan_cold,
             s.plan_same_batch,
             s.plan_collect_ms,
+            s.lookup_decode_ms,
+            s.lookup_precompute_ms,
             s.plan_head_ms,
             s.plan_cold_io_ms,
         ));
@@ -2150,6 +2164,8 @@ mod tests {
         s.plan_cold = 20;
         s.plan_same_batch = 5;
         s.plan_collect_ms = 3;
+        s.lookup_decode_ms = 40;
+        s.lookup_precompute_ms = 30;
         s.plan_head_ms = 4;
         s.plan_cold_io_ms = 5;
         s.stamp_struct_ms = 1;
@@ -2224,6 +2240,13 @@ mod tests {
         assert!(info.contains("recent_ms=3"), "{info}");
         assert!(info.contains("head_loc(cdf0=10"), "{info}");
         assert!(info.contains("lookup_sub(blks=4"), "{info}");
+        assert!(info.contains("decode=40ms"), "{info}");
+        assert!(info.contains("precompute=30ms"), "{info}");
+        assert!(info.contains("collect=3ms"), "{info}");
+        assert!(
+            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms)"),
+            "{info}"
+        );
         let dbg = format_debug(&s);
         assert!(dbg.contains("plan_batch "), "{dbg}");
         assert!(dbg.contains("pin_txid=15/25"), "{dbg}");

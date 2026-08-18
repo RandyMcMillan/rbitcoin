@@ -68,7 +68,7 @@ pub use scripts::{
 };
 pub use write::confirm_write_phase;
 #[cfg(test)]
-use write::write_height_needed;
+use write::{recent_create_height_slices, write_height_needed};
 
 /// Pure-write annotate backend from global `RBITCOIN_IO`.
 #[inline]

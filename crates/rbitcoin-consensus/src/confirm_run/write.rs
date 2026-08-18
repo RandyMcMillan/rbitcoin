@@ -10,6 +10,35 @@ pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     }
 }
 
+/// Per-height ranges over a write batch's `planned_fks` / pins.
+///
+/// One RecentCreates fifo row per prepared height. A leftover tail (count
+/// mismatch) is tagged with the last height so no create is dropped.
+pub(super) fn recent_create_height_slices(
+    prepared: &[(u32, usize)],
+    total: usize,
+) -> Vec<(u32, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for &(h, n) in prepared {
+        if off >= total {
+            break;
+        }
+        if off.saturating_add(n) > total {
+            break;
+        }
+        if n > 0 {
+            out.push((h, off..off + n));
+        }
+        off = off.saturating_add(n);
+    }
+    if off < total {
+        let height = prepared.last().map(|(h, _)| *h).unwrap_or(0);
+        out.push((height, off..total));
+    }
+    out
+}
+
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
 /// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
 ///
@@ -85,14 +114,23 @@ pub fn confirm_write_phase(
                     &pins,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
-                let height = batch.prepared.last().map(|p| p.height.0).unwrap_or(0);
-                let creates = planned_fks
-                    .iter()
-                    .zip(pins.iter())
-                    .map(|(fk, pin)| (pin.0.txid, *fk));
-                query
-                    .publish_recent_creates(height, creates)
-                    .map_err(ConsensusError::from)?;
+                let slices = recent_create_height_slices(
+                    &batch
+                        .prepared
+                        .iter()
+                        .map(|p| (p.height.0, p.tx_fks.len()))
+                        .collect::<Vec<_>>(),
+                    planned_fks.len(),
+                );
+                for (height, range) in slices {
+                    let creates = planned_fks[range.clone()]
+                        .iter()
+                        .zip(pins[range].iter())
+                        .map(|(fk, pin)| (pin.0.txid, *fk));
+                    query
+                        .publish_recent_creates(height, creates)
+                        .map_err(ConsensusError::from)?;
+                }
             }
         }
     }

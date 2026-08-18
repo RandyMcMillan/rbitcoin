@@ -1,6 +1,24 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
-use super::write_height_needed;
+use super::{recent_create_height_slices, write_height_needed};
+
+#[test]
+fn recent_create_height_slices_two_heights_and_remainder() {
+    assert_eq!(
+        recent_create_height_slices(&[(10, 2), (11, 3)], 5),
+        vec![(10, 0..2), (11, 2..5)]
+    );
+    assert_eq!(
+        recent_create_height_slices(&[(10, 2), (11, 3)], 7),
+        vec![(10, 0..2), (11, 2..5), (11, 5..7)],
+        "tail past prepared counts tags the last height"
+    );
+    assert!(recent_create_height_slices(&[(10, 2)], 0).is_empty());
+    assert_eq!(
+        recent_create_height_slices(&[(10, 0), (11, 4)], 4),
+        vec![(11, 0..4)]
+    );
+}
 
 /// Batch append: contiguous heights merge; gap returns Err(other).
 #[test]

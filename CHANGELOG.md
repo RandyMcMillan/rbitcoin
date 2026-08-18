@@ -20,6 +20,10 @@ before 1.0).
 
 ### Changed
 
+- **IBD write sample nest:** `IbdPerfSample.write` is a `WriteStageSample`
+  of the eight inventory tokens (`class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc`).
+  `write=` still equals `write_stage_ms`. INFO/DEBUG token strings unchanged.
+
 - **Stamp identity union:** load/plan stamp no longer accepts a BQ-ahead
   hits map. Facts come from in-flight → published `live_union` → TipOnly.
   Deleted `BqParentHits` and `confirm_wire_lookup_stamp_with_hits`.

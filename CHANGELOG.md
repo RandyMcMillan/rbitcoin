@@ -20,6 +20,15 @@ before 1.0).
 
 ### Changed
 
+- **Core functional field leftovers.** Official `rpc_net.py` stays
+  skip: dual-connect `getconnectioncount` now counts inbound+outbound
+  PeerHub sessions; `getpeerinfo` emits `last_block` /
+  `last_transaction` / `minfeefilter`; `addnode` is `manual`; nodes
+  send/record BIP133 `feefilter`; `getblockchaininfo` has tip `time`
+  and `mediantime`. First remaining official fail is pre-version
+  `getpeerinfo` (`rpc_net.py:138` — v1 magic / v2 `wait_for_new_peer`).
+  Inventory still **33 run**. Q-41 table matches 33/267.
+
 - **IBD write sample nest:** `IbdPerfSample.write` is a `WriteStageSample`
   of the eight inventory tokens (`class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc`).
   `write=` still equals `write_stage_ms`. INFO/DEBUG token strings unchanged.

@@ -39,6 +39,31 @@ pub(super) fn recent_create_height_slices(
     out
 }
 
+/// Pair idx ranges back to per-height RecentCreates rows (skip missing idx).
+pub(super) fn recent_create_rows_for_slices(
+    slices: &[(u32, std::ops::Range<usize>)],
+    txid_fks: &[([u8; 32], rbitcoin_primitives::Fk)],
+    ranges: &[Option<(u64, u64)>],
+) -> Vec<(u32, Vec<([u8; 32], rbitcoin_primitives::Fk, (u64, u64))>)> {
+    let mut out = Vec::new();
+    for (height, range) in slices {
+        let mut rows = Vec::new();
+        for i in range.clone() {
+            let Some((txid, fk)) = txid_fks.get(i) else {
+                break;
+            };
+            let Some(body) = ranges.get(i).copied().flatten() else {
+                continue;
+            };
+            rows.push((*txid, *fk, body));
+        }
+        if !rows.is_empty() {
+            out.push((*height, rows));
+        }
+    }
+    out
+}
+
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
 /// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
 ///
@@ -123,20 +148,36 @@ pub fn confirm_write_phase(
                     planned_fks.len(),
                 );
                 let t_recent = Instant::now();
-                for (height, range) in slices {
-                    let creates = planned_fks[range.clone()]
-                        .iter()
-                        .zip(pins[range].iter())
-                        .map(|(fk, pin)| (pin.0.txid, *fk));
-                    query
-                        .note_recent_creates_defer(height, creates)
-                        .map_err(ConsensusError::from)?;
+                let txid_fks: Vec<([u8; 32], rbitcoin_primitives::Fk)> = planned_fks
+                    .iter()
+                    .zip(pins.iter())
+                    .map(|(fk, pin)| (pin.0.txid, *fk))
+                    .collect();
+                let fks: Vec<rbitcoin_primitives::Fk> =
+                    txid_fks.iter().map(|(_, fk)| *fk).collect();
+                let t_idx = Instant::now();
+                let ranges = query
+                    .store()
+                    .tx_body_range_batch(&fks)
+                    .map_err(ConsensusError::from)?;
+                let idx_ns = t_idx.elapsed().as_nanos() as u64;
+                for (height, rows) in recent_create_rows_for_slices(&slices, &txid_fks, &ranges) {
+                    query.note_recent_creates_rows(height, rows);
                 }
                 if let Some(last) = batch.prepared.last() {
                     query.expire_recent_creates_defer(last.height.0);
                 }
+                let t_clone = Instant::now();
                 query.flush_recent_creates();
+                let clone_ns = t_clone.elapsed().as_nanos() as u64;
                 let recent_ns = t_recent.elapsed().as_nanos() as u64;
+                if idx_ns > 0 {
+                    confirm_phase_stats::WRITE_RECENT_IDX_NS.fetch_add(idx_ns, Ordering::Relaxed);
+                }
+                if clone_ns > 0 {
+                    confirm_phase_stats::WRITE_RECENT_CLONE_NS
+                        .fetch_add(clone_ns, Ordering::Relaxed);
+                }
                 if recent_ns > 0 {
                     confirm_phase_stats::WRITE_RECENT_NS.fetch_add(recent_ns, Ordering::Relaxed);
                 }
@@ -179,11 +220,18 @@ pub fn confirm_write_phase(
 
             let n_blocks = batch.prepared.len();
             let cc0 = confirm_phase_stats::CLASS_C_NS.load(Ordering::Relaxed);
+            let t_cc = Instant::now();
             let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
+            let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
             // Tables only (strong+tip), matching CLASS_C_NS — not join wall / SH.
             let class_c_ns = confirm_phase_stats::CLASS_C_NS
                 .load(Ordering::Relaxed)
                 .saturating_sub(cc0);
+            let class_c_join_ns = class_c_wall_ns.saturating_sub(class_c_ns);
+            if class_c_join_ns > 0 {
+                confirm_phase_stats::WRITE_CLASS_C_JOIN_NS
+                    .fetch_add(class_c_join_ns, Ordering::Relaxed);
+            }
 
             let (spend_ann_ns, tip_gc_ns) =
                 post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;

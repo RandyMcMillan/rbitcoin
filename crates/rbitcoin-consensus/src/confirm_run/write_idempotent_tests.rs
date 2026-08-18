@@ -1,6 +1,6 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
-use super::{recent_create_height_slices, write_height_needed};
+use super::{recent_create_height_slices, recent_create_rows_for_slices, write_height_needed};
 
 #[test]
 fn recent_create_height_slices_two_heights_and_remainder() {
@@ -18,6 +18,29 @@ fn recent_create_height_slices_two_heights_and_remainder() {
         recent_create_height_slices(&[(10, 0), (11, 4)], 4),
         vec![(11, 0..4)]
     );
+}
+
+#[test]
+fn recent_create_rows_skip_missing_idx_keep_heights() {
+    let tid = |b| {
+        let mut t = [0u8; 32];
+        t[0] = b;
+        t
+    };
+    let slices = recent_create_height_slices(&[(10, 2), (11, 2)], 4);
+    let pairs = [
+        (tid(1), rbitcoin_primitives::Fk(1)),
+        (tid(2), rbitcoin_primitives::Fk(2)),
+        (tid(3), rbitcoin_primitives::Fk(3)),
+        (tid(4), rbitcoin_primitives::Fk(4)),
+    ];
+    let ranges = [Some((1, 8)), None, Some((9, 8)), Some((17, 8))];
+    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(rows[0].1.len(), 1, "missing idx at height 10 dropped");
+    assert_eq!(rows[1].0, 11);
+    assert_eq!(rows[1].1.len(), 2);
 }
 
 /// Batch append: contiguous heights merge; gap returns Err(other).

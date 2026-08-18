@@ -81,6 +81,9 @@ pub(crate) struct WriteStageSample {
     /// RecentCreates note+expire+one snapshot (`recent_pub=`)
     pub recent_pub_ms: u64,
     pub recent_pub_ns: u64,
+    /// `class_c_commit` join/flush minus tables (`class_c_join=`)
+    pub class_c_join_ms: u64,
+    pub class_c_join_ns: u64,
     /// Residual `head_insert_queued` join after Class C (`drain_join=`)
     pub drain_join_ms: u64,
     pub drain_join_ns: u64,
@@ -101,6 +104,7 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
             .saturating_add(self.recent_pub_ms)
+            .saturating_add(self.class_c_join_ms)
             .saturating_add(self.drain_join_ms)
             .saturating_add(self.dequeue_ms)
     }
@@ -116,6 +120,7 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
             .saturating_add(self.recent_pub_ns)
+            .saturating_add(self.class_c_join_ns)
             .saturating_add(self.drain_join_ns)
             .saturating_add(self.dequeue_ns)
     }
@@ -160,6 +165,9 @@ pub(crate) struct IbdPerfSample {
     /// Ensure mix: residency/pin hits vs cold denserels body loads.
     pub ensure_res_hit: u64,
     pub ensure_cold_n: u64,
+    /// RecentCreates idx vs snapshot clone (`recent_idx=` / `recent_clone=`).
+    pub recent_idx_ms: u64,
+    pub recent_clone_ms: u64,
     /// Assemble subtimers (ms; sum ≈ connect/assemble).
     pub asm_prevout_ms: u64,
     pub asm_sigop_ms: u64,
@@ -463,6 +471,8 @@ impl Default for IbdPerfSample {
             write: WriteStageSample::default(),
             ensure_res_hit: 0,
             ensure_cold_n: 0,
+            recent_idx_ms: 0,
+            recent_clone_ms: 0,
             asm_prevout_ms: 0,
             asm_sigop_ms: 0,
             asm_final_ms: 0,
@@ -818,8 +828,11 @@ pub(crate) fn sample(
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
     let recent_pub_ns = rbitcoin_consensus::confirm_phase_stats::sample_write_recent_and_reset();
+    let (recent_idx_ns, recent_clone_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_write_recent_parts_and_reset();
     let (drain_join_ns, dequeue_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
+    let class_c_join_ns = rbitcoin_consensus::confirm_phase_stats::sample_class_c_join_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
@@ -903,6 +916,8 @@ pub(crate) fn sample(
             cache_tip_ns,
             recent_pub_ms: ns_ms(recent_pub_ns),
             recent_pub_ns,
+            class_c_join_ms: ns_ms(class_c_join_ns),
+            class_c_join_ns,
             drain_join_ms: ns_ms(drain_join_ns),
             drain_join_ns,
             dequeue_ms: ns_ms(dequeue_ns),
@@ -910,6 +925,8 @@ pub(crate) fn sample(
         },
         ensure_res_hit,
         ensure_cold_n,
+        recent_idx_ms: ns_ms(recent_idx_ns),
+        recent_clone_ms: ns_ms(recent_clone_ns),
         asm_prevout_ms: ns_ms(asm_prevout_ns),
         asm_sigop_ms: ns_ms(asm_sigop_ns),
         asm_final_ms: ns_ms(asm_final_ns),
@@ -1446,7 +1463,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms \
+         class_c={}ms class_c_join={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms(idx={} clone={}) \
          drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
@@ -1463,11 +1480,14 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.spent_cold_ms,
         s.spent_pending_ms,
         s.write.class_c_ms,
+        s.write.class_c_join_ms,
         s.write.sh_ms,
         s.write.utxo_ms,
         s.write.tweak_ms,
         s.write.cache_tip_ms,
         s.write.recent_pub_ms,
+        s.recent_idx_ms,
+        s.recent_clone_ms,
         s.write.drain_join_ms,
         s.write.dequeue_ms,
         s.thr_write_work_ms.saturating_sub(write_stage_ms(s)),
@@ -1945,7 +1965,8 @@ mod tests {
         assert!(line.contains("tweaks=64ms"), "{line}");
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
-        assert!(line.contains("recent_pub=0ms"), "{line}");
+        assert!(line.contains("recent_pub=0ms(idx=0 clone=0)"), "{line}");
+        assert!(line.contains("class_c_join=0ms"), "{line}");
         assert!(line.contains("drain_join=0ms"), "{line}");
         assert!(line.contains("dequeue=0ms"), "{line}");
         assert!(line.contains("other=0ms"), "{line}");

@@ -77,7 +77,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | Rank | ID | Item | Tag | Done looks like |
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: no fuzz crate, no corpus, no job.** |
-| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 37 / 267.** Next: leftover P2P (`p2p_invalid_messages` addrv2 log zoo) and `rpc-missing` / `core-log` that still match claimed node/P2P/miner surface. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
+| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 38 / 267.** Next: Wave E (`mempool_accept` permitbaremultisig + field zoo) and thin P2P leftovers (`p2p_invalid_block` v1, `feature_chain_tiebreaks` missing-parent getdata). Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-50** | Perf meter residual coverage | ops | On a saturated confirm thread, the named `ibd: perf` sub-meters account for (nearly) all busy wall. 2026-08-18 mainnet run: lookup 5.15s busy vs 1.76s metered, write 5.05s vs 2.39s, `stamp_sub batch=` 854ms wall vs ~170ms subs — both perf audits this week spent most of their effort attributing dark time. Done: an explicit residual per stage wall (wall − named subs ≈ 0), same-commit rule as the AGENTS timer inventory |
 | 4 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed. Q-50 adds meters on DEBUG/`tip: perf`, never more INFO |
 | 5 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
@@ -96,7 +96,7 @@ artifacts).
 | ID | Verdict |
 |----|---------|
 | **Q-30** | Keep rank 1. Still the highest correctness hole; zero in-tree fuzz. |
-| **Q-41** | Keep rank 2. 9 → **37** `run` (Waves A–D leftovers + leftover-P2P + follow-up `p2p_compactblocks_blocksonly` + `p2p_blocksonly`). 230 skips remain; `rpc-missing` + `core-log` are the only growth matching claimed surface. |
+| **Q-41** | Keep rank 2. 9 → **38** `run` (Waves A–D leftovers + leftover-P2P + follow-up + `p2p_getdata`). 229 skips remain; `rpc-missing` + `core-log` are the only growth matching claimed surface. |
 | **Q-50** | **New, rank 3.** Confirm perf program (#117–#126) raised IBD 3.9 → 6.4 blk/s, but both remaining saturated threads are >50% unmetered — every reaudit re-derives the same dark time. Cheapest leverage on the active program. |
 | **Q-36** | Keep. IBD/tip INFO is still a firehose; perf lines are ~2.5 KB each. |
 | **Q-49** | **Closed.** `x809` DNS + `P2P_V2` gossip + skip known-v1 while better addrs remain. |
@@ -157,7 +157,7 @@ findings 001–021, CI split, map-free README, …) live in
 | **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
 | **—** | Docs map + one owner per fact | `docs/README.md`; folded store-format / startup-states / future-features / COVERAGE (`#81`) |
 | **—** | Tests assert behavior, not repo text | No `include_str!` of production `.rs` / CONTRIBUTING (`#85`) |
-| **—** | Core functional `run` set | **37** unmodified v31.1 scripts (was 9). Remaining growth is **Q-41** |
+| **—** | Core functional `run` set | **38** unmodified v31.1 scripts (was 9). Remaining growth is **Q-41** |
 | **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
 | **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
 | **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; `musl.yml` after green master `ci` |

@@ -34,6 +34,8 @@ pub struct RpcConfig {
     pub subversion: Option<String>,
     /// Core `-rpcworkqueue`. `None` = unlimited (tests / default).
     pub work_queue: Option<usize>,
+    /// Core `-permitbaremultisig` (default true).
+    pub permit_bare_multisig: bool,
 }
 
 /// Live RPC server handle.
@@ -103,6 +105,7 @@ pub async fn run_rpc(
         chain,
         logpath: config.datadir.join("debug.log").display().to_string(),
         active: std::sync::Mutex::new(Vec::new()),
+        permit_bare_multisig: config.permit_bare_multisig,
     });
 
     let listener = TcpListener::bind(config.listen)
@@ -498,6 +501,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            permit_bare_multisig: true,
         };
         let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -619,6 +623,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            permit_bare_multisig: true,
         };
         let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -700,6 +705,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: Some(1),
+            permit_bare_multisig: true,
         };
         let handle = run_rpc(cfg, q, Some(mp), None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;

@@ -4828,6 +4828,107 @@ mod tests {
         });
     }
 
+    /// `p2p_getdata.py`: GETDATA inv type 0 must not stall the session;
+    /// a later MSG_BLOCK getdata of the tip still serves.
+    #[test]
+    fn invalid_getdata_type0_still_serves_tip_block() {
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::{Network, ScriptBuf};
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("gd-type0");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("one block");
+            let tip = hub.tip_hash().expect("tip");
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 0u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::Unknown {
+                    inv_type: 0,
+                    hash: [0u8; 32],
+                }])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ban, 0, "type-0 getdata must not disconnect");
+            assert!(
+                out_rx.try_recv().is_err(),
+                "type-0 getdata must not emit a reply"
+            );
+
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::Block(tip)])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().expect("tip getdata must serve") {
+                NetworkMessage::Block(b) => assert_eq!(b.block_hash(), tip),
+                other => panic!("expected tip Block, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
     /// Compact helpers with a live mempool hub attached (fill/missing/blocktxn).
     #[test]
     fn cmpct_helpers_with_mempool_live_and_blocktxn() {

@@ -6,13 +6,16 @@
 
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::ptr::null_mut;
 
 pub(crate) struct IocpEngine {
     port: *mut core::ffi::c_void,
     ready: VecDeque<(u64, i32)>,
+    /// Handles this port already bound. Recycled HANDLE values after close
+    /// are new objects — `CreateIoCompletionPort` succeeds and we re-insert.
+    associated: HashSet<isize>,
 }
 
 // IOCP handle is used only from the machine thread (same as uring TLS).
@@ -75,22 +78,34 @@ impl IocpEngine {
         Ok(Self {
             port,
             ready: VecDeque::new(),
+            associated: HashSet::new(),
         })
     }
 
-    fn associate(&self, handle: IoHandle) -> Result<(), StoreError> {
-        let h = handle.as_raw_handle() as *mut core::ffi::c_void;
+    fn associate(&mut self, handle: IoHandle) -> Result<(), StoreError> {
+        let raw = handle.as_raw_handle();
+        if self.associated.contains(&raw) {
+            return Ok(());
+        }
+        let h = raw as *mut core::ffi::c_void;
         let p = unsafe { CreateIoCompletionPort(h, self.port, 0, 0) };
         if p.is_null() {
-            // Already associated is often ERROR_INVALID_PARAMETER; ignore if port matches.
+            // 87 = already bound to some port, or not FILE_FLAG_OVERLAPPED.
+            // We only skip the syscall for handles *this* port bound. An
+            // untracked 87 is a hard error (non-overlapped or another port).
             let err = unsafe { GetLastError() };
-            if err != 0 && err != 87 {
-                return Err(StoreError::io(
-                    Path::new("iocp"),
-                    std::io::Error::from_raw_os_error(err as i32),
-                ));
-            }
+            return Err(StoreError::io(
+                Path::new("iocp"),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "CreateIoCompletionPort associate failed (os error {err}); \
+                         file handle must be opened with FILE_FLAG_OVERLAPPED"
+                    ),
+                ),
+            ));
         }
+        self.associated.insert(raw);
         Ok(())
     }
 
@@ -222,5 +237,70 @@ impl Drop for IocpEngine {
             }
             self.port = null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rbitcoin-iocp-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn open_overlapped(path: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(path)
+            .expect("overlapped tmp")
+    }
+
+    #[test]
+    fn associate_twice_same_port_ok() {
+        let path = tmp("twice");
+        let f = open_overlapped(&path);
+        let h = IoHandle::from_file(&f);
+        assert!(h.pwrite(0, b"ab") > 0);
+        let mut eng = IocpEngine::open(8).unwrap();
+        eng.associate(h).unwrap();
+        eng.associate(h).unwrap();
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn associate_non_overlapped_is_error() {
+        let path = tmp("sync");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("sync tmp");
+        let h = IoHandle::from_file(&f);
+        let mut eng = IocpEngine::open(8).unwrap();
+        let err = eng.associate(h).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("FILE_FLAG_OVERLAPPED"),
+            "expected overlapped hint, got {s}"
+        );
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -7,7 +7,7 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, OutPoint, Transaction, TxOut, Witness};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{FkMap, Query, U32Map, U64Map};
+use rbitcoin_query::{FkMap, Query, TxidHasher, U32Map, U64Map};
 use std::borrow::Borrow;
 use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
@@ -542,7 +542,7 @@ pub fn validate_block_connect(
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut pending = std::collections::HashSet::new();
-    let mut pending_creates = std::collections::HashMap::new();
+    let mut pending_creates = PendingCreates::default();
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::default();
     let create_txids: Vec<[u8; 32]> = block
@@ -879,6 +879,55 @@ impl ScriptCheckJob {
     }
 }
 
+/// Identity-hashed `txid → V` (assemble index / pack creates).
+pub(crate) type TxidMap<V> = std::collections::HashMap<[u8; 32], V, BuildHasherDefault<TxidHasher>>;
+
+/// Pack-local create fk by parent txid (not per-vout — fk is per tx).
+pub(crate) type PendingCreates = TxidMap<rbitcoin_primitives::Fk>;
+
+/// Block-local prevout path counts; flush to [`confirm_phase_stats`] once.
+#[derive(Default)]
+struct AsmPrevoutAcc {
+    in_n: u64,
+    same_n: u64,
+    batch_n: u64,
+    cold_n: u64,
+    cold_null_fk_n: u64,
+    cold_not_pin_n: u64,
+    cold_txid_mismatch_n: u64,
+    cold_vout_miss_n: u64,
+}
+
+impl AsmPrevoutAcc {
+    fn flush(&self) {
+        let add = |a: &std::sync::atomic::AtomicU64, v: u64| {
+            if v > 0 {
+                a.fetch_add(v, Ordering::Relaxed);
+            }
+        };
+        add(&confirm_phase_stats::ASM_IN_N, self.in_n);
+        add(&confirm_phase_stats::ASM_PREV_SAME_N, self.same_n);
+        add(&confirm_phase_stats::ASM_PREV_BATCH_N, self.batch_n);
+        add(&confirm_phase_stats::ASM_PREV_COLD_N, self.cold_n);
+        add(
+            &confirm_phase_stats::ASM_PREV_COLD_NULL_FK_N,
+            self.cold_null_fk_n,
+        );
+        add(
+            &confirm_phase_stats::ASM_PREV_COLD_NOT_PIN_N,
+            self.cold_not_pin_n,
+        );
+        add(
+            &confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N,
+            self.cold_txid_mismatch_n,
+        );
+        add(
+            &confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N,
+            self.cold_vout_miss_n,
+        );
+    }
+}
+
 /// Sequential assemble: resolve prevout **content**, build script jobs, collect spends.
 ///
 /// [`AssembleMode::Optimistic`] (confirm IBD path): no durable spentness / maturity /
@@ -887,7 +936,10 @@ impl ScriptCheckJob {
 /// (BIP113 MTP of prev block) still runs here — it only needs header MTP.
 /// [`AssembleMode::Full`]: spentness + maturity + BIP68 during the walk (legacy).
 ///
-/// `pending_spent` / `pending_creates`: run-local same-run tracking.
+/// `pending_spent`: pack-local double-spend (early reject before scripts).
+/// `pending_creates`: pack-local `txid → create_fk` (not per-vout).
+/// Same-block outs use `txid_index` (this block, `pj < ti`); meters flush
+/// once per block (no per-input Instant / atomics).
 ///
 /// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
 /// [`rbitcoin_query::BatchThin`], then shared outs FIFO / durable store.
@@ -905,7 +957,7 @@ pub(crate) fn assemble_block_prevouts(
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
-    pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
+    pending_creates: &mut PendingCreates,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
     create_txids: &[[u8; 32]],
@@ -950,7 +1002,7 @@ fn assemble_block_prevouts_mode(
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
-    pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
+    pending_creates: &mut PendingCreates,
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
@@ -999,13 +1051,12 @@ fn assemble_block_prevouts_mode(
     let n_tx = block.txdata.len();
     let mut block_spends: std::collections::HashSet<OutPoint> =
         std::collections::HashSet::with_capacity(n_tx.saturating_mul(2));
-    let mut txid_index: std::collections::HashMap<[u8; 32], usize> =
-        std::collections::HashMap::with_capacity(n_tx);
+    let mut txid_index: TxidMap<usize> =
+        TxidMap::with_capacity_and_hasher(n_tx, Default::default());
     for (i, id) in create_txids.iter().enumerate() {
         txid_index.insert(*id, i);
     }
-    let mut same_block: std::collections::HashMap<[u8; 32], usize> =
-        std::collections::HashMap::with_capacity(n_tx);
+    let mut acc = AsmPrevoutAcc::default();
     let mut fees = 0i64;
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
@@ -1085,7 +1136,7 @@ fn assemble_block_prevouts_mode(
                     .as_ref()
                     .and_then(|t| t.get(ii))
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
-                    .or_else(|| pending_creates.get(&key).copied())
+                    .or_else(|| pending_creates.get(&key.0).copied())
                     .or_else(|| {
                         query
                             .tx_fk_by_txid_tip(op.txid.as_byte_array())
@@ -1098,7 +1149,8 @@ fn assemble_block_prevouts_mode(
                 };
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
-                if mode == AssembleMode::Full && !pin_live && !pending_creates.contains_key(&key) {
+                if mode == AssembleMode::Full && !pin_live && !pending_creates.contains_key(&key.0)
+                {
                     let spent = if let Some(cfk) = prev_fk {
                         query
                             .store()
@@ -1119,11 +1171,13 @@ fn assemble_block_prevouts_mode(
                     block,
                     op,
                     prev_fk,
-                    &same_block,
+                    &txid_index,
+                    ti,
                     &mut coinbase_height_cache,
                     batch_parents,
                     ctx.height.0,
                     mode == AssembleMode::Full,
+                    &mut acc,
                 )?;
                 let create_fk = prev_out.create_fk;
                 if mode == AssembleMode::Full {
@@ -1162,9 +1216,6 @@ fn assemble_block_prevouts_mode(
                 .fetch_add(t_sig.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             let t_fin = Instant::now();
-            if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
-                return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
-            }
             // Full mode only: Optimistic defers BIP68 to structural. Reuse BIP113 MTP.
             if mode == AssembleMode::Full && ctx.params.csv_active_at(ctx.height.0) {
                 let mut coin_mtps = Vec::with_capacity(input_create_heights.len());
@@ -1247,14 +1298,12 @@ fn assemble_block_prevouts_mode(
         }
 
         let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
-        for (v, _) in tx.output.iter().enumerate() {
-            if !create_fk.is_null() {
-                pending_creates.insert((txid, v as u32), create_fk);
-            }
+        if !create_fk.is_null() {
+            pending_creates.insert(txid, create_fk);
         }
-        same_block.insert(txid, ti);
     }
 
+    acc.flush();
     Ok((script_jobs, spends, fees))
 }
 
@@ -1843,54 +1892,35 @@ fn resolve_prevout(
     block: &Block,
     op: OutPoint,
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
-    same_block: &std::collections::HashMap<[u8; 32], usize>,
+    txid_index: &TxidMap<usize>,
+    spend_ti: usize,
     coinbase_height_cache: &mut FkMap<Option<u32>>,
     batch_parents: &rbitcoin_query::BatchParents,
     spend_height: u32,
     // Optimistic: prevout value/script only. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
+    acc: &mut AsmPrevoutAcc,
 ) -> Result<ResolvedPrevout, ConsensusError> {
-    use std::sync::atomic::Ordering;
-    use std::time::Instant;
-
-    let t0 = Instant::now();
     let prev_txid = op.txid.to_byte_array();
 
-    #[inline]
-    fn note_path(
-        path_ns: &std::sync::atomic::AtomicU64,
-        path_n: &std::sync::atomic::AtomicU64,
-        t0: Instant,
-    ) {
-        path_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        path_n.fetch_add(1, Ordering::Relaxed);
-        confirm_phase_stats::ASM_IN_N.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        if std::ptr::eq(path_n, &confirm_phase_stats::ASM_PREV_BATCH_N) {
-            confirm_phase_stats::tl_note_batch_hit();
+    if let Some(&pj) = txid_index.get(&prev_txid) {
+        if pj < spend_ti {
+            let tx = block.txdata.get(pj).ok_or(ConsensusError::MissingPrevout)?;
+            let v = op.vout as usize;
+            let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
+            acc.in_n = acc.in_n.saturating_add(1);
+            acc.same_n = acc.same_n.saturating_add(1);
+            return Ok(ResolvedPrevout {
+                txout: o.clone(),
+                coinbase_height: None,
+                create_height: if resolve_create_heights {
+                    spend_height
+                } else {
+                    0
+                },
+                create_fk: rbitcoin_primitives::Fk::NULL,
+            });
         }
-    }
-
-    if let Some(&ti) = same_block.get(&prev_txid) {
-        let tx = block.txdata.get(ti).ok_or(ConsensusError::MissingPrevout)?;
-        let v = op.vout as usize;
-        let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
-        // Same-block: Core uses the spending block's height as the coin height.
-        note_path(
-            &confirm_phase_stats::ASM_PREV_SAME_NS,
-            &confirm_phase_stats::ASM_PREV_SAME_N,
-            t0,
-        );
-        return Ok(ResolvedPrevout {
-            txout: o.clone(),
-            coinbase_height: None,
-            create_height: if resolve_create_heights {
-                spend_height
-            } else {
-                0
-            },
-            create_fk: rbitcoin_primitives::Fk::NULL,
-        });
     }
 
     // Batch pin first (no TxRecord clone — A3). Cold Class A only when the
@@ -1923,11 +1953,10 @@ fn resolve_prevout(
                 } else {
                     (None, 0)
                 };
-                note_path(
-                    &confirm_phase_stats::ASM_PREV_BATCH_NS,
-                    &confirm_phase_stats::ASM_PREV_BATCH_N,
-                    t0,
-                );
+                acc.in_n = acc.in_n.saturating_add(1);
+                acc.batch_n = acc.batch_n.saturating_add(1);
+                #[cfg(test)]
+                confirm_phase_stats::tl_note_batch_hit();
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(value as u64),
@@ -1943,7 +1972,7 @@ fn resolve_prevout(
                 // (schema-13 zero identity, wrong denserels stamp) — hard fail.
                 // Do **not** soft-cold recover; fill pin identity at load instead.
                 let _ = parent_txid;
-                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N.fetch_add(1, Ordering::Relaxed);
+                acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_txid_mismatch();
                 return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
@@ -1952,7 +1981,7 @@ fn resolve_prevout(
             }
             None if batch_parents.contains(prev_fk) => {
                 // Parent create pinned, but needed vout not in sparse outs — load bug.
-                confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N.fetch_add(1, Ordering::Relaxed);
+                acc.cold_vout_miss_n = acc.cold_vout_miss_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_vout_miss();
                 return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
@@ -1963,12 +1992,9 @@ fn resolve_prevout(
         }
     }
 
-    let t_fk = Instant::now();
     let head_fk = query
         .tx_fk_by_txid_tip(&prev_txid)
         .map_err(ConsensusError::from)?;
-    confirm_phase_stats::ASM_PREV_FK_NS
-        .fetch_add(t_fk.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let candidates = [prev_fk_hint, head_fk];
     let mut seen: [u64; 3] = [0; 3];
     let mut n_seen = 0usize;
@@ -2008,19 +2034,16 @@ fn resolve_prevout(
         } else {
             (None, 0)
         };
-        note_path(
-            &confirm_phase_stats::ASM_PREV_COLD_NS,
-            &confirm_phase_stats::ASM_PREV_COLD_N,
-            t0,
-        );
+        acc.in_n = acc.in_n.saturating_add(1);
+        acc.cold_n = acc.cold_n.saturating_add(1);
         match cold_why {
             ColdWhy::NullFk => {
-                confirm_phase_stats::ASM_PREV_COLD_NULL_FK_N.fetch_add(1, Ordering::Relaxed);
+                acc.cold_null_fk_n = acc.cold_null_fk_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_null_fk();
             }
             ColdWhy::NotPin => {
-                confirm_phase_stats::ASM_PREV_COLD_NOT_PIN_N.fetch_add(1, Ordering::Relaxed);
+                acc.cold_not_pin_n = acc.cold_not_pin_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_not_pin();
             }

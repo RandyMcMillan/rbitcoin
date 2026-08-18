@@ -41,8 +41,9 @@ pub use peers::{
 };
 pub use rbitcoin_mempool::MempoolGraphStats;
 pub use seeds::{
-    default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
-    resolve_fixed_seeds, AddrMan, PeerEntry, PeerFlags,
+    default_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts, pick_seed_results,
+    required_seed_services, resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds,
+    seed_lookup_names, AddrMan, PeerEntry, PeerFlags,
 };
 pub use service::{magic_for, magic_for_params, NetConfig, P2PHandle, P2PNode};
 pub use tx_relay::{

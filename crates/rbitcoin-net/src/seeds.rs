@@ -80,14 +80,57 @@ pub fn resolve_fixed_seeds(network: Network) -> Vec<SocketAddr> {
     out
 }
 
+/// Per listed seed: Core `x<hex>.` filter hostname first, then the bare seed.
+pub fn seed_lookup_names(network: Network) -> Vec<Vec<String>> {
+    let bits = required_seed_services();
+    dns_seeds(network)
+        .iter()
+        .map(|seed| vec![dns_seed_query_host(seed, bits), (*seed).to_string()])
+        .collect()
+}
+
+/// Prefer the x-filter A/AAAA set when it is non-empty; otherwise the unfiltered set.
+pub fn pick_seed_results(x_ips: &[SocketAddr], plain_ips: &[SocketAddr]) -> Vec<SocketAddr> {
+    if !x_ips.is_empty() {
+        x_ips.to_vec()
+    } else {
+        plain_ips.to_vec()
+    }
+}
+
+fn resolve_host_port(host: &str, port: u16) -> Vec<SocketAddr> {
+    let with_port = format!("{host}:{port}");
+    match with_port.to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Resolve DNS seed hostnames to socket addresses using the network default port.
+///
+/// Each seed is queried as `x809.<seed>` first. If that name returns no
+/// addresses, the unfiltered seed name is tried. First success wins per seed
+/// so the same IPs are not injected twice.
 pub fn resolve_dns_seeds(network: Network) -> Vec<SocketAddr> {
     let port = default_port(network);
     let mut out = Vec::new();
-    for host in dns_seeds(network) {
-        let with_port = format!("{host}:{port}");
-        if let Ok(iter) = with_port.to_socket_addrs() {
-            out.extend(iter);
+    for names in seed_lookup_names(network) {
+        let x_ips = names
+            .first()
+            .map(|h| resolve_host_port(h, port))
+            .unwrap_or_default();
+        let plain_ips = if x_ips.is_empty() {
+            names
+                .get(1)
+                .map(|h| resolve_host_port(h, port))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for a in pick_seed_results(&x_ips, &plain_ips) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
         }
     }
     out
@@ -648,6 +691,38 @@ mod tests {
         merged.add(a);
         assert!(merged.flags(&a).is_fast());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_lookup_names_x_filter_before_unfiltered() {
+        let names = seed_lookup_names(Network::Mainnet);
+        assert!(!names.is_empty());
+        assert_eq!(names[0][0], "x809.seed.bitcoin.sipa.be");
+        assert_eq!(names[0][1], "seed.bitcoin.sipa.be");
+        for pair in &names {
+            assert_eq!(pair.len(), 2);
+            assert!(pair[0].starts_with("x809."), "{pair:?}");
+            assert!(!pair[1].starts_with("x809."), "{pair:?}");
+        }
+        let signet = seed_lookup_names(Network::Signet);
+        assert_eq!(
+            signet,
+            vec![vec![
+                "x809.seed.signet.bitcoin.sprovoost.nl".to_string(),
+                "seed.signet.bitcoin.sprovoost.nl".to_string(),
+            ]]
+        );
+        assert!(seed_lookup_names(Network::Regtest).is_empty());
+    }
+
+    #[test]
+    fn pick_seed_results_first_success_wins() {
+        let x = addr(1);
+        let plain = addr(2);
+        assert_eq!(pick_seed_results(&[x], &[plain]), vec![x]);
+        assert_eq!(pick_seed_results(&[], &[plain]), vec![plain]);
+        assert!(pick_seed_results(&[], &[]).is_empty());
+        assert_eq!(pick_seed_results(&[x, addr(3)], &[plain]), vec![x, addr(3)]);
     }
 
     #[test]

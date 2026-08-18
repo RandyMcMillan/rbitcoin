@@ -998,6 +998,7 @@ pub(crate) fn spawn_confirm_engine(
                 let heights_hashes = batch.heights_hashes();
                 match hub_wb.confirm_write(batch) {
                     Ok(_outcomes) => {
+                        let t_deq = Instant::now();
                         for (height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
                             if let Err(e) = hub_wb.query.block_queue_dequeue_height(*height) {
@@ -1018,6 +1019,11 @@ pub(crate) fn spawn_confirm_engine(
                             }
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        let deq_ns = t_deq.elapsed().as_nanos() as u64;
+                        if deq_ns > 0 {
+                            rbitcoin_consensus::confirm_phase_stats::WRITE_DEQUEUE_NS
+                                .fetch_add(deq_ns, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let elapsed = t0.elapsed();
                         confirm_thr_stats::add_write_work(elapsed);
                         if elapsed.as_millis() > 2_000 {

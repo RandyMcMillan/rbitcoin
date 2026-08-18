@@ -20,13 +20,15 @@
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
 //! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`
-//!   with nested `decode=` / `precompute=` / `collect=`)
+//!   with nested `decode=` / `precompute=` / `collect=` / `head=(probe= io= preads=)`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
 //!   clone, and post-scriptq prune (`load_thr pack/stamp/pin/asm/prune`).
 //! - **script=** = `SCRIPT_NS` (verify / skip-loop only). `thr script work`
 //!   is that same ns. Recv/send are wait. Feed-ahead join of N is not script.
-//! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tweaks + tip GC
+//! - **write** = Class A + ensure + structural + class_c + spend + tweaks + tip GC
+//!   + `recent_pub=` / `drain_join=` / `dequeue=`. `other=` is write-thread work
+//!   minus that inventory.
 //!
 //! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
 //! the write thread joins) must add a named token here in the **same commit**.
@@ -47,8 +49,9 @@ use rbitcoin_query::ProcessOwnedSizes;
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
 ///
 /// Inventory: `class_a` + `ensure` + `struct` + `class_c` + `sh` + `spend`
-/// + `tweaks` + `tip_gc`. Subtimers (spent_sub, ann, class_a_sub) stay on
-/// the outer sample until a later nest.
+/// + `tweaks` + `tip_gc` + `recent_pub` + `drain_join` + `dequeue`.
+/// `other=` is write-thread work minus this inventory. Subtimers (spent_sub,
+/// ann, class_a_sub) stay on the outer sample until a later nest.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WriteStageSample {
     /// `archive_commit_plan`
@@ -75,6 +78,15 @@ pub(crate) struct WriteStageSample {
     /// `advance_parent_cache_tip` (`tip_gc=`)
     pub cache_tip_ms: u64,
     pub cache_tip_ns: u64,
+    /// RecentCreates note+expire+one snapshot (`recent_pub=`)
+    pub recent_pub_ms: u64,
+    pub recent_pub_ns: u64,
+    /// Residual `head_insert_queued` join after Class C (`drain_join=`)
+    pub drain_join_ms: u64,
+    pub drain_join_ns: u64,
+    /// Body-queue dequeue after confirm (`dequeue=`)
+    pub dequeue_ms: u64,
+    pub dequeue_ns: u64,
 }
 
 impl WriteStageSample {
@@ -88,6 +100,9 @@ impl WriteStageSample {
             .saturating_add(self.utxo_ms)
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
+            .saturating_add(self.recent_pub_ms)
+            .saturating_add(self.drain_join_ms)
+            .saturating_add(self.dequeue_ms)
     }
 
     /// Same inventory in nanoseconds (`format_debug` us/blk write=).
@@ -100,6 +115,9 @@ impl WriteStageSample {
             .saturating_add(self.utxo_apply_ns)
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
+            .saturating_add(self.recent_pub_ns)
+            .saturating_add(self.drain_join_ns)
+            .saturating_add(self.dequeue_ns)
     }
 }
 
@@ -327,6 +345,12 @@ pub(crate) struct IbdPerfSample {
     pub lookup_precompute_ms: u64,
     /// Lookup-wave TipOnly `get_fk_by_txid_batch` (`wave=… head=`). Not load stamp.
     pub lookup_wave_head_ms: u64,
+    /// TipOnly CPU (slot/fuse probe + fence snapshot) inside `head=`.
+    pub lookup_wave_head_probe_ms: u64,
+    /// TipOnly body+idx pread wall inside `head=`.
+    pub lookup_wave_head_io_ms: u64,
+    /// TipOnly `txid.body` / identity preads this window.
+    pub lookup_wave_head_preads: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
     pub plan_cold: u64,
@@ -577,6 +601,9 @@ impl Default for IbdPerfSample {
             lookup_decode_ms: 0,
             lookup_precompute_ms: 0,
             lookup_wave_head_ms: 0,
+            lookup_wave_head_probe_ms: 0,
+            lookup_wave_head_io_ms: 0,
+            lookup_wave_head_preads: 0,
             plan_parents: 0,
             plan_already: 0,
             plan_cold: 0,
@@ -790,6 +817,9 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let recent_pub_ns = rbitcoin_consensus::confirm_phase_stats::sample_write_recent_and_reset();
+    let (drain_join_ns, dequeue_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
@@ -871,6 +901,12 @@ pub(crate) fn sample(
             tweak_ns,
             cache_tip_ms: ns_ms(cache_tip_ns),
             cache_tip_ns,
+            recent_pub_ms: ns_ms(recent_pub_ns),
+            recent_pub_ns,
+            drain_join_ms: ns_ms(drain_join_ns),
+            drain_join_ns,
+            dequeue_ms: ns_ms(dequeue_ns),
+            dequeue_ns,
         },
         ensure_res_hit,
         ensure_cold_n,
@@ -1012,6 +1048,9 @@ pub(crate) fn sample(
         lookup_decode_ms: ns_ms(dens.decode_ns),
         lookup_precompute_ms: ns_ms(dens.precompute_ns),
         lookup_wave_head_ms: ns_ms(dens.wave_head_ns),
+        lookup_wave_head_probe_ms: ns_ms(head_res.probe_ns),
+        lookup_wave_head_io_ms: ns_ms(head_res.body_ns.saturating_add(head_res.idx_ns)),
+        lookup_wave_head_preads: head_res.body_lookups,
         plan_parents: dens.parents,
         plan_already: dens.already,
         plan_cold: dens.cold,
@@ -1172,7 +1211,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms) keep={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={})) keep={}ms other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1190,6 +1229,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.lookup_precompute_ms,
         s.plan_collect_ms,
         s.lookup_wave_head_ms,
+        s.lookup_wave_head_probe_ms,
+        s.lookup_wave_head_io_ms,
+        s.lookup_wave_head_preads,
         s.thr_lookup_keep_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
@@ -1404,7 +1446,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms \
+         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms \
+         drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
         s.write.class_a_ms,
@@ -1424,6 +1467,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.write.utxo_ms,
         s.write.tweak_ms,
         s.write.cache_tip_ms,
+        s.write.recent_pub_ms,
+        s.write.drain_join_ms,
+        s.write.dequeue_ms,
+        s.thr_write_work_ms.saturating_sub(write_stage_ms(s)),
         s.ann_ms,
         s.ann_n,
         s.ann_pread_skip,
@@ -1491,7 +1538,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
-         spend={}(r={} i={} skip={}) tweaks={} tip_gc={}",
+         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={} drain_join={} dequeue={}",
         us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
@@ -1511,6 +1558,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.spend_skip,
         us(s.write.tweak_ns),
         us(s.write.cache_tip_ns),
+        us(s.write.recent_pub_ns),
+        us(s.write.drain_join_ns),
+        us(s.write.dequeue_ns),
     );
     append_nz(&mut out, "recon_us", us(s.recon_ns));
     append_nz(&mut out, "wire_us", us(s.wire_ns));
@@ -1880,10 +1930,12 @@ mod tests {
         write.utxo_ms = 32;
         write.tweak_ms = 64;
         write.cache_tip_ms = 128;
+        write.drain_join_ms = 0;
+        write.dequeue_ms = 0;
         assert_eq!(
             write.stage_ms(),
             255,
-            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc"
+            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc+recent_pub+drain_join+dequeue"
         );
         let mut s = IbdPerfSample::default();
         s.write = write;
@@ -1893,6 +1945,10 @@ mod tests {
         assert!(line.contains("tweaks=64ms"), "{line}");
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
+        assert!(line.contains("recent_pub=0ms"), "{line}");
+        assert!(line.contains("drain_join=0ms"), "{line}");
+        assert!(line.contains("dequeue=0ms"), "{line}");
+        assert!(line.contains("other=0ms"), "{line}");
     }
 
     #[test]
@@ -2254,7 +2310,9 @@ mod tests {
         assert!(info.contains("precompute=30ms"), "{info}");
         assert!(info.contains("collect=3ms"), "{info}");
         assert!(
-            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms)"),
+            info.contains(
+                "wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms(probe=0ms io=0ms preads=0))"
+            ),
             "{info}"
         );
         let dbg = format_debug(&s);

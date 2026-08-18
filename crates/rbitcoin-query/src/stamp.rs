@@ -104,7 +104,7 @@ pub fn stamp_external_parents(
 
     let t_head = Instant::now();
     if !need_head.is_empty() {
-        need_head.sort_unstable_by_key(|txid| store.txs.head_primary_slot(txid));
+        need_head.sort_by_cached_key(|txid| store.txs.head_primary_slot(txid));
         let hits = store.get_fk_by_txid_batch(&need_head)?;
         let first_fks = store.txs.head_first_fks_snapshot();
         let mut age0 = 0u64;

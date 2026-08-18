@@ -1032,7 +1032,10 @@ fn get_fk_by_txid_batch_matches_single() {
     }
     let fks = t.put_full_batch_indexed(&items, true).unwrap();
     let mut keys: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
+    let mut cached = keys.clone();
     keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
+    cached.sort_by_cached_key(|k| t.head_primary_slot(k));
+    assert_eq!(keys, cached, "cached slot key must match by_key order");
     let batch = t.get_fk_by_txid_batch(&keys).unwrap();
     assert_eq!(batch.len(), 5);
     for (txid, row) in &batch {

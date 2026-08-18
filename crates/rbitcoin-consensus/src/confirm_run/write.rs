@@ -122,17 +122,23 @@ pub fn confirm_write_phase(
                         .collect::<Vec<_>>(),
                     planned_fks.len(),
                 );
+                let t_recent = Instant::now();
                 for (height, range) in slices {
                     let creates = planned_fks[range.clone()]
                         .iter()
                         .zip(pins[range].iter())
                         .map(|(fk, pin)| (pin.0.txid, *fk));
                     query
-                        .note_recent_creates(height, creates)
+                        .note_recent_creates_defer(height, creates)
                         .map_err(ConsensusError::from)?;
                 }
                 if let Some(last) = batch.prepared.last() {
-                    query.expire_recent_creates(last.height.0);
+                    query.expire_recent_creates_defer(last.height.0);
+                }
+                query.flush_recent_creates();
+                let recent_ns = t_recent.elapsed().as_nanos() as u64;
+                if recent_ns > 0 {
+                    confirm_phase_stats::WRITE_RECENT_NS.fetch_add(recent_ns, Ordering::Relaxed);
                 }
             }
         }
@@ -182,6 +188,7 @@ pub fn confirm_write_phase(
             let (spend_ann_ns, tip_gc_ns) =
                 post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
+            let t_join = Instant::now();
             match drain.join() {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(ConsensusError::from(e)),
@@ -190,6 +197,11 @@ pub fn confirm_write_phase(
                         "tx.head write-behind drain thread panicked",
                     )));
                 }
+            }
+            let drain_join_ns = t_join.elapsed().as_nanos() as u64;
+            if drain_join_ns > 0 {
+                confirm_phase_stats::WRITE_DRAIN_JOIN_NS
+                    .fetch_add(drain_join_ns, Ordering::Relaxed);
             }
             // Insert finished. Load polls this fk HWM (not tip/fence — 67438).
             if let Some(fk) = drain_max_fk {

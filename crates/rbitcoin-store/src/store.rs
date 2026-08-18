@@ -714,7 +714,9 @@ impl Store {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
         // `height_fence_extend`. Confirm extends before `set_many`, so tip
         // cannot publish while this clone is in flight. Clone is O(blocks).
+        let t_fence = std::time::Instant::now();
         let fence = self.fence().clone();
+        crate::head_resolve_stats::add_probe(t_fence.elapsed().as_nanos() as u64);
         crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
             &self.txs,
             &fence,

@@ -426,11 +426,12 @@ pub(crate) fn write_queue_cap() -> usize {
 
 /// How many script-ok parts write may merge in one `confirm_write_phase`.
 ///
-/// ¼ of [`write_queue_cap`] (floor, at least 1) so scripts keep empty slots
-/// while write runs. Default cap 20 → **5**.
+/// Snapshot-drain: take everything already in `writeq` before work starts
+/// so one `flush_class_c_tip` covers the queued run and scripts see an empty
+/// queue while write runs. Does not pull more parts mid-write.
 #[inline]
 pub(crate) fn write_drain_max_parts(writeq_cap: usize) -> usize {
-    writeq_cap.saturating_div(4).max(1)
+    writeq_cap.max(1)
 }
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).

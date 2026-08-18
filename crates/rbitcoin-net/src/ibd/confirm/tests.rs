@@ -866,8 +866,8 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
         super::confirm_batch_max_inputs(),
         super::CONFIRM_BATCH_INPUTS_DEFAULT
     );
-    assert_eq!(super::write_drain_max_parts(20), 5);
-    assert_eq!(super::write_drain_max_parts(4), 1);
-    assert_eq!(super::write_drain_max_parts(3), 1);
+    assert_eq!(super::write_drain_max_parts(20), 20);
+    assert_eq!(super::write_drain_max_parts(4), 4);
+    assert_eq!(super::write_drain_max_parts(3), 3);
     assert_eq!(super::write_drain_max_parts(0), 1);
 }

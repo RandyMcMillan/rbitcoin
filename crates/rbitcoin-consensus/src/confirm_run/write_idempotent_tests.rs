@@ -285,6 +285,74 @@ fn scripts_stage_depth1_submits_second_before_first_finishes() {
     scripts_feed_test_sync::reset();
 }
 
+/// After N+1 is submitted, join must not `recv_timeout(200µs)` for the rest
+/// of N's wave. A 200 ms tail would be ~1000 timeouts with the old loop.
+#[test]
+fn scripts_join_blocks_after_lookahead() {
+    use super::{
+        scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
+        ScriptsBatchMeta,
+    };
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    scripts_feed_test_sync::reset();
+    scripts_feed_test_sync::set_hold_first_until_second_submit(true);
+    scripts_feed_test_sync::set_hold_tail_after_second(true);
+
+    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
+    let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+    let outcomes_w = Arc::clone(&outcomes);
+
+    let stage = thread::spawn(move || {
+        scripts_stage_from_load_channel(
+            &mat_rx,
+            |ok, _meta: ScriptsBatchMeta| {
+                outcomes_w.lock().unwrap().push(ok);
+                true
+            },
+            |_e, _meta| false,
+            || false,
+        );
+    });
+
+    mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while scripts_feed_test_sync::submit_count() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "A never submitted to coordinator"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    mat_tx
+        .send((empty_loaded_batch(), 0))
+        .expect("send B while A verifying");
+    while scripts_feed_test_sync::submit_count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "B not submitted before A finished (feed-ahead dead under depth-1)"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let timeouts_at_lookahead = scripts_feed_test_sync::recv_timeout_count();
+    drop(mat_tx);
+    stage.join().expect("stage thread");
+    let after = scripts_feed_test_sync::recv_timeout_count();
+    let tail = after.saturating_sub(timeouts_at_lookahead);
+    assert!(
+        tail < 20,
+        "join kept 200µs-polling after lookahead ({tail} timeouts; 200ms tail ≈ 1000 if broken)"
+    );
+    let outs = outcomes.lock().unwrap();
+    assert_eq!(outs.len(), 2, "both batches script-ok");
+    scripts_feed_test_sync::set_hold_first_until_second_submit(false);
+    scripts_feed_test_sync::set_hold_tail_after_second(false);
+    scripts_feed_test_sync::reset();
+}
+
 #[test]
 fn check_bip34_helper_and_expected_bits_no_retarget() {
     use super::{check_bip34, expected_bits_extending};

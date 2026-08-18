@@ -91,7 +91,7 @@ known retain structures:
 | `conf ready=` / `scriptq` / `writeq` | `ready=` = BQ resolve-complete inventory; scriptq/writeq are real queue contents + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= recent= union= h2h= fence= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; live and pub are separate maps until they share an Arc) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= pstore= recent= union= h2h= fence= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; one published Arc + overlay + fifo) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 

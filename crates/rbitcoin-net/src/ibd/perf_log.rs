@@ -1805,9 +1805,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let if_mib = o.inflight_bytes / (1024 * 1024);
     let ps_mib = o.pstore_bytes / (1024 * 1024);
     // txid + fk + range + hash overhead — identity only, no outs.
-    // live and pub are separate HashMaps today (step 2 will share the Arc).
-    let recent_bytes = (o.recent_keys as u64)
-        .saturating_add(o.recent_pub_keys as u64)
+    // One published map + overlay + fifo. live is published⊕overlay (not a second map).
+    let recent_bytes = (o.recent_pub_keys as u64)
         .saturating_mul(96)
         .saturating_add((o.recent_overlay_keys as u64).saturating_mul(96))
         .saturating_add((o.recent_fifo_keys as u64).saturating_mul(32));

@@ -8,10 +8,10 @@
 //! [`recent_creates_horizon`] (`2 * soft_win`, floor 256) so the ring outlives
 //! BQ / lookup lead (1× the soft 1-min window is not enough).
 //!
-//! Writers mutate the locked map and mark dirty. [`RecentCreates::publish_if_dirty`]
-//! is the only full-map snapshot rebuild (confirm write: once per batch). Load
-//! [`RecentCreates::get`] / [`RecentSnap::get`] see a small dirty overlay first
-//! so stamp hits unflushed notes without cloning the live map.
+//! Overlay + tombstones hold unflushed notes. [`RecentCreates::publish_if_dirty`]
+//! builds **one** published [`Arc`] (confirm write: once per batch). There is no
+//! second live HashMap. Load [`get`](RecentCreates::get) / [`RecentSnap::get`]
+//! see overlay first so stamp hits unflushed notes without cloning.
 
 use crate::published_ids::TxidHasher;
 use arc_swap::ArcSwap;
@@ -41,7 +41,6 @@ struct LiveEnt {
 }
 
 struct Inner {
-    live: LiveMap,
     overlay: LiveMap,
     dead: DeadSet,
     fifo: VecDeque<(u32, Vec<[u8; 32]>)>,
@@ -82,7 +81,6 @@ impl Default for RecentCreates {
         Self {
             live: ArcSwap::from_pointee(LiveMap::default()),
             inner: Mutex::new(Inner {
-                live: LiveMap::default(),
                 overlay: LiveMap::default(),
                 dead: DeadSet::default(),
                 fifo: VecDeque::new(),
@@ -97,11 +95,7 @@ impl RecentCreates {
         Self::default()
     }
 
-    fn publish(live: &ArcSwap<LiveMap>, g: &Inner) {
-        live.store(Arc::new(g.live.clone()));
-    }
-
-    /// Rebuild the load snapshot if [`Self::note`] / expire / drop dirtied the map.
+    /// Merge overlay/dead into one new published Arc. No second live HashMap.
     ///
     /// No-op when clean. Confirm write flushes once after all height notes + expire.
     pub fn publish_if_dirty(&self) {
@@ -109,7 +103,15 @@ impl RecentCreates {
         if !g.dirty {
             return;
         }
-        Self::publish(&self.live, &g);
+        let published = self.live.load_full();
+        let mut next = (*published).clone();
+        for (k, e) in g.overlay.iter() {
+            next.insert(*k, *e);
+        }
+        for k in g.dead.iter() {
+            next.remove(k);
+        }
+        self.live.store(Arc::new(next));
         g.overlay.clear();
         g.dead.clear();
         g.dirty = false;
@@ -126,7 +128,6 @@ impl RecentCreates {
                 continue;
             }
             let ent = LiveEnt { fk, range, height };
-            g.live.insert(txid, ent);
             g.overlay.insert(txid, ent);
             g.dead.remove(&txid);
             keys.push(txid);
@@ -141,6 +142,7 @@ impl RecentCreates {
     /// Drop heights `≤ through` (inclusive). A key stays if a newer height
     /// re-noted it (last-write `LiveEnt.height`).
     pub fn expire_through(&self, through: u32) {
+        let published = self.live.load_full();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut changed = false;
         while let Some(&(h, _)) = g.fifo.front() {
@@ -149,10 +151,16 @@ impl RecentCreates {
             }
             let (_, keys) = g.fifo.pop_front().expect("front");
             for t in keys {
-                if let Some(ent) = g.live.get(&t) {
+                if let Some(ent) = g.overlay.get(&t) {
                     if ent.height <= through {
-                        g.live.remove(&t);
                         g.overlay.remove(&t);
+                        g.dead.insert(t);
+                        changed = true;
+                    }
+                    continue;
+                }
+                if let Some(ent) = published.get(&t) {
+                    if ent.height <= through {
                         g.dead.insert(t);
                         changed = true;
                     }
@@ -175,23 +183,30 @@ impl RecentCreates {
 
     /// Disconnect: drop heights `≥ height`.
     pub fn drop_from(&self, height: u32) {
+        let published = self.live.load_full();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let before = g.live.len();
         g.fifo.retain(|(h, _)| *h < height);
-        let mut dropped: Vec<[u8; 32]> = Vec::new();
-        g.live.retain(|t, ent| {
+        let mut changed = false;
+        let mut drop_ov: Vec<[u8; 32]> = Vec::new();
+        g.overlay.retain(|t, ent| {
             if ent.height < height {
                 true
             } else {
-                dropped.push(*t);
+                drop_ov.push(*t);
                 false
             }
         });
-        for t in dropped {
-            g.overlay.remove(&t);
+        for t in drop_ov {
             g.dead.insert(t);
+            changed = true;
         }
-        if g.live.len() != before {
+        for (t, ent) in published.iter() {
+            if ent.height >= height {
+                g.dead.insert(*t);
+                changed = true;
+            }
+        }
+        if changed {
             g.dirty = true;
         }
     }
@@ -221,10 +236,11 @@ impl RecentCreates {
     pub fn size_detail(&self) -> (usize, usize, usize, usize, usize) {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let fifo_keys = g.fifo.iter().map(|(_, k)| k.len()).sum();
+        let pub_k = self.live.load().len();
         (
             g.fifo.len(),
-            g.live.len(),
-            self.live.load().len(),
+            pub_k.saturating_add(g.overlay.len()),
+            pub_k,
             g.overlay.len(),
             fifo_keys,
         )
@@ -277,6 +293,12 @@ mod tests {
         assert_eq!(pub_k, 1);
         assert_eq!(ov, 0);
         assert_eq!(fifo, 1);
+        let a = r.snapshot();
+        let b = r.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&a.published, &b.published),
+            "flush must not keep a second live HashMap; snapshots share the Arc"
+        );
     }
 
     #[test]

@@ -265,6 +265,28 @@ mod tests {
     }
 
     #[test]
+    fn tx_precompute_bip143_all_matches_sighash_cache() {
+        use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+        let tx = p2wpkh_like();
+        let pre = TxPrecompute::from_tx(&tx);
+        let script_code = tx.output[0].script_pubkey.p2wpkh_script_code();
+        // not p2wpkh template — use OP_TRUE as scriptCode; compare our ALL hash
+        // to rust-bitcoin p2wsh ALL with the same script.
+        let wscript = bitcoin::script::Script::from_bytes(&[0x51]);
+        let amt = Amount::from_sat(50_000);
+        let ours =
+            crate::script::crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &pre)
+                .unwrap();
+        let mut cache = SighashCache::new(&tx);
+        let theirs = cache
+            .p2wsh_signature_hash(0, wscript, amt, EcdsaSighashType::All)
+            .unwrap()
+            .to_byte_array();
+        assert_eq!(ours, theirs);
+        let _ = script_code;
+    }
+
+    #[test]
     fn tx_precompute_finish_spent_matches_amount_spk_walk() {
         let tx = p2wpkh_like();
         let prev = TxOut {

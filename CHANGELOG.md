@@ -20,6 +20,13 @@ before 1.0).
 
 ### Changed
 
+- **Confirm structure one-pass:** `validate_block_structure_hashed` uses
+  `TxPrecompute::from_tx` (txid + wtxid + weight + BIP143/BIP341 common
+  SHA256 midstates in one walk). BIP143 P2WPKH/P2WSH / interpreter
+  consume those midstates (no per-input prevouts walk). `stamp_sub`
+  adds `struct_txid=` / `struct_walk=`. rust-bitcoin remains the test
+  oracle. Taproot still uses `SighashCache` for now.
+
 - **Assemble meters and maps:** prevout path counts flush once per block
   (no per-input `Instant` / atomics). Same-block outs use `txid_index`
   (`TxidHasher`); pack `pending_creates` is `txid → fk`. `ibd: perf`

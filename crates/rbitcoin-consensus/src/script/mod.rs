@@ -47,11 +47,14 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
         return Ok(());
     }
     let mut cache = SighashCache::new(tx);
+    let mut pre = crate::TxPrecompute::from_tx(tx);
+    pre.finish_spent(&job.prevouts);
     if n == 1 {
-        return verify_input(job, 0, tx, &mut cache).map_err(|e| annotate_script_err(e, tx, 0));
+        return verify_input(job, 0, tx, &mut cache, &pre)
+            .map_err(|e| annotate_script_err(e, tx, 0));
     }
     for ii in 0..n {
-        verify_input(job, ii, tx, &mut cache).map_err(|e| annotate_script_err(e, tx, ii))?;
+        verify_input(job, ii, tx, &mut cache, &pre).map_err(|e| annotate_script_err(e, tx, ii))?;
     }
     Ok(())
 }
@@ -84,6 +87,7 @@ pub(crate) fn verify_input(
     input_index: usize,
     tx: &Transaction,
     cache: &mut bitcoin::sighash::SighashCache<&Transaction>,
+    pre: &crate::TxPrecompute,
 ) -> Result<(), ConsensusError> {
     if input_index >= job.prevouts.len() || input_index >= tx.input.len() {
         return Err(ConsensusError::Script("input index".into()));
@@ -95,7 +99,7 @@ pub(crate) fn verify_input(
 
     if job.witness_active {
         if let Some((version, program)) = classify::witness_program(spk) {
-            return verify_native_witness(job, input_index, tx, cache, version, program);
+            return verify_native_witness(job, input_index, tx, cache, pre, version, program);
         }
     }
 
@@ -126,7 +130,7 @@ pub(crate) fn verify_input(
             if !job.bip16_active {
                 return verify_bare(job, input_index, tx, prevout);
             }
-            if let Some(res) = nested::try_p2sh_nested_segwit(job, input_index, tx, cache) {
+            if let Some(res) = nested::try_p2sh_nested_segwit(job, input_index, tx, cache, pre) {
                 return res;
             }
             if job.witness_active && has_witness {
@@ -147,6 +151,7 @@ fn verify_native_witness(
     input_index: usize,
     tx: &Transaction,
     cache: &mut bitcoin::sighash::SighashCache<&Transaction>,
+    pre: &crate::TxPrecompute,
     version: u8,
     program: &[u8],
 ) -> Result<(), ConsensusError> {
@@ -154,7 +159,7 @@ fn verify_native_witness(
         return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
     }
     match (version, program.len()) {
-        (0, 20) => p2wpkh::verify(job, input_index, tx, cache),
+        (0, 20) => p2wpkh::verify(job, input_index, tx, pre),
         (0, 32) => p2wsh::verify(job, input_index, tx),
         (0, _) => Err(ConsensusError::Script(
             "WITNESS_PROGRAM_WRONG_LENGTH".into(),
@@ -227,7 +232,6 @@ fn verify_bare(
 pub(crate) mod crypto {
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{ecdsa, Message, PublicKey, Secp256k1, VerifyOnly};
-    use bitcoin::sighash::EcdsaSighashType;
 
     use crate::error::ConsensusError;
 
@@ -375,6 +379,7 @@ pub(crate) mod crypto {
         script_code: &bitcoin::Script,
         amount: bitcoin::Amount,
         raw_ty: u32,
+        pre: &crate::TxPrecompute,
     ) -> Result<[u8; 32], ConsensusError> {
         use bitcoin::consensus::Encodable;
         use bitcoin::hashes::{sha256d, Hash, HashEngine};
@@ -398,36 +403,19 @@ pub(crate) mod crypto {
         let zero = [0u8; 32];
 
         let hash_prevouts: [u8; 32] = if !anyone_can_pay {
-            let mut eng = sha256d::Hash::engine();
-            for i in &tx.input {
-                i.previous_output
-                    .consensus_encode(&mut eng)
-                    .map_err(|_| ConsensusError::Script("bip143 prevouts".into()))?;
-            }
-            sha256d::Hash::from_engine(eng).to_byte_array()
+            pre.hash_prevouts()
         } else {
             zero
         };
 
         let hash_sequence: [u8; 32] = if !anyone_can_pay && base != Single && base != None {
-            let mut eng = sha256d::Hash::engine();
-            for i in &tx.input {
-                i.sequence
-                    .consensus_encode(&mut eng)
-                    .map_err(|_| ConsensusError::Script("bip143 sequences".into()))?;
-            }
-            sha256d::Hash::from_engine(eng).to_byte_array()
+            pre.hash_sequence()
         } else {
             zero
         };
 
         let hash_outputs: [u8; 32] = if base != Single && base != None {
-            let mut eng = sha256d::Hash::engine();
-            for o in &tx.output {
-                o.consensus_encode(&mut eng)
-                    .map_err(|_| ConsensusError::Script("bip143 outputs".into()))?;
-            }
-            sha256d::Hash::from_engine(eng).to_byte_array()
+            pre.hash_outputs()
         } else if base == Single && input_index < tx.output.len() {
             let mut eng = sha256d::Hash::engine();
             tx.output[input_index]
@@ -480,38 +468,31 @@ pub(crate) mod crypto {
         script_pubkey: &bitcoin::Script,
         amount: bitcoin::Amount,
         raw_ty: u32,
-        cache: &mut bitcoin::sighash::SighashCache<&bitcoin::Transaction>,
+        pre: &crate::TxPrecompute,
     ) -> Result<[u8; 32], ConsensusError> {
-        let mapped = EcdsaSighashType::from_consensus(raw_ty);
-        if mapped.to_u32() == raw_ty {
-            return cache
-                .p2wpkh_signature_hash(input_index, script_pubkey, amount, mapped)
-                .map(|h| h.to_byte_array())
-                .map_err(|_| ConsensusError::Script("p2wpkh sighash".into()));
-        }
         let script_code = script_pubkey
             .p2wpkh_script_code()
             .ok_or_else(|| ConsensusError::Script("bip143 not p2wpkh".into()))?;
-        bip143_signature_hash(tx, input_index, script_code.as_script(), amount, raw_ty)
+        bip143_signature_hash(
+            tx,
+            input_index,
+            script_code.as_script(),
+            amount,
+            raw_ty,
+            pre,
+        )
     }
 
-    /// P2WSH / tapscript-free WitnessV0 BIP143 with the same fast/slow split.
+    /// P2WSH / WitnessV0 BIP143 using [`crate::TxPrecompute`] midstates.
     pub fn bip143_p2wsh_signature_hash(
         tx: &bitcoin::Transaction,
         input_index: usize,
         witness_script: &bitcoin::Script,
         amount: bitcoin::Amount,
         raw_ty: u32,
-        cache: &mut bitcoin::sighash::SighashCache<&bitcoin::Transaction>,
+        pre: &crate::TxPrecompute,
     ) -> Result<[u8; 32], ConsensusError> {
-        let mapped = EcdsaSighashType::from_consensus(raw_ty);
-        if mapped.to_u32() == raw_ty {
-            return cache
-                .p2wsh_signature_hash(input_index, witness_script, amount, mapped)
-                .map(|h| h.to_byte_array())
-                .map_err(|_| ConsensusError::Script("p2wsh sighash".into()));
-        }
-        bip143_signature_hash(tx, input_index, witness_script, amount, raw_ty)
+        bip143_signature_hash(tx, input_index, witness_script, amount, raw_ty, pre)
     }
 
     /// Verify ECDSA under **Bitcoin consensus** rules.
@@ -704,7 +685,8 @@ mod verify_routing_tests {
             const_scriptcode: false,
         };
         let mut cache = bitcoin::sighash::SighashCache::new(&*job2.tx);
-        assert!(verify_input(&job2, 0, &*job2.tx, &mut cache).is_err());
+        let pre = crate::TxPrecompute::from_tx(&*job2.tx);
+        assert!(verify_input(&job2, 0, &*job2.tx, &mut cache, &pre).is_err());
     }
 
     #[test]
@@ -850,15 +832,16 @@ mod verify_routing_tests {
         let amt = Amount::from_sat(50_000);
 
         // Bad index.
-        assert!(crypto::bip143_signature_hash(&tx, 9, sc, amt, 0x01).is_err());
+        let pre = crate::TxPrecompute::from_tx(&tx);
+        assert!(crypto::bip143_signature_hash(&tx, 9, sc, amt, 0x01, &pre).is_err());
 
         // All / Single / None + AnyoneCanPay variants.
         for ty in [0x01u32, 0x02, 0x03, 0x81, 0x82, 0x83] {
-            let h = crypto::bip143_signature_hash(&tx, 0, sc, amt, ty).expect("sighash");
+            let h = crypto::bip143_signature_hash(&tx, 0, sc, amt, ty, &pre).expect("sighash");
             assert_ne!(h, [0u8; 32]);
         }
         // Single at index with matching output (input 1 → output 1).
-        let h_single = crypto::bip143_signature_hash(&tx, 1, sc, amt, 0x03).unwrap();
+        let h_single = crypto::bip143_signature_hash(&tx, 1, sc, amt, 0x03, &pre).unwrap();
         // Single with no matching output (only 2 outs; index 1 ok; use 1-input for zero outputs arm).
         let tx1 = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -866,16 +849,14 @@ mod verify_routing_tests {
             input: vec![tx.input[0].clone()],
             output: vec![],
         };
-        let h_none_out = crypto::bip143_signature_hash(&tx1, 0, sc, amt, 0x03).unwrap();
+        let pre1 = crate::TxPrecompute::from_tx(&tx1);
+        let h_none_out = crypto::bip143_signature_hash(&tx1, 0, sc, amt, 0x03, &pre1).unwrap();
         assert_ne!(h_single, h_none_out);
 
-        // Non-standard raw type 0x65 → slow path for p2wsh.
-        let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+        // Non-standard raw type 0x65 uses the same midstates + raw nHashType.
         let wscript = Script::from_bytes(&[0x51]);
-        let h_fast =
-            crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &mut cache).unwrap();
-        let h_slow =
-            crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x65, &mut cache).unwrap();
+        let h_fast = crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &pre).unwrap();
+        let h_slow = crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x65, &pre).unwrap();
         assert_ne!(h_fast, [0u8; 32]);
         assert_ne!(h_slow, [0u8; 32]);
         // Standard and non-standard types must differ (raw_ty in digest).

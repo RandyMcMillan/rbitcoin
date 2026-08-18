@@ -71,8 +71,8 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **8-block** `two_node` IBD + reconstruct + slim dead-peer + hub reorgs. `coverage.sh` `--skip`s the P2P IBD names. Agents use targeted `-p` tests locally; this suite runs on the PR. |
-| **CI multinode job** | same two named filters as before | 8-block IBD + reconstruct (cannot add filters without `workflows` permission) |
+| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **8-block** `two_node` IBD + hub reorgs. Reconstruct / dead-peer are the **multinode** job. Agents use targeted `-p` tests locally; this suite runs on the PR. |
+| **CI multinode job** | named filters + `--ignored` job-only cases | 8-block IBD, reconstruct, slim dead-peer |
 | **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
 
 ### Suite speed budgets (default tier)
@@ -102,7 +102,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` once per store |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall; `serve_after_restart_via_reconstruct` 90s wall (default + job). `coverage.sh` `--skip`s those names plus `ibd_skips_dead_peer` so llvm-cov does not re-pay P2P. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
+**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` also `--skip`s those names plus `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -207,8 +207,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
 | `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
 | `two_node_header_and_block_sync` | P2P (**default + multinode CI**) | Seeder → peer 8-block IBD. **Not** re-run under `coverage.sh`. |
-| `serve_after_restart_via_reconstruct` | P2P (**default + multinode CI**) | Cold serve via reconstruct. **Not** re-run under `coverage.sh`. |
-| `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` (~0.5s). **Not** re-run under `coverage.sh`. |
+| `serve_after_restart_via_reconstruct` | P2P (**multinode job only**) | Cold serve via reconstruct |
+| `ibd_skips_dead_peer` | P2P (**multinode job only**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
 | `three_node_relay_path` | P2P (**ignored**) | Hop serve — `scripts/integration.sh` |
 
@@ -223,7 +223,7 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 ### Integration / multi-node
 
-Default `cargo test` runs `two_node_header_and_block_sync`, reconstruct, and slim dead-peer. The required **multinode** job still names the two original filters. `coverage.sh` skips those P2P names.
+Default `cargo test` runs `two_node_header_and_block_sync` (8-block). The required **multinode** job also runs reconstruct and slim dead-peer (`--ignored` filters in `ci.yml`).
 Heavy topology (3-hop, 48-block, mesh, `run_p2p`) stays `#[ignore]` for `scripts/integration.sh`:
 
 ```bash

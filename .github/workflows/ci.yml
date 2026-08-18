@@ -93,13 +93,16 @@ jobs:
           workspaces: ". -> target/dev"
       - name: multi-node IBD (tier A)
         # One TESTNAME per `cargo test` invocation (second free arg is an error on
-        # rustc 1.95+). Run the two tier-A cases as separate commands.
+        # rustc 1.95+). Reconstruct / dead-peer are `#[ignore]` in the default
+        # suite so llvm-cov does not re-pay them; pass `--ignored` here.
         run: |
           set -euo pipefail
           cargo test -p rbitcoin-test --test integration_multinode \
             two_node_header_and_block_sync -- --nocapture
           cargo test -p rbitcoin-test --test integration_multinode \
-            serve_after_restart_via_reconstruct -- --nocapture
+            serve_after_restart_via_reconstruct -- --ignored --nocapture
+          cargo test -p rbitcoin-test --test integration_multinode \
+            ibd_skips_dead_peer -- --ignored --nocapture
   # Line-coverage gate (≥90% first-party LCOV LH/LF). Slow; waits for the
   # fast gates so a red fmt/clippy/test does not start this job. Required.
   coverage:

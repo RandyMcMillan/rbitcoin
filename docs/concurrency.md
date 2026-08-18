@@ -9,7 +9,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
 | Confirm **lookup** | 1 OS thread | load wire from **body queue**; structure + stamp create_fk (Class A planned only) |
 | Confirm **load** | 1 OS thread | stamp from in-flight + published union + TipOnly `tx.head`; pin `txout` + assemble |
-| Confirm **scripts** | 1 OS thread + 2 coordinators + `rbtc-scripts` steal | **none** — pure CPU |
+| Confirm **scripts** | 1 OS thread + 2 coordinators + `rbtc-scripts` steal (lock-free claim) | **none** — pure CPU |
 | Confirm **write** | 1 OS thread | **sole Class A appender** (`txout`+`inwit`+`spent`) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. Class A **never leads tip** (same commit era; no archive-ahead DONTNEED) |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
@@ -21,7 +21,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **IBD lookup resolve wave:** TipOnly `head_fk` over at most **1080** BQ-ready heights or soft **64000** inputs (include-overshoot; 256 k unique-key safety cap), then mark those complete for load to claim. One published identity layer per wave; get walks the chain (no union rebuild). When `ready >` half the 1-min BQ window, lookup waits for a full wave instead of minting a 1-block layer — unless the first unresolved height is within `path_lo + win/2` (load is about to claim it; O(1) from the already-sorted unresolved list).
 
-**`ibd: perf`:** `load=` is pin+assemble only. Load OS-thread leftover TipOnly is `load_thr stamp=`; post-scriptq in-flight drop is `prune=`. `script=` is verify ns (`jobs=`/`skip=`), not feed-ahead join. `ready>0` + `scriptq=1` + high `stamp=` means leftover on load, not a hungry script pool.
+**`ibd: perf`:** `load=` is pin+assemble only. Load OS-thread leftover TipOnly is `load_thr stamp=`; post-scriptq in-flight drop is `prune=`. `script=` is verify / `wait_done` wall (`jobs=`/`skip=`), not the feed-ahead join poller. Steal claim is an `ArcSwap` snapshot + `fetch_add` (no `WAVES` mutex per job). After N+1 is on the second coordinator, scripts join **blocks** (200 µs `recv_timeout` only while lookahead is still empty). `ready>0` + `scriptq=1` + high `stamp=` means leftover on load, not a hungry script pool.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire load path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load. **IBD most-work reorg** calls `accept_branch` from the **IBD orchestration task only** — never from confirm lookup/load/scripts/write threads. Selector / apply / invalid-heavy: [`architecture.md`](./architecture.md#most-work-chain-selection-ibd--tip-follow).
 

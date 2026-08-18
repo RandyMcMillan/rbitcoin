@@ -85,6 +85,14 @@ pub fn confirm_write_phase(
                     &pins,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
+                let height = batch.prepared.last().map(|p| p.height.0).unwrap_or(0);
+                let creates = planned_fks
+                    .iter()
+                    .zip(pins.iter())
+                    .map(|(fk, pin)| (pin.0.txid, *fk));
+                query
+                    .publish_recent_creates(height, creates)
+                    .map_err(ConsensusError::from)?;
             }
         }
     }

@@ -30,8 +30,16 @@ before 1.0).
   of the eight inventory tokens (`class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc`).
   `write=` still equals `write_stage_ms`. INFO/DEBUG token strings unchanged.
 
+- **Recent-create identity ring:** write publishes `txid → (create_fk,
+  body_range)` after Class A + idx. Load stamp probes it after published
+  live-union and before leftover TipOnly. Height-FIFO expire is
+  `2 × soft_confirm_window` (floor 256). Identity only — no outs / not a
+  process pin FIFO. `ibd: perf` adds `recent=` / `recent_ms=`; `ibd: sizes`
+  adds `recent=Nh/Nk≈NMiB`.
+
 - **Stamp identity union:** load/plan stamp no longer accepts a BQ-ahead
-  hits map. Facts come from in-flight → published `live_union` → TipOnly.
+  hits map. Facts come from in-flight → published `live_union` →
+  recent-creates → TipOnly.
   Deleted `BqParentHits` and `confirm_wire_lookup_stamp_with_hits`.
   Pin denserels read only `ParentPinStamp` (no `plan.external_parent_*`
   fallback). S0 plan and plan=None rehydrate share

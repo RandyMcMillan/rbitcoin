@@ -440,13 +440,14 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        // External parents: in-flight → published live_union → TipOnly, then
-        // idx range-fill. Same helper as plan=None rehydrate.
+        // External parents: in-flight → published live_union → recent creates
+        // → leftover TipOnly, then idx range-fill. Same helper as plan=None.
         let ext = crate::stamp_external_parents(
             &self.store,
             &need_vec,
             in_flight,
             published.unwrap_or(self.published_ids.as_ref()),
+            self.recent_creates.as_ref(),
         )?;
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
@@ -1581,6 +1582,7 @@ mod tests {
             &[parent_txid],
             &crate::InFlightView::empty(),
             published.as_ref(),
+            q.recent_creates().as_ref(),
         )
         .expect("shared helper");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(88)));
@@ -1598,6 +1600,83 @@ mod tests {
             plan.external_parent_txid(88),
             helper.txids.get(&88).copied()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write-published recent identity skips leftover TipOnly (`head_need=0`).
+    #[test]
+    fn stamp_hits_recent_creates_skips_leftover() {
+        let (dir, q) = temp_query("recent-creates-stamp");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x91;
+            t
+        };
+        q.recent_creates()
+            .note(10, [(parent_txid, Fk(91), (5000, 16))]);
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let helper = crate::stamp_external_parents(
+                q.store(),
+                &[parent_txid],
+                &crate::InFlightView::empty(),
+                q.published_ids().as_ref(),
+                q.recent_creates().as_ref(),
+            )
+            .expect("recent stamp");
+            assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(91)));
+            assert_eq!(helper.ranges.get(&91), Some(&(5000, 16)));
+            assert_eq!(helper.recent_n, 1);
+            assert_eq!(helper.head_need_n, 0, "recent hit must skip leftover");
+
+            let child = child_spend(parent_txid, 0x92);
+            let mut need = vec![(Fk(1), vec![child])];
+            let plan = q
+                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+                .expect("S0 recent");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(91));
+            assert_eq!(plan.external_parent_ranges.get(&91), Some(&(5000, 16)));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.head_need, 0, "plan path must skip leftover too");
+            assert!(mix.recent_n >= 1, "recent hits must be metered: {mix:?}");
+        });
+        q.recent_creates().drop_from(10);
+        assert!(q.recent_creates().get(&parent_txid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After Class A + idx, `publish_recent_creates` is what write uses.
+    #[test]
+    fn publish_recent_creates_after_commit_skips_leftover() {
+        let (dir, q) = temp_query("recent-publish");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = crate::InFlightView::empty();
+        let plan_a = q.archive_plan_batch_from(&mut need_a, 1, &empty).unwrap();
+        let parent_txid = plan_a.batch_creates[0].0;
+        let parent_fk = plan_a.batch_creates[0].1;
+        let header_fk = plan_a.per_header_ranges[0].0;
+        let creates = plan_a.batch_creates.clone();
+        q.archive_commit_plan(plan_a).unwrap();
+        q.store()
+            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
+            .unwrap();
+        q.publish_recent_creates(0, creates).unwrap();
+        assert!(
+            q.recent_creates().get(&parent_txid).is_some(),
+            "write publish must expose committed identity"
+        );
+
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let mut need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
+            let plan_b = q
+                .archive_plan_batch_from(&mut need_b, 2, &empty)
+                .expect("recent publish must stamp");
+            assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.head_need, 0, "published recent must skip leftover");
+            assert!(mix.recent_n >= 1, "recent publish must meter: {mix:?}");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

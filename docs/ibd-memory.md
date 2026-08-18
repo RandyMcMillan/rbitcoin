@@ -28,6 +28,7 @@ do not hold both a decoded `Block` and the wire bytes.
 |-----------|-------------|---------------------------|
 | **Published identity union** | Per-wave parent maps still on the BQ (`ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup drops a layer once no height in its span remains on the BQ. Disconnect stores `None`. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range) |
+| **RecentCreates identity ring** | `txid → fk+range` only; expire `2×soft_win` (floor 256 heights) | Write `publish_recent_creates` after Class A+idx; disconnect `drop_from`. Not a pin/outs FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
@@ -87,7 +88,7 @@ known retain structures:
 | `conf ready=` / `scriptq` / `writeq` | `ready=` = BQ resolve-complete inventory; scriptq/writeq are real queue contents + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= pstore= recent= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh/Nk≈NMiB`) + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 

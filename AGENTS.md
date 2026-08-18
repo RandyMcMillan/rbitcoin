@@ -90,9 +90,16 @@ Pin material is **plan / batch only** (`batch_pin`, `BatchParents`). No process
 create pin FIFO. IBD confirm intake
 is **body queue wire only** → lookup → load.
 
+**RecentCreates** is **identity only** (`txid → create_fk + body_range`),
+write-published after Class A+idx, height-bounded
+(`2 * soft_confirm_window`, floor 256). Load stamp probes it after published
+live-union and before leftover TipOnly. **Outs stay pipeline-local** — this
+ring is not a process pin FIFO.
+
 Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
 (the only Allowed/Forbidden IO table). In-flight prune after pin + scripts
-handoff; no leftover pending map; union miss is permanent.
+handoff; no leftover pending / pin FIFO; recent identity ring is
+height-bounded. Union miss is permanent.
 
 ### Confirm pipeline timers
 

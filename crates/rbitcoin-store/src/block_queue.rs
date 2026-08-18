@@ -288,25 +288,27 @@ impl BlockQueue {
         Ok(n)
     }
 
-    /// Lowest distinct queued heights `≥ path_lo` that are not resolve-complete
-    /// and not in `skip`, capped at `cap`. One pass over the index (no
-    /// per-height `is_resolve_complete` scan). Sorted ascending.
+    /// Contiguous unresolved heights from `path_lo`. Stops at the first height
+    /// not on the queue (a hole). Skips resolve-complete and `skip` without
+    /// treating those as a gap. Capped at `cap`.
     pub fn unresolved_heights(&self, path_lo: u32, skip: &HashSet<u32>, cap: usize) -> Vec<u32> {
         if cap == 0 {
             return Vec::new();
         }
-        let mut seen = HashSet::new();
         let mut out: Vec<u32> = Vec::new();
-        for e in self.index.values() {
-            if e.height < path_lo || e.resolve_complete || skip.contains(&e.height) {
-                continue;
+        let mut h = path_lo;
+        while out.len() < cap {
+            if !self.contains_height(h) {
+                break;
             }
-            if seen.insert(e.height) {
-                out.push(e.height);
+            if !self.is_resolve_complete(h) && !skip.contains(&h) {
+                out.push(h);
             }
+            h = match h.checked_add(1) {
+                Some(n) => n,
+                None => break,
+            };
         }
-        out.sort_unstable();
-        out.truncate(cap);
         out
     }
 
@@ -687,6 +689,28 @@ mod tests {
         assert_eq!(got, vec![18, 19, 20, 21, 22, 23]);
         assert_eq!(q.unresolved_heights(10, &skip, 3), vec![18, 19, 20]);
         assert!(q.unresolved_heights(10, &skip, 0).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolved_heights_stops_at_first_gap() {
+        use std::collections::HashSet;
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(12, [12u8; 32], 1, b"a").unwrap();
+        q.enqueue(13, [13u8; 32], 1, b"b").unwrap();
+        let none = HashSet::new();
+        assert!(
+            q.unresolved_heights(10, &none, 8).is_empty(),
+            "missing path_lo must not skip ahead: {:?}",
+            q.unresolved_heights(10, &none, 8)
+        );
+        q.enqueue(10, [10u8; 32], 1, b"c").unwrap();
+        q.enqueue(11, [11u8; 32], 1, b"d").unwrap();
+        assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11, 12, 13]);
+        // Hole at 12 after removing it — prefix only.
+        q.dequeue_height(12).unwrap();
+        assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -41,6 +41,18 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
+/// Core `BLOCK_MUTATED`: reconstructed compact/body does not match the header.
+/// Do not cache the hash as `BLOCK_FAILED`.
+fn reject_is_mutated(reason: &str) -> bool {
+    reason.contains("merkle")
+        || reason.contains("bad-txnmrklroot")
+        || reason.contains("bad-txns-duplicate")
+        || reason.contains("witness commitment")
+        || reason.contains("bad-witness-nonce")
+        || reason.contains("missing witness commitment")
+        || reason.contains("wtxid count")
+}
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -1451,18 +1463,15 @@ impl ChainHub {
                 }
             }
             Err(e) => {
-                let s = e.to_string();
-                // Merkle mismatch is Core "mutated": do not mark BLOCK_FAILED.
-                let mutated = s.contains("merkle") || s.contains("bad-txnmrklroot");
-                if !mutated
-                    && self
-                        .query
-                        .get_header_by_hash(&hash.to_byte_array())
-                        .ok()
-                        .flatten()
-                        .is_some()
-                {
-                    self.invalidated.write().unwrap().insert(hash);
+                // Core `BLOCK_FAILED`: remember consensus-invalid hashes even
+                // when the header was never persisted (compact reconstruct).
+                // Mutated bodies (merkle / witness commitment) keep the hash
+                // acceptable so a later honest reconstruct can connect
+                // (`p2p_compactblocks` stalling-peer invalid compact).
+                if let NetError::Consensus(s) = &e {
+                    if !reject_is_mutated(s) && !s.to_ascii_lowercase().contains("not found") {
+                        self.note_invalid_block(hash);
+                    }
                 }
                 Err(e)
             }
@@ -1774,6 +1783,22 @@ pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
     format!("initial getheaders ({locator_height}) to peer={peer}")
 }
 
+/// Core `HEADERS_DOWNLOAD_TIMEOUT_BASE` (15 min) + 1 ms per header-interval.
+pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
+    let since = now.saturating_sub(best_header_time);
+    // ceil(1ms * since / 600s) in seconds == ceil(since / 600_000).
+    let variable = since.div_ceil(600_000);
+    now.saturating_add(15 * 60).saturating_add(variable)
+}
+
+pub fn headers_timeout_disconnect_log(peer: u64) -> String {
+    format!("Timeout downloading headers, disconnecting peer={peer}")
+}
+
+pub fn headers_timeout_noban_log(peer: u64) -> String {
+    format!("Timeout downloading headers from noban peer, not disconnecting peer={peer}")
+}
+
 pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
     let time = header.time;
     let ver = header.version.to_consensus();
@@ -2048,6 +2073,19 @@ mod tests {
         assert_eq!(
             initial_getheaders_log(0, 0),
             "initial getheaders (0) to peer=0"
+        );
+        assert_eq!(
+            headers_timeout_disconnect_log(0),
+            "Timeout downloading headers, disconnecting peer=0"
+        );
+        assert_eq!(
+            headers_timeout_noban_log(0),
+            "Timeout downloading headers from noban peer, not disconnecting peer=0"
+        );
+        // Test formula: now=1_000_000, genesis=0 → variable = ceil(1e6/6e5)=2.
+        assert_eq!(
+            headers_download_timeout_secs(1_000_000, 0),
+            1_000_000 + 900 + 2
         );
     }
 

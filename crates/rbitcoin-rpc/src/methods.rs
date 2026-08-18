@@ -5292,6 +5292,20 @@ mod tests {
         assert!(totals["totalbytesrecv"].as_u64().unwrap() >= 29);
         assert_eq!(totals["totalbytessent"].as_u64().unwrap(), 0);
 
+        // p2p_invalid_messages.py:96 — a 12-byte header fragment must bump
+        // totalbytesrecv before the frame is complete.
+        let wire = rbitcoin_net::WireBytes::new();
+        live.attach_wire(wire.clone());
+        let before = dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"]
+            .as_u64()
+            .unwrap();
+        wire.recv
+            .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
+        let mid = dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(mid, before + 12);
+
         // rpc_net.py:100 — dual inbound+outbound is two connections, not
         // outbound-follow-only (ctx.connections stays 0 here).
         let inbound = hub.register(bind, addr, &ver, true, PeerConnType::Inbound);

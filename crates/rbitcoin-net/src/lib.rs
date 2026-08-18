@@ -18,8 +18,9 @@ mod v2;
 
 pub use cache::BlockCache;
 pub use chain::{
-    accept_block_header_nodos_log, ignoring_low_work_chain_log, initial_getheaders_log,
-    log_update_tip, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent,
+    accept_block_header_nodos_log, headers_download_timeout_secs, headers_timeout_disconnect_log,
+    headers_timeout_noban_log, ignoring_low_work_chain_log, initial_getheaders_log, log_update_tip,
+    AcceptOutcome, ChainHub, ChainTipInfo, TipEvent,
 };
 pub use codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH};
 pub use error::NetError;
@@ -47,6 +48,7 @@ pub use service::{magic_for, magic_for_params, NetConfig, P2PHandle, P2PNode};
 pub use tx_relay::{
     ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample, QueryUtxoProvider,
 };
+pub use v2::WireBytes;
 
 /// Default number of **live download peers** during IBD (`IbdConfig::target_peers`
 /// and node `--max-outbound` default).

@@ -33,6 +33,22 @@ before 1.0).
 
 ### Changed
 
+- **Core functional leftover-P2P.** Official unmodified
+  `p2p_initial_headers_sync.py` and `p2p_compactblocks.py` are `run`
+  (33→**35**). Initial `getheaders` goes to one `NODE_NETWORK` peer
+  until the tip is within 24h; each new block INV may add one extra
+  peer; headers-download timeout disconnects a stalling peer unless
+  whitelist `noban`. BIP152: tip INV is `MSG_BLOCK`; `sendcmpct(1)`
+  announces `cmpctblock`; getdata type 4; getblocktxn depth 10;
+  compact getdata depth 5; OOB getblocktxn disconnects; HB max 3
+  with 2 inbound + 1 outbound fill slots; cached-invalid child
+  compact is `bad-prevblk`; a second failed `blocktxn` disconnects.
+  v2 length-prefix reject logs `V2 transport error: packet too large`
+  and disconnects; unknown short/long type logs and stays connected
+  (`*other*` raw size). `getnettotals` counts raw TCP when a session
+  has `WireBytes`. `p2p_invalid_messages.py` stays skip at inbound
+  `sendaddrv2` (`:188`). Q-41 is 35/267.
+
 - **Script steal claim + join:** `rbtc-scripts-*` claim a published
   wave snapshot (`ArcSwap`) instead of locking `WAVES` per job;
   `in_wave` is AcqRel. After feed-ahead submits N+1, scripts join

@@ -177,7 +177,7 @@ pub(crate) async fn spawn_peer(
     let stream = TcpStream::connect(addr).await?;
     let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let (ver, reader, writer) = connect_and_handshake(
+    let (ver, reader, writer, _wire) = connect_and_handshake(
         stream,
         magic,
         local,
@@ -318,6 +318,10 @@ pub(crate) async fn spawn_peer(
                             },
                             move || {},
                         );
+                    }
+                    Err(NetError::InvalidV2Type { .. }) => {
+                        // Core logs and stays connected (same as tip-follow).
+                        continue;
                     }
                     Err(NetError::Io(e))
                         if e.kind() == std::io::ErrorKind::UnexpectedEof

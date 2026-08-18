@@ -177,12 +177,19 @@ pub fn validate_block_structure_with_pres(
     let walk_ns = t_walk.elapsed().as_nanos() as u64;
 
     let has_witness_data = block_has_witness(block);
-    if has_witness_data {
-        if ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
+    let has_commitment = coinbase_has_witness_commitment(block);
+    if has_witness_data || has_commitment {
+        if has_witness_data
+            && ctx.enforce_height_gates
+            && !ctx.params.segwit_active_at(ctx.height.0)
+        {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
-        check_witness_commitment_with_wtxids(block, &non_cb)?;
+        if has_commitment || ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates
+        {
+            let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+            check_witness_commitment_with_wtxids(block, &non_cb)?;
+        }
     }
 
     crate::plan_stamp_sub_stats::note_struct_parts(txid_ns, 0, walk_ns);
@@ -190,6 +197,16 @@ pub fn validate_block_structure_with_pres(
     // BIP325 signet solution is not checked here — tip confirm only.
 
     Ok(pres)
+}
+
+fn coinbase_has_witness_commitment(block: &Block) -> bool {
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    block.txdata.first().is_some_and(|cb| {
+        cb.output.iter().any(|o| {
+            let b = o.script_pubkey.as_bytes();
+            b.len() >= 38 && b[0..6] == MAGIC
+        })
+    })
 }
 
 /// True if any input carries witness data.

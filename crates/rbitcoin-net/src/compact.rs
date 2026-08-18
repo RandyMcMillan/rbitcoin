@@ -32,6 +32,23 @@ fn short_id_for_tx(tx: &Transaction, version: u32, keys: (u64, u64)) -> ShortId 
     }
 }
 
+/// Core: prefilled indexes must decode in-range. Out-of-range is a
+/// malformed `cmpctblock` (`p2p_compactblocks` `test_invalid_cmpctblock_message`).
+pub fn prefilled_indexes_ok(hsi: &HeaderAndShortIds) -> bool {
+    let total = hsi.short_ids.len().saturating_add(hsi.prefilled_txs.len());
+    let mut last: Option<usize> = None;
+    for (abs, _) in prefilled_absolute_indexes(hsi) {
+        if abs >= total {
+            return false;
+        }
+        if last.is_some_and(|p| abs <= p) {
+            return false;
+        }
+        last = Some(abs);
+    }
+    true
+}
+
 /// Absolute block indexes of prefilled txs (decode differential encoding).
 pub fn prefilled_absolute_indexes(hsi: &HeaderAndShortIds) -> Vec<(usize, &Transaction)> {
     let mut out = Vec::with_capacity(hsi.prefilled_txs.len());
@@ -460,5 +477,17 @@ mod tests {
         let idxs = prefilled_absolute_indexes(&hsi);
         assert!(!idxs.is_empty());
         assert_eq!(idxs[0].0, 0); // coinbase at abs 0
+        assert!(prefilled_indexes_ok(&hsi));
+
+        let oob = HeaderAndShortIds {
+            header: dummy_header(),
+            nonce: 0,
+            short_ids: vec![],
+            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction {
+                idx: 1,
+                tx: coinbase(),
+            }],
+        };
+        assert!(!prefilled_indexes_ok(&oob));
     }
 }

@@ -185,22 +185,17 @@ pub fn confirm_bq_resolve_wave_with_ids(
     let mut promote: Vec<(u32, ResolvedWire, u64)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
-    let mut by_h: HashMap<u32, (Option<Vec<u8>>, Option<ResolvedWire>)> = HashMap::new();
-    for (h, payload) in intake.raw {
-        by_h.entry(h).or_default().0 = Some(payload);
-    }
+    let raw_h: HashSet<u32> = intake.raw.into_iter().collect();
+    let mut resolved_by_h: HashMap<u32, ResolvedWire> = HashMap::new();
     for (h, wire) in intake.resolved {
-        by_h.entry(h).or_default().1 = Some(wire);
+        resolved_by_h.insert(h, wire);
     }
 
     for &h in heights {
-        let Some(slot) = by_h.remove(&h) else {
-            continue;
-        };
-        let (block, pres) = if let Some(wire) = slot.1 {
+        let (block, pres) = if let Some(wire) = resolved_by_h.remove(&h) {
             (Arc::clone(&wire.block), Arc::clone(&wire.pres))
-        } else {
-            let Some(payload) = slot.0 else {
+        } else if raw_h.contains(&h) {
+            let Ok(Some(payload)) = query.block_queue_raw_payload(h) else {
                 continue;
             };
             let t_dec = Instant::now();
@@ -227,6 +222,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
                 charge,
             ));
             (block, pres)
+        } else {
+            continue;
         };
         let t_col = Instant::now();
         let need = collect_resolve_keys(params, h, block.as_ref(), pres.as_ref());

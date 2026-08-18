@@ -468,6 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn wave_intake_does_not_clone_raw_for_asked_set() {
+        let (dir, q) = temp_query();
+        for h in 0..64u32 {
+            q.block_queue_enqueue(h, [h as u8; 32], 1, &[h as u8; 64])
+                .unwrap();
+        }
+        let asked: Vec<u32> = (0..64).collect();
+        let _ = rbitcoin_store::take_raw_clone_n();
+        let intake = q.block_queue_wave_intake(&asked);
+        assert_eq!(intake.raw.len(), 64, "all still-raw heights classified");
+        assert_eq!(
+            rbitcoin_store::take_raw_clone_n(),
+            0,
+            "wave_intake must not clone raw payloads for the asked set"
+        );
+        for &h in asked.iter().take(16) {
+            assert!(q.block_queue_raw_payload(h).unwrap().is_some());
+        }
+        assert_eq!(
+            rbitcoin_store::take_raw_clone_n(),
+            16,
+            "only the decode prefix may clone"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn block_queue_promote_wave_keeps_resolved_drops_raw() {
         use crate::ResolvedWire;
         use bitcoin::block::{Header, Version};
@@ -510,7 +537,7 @@ mod tests {
         let intake2 = q.block_queue_wave_intake(&[7, 8]);
         assert_eq!(intake2.resolved.len(), 1);
         assert_eq!(intake2.raw.len(), 1);
-        assert_eq!(intake2.raw[0].0, 8);
+        assert_eq!(intake2.raw[0], 8);
         q.block_queue_drop_resolved_from(7);
         assert!(q.block_queue_resolved(7).is_none());
         assert_eq!(q.block_queue_dequeue_height(8).unwrap(), 1);

@@ -1594,7 +1594,7 @@ impl Query {
     /// Raw frame only. `None` when missing or already promoted.
     pub fn block_queue_raw_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
         let g = self.block_queue.lock().unwrap();
-        Ok(g.raw_payloads(&[height]).into_iter().next().map(|(_, p)| p))
+        Ok(g.raw_payload(height))
     }
 
     /// Payload for a block **hash** if present on the RAM queue (any height).
@@ -1675,26 +1675,21 @@ impl Query {
 
     /// One lock: classify `heights` as still-raw vs already promoted.
     ///
-    /// Skips resolve-complete rows. Decode happens **outside** this lock.
+    /// Skips resolve-complete rows. **Does not clone raw payloads.** Decode
+    /// pulls [`Self::block_queue_raw_payload`] per height outside this lock.
     pub fn block_queue_wave_intake(&self, heights: &[u32]) -> BlockQueueWaveIntake {
         let g = self.block_queue.lock().unwrap();
         let mut out = BlockQueueWaveIntake::default();
-        let raw = g.raw_payloads(heights);
-        let raw_h: HashSet<u32> = raw.iter().map(|(h, _)| *h).collect();
         for &h in heights {
             if g.is_resolve_complete(h) {
                 continue;
             }
             if let Some(w) = g.resolved.get(&h) {
                 out.resolved.push((h, w.clone()));
-            } else if raw_h.contains(&h) {
-                continue;
+            } else if g.has_raw(h) {
+                out.raw.push(h);
             }
         }
-        out.raw = raw
-            .into_iter()
-            .filter(|(h, _)| !g.is_resolve_complete(*h))
-            .collect();
         out
     }
 

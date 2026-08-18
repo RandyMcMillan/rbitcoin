@@ -12,9 +12,13 @@ pub struct ResolvedWire {
 }
 
 /// One mutex snapshot of unresolved heights: still-raw vs already promoted.
+///
+/// `raw` is **heights only** — no payload clone. Lookup decodes via
+/// [`crate::Query::block_queue_raw_payload`] per height it will actually
+/// process.
 #[derive(Clone, Debug, Default)]
 pub struct BlockQueueWaveIntake {
-    pub raw: Vec<(u32, Vec<u8>)>,
+    pub raw: Vec<u32>,
     pub resolved: Vec<(u32, ResolvedWire)>,
 }
 

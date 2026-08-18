@@ -563,11 +563,11 @@ pub use confirm_run::{
     confirm_scripts_phase, confirm_scripts_phase_async, confirm_wire_load_from_plan,
     confirm_wire_load_phase, confirm_wire_load_phase_pipelined, confirm_wire_lookup_stamp,
     confirm_wire_run, confirm_wire_run_preverified, confirm_write_phase, join_scripts_polling,
-    lookup_stage_stats, plan_stamp_sub_stats, scripts_feed_test_sync,
-    scripts_stage_from_load_channel, BqResolveWave, BqResolveWaveStats, ConfirmLoadOutcome,
-    ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch, PlanStampOutcome, ScriptOkBatch,
-    ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle, WireLoadPipeline,
-    BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS, BQ_RESOLVE_WAVE_MIN_INPUTS,
+    lookup_stage_stats, plan_stamp_sub_stats, scripts_stage_from_load_channel, BqResolveWave,
+    BqResolveWaveStats, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch,
+    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, ScriptsBatchMeta, ScriptsPhaseHandle,
+    WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
+    BQ_RESOLVE_WAVE_MIN_INPUTS,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

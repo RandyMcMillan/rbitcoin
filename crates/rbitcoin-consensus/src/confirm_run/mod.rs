@@ -61,7 +61,8 @@ use phases::{assemble_run, script_wave};
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
-pub use scripts::scripts_feed_test_sync;
+#[cfg(test)]
+pub use scripts::scripts_stage_from_load_channel_with;
 pub use scripts::{
     confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
     join_scripts_polling, scripts_stage_from_load_channel, ScriptsBatchMeta, ScriptsPhaseHandle,

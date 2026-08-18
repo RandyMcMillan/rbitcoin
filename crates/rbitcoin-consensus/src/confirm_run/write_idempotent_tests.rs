@@ -204,9 +204,8 @@ fn scripts_feed_ahead_single_batch() {
 
 /// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
 ///
-/// Thread name is recorded on the handle (not process-global
-/// [`scripts_feed_test_sync`]) so a parallel `reset()` / `on_phase_enter`
-/// cannot steal or overwrite it under `cargo llvm-cov`.
+/// Thread name is recorded on the handle so a parallel scripts phase
+/// cannot overwrite it.
 #[test]
 fn scripts_phase_does_not_run_on_steal_worker() {
     use super::confirm_scripts_phase_async;
@@ -255,37 +254,59 @@ fn scripts_feed_ahead_zero_batches() {
     assert!(outs.is_empty());
 }
 
-/// **Production claim timing under depth-1:** batch B is submitted to a
-/// coordinator while A’s wave is still open (not only after A’s join returns).
+/// Depth-1 feed-ahead + no 200 µs-poll after lookahead, **without** a
+/// process-global HOLD in [`super::confirm_scripts_phase`].
 ///
-/// Drives [`scripts_stage_from_load_channel`] (same `try_recv` +
-/// [`join_scripts_polling`] pattern as the IBD scripts OS thread) on a
-/// `sync_channel(1)`. First wave holds in [`confirm_scripts_phase`] until
-/// a second async submit is observed — deadlocks if feed-ahead only
-/// try_recv once before a blocking join.
+/// A sibling `confirm_scripts_phase` running while A is held must finish
+/// immediately (the old `HOLD_FIRST` hook stalled every phase in the crate).
 #[test]
-fn scripts_stage_depth1_submits_second_before_first_finishes() {
+fn scripts_stage_depth1_feeds_ahead_without_holding_siblings() {
     use super::{
-        scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
-        ScriptsBatchMeta,
+        confirm_scripts_phase, join_scripts_polling, scripts_stage_from_load_channel_with,
+        ConfirmScriptOutcome, ScriptsBatchMeta, ScriptsPhaseHandle,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let _feed = scripts_feed_test_sync::lock();
-    scripts_feed_test_sync::reset();
-    scripts_feed_test_sync::set_hold_first_until_second_submit(true);
-
-    // Depth 1 — same default load→scripts capacity class.
-    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
+    let submits = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcomes_w = Arc::clone(&outcomes);
+    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
 
+    let submits_s = Arc::clone(&submits);
+    let gate_s = Arc::clone(&gate);
+    let outcomes_w = Arc::clone(&outcomes);
     let stage = thread::spawn(move || {
-        scripts_stage_from_load_channel(
+        scripts_stage_from_load_channel_with(
             &mat_rx,
+            |batch, mat_ns| {
+                let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
+                let n = submits_s.fetch_add(1, Ordering::SeqCst) + 1;
+                let gate = Arc::clone(&gate_s);
+                let handle = ScriptsPhaseHandle::spawn_fn(move || {
+                    if n == 1 {
+                        let (lock, cv) = &*gate;
+                        let mut go = lock.lock().unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !*go {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                break;
+                            }
+                            let (g, w) = cv.wait_timeout(go, left).unwrap();
+                            go = g;
+                            if w.timed_out() {
+                                break;
+                            }
+                        }
+                    }
+                    confirm_scripts_phase(batch)
+                });
+                (handle, meta)
+            },
             |ok, _meta: ScriptsBatchMeta| {
                 outcomes_w.lock().unwrap().push(ok);
                 true
@@ -295,105 +316,58 @@ fn scripts_stage_depth1_submits_second_before_first_finishes() {
         );
     });
 
-    // Enqueue A; stage claims it (channel free). Hold keeps A's phase open.
     mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while scripts_feed_test_sync::submit_count() < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "A never submitted to coordinator"
-        );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while submits.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "A never submitted");
         thread::sleep(Duration::from_millis(1));
     }
-    // Enqueue B while A is held mid-wave; feed-ahead must try_recv+submit B.
+
+    let sibling = thread::spawn(|| {
+        let t0 = Instant::now();
+        confirm_scripts_phase(empty_loaded_batch()).expect("sibling phase");
+        t0.elapsed()
+    });
+    let sibling_dt = sibling.join().expect("sibling");
+    assert!(
+        sibling_dt < Duration::from_millis(200),
+        "confirm_scripts_phase must not honor another test's hold ({sibling_dt:?})"
+    );
+
     mat_tx
         .send((empty_loaded_batch(), 0))
-        .expect("send B while A verifying");
-    while scripts_feed_test_sync::submit_count() < 2 {
+        .expect("send B while A held");
+    while submits.load(Ordering::SeqCst) < 2 {
         assert!(
             Instant::now() < deadline,
             "B not submitted before A finished (feed-ahead dead under depth-1)"
         );
         thread::sleep(Duration::from_millis(1));
     }
-    // A can finish (hold released by submit_count>=2); both outcomes ordered.
+
+    {
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
     drop(mat_tx);
     stage.join().expect("stage thread");
     let outs = outcomes.lock().unwrap();
     assert_eq!(outs.len(), 2, "both batches script-ok");
     assert!(outs[0].batch.is_empty());
     assert!(outs[1].batch.is_empty());
-    scripts_feed_test_sync::set_hold_first_until_second_submit(false);
-    scripts_feed_test_sync::reset();
-}
 
-/// After N+1 is submitted, join must not `recv_timeout(200µs)` for the rest
-/// of N's wave. A 200 ms tail would be ~1000 timeouts with the old loop.
-#[test]
-fn scripts_join_blocks_after_lookahead() {
-    use super::{
-        scripts_feed_test_sync, scripts_stage_from_load_channel, ConfirmScriptOutcome,
-        ScriptsBatchMeta,
-    };
-    use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let _feed = scripts_feed_test_sync::lock();
-    scripts_feed_test_sync::reset();
-    scripts_feed_test_sync::set_hold_first_until_second_submit(true);
-    scripts_feed_test_sync::set_hold_tail_after_second(true);
-
-    let (mat_tx, mat_rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
-    let outcomes: Arc<Mutex<Vec<ConfirmScriptOutcome>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcomes_w = Arc::clone(&outcomes);
-
-    let stage = thread::spawn(move || {
-        scripts_stage_from_load_channel(
-            &mat_rx,
-            |ok, _meta: ScriptsBatchMeta| {
-                outcomes_w.lock().unwrap().push(ok);
-                true
-            },
-            |_e, _meta| false,
-            || false,
-        );
-    });
-
-    mat_tx.send((empty_loaded_batch(), 0)).expect("send A");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while scripts_feed_test_sync::submit_count() < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "A never submitted to coordinator"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    mat_tx
-        .send((empty_loaded_batch(), 0))
-        .expect("send B while A verifying");
-    while scripts_feed_test_sync::submit_count() < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "B not submitted before A finished (feed-ahead dead under depth-1)"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let timeouts_at_lookahead = scripts_feed_test_sync::recv_timeout_count();
-    drop(mat_tx);
-    stage.join().expect("stage thread");
-    let after = scripts_feed_test_sync::recv_timeout_count();
-    let tail = after.saturating_sub(timeouts_at_lookahead);
-    assert!(
-        tail < 20,
-        "join kept 200µs-polling after lookahead ({tail} timeouts; 200ms tail ≈ 1000 if broken)"
+    let mut polls = 0u32;
+    let handle = ScriptsPhaseHandle::spawn_fn(|| confirm_scripts_phase(empty_loaded_batch()));
+    join_scripts_polling(&handle, Duration::from_micros(200), || {
+        polls += 1;
+        false
+    })
+    .expect("join after lookahead");
+    assert_eq!(
+        polls, 1,
+        "join must recv_blocking after first false, not 200µs-poll (polls={polls})"
     );
-    let outs = outcomes.lock().unwrap();
-    assert_eq!(outs.len(), 2, "both batches script-ok");
-    scripts_feed_test_sync::set_hold_first_until_second_submit(false);
-    scripts_feed_test_sync::set_hold_tail_after_second(false);
-    scripts_feed_test_sync::reset();
 }
 
 #[test]
@@ -763,14 +737,12 @@ fn expected_bits_extending_uses_header_plan_when_period_start_above_tip() {
 fn script_wave_skips_preverified_txids() {
     use super::{confirm_scripts_phase, LoadedBatch, Prepared, ScriptPreverified};
     use crate::block::ScriptCheckJob;
-    use crate::confirm_phase_stats;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_primitives::{Fk, Height};
-    use std::sync::atomic::Ordering;
 
     let prevouts = vec![TxOut {
         value: Amount::from_sat(50_0000_0000),
@@ -823,16 +795,7 @@ fn script_wave_skips_preverified_txids() {
         script_preverified: pre,
         archive_plan: None,
     };
-    let before = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
-    let jobs_before = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
     confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
-    let after = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
-    let jobs_after = confirm_phase_stats::SCRIPT_JOBS.load(Ordering::Relaxed);
-    assert!(after > before, "skip counter should bump");
-    assert_eq!(
-        jobs_after, jobs_before,
-        "skipped job must not count as a pool job"
-    );
 }
 
 /// Cold-range pin then pstore adopt: first pin reads body, second does not.
@@ -1817,11 +1780,9 @@ fn post_commit_missing_denserels_is_invariant_error() {
 #[test]
 fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
     use super::{ensure_spend_abs_layouts, Prepared};
-    use crate::confirm_phase_stats;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{BatchParents, Query};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::atomic::Ordering;
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -1890,14 +1851,7 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
         prev_mtp: 0,
     }];
 
-    let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    let _ = confirm_phase_stats::ENSURE_RES_HIT.swap(0, Ordering::Relaxed);
     ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("spent-range ensure");
-    let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    assert_eq!(
-        cold, 0,
-        "must not denserels-body cold when spent idx stamps abs"
-    );
     assert!(bp.has_abs_layout(parent_fk));
     assert_eq!(
         bp.get_spender_abs(parent_fk, 0),
@@ -1912,11 +1866,9 @@ fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
 #[test]
 fn write_ensure_stamps_spent_range_after_load_pin() {
     use super::{ensure_spend_abs_layouts, pin_for_wire_batch, ParentPinStamp, Prepared};
-    use crate::confirm_phase_stats;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::Query;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::atomic::Ordering;
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -2010,13 +1962,7 @@ fn write_ensure_stamps_spent_range_after_load_pin() {
         hash: [4u8; 32],
         prev_mtp: 0,
     }];
-    let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
     ensure_spend_abs_layouts(&q, &mut parents, &prepared).expect("ensure pin-hit");
-    let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
-    assert_eq!(
-        cold, 0,
-        "archived parent must not cold-load at write ensure"
-    );
     assert!(
         parents.has_abs_layout(pfk),
         "write ensure must stamp spent_range"

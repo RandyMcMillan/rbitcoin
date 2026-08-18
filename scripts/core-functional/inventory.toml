@@ -152,9 +152,7 @@ reason = "core-log"
 
 [[test]]
 name = "feature_filelock.py"
-status = "skip"
-reason = "core-internal"
-analog = "second process refuses same datadir (TODO)"
+status = "run"
 
 [[test]]
 name = "feature_framework_miniwallet.py"
@@ -852,9 +850,7 @@ status = "run"
 
 [[test]]
 name = "rpc_decodescript.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: Core decodescript field parity (method exists)"
+status = "run"
 
 [[test]]
 name = "rpc_deprecated.py"
@@ -899,9 +895,7 @@ analog = "official: Method not found: getblockfrompeer (rpc_getblockfrompeer.py:
 
 [[test]]
 name = "rpc_getblockstats.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "official: FileNotFoundError renaming blk00000.dat after stats/genesis/OP_RETURN/header-only passed (store/, not Core blocksdir)"
+status = "run"
 
 [[test]]
 name = "rpc_getchaintips.py"

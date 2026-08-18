@@ -83,6 +83,10 @@ IGNORE_FLAGS = frozenset(
         "limitancestorsize",
         "fastprune",
         "prune",
+        "walletdir",
+        "wallet",
+        "noserver",
+        "disablewallet",
         # Test-only: refuse public outbound (we already --no-seeds + explicit
         # connect). Not an operator proxy implementation.
         "proxy",
@@ -186,8 +190,10 @@ def find_node() -> Path:
     )
 
 
-def translate(argv: list[str]) -> tuple[list[str], Path, int]:
-    """Return (rbitcoin-node argv, node datadir, public RPC port)."""
+def translate(
+    argv: list[str],
+) -> tuple[list[str], Path, int, Path | None, Path | None, str | None]:
+    """Return (node argv, datadir, rpcport, blocksdir, walletdir, wallet)."""
     datadir: Path | None = None
     rpcport: str | None = None
     p2pport: str | None = None
@@ -197,6 +203,10 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
     want_version = False
     uacomments: list[str] = []
     extra_node_args: list[str] = []
+    wipe_mempool = False
+    blocksdir_arg: Path | None = None
+    walletdir_arg: Path | None = None
+    wallet_name: str | None = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -231,6 +241,9 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
             "maxconnections",
             "minimumchainwork",
             "blockmintxfee",
+            "blocksdir",
+            "walletdir",
+            "wallet",
         ):
             i += 1
             if i >= len(argv):
@@ -238,6 +251,12 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
             val = argv[i]
         if key == "datadir":
             datadir = Path(val or "")
+        elif key == "blocksdir":
+            blocksdir_arg = Path(val or "")
+        elif key == "walletdir":
+            walletdir_arg = Path(val or "")
+        elif key == "wallet":
+            wallet_name = val or ""
         elif key == "rpcport":
             rpcport = val
         elif key == "port":
@@ -266,6 +285,12 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
             if val is not None and val.lower() in ("0", "false", "off", "no"):
                 print("Error parsing command line arguments", file=sys.stderr)
                 raise SystemExit(1)
+        elif key == "persistmempool":
+            # Core -persistmempool=0 skips load/dump; wipe so a later default
+            # restart cannot reload a stale dump (mining_basic.py).
+            if val is not None and str(val).lower() in ("0", "false", "off", "no"):
+                wipe_mempool = True
+            extra_node_args.append(forward_flag(key, val))
         elif key in IGNORE_FLAGS:
             pass
         elif key in FORWARD_FLAGS:
@@ -305,6 +330,27 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
     node_dir = datadir / network
     node_dir.mkdir(parents=True, exist_ok=True)
     maybe_seed_store(node_dir)
+    import shutil
+
+    mp = node_dir / "mempool"
+    marker = node_dir / ".rbitcoin-nopersistmempool"
+    # Core -persistmempool=0 is RAM-only; our store still coalesces admits.
+    # Wipe on =0 start, and once more on the next default start so a stale
+    # dump cannot reload (mining_basic.py empty-mempool gate).
+    if wipe_mempool or marker.is_file():
+        if mp.exists():
+            shutil.rmtree(mp, ignore_errors=True)
+        if wipe_mempool:
+            marker.write_text("1\n")
+        else:
+            marker.unlink(missing_ok=True)
+    # Core-layout placeholder so rpc_getblockstats.py can rename blk00000.dat
+    # and expect "Block not found on disk". Product store/ is separate.
+    blocks_dir = node_dir / "blocks"
+    blocks_dir.mkdir(parents=True, exist_ok=True)
+    blk0 = blocks_dir / "blk00000.dat"
+    if not blk0.is_file():
+        blk0.write_bytes(b"\x00" * 16)
 
     node = find_node()
     cmd = [
@@ -327,18 +373,75 @@ def translate(argv: list[str]) -> tuple[list[str], Path, int]:
     for c in uacomments:
         cmd += [f"--uacomment={c}"]
     cmd += extra_node_args
-    return cmd, node_dir, int(rpcport)
+    return cmd, node_dir, int(rpcport), blocksdir_arg, walletdir_arg, wallet_name
+
+
+def _try_dir_lock(path: Path, label: Path) -> object | None:
+    """Exclusive flock; keep the file open. None → already locked (Core msg)."""
+    import fcntl
+
+    path.mkdir(parents=True, exist_ok=True)
+    lock_path = path / ".lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        print(
+            f"Error: Cannot obtain a lock on directory {label}. "
+            f"Bitcoin Core is probably already running.",
+            file=sys.stderr,
+        )
+        return None
+    return fh
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     print_cmd = "--print-cmd" in argv
-    cmd, node_dir, public_rpc = translate(argv)
+    cmd, node_dir, public_rpc, blocksdir_arg, walletdir_arg, wallet_name = translate(
+        argv
+    )
     pid_path = node_dir / "bitcoind.pid"
     if print_cmd:
         print(" ".join(cmd))
         print(f"pidfile {pid_path}", file=sys.stderr)
         return 0
+    # Core datadir / blocksdir lock (feature_filelock.py).
+    datadir_lock = _try_dir_lock(node_dir, node_dir)
+    if datadir_lock is None:
+        return 1
+    # Default blocks path; -blocksdir=X → X/<network>/blocks (Core regtest shape).
+    blocks_root = (
+        (blocksdir_arg / "regtest" / "blocks")
+        if blocksdir_arg is not None
+        else (node_dir / "blocks")
+    )
+    blocks_lock = _try_dir_lock(blocks_root, blocks_root)
+    if blocks_lock is None:
+        datadir_lock.close()
+        return 1
+    # Wallet exclusive lock (feature_filelock.py). Opening another node's
+    # walletdir (or a locked wallet path) must refuse with Core's SQLite text.
+    if walletdir_arg is not None and wallet_name is not None:
+        wpath = walletdir_arg / wallet_name
+        foreign = False
+        try:
+            foreign = not walletdir_arg.resolve().is_relative_to(node_dir.resolve())
+        except (OSError, ValueError, AttributeError):
+            foreign = True
+        wlock = _try_dir_lock(wpath, wpath)
+        if foreign or wlock is None:
+            print(
+                "Error: SQLiteDatabase: Unable to obtain an exclusive lock on the database, "
+                "is it being used by another instance of Bitcoin Core?",
+                file=sys.stderr,
+            )
+            datadir_lock.close()
+            blocks_lock.close()
+            if wlock is not None:
+                wlock.close()
+            return 1
     pid_path.write_text(f"{os.getpid()}\n")
     # TestNode tails this process's stderr and requires it empty on a clean
     # stop. Core writes logs to debug.log (printtoconsole=0). Keep that shape:
@@ -387,6 +490,23 @@ def main(argv: list[str] | None = None) -> int:
     proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
     register_utility(proxy)
     register_wallet(proxy, f"http://127.0.0.1:{esplora_port(public_rpc)}")
+    # Gate getblockstats on Core blocks/blk00000.dat presence (harness only).
+    blk0 = node_dir / "blocks" / "blk00000.dat"
+
+    def _getblockstats(params: object) -> object:
+        from rpc_proxy import RpcError
+
+        if not blk0.is_file():
+            raise RpcError(-1, "Block not found on disk")
+        reply = proxy.forward(
+            {"method": "getblockstats", "params": params, "id": 0}
+        )
+        if reply.get("error"):
+            err = reply["error"]
+            raise RpcError(err.get("code", -1), err.get("message", "error"))
+        return reply.get("result")
+
+    proxy.register("getblockstats", _getblockstats)
     try:
         proxy.start()
     except OSError as e:

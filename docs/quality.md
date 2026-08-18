@@ -79,11 +79,10 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 35 / 268.** Next: leftover P2P (`p2p_invalid_messages`) and `rpc-missing` / `core-log` that still match claimed node/P2P/miner surface. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-50** | Perf meter residual coverage | ops | On a saturated confirm thread, the named `ibd: perf` sub-meters account for (nearly) all busy wall. 2026-08-18 mainnet run: lookup 5.15s busy vs 1.76s metered, write 5.05s vs 2.39s, `stamp_sub batch=` 854ms wall vs ~170ms subs — both perf audits this week spent most of their effort attributing dark time. Done: an explicit residual per stage wall (wall − named subs ≈ 0), same-commit rule as the AGENTS timer inventory |
 | 4 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed. Q-50 adds meters on DEBUG/`tip: perf`, never more INFO |
-| 5 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
-| 6 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
-| 7 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 8 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
-| 9 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-18 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.5k**, `peer` **4.3k**, `query/lib` **3.7k**, `scripthash` **3.5k**, `electrum/server` **3.3k**, `chain` **3.1k**, `store` **3.0k**, `ibd/perf_log` **2.6k** (new entrant; grows with every perf PR — Q-50 is its seam). No drive-by splits |
+| 5 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
+| 6 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 7 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
+| 8 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-18 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.5k**, `peer` **4.3k**, `query/lib` **3.7k**, `scripthash` **3.5k**, `electrum/server` **3.3k**, `chain` **3.1k**, `store` **3.0k**, `ibd/perf_log` **2.6k** (new entrant; grows with every perf PR — Q-50 is its seam). No drive-by splits |
 
 ### Still valid? (this reaudit)
 
@@ -99,8 +98,8 @@ artifacts).
 | **Q-41** | Keep rank 2. **35** `run` holds; 232 skips (68 `no-wallet`, 53 `rpc-missing`, 32 `core-log`). `rpc-missing` + `core-log` remain the only growth matching claimed surface. |
 | **Q-50** | **New, rank 3.** Confirm perf program (#117–#126) raised IBD 3.9 → 6.4 blk/s, but both remaining saturated threads are >50% unmetered — every reaudit re-derives the same dark time. Cheapest leverage on the active program. |
 | **Q-36** | Keep. IBD/tip INFO is still a firehose; perf lines are ~2.5 KB each. |
-| **Q-49** | Keep, raised above Q-48 (operator-affecting now vs blocked upstream). |
-| **Q-48** | Keep, lowered. Waits on rust-bitcoin (**RB-007**). |
+| **Q-49** | **Closed.** `x809` DNS + `P2P_V2` gossip + skip known-v1 while better addrs remain. |
+| **Q-48** | Keep, now rank 5. Waits on rust-bitcoin (**RB-007**). |
 | **Q-31** | Keep. Useful for Q-30; not blocking operators. |
 | **Q-34** | Keep. Onboarding still medium. |
 | **R-10** | Keep last, list refreshed. `peer` **4.3k** and `ibd/perf_log` **2.6k** joined the giants with the perf program; peel only when Q-50/Q-41 need a seam. |
@@ -152,6 +151,7 @@ findings 001–021, CI split, map-free README, …) live in
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-49** | v2-only peer discovery | `x809.<seed>` first, then unfiltered; `addr`/`addrv2` requires `P2P_V2`; dial skips `INCOMPATIBLE` while any better addr remains. Owner: [`OPERATOR.md`](../OPERATOR.md) § P2P + `seeds.rs` |
 | **Q-47** | Honest `getblockchaininfo` disk / progress | Store file walk + `blocks/headers` (not dummy 0 / 0.5) |
 | **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
 | **—** | Docs map + one owner per fact | `docs/README.md`; folded store-format / startup-states / future-features / COVERAGE (`#81`) |

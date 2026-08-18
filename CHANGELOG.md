@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
+  decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`
+  again (`stamp_sub struct_txid=` is 0 on IBD). BQ is not a decoded stash
+  after `take_raw`.
+
 - **Confirm queue caps:** `loadq=14` · `scriptq=4` · `writeq=14`
   (was loadq=8 · writeq=20).
 

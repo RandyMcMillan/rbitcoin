@@ -52,6 +52,12 @@ wire / body-queue
   → abs spend annotate (put_spend_batch_by_abs_meta on spent.body only)
 ```
 
+IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
+`take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
+run on the **load** thread and consume `LoadBatch.pres` — they do not read
+`block_queue_resolved`. Leftover TipOnly on that stamp is still **lookup-stage
+IO** (head / idx), not load pin.
+
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
 | **lookup** | `tx.head`, `txout.idx` / `spent.idx` (fk + ranges), `txid.body`, headers | **`txout`/`inwit` decode** |

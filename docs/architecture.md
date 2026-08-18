@@ -28,10 +28,10 @@ the linked owner docs.
 ```
 
 **IBD height-ordered path (current):** peer **offers raw framed wire into the
-body queue** and notes readiness on the confirm feed; confirm **lookup** decodes
-and promotes to decoded-only; **load** takes that `Arc<Block>`, **scripts** are
-pure CPU, **write** is the only Class A appender and dequeues the body-queue
-entry after tip advance.
+body queue** and notes readiness on the confirm feed; confirm **lookup** decodes,
+TipOnly-resolves, and **`take_raw` onto loadq**; **load** stamps with that
+`pres` then pins; **scripts** are pure CPU; **write** is the only Class A
+appender. Roles: [`concurrency.md`](./concurrency.md).
 
 **Invariant — Class A never leads tip:** there is no dual-track “archive Class A
 far ahead of confirmed tip.” Wire plan + Class A append + Class C tip advance

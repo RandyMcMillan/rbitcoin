@@ -449,7 +449,7 @@ pub(crate) async fn spawn_peer(
     })
 }
 
-/// IPv4/IPv6 sockets with full/limited network service from classic `addr`.
+/// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
 fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<SocketAddr> {
     let mut out = Vec::with_capacity(list.len().min(32));
     for (_ts, a) in list {
@@ -465,7 +465,7 @@ fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec
     out
 }
 
-/// IPv4/IPv6 sockets with full/limited network service from `addrv2`.
+/// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
 fn socket_addrs_from_addrv2(list: &[bitcoin::p2p::address::AddrV2Message]) -> Vec<SocketAddr> {
     let mut out = Vec::with_capacity(list.len().min(32));
     for a in list {
@@ -482,7 +482,8 @@ fn socket_addrs_from_addrv2(list: &[bitcoin::p2p::address::AddrV2Message]) -> Ve
 }
 
 fn services_useful_for_ibd(flags: ServiceFlags) -> bool {
-    flags.has(ServiceFlags::NETWORK) || flags.has(ServiceFlags::NETWORK_LIMITED)
+    (flags.has(ServiceFlags::NETWORK) || flags.has(ServiceFlags::NETWORK_LIMITED))
+        && flags.has(ServiceFlags::P2P_V2)
 }
 
 fn usable_dial_addr(sa: &SocketAddr) -> bool {
@@ -531,9 +532,16 @@ mod tests {
 
     #[test]
     fn usable_dial_and_services_filters() {
-        assert!(services_useful_for_ibd(ServiceFlags::NETWORK));
-        assert!(services_useful_for_ibd(ServiceFlags::NETWORK_LIMITED));
+        assert!(!services_useful_for_ibd(ServiceFlags::NETWORK));
+        assert!(!services_useful_for_ibd(ServiceFlags::NETWORK_LIMITED));
+        assert!(!services_useful_for_ibd(ServiceFlags::P2P_V2));
         assert!(!services_useful_for_ibd(ServiceFlags::NONE));
+        assert!(services_useful_for_ibd(
+            ServiceFlags::NETWORK | ServiceFlags::P2P_V2
+        ));
+        assert!(services_useful_for_ibd(
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::P2P_V2
+        ));
 
         let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         assert!(usable_dial_addr(&good));
@@ -607,29 +615,39 @@ mod tests {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
         use bitcoin::p2p::ServiceFlags;
 
+        let v2_net = ServiceFlags::NETWORK | ServiceFlags::P2P_V2;
+        let v2_limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::P2P_V2;
         let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let limited_sa = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333);
         let no_svc = Address::new(&good, ServiceFlags::NONE);
-        let net = Address::new(&good, ServiceFlags::NETWORK);
-        let limited = Address::new(
-            &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333),
-            ServiceFlags::NETWORK_LIMITED,
-        );
+        let net_only = Address::new(&good, ServiceFlags::NETWORK);
+        let net_v2 = Address::new(&good, v2_net);
+        let limited_only = Address::new(&limited_sa, ServiceFlags::NETWORK_LIMITED);
+        let limited_v2 = Address::new(&limited_sa, v2_limited);
         let unusable = Address::new(
             &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333),
-            ServiceFlags::NETWORK,
+            v2_net,
         );
-        let out = socket_addrs_from_addr(&[(1, no_svc), (2, net), (3, limited), (4, unusable)]);
-        assert_eq!(out.len(), 2);
-        assert!(out.contains(&good));
-        assert!(out.contains(&SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
-            8333
-        )));
+        let out = socket_addrs_from_addr(&[
+            (1, no_svc),
+            (2, net_only),
+            (3, net_v2),
+            (4, limited_only),
+            (5, limited_v2),
+            (6, unusable),
+        ]);
+        assert_eq!(out, vec![good, limited_sa]);
 
         let v2_good = AddrV2Message {
             time: 1,
-            services: ServiceFlags::NETWORK,
+            services: v2_net,
             addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+            port: 18444,
+        };
+        let v2_net_only = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 8)),
             port: 18444,
         };
         let v2_bad_svc = AddrV2Message {
@@ -640,25 +658,26 @@ mod tests {
         };
         let v2_zero_port = AddrV2Message {
             time: 1,
-            services: ServiceFlags::NETWORK,
+            services: v2_net,
             addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 11)),
             port: 0,
         };
-        let out2 = socket_addrs_from_addrv2(&[v2_good, v2_bad_svc, v2_zero_port]);
-        assert_eq!(out2.len(), 1);
+        let out2 = socket_addrs_from_addrv2(&[v2_good, v2_net_only, v2_bad_svc, v2_zero_port]);
         assert_eq!(
-            out2[0],
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 18444)
+            out2,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                18444
+            )]
         );
 
-        // IPv6 multicast rejected; IPv6 limited-network accepted.
         let v6_multi =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8333);
         assert!(!usable_dial_addr(&v6_multi));
         let v6_net = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333);
         let v2_v6 = AddrV2Message {
             time: 1,
-            services: ServiceFlags::NETWORK_LIMITED,
+            services: v2_limited,
             addr: AddrV2::Ipv6(Ipv6Addr::LOCALHOST),
             port: 8333,
         };

@@ -767,32 +767,53 @@ impl ConfirmQueueDepths {
 /// Operator line for load stamp reject. Stamp-stage `missing prevout` is the
 /// leftover TipOnly miss remapped from `parent create_fk unresolved` — name
 /// that so a race is not logged as a bare invalid-block.
+pub(crate) fn format_stamp_reject_missing_prevout(
+    leftover_n: u64,
+    leftover_hit: u64,
+    miss_n: u64,
+    miss_txid: Option<[u8; 32]>,
+    pending: bool,
+    miss_on: Option<&str>,
+    miss_cands: u64,
+    diag: bool,
+) -> String {
+    let mut s = format!(
+        "missing prevout (leftover parent create_fk unresolved leftover_n={leftover_n} leftover_hit={leftover_hit}"
+    );
+    if miss_n > 0 {
+        s.push_str(&format!(" miss_n={miss_n}"));
+        if let Some(raw) = miss_txid {
+            s.push_str(&format!(
+                " miss_txid={}",
+                bitcoin::Txid::from_byte_array(raw)
+            ));
+        }
+        s.push_str(&format!(" pending={}", u8::from(pending)));
+        if let Some(on) = miss_on {
+            s.push_str(&format!(" miss_on={on} miss_cands={miss_cands}"));
+        }
+        if diag {
+            s.push_str(" diag=1");
+        }
+    }
+    s.push(')');
+    s
+}
+
 pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
     if err == "missing prevout" {
         let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
         let miss = rbitcoin_query::archive_phase_stats::last_union_miss();
-        let mut s = format!(
-            "{err} (leftover parent create_fk unresolved leftover_n={} leftover_hit={}",
-            last.head_need, last.head_hit
-        );
-        if miss.n > 0 {
-            s.push_str(&format!(" miss_n={}", miss.n));
-            if let Some(raw) = miss.txid {
-                s.push_str(&format!(
-                    " miss_txid={}",
-                    bitcoin::Txid::from_byte_array(raw)
-                ));
-            }
-            s.push_str(&format!(" pending={}", u8::from(miss.pending)));
-            if let Some(on) = miss.miss_on {
-                s.push_str(&format!(" miss_on={} miss_cands={}", on, miss.miss_cands));
-            }
-            if rbitcoin_store::leftover_probe_diag_ready() {
-                s.push_str(" diag=1");
-            }
-        }
-        s.push(')');
-        s
+        format_stamp_reject_missing_prevout(
+            last.head_need,
+            last.head_hit,
+            miss.n,
+            miss.txid,
+            miss.pending,
+            miss.miss_on,
+            miss.miss_cands,
+            rbitcoin_store::leftover_probe_diag_ready(),
+        )
     } else {
         err.to_string()
     }
@@ -876,7 +897,7 @@ pub(crate) mod confirm_thr_stats {
     static WRITE_WORK_NS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
-    fn add(a: &AtomicU64, d: Duration) {
+    pub(crate) fn add(a: &AtomicU64, d: Duration) {
         let ns = d.as_nanos() as u64;
         if ns > 0 {
             a.fetch_add(ns, Ordering::Relaxed);

@@ -1,7 +1,8 @@
 //! tests (peeled from ibd/confirm.rs).
 
 use super::{
-    format_conf_q, format_queue_depth, stamp_reject_operator_msg, ConfirmFeed, ConfirmQueueDepths,
+    format_conf_q, format_queue_depth, format_stamp_reject_missing_prevout,
+    stamp_reject_operator_msg, ConfirmFeed, ConfirmQueueDepths,
 };
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -529,18 +530,25 @@ fn queue_load_send_saturates_wire_and_parents() {
 }
 
 #[test]
-fn thr_stats_sample_and_reset() {
+fn thr_stats_add_is_local() {
     use super::confirm_thr_stats;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
-    let _ = confirm_thr_stats::sample_and_reset(); // clear
-    confirm_thr_stats::add_load_clone(Duration::from_millis(5));
-    confirm_thr_stats::add_load_recv_wait(Duration::from_millis(20));
-    let s = confirm_thr_stats::sample_and_reset();
-    assert!(s.load_clone_ns >= 5_000_000);
-    assert!(s.load_recv_wait_ns >= 20_000_000);
-    assert_eq!(s.lookup_stamp_ns, 0);
-    let z = confirm_thr_stats::sample_and_reset();
-    assert_eq!(z.load_clone_ns, 0);
+    let a = AtomicU64::new(0);
+    confirm_thr_stats::add(&a, Duration::from_millis(5));
+    confirm_thr_stats::add(&a, Duration::from_millis(20));
+    assert!(a.load(Ordering::Relaxed) >= 25_000_000);
+    let before = a.load(Ordering::Relaxed);
+    confirm_thr_stats::add(&a, Duration::ZERO);
+    assert_eq!(
+        a.load(Ordering::Relaxed),
+        before,
+        "zero duration is a no-op"
+    );
+    assert_eq!(
+        confirm_thr_stats::script_work_from_verify_ns(2_000),
+        Duration::from_nanos(2_000)
+    );
 }
 
 #[test]
@@ -567,9 +575,10 @@ fn stamp_reject_names_union_miss_txid() {
     let mut raw = [0u8; 32];
     raw[0] = 0xab;
     raw[31] = 0xcd;
-    rbitcoin_query::archive_phase_stats::note_resolve_counts(1, 1, 1914, 1913, 0, 0);
-    rbitcoin_query::archive_phase_stats::note_union_miss(raw, 1, true, Some("head"), 0);
-    let msg = stamp_reject_operator_msg("missing prevout");
+    let msg =
+        format_stamp_reject_missing_prevout(1914, 1913, 1, Some(raw), true, Some("head"), 0, false);
+    assert!(msg.contains("leftover_n=1914"), "{msg}");
+    assert!(msg.contains("leftover_hit=1913"), "{msg}");
     assert!(msg.contains("miss_n=1"), "{msg}");
     assert!(msg.contains("miss_txid="), "{msg}");
     assert!(msg.contains("pending=1"), "{msg}");
@@ -845,59 +854,9 @@ fn claim_feed_skips_inflight_and_confirmed_in_helper() {
     assert!(claim_feed_run(1, 0, 100, |_| true, |_| false).is_empty());
 }
 
-/// All thr_stats counters + zero-duration no-op + note_wire prefer path.
+/// note_wire prefer path (instance-local; not process-global thr_stats).
 #[test]
 fn thr_stats_all_stages_and_note_wire_prefer() {
-    use super::confirm_thr_stats;
-    use std::time::Duration;
-    let _ = confirm_thr_stats::sample_and_reset();
-    // Zero duration must not bump counters.
-    confirm_thr_stats::add_lookup_claim(Duration::ZERO);
-    confirm_thr_stats::add_write_work(Duration::ZERO);
-    let z = confirm_thr_stats::sample_and_reset();
-    assert_eq!(z.lookup_claim_ns, 0);
-    assert_eq!(z.write_work_ns, 0);
-
-    let d = Duration::from_nanos(1_000);
-    confirm_thr_stats::add_lookup_claim(d);
-    confirm_thr_stats::add_lookup_stamp(d);
-    confirm_thr_stats::add_lookup_other(d);
-    confirm_thr_stats::add_lookup_send_wait(d);
-    confirm_thr_stats::add_load_recv_wait(d);
-    confirm_thr_stats::add_load_pack(d);
-    confirm_thr_stats::add_load_clone(d);
-    confirm_thr_stats::add_load_stamp(d);
-    confirm_thr_stats::add_load_pin(d);
-    confirm_thr_stats::add_load_asm(d);
-    confirm_thr_stats::add_load_prune(d);
-    confirm_thr_stats::add_load_send_wait(d);
-    confirm_thr_stats::add_script_recv_wait(d);
-    confirm_thr_stats::add_script_work(d);
-    confirm_thr_stats::add_script_send_wait(d);
-    confirm_thr_stats::add_write_recv_wait(d);
-    confirm_thr_stats::add_write_work(d);
-    let s = confirm_thr_stats::sample_and_reset();
-    assert!(s.lookup_claim_ns >= 1_000);
-    assert!(s.lookup_stamp_ns >= 1_000);
-    assert!(s.lookup_other_ns >= 1_000);
-    assert!(s.lookup_send_wait_ns >= 1_000);
-    assert!(s.load_recv_wait_ns >= 1_000);
-    assert!(s.load_pack_ns >= 1_000);
-    assert!(s.load_clone_ns >= 1_000);
-    assert!(s.load_stamp_ns >= 1_000);
-    assert!(s.load_pin_ns >= 1_000);
-    assert!(s.load_asm_ns >= 1_000);
-    assert!(s.load_prune_ns >= 1_000);
-    assert!(s.load_send_wait_ns >= 1_000);
-    assert!(s.script_recv_wait_ns >= 1_000);
-    assert!(s.script_work_ns >= 1_000);
-    assert!(s.script_send_wait_ns >= 1_000);
-    assert!(s.write_recv_wait_ns >= 1_000);
-    assert!(s.write_work_ns >= 1_000);
-    confirm_thr_stats::add_script_work(confirm_thr_stats::script_work_from_verify_ns(2_000));
-    let sw = confirm_thr_stats::sample_and_reset();
-    assert_eq!(sw.script_work_ns, 2_000);
-
     // note_wire: prefer keeping wire when already noted without; ignore inflight.
     let feed = ConfirmFeed::new();
     feed.note(10, bh(1));

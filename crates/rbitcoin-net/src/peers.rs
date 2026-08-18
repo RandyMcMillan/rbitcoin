@@ -580,6 +580,11 @@ impl PeerHub {
         self.noban.store(v, Ordering::Relaxed);
     }
 
+    /// Core whitelist `noban` — bypass low-work header anti-DoS.
+    pub fn is_noban(&self) -> bool {
+        self.noban.load(Ordering::Relaxed)
+    }
+
     fn is_preferred_download(p: &LivePeer) -> bool {
         matches!(
             p.conn_type,

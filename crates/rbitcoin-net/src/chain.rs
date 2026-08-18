@@ -156,6 +156,12 @@ impl ChainHub {
             || self.asked_blocks.read().unwrap().contains(hash)
     }
 
+    /// Getdata already in flight (process-wide). Held unprocessed bodies are
+    /// not asked — `p2p_unrequested_blocks` INV still requests them.
+    pub fn asked_block(&self, hash: &BlockHash) -> bool {
+        self.asked_blocks.read().unwrap().contains(hash)
+    }
+
     pub fn note_gbt_assembled(&self) {
         self.gbt_assembled.store(true, Ordering::Relaxed);
     }
@@ -516,10 +522,13 @@ impl ChainHub {
         true
     }
 
-    /// Prev hash from a held/archive body or the header store (no extra index).
-    fn prev_of(&self, hash: &BlockHash) -> Option<BlockHash> {
+    /// Prev hash from a held/archive body, header-only tip, or the header store.
+    pub(crate) fn prev_of(&self, hash: &BlockHash) -> Option<BlockHash> {
         if let Some(b) = self.load_side_body(hash) {
             return Some(b.header.prev_blockhash);
+        }
+        if let Some((prev, _)) = self.header_tips.read().unwrap().get(hash) {
+            return Some(*prev);
         }
         let (_, rec) = self
             .query
@@ -630,6 +639,19 @@ impl ChainHub {
     pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
         let _ = self.ensure_header_fk(header)?;
         Ok(())
+    }
+
+    /// Best-chain or header-only height of `hash`.
+    pub fn header_height(&self, hash: &BlockHash) -> Option<u32> {
+        if let Some(h) = self
+            .query
+            .height_of_hash(&hash.to_byte_array())
+            .ok()
+            .flatten()
+        {
+            return Some(h.0);
+        }
+        self.header_tips.read().unwrap().get(hash).map(|(_, h)| *h)
     }
 
     /// Whether `hash` is marked invalid (`invalidateblock` or rejected `submitblock`).
@@ -1778,6 +1800,11 @@ pub fn ignoring_low_work_chain_log(height: u32) -> String {
     format!("[net] Ignoring low-work chain (height={height})")
 }
 
+/// Core `ProcessNewBlockHeaders` IBD progress (noban / sufficient-work).
+pub fn synchronizing_blockheaders_log(height: u32) -> String {
+    format!("Synchronizing blockheaders, height: {height}")
+}
+
 /// `p2p_initial_headers_sync.py` first getheaders after connect.
 pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
     format!("initial getheaders ({locator_height}) to peer={peer}")
@@ -2069,6 +2096,10 @@ mod tests {
         assert_eq!(
             ignoring_low_work_chain_log(14),
             "[net] Ignoring low-work chain (height=14)"
+        );
+        assert_eq!(
+            synchronizing_blockheaders_log(14),
+            "Synchronizing blockheaders, height: 14"
         );
         assert_eq!(
             initial_getheaders_log(0, 0),

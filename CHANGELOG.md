@@ -60,6 +60,21 @@ before 1.0).
   `addr`/`addrv2` requires `P2P_V2`; dial ranking omits known-v1
   (`INCOMPATIBLE`) while any better candidate remains.
 
+- **Core functional leftover-P2P follow-up.** Official unmodified
+  `p2p_compactblocks_blocksonly.py` is `run` (35→**36**). `-blocksonly`
+  does not select HB; it getdata's `MSG_WITNESS_BLOCK` while relay
+  peers getdata `MSG_CMPCT_BLOCK` after `sendcmpct` v2. Handshake
+  advertises BIP155 `sendaddrv2` before verack. Low-work header
+  announces log Core `Ignoring low-work chain (height=N)` /
+  `Synchronizing blockheaders, height: N` (pending-path height, not
+  one-header-from-genesis); non-noban does not persist a low-work
+  headers tree; noban stores headers-only. INV of a known fork header
+  may getdata missing bodies on that path. `p2p_headers_sync_with_minchainwork.py`
+  stays skip at the ~2032-block `generatetoaddress` 120s timeout
+  (`:112`). `p2p_invalid_messages.py` stays skip at empty addrv2 Core
+  logs (`:203`). `p2p_unrequested_blocks.py` stays skip at INV
+  getdata[0] ≠ headers-only parent (`:225`). Q-41 is 36/267.
+
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`
   per height. Peer offer copies wire **before** the BQ lock.

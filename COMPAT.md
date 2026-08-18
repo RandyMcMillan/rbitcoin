@@ -55,7 +55,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `chainwork` is real. `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers` (see [`docs/rpc.md`](./docs/rpc.md)) |
-| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire. Learned `addr`/`addrv2` must advertise `P2P_V2` |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `maxmempool` is the hub weight budget |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan |
 | Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done | `txindex` means Class A reconstruct; `getchaintips` is the active tip |

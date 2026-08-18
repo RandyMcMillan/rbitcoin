@@ -7,11 +7,22 @@
 //! The book can be **persisted** under the datadir (`peers` file) so discovered
 //! addrs and flags survive restarts.
 
+use bitcoin::p2p::ServiceFlags;
 use rbitcoin_primitives::Network;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+
+/// Service bits we advertise and ask DNS seeds for (`NETWORK|WITNESS|P2P_V2` = `0x809`).
+pub fn required_seed_services() -> ServiceFlags {
+    ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
+}
+
+/// Core `x<hex>.<seed>` hostname (`strprintf("x%x.%s", nRequiredServiceBits, seed)`).
+pub fn dns_seed_query_host(seed: &str, services: ServiceFlags) -> String {
+    format!("x{:x}.{seed}", services.to_u64())
+}
 
 /// DNS seed hostnames (resolve at runtime with default port).
 pub fn dns_seeds(network: Network) -> &'static [&'static str] {
@@ -69,14 +80,57 @@ pub fn resolve_fixed_seeds(network: Network) -> Vec<SocketAddr> {
     out
 }
 
+/// Per listed seed: Core `x<hex>.` filter hostname first, then the bare seed.
+pub fn seed_lookup_names(network: Network) -> Vec<Vec<String>> {
+    let bits = required_seed_services();
+    dns_seeds(network)
+        .iter()
+        .map(|seed| vec![dns_seed_query_host(seed, bits), (*seed).to_string()])
+        .collect()
+}
+
+/// Prefer the x-filter A/AAAA set when it is non-empty; otherwise the unfiltered set.
+pub fn pick_seed_results(x_ips: &[SocketAddr], plain_ips: &[SocketAddr]) -> Vec<SocketAddr> {
+    if !x_ips.is_empty() {
+        x_ips.to_vec()
+    } else {
+        plain_ips.to_vec()
+    }
+}
+
+fn resolve_host_port(host: &str, port: u16) -> Vec<SocketAddr> {
+    let with_port = format!("{host}:{port}");
+    match with_port.to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Resolve DNS seed hostnames to socket addresses using the network default port.
+///
+/// Each seed is queried as `x809.<seed>` first. If that name returns no
+/// addresses, the unfiltered seed name is tried. First success wins per seed
+/// so the same IPs are not injected twice.
 pub fn resolve_dns_seeds(network: Network) -> Vec<SocketAddr> {
     let port = default_port(network);
     let mut out = Vec::new();
-    for host in dns_seeds(network) {
-        let with_port = format!("{host}:{port}");
-        if let Ok(iter) = with_port.to_socket_addrs() {
-            out.extend(iter);
+    for names in seed_lookup_names(network) {
+        let x_ips = names
+            .first()
+            .map(|h| resolve_host_port(h, port))
+            .unwrap_or_default();
+        let plain_ips = if x_ips.is_empty() {
+            names
+                .get(1)
+                .map(|h| resolve_host_port(h, port))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for a in pick_seed_results(&x_ips, &plain_ips) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
         }
     }
     out
@@ -325,7 +379,11 @@ impl AddrMan {
     }
 
     /// Ranked dial list: tier 0 first (untried / fast / good history), then slow,
-    /// then failed/incompatible. Within a tier, IPv4 before IPv6.
+    /// then failed-last-connect. Within a tier, IPv4 before IPv6.
+    ///
+    /// `INCOMPATIBLE` is omitted while any other candidate remains so a mixed
+    /// book does not burn outbound slots on known-v1. If every remaining addr
+    /// is incompatible, those are returned as last-resort.
     pub fn take_dial_candidates(
         &self,
         max: usize,
@@ -334,17 +392,20 @@ impl AddrMan {
         if max == 0 || self.order.is_empty() {
             return Vec::new();
         }
-        let mut ranked: Vec<(u8, bool, SocketAddr)> = self
+        let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
             .iter()
             .filter(|a| !exclude.contains(*a))
             .map(|&a| {
                 let f = self.flags(&a);
-                (f.dial_tier(), a.is_ipv6(), a)
+                (f.dial_tier(), a.is_ipv6(), f.is_incompatible(), a)
             })
             .collect();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        ranked.into_iter().take(max).map(|(_, _, a)| a).collect()
+        if ranked.iter().any(|(_, _, incompat, _)| !*incompat) {
+            ranked.retain(|(_, _, incompat, _)| !*incompat);
+        }
+        ranked.into_iter().take(max).map(|(_, _, _, a)| a).collect()
     }
 
     /// Round-robin-ish: take up to `max` peers starting at `offset` (legacy helper).
@@ -540,14 +601,57 @@ mod tests {
         am.note_connect_failed(incompat, true);
 
         let got = am.take_dial_candidates(4, &HashSet::new());
-        assert_eq!(got.len(), 4);
-        // First two must be preferred tier (good + untried), last two last-resort.
+        assert_eq!(got.len(), 3);
+        assert!(!got.contains(&incompat));
         let tiers: Vec<u8> = got.iter().map(|a| am.flags(a).dial_tier()).collect();
-        assert!(tiers[0] <= tiers[1]);
         assert_eq!(tiers[0], 0);
         assert_eq!(tiers[1], 0);
         assert_eq!(tiers[2], 2);
-        assert_eq!(tiers[3], 2);
+        assert!(am.flags(&got[2]).failed_last_connect());
+    }
+
+    #[test]
+    fn take_dial_skips_incompatible_while_good_remain() {
+        let mut am = AddrMan::new();
+        let good = addr(1);
+        let untried = addr(2);
+        let failed = addr(3);
+        let incompat_a = addr(4);
+        let incompat_b = addr(5);
+        am.add(good);
+        am.add(untried);
+        am.add(failed);
+        am.add(incompat_a);
+        am.add(incompat_b);
+        am.note_connected(good);
+        am.note_connect_failed(failed, false);
+        am.note_connect_failed(incompat_a, true);
+        am.note_connect_failed(incompat_b, true);
+
+        let got = am.take_dial_candidates(48, &HashSet::new());
+        assert!(
+            got.iter().all(|a| !am.flags(a).is_incompatible()),
+            "INCOMPATIBLE must not fill the batch while any other addr remains: {got:?}"
+        );
+        assert!(got.contains(&good));
+        assert!(got.contains(&untried));
+        assert!(got.contains(&failed), "FAILED_LAST_CONNECT stays retryable");
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn take_dial_incompatible_when_nothing_else() {
+        let mut am = AddrMan::new();
+        let a = addr(1);
+        let b = addr(2);
+        am.add(a);
+        am.add(b);
+        am.note_connect_failed(a, true);
+        am.note_connect_failed(b, true);
+        let got = am.take_dial_candidates(48, &HashSet::new());
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&a));
+        assert!(got.contains(&b));
     }
 
     #[test]
@@ -587,6 +691,56 @@ mod tests {
         merged.add(a);
         assert!(merged.flags(&a).is_fast());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_lookup_names_x_filter_before_unfiltered() {
+        let names = seed_lookup_names(Network::Mainnet);
+        assert!(!names.is_empty());
+        assert_eq!(names[0][0], "x809.seed.bitcoin.sipa.be");
+        assert_eq!(names[0][1], "seed.bitcoin.sipa.be");
+        for pair in &names {
+            assert_eq!(pair.len(), 2);
+            assert!(pair[0].starts_with("x809."), "{pair:?}");
+            assert!(!pair[1].starts_with("x809."), "{pair:?}");
+        }
+        let signet = seed_lookup_names(Network::Signet);
+        assert_eq!(
+            signet,
+            vec![vec![
+                "x809.seed.signet.bitcoin.sprovoost.nl".to_string(),
+                "seed.signet.bitcoin.sprovoost.nl".to_string(),
+            ]]
+        );
+        assert!(seed_lookup_names(Network::Regtest).is_empty());
+    }
+
+    #[test]
+    fn pick_seed_results_first_success_wins() {
+        let x = addr(1);
+        let plain = addr(2);
+        assert_eq!(pick_seed_results(&[x], &[plain]), vec![x]);
+        assert_eq!(pick_seed_results(&[], &[plain]), vec![plain]);
+        assert!(pick_seed_results(&[], &[]).is_empty());
+        assert_eq!(pick_seed_results(&[x, addr(3)], &[plain]), vec![x, addr(3)]);
+    }
+
+    #[test]
+    fn dns_seed_query_host_matches_core_x_filter() {
+        use bitcoin::p2p::ServiceFlags;
+        let bits = required_seed_services();
+        assert!(bits.has(ServiceFlags::NETWORK));
+        assert!(bits.has(ServiceFlags::WITNESS));
+        assert!(bits.has(ServiceFlags::P2P_V2));
+        assert_eq!(bits.to_u64(), 0x809);
+        assert_eq!(
+            dns_seed_query_host("seed.bitcoin.sipa.be", bits),
+            "x809.seed.bitcoin.sipa.be"
+        );
+        assert_eq!(
+            dns_seed_query_host("seed.signet.bitcoin.sprovoost.nl", bits),
+            "x809.seed.signet.bitcoin.sprovoost.nl"
+        );
     }
 
     #[test]

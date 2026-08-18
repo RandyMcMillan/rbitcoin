@@ -55,6 +55,11 @@ before 1.0).
 
 ### Changed
 
+- **v2-only peer discovery (Q-49):** DNS queries `x809.<seed>`
+  (`NETWORK|WITNESS|P2P_V2`) before the unfiltered name; learned
+  `addr`/`addrv2` requires `P2P_V2`; dial ranking omits known-v1
+  (`INCOMPATIBLE`) while any better candidate remains.
+
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`
   per height. Peer offer copies wire **before** the BQ lock.

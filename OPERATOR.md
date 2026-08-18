@@ -377,6 +377,12 @@ Do **not** wipe `store/` for mempool slot/full errors.
 ## P2P transport
 
 - **BIP324 v2 only** — plaintext v1 peers disconnect (`peer does not speak BIP324 v2`).
+- **Discovery** queries Core DNS seeds for `NETWORK|WITNESS|P2P_V2`
+  (`x809.<seed>` first; the bare seed name only if that returns nothing).
+  Learned `addr` / `addrv2` is ingested only when the row advertises `P2P_V2`
+  (plus `NETWORK` or `NETWORK_LIMITED`). Dial ranking omits known-v1
+  (`INCOMPATIBLE`) addresses while any better candidate remains. Seed host
+  list lives in `dns_seeds()` (`crates/rbitcoin-net/src/seeds.rs`).
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
 - **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.

@@ -21,6 +21,12 @@ use std::sync::Arc;
 pub const BQ_RESOLVE_WAVE_MAX_BLOCKS: usize = 1080;
 /// Soft max Σ `tx.input` per lookup wave (8× load's 8000; overshoot included).
 pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 64_000;
+/// Hard min Σ `tx.input` per published layer (same number as load's pack).
+///
+/// Hold a thinner collect when more unresolved BQ heights can still join —
+/// including `ready=0` / load-frontier / unknown window. Last available
+/// thin wave still emits (tip / empty BQ).
+pub const BQ_RESOLVE_WAVE_MIN_INPUTS: u32 = 8000;
 /// Safety cap so one megablock run cannot stall the wave.
 pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 256_000;
 
@@ -43,10 +49,13 @@ pub fn bq_resolve_wave_stop_after(
 /// `path_lo` is the load frontier (store tip+1). `first_unresolved` is the
 /// lowest collected height (already sorted by [`BlockQueue::unresolved_heights`]).
 ///
-/// Never hold when the first unresolved height sits in the load-facing half
-/// of the window (`first - path_lo ≤ win/2`) — that is the block load is
-/// about to claim. O(1): two subtracts, no extra queue walk.
-/// `soft_win == 0` (rate unknown) never holds.
+/// Never hold (above the input floor) when the first unresolved height sits
+/// in the load-facing half of the window (`first - path_lo ≤ win/2`) — that
+/// is the block load is about to claim. O(1): two subtracts, no extra queue
+/// walk. `soft_win == 0` (rate unknown) skips only the fat-BQ short hold.
+///
+/// `more_remain`: more unresolved BQ heights can still join this layer.
+/// Under [`BQ_RESOLVE_WAVE_MIN_INPUTS`] that wins over ready=0 / frontier.
 #[inline]
 pub fn bq_resolve_wave_hold_partial(
     ready: u32,
@@ -55,20 +64,30 @@ pub fn bq_resolve_wave_hold_partial(
     n_blocks: usize,
     path_lo: u32,
     first_unresolved: u32,
+    more_remain: bool,
 ) -> bool {
-    if soft_win == 0 || n_blocks == 0 {
+    if n_blocks == 0 {
+        return false;
+    }
+    let at_max = bq_resolve_wave_stop_after(
+        sum_inputs,
+        n_blocks,
+        BQ_RESOLVE_WAVE_MAX_INPUTS,
+        BQ_RESOLVE_WAVE_MAX_BLOCKS,
+    );
+    if at_max {
+        return false;
+    }
+    if sum_inputs < BQ_RESOLVE_WAVE_MIN_INPUTS && more_remain {
+        return true;
+    }
+    if soft_win == 0 {
         return false;
     }
     if first_unresolved.saturating_sub(path_lo) <= soft_win / 2 {
         return false;
     }
     ready > soft_win / 2
-        && !bq_resolve_wave_stop_after(
-            sum_inputs,
-            n_blocks,
-            BQ_RESOLVE_WAVE_MAX_INPUTS,
-            BQ_RESOLVE_WAVE_MAX_BLOCKS,
-        )
 }
 
 /// Outcome of one TipOnly wave over BQ-ready heights.
@@ -231,6 +250,12 @@ pub fn confirm_bq_resolve_wave_with_ids(
             .tip_height()
             .map(|h| h.0.saturating_add(1))
             .unwrap_or(0);
+        // More of *this* asked set still uncollected (decode skip), or the BQ
+        // is still filling under an IBD-sized 1-min window. Do not treat
+        // confirm-inflight heights the caller omitted as joinable.
+        let win = query.soft_confirm_window();
+        let filling = win >= 144 && (query.block_queue_count() as u32) < win;
+        let more_remain = per_height.len() < heights.len() || filling;
         if bq_resolve_wave_hold_partial(
             query.block_queue_count() as u32,
             query.soft_confirm_window(),
@@ -238,6 +263,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
             per_height.len(),
             path_lo,
             first,
+            more_remain,
         ) {
             stats.work_ns = t0.elapsed().as_nanos() as u64;
             return Ok(stats);
@@ -500,9 +526,10 @@ mod tests {
     fn resolve_wave_pack_limits_are_4x_load_class() {
         assert_eq!(BQ_RESOLVE_WAVE_MAX_BLOCKS, 1080);
         assert_eq!(BQ_RESOLVE_WAVE_MAX_INPUTS, 64_000);
+        assert_eq!(BQ_RESOLVE_WAVE_MIN_INPUTS, 8000);
         assert_eq!(BQ_RESOLVE_WAVE_MAX_KEYS, 256_000);
         assert!(BQ_RESOLVE_WAVE_MAX_BLOCKS >= 144 * 4);
-        assert!(BQ_RESOLVE_WAVE_MAX_INPUTS >= 8000 * 8);
+        assert!(BQ_RESOLVE_WAVE_MAX_INPUTS >= BQ_RESOLVE_WAVE_MIN_INPUTS * 8);
         // Include-overshoot: take the crossing block, then stop.
         assert!(!bq_resolve_wave_stop_after(63_900, 1, 64_000, 1080));
         assert!(bq_resolve_wave_stop_after(64_100, 2, 64_000, 1080));
@@ -513,22 +540,57 @@ mod tests {
     #[test]
     fn hold_partial_table() {
         // far unresolved (beyond first half of win) + fat + short → hold
-        assert!(bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 191));
-        // same, but gap is in the first half of the window → emit (load needs it)
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 190));
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100));
+        assert!(bq_resolve_wave_hold_partial(
+            330, 180, 4_000, 1, 100, 191, false
+        ));
+        // above min, gap in the first half of the window → emit (load needs it)
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 9_000, 2, 100, 190, true
+        ));
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 9_000, 2, 100, 100, true
+        ));
         // fat BQ + full input wave → emit
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 64_100, 16, 100, 250
+            330, 180, 64_100, 16, 100, 250, true
         ));
         // fat BQ + full block cap → emit
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 1, 1080, 100, 250));
-        // thin BQ + short wave → emit (load catching up)
-        assert!(!bq_resolve_wave_hold_partial(50, 180, 4_000, 1, 100, 250));
-        // rate unknown (win=0) → never hold
-        assert!(!bq_resolve_wave_hold_partial(330, 0, 4_000, 1, 100, 250));
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 1, 1080, 100, 250, true
+        ));
+        // thin BQ + short wave, nothing more to join → emit
+        assert!(!bq_resolve_wave_hold_partial(
+            50, 180, 4_000, 1, 100, 250, false
+        ));
+        // rate unknown (win=0), nothing more to join → emit
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 0, 4_000, 1, 100, 250, false
+        ));
         // nothing collected
-        assert!(!bq_resolve_wave_hold_partial(330, 180, 0, 0, 100, 100));
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 0, 0, 100, 100, true
+        ));
+        // Hard min 8000: hold a thin layer when more BQ heights can still join,
+        // even if ready=0 or the gap is at the load frontier.
+        assert!(
+            bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, true),
+            "ready=0 must still hold under 8000 inputs when more remain"
+        );
+        assert!(
+            bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100, true),
+            "load-frontier exception must not mint a <8000-input layer"
+        );
+        assert!(
+            bq_resolve_wave_hold_partial(0, 0, 4_000, 1, 100, 100, true),
+            "unknown window must still hold under 8000 when more remain"
+        );
+        assert!(
+            !bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, false),
+            "last available thin wave must emit (tip / empty BQ)"
+        );
+        assert!(!bq_resolve_wave_hold_partial(
+            0, 180, 8_000, 2, 100, 100, true
+        ));
     }
 
     #[test]
@@ -598,6 +660,41 @@ mod tests {
             "unresolved height in the first half of the soft window must emit"
         );
         assert!(q.block_queue_is_resolve_complete(1));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn ready_zero_holds_under_min_inputs_when_more_unresolved() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        for h in 1..=10u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+            prev = b.block_hash();
+        }
+        // IBD-sized window, BQ still filling (10 < 180) — hold even ready=0.
+        let _ = q.block_queue_update_soft_pressure(Some(3.0));
+        let all: Vec<u32> = (1..=10).collect();
+        let st = confirm_bq_resolve_wave(&q, &params, &all).unwrap();
+        assert_eq!(
+            st.heights, 0,
+            "must not publish a 10-input layer while the BQ is still filling"
+        );
+        assert!(!q.block_queue_is_resolve_complete(1));
+        let _ = q.block_queue_update_soft_pressure(None);
+        let st = confirm_bq_resolve_wave(&q, &params, &all).unwrap();
+        assert_eq!(
+            st.heights, 10,
+            "unknown window + whole remaining set must emit"
+        );
+        assert!(q.block_queue_is_resolve_complete(1));
+        assert!(q.block_queue_is_resolve_complete(10));
         let _ = std::fs::remove_dir_all(&path);
     }
 

@@ -33,6 +33,11 @@ before 1.0).
 
 ### Changed
 
+- **Lookup wave min 8000 inputs:** do not publish a TipOnly layer under
+  8000 Σ `tx.input` when more unresolved BQ heights can still join,
+  including `ready=0` / load-frontier / unknown window. Last available
+  thin wave still emits. Max remains 64000 inputs / 1080 blocks.
+
 - **Core functional leftover-P2P.** Official unmodified
   `p2p_initial_headers_sync.py` and `p2p_compactblocks.py` are `run`
   (33→**35**). Initial `getheaders` goes to one `NODE_NETWORK` peer

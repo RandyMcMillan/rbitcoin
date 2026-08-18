@@ -93,7 +93,7 @@ analog = "none"
 name = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: equal-work tip choice (preciousblock exists)"
+analog = "official: after B0-B2 headers/blocks, send_blocks_and_test B7 success=False never got getdata (feature_chain_tiebreaks.py:86); missing-parent side-chain getdata later"
 
 [[test]]
 name = "feature_cltv.py"
@@ -417,7 +417,7 @@ reason = "no-zmq"
 name = "mempool_accept.py"
 status = "skip"
 reason = "rpc-missing"
-analog = "follow-up: MiniWallet + testmempoolaccept field parity"
+analog = "official: after permitbaremultisig + incrementalrelayfee, testmempoolaccept(rawtxs='ff00baar') is -32602 'rawtxs array required' not -3 'JSON value of type string is not of expected type array' (mempool_accept.py:98); Core type-check / reject-reason zoo later"
 
 [[test]]
 name = "mempool_accept_wtxid.py"
@@ -641,9 +641,7 @@ analog = "follow-up: getaddr"
 
 [[test]]
 name = "p2p_getdata.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: getdata + reconstruct serve"
+status = "run"
 
 [[test]]
 name = "p2p_handshake.py"
@@ -683,8 +681,8 @@ status = "run"
 [[test]]
 name = "p2p_invalid_block.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: invalid block reject + map"
+reason = "v1-only"
+analog = "official: --v1transport add_p2p_connection magic-bytes mismatch (p2p_invalid_block.py:44); v2 later: bad-txns-inputs-duplicate missing (got consensus double spend in block) (p2p_invalid_block.py:98)"
 
 [[test]]
 name = "p2p_invalid_locator.py"

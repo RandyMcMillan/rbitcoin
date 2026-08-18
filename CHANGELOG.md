@@ -55,6 +55,16 @@ before 1.0).
 
 ### Changed
 
+- **Core functional Wave E / thin leftovers.** Official unmodified
+  `p2p_getdata.py` is `run` (37→**38**). Invalid GETDATA inv type 0
+  does not stall the session; a later MSG_BLOCK getdata of the tip
+  is served. `p2p_invalid_block.py` stays skip at `--v1transport`
+  magic-bytes mismatch (`:44`). `feature_chain_tiebreaks.py` stays
+  skip at missing-parent B7 getdata (`:86`). `mempool_accept.py`
+  stays skip at `testmempoolaccept` type-check dialect (`:98`)
+  after `getmempoolinfo.permitbaremultisig` and `incrementalrelayfee`
+  match Core. Q-41 is 38/267.
+
 - **v2-only peer discovery (Q-49):** DNS queries `x809.<seed>`
   (`NETWORK|WITNESS|P2P_V2`) before the unfiltered name; learned
   `addr`/`addrv2` requires `P2P_V2`; dial ranking omits known-v1

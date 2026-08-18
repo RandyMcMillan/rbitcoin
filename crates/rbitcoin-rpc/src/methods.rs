@@ -67,6 +67,8 @@ pub struct RpcContext {
     pub chain: Option<Arc<rbitcoin_net::ChainHub>>,
     /// Core `getrpcinfo.logpath` (`{datadir}/debug.log`).
     pub logpath: String,
+    /// Core `-permitbaremultisig` (default true). `getmempoolinfo`.
+    pub permit_bare_multisig: bool,
     /// In-flight RPC methods (method, start) for `getrpcinfo.active_commands`.
     pub active: std::sync::Mutex<Vec<(String, Instant)>>,
 }
@@ -1177,8 +1179,9 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "maxmempool": 0,
             "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
             "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
+            "incrementalrelayfee": MempoolHub::relay_fee_btc_per_kb(),
             "unbroadcastcount": 0,
-            "permitbaremultisig": true,
+            "permitbaremultisig": ctx.permit_bare_multisig,
             "optimal": true,
         }));
     };
@@ -1199,9 +1202,10 @@ fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "maxmempool": mp.max_weight(),
         "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
+        "incrementalrelayfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
         "unbroadcastcount": mp.unbroadcast_count(),
-        "permitbaremultisig": true,
+        "permitbaremultisig": ctx.permit_bare_multisig,
         "optimal": true,
     }))
 }
@@ -3170,6 +3174,7 @@ mod tests {
             chain: None,
             logpath: String::new(),
             active: std::sync::Mutex::new(Vec::new()),
+            permit_bare_multisig: true,
         };
         (ctx, dir)
     }
@@ -3207,8 +3212,21 @@ mod tests {
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["size"], 0);
         assert_eq!(mem["loaded"], true);
+        assert_eq!(mem["permitbaremultisig"], true);
         let raw = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
         assert_eq!(raw, json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getmempoolinfo_permitbaremultisig_follows_ctx() {
+        let (mut ctx, dir) = ctx_empty();
+        ctx.permit_bare_multisig = false;
+        let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+        assert_eq!(
+            mem["permitbaremultisig"], false,
+            "getmempoolinfo must honor -permitbaremultisig=0"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3572,6 +3590,7 @@ mod tests {
             chain: None,
             logpath: String::new(),
             active: std::sync::Mutex::new(Vec::new()),
+            permit_bare_multisig: true,
         };
         let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem2["loaded"], true);
@@ -3619,6 +3638,7 @@ mod tests {
             chain: None,
             logpath: String::new(),
             active: std::sync::Mutex::new(Vec::new()),
+            permit_bare_multisig: true,
         };
 
         let tip_h = chain.tip_height();
@@ -4090,6 +4110,7 @@ mod tests {
             chain: Some(Arc::clone(&hub)),
             logpath: String::new(),
             active: std::sync::Mutex::new(Vec::new()),
+            permit_bare_multisig: true,
         };
         (ctx, dir, hub)
     }
@@ -5471,6 +5492,7 @@ mod tests {
             chain: None,
             logpath: String::new(),
             active: std::sync::Mutex::new(Vec::new()),
+            permit_bare_multisig: true,
         };
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(

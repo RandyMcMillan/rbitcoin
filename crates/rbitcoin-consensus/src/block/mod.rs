@@ -79,6 +79,16 @@ pub fn validate_block_structure_precomputed(
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<Vec<TxPrecompute>, ConsensusError> {
+    validate_block_structure_with_pres(block, ctx, None)
+}
+
+/// Like [`validate_block_structure_precomputed`], reusing lookup-stashed pres
+/// when `pres` is `Some` (no second `from_tx`). Length must match `txdata`.
+pub fn validate_block_structure_with_pres(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: Option<&[TxPrecompute]>,
+) -> Result<Vec<TxPrecompute>, ConsensusError> {
     if block.txdata.is_empty() {
         return Err(ConsensusError::BadBlock("no transactions"));
     }
@@ -92,17 +102,22 @@ pub fn validate_block_structure_precomputed(
     }
 
     let n = block.txdata.len();
-    let mut pres = Vec::with_capacity(n);
+    let (pres, txid_ns) = if let Some(stashed) = pres {
+        if stashed.len() != n {
+            return Err(ConsensusError::BadBlock("precompute count mismatch"));
+        }
+        (stashed.to_vec(), 0)
+    } else {
+        let t_txid = Instant::now();
+        let v: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+        (v, t_txid.elapsed().as_nanos() as u64)
+    };
     let mut seen = std::collections::HashSet::with_capacity(n);
-    let t_txid = Instant::now();
-    for tx in &block.txdata {
-        let p = TxPrecompute::from_tx(tx);
+    for p in &pres {
         if !seen.insert(p.txid) {
             return Err(ConsensusError::BadBlock("duplicate txid"));
         }
-        pres.push(p);
     }
-    let txid_ns = t_txid.elapsed().as_nanos() as u64;
 
     let t_walk = Instant::now();
     let tx_count_vi = bitcoin::consensus::encode::VarInt(n as u64).size();

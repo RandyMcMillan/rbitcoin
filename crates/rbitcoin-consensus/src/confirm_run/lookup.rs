@@ -309,8 +309,13 @@ pub(super) fn wire_lookup_phase(
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t_struct = Instant::now();
-        // Sole compute_txid pass for this block in the confirm pipeline.
-        let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        let stashed = query.block_queue_resolved(height.0);
+        let pres = crate::block::validate_block_structure_with_pres(
+            block.as_ref(),
+            &ctx,
+            stashed.as_ref().map(|w| w.pres.as_ref()),
+        )?;
+        let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         if i == 0 {
             if height.0 != path_lo {
                 return Err(ConsensusError::BadPrev);

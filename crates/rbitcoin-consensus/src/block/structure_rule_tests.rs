@@ -3,8 +3,8 @@
 use super::{
     apply_witness_commitment, bip16_active_from_prev_mtp, bip34_height_script, block_subsidy,
     is_p2sh_script, is_p2wpkh_program, is_p2wsh_program, last_script_push, merkle_root_bytes,
-    script_sigop_count, validate_block_structure, validate_block_structure_hashed, ScriptCheckJob,
-    ValidationContext, BIP16_EXCEPTION_MAINNET,
+    script_sigop_count, validate_block_structure, validate_block_structure_hashed,
+    validate_block_structure_with_pres, ScriptCheckJob, ValidationContext, BIP16_EXCEPTION_MAINNET,
 };
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
@@ -110,6 +110,25 @@ fn structure_meters_split_txid_wtxid_walk() {
         s.struct_walk_ns > 0,
         "weight/sigops walks must be metered: {s:?}"
     );
+}
+
+#[test]
+fn structure_with_pres_skips_from_tx() {
+    use rbitcoin_query::TxPrecompute;
+    let _ = crate::plan_stamp_sub_stats::sample_and_reset();
+    let mut spend = non_coinbase_spend(1);
+    spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
+    let mut b = block_with(vec![coinbase(1), spend]);
+    apply_witness_commitment(&mut b);
+    let pres: Vec<TxPrecompute> = b.txdata.iter().map(TxPrecompute::from_tx).collect();
+    let _ = crate::plan_stamp_sub_stats::sample_and_reset();
+    let out = validate_block_structure_with_pres(&b, &ctx_h(1), Some(&pres))
+        .expect("stashed pres must still enforce merkle");
+    assert_eq!(out.len(), pres.len());
+    assert_eq!(out[0].txid, pres[0].txid);
+    let s = crate::plan_stamp_sub_stats::sample_and_reset();
+    assert_eq!(s.struct_txid_ns, 0, "with_pres must not from_tx: {s:?}");
+    assert!(s.struct_walk_ns > 0, "merkle/weight still run: {s:?}");
 }
 
 fn assert_bad_block(err: ConsensusError, needle: &str) {

@@ -1248,9 +1248,9 @@ pub(crate) fn spawn_confirm_engine(
                 }
                 lookup_ahead.apply_disconnect(&hub_load);
                 confirm_thr_stats::add_load_prune(t_hygiene.elapsed());
-                let batch: (Vec<(u32, BlockHash, bitcoin::Block)>, u32) = {
+                let batch: (Vec<(u32, BlockHash, Arc<bitcoin::Block>)>, u32) = {
                     let mut g = feed_load.inner.lock().unwrap();
-                    let found: Option<(Vec<(u32, BlockHash, bitcoin::Block)>, u32)> = loop {
+                    let found: Option<(Vec<(u32, BlockHash, Arc<bitcoin::Block>)>, u32)> = loop {
                         if feed_load.stopped() {
                             drop(g);
                             drop(mat_tx);
@@ -1289,7 +1289,7 @@ pub(crate) fn spawn_confirm_engine(
                             let soft_inputs = confirm_batch_max_inputs();
                             let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
                             drop(g);
-                            let mut run: Vec<(u32, BlockHash, bitcoin::Block)> =
+                            let mut run: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> =
                                 Vec::with_capacity(hard_blocks.min(32));
                             let mut sum_inputs = 0u32;
                             let mut h = expect;
@@ -1317,7 +1317,7 @@ pub(crate) fn spawn_confirm_engine(
                                     continue;
                                 }
                                 let block = if let Some(b) = opt_wire {
-                                    b
+                                    Arc::new(b)
                                 } else {
                                     match load_decode_bq_block(&hub_load, h, &hash) {
                                         Ok(b) => b,
@@ -1332,7 +1332,7 @@ pub(crate) fn spawn_confirm_engine(
                                         }
                                     }
                                 };
-                                let inputs = block_input_count(&block);
+                                let inputs = block_input_count(block.as_ref());
                                 {
                                     let mut gg = feed_load.inner.lock().unwrap();
                                     gg.inflight.insert(h);
@@ -1391,7 +1391,7 @@ pub(crate) fn spawn_confirm_engine(
                 if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     let req: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                         .iter()
-                        .map(|(h, ha, b)| (*h, *ha, Some(b.clone())))
+                        .map(|(h, ha, b)| (*h, *ha, Some((**b).clone())))
                         .collect();
                     feed_load.requeue_wire(&req);
                     drop(mat_tx);
@@ -1412,12 +1412,7 @@ pub(crate) fn spawn_confirm_engine(
                     std::sync::Arc<bitcoin::Block>,
                 )> = wire_batch
                     .iter()
-                    .map(|(h, _, w)| {
-                        (
-                            rbitcoin_primitives::Height(*h),
-                            std::sync::Arc::new(w.clone()),
-                        )
-                    })
+                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), Arc::clone(w)))
                     .collect();
                 confirm_thr_stats::add_load_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
@@ -1689,15 +1684,27 @@ enum PackWireErr {
     HashMismatch,
 }
 
-/// Confirm-side load+decode of one body-queue height (pack path only).
+/// Confirm-side load of one body-queue height (pack path only).
+///
+/// Prefers lookup-promoted `Arc<Block>` (no second consensus_decode).
 fn load_decode_bq_block(
     hub: &ChainHub,
     height: u32,
     expect_hash: &BlockHash,
-) -> Result<bitcoin::Block, PackWireErr> {
+) -> Result<Arc<bitcoin::Block>, PackWireErr> {
     use bitcoin::consensus::Decodable;
+    if let Some(w) = hub.query.block_queue_resolved(height) {
+        if w.block.block_hash() != *expect_hash {
+            warn!(
+                "ibd: body queue hash mismatch @{height}: feed={expect_hash} payload={}",
+                w.block.block_hash()
+            );
+            return Err(PackWireErr::HashMismatch);
+        }
+        return Ok(w.block);
+    }
     match hub.query.block_queue_payload(height) {
-        Ok(Some(payload)) => {
+        Ok(Some(payload)) if !payload.is_empty() => {
             let mut cursor = std::io::Cursor::new(payload.as_slice());
             match bitcoin::Block::consensus_decode(&mut cursor) {
                 Ok(block) => {
@@ -1708,7 +1715,7 @@ fn load_decode_bq_block(
                         );
                         Err(PackWireErr::HashMismatch)
                     } else {
-                        Ok(block)
+                        Ok(Arc::new(block))
                     }
                 }
                 Err(e) => {
@@ -1717,7 +1724,7 @@ fn load_decode_bq_block(
                 }
             }
         }
-        Ok(None) => Err(PackWireErr::Missing),
+        Ok(Some(_)) | Ok(None) => Err(PackWireErr::Missing),
         Err(e) => {
             warn!("ibd: body queue read fail @{height} {expect_hash}: {e}");
             Err(PackWireErr::Missing)

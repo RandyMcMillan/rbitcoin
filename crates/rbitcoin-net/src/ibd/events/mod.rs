@@ -573,8 +573,10 @@ fn load_reorg_body(
         return Some(b);
     }
     if let Ok(Some(wire)) = hub.query.block_queue_payload_by_hash(&hash.to_byte_array()) {
-        if let Ok(b) = deserialize::<bitcoin::Block>(&wire) {
-            return Some(b);
+        if !wire.is_empty() {
+            if let Ok(b) = deserialize::<bitcoin::Block>(&wire) {
+                return Some(b);
+            }
         }
     }
     if let Ok(Some(b)) = hub.query.reconstruct_block_by_hash(&hash.to_byte_array()) {
@@ -619,10 +621,16 @@ fn try_reorg_on_bad_prev(
     };
     let ext = hub
         .query
-        .block_queue_payload(height)
-        .ok()
-        .flatten()
-        .and_then(|wire| deserialize::<bitcoin::Block>(&wire).ok())
+        .block_queue_resolved(height)
+        .map(|w| (*w.block).clone())
+        .or_else(|| {
+            hub.query
+                .block_queue_payload(height)
+                .ok()
+                .flatten()
+                .filter(|wire| !wire.is_empty())
+                .and_then(|wire| deserialize::<bitcoin::Block>(&wire).ok())
+        })
         .or_else(|| load_reorg_body(st, hub, hash));
     let Some(ext) = ext else {
         return false;

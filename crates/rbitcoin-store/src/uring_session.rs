@@ -38,6 +38,39 @@ pub enum SessionKind {
     Iocp,
 }
 
+/// Held completion session, or standalone (TLS / libc).
+///
+/// `held` is for machines that already own the thread-local ring. `none` is
+/// the standalone path. Do **not** nest [`with_thread_local`] while a `held`
+/// ctx is live.
+pub struct IoCtx<'a> {
+    session: Option<&'a mut UringSession>,
+}
+
+impl<'a> IoCtx<'a> {
+    #[inline]
+    pub fn held(session: &'a mut UringSession) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    #[inline]
+    pub fn none() -> IoCtx<'static> {
+        IoCtx { session: None }
+    }
+
+    #[inline]
+    pub fn from_opt(session: Option<&'a mut UringSession>) -> Self {
+        Self { session }
+    }
+
+    #[inline]
+    pub fn session(&mut self) -> Option<&mut UringSession> {
+        self.session.as_deref_mut()
+    }
+}
+
 thread_local! {
     static FORCED_KIND: Cell<Option<SessionKind>> = const { Cell::new(None) };
 }

@@ -916,7 +916,7 @@ impl AddressHead {
     /// hop each key in RAM. Same results as N× [`Self::probe_fks`] (order preserved).
     ///
     pub fn probe_fks_batch(&self, txids: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_fks_batch_inner(txids, None)
+        self.probe_fks_batch_ctx(txids, &mut crate::IoCtx::none())
     }
 
     /// Same as [`Self::probe_fks_batch`] but page preads use the
@@ -930,13 +930,22 @@ impl AddressHead {
         txids: &[[u8; 32]],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_fks_batch_inner(txids, Some(session))
+        self.probe_fks_batch_ctx(txids, &mut crate::IoCtx::held(session))
+    }
+
+    /// Probe with a shared [`crate::IoCtx`] (held session or standalone).
+    pub(crate) fn probe_fks_batch_ctx(
+        &self,
+        txids: &[[u8; 32]],
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_fks_batch_inner(txids, ctx)
     }
 
     fn probe_fks_batch_inner(
         &self,
         txids: &[[u8; 32]],
-        session: Option<&mut crate::uring_session::UringSession>,
+        ctx: &mut crate::IoCtx<'_>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n_keys = txids.len();
         if n_keys == 0 {
@@ -970,7 +979,7 @@ impl AddressHead {
 
         let mut out = vec![Vec::new(); n_keys];
 
-        match session {
+        match ctx.session() {
             Some(session) => self.probe_pages_streaming_on_session(
                 session,
                 txids,
@@ -1546,6 +1555,35 @@ mod tests {
             same_page.push(t);
         }
         let _ = h.probe_fks_batch(&same_page).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    /// Held pool session must probe pages via the shared [`IoCtx`] (same
+    /// results as serial, SQEs on the held ring).
+    #[test]
+    fn probe_fks_batch_held_pool_session_matches_serial() {
+        use crate::uring_session::{IoCtx, SessionKind, UringSession};
+        let path = tmp("probe_ctx");
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x42;
+        h.insert(&txid, Fk(9)).unwrap();
+        let serial = h.probe_fks(&txid).unwrap();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let _ = crate::uring_session::test_take_last_sqe_lens();
+        let mut ctx = IoCtx::held(&mut session);
+        let batch = h
+            .probe_fks_batch_ctx(&[txid], &mut ctx)
+            .expect("held-session probe");
+        session.drain_all().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0], serial);
+        let sqes = crate::uring_session::test_take_last_sqe_lens();
+        assert!(
+            !sqes.is_empty(),
+            "probe_fks_batch_ctx(held) must submit on the held session"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }

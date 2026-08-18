@@ -346,6 +346,15 @@ pub(crate) fn pread_batch_on_session(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [ReadOp<'_>],
 ) -> bool {
+    pread_batch_on_ctx(&mut crate::IoCtx::held(session), ops)
+}
+
+/// [`pread_batch_on_session`] via a shared [`crate::IoCtx`]. `none` returns
+/// false so the caller uses libc (never nested TLS).
+pub(crate) fn pread_batch_on_ctx(ctx: &mut crate::IoCtx<'_>, ops: &mut [ReadOp<'_>]) -> bool {
+    let Some(session) = ctx.session() else {
+        return false;
+    };
     let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
     if total_nonempty == 0 {
         for op in ops.iter_mut() {

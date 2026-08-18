@@ -23,6 +23,7 @@
 use crate::error::StoreError;
 use crate::height_fence::HeightFence;
 use crate::io_backend::{self, ReadIoBackend};
+use crate::segmented_head::HeadProbeWave;
 use crate::tx_table::TxTable;
 use crate::txid_body::TxidBody;
 use crate::uring_session::{self, UringSession};
@@ -255,7 +256,7 @@ fn resolve_fk_and_range_core(
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
-    mut session: Option<&mut UringSession>,
+    session: Option<&mut UringSession>,
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
@@ -273,14 +274,13 @@ fn resolve_fk_and_range_core(
     let mut idx_ns = 0u64;
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
+    let mut ctx = crate::IoCtx::from_opt(session);
 
     let t_probe = Instant::now();
-    let open = match session.as_mut() {
-        Some(s) => table
+    let open =
+        table
             .head
-            .probe_candidates_batch_open_on_session(&mixed, s)?,
-        None => table.head.probe_candidates_batch_open(&mixed)?,
-    };
+            .probe_candidates_batch_wave(&mixed, HeadProbeWave::Open, None, &mut ctx)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &open));
     id_idx_wave(
@@ -297,21 +297,19 @@ fn resolve_fk_and_range_core(
         &mut idx_ns,
         &first_fks,
         &mut local_age,
-        &mut session,
+        &mut ctx,
         &mut had_id,
     )?;
 
     if any_unfinished(&winner, &connected, heights) {
         let active = unfinished_mask(&winner, &connected, heights);
         let t_probe = Instant::now();
-        let mid = match session.as_mut() {
-            Some(s) => table
-                .head
-                .probe_candidates_batch_sealed_hot_on_session(&mixed, &active, s)?,
-            None => table
-                .head
-                .probe_candidates_batch_sealed_hot(&mixed, &active)?,
-        };
+        let mid = table.head.probe_candidates_batch_wave(
+            &mixed,
+            HeadProbeWave::SealedHot,
+            Some(&active),
+            &mut ctx,
+        )?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &mid));
         id_idx_wave(
@@ -328,7 +326,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            &mut session,
+            &mut ctx,
             &mut had_id,
         )?;
     }
@@ -336,12 +334,12 @@ fn resolve_fk_and_range_core(
     if any_unfinished(&winner, &connected, heights) {
         let active = unfinished_mask(&winner, &connected, heights);
         let t_probe = Instant::now();
-        let cold = match session.as_mut() {
-            Some(s) => table
-                .head
-                .probe_candidates_batch_cold_on_session(&mixed, &active, s)?,
-            None => table.head.probe_candidates_batch_cold(&mixed, &active)?,
-        };
+        let cold = table.head.probe_candidates_batch_wave(
+            &mixed,
+            HeadProbeWave::Cold,
+            Some(&active),
+            &mut ctx,
+        )?;
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cold));
         id_idx_wave(
@@ -358,7 +356,7 @@ fn resolve_fk_and_range_core(
             &mut idx_ns,
             &first_fks,
             &mut local_age,
-            &mut session,
+            &mut ctx,
             &mut had_id,
         )?;
     }
@@ -506,7 +504,7 @@ fn fill_idx_pages_libc(pages: &[crate::tx_idx::IdxPagePlan], bufs: &mut [Vec<u8>
 fn body_ranges_batched(
     table: &TxTable,
     fks: &[Fk],
-    session: Option<&mut UringSession>,
+    ctx: &mut crate::IoCtx<'_>,
 ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
     if fks.is_empty() {
         return Ok(Vec::new());
@@ -527,7 +525,7 @@ fn body_ranges_batched(
         return Ok(vec![None; fks.len()]);
     }
     let mut bufs: Vec<Vec<u8>> = uniq.iter().map(|p| vec![0u8; p.want]).collect();
-    let filled = match session {
+    let filled = match ctx.session() {
         Some(sess) => fill_idx_pages(sess, &uniq, &mut bufs),
         None => false,
     };
@@ -607,8 +605,8 @@ fn unfinished_mask(
 /// unconnected body match does not. Chosen fks share **one** idx-page fill
 /// (held session or libc).
 ///
-/// When `session` is `Some`, ID + IDX page preads ride that **already-held**
-/// plan ring. When `None`, libc pread for ID and unique idx pages.
+/// When `ctx` is held, ID + IDX page preads ride that **already-held**
+/// plan ring. When none, libc pread for ID and unique idx pages.
 fn id_idx_wave(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -623,7 +621,7 @@ fn id_idx_wave(
     idx_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-    session: &mut Option<&mut UringSession>,
+    ctx: &mut crate::IoCtx<'_>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
     use crate::head_resolve_pick::{
@@ -663,10 +661,7 @@ fn id_idx_wave(
         }
         if !need.is_empty() {
             let t_id = Instant::now();
-            let (more, _pages) = match session.as_mut() {
-                Some(sess) => side.get_many_page_grouped_on_session(&need, sess)?,
-                None => side.get_many_page_grouped(&need)?,
-            };
+            let (more, _pages) = side.get_many_page_grouped_ctx(&need, ctx)?;
             *id_ns = id_ns.saturating_add(t_id.elapsed().as_nanos() as u64);
             *body_lookups = body_lookups.saturating_add(more.len() as u64);
             id_map.extend(more);
@@ -717,10 +712,7 @@ fn id_idx_wave(
         ));
     }
     let t_idx = Instant::now();
-    let ranges = match session.as_mut() {
-        Some(sess) => body_ranges_batched(table, &chosen_fks, Some(sess))?,
-        None => body_ranges_batched(table, &chosen_fks, None)?,
-    };
+    let ranges = body_ranges_batched(table, &chosen_fks, ctx)?;
     record_chosen_idx_ranges(
         &chosen_kis,
         &chosen_fks,
@@ -1300,7 +1292,8 @@ mod tests {
             uniq_near.len()
         );
 
-        let batch = body_ranges_batched(&t, &[first, near, far], None).unwrap();
+        let batch =
+            body_ranges_batched(&t, &[first, near, far], &mut crate::IoCtx::none()).unwrap();
         for (fk, got) in [first, near, far].iter().zip(batch.iter()) {
             let exp = t.body.record_range(*fk).unwrap();
             assert_eq!(*got, Some(exp), "fk={}", fk.0);

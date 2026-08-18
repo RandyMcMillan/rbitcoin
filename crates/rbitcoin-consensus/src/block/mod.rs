@@ -179,7 +179,9 @@ pub fn validate_block_structure_with_pres(
     let has_witness_data = block_has_witness(block);
     let has_commitment = coinbase_has_witness_commitment(block);
     if has_witness_data || has_commitment {
-        if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0)
+        if has_witness_data
+            && ctx.enforce_height_gates
+            && !ctx.params.segwit_active_at(ctx.height.0)
         {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }

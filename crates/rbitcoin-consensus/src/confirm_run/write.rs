@@ -122,17 +122,23 @@ pub fn confirm_write_phase(
                         .collect::<Vec<_>>(),
                     planned_fks.len(),
                 );
+                let t_recent = Instant::now();
                 for (height, range) in slices {
                     let creates = planned_fks[range.clone()]
                         .iter()
                         .zip(pins[range].iter())
                         .map(|(fk, pin)| (pin.0.txid, *fk));
                     query
-                        .note_recent_creates(height, creates)
+                        .note_recent_creates_defer(height, creates)
                         .map_err(ConsensusError::from)?;
                 }
                 if let Some(last) = batch.prepared.last() {
-                    query.expire_recent_creates(last.height.0);
+                    query.expire_recent_creates_defer(last.height.0);
+                }
+                query.flush_recent_creates();
+                let recent_ns = t_recent.elapsed().as_nanos() as u64;
+                if recent_ns > 0 {
+                    confirm_phase_stats::WRITE_RECENT_NS.fetch_add(recent_ns, Ordering::Relaxed);
                 }
             }
         }

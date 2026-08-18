@@ -8,8 +8,9 @@
 //! [`recent_creates_horizon`] (`2 * soft_win`, floor 256) so the ring outlives
 //! BQ / lookup lead (1× the soft 1-min window is not enough).
 //!
-//! Writers rebuild an [`arc_swap::ArcSwap`] snapshot once per note/expire.
-//! Load `get` is a pointer load, not a lock per leftover key.
+//! Writers mutate the locked map and mark dirty. [`RecentCreates::publish_if_dirty`]
+//! is the only snapshot rebuild (confirm write: once per batch). Load `get` is a
+//! pointer load, not a lock per leftover key.
 
 use crate::published_ids::TxidHasher;
 use arc_swap::ArcSwap;
@@ -40,6 +41,7 @@ struct LiveEnt {
 struct Inner {
     live: LiveMap,
     fifo: VecDeque<(u32, Vec<[u8; 32]>)>,
+    dirty: bool,
 }
 
 /// Immutable live map for one stamp pack.
@@ -68,6 +70,7 @@ impl Default for RecentCreates {
             inner: Mutex::new(Inner {
                 live: LiveMap::default(),
                 fifo: VecDeque::new(),
+                dirty: false,
             }),
         }
     }
@@ -82,7 +85,21 @@ impl RecentCreates {
         live.store(Arc::new(g.live.clone()));
     }
 
+    /// Rebuild the load snapshot if [`Self::note`] / expire / drop dirtied the map.
+    ///
+    /// No-op when clean. Confirm write flushes once after all height notes + expire.
+    pub fn publish_if_dirty(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.dirty {
+            return;
+        }
+        Self::publish(&self.live, &g);
+        g.dirty = false;
+    }
+
     /// Insert creates at `height`. Last write wins if the txid is already live.
+    ///
+    /// Does not rebuild the snapshot — call [`Self::publish_if_dirty`].
     pub fn note(&self, height: u32, rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>) {
         let mut keys: Vec<[u8; 32]> = Vec::new();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -97,7 +114,7 @@ impl RecentCreates {
             return;
         }
         g.fifo.push_back((height, keys));
-        Self::publish(&self.live, &g);
+        g.dirty = true;
     }
 
     /// Drop heights `≤ through` (inclusive). A key stays if a newer height
@@ -120,7 +137,7 @@ impl RecentCreates {
             }
         }
         if changed {
-            Self::publish(&self.live, &g);
+            g.dirty = true;
         }
     }
 
@@ -140,7 +157,7 @@ impl RecentCreates {
         g.fifo.retain(|(h, _)| *h < height);
         g.live.retain(|_, ent| ent.height < height);
         if g.live.len() != before {
-            Self::publish(&self.live, &g);
+            g.dirty = true;
         }
     }
 
@@ -192,10 +209,39 @@ mod tests {
     }
 
     #[test]
+    fn two_notes_without_flush_do_not_rebuild_snapshot() {
+        let r = RecentCreates::new();
+        let before = r.snapshot();
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        r.note(11, [(tid(2), Fk(2), (3, 4))]);
+        let mid = r.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&before.0, &mid.0),
+            "note must not clone the live map; publish_if_dirty is the snapshot rebuild"
+        );
+        assert!(
+            r.get(&tid(1)).is_none(),
+            "unpublished notes must not be visible to get"
+        );
+        assert_eq!(r.size_snapshot(), (2, 2));
+        r.publish_if_dirty();
+        assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
+        assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
+        let after = r.snapshot();
+        assert!(!std::sync::Arc::ptr_eq(&before.0, &after.0));
+        r.publish_if_dirty();
+        assert!(
+            std::sync::Arc::ptr_eq(&after.0, &r.snapshot().0),
+            "second publish_if_dirty is a no-op when clean"
+        );
+    }
+
+    #[test]
     fn note_makes_get_visible() {
         let r = RecentCreates::new();
         assert!(r.get(&tid(1)).is_none());
         r.note(10, [(tid(1), Fk(7), (100, 8))]);
+        r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(7), (100, 8))));
         assert!(r.get(&tid(2)).is_none());
     }
@@ -214,6 +260,7 @@ mod tests {
         r.note(10, [(tid(1), Fk(1), (1, 2)), (tid(2), Fk(2), (3, 4))]);
         r.note(11, [(tid(2), Fk(2), (3, 4)), (tid(3), Fk(3), (5, 6))]);
         r.expire_through(10);
+        r.publish_if_dirty();
         assert!(r.get(&tid(1)).is_none(), "height-10-only key must drop");
         assert_eq!(
             r.get(&tid(2)),
@@ -230,6 +277,7 @@ mod tests {
     fn expire_to_horizon_keeps_until_tip_covers_window() {
         let r = RecentCreates::new();
         r.note(0, [(tid(1), Fk(1), (1, 2))]);
+        r.publish_if_dirty();
         r.expire_to_horizon(100, RECENT_CREATES_HORIZON_FLOOR);
         assert_eq!(
             r.get(&tid(1)),
@@ -237,6 +285,7 @@ mod tests {
             "tip below horizon must not drop genesis-height notes"
         );
         r.expire_to_horizon(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_FLOOR);
+        r.publish_if_dirty();
         assert!(r.get(&tid(1)).is_none());
     }
 
@@ -246,6 +295,7 @@ mod tests {
         r.note(10, [(tid(1), Fk(1), (1, 2))]);
         r.note(12, [(tid(2), Fk(2), (3, 4))]);
         r.drop_from(12);
+        r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
         assert!(r.get(&tid(2)).is_none());
     }

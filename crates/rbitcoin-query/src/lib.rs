@@ -1236,6 +1236,7 @@ impl Query {
             .store(height, AtomicOrdering::Release);
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
         self.recent_creates.drop_from(height);
+        self.recent_creates.publish_if_dirty();
         self.block_queue_drop_resolved_from(height);
     }
 
@@ -1537,8 +1538,22 @@ impl Query {
         Ok(())
     }
 
-    /// Note identity rows without expiring the ring (write batches expire once).
+    /// Note identity rows and flush so a single-height caller sees `get`.
+    ///
+    /// Write batches use [`Self::note_recent_creates_defer`] + one
+    /// [`Self::flush_recent_creates`] so the live map is cloned once.
     pub fn note_recent_creates(
+        &self,
+        height: u32,
+        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
+    ) -> Result<(), QueryError> {
+        self.note_recent_creates_defer(height, creates)?;
+        self.flush_recent_creates();
+        Ok(())
+    }
+
+    /// Note identity rows without rebuilding the load snapshot.
+    pub fn note_recent_creates_defer(
         &self,
         height: u32,
         creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
@@ -1557,8 +1572,19 @@ impl Query {
         Ok(())
     }
 
+    /// Rebuild the RecentCreates snapshot if note/expire/drop dirtied it.
+    pub fn flush_recent_creates(&self) {
+        self.recent_creates.publish_if_dirty();
+    }
+
     /// Drop fifo rows past [`recent_creates_horizon`] relative to `tip_hint`.
     pub fn expire_recent_creates(&self, tip_hint: u32) {
+        self.expire_recent_creates_defer(tip_hint);
+        self.flush_recent_creates();
+    }
+
+    /// Expire without rebuilding the snapshot (write batch flushes once).
+    pub fn expire_recent_creates_defer(&self, tip_hint: u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
         let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
         self.recent_creates

@@ -47,8 +47,8 @@ use rbitcoin_query::ProcessOwnedSizes;
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
 ///
 /// Inventory: `class_a` + `ensure` + `struct` + `class_c` + `sh` + `spend`
-/// + `tweaks` + `tip_gc`. Subtimers (spent_sub, ann, class_a_sub) stay on
-/// the outer sample until a later nest.
+/// + `tweaks` + `tip_gc` + `recent_pub`. Subtimers (spent_sub, ann, class_a_sub)
+/// stay on the outer sample until a later nest.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WriteStageSample {
     /// `archive_commit_plan`
@@ -75,6 +75,9 @@ pub(crate) struct WriteStageSample {
     /// `advance_parent_cache_tip` (`tip_gc=`)
     pub cache_tip_ms: u64,
     pub cache_tip_ns: u64,
+    /// RecentCreates note+expire+one snapshot (`recent_pub=`)
+    pub recent_pub_ms: u64,
+    pub recent_pub_ns: u64,
 }
 
 impl WriteStageSample {
@@ -88,6 +91,7 @@ impl WriteStageSample {
             .saturating_add(self.utxo_ms)
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
+            .saturating_add(self.recent_pub_ms)
     }
 
     /// Same inventory in nanoseconds (`format_debug` us/blk write=).
@@ -100,6 +104,7 @@ impl WriteStageSample {
             .saturating_add(self.utxo_apply_ns)
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
+            .saturating_add(self.recent_pub_ns)
     }
 }
 
@@ -790,6 +795,7 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let recent_pub_ns = rbitcoin_consensus::confirm_phase_stats::sample_write_recent_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
@@ -871,6 +877,8 @@ pub(crate) fn sample(
             tweak_ns,
             cache_tip_ms: ns_ms(cache_tip_ns),
             cache_tip_ns,
+            recent_pub_ms: ns_ms(recent_pub_ns),
+            recent_pub_ns,
         },
         ensure_res_hit,
         ensure_cold_n,
@@ -1404,7 +1412,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms \
+         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
         s.write.class_a_ms,
@@ -1424,6 +1432,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.write.utxo_ms,
         s.write.tweak_ms,
         s.write.cache_tip_ms,
+        s.write.recent_pub_ms,
         s.ann_ms,
         s.ann_n,
         s.ann_pread_skip,
@@ -1491,7 +1500,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
-         spend={}(r={} i={} skip={}) tweaks={} tip_gc={}",
+         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={}",
         us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
@@ -1511,6 +1520,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.spend_skip,
         us(s.write.tweak_ns),
         us(s.write.cache_tip_ns),
+        us(s.write.recent_pub_ns),
     );
     append_nz(&mut out, "recon_us", us(s.recon_ns));
     append_nz(&mut out, "wire_us", us(s.wire_ns));
@@ -1893,6 +1903,7 @@ mod tests {
         assert!(line.contains("tweaks=64ms"), "{line}");
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
+        assert!(line.contains("recent_pub=0ms"), "{line}");
     }
 
     #[test]

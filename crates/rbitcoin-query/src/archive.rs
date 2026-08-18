@@ -1614,6 +1614,7 @@ mod tests {
         };
         q.recent_creates()
             .note(10, [(parent_txid, Fk(91), (5000, 16))]);
+        q.recent_creates().publish_if_dirty();
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
             let helper = crate::stamp_external_parents(
@@ -1641,6 +1642,7 @@ mod tests {
             assert!(mix.recent_n >= 1, "recent hits must be metered: {mix:?}");
         });
         q.recent_creates().drop_from(10);
+        q.recent_creates().publish_if_dirty();
         assert!(q.recent_creates().get(&parent_txid).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

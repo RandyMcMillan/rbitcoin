@@ -1737,7 +1737,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} rej={} \
-         | bq soft={}/{} RAM={}MiB \
+         | bq soft={}/{} RAM={}MiB bq_dec={} \
          | conf_plans={} \
          | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
@@ -1768,6 +1768,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
+        o.bq_promoted,
         o.conf_plans,
         cp.ready,
         cp.script_batches,
@@ -2382,6 +2383,7 @@ mod tests {
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;
+        s.owned.bq_promoted = 3;
         s.owned.head.primary_bits = 25;
         s.owned.head.primary_entry_b = 4;
         s.owned.head.primary_slots = 1 << 25;
@@ -2414,7 +2416,7 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("miss="), "{line}");
         assert!(!line.contains("body_soft"), "{line}");
-        assert!(line.contains("bq soft=4/256 RAM=32MiB"), "{line}");
+        assert!(line.contains("bq soft=4/256 RAM=32MiB bq_dec=3"), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         assert!(line.contains("conf_plans=80"), "{line}");

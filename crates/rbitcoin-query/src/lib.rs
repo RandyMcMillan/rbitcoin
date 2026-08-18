@@ -75,6 +75,8 @@ pub struct ProcessOwnedSizes {
     /// Write-published recent-create identity ring (heights / live keys).
     pub recent_heights: usize,
     pub recent_keys: usize,
+    /// Body-queue heights whose raw payload was dropped after lookup decode.
+    pub bq_promoted: usize,
 }
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
@@ -1735,6 +1737,7 @@ impl Query {
             pstore_bytes: mem.pstore_bytes,
             recent_heights: rec_h,
             recent_keys: rec_k,
+            bq_promoted: self.block_queue_promoted_count(),
         }
     }
 

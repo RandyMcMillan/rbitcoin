@@ -8,21 +8,24 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); confirm pack **decodes** by height; confirm-write **dequeues** after tip advance. **RAM-only by design** — avoids double-writing every block (queue + Class A). Restart empties the queue; **tip-batch Class A is reconstructed into BQ** (`rehydrate_class_a_into_body_queue`, ≤`TIP_HOLE_MAX`) so claim does not wait on re-getdata when bodies are already packed. Logs: `bq soft=n/win RAM=`. |
+| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). `bytes()` is raw length or decoded charge after promote | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); lookup **promotes** to decoded-only (`Arc<Block>` + `TxPrecompute`, raw dropped); load pack uses that Arc. Confirm-write **dequeues** after tip advance. **Never both** raw and decoded. **RAM-only by design** — avoids double-writing every block (queue + Class A). Restart empties the queue; **tip-batch Class A is reconstructed into BQ** (`rehydrate_class_a_into_body_queue`, ≤`TIP_HOLE_MAX`) so claim does not wait on re-getdata when bodies are already packed. Logs: `bq soft=n/win RAM=` `bq_dec=`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary gate is soft assign (100 MiB free / 1 min confirm window). |
 | **Confirm feed** | readiness (height/hash), no wire retain | **Load** packs tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (hardcoded **8000**, overshoot block included) or hard **144** blocks. At dense mainnet heights **8000 inputs ≈ a few blocks** (often 1–3; early chain can pack many tiny blocks up to 144). Do not treat ~32 as pack size. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave (holds a short wave while `ready` is over half the 1-min BQ window, unless the first unresolved height is in the load-facing half of that window). Requeue / finish on outcome |
 
 ## Soft budgets (unified body-queue path)
 
 Peers enqueue **raw** framed block payloads into the **in-RAM** body queue (no
-peer full-block decode). Confirm pack is the sole wire decode. Confirm commit is
-the sole Class A appender (**no** dual-track archive-job / ContigPark pipeline).
+peer full-block decode). Lookup is the first decode: it runs `TxPrecompute::from_tx`,
+promotes the height to decoded-only, and drops the raw frame (one BQ mutex per
+wave). Load pack clones the `Arc<Block>` and structure reuses stashed pres.
+Confirm commit is the sole Class A appender (**no** dual-track archive-job /
+ContigPark pipeline).
 
 **Why RAM (not disk):** writing peer wire to a durable queue and again into Class
 A would **double disk write every block**. Process memory + redownload on restart
 is the deliberate tradeoff. Accept stores raw wire only (block hash already known
-from framing); full parse / txid calculation stays on the confirm pack path so we
-do not hold both a decoded `Block` and the wire bytes.
+from framing). After lookup processes a height we hold the decoded `Block` +
+pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
@@ -83,7 +86,7 @@ known retain structures:
 |-------------|----------------|
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
-| `bq soft=n/win RAM=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB |
+| `bq soft=n/win RAM=` `bq_dec=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB (decoded charge after promote) + promoted height count |
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
 | `conf ready=` / `scriptq` / `writeq` | `ready=` = BQ resolve-complete inventory; scriptq/writeq are real queue contents + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |

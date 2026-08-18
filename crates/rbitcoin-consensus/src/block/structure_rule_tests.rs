@@ -696,7 +696,7 @@ fn assemble_full_mode_spend_and_bip68() {
     use super::{assemble_block_prevouts_mode, AssembleMode};
     use crate::accept_and_connect_block;
     use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -788,7 +788,7 @@ fn assemble_full_mode_spend_and_bip68() {
     let parents = BatchParents::new();
     let thin = BatchThin::default();
     let mut spent = HashSet::new();
-    let mut creates = HashMap::new();
+    let mut creates = super::PendingCreates::default();
     let create_txids: Vec<[u8; 32]> = block
         .txdata
         .iter()
@@ -820,7 +820,7 @@ fn assemble_full_mode_spend_and_bip68() {
 fn assemble_rejects_empty_and_fk_mismatch() {
     use super::assemble_block_prevouts;
     use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -843,7 +843,7 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let parents = BatchParents::new();
     let thin = BatchThin::default();
     let mut spent = HashSet::new();
-    let mut creates = HashMap::new();
+    let mut creates = super::PendingCreates::default();
     let zero = [0u8; 32];
     let err = assemble_block_prevouts(
         &q,
@@ -922,6 +922,72 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Pack creates are `txid → fk` (one insert). Meters flush once (in_n = spends).
+#[test]
+fn assemble_pending_creates_is_txid_map_and_meters_flush() {
+    use super::assemble_block_prevouts;
+    use crate::confirm_phase_stats;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, BatchThin, Query};
+    use std::collections::HashSet;
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-assemble-creates-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let ctx = ctx_h(1);
+    let parents = BatchParents::new();
+    let thin = BatchThin::default();
+    let mut spent = HashSet::new();
+    let mut creates = super::PendingCreates::default();
+    let b = block_with(vec![coinbase(1)]);
+    let tids: Vec<[u8; 32]> = b
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = b.header.block_hash().to_byte_array();
+    let bip16 = bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, 0);
+    let _ = confirm_phase_stats::sample_assemble_and_reset();
+    let _ = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+    assemble_block_prevouts(
+        &q,
+        &b,
+        &ctx,
+        Some(&[Fk(1)]),
+        &mut spent,
+        &mut creates,
+        &parents,
+        &thin,
+        &tids,
+        0,
+        &bh,
+        bip16,
+        None,
+    )
+    .expect("coinbase-only assemble");
+    assert_eq!(creates.len(), 1, "one create fk per tx, not per vout");
+    assert_eq!(creates.get(&tids[0]), Some(&Fk(1)));
+    let (in_n, _bns, batch_n, _sns, same_n, ..) =
+        confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+    assert_eq!(in_n, 0, "coinbase has no prevouts");
+    assert_eq!(batch_n, 0);
+    assert_eq!(same_n, 0);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// N1: cold-path reason counters for pin→assemble leakage classes.
 ///
 /// Drives [`super::resolve_prevout`] (same crate) so each miss class is
@@ -934,7 +1000,6 @@ fn n1_assemble_cold_why_reasons() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, Query};
     use rbitcoin_store::OutputRecord;
-    use std::collections::HashMap;
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -996,7 +1061,7 @@ fn n1_assemble_cold_why_reasons() {
         vout: 0,
     };
     let empty_block = block_with(vec![coinbase(4)]);
-    let same_block: HashMap<[u8; 32], usize> = HashMap::new();
+    let txid_index = super::TxidMap::<usize>::default();
     let mut cb_cache: rbitcoin_query::FkMap<Option<u32>> = rbitcoin_query::FkMap::default();
 
     // Thread-local N1 counters (process-global atomics race under parallel cargo test).
@@ -1011,11 +1076,13 @@ fn n1_assemble_cold_why_reasons() {
             &empty_block,
             op,
             None,
-            &same_block,
+            &txid_index,
+            0,
             &mut cb_cache,
             &parents,
             4,
             false,
+            &mut super::AsmPrevoutAcc::default(),
         )
         .expect("null_fk cold");
         let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
@@ -1032,11 +1099,13 @@ fn n1_assemble_cold_why_reasons() {
             &empty_block,
             op,
             Some(last_cb_fk),
-            &same_block,
+            &txid_index,
+            0,
             &mut cb_cache,
             &parents,
             4,
             false,
+            &mut super::AsmPrevoutAcc::default(),
         )
         .expect("not_pin cold");
         let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
@@ -1061,11 +1130,13 @@ fn n1_assemble_cold_why_reasons() {
             &empty_block,
             op,
             Some(last_cb_fk),
-            &same_block,
+            &txid_index,
+            0,
             &mut cb_cache,
             &parents,
             4,
             false,
+            &mut super::AsmPrevoutAcc::default(),
         )
         .expect("batch hit");
         let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
@@ -1087,11 +1158,13 @@ fn n1_assemble_cold_why_reasons() {
             &empty_block,
             op,
             Some(last_cb_fk),
-            &same_block,
+            &txid_index,
+            0,
             &mut cb_cache,
             &parents,
             4,
             false,
+            &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("mismatch must hard-fail"),
             Err(e) => e,
@@ -1119,11 +1192,13 @@ fn n1_assemble_cold_why_reasons() {
             &empty_block,
             op,
             Some(last_cb_fk),
-            &same_block,
+            &txid_index,
+            0,
             &mut cb_cache,
             &parents,
             4,
             false,
+            &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("vout_miss must hard-fail"),
             Err(e) => e,

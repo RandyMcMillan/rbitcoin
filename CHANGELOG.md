@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **Assemble meters and maps:** prevout path counts flush once per block
+  (no per-input `Instant` / atomics). Same-block outs use `txid_index`
+  (`TxidHasher`); pack `pending_creates` is `txid → fk`. `ibd: perf`
+  assemble tokens stay; `us/in` is still `ASM_PREVOUT_NS / ASM_IN_N`.
+
 - **Core functional field leftovers.** Official `rpc_net.py` stays
   skip: dual-connect `getconnectioncount` now counts inbound+outbound
   PeerHub sessions; `getpeerinfo` emits `last_block` /

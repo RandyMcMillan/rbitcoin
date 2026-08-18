@@ -14,7 +14,7 @@ pub(super) fn assemble_run(
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-    let mut pending_creates: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> = HashMap::new();
+    let mut pending_creates = crate::block::PendingCreates::default();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(metas.len());
 

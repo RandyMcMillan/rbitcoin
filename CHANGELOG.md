@@ -20,6 +20,12 @@ before 1.0).
 
 ### Changed
 
+- **Store IoCtx:** head-resolve / identity / idx page fill share one
+  `IoCtx` (`held` session or standalone). Crate-private
+  `probe_candidates_batch_{open,sealed_hot,cold}_on_session` twins are
+  one `probe_candidates_batch_wave`. Machines still hold TLS; nested
+  `with_thread_local` still panics. Public `*_on_session` wrappers remain.
+
 - **IBD write sample nest:** `IbdPerfSample.write` is a `WriteStageSample`
   of the eight inventory tokens (`class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc`).
   `write=` still equals `write_stage_ms`. INFO/DEBUG token strings unchanged.

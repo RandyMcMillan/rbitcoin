@@ -593,7 +593,7 @@ impl SegmentedTxHead {
     /// Sealed segments still fuse-gate per key; only keys that pass are batched
     /// for that segment's page loads. Page IO uses TLS bulk_io.
     pub fn probe_candidates_batch(&self, mixed: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::All, None)
+        self.probe_candidates_batch_wave(mixed, HeadProbeWave::All, None, &mut crate::IoCtx::none())
     }
 
     /// Same as [`Self::probe_candidates_batch`] but head page preads use the
@@ -603,78 +603,68 @@ impl SegmentedTxHead {
         mixed: &[[u8; 32]],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::All, None)
+        self.probe_candidates_batch_wave(
+            mixed,
+            HeadProbeWave::All,
+            None,
+            &mut crate::IoCtx::held(session),
+        )
     }
 
     /// Wave 1: unsealed open tail only.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_open(
         &self,
         mixed: &[[u8; 32]],
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Open, None)
-    }
-
-    /// Wave 1 on a held plan TLS session.
-    pub(crate) fn probe_candidates_batch_open_on_session(
-        &self,
-        mixed: &[[u8; 32]],
-        session: &mut crate::uring_session::UringSession,
-    ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Open, None)
+        self.probe_candidates_batch_wave(
+            mixed,
+            HeadProbeWave::Open,
+            None,
+            &mut crate::IoCtx::none(),
+        )
     }
 
     /// Wave 2: sealed ages `1..=3`. Inactive keys (`active[i] == false`) get
     /// empty cand lists, same as cold.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_sealed_hot(
         &self,
         mixed: &[[u8; 32]],
         active: &[bool],
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::SealedHot, Some(active))
-    }
-
-    /// Wave 2 on a held plan TLS session.
-    pub(crate) fn probe_candidates_batch_sealed_hot_on_session(
-        &self,
-        mixed: &[[u8; 32]],
-        active: &[bool],
-        session: &mut crate::uring_session::UringSession,
-    ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(
+        self.probe_candidates_batch_wave(
             mixed,
-            Some(session),
             HeadProbeWave::SealedHot,
             Some(active),
+            &mut crate::IoCtx::none(),
         )
     }
 
     /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where
     /// `active[i]` is true (wave-1 misses / unconnected hot). Inactive keys
     /// get empty cand lists.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_cold(
         &self,
         mixed: &[[u8; 32]],
         active: &[bool],
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, None, HeadProbeWave::Cold, Some(active))
+        self.probe_candidates_batch_wave(
+            mixed,
+            HeadProbeWave::Cold,
+            Some(active),
+            &mut crate::IoCtx::none(),
+        )
     }
 
-    /// Two-wave resolve: cold probe on a held plan TLS session.
-    pub(crate) fn probe_candidates_batch_cold_on_session(
+    /// One probe walk: `wave` + shared [`crate::IoCtx`] (held session or standalone).
+    pub(crate) fn probe_candidates_batch_wave(
         &self,
         mixed: &[[u8; 32]],
-        active: &[bool],
-        session: &mut crate::uring_session::UringSession,
-    ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        self.probe_candidates_batch_inner(mixed, Some(session), HeadProbeWave::Cold, Some(active))
-    }
-
-    fn probe_candidates_batch_inner(
-        &self,
-        mixed: &[[u8; 32]],
-        mut session: Option<&mut crate::uring_session::UringSession>,
         wave: HeadProbeWave,
         active: Option<&[bool]>,
+        ctx: &mut crate::IoCtx<'_>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n = mixed.len();
         let mut out = vec![Vec::new(); n];
@@ -708,10 +698,7 @@ impl SegmentedTxHead {
             }
             if !pass_keys.is_empty() {
                 LOOKUP_OPEN.fetch_add(pass_keys.len() as u64, Ordering::Relaxed);
-                let rel_lists = match session.as_mut() {
-                    Some(s) => last.head.probe_fks_batch_on_session(&pass_keys, s)?,
-                    None => last.head.probe_fks_batch(&pass_keys)?,
-                };
+                let rel_lists = last.head.probe_fks_batch_ctx(&pass_keys, ctx)?;
                 for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                     for r in rels.into_iter().rev() {
                         if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
@@ -761,10 +748,7 @@ impl SegmentedTxHead {
             if pass_keys.is_empty() {
                 continue;
             }
-            let rel_lists = match session.as_mut() {
-                Some(s) => seg.head.probe_fks_batch_on_session(&pass_keys, s)?,
-                None => seg.head.probe_fks_batch(&pass_keys)?,
-            };
+            let rel_lists = seg.head.probe_fks_batch_ctx(&pass_keys, ctx)?;
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
                     if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {

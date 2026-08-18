@@ -338,14 +338,12 @@ fn test_force_session_false() -> bool {
     TEST_FORCE_SESSION_FALSE.with(|c| c.get())
 }
 
-/// Bulk pread on an **already-held** plan TLS session (no nested `with_thread_local`).
-///
-/// Used by head-resolve ID stage after probe holds the ring. Returns false if
-/// any SQE failed — caller falls back to libc pread for that batch.
-pub(crate) fn pread_batch_on_session(
-    session: &mut crate::uring_session::UringSession,
-    ops: &mut [ReadOp<'_>],
-) -> bool {
+/// Bulk pread on a shared [`crate::IoCtx`]. Held session submits SQEs;
+/// `none` returns false so the caller uses libc (never nested TLS).
+pub(crate) fn pread_batch_on_ctx(ctx: &mut crate::IoCtx<'_>, ops: &mut [ReadOp<'_>]) -> bool {
+    let Some(session) = ctx.session() else {
+        return false;
+    };
     let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
     if total_nonempty == 0 {
         for op in ops.iter_mut() {
@@ -1135,8 +1133,8 @@ mod tests {
                 result: i32::MIN,
             }];
             assert!(
-                pread_batch_on_session(&mut sess, &mut ops2),
-                "pread_batch_on_session must succeed on pool (not a linux-only stub)"
+                pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops2),
+                "pread_batch_on_ctx(held) must succeed on pool (not a linux-only stub)"
             );
             assert_eq!(ops2[0].result, 4);
             assert_eq!(&b2, b"sess");

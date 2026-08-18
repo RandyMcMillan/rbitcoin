@@ -236,7 +236,7 @@ impl TxidBody {
         &self,
         fks: &[Fk],
     ) -> Result<(HashMap<u64, [u8; 32]>, u64), StoreError> {
-        self.get_many_page_grouped_inner(fks, None)
+        self.get_many_page_grouped_ctx(fks, &mut crate::IoCtx::none())
     }
 
     /// Same as [`Self::get_many_page_grouped`] but page preads use the
@@ -246,13 +246,22 @@ impl TxidBody {
         fks: &[Fk],
         session: &mut crate::uring_session::UringSession,
     ) -> Result<(HashMap<u64, [u8; 32]>, u64), StoreError> {
-        self.get_many_page_grouped_inner(fks, Some(session))
+        self.get_many_page_grouped_ctx(fks, &mut crate::IoCtx::held(session))
+    }
+
+    /// Page-grouped identity fill with a shared [`crate::IoCtx`].
+    pub(crate) fn get_many_page_grouped_ctx(
+        &self,
+        fks: &[Fk],
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<(HashMap<u64, [u8; 32]>, u64), StoreError> {
+        self.get_many_page_grouped_inner(fks, ctx)
     }
 
     fn get_many_page_grouped_inner(
         &self,
         fks: &[Fk],
-        mut session: Option<&mut crate::uring_session::UringSession>,
+        ctx: &mut crate::IoCtx<'_>,
     ) -> Result<(HashMap<u64, [u8; 32]>, u64), StoreError> {
         let n = self.count();
         let mut unique: Vec<u64> = Vec::with_capacity(fks.len());
@@ -301,9 +310,9 @@ impl TxidBody {
 
         // Prefer held-session bulk pread; else libc pread (never nested TLS).
         let mut used_session = false;
-        if let Some(sess) = session.as_mut() {
+        if ctx.session().is_some() {
             use crate::bulk_io::ReadOp;
-            // SAFETY: each jobs[i].1 is a distinct Vec owned until after pread_batch_on_session.
+            // SAFETY: each jobs[i].1 is a distinct Vec owned until after pread_batch_on_ctx.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
             for (first, blob, _) in jobs.iter_mut() {
                 let off = Self::entry_offset(*first)?;
@@ -317,7 +326,7 @@ impl TxidBody {
                     result: i32::MIN,
                 });
             }
-            used_session = crate::bulk_io::pread_batch_on_session(sess, &mut ops);
+            used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops);
             if used_session {
                 for (op, (first, blob, _)) in ops.iter().zip(jobs.iter_mut()) {
                     if op.result < 0 || (op.result as usize) != blob.len() {

@@ -185,7 +185,7 @@ on `master`/`main` after the PR merges**.
 |------|-----|
 | **Each plan step** | Targeted tests for crates/modules touched (`cargo test -p …`); Red→green on the step contract; **one logical commit** |
 | **Not locally (default)** | `cargo test --workspace`, `./scripts/coverage.sh`, workspace `clippy … -D warnings`, `nix build .#rbitcoin-musl` |
-| **Plan coded** | Push the worktree branch over the **HTTPS URL** (leave `origin` on SSH); **one PR** for the whole plan (many commits). See `AGENTS.md` § Push. |
+| **Plan coded** | Push the worktree branch over the **explicit HTTPS URL** (bot has no SSH; `origin` `pushurl` stays SSH for the operator); **one PR** for the whole plan (many commits). See `AGENTS.md` § Push. |
 | **Plan complete** | Required Actions checks on that PR are **green** (`fmt` / `deny` / `clippy` / `test` / `multinode` / `coverage`). Poll after open and after every fixup push. |
 | **Musl install** | **Only** on `master`/`main` after merge |
 | **After merge** | Remove the worktree; delete the local **and** remote topic branch; `git fetch --prune`. See `AGENTS.md` § After merge cleanup. |

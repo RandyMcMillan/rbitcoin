@@ -814,9 +814,9 @@ pub struct ScriptCheckJob {
 }
 
 impl ScriptCheckJob {
-    /// Build a job hashing `tx` once for [`Self::txid`] (tests / benches).
+    /// Build a job hashing `tx` once for [`Self::txid`] (tests / detached verify).
     #[inline]
-    pub(crate) fn new(
+    pub fn new(
         prevouts: Vec<TxOut>,
         tx: Transaction,
         bip65_active: bool,

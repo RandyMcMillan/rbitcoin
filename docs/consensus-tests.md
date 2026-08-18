@@ -74,7 +74,7 @@ See `crates/rbitcoin-consensus/tests/fixtures/README.md`.
 | S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `s11_rejects_excessive_legacy_sigops` |
 | S12 | Connect: P2SH + witness sigops (BIP16/BIP141) | `bad-blk-sigops` | `sigop_cost_tests::*` + connect path `tx_sigop_cost` |
 
-Location: `crates/rbitcoin-consensus/src/block.rs` (`structure_rule_tests`).
+Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
 
 ## B. Header — `validate_header` / helpers
 

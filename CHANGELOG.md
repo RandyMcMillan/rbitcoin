@@ -31,6 +31,22 @@ before 1.0).
   `--smoke` until `store/scripthash.body` exists. Darwin zips are ad-hoc
   `codesign -s -` (not notarized).
 
+### Removed
+
+- **Host forensics and cargo benches:** `examples/diag_*`, `dump_wit`,
+  all `[[bench]]`, `rbitcoin-store-bench`, `freeze_benches`,
+  `reader_contention`, `diag_tip961461`, and ignored page-group / SH-head
+  wall microbenches. Default graph is product + suite
+  (`scripts/check_default_targets.test.sh`). Host A/B is musl + `ibd: perf`.
+
+- **Unused spend-annotate wrappers:** `Store::put_spend_batch_by_create` and
+  `_ranged`. Confirm write is abs-meta only
+  (`put_spend_batch_by_abs_meta_known`). `put_spend` / `put_spend_batch`
+  (txid) stay for `connect_block` / archive commit.
+
+- **`script_bench` facade:** detached script verify and fixture tests use
+  `ScriptCheckJob` + `verify_scripts_pool` / `verify_job_all_inputs`.
+
 ### Changed
 
 - **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when
@@ -43,6 +59,10 @@ before 1.0).
   one feed collect, one `block_queue_pack_snapshot`, one inflight mark
   (stored hash vs feed; no happy-path `block.block_hash()`). Script
   steal is unchanged — decode stays on the lookup thread.
+
+- **Docs remotes + lookup:** `origin` fetch is HTTPS, `pushurl` is SSH
+  (`AGENTS.md`). `OPERATOR.md` lookup row includes the hard min 8000
+  inputs. Living pointers use `block/mod.rs` / `structure_rule_tests.rs`.
 
 - **Lookup wave min 8000 inputs:** do not publish a TipOnly layer under
   8000 Σ `tx.input` when more unresolved BQ heights can still join,

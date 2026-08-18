@@ -22,14 +22,5 @@ getrandom = "0.4"
 io-uring = "0.7"
 # Sealed segment fuse8 is in-tree (`binary_fuse8` + `fuse8_filter`); no xorf/bincode.
 
-[[bin]]
-name = "rbitcoin-store-bench"
-path = "src/bin/store_bench.rs"
-
-
-[[bench]]
-name = "spend_batch"
-harness = false
-
 [lints]
 workspace = true

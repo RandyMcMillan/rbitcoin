@@ -612,6 +612,7 @@ impl SegmentedTxHead {
     }
 
     /// Wave 1: unsealed open tail only.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_open(
         &self,
         mixed: &[[u8; 32]],
@@ -626,6 +627,7 @@ impl SegmentedTxHead {
 
     /// Wave 2: sealed ages `1..=3`. Inactive keys (`active[i] == false`) get
     /// empty cand lists, same as cold.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_sealed_hot(
         &self,
         mixed: &[[u8; 32]],
@@ -642,6 +644,7 @@ impl SegmentedTxHead {
     /// Two-wave resolve: probe only **cold** (sealed ages ≥4) for keys where
     /// `active[i]` is true (wave-1 misses / unconnected hot). Inactive keys
     /// get empty cand lists.
+    #[cfg(test)]
     pub(crate) fn probe_candidates_batch_cold(
         &self,
         mixed: &[[u8; 32]],

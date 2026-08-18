@@ -562,6 +562,15 @@ pub async fn peer_session_with(
                         if let Some(s) = session.as_ref() {
                             s.request_tx_inv();
                             queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
+                            // setmocktime also ends a stalling headers-sync.
+                            // Restart getheaders here — waiting for the 50ms
+                            // tick loses p2p_initial_headers_sync noban
+                            // assert_single_getheaders_recipient.
+                            let _ = maybe_queue_initial_getheaders(
+                                &out_tx,
+                                hub.as_ref(),
+                                s,
+                            );
                         }
                     }
                 }

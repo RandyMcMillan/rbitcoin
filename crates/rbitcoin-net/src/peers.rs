@@ -645,11 +645,20 @@ impl PeerHub {
             return false;
         }
         let caught_up = now.saturating_sub(best_header_time) < 24 * 3600;
-        if !caught_up && self.n_sync_started.load(Ordering::Relaxed) != 0 {
-            return false;
+        if !caught_up {
+            // Two sessions can observe 0 after a noban timeout; only one
+            // extra getheaders (`p2p_initial_headers_sync` count==1).
+            if self
+                .n_sync_started
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+        } else {
+            self.n_sync_started.fetch_add(1, Ordering::Relaxed);
         }
         peer.sync_started.store(true, Ordering::Relaxed);
-        self.n_sync_started.fetch_add(1, Ordering::Relaxed);
         let timeout = crate::chain::headers_download_timeout_secs(now, best_header_time);
         peer.headers_sync_timeout.store(timeout, Ordering::Relaxed);
         true
@@ -709,6 +718,9 @@ impl PeerHub {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
                 p.sync_started.store(false, Ordering::Relaxed);
                 p.headers_sync_timeout.store(0, Ordering::Relaxed);
+                // In-flight getheaders timed out; allow a new one
+                // (`p2p_initial_headers_sync` noban recipient).
+                let _ = p.take_awaiting_headers();
                 self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
             } else {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_disconnect_log(p.id));
@@ -1107,6 +1119,41 @@ mod tests {
         assert!(!p1.is_sync_started());
         // After the sync peer leaves, another inbound may start.
         assert!(hub.try_start_headers_sync(&p2, now, 1_231_006_505));
+    }
+
+    #[test]
+    fn noban_headers_timeout_clears_awaiting_so_a_new_getheaders_can_send() {
+        let hub = PeerHub::new();
+        hub.set_noban(true);
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let _outbound = hub.register(
+            b,
+            b,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        let now = 1_700_000_000u64;
+        let best = 1_231_006_505u64;
+        assert!(hub.try_start_headers_sync(&inbound, now, best));
+        inbound.note_awaiting_headers();
+        assert!(inbound.is_awaiting_headers());
+        let deadline = crate::chain::headers_download_timeout_secs(now, best);
+        hub.set_mock_now(deadline + 1);
+        assert!(
+            !inbound.is_sync_started(),
+            "noban timeout must end the stalling sync"
+        );
+        assert!(
+            !inbound.is_awaiting_headers(),
+            "in-flight getheaders must be released so a replacement can send"
+        );
+        assert!(
+            hub.try_start_headers_sync(&inbound, deadline + 1, best),
+            "after timeout another getheaders start must be allowed"
+        );
     }
 
     #[test]

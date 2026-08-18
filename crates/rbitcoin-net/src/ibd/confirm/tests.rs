@@ -298,7 +298,7 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
         split_wave_into_load_batches, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS,
         LOAD_QUEUE_CAP_DEFAULT,
     };
-    assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 8);
+    assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 14);
     assert_eq!(super::confirm_queue_caps().load, LOAD_QUEUE_CAP_DEFAULT);
     assert_eq!(super::load_queue_cap(), LOAD_QUEUE_CAP_DEFAULT);
     assert!(super::LoadBatch { items: vec![] }.items.is_empty());

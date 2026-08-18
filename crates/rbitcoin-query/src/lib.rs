@@ -1670,14 +1670,22 @@ impl Query {
     ///
     /// One queue lock. Lookup wave select must use this instead of
     /// `list_meta` + per-height `is_resolve_complete`.
+    ///
+    /// Heights `≤ lookup_taken_hi` are already on loadq (`take_raw` removed
+    /// the BQ row). They are not a fetch hole — start after that high-water.
+    /// A missing height *above* the high-water still stops the walk.
     pub fn block_queue_unresolved_heights(
         &self,
         path_lo: u32,
         skip: &HashSet<u32>,
         cap: usize,
     ) -> Vec<u32> {
+        let start = match self.lookup_taken_hi() {
+            Some(hi) => path_lo.max(hi.saturating_add(1)),
+            None => path_lo,
+        };
         let g = self.block_queue.lock().unwrap();
-        g.unresolved_heights(path_lo, skip, cap)
+        g.unresolved_heights(start, skip, cap)
     }
 
     /// Load all queued blocks **with full payloads** (tests / tools).

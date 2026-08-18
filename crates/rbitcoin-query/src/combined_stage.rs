@@ -468,6 +468,31 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_heights_walks_past_taken_bq_hole() {
+        use std::collections::HashSet;
+        let (dir, q) = temp_query();
+        for h in 10..20u32 {
+            q.block_queue_enqueue(h, [h as u8; 32], 1, b"w").unwrap();
+        }
+        for h in 10..=12u32 {
+            assert!(q.block_queue_take_raw(h).is_some());
+        }
+        q.set_lookup_taken_hi(Some(12));
+        let none = HashSet::new();
+        assert_eq!(
+            q.block_queue_unresolved_heights(10, &none, 8),
+            vec![13, 14, 15, 16, 17, 18, 19]
+        );
+        assert!(q.block_queue_take_raw(15).is_some());
+        assert_eq!(q.block_queue_unresolved_heights(10, &none, 8), vec![13, 14]);
+        assert_eq!(
+            q.block_queue_unresolved_heights(16, &none, 8),
+            vec![16, 17, 18, 19]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn lookup_take_removes_bq_row_via_query() {
         let (dir, q) = temp_query();
         q.block_queue_enqueue(3, [3u8; 32], 1, b"xyz").unwrap();

@@ -284,6 +284,9 @@ pub(crate) struct IbdPerfSample {
     pub thr_lookup_send_wait_ms: u64,
     /// Stamp sub-walls (structure / prepare / filter / plan_batch).
     pub stamp_struct_ms: u64,
+    /// Split of structure: one-pass txid/wtxid encode vs remaining walks.
+    pub stamp_struct_txid_ms: u64,
+    pub stamp_struct_walk_ms: u64,
     pub stamp_prepare_ms: u64,
     pub stamp_filter_ms: u64,
     pub stamp_batch_ms: u64,
@@ -532,6 +535,8 @@ impl Default for IbdPerfSample {
             thr_lookup_other_ms: 0,
             thr_lookup_send_wait_ms: 0,
             stamp_struct_ms: 0,
+            stamp_struct_txid_ms: 0,
+            stamp_struct_walk_ms: 0,
             stamp_prepare_ms: 0,
             stamp_filter_ms: 0,
             stamp_batch_ms: 0,
@@ -962,6 +967,8 @@ pub(crate) fn sample(
         thr_lookup_other_ms: ns_ms(thr.lookup_other_ns),
         thr_lookup_send_wait_ms: ns_ms(thr.lookup_send_wait_ns),
         stamp_struct_ms: ns_ms(stamp_sub.struct_ns),
+        stamp_struct_txid_ms: ns_ms(stamp_sub.struct_txid_ns),
+        stamp_struct_walk_ms: ns_ms(stamp_sub.struct_walk_ns),
         stamp_prepare_ms: ns_ms(stamp_sub.prepare_ns),
         stamp_filter_ms: ns_ms(stamp_sub.filter_ns),
         stamp_batch_ms: ns_ms(stamp_sub.batch_ns),
@@ -1195,12 +1202,14 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         || s.thr_lookup_stamp_ms > 0
     {
         out.push_str(&format!(
-            " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
+            " stamp_sub(struct={}ms struct_txid={}ms struct_walk={}ms prepare={}ms filter={}ms batch={}ms \
              batch_assign={}ms collect={}ms pin_txid={} pin_txid%={} pin_txid_ms={} \
              leftover_n={} leftover_hit={} leftover_ms={} leftover_pend={} leftover_cdf0={} leftover_cdf3={} leftover_age_n={} \
              recent={} recent_ms={} \
              head={}ms stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
+            s.stamp_struct_txid_ms,
+            s.stamp_struct_walk_ms,
             s.stamp_prepare_ms,
             s.stamp_filter_ms,
             s.stamp_batch_ms,
@@ -1728,7 +1737,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} rej={} \
-         | bq soft={}/{} RAM={}MiB \
+         | bq soft={}/{} RAM={}MiB bq_dec={} \
          | conf_plans={} \
          | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
@@ -1759,6 +1768,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
+        o.bq_promoted,
         o.conf_plans,
         cp.ready,
         cp.script_batches,
@@ -2198,8 +2208,13 @@ mod tests {
         s.wf_store_body_ms = 2;
         s.load_missing_parents = 3;
         s.thr_lookup_stamp_ms = 1;
+        s.stamp_struct_ms = 8;
+        s.stamp_struct_txid_ms = 6;
+        s.stamp_struct_walk_ms = 2;
         let info = format_info(&s);
         assert!(info.contains("stamp_sub("), "{info}");
+        assert!(info.contains("struct_txid=6ms"), "{info}");
+        assert!(info.contains("struct_walk=2ms"), "{info}");
         assert!(info.contains("pin_txid=15"), "{info}");
         assert!(info.contains("pin_txid%=37"), "{info}");
         assert!(info.contains("pin_txid_ms=2"), "{info}");
@@ -2368,6 +2383,7 @@ mod tests {
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;
+        s.owned.bq_promoted = 3;
         s.owned.head.primary_bits = 25;
         s.owned.head.primary_entry_b = 4;
         s.owned.head.primary_slots = 1 << 25;
@@ -2400,7 +2416,7 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("miss="), "{line}");
         assert!(!line.contains("body_soft"), "{line}");
-        assert!(line.contains("bq soft=4/256 RAM=32MiB"), "{line}");
+        assert!(line.contains("bq soft=4/256 RAM=32MiB bq_dec=3"), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         assert!(line.contains("conf_plans=80"), "{line}");

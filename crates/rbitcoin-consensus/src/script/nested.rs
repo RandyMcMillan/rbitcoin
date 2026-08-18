@@ -30,7 +30,8 @@ pub(crate) fn try_p2sh_nested_segwit(
     job: &ScriptCheckJob,
     input_index: usize,
     tx: &Transaction,
-    cache: &mut SighashCache<&Transaction>,
+    _cache: &mut SighashCache<&Transaction>,
+    pre: &crate::TxPrecompute,
 ) -> Option<Result<(), ConsensusError>> {
     if !job.witness_active {
         return None;
@@ -65,7 +66,7 @@ pub(crate) fn try_p2sh_nested_segwit(
         (0, 20) => {
             let mut keyhash = [0u8; 20];
             keyhash.copy_from_slice(program);
-            p2wpkh::verify_with_keyhash(job, input_index, tx, &keyhash, redeem, cache)
+            p2wpkh::verify_with_keyhash(job, input_index, tx, &keyhash, redeem, pre)
         }
         (0, 32) => {
             let mut scripthash = [0u8; 32];
@@ -322,7 +323,13 @@ mod tests {
         tx.input[0].witness = Witness::from_slice(&[vec![0u8; 64], vec![0x02; 33]]);
         let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(
+            &job,
+            0,
+            &*job.tx,
+            &mut cache,
+            &crate::TxPrecompute::from_tx(&*job.tx),
+        );
         match r {
             Some(Err(e)) => {
                 let msg = format!("{e}");
@@ -351,7 +358,13 @@ mod tests {
         // Empty witness — must not succeed via legacy truthy-top.
         let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(
+            &job,
+            0,
+            &*job.tx,
+            &mut cache,
+            &crate::TxPrecompute::from_tx(&*job.tx),
+        );
         match r {
             Some(Err(e)) => {
                 assert!(format!("{e}").contains("WITNESS_MALLEATED_P2SH"), "got {e}");
@@ -377,7 +390,13 @@ mod tests {
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(
+            &job,
+            0,
+            &*job.tx,
+            &mut cache,
+            &crate::TxPrecompute::from_tx(&*job.tx),
+        );
         match r {
             Some(Err(e)) => {
                 assert!(
@@ -404,7 +423,14 @@ mod tests {
         let job = job_for(tx.clone(), p2sh_spk(&redeem), false);
         let mut cache = SighashCache::new(&*job.tx);
         assert!(
-            try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache).is_none(),
+            try_p2sh_nested_segwit(
+                &job,
+                0,
+                &*job.tx,
+                &mut cache,
+                &crate::TxPrecompute::from_tx(&*job.tx)
+            )
+            .is_none(),
             "without witness_active nested must not fire"
         );
     }
@@ -420,7 +446,14 @@ mod tests {
         let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
         let mut cache = SighashCache::new(&*job.tx);
         assert!(
-            try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache).is_none(),
+            try_p2sh_nested_segwit(
+                &job,
+                0,
+                &*job.tx,
+                &mut cache,
+                &crate::TxPrecompute::from_tx(&*job.tx)
+            )
+            .is_none(),
             "non-witness multi-push must not enter nested gate"
         );
         assert!(verify_p2sh_legacy(&job, 0, &*job.tx).is_ok());
@@ -440,7 +473,13 @@ mod tests {
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(
+            &job,
+            0,
+            &*job.tx,
+            &mut cache,
+            &crate::TxPrecompute::from_tx(&*job.tx),
+        );
         assert!(matches!(r, Some(Ok(()))), "v1-in-P2SH ACS, got {r:?}");
     }
 
@@ -480,7 +519,13 @@ mod tests {
             const_scriptcode: false,
         };
         let mut cache = SighashCache::new(&*job.tx);
-        let r = try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut cache);
+        let r = try_p2sh_nested_segwit(
+            &job,
+            0,
+            &*job.tx,
+            &mut cache,
+            &crate::TxPrecompute::from_tx(&*job.tx),
+        );
         assert!(matches!(r, Some(Err(_))));
 
         // Wrong redeem hash
@@ -509,7 +554,13 @@ mod tests {
         };
         let mut cache2 = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_nested_segwit(&job2, 0, &*job2.tx, &mut cache2),
+            try_p2sh_nested_segwit(
+                &job2,
+                0,
+                &*job2.tx,
+                &mut cache2,
+                &crate::TxPrecompute::from_tx(&*job2.tx)
+            ),
             Some(Err(_))
         ));
 
@@ -547,7 +598,13 @@ mod tests {
             const_scriptcode: false,
         };
         assert!(matches!(
-            try_p2sh_nested_segwit(&job3, 0, &*job3.tx, &mut SighashCache::new(&*job3.tx)),
+            try_p2sh_nested_segwit(
+                &job3,
+                0,
+                &*job3.tx,
+                &mut SighashCache::new(&*job3.tx),
+                &crate::TxPrecompute::from_tx(&*job3.tx)
+            ),
             Some(Err(_))
         ));
         // wrong hash
@@ -575,7 +632,13 @@ mod tests {
             const_scriptcode: false,
         };
         assert!(matches!(
-            try_p2sh_nested_segwit(&job4, 0, &*job4.tx, &mut SighashCache::new(&*job4.tx)),
+            try_p2sh_nested_segwit(
+                &job4,
+                0,
+                &*job4.tx,
+                &mut SighashCache::new(&*job4.tx),
+                &crate::TxPrecompute::from_tx(&*job4.tx)
+            ),
             Some(Err(_))
         ));
 
@@ -606,7 +669,14 @@ mod tests {
             const_scriptcode: false,
         };
         let mut c5 = SighashCache::new(&*job5.tx);
-        assert!(try_p2sh_nested_segwit(&job5, 0, &*job5.tx, &mut c5).is_none());
+        assert!(try_p2sh_nested_segwit(
+            &job5,
+            0,
+            &*job5.tx,
+            &mut c5,
+            &crate::TxPrecompute::from_tx(&*job5.tx)
+        )
+        .is_none());
 
         // Legacy wrong spk / hash / empty
         assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_err());
@@ -702,7 +772,13 @@ mod tests {
         };
         // Empty witness → p2wsh fails, but nested path reached scripthash copy + call.
         assert!(matches!(
-            try_p2sh_nested_segwit(&job, 0, &*job.tx, &mut SighashCache::new(&*job.tx)),
+            try_p2sh_nested_segwit(
+                &job,
+                0,
+                &*job.tx,
+                &mut SighashCache::new(&*job.tx),
+                &crate::TxPrecompute::from_tx(&*job.tx),
+            ),
             Some(Err(_))
         ));
 
@@ -740,7 +816,13 @@ mod tests {
         };
         let mut cache = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_nested_segwit(&job2, 0, &*job2.tx, &mut cache),
+            try_p2sh_nested_segwit(
+                &job2,
+                0,
+                &*job2.tx,
+                &mut cache,
+                &crate::TxPrecompute::from_tx(&*job2.tx),
+            ),
             Some(Err(_))
         ));
 

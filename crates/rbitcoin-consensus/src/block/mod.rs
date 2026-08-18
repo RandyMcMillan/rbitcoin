@@ -13,6 +13,7 @@ use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -67,6 +68,27 @@ pub fn validate_block_structure_hashed(
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<Vec<[u8; 32]>, ConsensusError> {
+    Ok(validate_block_structure_precomputed(block, ctx)?
+        .into_iter()
+        .map(|p| p.txid)
+        .collect())
+}
+
+/// Structure checks plus per-tx [`TxPrecompute`] (one walk: txid/wtxid/weight/common SHA256).
+pub fn validate_block_structure_precomputed(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+) -> Result<Vec<TxPrecompute>, ConsensusError> {
+    validate_block_structure_with_pres(block, ctx, None)
+}
+
+/// Like [`validate_block_structure_precomputed`], reusing lookup-stashed pres
+/// when `pres` is `Some` (no second `from_tx`). Length must match `txdata`.
+pub fn validate_block_structure_with_pres(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: Option<&[TxPrecompute]>,
+) -> Result<Vec<TxPrecompute>, ConsensusError> {
     if block.txdata.is_empty() {
         return Err(ConsensusError::BadBlock("no transactions"));
     }
@@ -79,24 +101,38 @@ pub fn validate_block_structure_hashed(
         }
     }
 
-    let weight = block.weight();
-    if weight.to_wu() > 4_000_000 {
+    let n = block.txdata.len();
+    let (pres, txid_ns) = if let Some(stashed) = pres {
+        if stashed.len() != n {
+            return Err(ConsensusError::BadBlock("precompute count mismatch"));
+        }
+        (stashed.to_vec(), 0)
+    } else {
+        let t_txid = Instant::now();
+        let v: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+        (v, t_txid.elapsed().as_nanos() as u64)
+    };
+    let mut seen = std::collections::HashSet::with_capacity(n);
+    for p in &pres {
+        if !seen.insert(p.txid) {
+            return Err(ConsensusError::BadBlock("duplicate txid"));
+        }
+    }
+
+    let t_walk = Instant::now();
+    let tx_count_vi = bitcoin::consensus::encode::VarInt(n as u64).size();
+    let base = 80usize
+        .saturating_add(tx_count_vi)
+        .saturating_add(pres.iter().map(|p| p.base_size).sum());
+    let total = 80usize
+        .saturating_add(tx_count_vi)
+        .saturating_add(pres.iter().map(|p| p.total_size).sum());
+    let weight_wu = (base.saturating_mul(3).saturating_add(total)) as u64;
+    if weight_wu > 4_000_000 {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
-    let has_witness = block_has_witness(block);
-
-    let n = block.txdata.len();
-    let mut txids = Vec::with_capacity(n);
-    let mut seen = std::collections::HashSet::with_capacity(n);
-    for tx in &block.txdata {
-        let id = tx.compute_txid().to_byte_array();
-        if !seen.insert(id) {
-            return Err(ConsensusError::BadBlock("duplicate txid"));
-        }
-        txids.push(id);
-    }
-
+    let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
     let merkle = merkle_root_bytes(&txids);
     if merkle != block.header.merkle_root.to_byte_array() {
         return Err(ConsensusError::BadBlock("merkle root mismatch"));
@@ -116,47 +152,44 @@ pub fn validate_block_structure_hashed(
     }
 
     const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    for tx in &block.txdata {
-        let mut out_sum = 0u64;
+    for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for o in &tx.output {
-            let v = o.value.to_sat();
-            if v > MAX_MONEY {
+            if o.value.to_sat() > MAX_MONEY {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
             }
-            out_sum = out_sum.saturating_add(v);
-            if out_sum > MAX_MONEY {
-                return Err(ConsensusError::BadBlock("bad-txns-txouttotal-toolarge"));
-            }
+        }
+        if p.out_sum > MAX_MONEY {
+            return Err(ConsensusError::BadBlock("bad-txns-txouttotal-toolarge"));
         }
     }
 
-    // Structure charges legacy×4 only. P2SH/witness sigops need prevouts (connect).
     {
         const WITNESS_SCALE: u64 = 4;
         const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
         let mut cost = 0u64;
-        for tx in &block.txdata {
-            cost = cost.saturating_add(legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE));
+        for p in &pres {
+            cost = cost.saturating_add(p.sigops.saturating_mul(WITNESS_SCALE));
         }
         if cost > MAX_BLOCK_SIGOPS_COST {
             return Err(ConsensusError::BadBlock("bad-blk-sigops"));
         }
     }
+    let walk_ns = t_walk.elapsed().as_nanos() as u64;
 
-    if has_witness {
+    let has_witness_data = block_has_witness(block);
+    if has_witness_data {
         if ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }
-        let mut non_cb = Vec::with_capacity(n.saturating_sub(1));
-        for tx in block.txdata.iter().skip(1) {
-            non_cb.push(tx.compute_wtxid().to_byte_array());
-        }
+        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
         check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
 
+    crate::plan_stamp_sub_stats::note_struct_parts(txid_ns, 0, walk_ns);
+
     // BIP325 signet solution is not checked here — tip confirm only.
 
-    Ok(txids)
+    Ok(pres)
 }
 
 /// True if any input carries witness data.
@@ -229,7 +262,7 @@ pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
     n
 }
 
-fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
+pub(crate) fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
     let mut n = 0u64;
     let mut i = 0usize;
     let mut last_opcode = 0xffu8;
@@ -2192,6 +2225,8 @@ fn is_anyone_can_spend(script: &Script) -> bool {
     crate::script::is_anyone_can_spend(script)
 }
 
+pub use rbitcoin_query::TxPrecompute;
+
 #[cfg(test)]
 mod bip34_tests;
 #[cfg(test)]
@@ -2200,3 +2235,5 @@ mod finality_tests;
 mod sigop_cost_tests;
 #[cfg(test)]
 mod structure_rule_tests;
+#[cfg(test)]
+mod tx_precompute;

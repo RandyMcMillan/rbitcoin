@@ -256,8 +256,13 @@ pub fn confirm_wire_load_phase_pipelined(
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t = Instant::now();
-        // Sole compute_txid pass for this block in the confirm pipeline.
-        let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        let stashed = query.block_queue_resolved(height.0);
+        let pres = crate::block::validate_block_structure_with_pres(
+            block.as_ref(),
+            &ctx,
+            stashed.as_ref().map(|w| w.pres.as_ref()),
+        )?;
+        let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
         // Later heights in the same batch validate against prior wire, not store tip.
         let t = Instant::now();

@@ -113,8 +113,9 @@ pub fn verify_tx_scripts_detached(
 pub use block::{
     apply_witness_commitment, bip34_height_script, bip68_active_for_tx, block_has_witness,
     block_subsidy, is_final_tx, sequence_locks_satisfied, tx_gbt_sigops, validate_block_connect,
-    validate_block_structure, validate_block_structure_hashed, witness_commitment_script,
-    ValidationContext, LOCKTIME_THRESHOLD,
+    validate_block_structure, validate_block_structure_hashed,
+    validate_block_structure_precomputed, validate_block_structure_with_pres,
+    witness_commitment_script, TxPrecompute, ValidationContext, LOCKTIME_THRESHOLD,
 };
 pub use clock::{current_now, wall_now, with_now, NodeClock};
 pub use convert::{block_to_apply, block_to_apply_with_txids, header_to_record};

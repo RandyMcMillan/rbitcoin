@@ -6,7 +6,8 @@
 //! **redownload on restart** and peak RAM for a single durable write (Class A).
 //!
 //! **Lifecycle:** enqueue after peer framing (raw payload only — no full block
-//! parse); **dequeue only after combined confirm-write** (or permanent reject).
+//! parse); lookup **promotes** a wave to decoded-only (drops raw, keeps a
+//! charge); **dequeue only after combined confirm-write** (or permanent reject).
 //! Restart does **not** rehydrate payloads (queue starts empty).
 //!
 //! **Primary capacity** is soft densify assign in the net layer (no hysteresis):
@@ -26,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
 pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
 
-/// One queued block (full wire payload — held in RAM until confirm-write).
+/// One queued block. `payload` is empty after [`BlockQueue::promote_wave`].
 #[derive(Debug, Clone)]
 pub struct QueuedBlock {
     pub id: u64,
@@ -36,6 +37,29 @@ pub struct QueuedBlock {
     pub payload: Vec<u8>,
 }
 
+/// Wire bytes or a post-lookup charge (decoded `Block` lives on Query).
+#[derive(Debug, Clone)]
+enum QueuedBody {
+    Raw(Vec<u8>),
+    Promoted { charge: u64 },
+}
+
+impl QueuedBody {
+    fn charge(&self) -> u64 {
+        match self {
+            Self::Raw(v) => v.len() as u64,
+            Self::Promoted { charge } => *charge,
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        match self {
+            Self::Raw(v) => v,
+            Self::Promoted { .. } => &[],
+        }
+    }
+}
+
 /// Index-only view of a queue entry (no payload clone).
 #[derive(Debug, Clone, Copy)]
 pub struct QueuedBlockMeta {
@@ -43,6 +67,7 @@ pub struct QueuedBlockMeta {
     pub height: u32,
     pub hash: [u8; 32],
     pub header_fk: u64,
+    /// Raw wire length, or decoded charge after promote.
     pub payload_len: u64,
     /// Lookup finished TipOnly for this height (load may still leftover-stamp).
     pub resolve_complete: bool,
@@ -66,7 +91,7 @@ struct IndexEntry {
     height: u32,
     hash: [u8; 32],
     header_fk: u64,
-    payload: Vec<u8>,
+    body: QueuedBody,
     resolve_complete: bool,
 }
 
@@ -168,7 +193,7 @@ impl BlockQueue {
                 height,
                 hash,
                 header_fk,
-                payload: payload.to_vec(),
+                body: QueuedBody::Raw(payload.to_vec()),
                 resolve_complete: false,
             },
         );
@@ -185,7 +210,7 @@ impl BlockQueue {
             height: e.height,
             hash: e.hash,
             header_fk: e.header_fk,
-            payload: e.payload.clone(),
+            payload: e.body.payload().to_vec(),
         }))
     }
 
@@ -204,7 +229,7 @@ impl BlockQueue {
         let Some(e) = self.index.remove(&id) else {
             return Ok(false);
         };
-        self.bytes = self.bytes.saturating_sub(e.payload.len() as u64);
+        self.bytes = self.bytes.saturating_sub(e.body.charge());
         Ok(true)
     }
 
@@ -256,7 +281,7 @@ impl BlockQueue {
                 height: e.height,
                 hash: e.hash,
                 header_fk: e.header_fk,
-                payload_len: e.payload.len() as u64,
+                payload_len: e.body.charge(),
                 resolve_complete: e.resolve_complete,
             })
             .collect()
@@ -336,6 +361,59 @@ impl BlockQueue {
             .values()
             .find(|e| e.height == height)
             .map(|e| e.hash)
+    }
+
+    /// Raw wire for `heights` still holding payload. One pass; skips promoted.
+    pub fn raw_payloads(&self, heights: &[u32]) -> Vec<(u32, Vec<u8>)> {
+        let want: HashSet<u32> = heights.iter().copied().collect();
+        let mut out = Vec::new();
+        for e in self.index.values() {
+            if !want.contains(&e.height) {
+                continue;
+            }
+            if let QueuedBody::Raw(v) = &e.body {
+                out.push((e.height, v.clone()));
+            }
+        }
+        out
+    }
+
+    /// Replace raw with a decoded charge for each height. Returns how many
+    /// were still raw. Already-promoted rows keep their charge. One pass.
+    pub fn promote_wave(&mut self, items: &[(u32, u64)]) -> Result<usize, StoreError> {
+        let mut n = 0usize;
+        for &(height, charge) in items {
+            let Some(e) = self.index.values_mut().find(|e| e.height == height) else {
+                continue;
+            };
+            if matches!(e.body, QueuedBody::Promoted { .. }) {
+                continue;
+            }
+            let old = e.body.charge();
+            e.body = QueuedBody::Promoted { charge };
+            self.bytes = self.bytes.saturating_sub(old).saturating_add(charge);
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    pub fn promoted_count(&self) -> usize {
+        self.index
+            .values()
+            .filter(|e| matches!(e.body, QueuedBody::Promoted { .. }))
+            .count()
+    }
+
+    pub fn mark_resolve_complete_wave(&mut self, heights: &[u32]) -> Result<usize, StoreError> {
+        let want: HashSet<u32> = heights.iter().copied().collect();
+        let mut n = 0usize;
+        for e in self.index.values_mut() {
+            if want.contains(&e.height) && !e.resolve_complete {
+                e.resolve_complete = true;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -597,6 +675,36 @@ mod tests {
         assert!(q.contains_height(9));
         assert!(!q.is_resolve_complete(9));
         assert!(q.mark_resolve_complete(10).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_wave_drops_raw_and_charges_decoded() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(10, [1u8; 32], 1, b"aaaa").unwrap();
+        q.enqueue(11, [2u8; 32], 2, b"bb").unwrap();
+        q.enqueue(12, [3u8; 32], 3, b"c").unwrap();
+        assert_eq!(q.bytes(), 7);
+        let raw = q.raw_payloads(&[10, 11, 99]);
+        assert_eq!(raw.len(), 2);
+        assert_eq!(q.promote_wave(&[(10, 16), (11, 8)]).unwrap(), 2);
+        assert_eq!(
+            q.bytes(),
+            16 + 8 + 1,
+            "promoted charge replaces raw; 12 stays raw"
+        );
+        assert!(q.get_by_height(10).unwrap().unwrap().payload.is_empty());
+        assert!(q.get_by_height(11).unwrap().unwrap().payload.is_empty());
+        assert_eq!(q.get_by_height(12).unwrap().unwrap().payload, b"c");
+        assert_eq!(q.raw_payloads(&[10, 11, 12]), vec![(12, b"c".to_vec())]);
+        assert_eq!(q.promoted_count(), 2);
+        let meta10 = q.list_meta().into_iter().find(|m| m.height == 10).unwrap();
+        assert_eq!(meta10.payload_len, 16);
+        assert_eq!(q.dequeue_height(10).unwrap(), 1);
+        assert_eq!(q.bytes(), 8 + 1);
+        assert_eq!(q.promoted_count(), 1);
+        assert!(q.get_by_height(10).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

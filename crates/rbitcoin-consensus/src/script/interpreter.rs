@@ -1340,14 +1340,14 @@ fn sighash_for_script(
             Ok(h.to_byte_array())
         }
         SigVersion::WitnessV0 => {
-            let mut cache = ctx.cache.borrow_mut();
+            let pre = crate::TxPrecompute::from_tx(ctx.tx);
             crypto::bip143_p2wsh_signature_hash(
                 ctx.tx,
                 ctx.input_index,
                 script_code,
                 ctx.amount,
                 ty_raw,
-                &mut cache,
+                &pre,
             )
         }
         SigVersion::TapScript => unreachable!(),

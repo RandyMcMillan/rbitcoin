@@ -1,17 +1,17 @@
 //! Native P2WPKH verification (SegWit v0).
 
-use bitcoin::sighash::SighashCache;
 use bitcoin::Transaction;
 
 use super::crypto;
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
+use crate::TxPrecompute;
 
 pub(crate) fn verify(
     job: &ScriptCheckJob,
     input_index: usize,
     tx: &Transaction,
-    cache: &mut SighashCache<&Transaction>,
+    pre: &TxPrecompute,
 ) -> Result<(), ConsensusError> {
     let spk = job.prevouts[input_index].script_pubkey.as_bytes();
     debug_assert!(spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
@@ -47,14 +47,8 @@ pub(crate) fn verify(
 
     let amount = job.prevouts[input_index].value;
     let spk_script = job.prevouts[input_index].script_pubkey.as_script();
-    let sighash = crypto::bip143_p2wpkh_signature_hash(
-        tx,
-        input_index,
-        spk_script,
-        amount,
-        sighash_ty,
-        cache,
-    )?;
+    let sighash =
+        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk_script, amount, sighash_ty, pre)?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
@@ -69,7 +63,7 @@ pub(crate) fn verify_with_keyhash(
     tx: &Transaction,
     keyhash: &[u8; 20],
     witness_program: &[u8],
-    cache: &mut SighashCache<&Transaction>,
+    pre: &TxPrecompute,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
     if input.witness.len() != 2 {
@@ -98,7 +92,7 @@ pub(crate) fn verify_with_keyhash(
     let amount = job.prevouts[input_index].value;
     let spk = bitcoin::script::Script::from_bytes(witness_program);
     let sighash =
-        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty, cache)?;
+        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty, pre)?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
@@ -158,20 +152,20 @@ mod tests {
     #[test]
     fn witness_shape_errors() {
         let job = job_with_witness(&[]);
-        let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
+        let pre = crate::TxPrecompute::from_tx(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &pre).is_err());
 
         let job = job_with_witness(&[&[0x01]]);
-        let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
+        let pre = crate::TxPrecompute::from_tx(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &pre).is_err());
 
         let job = job_with_witness(&[&[], &[0x02; 33]]);
-        let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
+        let pre = crate::TxPrecompute::from_tx(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &pre).is_err());
 
         let job = job_with_witness(&[&[0x30, 0x01, 0x01, 0x01], &[0x02; 33]]);
-        let mut cache = SighashCache::new(&*job.tx);
-        let err = verify(&job, 0, &*job.tx, &mut cache).unwrap_err();
+        let pre = crate::TxPrecompute::from_tx(&*job.tx);
+        let err = verify(&job, 0, &*job.tx, &pre).unwrap_err();
         assert!(format!("{err}").contains("p2wpkh"));
 
         let redeem = {
@@ -180,7 +174,7 @@ mod tests {
             r
         };
         let job = job_with_witness(&[&[0x01]]);
-        let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify_with_keyhash(&job, 0, &*job.tx, &[0u8; 20], &redeem, &mut cache).is_err());
+        let pre = crate::TxPrecompute::from_tx(&*job.tx);
+        assert!(verify_with_keyhash(&job, 0, &*job.tx, &[0u8; 20], &redeem, &pre).is_err());
     }
 }

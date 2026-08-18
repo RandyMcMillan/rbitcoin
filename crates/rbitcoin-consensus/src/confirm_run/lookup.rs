@@ -309,8 +309,13 @@ pub(super) fn wire_lookup_phase(
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t_struct = Instant::now();
-        // Sole compute_txid pass for this block in the confirm pipeline.
-        let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        let stashed = query.block_queue_resolved(height.0);
+        let pres = crate::block::validate_block_structure_with_pres(
+            block.as_ref(),
+            &ctx,
+            stashed.as_ref().map(|w| w.pres.as_ref()),
+        )?;
+        let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         if i == 0 {
             if height.0 != path_lo {
                 return Err(ConsensusError::BadPrev);
@@ -490,9 +495,25 @@ pub mod plan_stamp_sub_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static STRUCT_NS: AtomicU64 = AtomicU64::new(0);
+    static STRUCT_TXID_NS: AtomicU64 = AtomicU64::new(0);
+    static STRUCT_WTXID_NS: AtomicU64 = AtomicU64::new(0);
+    static STRUCT_WALK_NS: AtomicU64 = AtomicU64::new(0);
     static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
     static FILTER_NS: AtomicU64 = AtomicU64::new(0);
     static BATCH_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Split of [`validate_block_structure_hashed`]: txid encode, wtxid encode, other walks.
+    pub fn note_struct_parts(txid_ns: u64, wtxid_ns: u64, walk_ns: u64) {
+        if txid_ns > 0 {
+            STRUCT_TXID_NS.fetch_add(txid_ns, Ordering::Relaxed);
+        }
+        if wtxid_ns > 0 {
+            STRUCT_WTXID_NS.fetch_add(wtxid_ns, Ordering::Relaxed);
+        }
+        if walk_ns > 0 {
+            STRUCT_WALK_NS.fetch_add(walk_ns, Ordering::Relaxed);
+        }
+    }
 
     pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
         if struct_ns > 0 {
@@ -512,6 +533,9 @@ pub mod plan_stamp_sub_stats {
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
         pub struct_ns: u64,
+        pub struct_txid_ns: u64,
+        pub struct_wtxid_ns: u64,
+        pub struct_walk_ns: u64,
         pub prepare_ns: u64,
         pub filter_ns: u64,
         pub batch_ns: u64,
@@ -520,6 +544,9 @@ pub mod plan_stamp_sub_stats {
     pub fn sample_and_reset() -> Sample {
         Sample {
             struct_ns: STRUCT_NS.swap(0, Ordering::Relaxed),
+            struct_txid_ns: STRUCT_TXID_NS.swap(0, Ordering::Relaxed),
+            struct_wtxid_ns: STRUCT_WTXID_NS.swap(0, Ordering::Relaxed),
+            struct_walk_ns: STRUCT_WALK_NS.swap(0, Ordering::Relaxed),
             prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
             filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
             batch_ns: BATCH_NS.swap(0, Ordering::Relaxed),

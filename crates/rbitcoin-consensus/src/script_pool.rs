@@ -7,6 +7,7 @@
 //!
 //! No rayon / crossbeam.
 
+use arc_swap::ArcSwap;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -56,14 +57,14 @@ impl Wave {
         if i >= self.n {
             return None;
         }
-        self.in_wave.fetch_add(1, Ordering::SeqCst);
+        self.in_wave.fetch_add(1, Ordering::AcqRel);
         Some(i)
     }
 
     fn is_complete(&self) -> bool {
         let claimed_out =
             self.next.load(Ordering::Relaxed) >= self.n || self.failed.load(Ordering::Relaxed);
-        claimed_out && self.in_wave.load(Ordering::SeqCst) == 0
+        claimed_out && self.in_wave.load(Ordering::Acquire) == 0
     }
 
     fn run_one(&self, i: usize) {
@@ -77,7 +78,7 @@ impl Wave {
                 *g = Some(e);
             }
         }
-        self.in_wave.fetch_sub(1, Ordering::SeqCst);
+        self.in_wave.fetch_sub(1, Ordering::AcqRel);
         if self.is_complete() {
             *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
             self.done_cv.notify_all();
@@ -93,10 +94,25 @@ impl Wave {
 }
 
 static WAVES: Mutex<Vec<Arc<Wave>>> = Mutex::new(Vec::new());
+static WAVES_SNAP: OnceLock<ArcSwap<Vec<Arc<Wave>>>> = OnceLock::new();
 
+#[cfg(test)]
+static STEAL_WAVES_LOCKS: AtomicUsize = AtomicUsize::new(0);
+
+fn waves_snap() -> &'static ArcSwap<Vec<Arc<Wave>>> {
+    WAVES_SNAP.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
+}
+
+fn publish_waves(waves: &[Arc<Wave>]) {
+    waves_snap().store(Arc::new(waves.to_vec()));
+}
+
+/// Lock-free claim: load the published wave list. Must not lock [`WAVES`]
+/// (IBD waves are tens of thousands of short jobs). [`STEAL_WAVES_LOCKS`]
+/// counts steal-path mutex takes only — increment it if this function locks.
 fn steal_index() -> Option<(Arc<Wave>, usize)> {
-    let waves = WAVES.lock().unwrap_or_else(|p| p.into_inner());
-    for w in waves.iter() {
+    let snap = waves_snap().load();
+    for w in snap.iter() {
         if let Some(i) = w.claim() {
             return Some((Arc::clone(w), i));
         }
@@ -153,19 +169,19 @@ where
         done_cv: Condvar::new(),
     });
     {
-        WAVES
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(Arc::clone(&wave));
+        let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+        g.push(Arc::clone(&wave));
+        publish_waves(&g);
     }
     let pool = workers();
     pool.cv.notify_all();
     wave.wait_done();
 
-    WAVES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|w| !Arc::ptr_eq(w, &wave));
+    {
+        let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|w| !Arc::ptr_eq(w, &wave));
+        publish_waves(&g);
+    }
 
     let err = wave
         .first_err
@@ -514,6 +530,27 @@ mod tests {
         b.join().expect("b").expect("b ok");
         assert_eq!(a_hits.load(Ordering::Relaxed), 16);
         assert_eq!(b_hits.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    fn steal_index_does_not_lock_waves_per_job() {
+        // Claim must not take WAVES: a 256-job wave is tens of thousands of
+        // short P2WPKH jobs on IBD. Today's steal_index locks per claim.
+        workers();
+        STEAL_WAVES_LOCKS.store(0, Ordering::Relaxed);
+        let items: Vec<u32> = (0..256).collect();
+        let hits = AtomicUsize::new(0);
+        try_for_each_parallel(&items, |_| {
+            hits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 256);
+        let locks = STEAL_WAVES_LOCKS.load(Ordering::Relaxed);
+        assert_eq!(
+            locks, 0,
+            "steal_index took WAVES {locks} times (must be snapshot load only)"
+        );
     }
 
     #[test]

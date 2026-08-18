@@ -7,7 +7,7 @@
 # dylibs — only /usr/lib and /System/Library.
 #
 # Artifacts: rbitcoin-aarch64-darwin-<12-sha> (node, cli, SHA256SUMS).
-# Unsigned (no notarization).
+# Ad-hoc codesigned (`codesign -s -`). Not notarized / no Developer ID.
 
 name: macos
 
@@ -82,8 +82,31 @@ jobs:
       - name: Build node + cli
         run: cargo build --release -p rbitcoin-node -p rbitcoin-cli
 
+      - name: Smoke store create/open
+        env:
+          RBITCOIN_HEAD_SCALE: tiny
+        run: |
+          set -euo pipefail
+          cargo test --release -p rbitcoin-store --lib \
+            -- file::advise_tests::scripthash_body_create_open_roundtrip
+
       - name: Stage artifacts
         run: ./scripts/stage-native-artifacts.sh darwin target/release-darwin/release ./dist
+
+      - name: Verify ad-hoc codesign
+        run: |
+          set -euo pipefail
+          codesign -v dist/rbitcoin-node
+          codesign -v dist/rbitcoin-cli
+
+      - name: Smoke staged node opens scripthash.body
+        env:
+          RBITCOIN_HEAD_SCALE: tiny
+        run: |
+          set -euo pipefail
+          ./dist/rbitcoin-node --smoke --network regtest --datadir ./mac-smoke \
+            --no-seeds --log-level error
+          test -f ./mac-smoke/store/scripthash.body
 
       - name: Upload Darwin binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

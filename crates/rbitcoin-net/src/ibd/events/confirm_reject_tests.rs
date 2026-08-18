@@ -1929,6 +1929,32 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     );
     assert_eq!(hub.query.block_queue_stats().2, 1);
 
+    let b2 = shell(h1, 2, 2);
+    let h2 = b2.block_hash();
+    st.record_height(h2, 2);
+    st.header_fks
+        .insert(h2, hub.ensure_header_fk(&b2.header).unwrap());
+    hub.query.set_lookup_taken_hi(Some(2));
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::BlockFramed {
+            peer: 1,
+            hash: h2,
+            payload: ser(&b2),
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(
+        !st.body.is_pending(&h2),
+        "taken height must not mark_pending (zombie re-race)"
+    );
+    assert!(!hub.query.block_queue_has_height(2));
+    hub.query.set_lookup_taken_hi(None);
+
     let far_h = 1u32 + super::super::CONTIG_DENSIFY_AHEAD + 10;
     let far = shell(h1, far_h, far_h);
     let far_hash = far.block_hash();

@@ -76,14 +76,11 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     )
 }
 
-/// True if confirm lookup/load can claim this height without another getdata.
+/// True if this height does not need another getdata.
 ///
-/// **Only** body-queue wire (or already confirmed). Class A alone is not
-/// claim-ready — the sole confirm intake is bq → lookup → load (wire).
-///
-/// **Pending without BQ is not claim-ready** (zombie): `mark_pending` can outlive
-/// queue drop / failed pack. Treating it as ready made `hole=0` + `inflight=0`
-/// while tip+1 could not load (mainnet ~97% stall: feed ahead, claim wait forever).
+/// In hand: confirmed, matching BQ hash, or already taken onto loadq
+/// (`H ≤ lookup_taken_hi`). Class A alone is not enough. Pending without
+/// BQ is not in hand (zombie). Rejected is never in hand.
 pub(crate) fn claim_ready(
     hub: &ChainHub,
     body: &mut BodyPresence,
@@ -97,6 +94,9 @@ pub(crate) fn claim_ready(
     if body.is_rejected(hash) {
         return false;
     }
+    if hub.query.lookup_already_taken(height) {
+        return true;
+    }
     // Must be **this** hash at the height — first-wins BQ of a different block
     // is not claim-ready (mainnet tip+1 wrong-wire thrash / permanent hole).
     hub.query
@@ -104,12 +104,12 @@ pub(crate) fn claim_ready(
         .is_some_and(|h| h == hash.to_byte_array())
 }
 
-/// Count heights from tip+1 until the next claim-ready body (fetch gap).
+/// Count heights from tip+1 until the next in-hand body (fetch gap).
 ///
 /// - Missing header on the work path → stop (cannot request further).
 /// - Rejected tip+1 → stop (not a download gap; confirm is blacklisted).
-/// - Claim-ready (body-queue wire) → stop.
-/// - Otherwise increment hole (needs getdata before tip can claim it).
+/// - In hand (confirmed / BQ hash / taken onto loadq) → stop.
+/// - Otherwise increment hole (needs getdata).
 pub(crate) fn tip_fetch_hole(
     hub: &ChainHub,
     height_to_hash: &HashMap<u32, BlockHash>,
@@ -528,6 +528,49 @@ mod tests {
         // Confirmed tip block is claim-ready (hub.has_block).
         let ghash = hub.tip_hash().expect("genesis tip");
         assert!(claim_ready(&hub, &mut body2, 0, &ghash));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claim_ready_taken_prefix_is_not_a_fetch_hole() {
+        use super::super::body::BodyPresence;
+        use super::{claim_ready, tip_fetch_hole};
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-taken-hole-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+
+        let mut h2h = HashMap::new();
+        let mut body = BodyPresence::new();
+        for i in 1u8..=4 {
+            let h = BlockHash::from_byte_array([i; 32]);
+            h2h.insert(i as u32, h);
+            body.mark_missing(h);
+        }
+        hub.query.set_lookup_taken_hi(Some(2));
+        assert!(claim_ready(&hub, &mut body, 1, &h2h[&1]));
+        assert!(claim_ready(&hub, &mut body, 2, &h2h[&2]));
+        assert!(!claim_ready(&hub, &mut body, 3, &h2h[&3]));
+        assert_eq!(tip_fetch_hole(&hub, &h2h, &mut body), 0);
+
+        hub.query.set_lookup_taken_hi(None);
+        assert!(!claim_ready(&hub, &mut body, 1, &h2h[&1]));
+        assert_eq!(tip_fetch_hole(&hub, &h2h, &mut body), 4);
 
         let _ = std::fs::remove_dir_all(dir);
     }

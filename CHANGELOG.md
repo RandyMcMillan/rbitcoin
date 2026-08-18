@@ -25,6 +25,10 @@ before 1.0).
 
 ### Fixed
 
+- **Tip-hole / densify / receive share one in-hand rule:** confirmed,
+  matching BQ hash, or `H ≤ lookup_taken_hi`. Taken loadq heights are
+  not fetch holes and do not re-getdata or `mark_pending`.
+
 - **Lookup walk after loadq take:** `block_queue_unresolved_heights`
   starts after `lookup_taken_hi`. Taken BQ rows are not a fetch hole,
   so lookup can fill loadq ahead of tip. A missing height *above*

@@ -300,10 +300,10 @@ fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// all pending first left densify-ahead heights frozen (tip advances past tip-batch
 /// cover, soft filled, conf stuck on a later hole).
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
-    if hub.query.lookup_already_taken(ht) {
+    let &h = st.height_to_hash.get(&ht)?;
+    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
         return None;
     }
-    let &h = st.height_to_hash.get(&ht)?;
     if st.inflight.contains_key(&h) || st.body.is_rejected(&h) {
         return None;
     }
@@ -555,13 +555,13 @@ pub(crate) fn cover_tip_holes(
             continue;
         }
         let ht = st.hash_height.get(&h).copied();
-        if hub.has_block(&h) {
-            continue;
-        }
         if let Some(ht) = ht {
-            if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
+            if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
                 continue;
             }
+            let _ = bq_wire_for_hash(hub, ht, h);
+        } else if hub.has_block(&h) {
+            continue;
         }
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
         let mut avoid: HashSet<usize> = HashSet::new();
@@ -639,6 +639,35 @@ mod tests {
         assert!(Query::lookup_taken_covers(4, Some(5)));
         assert!(!Query::lookup_taken_covers(6, Some(5)));
         assert!(Query::lookup_taken_covers(0, Some(0)));
+    }
+
+    #[test]
+    fn cover_tip_holes_skips_taken_prefix() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        let want = h(0x11);
+        st.record_height(want, ht);
+        st.height_to_hash.insert(ht, want);
+        st.body.mark_missing(want);
+        hub.query.set_lookup_taken_hi(Some(ht));
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert!(
+            holes.is_empty(),
+            "taken tip+1 is not a fetch hole: {holes:?}"
+        );
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+        let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[want]);
+        assert_eq!(issued, 0, "must not race getdata for a taken height");
+        assert!(st.inflight.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn h(n: u32) -> BlockHash {

@@ -163,9 +163,22 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
     };
 
     // Two packs: write parent (drain+fence) before the child is even offered.
-    feed.note_wire(h_parent, parent.block_hash(), Some(parent));
+    // Production path is BQ raw → lookup take → loadq (not feed.note_wire).
+    use bitcoin::consensus::encode::serialize;
+    hub.query
+        .block_queue_enqueue(
+            h_parent,
+            parent.block_hash().to_byte_array(),
+            1,
+            &serialize(&parent),
+        )
+        .unwrap();
+    feed.note(h_parent, parent.block_hash());
     wait_tip(h_parent);
-    feed.note_wire(child_h, child_hash, Some(child));
+    hub.query
+        .block_queue_enqueue(child_h, child_hash.to_byte_array(), 1, &serialize(&child))
+        .unwrap();
+    feed.note(child_h, child_hash);
     wait_tip(child_h);
 
     feed.request_stop();
@@ -308,6 +321,58 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
         split_wave_into_load_batches(&thin, 8000, 144),
         vec![144, 144]
     );
+}
+
+#[test]
+fn load_recv_is_lookup_order() {
+    use super::LoadBatch;
+    use rbitcoin_query::{ResolvedWire, TxPrecompute};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    let (tx, rx) = mpsc::sync_channel::<LoadBatch>(8);
+    let mk = |h: u32| {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let pres: Arc<[TxPrecompute]> = genesis
+            .txdata
+            .iter()
+            .map(TxPrecompute::from_tx)
+            .collect::<Vec<_>>()
+            .into();
+        (
+            h,
+            [h as u8; 32],
+            ResolvedWire {
+                block: Arc::new(genesis),
+                pres,
+            },
+        )
+    };
+    tx.send(LoadBatch {
+        items: vec![mk(1), mk(2)],
+    })
+    .unwrap();
+    tx.send(LoadBatch { items: vec![mk(3)] }).unwrap();
+    let a = rx.recv().unwrap();
+    let b = rx.recv().unwrap();
+    assert_eq!(a.items[0].0, 1);
+    assert_eq!(a.items[1].0, 2);
+    assert_eq!(b.items[0].0, 3);
+}
+
+#[test]
+fn lookup_blocks_when_loadq_full() {
+    use super::{LoadBatch, LOAD_QUEUE_CAP_DEFAULT};
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::sync_channel::<LoadBatch>(LOAD_QUEUE_CAP_DEFAULT);
+    for _ in 0..LOAD_QUEUE_CAP_DEFAULT {
+        tx.send(LoadBatch { items: vec![] }).unwrap();
+    }
+    assert!(
+        tx.try_send(LoadBatch { items: vec![] }).is_err(),
+        "9th send must wait / fail while loadq is full"
+    );
+    let _ = rx.recv().unwrap();
+    tx.send(LoadBatch { items: vec![] }).unwrap();
 }
 
 #[test]

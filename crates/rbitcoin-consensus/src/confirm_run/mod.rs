@@ -47,7 +47,7 @@ mod scripts;
 mod write;
 
 pub use bq_resolve::{
-    confirm_bq_resolve_wave, confirm_bq_resolve_wave_with_ids, BqResolveWaveStats,
+    confirm_bq_resolve_wave, confirm_bq_resolve_wave_with_ids, BqResolveWave, BqResolveWaveStats,
     BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS, BQ_RESOLVE_WAVE_MIN_INPUTS,
 };
 pub use lookup::lookup_stage_stats;

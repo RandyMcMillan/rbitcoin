@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, ready=/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, loadq=/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
 //! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **load_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
@@ -2451,9 +2451,8 @@ mod tests {
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
-        assert!(line.contains("ready=0"), "{line}");
         assert!(
-            line.contains("scriptq<0/2 writeq=1/2") || line.contains("scriptq="),
+            line.contains("loadq<0/8 scriptq<0/2 writeq=1/2") || line.contains("loadq="),
             "{line}"
         );
         assert!(line.contains("thru=200"), "{line}");

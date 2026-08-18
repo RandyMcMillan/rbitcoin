@@ -41,6 +41,18 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
+/// Core `BLOCK_MUTATED`: reconstructed compact/body does not match the header.
+/// Do not cache the hash as `BLOCK_FAILED`.
+fn reject_is_mutated(reason: &str) -> bool {
+    reason.contains("merkle")
+        || reason.contains("bad-txnmrklroot")
+        || reason.contains("bad-txns-duplicate")
+        || reason.contains("witness commitment")
+        || reason.contains("bad-witness-nonce")
+        || reason.contains("missing witness commitment")
+        || reason.contains("wtxid count")
+}
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -1451,18 +1463,15 @@ impl ChainHub {
                 }
             }
             Err(e) => {
-                let s = e.to_string();
-                // Merkle mismatch is Core "mutated": do not mark BLOCK_FAILED.
-                let mutated = s.contains("merkle") || s.contains("bad-txnmrklroot");
-                if !mutated
-                    && self
-                        .query
-                        .get_header_by_hash(&hash.to_byte_array())
-                        .ok()
-                        .flatten()
-                        .is_some()
-                {
-                    self.invalidated.write().unwrap().insert(hash);
+                // Core `BLOCK_FAILED`: remember consensus-invalid hashes even
+                // when the header was never persisted (compact reconstruct).
+                // Mutated bodies (merkle / witness commitment) keep the hash
+                // acceptable so a later honest reconstruct can connect
+                // (`p2p_compactblocks` stalling-peer invalid compact).
+                if let NetError::Consensus(s) = &e {
+                    if !reject_is_mutated(s) && !s.to_ascii_lowercase().contains("not found") {
+                        self.note_invalid_block(hash);
+                    }
                 }
                 Err(e)
             }

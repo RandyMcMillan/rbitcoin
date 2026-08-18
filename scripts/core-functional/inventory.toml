@@ -591,9 +591,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_compactblocks.py"
-status = "skip"
-reason = "core-log"
-analog = "official: wait_for_block_announcement 30s in test_sendcmpct check_announcement_of_new_block (p2p_compactblocks.py:206 / :215); generate() tip is not announced as headers/inv/cmpctblock to the test peer"
+status = "run"
 
 [[test]]
 name = "p2p_compactblocks_blocksonly.py"

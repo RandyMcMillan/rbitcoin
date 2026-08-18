@@ -111,6 +111,9 @@ pub struct LivePeer {
     /// Shared with the TCP reader so split-header bytes count (`p2p_invalid_messages`).
     wire_recv: Mutex<Option<std::sync::Arc<AtomicU64>>>,
     wire_sent: Mutex<Option<std::sync::Arc<AtomicU64>>>,
+    /// Compact hashes whose first `blocktxn` reconstruct already failed
+    /// (`p2p_compactblocks` `test_multiple_blocktxn_response`).
+    failed_cmpct: Mutex<HashSet<BlockHash>>,
 }
 
 impl LivePeer {
@@ -176,6 +179,20 @@ impl LivePeer {
 
     pub fn request_disconnect(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn note_failed_cmpct(&self, hash: BlockHash) {
+        self.failed_cmpct
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash);
+    }
+
+    pub fn has_failed_cmpct(&self, hash: &BlockHash) -> bool {
+        self.failed_cmpct
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
     }
 
     pub fn set_hb_to(&self, v: bool) {
@@ -514,6 +531,8 @@ pub struct PeerHub {
     last_inv_headers_sync: Mutex<Option<BlockHash>>,
     /// Core whitelist `noban` — do not disconnect a stalling headers-sync peer.
     noban: AtomicBool,
+    /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
+    cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
 }
 
 impl PeerHub {
@@ -528,7 +547,33 @@ impl PeerHub {
             n_sync_started: AtomicU64::new(0),
             last_inv_headers_sync: Mutex::new(None),
             noban: AtomicBool::new(false),
+            cmpct_fills: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// BIP152: at most two inbound `getblocktxn` plus one outbound for a hash.
+    pub fn try_cmpct_fill_slot(&self, hash: BlockHash, inbound: bool) -> bool {
+        let mut g = self.cmpct_fills.lock().unwrap_or_else(|e| e.into_inner());
+        let (n_in, has_out) = g.entry(hash).or_insert((0, false));
+        if inbound {
+            if *n_in >= 2 {
+                return false;
+            }
+            *n_in = n_in.saturating_add(1);
+            true
+        } else if *has_out {
+            false
+        } else {
+            *has_out = true;
+            true
+        }
+    }
+
+    pub fn clear_cmpct_fill(&self, hash: BlockHash) {
+        self.cmpct_fills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&hash);
     }
 
     pub fn set_noban(&self, v: bool) {
@@ -702,6 +747,7 @@ impl PeerHub {
             minfeefilter_sat_kvb: AtomicU64::new(0),
             wire_recv: Mutex::new(None),
             wire_sent: Mutex::new(None),
+            failed_cmpct: Mutex::new(HashSet::new()),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);

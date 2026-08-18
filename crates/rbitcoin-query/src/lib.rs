@@ -10,6 +10,7 @@ mod confirm_parent_cache;
 mod connect;
 mod in_flight;
 mod published_ids;
+mod recent_creates;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -67,6 +68,9 @@ pub struct ProcessOwnedSizes {
     pub pstore_weak: usize,
     pub pstore_live: usize,
     pub pstore_bytes: u64,
+    /// Write-published recent-create identity ring (heights / live keys).
+    pub recent_heights: usize,
+    pub recent_keys: usize,
 }
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
@@ -133,6 +137,7 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds};
+pub use recent_creates::{recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_FLOOR};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -426,6 +431,9 @@ pub mod archive_phase_stats {
     pub static PIN_TXID_N: AtomicU64 = AtomicU64::new(0);
     /// Wall of that consult (RAM).
     pub static PIN_TXID_NS: AtomicU64 = AtomicU64::new(0);
+    /// Write-published recent-create identity hits (after published, before leftover).
+    pub static RECENT_N: AtomicU64 = AtomicU64::new(0);
+    pub static RECENT_NS: AtomicU64 = AtomicU64::new(0);
     /// Leftover TipOnly: pending-head hits among `head_need`.
     pub static LEFTOVER_PEND: AtomicU64 = AtomicU64::new(0);
     /// Leftover hit ages ≤0 / ≤3 / hit count (for leftover_cdf).
@@ -472,6 +480,8 @@ pub mod archive_phase_stats {
         pub head_hit: u64,
         pub pin_txid_n: u64,
         pub pin_txid_ns: u64,
+        pub recent_n: u64,
+        pub recent_ns: u64,
         pub leftover_pend: u64,
         pub leftover_cdf0_pct: u64,
         pub leftover_cdf3_pct: u64,
@@ -546,6 +556,8 @@ pub mod archive_phase_stats {
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
             pin_txid_n: PIN_TXID_N.swap(0, Ordering::Relaxed),
             pin_txid_ns: PIN_TXID_NS.swap(0, Ordering::Relaxed),
+            recent_n: RECENT_N.swap(0, Ordering::Relaxed),
+            recent_ns: RECENT_NS.swap(0, Ordering::Relaxed),
             leftover_pend: LEFTOVER_PEND.swap(0, Ordering::Relaxed),
             leftover_cdf0_pct: {
                 let n = LEFTOVER_AGE_N.load(Ordering::Relaxed);
@@ -643,6 +655,15 @@ pub mod archive_phase_stats {
         exclusive::with(|| {
             add(&PIN_TXID_N, n);
             add(&PIN_TXID_NS, ns);
+        });
+    }
+
+    /// Recent-create ring hits this plan batch.
+    #[inline]
+    pub fn note_recent(n: u64, ns: u64) {
+        exclusive::with(|| {
+            add(&RECENT_N, n);
+            add(&RECENT_NS, ns);
         });
     }
 
@@ -1078,6 +1099,9 @@ pub struct Query {
     disconnect_gen: AtomicU64,
     /// Lookup-published parent identity union (wave hits still in the BQ window).
     published_ids: std::sync::Arc<crate::PublishedIds>,
+    /// Write-published just-confirmed identity (txid → fk+range). Load stamp
+    /// before leftover TipOnly. Outs are not stored.
+    recent_creates: std::sync::Arc<crate::RecentCreates>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1157,6 +1181,7 @@ impl Query {
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
+            recent_creates: std::sync::Arc::new(crate::RecentCreates::new()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -1182,6 +1207,7 @@ impl Query {
         self.disconnect_height
             .store(height, AtomicOrdering::Release);
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
+        self.recent_creates.drop_from(height);
     }
 
     /// If `seen_gen` is stale, update it and return the disconnect height.
@@ -1461,6 +1487,36 @@ impl Query {
         &self.published_ids
     }
 
+    /// Just-confirmed identity ring (write-published; load stamp before leftover).
+    pub fn recent_creates(&self) -> &std::sync::Arc<crate::RecentCreates> {
+        &self.recent_creates
+    }
+
+    /// After Class A + idx: publish `txid → (fk, range)` and expire past
+    /// [`recent_creates_horizon`]. Missing idx range is skipped (leftover
+    /// TipOnly stays the home).
+    pub fn publish_recent_creates(
+        &self,
+        height: u32,
+        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
+    ) -> Result<(), QueryError> {
+        let pairs: Vec<([u8; 32], Fk)> = creates.into_iter().collect();
+        if !pairs.is_empty() {
+            let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
+            let ranges = self.store.tx_body_range_batch(&fks)?;
+            let rows = pairs
+                .into_iter()
+                .zip(ranges)
+                .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
+            self.recent_creates.note(height, rows);
+        }
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(height);
+        let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
+        self.recent_creates
+            .expire_to_horizon(tip.max(height), horizon);
+        Ok(())
+    }
+
     /// Index-only queue entries (no payload clone). Empty after restart.
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         let g = self.block_queue.lock().unwrap();
@@ -1563,6 +1619,7 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
+        let (rec_h, rec_k) = self.recent_creates.size_snapshot();
         let mut head = self.store.txs.head_resize_size_snapshot();
         head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
         ProcessOwnedSizes {
@@ -1577,6 +1634,8 @@ impl Query {
             pstore_weak: mem.pstore_weak,
             pstore_live: mem.pstore_live,
             pstore_bytes: mem.pstore_bytes,
+            recent_heights: rec_h,
+            recent_keys: rec_k,
         }
     }
 

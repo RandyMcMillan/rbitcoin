@@ -80,7 +80,7 @@ impl LoadAheadState {
     fn publish_mem_stats(&self) {
         let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
         let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-        if weak > live.saturating_mul(2) && weak > 4096 {
+        if weak > 4096 {
             self.parent_store.gc_dead_weaks();
             let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
             rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
@@ -424,6 +424,15 @@ pub(crate) fn write_queue_cap() -> usize {
     confirm_queue_caps().write
 }
 
+/// How many script-ok parts write may merge in one `confirm_write_phase`.
+///
+/// ¼ of [`write_queue_cap`] (floor, at least 1) so scripts keep empty slots
+/// while write runs. Default cap 20 → **5**.
+#[inline]
+pub(crate) fn write_drain_max_parts(writeq_cap: usize) -> usize {
+    writeq_cap.saturating_div(4).max(1)
+}
+
 /// Max heights claimable ahead of tip+1 (pipeline depth).
 ///
 /// Lookup may start the next run while load/scripts/write hold earlier ones,
@@ -718,6 +727,7 @@ pub(crate) fn stamp_reject_operator_msg(err: &str) -> String {
 fn drain_script_ok_write_queue(
     first: rbitcoin_consensus::ScriptOkBatch,
     rx: &std::sync::mpsc::Receiver<rbitcoin_consensus::ScriptOkBatch>,
+    max_parts: usize,
     mut on_extra: impl FnMut(&rbitcoin_consensus::ScriptOkBatch),
 ) -> (
     rbitcoin_consensus::ScriptOkBatch,
@@ -726,7 +736,11 @@ fn drain_script_ok_write_queue(
 ) {
     let mut batch = first;
     let mut parts = 1usize;
+    let max_parts = max_parts.max(1);
     loop {
+        if parts >= max_parts {
+            break;
+        }
         match rx.try_recv() {
             Ok(more) => {
                 on_extra(&more);
@@ -962,13 +976,17 @@ pub(crate) fn spawn_confirm_engine(
                         Err(_) => break,
                     },
                 };
-                let (batch, parts, next_left) =
-                    drain_script_ok_write_queue(first, &write_rx, |b| {
+                let (batch, parts, next_left) = drain_script_ok_write_queue(
+                    first,
+                    &write_rx,
+                    write_drain_max_parts(write_queue_cap()),
+                    |b| {
                         let n = b.len();
                         let wire = b.approx_wire_bytes();
                         let parents = b.parent_count();
                         q_wb.note_write_recv(n, wire, parents);
-                    });
+                    },
+                );
                 leftover = next_left;
                 confirm_thr_stats::add_write_recv_wait(t_recv.elapsed());
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {

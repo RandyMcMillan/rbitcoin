@@ -1485,11 +1485,12 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
-        let id = g.enqueue(height, hash, header_fk, payload)?;
+        let id = g.enqueue_vec(height, hash, header_fk, owned)?;
         Ok(BlockQueueOffer { queue_id: id })
     }
 
@@ -1501,8 +1502,9 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, QueryError> {
+        let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
-        Ok(g.enqueue(height, hash, header_fk, payload)?)
+        Ok(g.enqueue_vec(height, hash, header_fk, owned)?)
     }
 
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
@@ -1530,21 +1532,37 @@ impl Query {
         height: u32,
         creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
     ) -> Result<(), QueryError> {
+        self.note_recent_creates(height, creates)?;
+        self.expire_recent_creates(height);
+        Ok(())
+    }
+
+    /// Note identity rows without expiring the ring (write batches expire once).
+    pub fn note_recent_creates(
+        &self,
+        height: u32,
+        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
+    ) -> Result<(), QueryError> {
         let pairs: Vec<([u8; 32], Fk)> = creates.into_iter().collect();
-        if !pairs.is_empty() {
-            let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
-            let ranges = self.store.tx_body_range_batch(&fks)?;
-            let rows = pairs
-                .into_iter()
-                .zip(ranges)
-                .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
-            self.recent_creates.note(height, rows);
+        if pairs.is_empty() {
+            return Ok(());
         }
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(height);
+        let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
+        let ranges = self.store.tx_body_range_batch(&fks)?;
+        let rows = pairs
+            .into_iter()
+            .zip(ranges)
+            .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
+        self.recent_creates.note(height, rows);
+        Ok(())
+    }
+
+    /// Drop fifo rows past [`recent_creates_horizon`] relative to `tip_hint`.
+    pub fn expire_recent_creates(&self, tip_hint: u32) {
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
         let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
         self.recent_creates
-            .expire_to_horizon(tip.max(height), horizon);
-        Ok(())
+            .expire_to_horizon(tip.max(tip_hint), horizon);
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -1594,7 +1612,7 @@ impl Query {
     /// Raw frame only. `None` when missing or already promoted.
     pub fn block_queue_raw_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
         let g = self.block_queue.lock().unwrap();
-        Ok(g.raw_payloads(&[height]).into_iter().next().map(|(_, p)| p))
+        Ok(g.raw_payload(height))
     }
 
     /// Payload for a block **hash** if present on the RAM queue (any height).
@@ -1675,26 +1693,21 @@ impl Query {
 
     /// One lock: classify `heights` as still-raw vs already promoted.
     ///
-    /// Skips resolve-complete rows. Decode happens **outside** this lock.
+    /// Skips resolve-complete rows. **Does not clone raw payloads.** Decode
+    /// pulls [`Self::block_queue_raw_payload`] per height outside this lock.
     pub fn block_queue_wave_intake(&self, heights: &[u32]) -> BlockQueueWaveIntake {
         let g = self.block_queue.lock().unwrap();
         let mut out = BlockQueueWaveIntake::default();
-        let raw = g.raw_payloads(heights);
-        let raw_h: HashSet<u32> = raw.iter().map(|(h, _)| *h).collect();
         for &h in heights {
             if g.is_resolve_complete(h) {
                 continue;
             }
             if let Some(w) = g.resolved.get(&h) {
                 out.resolved.push((h, w.clone()));
-            } else if raw_h.contains(&h) {
-                continue;
+            } else if g.has_raw(h) {
+                out.raw.push(h);
             }
         }
-        out.raw = raw
-            .into_iter()
-            .filter(|(h, _)| !g.is_resolve_complete(*h))
-            .collect();
         out
     }
 

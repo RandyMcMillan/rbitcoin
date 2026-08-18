@@ -27,6 +27,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
 pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
 
+/// Payload clones from [`BlockQueue::raw_payloads`] / [`BlockQueue::raw_payload`].
+/// Debug/test only — wave intake must not bump this for the whole asked set.
+#[cfg(debug_assertions)]
+static RAW_CLONE_N: AtomicU64 = AtomicU64::new(0);
+
+/// Take-and-reset raw payload clone count (debug builds / unit tests).
+#[cfg(debug_assertions)]
+pub fn take_raw_clone_n() -> u64 {
+    RAW_CLONE_N.swap(0, Ordering::Relaxed)
+}
+
+#[cfg(debug_assertions)]
+fn note_raw_clone() {
+    RAW_CLONE_N.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One queued block. `payload` is empty after [`BlockQueue::promote_wave`].
 #[derive(Debug, Clone)]
 pub struct QueuedBlock {
@@ -188,6 +204,22 @@ impl BlockQueue {
                 "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
             ));
         }
+        self.enqueue_vec(height, hash, header_fk, payload.to_vec())
+    }
+
+    /// Enqueue an already-owned payload (copy happened outside the BQ lock).
+    pub fn enqueue_vec(
+        &mut self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: Vec<u8>,
+    ) -> Result<u64, StoreError> {
+        if !self.can_enqueue(payload.len()) {
+            return Err(StoreError::BudgetFull(
+                "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.index.insert(
@@ -196,7 +228,7 @@ impl BlockQueue {
                 height,
                 hash,
                 header_fk,
-                body: QueuedBody::Raw(payload.to_vec()),
+                body: QueuedBody::Raw(payload),
                 resolve_complete: false,
             },
         );
@@ -382,7 +414,30 @@ impl BlockQueue {
         out
     }
 
+    /// True when `height` still holds a raw (unpromoted) payload. No clone.
+    pub fn has_raw(&self, height: u32) -> bool {
+        matches!(
+            self.entry_for_height(height).map(|e| &e.body),
+            Some(QueuedBody::Raw(_))
+        )
+    }
+
+    /// Clone one still-raw payload by height. Promoted / missing → `None`.
+    pub fn raw_payload(&self, height: u32) -> Option<Vec<u8>> {
+        match self.entry_for_height(height).map(|e| &e.body) {
+            Some(QueuedBody::Raw(v)) => {
+                #[cfg(debug_assertions)]
+                note_raw_clone();
+                Some(v.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Raw wire for `heights` still holding payload. One pass; skips promoted.
+    ///
+    /// Lookup wave must not use this for the unresolved cap — clone via
+    /// [`Self::raw_payload`] per height that will actually decode.
     pub fn raw_payloads(&self, heights: &[u32]) -> Vec<(u32, Vec<u8>)> {
         let want: HashSet<u32> = heights.iter().copied().collect();
         let mut out = Vec::new();
@@ -391,6 +446,8 @@ impl BlockQueue {
                 continue;
             }
             if let QueuedBody::Raw(v) = &e.body {
+                #[cfg(debug_assertions)]
+                note_raw_clone();
                 out.push((e.height, v.clone()));
             }
         }
@@ -728,6 +785,25 @@ mod tests {
         assert_eq!(q.bytes(), 8 + 1);
         assert_eq!(q.promoted_count(), 1);
         assert!(q.get_by_height(10).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_payload_clones_one_has_raw_does_not() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        for h in 0..8u32 {
+            q.enqueue(h, [h as u8; 32], 1, &[h as u8; 8]).unwrap();
+        }
+        let _ = take_raw_clone_n();
+        assert!(q.has_raw(3));
+        assert_eq!(take_raw_clone_n(), 0);
+        assert_eq!(q.raw_payload(3).unwrap().len(), 8);
+        assert_eq!(take_raw_clone_n(), 1);
+        let _ = q.promote_wave(&[(3, 16)]).unwrap();
+        assert!(!q.has_raw(3));
+        assert!(q.raw_payload(3).is_none());
+        assert_eq!(take_raw_clone_n(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -49,6 +49,16 @@ before 1.0).
 
 ### Changed
 
+- **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
+  promoted heights with **no payload clone**; decode pulls `raw_payload`
+  per height. Peer offer copies wire **before** the BQ lock.
+  `lookup_thr wave=` nests `head=` (TipOnly `get_fk_by_txid_batch`);
+  `lookup_sub head=` is that token, not load stamp. Collect sets use
+  `TxidHasher`. Write merges at most **¼ of writeq** (5 of 20) so scripts
+  keep empty slots; RecentCreates expire once per write. Pstore
+  `size_snapshot` is insert/gc counters (no slot walk); pin names `thin=`.
+  Restart leftover is still empty RAM identity (not a horizon miss).
+
 - **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when
   tip+1 is ready but BQ resolve is incomplete (no retain+BQ spin). Write
   notes RecentCreates **per prepared height**; published identity layers

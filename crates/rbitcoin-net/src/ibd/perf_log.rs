@@ -325,6 +325,8 @@ pub(crate) struct IbdPerfSample {
     pub lookup_decode_ms: u64,
     /// Lookup-wave `TxPrecompute::from_tx` (`precompute=`).
     pub lookup_precompute_ms: u64,
+    /// Lookup-wave TipOnly `get_fk_by_txid_batch` (`wave=… head=`). Not load stamp.
+    pub lookup_wave_head_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
     pub plan_cold: u64,
@@ -574,6 +576,7 @@ impl Default for IbdPerfSample {
             plan_cold_io_ms: 0,
             lookup_decode_ms: 0,
             lookup_precompute_ms: 0,
+            lookup_wave_head_ms: 0,
             plan_parents: 0,
             plan_already: 0,
             plan_cold: 0,
@@ -1008,6 +1011,7 @@ pub(crate) fn sample(
         plan_cold_io_ms: ns_ms(dens.cold_io_ns),
         lookup_decode_ms: ns_ms(dens.decode_ns),
         lookup_precompute_ms: ns_ms(dens.precompute_ns),
+        lookup_wave_head_ms: ns_ms(dens.wave_head_ns),
         plan_parents: dens.parents,
         plan_already: dens.already,
         plan_cold: dens.cold,
@@ -1168,7 +1172,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms) keep={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms) keep={}ms other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1185,6 +1189,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.lookup_decode_ms,
         s.lookup_precompute_ms,
         s.plan_collect_ms,
+        s.lookup_wave_head_ms,
         s.thr_lookup_keep_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
@@ -1257,7 +1262,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms stamp_head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
@@ -1266,6 +1271,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.plan_collect_ms,
             s.lookup_decode_ms,
             s.lookup_precompute_ms,
+            s.lookup_wave_head_ms,
             s.plan_head_ms,
             s.plan_cold_io_ms,
         ));
@@ -1330,7 +1336,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          assemble={}ms(prevout={} us/in={} batch={}/n={} same={}/n={} cold={}/n={} \
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
-         pin(plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
+         pin(thin={}ms plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
          adopt={}ms range_fill={}ms contract={}ms publish={}ms) \
          pin_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
@@ -1360,6 +1366,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.asm_sigop_ms,
         s.asm_final_ms,
         s.asm_job_ms,
+        s.load_thin_ms,
         plan_pin_ms,
         s.load_pin_plan,
         cold_range_ms,
@@ -2092,6 +2099,7 @@ mod tests {
         s.asm_sigop_ms = 2;
         s.asm_final_ms = 0;
         s.asm_job_ms = 40;
+        s.load_thin_ms = 7;
         s.load_plan_pin_ms = 100;
         s.load_pin_plan = 20_000;
         s.load_pin_adopt_ms = 15;
@@ -2108,6 +2116,7 @@ mod tests {
         s.load_pin_cache_body = 30_000;
         let line = format_info(&s);
         // Residual pin sub-timers named in pin(...) block.
+        assert!(line.contains("thin=7ms"), "{line}");
         assert!(line.contains("adopt=15ms"), "{line}");
         assert!(line.contains("range_fill=40ms"), "{line}");
         assert!(line.contains("contract=25ms"), "{line}");
@@ -2166,6 +2175,7 @@ mod tests {
         s.plan_collect_ms = 3;
         s.lookup_decode_ms = 40;
         s.lookup_precompute_ms = 30;
+        s.lookup_wave_head_ms = 20;
         s.plan_head_ms = 4;
         s.plan_cold_io_ms = 5;
         s.stamp_struct_ms = 1;
@@ -2244,7 +2254,7 @@ mod tests {
         assert!(info.contains("precompute=30ms"), "{info}");
         assert!(info.contains("collect=3ms"), "{info}");
         assert!(
-            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms)"),
+            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms)"),
             "{info}"
         );
         let dbg = format_debug(&s);

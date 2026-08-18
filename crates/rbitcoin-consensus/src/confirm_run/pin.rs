@@ -29,6 +29,7 @@ pub(super) fn pin_for_wire_batch(
     use std::sync::atomic::Ordering;
 
     let t_pin = Instant::now();
+    let t_thin = Instant::now();
     let mut batch_thin: rbitcoin_query::BatchThin = rbitcoin_query::BatchThin::default();
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let mut n_same_batch = 0u32;
@@ -154,6 +155,10 @@ pub(super) fn pin_for_wire_batch(
         batch_parents.adopt_from_store(parent_vouts.keys().copied());
     }
     let adopt_ns = t_adopt.elapsed().as_nanos() as u64;
+    let thin_ns = t_thin.elapsed().as_nanos() as u64;
+    if thin_ns > 0 {
+        confirm_load_stats::THIN_NS.fetch_add(thin_ns, Ordering::Relaxed);
+    }
     let mut still_need: U64Map<Vec<u32>> = U64Map::default();
     let mut n_plan_pin = 0u64;
 

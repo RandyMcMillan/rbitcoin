@@ -316,6 +316,8 @@ impl SharedParentPin {
 struct PinIndex {
     by_fk: U64Map<Weak<SharedParentPin>>,
     by_txid: HashMap<[u8; 32], Weak<SharedParentPin>>,
+    /// Strong pins at last insert/gc (not a drop hook). Snapshot must not walk.
+    live: usize,
 }
 
 /// Prep-time registry: Weak map so dead pins free when last batch Arc drops.
@@ -386,11 +388,9 @@ impl PipelineParentStore {
 
     /// Occupancy: weak map slots, live strong pins, approx bytes of live pin outs.
     pub fn size_snapshot(&self) -> (usize, usize, u64) {
-        // O(slots) strong_count only — no Weak upgrade / ArcSwap / script walk
-        // on the load prune path.
         let g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         let weak_slots = g.by_fk.len();
-        let live = g.by_fk.values().filter(|w| w.strong_count() > 0).count();
+        let live = g.live.min(weak_slots);
         let bytes = (weak_slots as u64)
             .saturating_mul(24)
             .saturating_add((live as u64).saturating_mul(256));
@@ -404,6 +404,7 @@ impl PipelineParentStore {
         g.by_txid.retain(|_, w| w.strong_count() > 0);
         g.by_fk.shrink_to_fit();
         g.by_txid.shrink_to_fit();
+        g.live = g.by_fk.len();
     }
 
     /// One lock: upgrade live pins for `ids` into a map (prep batch start).
@@ -453,6 +454,7 @@ impl PipelineParentStore {
                     None => {
                         let w = Arc::downgrade(pin);
                         g.by_fk.insert(id, w.clone());
+                        g.live = g.live.saturating_add(1);
                         if pin.tx.txid != [0u8; 32] {
                             g.by_txid.insert(pin.tx.txid, w);
                         }
@@ -465,6 +467,7 @@ impl PipelineParentStore {
             if g.by_fk.len() > 16_384 {
                 g.by_fk.retain(|_, w| w.strong_count() > 0);
                 g.by_txid.retain(|_, w| w.strong_count() > 0);
+                g.live = g.by_fk.len();
             }
         }
         for (id, existing, local) in conflicts {
@@ -1948,9 +1951,9 @@ mod tests {
         // Drop all strong refs → Weaks die; gc shrinks map.
         drop(bp);
         assert_eq!(store.live_count(), 0);
-        let (weak_dead, live_dead, _) = store.size_snapshot();
-        assert_eq!(live_dead, 0);
+        let (weak_dead, live_snap, _) = store.size_snapshot();
         assert!(weak_dead >= 2, "dead Weaks still occupy slots until gc");
+        let _ = live_snap; // O(1) snapshot may lag until gc (no slot walk)
         store.gc_dead_weaks();
         let (weak_after, live_after, bytes_after) = store.size_snapshot();
         assert_eq!(weak_after, 0);

@@ -58,6 +58,17 @@ pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
 /// Per-session misbehavior score that triggers disconnect (Core-like order).
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
 
+/// BIP152 HB is only for tx-relay peers. `-blocksonly` must not send
+/// `sendcmpct(announce=1)` (`p2p_compactblocks_blocksonly`).
+fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) {
+    if hub.mempool().is_some_and(|m| !m.relay_enabled()) {
+        return;
+    }
+    if let Some(s) = session {
+        s.maybe_select_as_hb();
+    }
+}
+
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
     if let Some(s) = session {
@@ -1267,9 +1278,7 @@ async fn handle_peer_frame(
                 Ok(AcceptOutcome::Accepted { .. }) => {
                     pending_blocks.remove(&hash);
                     pending_headers.remove(&hash);
-                    if let Some(s) = session {
-                        s.maybe_select_as_hb();
-                    }
+                    maybe_select_hb_if_relay(hub, session);
                     drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 }
                 Ok(AcceptOutcome::AlreadyHave) => {
@@ -1372,9 +1381,7 @@ async fn handle_peer_frame(
                         Ok(AcceptOutcome::Accepted { .. })
                     );
                     if accepted {
-                        if let Some(s) = session {
-                            s.maybe_select_as_hb();
-                        }
+                        maybe_select_hb_if_relay(hub, session);
                     } else if !hub.knows_header(&hsi.header.prev_blockhash) {
                         // Filled a better-work compact whose parent bodies
                         // we lack (`mempool_reorg` 20-block submitblock).
@@ -1439,8 +1446,8 @@ async fn handle_peer_frame(
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => match hub.accept_received_block(block) {
                         Ok(AcceptOutcome::Accepted { .. }) => {
+                            maybe_select_hb_if_relay(hub, session);
                             if let Some(s) = session {
-                                s.maybe_select_as_hb();
                                 if let Some(ph) = s.hub() {
                                     ph.clear_cmpct_fill(hash);
                                 }

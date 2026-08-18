@@ -1487,9 +1487,6 @@ impl ChainHub {
                 if let NetError::Consensus(s) = &e {
                     if !reject_is_mutated(s) && !s.to_ascii_lowercase().contains("not found") {
                         self.note_invalid_block(hash);
-                        // Keep the body so `getblock` can return confirmations=-1
-                        // (`p2p_unrequested_blocks` step 8).
-                        self.hold_body(block);
                     }
                 }
                 Err(e)

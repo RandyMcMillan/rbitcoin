@@ -13,6 +13,7 @@ use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -79,16 +80,19 @@ pub fn validate_block_structure_hashed(
         }
     }
 
+    let t_walk = Instant::now();
     let weight = block.weight();
     if weight.to_wu() > 4_000_000 {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
     let has_witness = block_has_witness(block);
+    let walk_before_txid_ns = t_walk.elapsed().as_nanos() as u64;
 
     let n = block.txdata.len();
     let mut txids = Vec::with_capacity(n);
     let mut seen = std::collections::HashSet::with_capacity(n);
+    let t_txid = Instant::now();
     for tx in &block.txdata {
         let id = tx.compute_txid().to_byte_array();
         if !seen.insert(id) {
@@ -96,7 +100,9 @@ pub fn validate_block_structure_hashed(
         }
         txids.push(id);
     }
+    let txid_ns = t_txid.elapsed().as_nanos() as u64;
 
+    let t_walk = Instant::now();
     let merkle = merkle_root_bytes(&txids);
     if merkle != block.header.merkle_root.to_byte_array() {
         return Err(ConsensusError::BadBlock("merkle root mismatch"));
@@ -142,17 +148,23 @@ pub fn validate_block_structure_hashed(
             return Err(ConsensusError::BadBlock("bad-blk-sigops"));
         }
     }
+    let walk_ns = walk_before_txid_ns.saturating_add(t_walk.elapsed().as_nanos() as u64);
 
+    let mut wtxid_ns = 0u64;
     if has_witness {
         if ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }
+        let t_wtxid = Instant::now();
         let mut non_cb = Vec::with_capacity(n.saturating_sub(1));
         for tx in block.txdata.iter().skip(1) {
             non_cb.push(tx.compute_wtxid().to_byte_array());
         }
+        wtxid_ns = t_wtxid.elapsed().as_nanos() as u64;
         check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
+
+    crate::plan_stamp_sub_stats::note_struct_parts(txid_ns, wtxid_ns, walk_ns);
 
     // BIP325 signet solution is not checked here — tip confirm only.
 

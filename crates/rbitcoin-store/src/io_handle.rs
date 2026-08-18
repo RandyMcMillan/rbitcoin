@@ -183,3 +183,46 @@ fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -
     }
     got as i32
 }
+
+/// Resize an overlapped file without `SetFilePointer` / std `Seek`.
+///
+/// `FILE_FLAG_OVERLAPPED` handles reject `WriteFile`/`ReadFile` with a NULL
+/// `OVERLAPPED` (Windows ERROR_INVALID_PARAMETER / os error 87). `File::set_len`
+/// on current rustc already uses this API; keep an explicit path so table grow
+/// does not regress if std changes.
+#[cfg(windows)]
+pub(crate) fn win_set_eof(file: &std::fs::File, new_len: u64) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileEndOfFileInfo {
+        end_of_file: i64,
+    }
+    extern "system" {
+        fn SetFileInformationByHandle(
+            h: *mut core::ffi::c_void,
+            class: u32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const FILE_END_OF_FILE_INFO: u32 = 6;
+    let info = FileEndOfFileInfo {
+        end_of_file: new_len as i64,
+    };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as *mut core::ffi::c_void,
+            FILE_END_OF_FILE_INFO,
+            (&info as *const FileEndOfFileInfo).cast(),
+            std::mem::size_of::<FileEndOfFileInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ))
+    } else {
+        Ok(())
+    }
+}

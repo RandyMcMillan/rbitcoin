@@ -1079,11 +1079,10 @@ mod tests {
     #[test]
     fn pool_harvest_returns_user_data_and_drains() {
         use std::io::Write;
-        use std::os::fd::AsRawFd;
         let (path, mut f) = tmp_rw("pool-harvest");
         f.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
         f.sync_all().unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         assert_eq!(session.kind(), SessionKind::Pool);
         let mut a = [0u8; 2];
@@ -1118,11 +1117,10 @@ mod tests {
     #[test]
     fn pool_short_read_is_libc_complete_not_silent_ok() {
         use std::io::Write;
-        use std::os::fd::AsRawFd;
         let (path, mut f) = tmp_rw("pool-short");
         f.write_all(&[1u8, 2]).unwrap();
         f.sync_all().unwrap();
-        let fd = f.as_raw_fd();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let mut buf = [0u8; 8];
         session.push_pread(fd, 0, &mut buf, 1).unwrap();

@@ -86,8 +86,25 @@ jobs:
       - name: Build CRT-static node + cli
         run: cargo build --release --target x86_64-pc-windows-msvc -p rbitcoin-node -p rbitcoin-cli
 
+      - name: Smoke store create/open
+        env:
+          RBITCOIN_HEAD_SCALE: tiny
+        run: |
+          set -euo pipefail
+          cargo test --release --target x86_64-pc-windows-msvc -p rbitcoin-store --lib \
+            -- file::advise_tests::scripthash_body_create_open_roundtrip
+
       - name: Stage artifacts
         run: ./scripts/stage-native-artifacts.sh windows target/release-win/x86_64-pc-windows-msvc/release ./dist
+
+      - name: Smoke staged node opens scripthash.body
+        env:
+          RBITCOIN_HEAD_SCALE: tiny
+        run: |
+          set -euo pipefail
+          ./dist/rbitcoin-node.exe --smoke --network regtest --datadir ./win-smoke \
+            --no-seeds --log-level error
+          test -f ./win-smoke/store/scripthash.body
 
       - name: Upload Windows binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

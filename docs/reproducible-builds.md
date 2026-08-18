@@ -90,7 +90,7 @@ Windows operator binary the same way:
 | OS | Why not Nix `pkgsStatic` | What CI builds |
 |----|--------------------------|----------------|
 | **Windows** | No musl-style fully static PE from this flake; mingw cross is a different CRT than operators run | `windows-2022` + rustc **1.95** + `-C target-feature=+crt-static`. Stage script refuses VC++ / MinGW runtime DLLs |
-| **Darwin** | Apple forbids a static `libSystem` link. `nix build` on a Mac is store-rpath (not portable) | `macos-14` + rustc **1.95**. Stage script allows only `/usr/lib` and `/System/Library` dylibs. Unsigned |
+| **Darwin** | Apple forbids a static `libSystem` link. `nix build` on a Mac is store-rpath (not portable) | `macos-14` + rustc **1.95**. Stage script allows only `/usr/lib` and `/System/Library` dylibs. Ad-hoc `codesign -s -` (not notarized). **aarch64 only** |
 
 Same cadence as musl: green `master` `ci`, `workflow_dispatch`, or PR
 label **`static-binaries`**. Staging: `scripts/stage-native-artifacts.sh`.

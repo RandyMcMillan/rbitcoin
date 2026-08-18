@@ -18,6 +18,19 @@ before 1.0).
   `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
   label. Linux musl stays Nix; Darwin/Windows are native runners.
 
+### Fixed
+
+- **Windows store create (os error 87):** table files open
+  `FILE_FLAG_OVERLAPPED` for IOCP. `TableFile::create` / `open` / trailing
+  header used std `Write`/`Read`/`Seek`, which call `WriteFile`/`ReadFile`
+  with a NULL `OVERLAPPED` and fail with `ERROR_INVALID_PARAMETER` on the
+  first file (`scripthash.body`). Header IO is positional `IoHandle`
+  pread/pwrite; grow uses `SetFileInformationByHandle`. IOCP associate no
+  longer treats every 87 as success (tracked same-port rebind only).
+  `windows.yml` / `macos.yml` smoke `TableFile` create/open and
+  `--smoke` until `store/scripthash.body` exists. Darwin zips are ad-hoc
+  `codesign -s -` (not notarized).
+
 ### Changed
 
 - **Confirm structure one-pass + lookup stash:** `TxPrecompute::from_tx`

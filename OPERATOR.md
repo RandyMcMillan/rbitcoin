@@ -36,7 +36,7 @@ See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 |----------|----------|
 | **musl** | `rbitcoin-musl-x86_64-linux-<12-hex>` — fully static |
 | **windows** | `rbitcoin-x86_64-windows-<12-hex>` — MSVC CRT-static `.exe` |
-| **macos** | `rbitcoin-aarch64-darwin-<12-hex>` — system-dylib only (unsigned) |
+| **macos** | `rbitcoin-aarch64-darwin-<12-hex>` — system-dylib only, ad-hoc signed (not notarized). **aarch64 only** |
 
 Open the commit → Checks → workflow → Artifacts. None of these are
 required PR checks. Retry from Actions → workflow → Run workflow.
@@ -44,6 +44,19 @@ Label a PR **`static-binaries`** to build the same three on that head.
 Local Linux `target/release/` install is still `nix build .#rbitcoin-musl`
 on a clean master tree. Windows IoRing is not supported. Darwin/Windows
 are not Nix packages — see [`docs/reproducible-builds.md`](docs/reproducible-builds.md).
+
+**Darwin Gatekeeper:** the zip is ad-hoc signed (`codesign -s -`), not
+notarized. If Finder or a browser sets quarantine and the binary is killed
+on launch:
+
+```bash
+xattr -d com.apple.quarantine rbitcoin-node rbitcoin-cli
+```
+
+**Windows store files** are opened `FILE_FLAG_OVERLAPPED` (IOCP). Header
+create/open/grow use positional `ReadFile`/`WriteFile` +
+`SetFileInformationByHandle`, not std `Read`/`Write`/`Seek`. Mixed
+`./datadir\store\...` in logs is display only — not a path bug.
 
 ## CLI (operator-first)
 

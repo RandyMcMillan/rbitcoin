@@ -28,6 +28,12 @@ Legacy token `mmap` demotes to **pread** with a one-time warning.
 **Defaults:** Linux `io_uring` if the ring opens, else pool. Darwin **pool**.
 Windows **IOCP**. Windows IoRing is not supported.
 
+**Windows table handles** are `FILE_FLAG_OVERLAPPED` so IOCP can bind.
+Create, open, header/trailer, and grow use positional `IoHandle`
+pread/pwrite and `SetFileInformationByHandle(FileEndOfFileInfo)`. Do
+**not** mix those handles with std `Read`/`Write`/`Seek` — `WriteFile`
+with a NULL `OVERLAPPED` is os error 87 (`ERROR_INVALID_PARAMETER`).
+
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
 `read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also
 thread pools (`kern.aiomax` default 16) — same class as `pool`, not an

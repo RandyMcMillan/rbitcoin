@@ -128,8 +128,11 @@ pub fn confirm_write_phase(
                         .zip(pins[range].iter())
                         .map(|(fk, pin)| (pin.0.txid, *fk));
                     query
-                        .publish_recent_creates(height, creates)
+                        .note_recent_creates(height, creates)
                         .map_err(ConsensusError::from)?;
+                }
+                if let Some(last) = batch.prepared.last() {
+                    query.expire_recent_creates(last.height.0);
                 }
             }
         }

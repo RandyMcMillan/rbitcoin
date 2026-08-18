@@ -1530,21 +1530,37 @@ impl Query {
         height: u32,
         creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
     ) -> Result<(), QueryError> {
+        self.note_recent_creates(height, creates)?;
+        self.expire_recent_creates(height);
+        Ok(())
+    }
+
+    /// Note identity rows without expiring the ring (write batches expire once).
+    pub fn note_recent_creates(
+        &self,
+        height: u32,
+        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
+    ) -> Result<(), QueryError> {
         let pairs: Vec<([u8; 32], Fk)> = creates.into_iter().collect();
-        if !pairs.is_empty() {
-            let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
-            let ranges = self.store.tx_body_range_batch(&fks)?;
-            let rows = pairs
-                .into_iter()
-                .zip(ranges)
-                .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
-            self.recent_creates.note(height, rows);
+        if pairs.is_empty() {
+            return Ok(());
         }
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(height);
+        let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
+        let ranges = self.store.tx_body_range_batch(&fks)?;
+        let rows = pairs
+            .into_iter()
+            .zip(ranges)
+            .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
+        self.recent_creates.note(height, rows);
+        Ok(())
+    }
+
+    /// Drop fifo rows past [`recent_creates_horizon`] relative to `tip_hint`.
+    pub fn expire_recent_creates(&self, tip_hint: u32) {
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
         let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
         self.recent_creates
-            .expire_to_horizon(tip.max(height), horizon);
-        Ok(())
+            .expire_to_horizon(tip.max(tip_hint), horizon);
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.

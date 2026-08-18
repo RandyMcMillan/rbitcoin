@@ -458,6 +458,18 @@ impl LivePeer {
             last_block: self.last_block.load(Ordering::Relaxed),
             last_transaction: self.last_transaction.load(Ordering::Relaxed),
             minfeefilter_sat_kvb: self.minfeefilter_sat_kvb.load(Ordering::Relaxed),
+            permissions: {
+                let mut p = Vec::new();
+                if let Some(h) = self.owner.upgrade() {
+                    if h.is_noban() {
+                        p.push("noban".into());
+                    }
+                    if h.is_relay_perm() {
+                        p.push("relay".into());
+                    }
+                }
+                p
+            },
         }
     }
 }
@@ -517,6 +529,8 @@ pub struct PeerInfo {
     pub last_transaction: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,
+    /// Core whitelist permission strings (`relay`, `noban`, …).
+    pub permissions: Vec<String>,
 }
 
 /// Thread-safe session table + addnode remembered addrs.

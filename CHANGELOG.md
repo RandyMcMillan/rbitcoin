@@ -76,8 +76,9 @@ before 1.0).
   wait_for_disconnect on an immature-coinbase fork (`:275`). Known-header
   INV does not getdata (sendheaders `inv_node`). `-blocksonly` reports
   `localrelay=false`, disconnects P2P txs/tx-invs, and exposes
-  `relaytxes`; RPC sendraw is still accepted. `p2p_blocksonly.py` stays
-  skip at inbound wait_for_tx (`:48`). Q-41 is 36/267.
+  `relaytxes`; RPC sendraw is still accepted and INVs inbound peers.
+  `getpeerinfo.permissions` exposes whitelist `relay`. `p2p_blocksonly.py`
+  stays skip at first_peer → second_peer wait_for_tx (`:74`). Q-41 is 36/267.
 
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`

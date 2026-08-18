@@ -377,6 +377,12 @@ pub async fn peer_session_with(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(50)), if session.is_some() => {
+                    if tx_announce_rx.is_none() {
+                        tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
+                    }
+                    if inv_flush_rx.is_none() {
+                        inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
+                    }
                     if let Some(s) = session.as_ref() {
                         match s.take_ping_action(s.clock_now()) {
                             Some(PingAction::Send { nonce }) => {
@@ -791,14 +797,17 @@ fn queue_due_tx_invs(
     if session.conn_type == crate::peers::PeerConnType::BlockRelay {
         return;
     }
-    // `-blocksonly` still INV locally submitted (unbroadcast) txs.
+    // `-blocksonly` still INV locally submitted (unbroadcast) txs immediately
+    // (`p2p_blocksonly.py:48` sendraw → inbound wait_for_tx). Do not wait for
+    // the 30s inbound age gate or a `request_tx_inv` flag.
     let now = session.clock_now();
     let clock_due = session.take_tx_inv_due(now);
     let live = mp.list_live();
     let age_due = live
         .iter()
         .any(|(_, _, _, tx)| mp.tx_inv_due(&tx.compute_wtxid()));
-    if !clock_due && !age_due {
+    let unbroadcast_due = live.iter().any(|(txid, _, _, _)| mp.is_unbroadcast(txid));
+    if !clock_due && !age_due && !unbroadcast_due {
         return;
     }
     let mut n = 0u32;
@@ -817,7 +826,8 @@ fn queue_due_tx_invs(
         if session.has_announced_wtx(&w) {
             continue;
         }
-        if !clock_due && !mp.tx_inv_due(&w) {
+        let local = mp.is_unbroadcast(&txid);
+        if !clock_due && !local && !mp.tx_inv_due(&w) {
             continue;
         }
         session.note_announced_wtx(w);
@@ -1343,16 +1353,13 @@ async fn handle_peer_frame(
                     );
                 }
                 Err(e) => {
-                    if hub.is_block_invalid(&hash) {
-                        rbitcoin_log::warn!(
-                            "p2p: accept dropped {hash} (invalid — disconnect): {e}"
-                        );
-                        punish_disconnect(ban_score, session);
-                    } else {
-                        rbitcoin_log::warn!(
-                            "p2p: accept dropped {hash} (invalid — keep session): {e}"
-                        );
-                    }
+                    // Rule rejects (`bad-txns-nonfinal`, BIP68/112 locktime,
+                    // `feature_csv_activation`) must keep the session so the
+                    // peer can send the next block. Cached-invalid is still
+                    // noted; compact children of a failed hash still disconnect.
+                    rbitcoin_log::warn!(
+                        "p2p: accept dropped {hash} (invalid — keep session): {e}"
+                    );
                 }
             }
         }
@@ -1553,9 +1560,25 @@ async fn handle_peer_frame(
                     let txid = tx.compute_txid();
                     from_this_peer.insert(txid, ());
                     match mp.accept_tx(tx) {
-                        Ok(_) => {
+                        Ok(r) => {
                             if let Some(s) = session {
                                 s.note_last_transaction();
+                            }
+                            // Only when P2P relay is off: accept-time announce
+                            // is skipped (not yet unbroadcast). Re-announce so
+                            // other tx-relay peers INV (`p2p_blocksonly` :74).
+                            // Do not do this when relay is on — that INVs every
+                            // accepted tx back at the sender and broke
+                            // feature_csv_activation (P2PInterface getdata storm).
+                            if !mp.relay_enabled() {
+                                mp.note_unbroadcast(r.txid);
+                                mp.rebroadcast_unbroadcast();
+                                mp.notify_inv_flush();
+                                if let Some(s) = session {
+                                    if let Some(ph) = s.hub() {
+                                        ph.request_all_tx_inv();
+                                    }
+                                }
                             }
                         }
                         Err(rbitcoin_mempool::AcceptError::Duplicate(_)) => {}
@@ -2846,6 +2869,322 @@ mod tests {
                 ban >= BAN_SCORE_THRESHOLD,
                 "blocksonly wtx inv must disconnect, ban={ban}"
             );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// `p2p_blocksonly.py:48`: RPC sendraw while relay is off must INV an
+    /// inbound peer (`request_all_tx_inv` + `queue_due_tx_invs`) and serve
+    /// the subsequent GetData WTx. Announce-at-accept is too early — the
+    /// unbroadcast set is only written after `accept_tx` returns.
+    #[test]
+    fn blocksonly_sendraw_invs_unbroadcast_to_inbound() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-sendraw");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let mp = hub.mempool().unwrap();
+            let mut ann_rx = mp.subscribe_announces();
+            mp.accept_tx(&tx).expect("sendraw accept");
+            let announced = ann_rx.try_recv().expect("accept publishes announce");
+            assert_eq!(announced.txid, tx.compute_txid());
+            assert!(
+                !mp.is_unbroadcast(&tx.compute_txid()),
+                "unbroadcast is noted only after accept_tx returns (sendraw)"
+            );
+            // Session announce handler would skip: relay off and not unbroadcast.
+            assert!(!mp.relay_enabled());
+
+            mp.note_unbroadcast(tx.compute_txid());
+            assert!(mp.is_unbroadcast(&tx.compute_txid()));
+
+            // Immediate INV of unbroadcast — no request_all_tx_inv / 30s gate.
+            let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound_imm =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            queue_due_tx_invs(&hub, inbound_imm.as_ref(), &HashMap::new(), &probe_tx);
+            match probe_rx.try_recv().expect("unbroadcast INV without clock_due") {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let block_relay =
+                peers.register(addr, addr, &ver, false, crate::peers::PeerConnType::BlockRelay);
+
+            peers.request_all_tx_inv();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            match out_rx.try_recv().expect("inbound must get wtx INV") {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+            queue_due_tx_invs(&hub, block_relay.as_ref(), &HashMap::new(), &out_tx);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "block-relay-only must not get tx INV"
+            );
+
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    tx.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(inbound.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().expect("getdata must serve tx") {
+                NetworkMessage::Tx(got) => assert_eq!(got.compute_wtxid(), tx.compute_wtxid()),
+                other => panic!("expected Tx, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// `p2p_blocksonly.py:74`: whitelist-relay peer's tx is accepted while
+    /// `-blocksonly` and INV'd to the other inbound peer.
+    #[test]
+    fn blocksonly_relay_perm_tx_invs_other_inbound() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-relay-perm");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+
+            let peers = crate::peers::PeerHub::new();
+            peers.set_relay_perm(true);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let first =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let second =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_first = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(tx.clone())),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_first,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(first.as_ref()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ban, 0, "whitelist relay must not disconnect");
+            assert!(hub.mempool().unwrap().is_unbroadcast(&tx.compute_txid()));
+            assert!(from_first.contains_key(&tx.compute_txid()));
+
+            let (inv_tx, mut inv_rx) = mpsc::unbounded_channel();
+            queue_due_tx_invs(&hub, second.as_ref(), &HashMap::new(), &inv_tx);
+            match inv_rx.try_recv().expect("second inbound must get wtx INV") {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+            queue_due_tx_invs(&hub, first.as_ref(), &from_first, &inv_tx);
+            assert!(
+                inv_rx.try_recv().is_err(),
+                "origin peer must not be re-INV'd"
+            );
+            let _ = out_rx.try_recv();
             let _ = std::fs::remove_dir_all(dir);
         });
     }

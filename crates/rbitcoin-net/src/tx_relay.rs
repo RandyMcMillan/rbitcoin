@@ -614,6 +614,11 @@ impl MempoolHub {
         self.inv_flush.subscribe()
     }
 
+    /// Wake session loops so they INV due / unbroadcast txs now.
+    pub fn notify_inv_flush(&self) {
+        let _ = self.inv_flush.send(());
+    }
+
     pub fn tx_inv_due(&self, wtxid: &Wtxid) -> bool {
         let now = self.mock_now.load(Ordering::Relaxed);
         if now == 0 {
@@ -1341,11 +1346,9 @@ impl MempoolHub {
 
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
     pub fn note_unbroadcast(&self, txid: Txid) {
-        if self.inner.read().unwrap().graph.contains(&txid) {
-            let mut u = self.unbroadcast.lock().unwrap();
-            u.insert(txid);
-            persist_unbroadcast_file(&self.dir, &u);
-        }
+        let mut u = self.unbroadcast.lock().unwrap();
+        u.insert(txid);
+        persist_unbroadcast_file(&self.dir, &u);
     }
 
     /// Peer getdata served this txid — it is no longer unbroadcast.

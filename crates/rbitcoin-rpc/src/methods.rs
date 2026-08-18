@@ -1025,6 +1025,7 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
         "last_block": p.last_block,
         "last_transaction": p.last_transaction,
         "minfeefilter": sat_kvb_to_btc(p.minfeefilter_sat_kvb),
+        "permissions": p.permissions,
     });
     if let Some(v) = p.pingtime {
         row["pingtime"] = json!(v);
@@ -1371,7 +1372,12 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     // (`p2p_blocksonly.py` sendrawtransaction).
     match mp.accept_tx(&tx) {
         Ok(r) => {
+            // Note unbroadcast *after* accept, then re-announce. The accept-time
+            // broadcast is too early for `-blocksonly` (relay off + not yet
+            // unbroadcast → session skips). `p2p_blocksonly.py:48`.
             mp.note_unbroadcast(r.txid);
+            mp.rebroadcast_unbroadcast();
+            mp.notify_inv_flush();
             if let Some(peers) = ctx.peers.as_ref() {
                 peers.request_all_tx_inv();
             }
@@ -1379,6 +1385,11 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         }
         // Core sendraw of a live mempool tx is a no-op success (returns txid).
         Err(e) if e.to_string().starts_with("duplicate ") => {
+            mp.note_unbroadcast(tx.compute_txid());
+            mp.rebroadcast_unbroadcast();
+            if let Some(peers) = ctx.peers.as_ref() {
+                peers.request_all_tx_inv();
+            }
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
         Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),
@@ -5300,6 +5311,10 @@ mod tests {
         assert_eq!(arr[0]["subver"], "/rbitcoin:0.1.0(testnode0)/");
         assert_eq!(arr[0]["inbound"], false);
         assert_eq!(arr[0]["relaytxes"], true);
+        assert_eq!(arr[0]["permissions"], json!([]));
+        hub.set_relay_perm(true);
+        let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        assert_eq!(r.as_array().unwrap()[0]["permissions"], json!(["relay"]));
         assert_eq!(arr[0]["addr"], "127.0.0.1:18444");
         assert_eq!(arr[0]["last_block"], 0);
         assert_eq!(arr[0]["last_transaction"], 0);

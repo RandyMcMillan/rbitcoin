@@ -325,6 +325,8 @@ pub(crate) struct IbdPerfSample {
     pub lookup_decode_ms: u64,
     /// Lookup-wave `TxPrecompute::from_tx` (`precompute=`).
     pub lookup_precompute_ms: u64,
+    /// Lookup-wave TipOnly `get_fk_by_txid_batch` (`wave=… head=`). Not load stamp.
+    pub lookup_wave_head_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
     pub plan_cold: u64,
@@ -574,6 +576,7 @@ impl Default for IbdPerfSample {
             plan_cold_io_ms: 0,
             lookup_decode_ms: 0,
             lookup_precompute_ms: 0,
+            lookup_wave_head_ms: 0,
             plan_parents: 0,
             plan_already: 0,
             plan_cold: 0,
@@ -1008,6 +1011,7 @@ pub(crate) fn sample(
         plan_cold_io_ms: ns_ms(dens.cold_io_ns),
         lookup_decode_ms: ns_ms(dens.decode_ns),
         lookup_precompute_ms: ns_ms(dens.precompute_ns),
+        lookup_wave_head_ms: ns_ms(dens.wave_head_ns),
         plan_parents: dens.parents,
         plan_already: dens.already,
         plan_cold: dens.cold,
@@ -1168,7 +1172,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms) keep={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms) keep={}ms other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1185,6 +1189,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.lookup_decode_ms,
         s.lookup_precompute_ms,
         s.plan_collect_ms,
+        s.lookup_wave_head_ms,
         s.thr_lookup_keep_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
@@ -1266,7 +1271,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.plan_collect_ms,
             s.lookup_decode_ms,
             s.lookup_precompute_ms,
-            s.plan_head_ms,
+            s.lookup_wave_head_ms,
             s.plan_cold_io_ms,
         ));
     }
@@ -2166,6 +2171,7 @@ mod tests {
         s.plan_collect_ms = 3;
         s.lookup_decode_ms = 40;
         s.lookup_precompute_ms = 30;
+        s.lookup_wave_head_ms = 20;
         s.plan_head_ms = 4;
         s.plan_cold_io_ms = 5;
         s.stamp_struct_ms = 1;
@@ -2244,7 +2250,7 @@ mod tests {
         assert!(info.contains("precompute=30ms"), "{info}");
         assert!(info.contains("collect=3ms"), "{info}");
         assert!(
-            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms)"),
+            info.contains("wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms)"),
             "{info}"
         );
         let dbg = format_debug(&s);

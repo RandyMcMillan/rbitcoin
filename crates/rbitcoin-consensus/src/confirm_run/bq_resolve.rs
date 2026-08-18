@@ -6,8 +6,9 @@
 
 use super::*;
 use bitcoin::consensus::Decodable;
-use rbitcoin_query::{ResolvedWire, TxPrecompute};
+use rbitcoin_query::{ResolvedWire, TxPrecompute, TxidHasher};
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -105,6 +106,8 @@ pub struct BqResolveWaveStats {
     pub precompute_ns: u64,
     /// `collect_resolve_keys` (this wave).
     pub collect_ns: u64,
+    /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
+    pub head_ns: u64,
 }
 
 /// Collect unique external prev_txids (+ pre-BIP34 create txids) from a wire block.
@@ -114,7 +117,8 @@ fn collect_resolve_keys(
     block: &Block,
     pres: &[TxPrecompute],
 ) -> Vec<[u8; 32]> {
-    let same_block: HashSet<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
+    let same_block: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
+        pres.iter().map(|p| p.txid).collect();
     let mut need: Vec<[u8; 32]> = Vec::new();
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
@@ -180,7 +184,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
     let t0 = Instant::now();
     let mut stats = BqResolveWaveStats::default();
     let mut per_height: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
-    let mut all_keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
+        HashSet::with_hasher(BuildHasherDefault::default());
     let mut sum_inputs = 0u32;
     let mut promote: Vec<(u32, ResolvedWire, u64)> = Vec::new();
 
@@ -286,6 +291,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
                 stats.decode_ns,
                 stats.precompute_ns,
                 stats.collect_ns,
+                stats.head_ns,
             );
             return Ok(stats);
         }
@@ -305,6 +311,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         None => (HashMap::new(), keys),
     };
     let mut need = need;
+    let t_head = Instant::now();
     need.sort_unstable_by_key(|txid| query.store().txs.head_primary_slot(txid));
 
     if !need.is_empty() {
@@ -318,6 +325,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
             }
         }
     }
+    stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = hit_map.len() as u32;
     if let Some((live, published)) = ids.as_mut() {
         let mut hits = rbitcoin_query::IdMap::default();
@@ -347,7 +355,12 @@ pub fn confirm_bq_resolve_wave_with_ids(
         .map_err(ConsensusError::from)?;
     stats.heights = done.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
-    lookup_stage_stats::note_wave_decode(stats.decode_ns, stats.precompute_ns, stats.collect_ns);
+    lookup_stage_stats::note_wave_decode(
+        stats.decode_ns,
+        stats.precompute_ns,
+        stats.collect_ns,
+        stats.head_ns,
+    );
     Ok(stats)
 }
 
@@ -493,11 +506,12 @@ mod tests {
         assert!(st.keys >= 1);
         assert!(st.hits >= 1);
         assert!(
-            st.decode_ns > 0 && st.precompute_ns > 0 && st.collect_ns > 0,
-            "raw-payload wave must meter decode=/precompute=/collect= (decode={} pre={} collect={})",
+            st.decode_ns > 0 && st.precompute_ns > 0 && st.collect_ns > 0 && st.head_ns > 0,
+            "raw-payload wave must meter decode=/precompute=/collect=/head= (decode={} pre={} collect={} head={})",
             st.decode_ns,
             st.precompute_ns,
-            st.collect_ns
+            st.collect_ns,
+            st.head_ns
         );
         assert!(
             q.published_ids().get(&g_cb.to_byte_array()).is_some(),

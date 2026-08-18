@@ -338,7 +338,9 @@ pub fn confirm_bq_resolve_wave_with_ids(
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
         let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-        let horizon = rbitcoin_query::recent_creates_horizon(query.soft_confirm_window());
+        let taken = query.lookup_taken_hi().unwrap_or(tip);
+        let span = taken.saturating_sub(tip);
+        let horizon = rbitcoin_query::recent_creates_horizon(span);
         live.keep_queued_or_horizon(&queued, tip, horizon);
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS

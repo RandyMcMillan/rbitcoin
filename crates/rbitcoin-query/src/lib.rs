@@ -155,7 +155,10 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds, TxidHasher};
-pub use recent_creates::{recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_FLOOR};
+pub use recent_creates::{
+    recent_creates_ewma_step, recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_CAP,
+    RECENT_CREATES_HORIZON_FLOOR,
+};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -1106,6 +1109,8 @@ pub struct Query {
     soft_confirm_window: AtomicU32,
     /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
     lookup_taken_hi: AtomicU32,
+    /// EWMA of `lookup_taken_hi − tip` for RecentCreates horizon.
+    recent_lead_ewma: AtomicU32,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -1208,6 +1213,7 @@ impl Query {
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
             lookup_taken_hi: AtomicU32::new(u32::MAX),
+            recent_lead_ewma: AtomicU32::new(0),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -1634,9 +1640,16 @@ impl Query {
     /// Expire without rebuilding the snapshot (write batch flushes once).
     pub fn expire_recent_creates_defer(&self, tip_hint: u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
-        let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
-        self.recent_creates
-            .expire_to_horizon(tip.max(tip_hint), horizon);
+        let tip = tip.max(tip_hint);
+        let taken = self.lookup_taken_hi().unwrap_or(tip);
+        let span = taken.saturating_sub(tip);
+        let ewma = crate::recent_creates_ewma_step(
+            self.recent_lead_ewma.load(AtomicOrdering::Relaxed),
+            span,
+        );
+        self.recent_lead_ewma.store(ewma, AtomicOrdering::Relaxed);
+        let horizon = crate::recent_creates_horizon(ewma);
+        self.recent_creates.expire_to_horizon(tip, horizon);
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.

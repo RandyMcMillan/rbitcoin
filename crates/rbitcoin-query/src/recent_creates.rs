@@ -5,8 +5,8 @@
 //! (not a process pin FIFO).
 //!
 //! Expire is `pop_front` of whole heights. Horizon is
-//! [`recent_creates_horizon`] (`2 * soft_win`, floor 256) so the ring outlives
-//! BQ / lookup lead (1× the soft 1-min window is not enough).
+//! [`recent_creates_horizon`] on an EWMA of `lookup_taken_hi − tip`
+//! plus 25% (floor 32, cap `32*144`).
 //!
 //! Overlay + tombstones hold unflushed notes. [`RecentCreates::publish_if_dirty`]
 //! builds **one** published [`Arc`] (confirm write: once per batch). There is no
@@ -20,14 +20,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
-/// Floor so a cold / tiny `soft_win` still covers a short lookup lead.
-pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 256;
+/// Floor so a cold / empty lead still covers one pipeline of 1-high batches.
+pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 32;
+/// Cap: 32 load-sized batches × 144-block hard pack.
+pub const RECENT_CREATES_HORIZON_CAP: u32 = 32 * 144;
 
-/// Heights to retain: twice the 1-min confirm window, at least
-/// [`RECENT_CREATES_HORIZON_FLOOR`].
+/// One EWMA step: `(3·ewma + span) / 4`. Cold `ewma == 0` starts at `span`.
 #[inline]
-pub fn recent_creates_horizon(soft_win: u32) -> u32 {
-    soft_win.saturating_mul(2).max(RECENT_CREATES_HORIZON_FLOOR)
+pub fn recent_creates_ewma_step(ewma: u32, span: u32) -> u32 {
+    if ewma == 0 {
+        span
+    } else {
+        ewma.saturating_mul(3).saturating_add(span) / 4
+    }
+}
+
+/// Heights to retain: EWMA lead + 25%, clamped to floor/cap.
+#[inline]
+pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
+    ewma_lead
+        .saturating_add(ewma_lead / 4)
+        .clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
 }
 
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
@@ -258,11 +271,18 @@ mod tests {
     }
 
     #[test]
-    fn recent_creates_horizon_is_2x_soft_win_with_floor() {
+    fn horizon_is_ewma_lead_plus_quarter() {
+        assert_eq!(recent_creates_ewma_step(0, 40), 40);
+        assert_eq!(recent_creates_ewma_step(40, 40), 40);
         assert_eq!(recent_creates_horizon(0), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(100), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(200), 400);
-        assert_eq!(recent_creates_horizon(400), 800);
+        assert_eq!(recent_creates_horizon(40), 50);
+        assert_eq!(recent_creates_horizon(10_000), RECENT_CREATES_HORIZON_CAP);
+        let mut e = 0u32;
+        for _ in 0..8 {
+            e = recent_creates_ewma_step(e, 40);
+        }
+        let h = recent_creates_horizon(e);
+        assert!((40..=50).contains(&h), "settled horizon={h}");
     }
 
     #[test]
@@ -371,7 +391,7 @@ mod tests {
         let r = RecentCreates::new();
         r.note(0, [(tid(1), Fk(1), (1, 2))]);
         r.publish_if_dirty();
-        r.expire_to_horizon(100, RECENT_CREATES_HORIZON_FLOOR);
+        r.expire_to_horizon(16, RECENT_CREATES_HORIZON_FLOOR);
         assert_eq!(
             r.get(&tid(1)),
             Some((Fk(1), (1, 2))),

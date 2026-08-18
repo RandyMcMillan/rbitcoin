@@ -9,13 +9,14 @@
 //! BQ / lookup lead (1× the soft 1-min window is not enough).
 //!
 //! Writers mutate the locked map and mark dirty. [`RecentCreates::publish_if_dirty`]
-//! is the only snapshot rebuild (confirm write: once per batch). Load `get` is a
-//! pointer load, not a lock per leftover key.
+//! is the only full-map snapshot rebuild (confirm write: once per batch). Load
+//! [`RecentCreates::get`] / [`RecentSnap::get`] see a small dirty overlay first
+//! so stamp hits unflushed notes without cloning the live map.
 
 use crate::published_ids::TxidHasher;
 use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +31,7 @@ pub fn recent_creates_horizon(soft_win: u32) -> u32 {
 }
 
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
+type DeadSet = HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>;
 
 #[derive(Clone, Copy)]
 struct LiveEnt {
@@ -40,20 +42,32 @@ struct LiveEnt {
 
 struct Inner {
     live: LiveMap,
+    overlay: LiveMap,
+    dead: DeadSet,
     fifo: VecDeque<(u32, Vec<[u8; 32]>)>,
     dirty: bool,
 }
 
-/// Immutable live map for one stamp pack.
+/// Published live map plus the unflushed overlay for one stamp pack.
 #[derive(Clone)]
-pub struct RecentSnap(std::sync::Arc<LiveMap>);
+pub struct RecentSnap {
+    published: std::sync::Arc<LiveMap>,
+    overlay: std::sync::Arc<LiveMap>,
+    dead: std::sync::Arc<DeadSet>,
+}
 
 impl RecentSnap {
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
         if *txid == [0u8; 32] {
             return None;
         }
-        self.0.get(txid).map(|e| (e.fk, e.range))
+        if self.dead.contains(txid) {
+            return None;
+        }
+        if let Some(e) = self.overlay.get(txid) {
+            return Some((e.fk, e.range));
+        }
+        self.published.get(txid).map(|e| (e.fk, e.range))
     }
 }
 
@@ -69,6 +83,8 @@ impl Default for RecentCreates {
             live: ArcSwap::from_pointee(LiveMap::default()),
             inner: Mutex::new(Inner {
                 live: LiveMap::default(),
+                overlay: LiveMap::default(),
+                dead: DeadSet::default(),
                 fifo: VecDeque::new(),
                 dirty: false,
             }),
@@ -94,6 +110,8 @@ impl RecentCreates {
             return;
         }
         Self::publish(&self.live, &g);
+        g.overlay.clear();
+        g.dead.clear();
         g.dirty = false;
     }
 
@@ -107,7 +125,10 @@ impl RecentCreates {
             if txid == [0u8; 32] {
                 continue;
             }
-            g.live.insert(txid, LiveEnt { fk, range, height });
+            let ent = LiveEnt { fk, range, height };
+            g.live.insert(txid, ent);
+            g.overlay.insert(txid, ent);
+            g.dead.remove(&txid);
             keys.push(txid);
         }
         if keys.is_empty() {
@@ -131,6 +152,8 @@ impl RecentCreates {
                 if let Some(ent) = g.live.get(&t) {
                     if ent.height <= through {
                         g.live.remove(&t);
+                        g.overlay.remove(&t);
+                        g.dead.insert(t);
                         changed = true;
                     }
                 }
@@ -155,7 +178,19 @@ impl RecentCreates {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = g.live.len();
         g.fifo.retain(|(h, _)| *h < height);
-        g.live.retain(|_, ent| ent.height < height);
+        let mut dropped: Vec<[u8; 32]> = Vec::new();
+        g.live.retain(|t, ent| {
+            if ent.height < height {
+                true
+            } else {
+                dropped.push(*t);
+                false
+            }
+        });
+        for t in dropped {
+            g.overlay.remove(&t);
+            g.dead.insert(t);
+        }
         if g.live.len() != before {
             g.dirty = true;
         }
@@ -166,9 +201,14 @@ impl RecentCreates {
         self.snapshot().get(txid)
     }
 
-    /// One Arc for a stamp pack (do not `load` per parent).
+    /// Published Arc plus a small overlay (do not `load` per parent).
     pub fn snapshot(&self) -> RecentSnap {
-        RecentSnap(self.live.load_full())
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        RecentSnap {
+            published: self.live.load_full(),
+            overlay: Arc::new(g.overlay.clone()),
+            dead: Arc::new(g.dead.clone()),
+        }
     }
 
     /// Occupancy for `ibd: sizes`.
@@ -216,22 +256,24 @@ mod tests {
         r.note(11, [(tid(2), Fk(2), (3, 4))]);
         let mid = r.snapshot();
         assert!(
-            std::sync::Arc::ptr_eq(&before.0, &mid.0),
+            std::sync::Arc::ptr_eq(&before.published, &mid.published),
             "note must not clone the live map; publish_if_dirty is the snapshot rebuild"
         );
-        assert!(
-            r.get(&tid(1)).is_none(),
-            "unpublished notes must not be visible to get"
+        assert_eq!(
+            r.get(&tid(1)),
+            Some((Fk(1), (1, 2))),
+            "dirty overlay must serve get before publish_if_dirty"
         );
+        assert_eq!(mid.get(&tid(2)), Some((Fk(2), (3, 4))));
         assert_eq!(r.size_snapshot(), (2, 2));
         r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
         assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
         let after = r.snapshot();
-        assert!(!std::sync::Arc::ptr_eq(&before.0, &after.0));
+        assert!(!std::sync::Arc::ptr_eq(&before.published, &after.published));
         r.publish_if_dirty();
         assert!(
-            std::sync::Arc::ptr_eq(&after.0, &r.snapshot().0),
+            std::sync::Arc::ptr_eq(&after.published, &r.snapshot().published),
             "second publish_if_dirty is a no-op when clean"
         );
     }
@@ -241,7 +283,6 @@ mod tests {
         let r = RecentCreates::new();
         assert!(r.get(&tid(1)).is_none());
         r.note(10, [(tid(1), Fk(7), (100, 8))]);
-        r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(7), (100, 8))));
         assert!(r.get(&tid(2)).is_none());
     }
@@ -260,7 +301,6 @@ mod tests {
         r.note(10, [(tid(1), Fk(1), (1, 2)), (tid(2), Fk(2), (3, 4))]);
         r.note(11, [(tid(2), Fk(2), (3, 4)), (tid(3), Fk(3), (5, 6))]);
         r.expire_through(10);
-        r.publish_if_dirty();
         assert!(r.get(&tid(1)).is_none(), "height-10-only key must drop");
         assert_eq!(
             r.get(&tid(2)),
@@ -295,7 +335,6 @@ mod tests {
         r.note(10, [(tid(1), Fk(1), (1, 2))]);
         r.note(12, [(tid(2), Fk(2), (3, 4))]);
         r.drop_from(12);
-        r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
         assert!(r.get(&tid(2)).is_none());
     }

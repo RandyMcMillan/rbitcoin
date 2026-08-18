@@ -369,12 +369,7 @@ pub(crate) fn apply_peer_event(
                     }
                 }
             }
-            if hub.query.lookup_already_taken(height) || hub.query.block_queue_has_height(height) {
-                st.body.mark_pending(hash);
-                if let Some(feed) = confirm_feed {
-                    feed.note(height, hash);
-                }
-                let _ = try_complete_awaiting_reorg(st, hub);
+            if super::progress::claim_ready(hub, &mut st.body, height, &hash) {
                 return;
             }
             let raw = hash.to_byte_array();

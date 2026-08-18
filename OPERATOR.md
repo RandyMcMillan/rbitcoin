@@ -175,7 +175,8 @@ At **info**, progress + perf already expose load/write bottlenecks (schema 16). 
 `pin_txid%` is stamp `txid→create_fk` from the published `live_union` chain vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
-tip+1 to the next claim-ready body. Tip-batch getdata races up to 4 peers
+tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken
+onto loadq). Tip-batch getdata races up to 4 peers
 (preferring faster live rates) and re-races after ~6s without wire. WARN
 `ibd: peer[…] stalled` is absolute zero block progress (~30s). WARN
 `ibd: peer[…] relative-slow (bps= med= spread=…)` disconnects a clear

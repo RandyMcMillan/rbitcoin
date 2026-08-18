@@ -19,15 +19,9 @@
 //! (`u64::MAX`) aside from OOM.
 
 use crate::error::StoreError;
-use rbitcoin_primitives::Fk;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// TipOnly parent hits attached by lookup. Lifetime is the BQ record.
-///
-/// `txid → (create_fk, txout body range)`. Dropped on dequeue / height drop.
-pub type BqParentHits = HashMap<[u8; 32], (Fk, (u64, u64))>;
 
 /// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
 pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;

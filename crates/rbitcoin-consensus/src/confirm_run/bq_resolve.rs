@@ -1,12 +1,11 @@
 //! BQ-ahead TipOnly parent resolve (lookup wave).
 //!
 //! One [`Store::get_fk_by_txid_batch`] (TipOnly) across a ready-height wave
-//! (soft **64000** inputs / hard **1080** blocks). Hits live on the BQ record.
-//! Does not claim, structure, or stamp.
+//! (soft **64000** inputs / hard **1080** blocks). Hits publish as one
+//! [`rbitcoin_query::IdLayer`] on the live union. Does not claim, structure, or stamp.
 
 use super::*;
 use bitcoin::consensus::Decodable;
-use rbitcoin_store::BqParentHits;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
@@ -202,7 +201,10 @@ pub fn confirm_bq_resolve_wave_with_ids(
 
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
     stats.keys = keys.len() as u32;
-    let (mut hit_map, need): (BqParentHits, Vec<[u8; 32]>) = match ids.as_mut() {
+    let (mut hit_map, need): (
+        HashMap<[u8; 32], (rbitcoin_primitives::Fk, (u64, u64))>,
+        Vec<[u8; 32]>,
+    ) = match ids.as_mut() {
         Some((live, _)) => {
             let (known, need) = live.partition(keys.iter());
             stats.skipped = known.len() as u32;
@@ -696,17 +698,10 @@ mod tests {
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
-        let empty = rbitcoin_store::BqParentHits::default();
         let items = [(Height(1), std::sync::Arc::new(b1))];
-        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
-            &q,
-            &params,
-            Milestone::NONE,
-            &items,
-            Some(&pipe),
-            Some(&empty),
-        )
-        .expect("in-flight parent must stamp until tip covers the parent height");
+        let stamped =
+            crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+                .expect("in-flight parent must stamp until tip covers the parent height");
         let plan = stamped.plan.expect("plan");
         let spend = plan
             .packed
@@ -797,17 +792,10 @@ mod tests {
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
-        let empty = rbitcoin_store::BqParentHits::default();
         let items = [(Height(1), std::sync::Arc::new(b1))];
-        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
-            &q,
-            &params,
-            Milestone::NONE,
-            &items,
-            Some(&pipe),
-            Some(&empty),
-        )
-        .expect("in-flight parent must stamp while confirmed tip leads the fence");
+        let stamped =
+            crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+                .expect("in-flight parent must stamp while confirmed tip leads the fence");
         let plan = stamped.plan.expect("plan");
         let spend = plan
             .packed
@@ -839,17 +827,9 @@ mod tests {
             1,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
         );
-        let empty = rbitcoin_store::BqParentHits::default();
         let items = [(Height(1), std::sync::Arc::new(b1))];
-        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
-            &q,
-            &params,
-            Milestone::NONE,
-            &items,
-            None,
-            Some(&empty),
-        )
-        .expect("leftover connected parent must TipOnly-head, not invariant");
+        let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
+            .expect("leftover connected parent must TipOnly-head, not invariant");
         let plan = stamped.plan.expect("new body needs a plan");
         let spend = plan
             .packed
@@ -907,8 +887,6 @@ mod tests {
                 1,
                 &rbitcoin_query::InFlightView::empty(),
                 None,
-                Some(&rbitcoin_store::BqParentHits::default()),
-                None,
             )
             .expect_err("disconnected leftover must not TipThenAny-fill");
         let msg = err.to_string();
@@ -943,15 +921,8 @@ mod tests {
         confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
         assert!(q.block_queue_is_resolve_complete(1));
         let items = [(Height(1), std::sync::Arc::new(b1))];
-        let stamped = crate::confirm_wire_lookup_stamp_with_hits(
-            &q,
-            &params,
-            Milestone::NONE,
-            &items,
-            None,
-            None,
-        )
-        .expect("coinbase-only block needs no external head");
+        let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
+            .expect("coinbase-only block needs no external head");
         let mat = crate::confirm_wire_load_from_plan(
             &q,
             &params,

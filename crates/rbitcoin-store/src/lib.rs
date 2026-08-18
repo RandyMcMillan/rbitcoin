@@ -58,9 +58,7 @@ pub use address_head::{
     MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS, PAGE_SLOT_BITS, PROBE_DEPTH_WARN,
     PROBE_REGION_BYTES, TINY_BITS,
 };
-pub use block_queue::{
-    BlockQueue, BqParentHits, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
-};
+pub use block_queue::{BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES};
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};

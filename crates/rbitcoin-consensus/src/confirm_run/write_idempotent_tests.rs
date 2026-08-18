@@ -1111,6 +1111,100 @@ fn pin_for_wire_then_freeze_clears_plan_staging() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Plan staging maps are not a pin fallback after lookup promised a stamp.
+#[test]
+fn pin_for_wire_ignores_plan_maps_without_stamp() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-no-or-else-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let parent_tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
+    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let pfk = q
+        .store()
+        .txs
+        .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
+        .unwrap()[0];
+    let range = q.store().tx_body_range(pfk).unwrap();
+    let parent_id = pfk.get().unwrap();
+
+    let spend_tx = TxRecord {
+        txid: [0x22u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_ins = vec![InputRecord {
+        prev_txid: parent_tx.txid,
+        create_fk: pfk,
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+    let spend_pin: CreatePin = Arc::new((spend_tx, spend_outs));
+
+    let plan = ArchiveWritePlan {
+        packed: vec![(Arc::clone(&spend_pin), spend_ins)],
+        planned_fks: vec![Fk(2)],
+        per_header_ranges: vec![],
+        spends: vec![],
+        batch_creates: vec![],
+        external_parent_ranges: {
+            let mut m = rbitcoin_query::U64Map::default();
+            m.insert(parent_id, range);
+            m
+        },
+        external_parent_txids: {
+            let mut m = rbitcoin_query::U64Map::default();
+            m.insert(parent_id, parent_tx.txid);
+            m
+        },
+        batch_pin: vec![Arc::clone(&spend_pin)],
+        index_tx: false,
+        body_est: 0,
+    };
+    let empty = ParentPinStamp::default();
+    let err = pin_for_wire_batch(&q, Some(&plan), &empty, &[], &[], None, None)
+        .expect_err("plan maps must not backfill an empty stamp");
+    let msg = err.to_string();
+    assert!(msg.contains("lookup stage miss"), "got: {msg}");
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn parent_pin_stamp_take_from_plan_moves_maps() {
     use super::ParentPinStamp;

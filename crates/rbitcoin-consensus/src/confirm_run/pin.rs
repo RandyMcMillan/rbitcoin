@@ -170,11 +170,7 @@ pub(super) fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                let plan_range = parent_pin
-                    .ranges
-                    .get(id)
-                    .copied()
-                    .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
+                let plan_range = parent_pin.ranges.get(id).copied();
                 if cb.is_some() || plan_range.is_some() {
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
@@ -197,11 +193,7 @@ pub(super) fn pin_for_wire_batch(
             } else {
                 None
             };
-            let plan_range = parent_pin
-                .ranges
-                .get(id)
-                .copied()
-                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(id).copied()));
+            let plan_range = parent_pin.ranges.get(id).copied();
             batch_parents.insert_owned(
                 fk,
                 tx.clone(),
@@ -226,19 +218,11 @@ pub(super) fn pin_for_wire_batch(
             Vec::new();
         let pending = std::mem::take(&mut still_need);
         for (id, need) in pending {
-            let range = parent_pin
-                .ranges
-                .get(&id)
-                .copied()
-                .or_else(|| plan.and_then(|p| p.external_parent_ranges.get(&id).copied()));
-            let Some(range) = range else {
+            let Some(range) = parent_pin.ranges.get(&id).copied() else {
                 still_need.insert(id, need);
                 continue;
             };
-            let tid = parent_pin.create_txid(id).or_else(|| {
-                plan.and_then(|p| p.external_parent_txid(id))
-                    .filter(|t| *t != [0u8; 32])
-            });
+            let tid = parent_pin.create_txid(id);
             let Some(tid) = tid else {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: lookup stage miss (load parent create identity not stamped)",

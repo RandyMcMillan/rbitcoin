@@ -1372,24 +1372,23 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     // (`p2p_blocksonly.py` sendrawtransaction).
     match mp.accept_tx(&tx) {
         Ok(r) => {
-            // Note unbroadcast *after* accept, then re-announce. The accept-time
-            // broadcast is too early for `-blocksonly` (relay off + not yet
-            // unbroadcast → session skips). `p2p_blocksonly.py:48`.
             mp.note_unbroadcast(r.txid);
-            mp.rebroadcast_unbroadcast();
-            mp.notify_inv_flush();
-            if let Some(peers) = ctx.peers.as_ref() {
-                peers.request_all_tx_inv();
+            // `-blocksonly`: accept-time announce is skipped (relay off + not
+            // yet unbroadcast). Re-announce after noting so inbound peers INV
+            // (`p2p_blocksonly.py:48`). When relay is on, leave the 30s inbound
+            // age gate alone (`mempool_reorg` / `mempool_unbroadcast`).
+            if !mp.relay_enabled() {
+                mp.rebroadcast_unbroadcast();
+                mp.notify_inv_flush();
+                if let Some(peers) = ctx.peers.as_ref() {
+                    peers.request_all_tx_inv();
+                }
             }
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
-        // Core sendraw of a live mempool tx is a no-op success (returns txid).
+        // Core sendraw of a live mempool tx is a no-op success (returns txid)
+        // and must not re-enter the unbroadcast set (`mempool_unbroadcast.py:93`).
         Err(e) if e.to_string().starts_with("duplicate ") => {
-            mp.note_unbroadcast(tx.compute_txid());
-            mp.rebroadcast_unbroadcast();
-            if let Some(peers) = ctx.peers.as_ref() {
-                peers.request_all_tx_inv();
-            }
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
         Err(e) => Err(rpc_error(ERR_VERIFY_REJECTED, accept_reject_reason(&e))),

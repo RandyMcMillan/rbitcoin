@@ -372,21 +372,6 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Empty pack that is not a body-missing reject: wait on `feed.cv` (lookup
-/// `notify` after resolve-complete). Do **not** busy-spin while tip+1 sits
-/// in `ready` but BQ is not resolve-complete — that hammers feed + BQ locks.
-#[inline]
-pub(crate) fn pack_empty_waits_for_lookup(run_n: usize, body_missing_n: usize) -> bool {
-    run_n == 0 && body_missing_n == 0
-}
-
-/// Happy-path pack hash check: compare the **stored** BQ/feed hash. Do not
-/// `block.block_hash()` when lookup already stored the hash.
-#[inline]
-pub(crate) fn pack_stored_hash_ok(stored: &[u8; 32], expect: &BlockHash) -> bool {
-    *stored == expect.to_byte_array()
-}
-
 /// Default lookup→load depth (`loadq`): one lookup-wave of prefetch (8×8000).
 pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
@@ -487,6 +472,7 @@ pub(crate) fn write_drain_max_parts(writeq_cap: usize) -> usize {
 /// Lookup may start the next run while load/scripts/write hold earlier ones,
 /// but must **not** skip a stuck tip+1 and claim thousands of far heights.
 /// Depth units = sum of stage caps (write is usually largest).
+#[cfg(test)]
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
     let q = c.load.saturating_add(c.script).saturating_add(c.write);

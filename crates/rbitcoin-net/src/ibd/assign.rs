@@ -299,12 +299,6 @@ fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// **zombie** pending (flag set, wrong/no wire) must demote and re-get — skipping
 /// all pending first left densify-ahead heights frozen (tip advances past tip-batch
 /// cover, soft filled, conf stuck on a later hole).
-/// Lookup already dequeued `ht` into loadq (contiguous high-water).
-#[inline]
-pub(crate) fn skip_lookup_taken(ht: u32, taken_hi: u32) -> bool {
-    taken_hi != u32::MAX && ht <= taken_hi
-}
-
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
     if hub.query.lookup_already_taken(ht) {
         return None;
@@ -639,12 +633,12 @@ mod tests {
 
     #[test]
     fn densify_skips_at_or_below_lookup_taken_hi() {
-        assert!(!skip_lookup_taken(5, u32::MAX));
-        assert!(!skip_lookup_taken(0, u32::MAX));
-        assert!(skip_lookup_taken(5, 5));
-        assert!(skip_lookup_taken(4, 5));
-        assert!(!skip_lookup_taken(6, 5));
-        assert!(skip_lookup_taken(0, 0));
+        assert!(!Query::lookup_taken_covers(5, None));
+        assert!(!Query::lookup_taken_covers(0, None));
+        assert!(Query::lookup_taken_covers(5, Some(5)));
+        assert!(Query::lookup_taken_covers(4, Some(5)));
+        assert!(!Query::lookup_taken_covers(6, Some(5)));
+        assert!(Query::lookup_taken_covers(0, Some(0)));
     }
 
     fn h(n: u32) -> BlockHash {

@@ -1496,10 +1496,12 @@ impl Query {
 
     /// Densify / offer: height is already in the confirm pipeline.
     pub fn lookup_already_taken(&self, height: u32) -> bool {
-        match self.lookup_taken_hi() {
-            Some(hi) => height <= hi,
-            None => false,
-        }
+        Self::lookup_taken_covers(height, self.lookup_taken_hi())
+    }
+
+    /// `taken_hi == None` means lookup has not consumed any height yet.
+    pub fn lookup_taken_covers(height: u32, taken_hi: Option<u32>) -> bool {
+        taken_hi.is_some_and(|hi| height <= hi)
     }
 
     /// Current soft-assign restricted flag (over free-byte floor).

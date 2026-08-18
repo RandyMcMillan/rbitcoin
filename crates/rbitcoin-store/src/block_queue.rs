@@ -287,11 +287,10 @@ impl BlockQueue {
     /// Take raw payload and remove the row. `None` if missing or already promoted.
     pub fn take_raw(&mut self, height: u32) -> Option<TakenRaw> {
         let id = *self.height_to_id.get(&height)?;
-        let payload = match self.index.get_mut(&id)? {
-            e => match &mut e.body {
-                QueuedBody::Raw(v) => std::mem::take(v),
-                QueuedBody::Promoted { .. } => return None,
-            },
+        let e = self.index.get_mut(&id)?;
+        let payload = match &mut e.body {
+            QueuedBody::Raw(v) => std::mem::take(v),
+            QueuedBody::Promoted { .. } => return None,
         };
         let e = self.index.get(&id)?;
         let out = TakenRaw {

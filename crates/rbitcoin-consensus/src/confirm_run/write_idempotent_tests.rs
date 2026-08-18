@@ -233,6 +233,7 @@ fn scripts_stage_depth1_submits_second_before_first_finishes() {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    let _feed = scripts_feed_test_sync::lock();
     scripts_feed_test_sync::reset();
     scripts_feed_test_sync::set_hold_first_until_second_submit(true);
 
@@ -298,6 +299,7 @@ fn scripts_join_blocks_after_lookahead() {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    let _feed = scripts_feed_test_sync::lock();
     scripts_feed_test_sync::reset();
     scripts_feed_test_sync::set_hold_first_until_second_submit(true);
     scripts_feed_test_sync::set_hold_tail_after_second(true);

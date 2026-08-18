@@ -279,13 +279,21 @@ impl ScriptsBatchMeta {
 /// Test-only sync so unit tests can prove N+1 was submitted while N’s wave is still open.
 pub mod scripts_feed_test_sync {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
+    static FEED_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
     static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
     static HOLD_TAIL: AtomicBool = AtomicBool::new(false);
     static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
     static RECV_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Hold across a feed-ahead timing test so a parallel `reset()` cannot
+    /// clear HOLD_* while another test is mid-wave (`cargo llvm-cov`).
+    pub fn lock() -> MutexGuard<'static, ()> {
+        FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     /// Reset counters (call at start of each feed-ahead timing test).
     pub fn reset() {

@@ -44,6 +44,10 @@ before 1.0).
   (stored hash vs feed; no happy-path `block.block_hash()`). Script
   steal is unchanged — decode stays on the lookup thread.
 
+- **Docs remotes + lookup:** `origin` fetch is HTTPS, `pushurl` is SSH
+  (`AGENTS.md`). `OPERATOR.md` lookup row includes the hard min 8000
+  inputs. Living pointers use `block/mod.rs` / `structure_rule_tests.rs`.
+
 - **Lookup wave min 8000 inputs:** do not publish a TipOnly layer under
   8000 Σ `tx.input` when more unresolved BQ heights can still join,
   including `ready=0` / load-frontier / unknown window. Last available

@@ -117,7 +117,7 @@ worktree branch → many small commits → one PR → poll GitHub Actions → gr
 A plan is **not complete** until that PR’s **required** checks are green.
 
 ```bash
-git fetch https://github.com/reardencode/rbitcoin.git master:refs/remotes/origin/master
+git fetch origin
 git worktree add -b <area>/<short-name> /tmp/rbtc-<short> origin/master
 export CARGO_TARGET_DIR=/tmp/rbtc-<short>/target/dev
 ```
@@ -128,7 +128,7 @@ export CARGO_TARGET_DIR=/tmp/rbtc-<short>/target/dev
 | Branch | Topic name — **never** commit the plan onto `master` |
 | `CARGO_TARGET_DIR` | Inside the worktree (`…/target/dev`) |
 | Identity | Worktree-only `git config --worktree user.name` / `user.email` for bot commits |
-| Remotes | Worktrees **share** `origin`. Never `git remote set-url origin`. |
+| Remotes | Worktrees **share** `origin`. Fetch/pull is HTTPS; `pushurl` is SSH. Never `git remote set-url origin` (collapses the split). |
 
 ### After merge cleanup
 
@@ -138,7 +138,7 @@ Once the PR is **merged** (not while open):
 git worktree remove /tmp/rbtc-<short>
 git branch -d <area>/<short-name>
 git push https://github.com/reardencode/rbitcoin.git --delete <area>/<short-name>
-git fetch https://github.com/reardencode/rbitcoin.git --prune
+git fetch origin --prune
 ```
 
 Keep `master` / `main`, the primary checkout, and any **open-PR** worktree.
@@ -166,16 +166,17 @@ Label **`core-functional`** when the PR touches the Core functional harness.
 Label **`static-binaries`** to build musl / Windows / Darwin operator
 snapshots on that PR (same jobs as green `master` `ci`).
 
-`origin` stays **SSH**. This VM has **no** GitHub App SSH key. The App token
-from `~/.config/rbitcoin-grok/gh-login.sh` (~1h) is HTTPS-only.
+`origin` fetch/pull is HTTPS; `pushurl` is SSH (operator). This VM has **no**
+GitHub App SSH key. The App token from `~/.config/rbitcoin-grok/gh-login.sh`
+(~1h) is HTTPS-only.
 
-`gh pr create` / `gh pr checks` talk to the API. `git fetch` / `git push` as
-the bot must use an **explicit HTTPS URL**. Do **not** `git remote set-url
-origin`. Do **not** `git push origin` as the bot.
+`gh pr create` / `gh pr checks` talk to the API. `git fetch origin` works
+here. Bot **push** must use an **explicit HTTPS URL**. Do **not**
+`git remote set-url origin`. Do **not** `git push origin` as the bot.
 
 ```bash
 ~/.config/rbitcoin-grok/gh-login.sh
-git fetch https://github.com/reardencode/rbitcoin.git master:refs/remotes/origin/master
+git fetch origin
 git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
 gh pr create --repo reardencode/rbitcoin --head <area>/<short-name> --title "…" --body "…"
 gh pr checks --watch
@@ -188,7 +189,7 @@ No `-u` on push (that would retarget the branch remote away from `origin`).
 | **One PR per plan** | Push more commits to the same branch. |
 | **Poll until green** | Do not walk away and call the plan done. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
-| **Do not** | Force-push `master`, merge a red PR, rewrite `origin` to HTTPS, or skip polling because “tests passed locally.” |
+| **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, or skip polling because “tests passed locally.” |
 
 Coverage (≥90% LCOV `LH`/`LF`) is a required CI job — see
 [`TESTING.md`](TESTING.md). If CI `coverage` fails, add a pin and push.

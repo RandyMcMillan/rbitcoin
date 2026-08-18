@@ -1357,9 +1357,7 @@ async fn handle_peer_frame(
                     // `feature_csv_activation`) must keep the session so the
                     // peer can send the next block. Cached-invalid is still
                     // noted; compact children of a failed hash still disconnect.
-                    rbitcoin_log::warn!(
-                        "p2p: accept dropped {hash} (invalid — keep session): {e}"
-                    );
+                    rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
                 }
             }
         }
@@ -2975,7 +2973,10 @@ mod tests {
             let inbound_imm =
                 peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
             queue_due_tx_invs(&hub, inbound_imm.as_ref(), &HashMap::new(), &probe_tx);
-            match probe_rx.try_recv().expect("unbroadcast INV without clock_due") {
+            match probe_rx
+                .try_recv()
+                .expect("unbroadcast INV without clock_due")
+            {
                 NetworkMessage::Inv(v) => {
                     assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
                 }
@@ -2997,8 +2998,13 @@ mod tests {
             };
             let inbound =
                 peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
-            let block_relay =
-                peers.register(addr, addr, &ver, false, crate::peers::PeerConnType::BlockRelay);
+            let block_relay = peers.register(
+                addr,
+                addr,
+                &ver,
+                false,
+                crate::peers::PeerConnType::BlockRelay,
+            );
 
             peers.request_all_tx_inv();
             let (out_tx, mut out_rx) = mpsc::unbounded_channel();
@@ -3134,8 +3140,7 @@ mod tests {
                 start_height: 0,
                 relay: true,
             };
-            let first =
-                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let first = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
             let second =
                 peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
 

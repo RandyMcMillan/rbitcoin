@@ -220,11 +220,18 @@ pub fn confirm_write_phase(
 
             let n_blocks = batch.prepared.len();
             let cc0 = confirm_phase_stats::CLASS_C_NS.load(Ordering::Relaxed);
+            let t_cc = Instant::now();
             let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
+            let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
             // Tables only (strong+tip), matching CLASS_C_NS — not join wall / SH.
             let class_c_ns = confirm_phase_stats::CLASS_C_NS
                 .load(Ordering::Relaxed)
                 .saturating_sub(cc0);
+            let class_c_join_ns = class_c_wall_ns.saturating_sub(class_c_ns);
+            if class_c_join_ns > 0 {
+                confirm_phase_stats::WRITE_CLASS_C_JOIN_NS
+                    .fetch_add(class_c_join_ns, Ordering::Relaxed);
+            }
 
             let (spend_ann_ns, tip_gc_ns) =
                 post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;

@@ -81,6 +81,9 @@ pub(crate) struct WriteStageSample {
     /// RecentCreates note+expire+one snapshot (`recent_pub=`)
     pub recent_pub_ms: u64,
     pub recent_pub_ns: u64,
+    /// `class_c_commit` join/flush minus tables (`class_c_join=`)
+    pub class_c_join_ms: u64,
+    pub class_c_join_ns: u64,
     /// Residual `head_insert_queued` join after Class C (`drain_join=`)
     pub drain_join_ms: u64,
     pub drain_join_ns: u64,
@@ -101,6 +104,7 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
             .saturating_add(self.recent_pub_ms)
+            .saturating_add(self.class_c_join_ms)
             .saturating_add(self.drain_join_ms)
             .saturating_add(self.dequeue_ms)
     }
@@ -116,6 +120,7 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
             .saturating_add(self.recent_pub_ns)
+            .saturating_add(self.class_c_join_ns)
             .saturating_add(self.drain_join_ns)
             .saturating_add(self.dequeue_ns)
     }
@@ -827,6 +832,7 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_write_recent_parts_and_reset();
     let (drain_join_ns, dequeue_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
+    let class_c_join_ns = rbitcoin_consensus::confirm_phase_stats::sample_class_c_join_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
@@ -910,6 +916,8 @@ pub(crate) fn sample(
             cache_tip_ns,
             recent_pub_ms: ns_ms(recent_pub_ns),
             recent_pub_ns,
+            class_c_join_ms: ns_ms(class_c_join_ns),
+            class_c_join_ns,
             drain_join_ms: ns_ms(drain_join_ns),
             drain_join_ns,
             dequeue_ms: ns_ms(dequeue_ns),
@@ -1455,7 +1463,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms(idx={} clone={}) \
+         class_c={}ms class_c_join={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms(idx={} clone={}) \
          drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
@@ -1472,6 +1480,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.spent_cold_ms,
         s.spent_pending_ms,
         s.write.class_c_ms,
+        s.write.class_c_join_ms,
         s.write.sh_ms,
         s.write.utxo_ms,
         s.write.tweak_ms,
@@ -1957,6 +1966,7 @@ mod tests {
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
         assert!(line.contains("recent_pub=0ms(idx=0 clone=0)"), "{line}");
+        assert!(line.contains("class_c_join=0ms"), "{line}");
         assert!(line.contains("drain_join=0ms"), "{line}");
         assert!(line.contains("dequeue=0ms"), "{line}");
         assert!(line.contains("other=0ms"), "{line}");

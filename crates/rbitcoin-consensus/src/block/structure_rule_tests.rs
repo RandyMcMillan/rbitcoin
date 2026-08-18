@@ -105,8 +105,7 @@ fn structure_meters_split_txid_wtxid_walk() {
     apply_witness_commitment(&mut b);
     validate_block_structure_hashed(&b, &ctx_h(1)).expect("witness block structure");
     let s = crate::plan_stamp_sub_stats::sample_and_reset();
-    assert!(s.struct_txid_ns > 0, "txid encode must be metered: {s:?}");
-    assert!(s.struct_wtxid_ns > 0, "wtxid encode must be metered: {s:?}");
+    assert!(s.struct_txid_ns > 0, "one-pass hash must be metered: {s:?}");
     assert!(
         s.struct_walk_ns > 0,
         "weight/sigops walks must be metered: {s:?}"

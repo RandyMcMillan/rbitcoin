@@ -1104,6 +1104,8 @@ pub struct Query {
     block_queue_pressure: AtomicBool,
     /// Last 1-min confirm window (`bq soft=n/win` `win`). 0 = rate unknown.
     soft_confirm_window: AtomicU32,
+    /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
+    lookup_taken_hi: AtomicU32,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -1205,6 +1207,7 @@ impl Query {
             }),
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
+            lookup_taken_hi: AtomicU32::new(u32::MAX),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -1469,6 +1472,30 @@ impl Query {
         self.soft_confirm_window.load(AtomicOrdering::Relaxed)
     }
 
+    /// Last contiguous height lookup took off the BQ (`None` if none yet).
+    pub fn lookup_taken_hi(&self) -> Option<u32> {
+        let h = self.lookup_taken_hi.load(AtomicOrdering::Relaxed);
+        if h == u32::MAX {
+            None
+        } else {
+            Some(h)
+        }
+    }
+
+    /// Publish lookup consume high-water. `None` resets (disconnect / reject).
+    pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
+        self.lookup_taken_hi
+            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+    }
+
+    /// Densify / offer: height is already in the confirm pipeline.
+    pub fn lookup_already_taken(&self, height: u32) -> bool {
+        match self.lookup_taken_hi() {
+            Some(hi) => height <= hi,
+            None => false,
+        }
+    }
+
     /// Current soft-assign restricted flag (over free-byte floor).
     pub fn block_queue_soft_pressure(&self) -> bool {
         self.block_queue_pressure.load(AtomicOrdering::Relaxed)
@@ -1697,6 +1724,12 @@ impl Query {
     pub fn block_queue_has_height(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();
         g.contains_height(height)
+    }
+
+    /// Take raw payload and remove the BQ row (lookup consume).
+    pub fn block_queue_take_raw(&self, height: u32) -> Option<rbitcoin_store::TakenRaw> {
+        let mut g = self.block_queue.lock().unwrap();
+        g.take_raw(height)
     }
 
     /// Hash of the first body-queue entry at `height`, if any.

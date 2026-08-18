@@ -44,6 +44,14 @@ fn note_raw_clone() {
     RAW_CLONE_N.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Raw row removed by [`BlockQueue::take_raw`] (lookup consume).
+#[derive(Debug, Clone)]
+pub struct TakenRaw {
+    pub hash: [u8; 32],
+    pub header_fk: u64,
+    pub payload: Vec<u8>,
+}
+
 /// One queued block. `payload` is empty after [`BlockQueue::promote_wave`].
 #[derive(Debug, Clone)]
 pub struct QueuedBlock {
@@ -274,6 +282,26 @@ impl BlockQueue {
             }
         }
         Ok(true)
+    }
+
+    /// Take raw payload and remove the row. `None` if missing or already promoted.
+    pub fn take_raw(&mut self, height: u32) -> Option<TakenRaw> {
+        let id = *self.height_to_id.get(&height)?;
+        let payload = match self.index.get_mut(&id)? {
+            e => match &mut e.body {
+                QueuedBody::Raw(v) => std::mem::take(v),
+                QueuedBody::Promoted { .. } => return None,
+            },
+        };
+        let e = self.index.get(&id)?;
+        let out = TakenRaw {
+            hash: e.hash,
+            header_fk: e.header_fk,
+            payload,
+        };
+        self.bytes = self.bytes.saturating_sub(out.payload.len() as u64);
+        let _ = self.dequeue(id);
+        Some(out)
     }
 
     /// Dequeue all records for a confirmed height (may be 0 or 1 in normal path).
@@ -780,6 +808,25 @@ mod tests {
         assert!(q.contains_height(9));
         assert!(!q.is_resolve_complete(9));
         assert!(q.mark_resolve_complete(10).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lookup_take_removes_bq_row() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(10, [10u8; 32], 7, b"aaaa").unwrap();
+        q.enqueue(11, [11u8; 32], 8, b"bb").unwrap();
+        assert_eq!(q.bytes(), 6);
+        let got = q.take_raw(10).expect("take 10");
+        assert_eq!(got.hash, [10u8; 32]);
+        assert_eq!(got.header_fk, 7);
+        assert_eq!(got.payload, b"aaaa");
+        assert!(!q.contains_height(10));
+        assert!(q.contains_height(11));
+        assert_eq!(q.bytes(), 2);
+        assert!(q.take_raw(10).is_none());
+        assert!(q.take_raw(99).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

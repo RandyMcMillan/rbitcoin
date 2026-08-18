@@ -47,8 +47,9 @@ use rbitcoin_query::ProcessOwnedSizes;
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
 ///
 /// Inventory: `class_a` + `ensure` + `struct` + `class_c` + `sh` + `spend`
-/// + `tweaks` + `tip_gc` + `recent_pub`. Subtimers (spent_sub, ann, class_a_sub)
-/// stay on the outer sample until a later nest.
+/// + `tweaks` + `tip_gc` + `recent_pub` + `drain_join` + `dequeue`.
+/// `other=` is write-thread work minus this inventory. Subtimers (spent_sub,
+/// ann, class_a_sub) stay on the outer sample until a later nest.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WriteStageSample {
     /// `archive_commit_plan`
@@ -78,6 +79,12 @@ pub(crate) struct WriteStageSample {
     /// RecentCreates note+expire+one snapshot (`recent_pub=`)
     pub recent_pub_ms: u64,
     pub recent_pub_ns: u64,
+    /// Residual `head_insert_queued` join after Class C (`drain_join=`)
+    pub drain_join_ms: u64,
+    pub drain_join_ns: u64,
+    /// Body-queue dequeue after confirm (`dequeue=`)
+    pub dequeue_ms: u64,
+    pub dequeue_ns: u64,
 }
 
 impl WriteStageSample {
@@ -92,6 +99,8 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
             .saturating_add(self.recent_pub_ms)
+            .saturating_add(self.drain_join_ms)
+            .saturating_add(self.dequeue_ms)
     }
 
     /// Same inventory in nanoseconds (`format_debug` us/blk write=).
@@ -105,6 +114,8 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
             .saturating_add(self.recent_pub_ns)
+            .saturating_add(self.drain_join_ns)
+            .saturating_add(self.dequeue_ns)
     }
 }
 
@@ -796,6 +807,8 @@ pub(crate) fn sample(
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
     let recent_pub_ns = rbitcoin_consensus::confirm_phase_stats::sample_write_recent_and_reset();
+    let (drain_join_ns, dequeue_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
@@ -879,6 +892,10 @@ pub(crate) fn sample(
             cache_tip_ns,
             recent_pub_ms: ns_ms(recent_pub_ns),
             recent_pub_ns,
+            drain_join_ms: ns_ms(drain_join_ns),
+            drain_join_ns,
+            dequeue_ms: ns_ms(dequeue_ns),
+            dequeue_ns,
         },
         ensure_res_hit,
         ensure_cold_n,
@@ -1413,6 +1430,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
          class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms \
+         drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
         s.write.class_a_ms,
@@ -1433,6 +1451,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.write.tweak_ms,
         s.write.cache_tip_ms,
         s.write.recent_pub_ms,
+        s.write.drain_join_ms,
+        s.write.dequeue_ms,
+        s.thr_write_work_ms.saturating_sub(write_stage_ms(s)),
         s.ann_ms,
         s.ann_n,
         s.ann_pread_skip,
@@ -1500,7 +1521,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
-         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={}",
+         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={} drain_join={} dequeue={}",
         us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
@@ -1521,6 +1542,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.write.tweak_ns),
         us(s.write.cache_tip_ns),
         us(s.write.recent_pub_ns),
+        us(s.write.drain_join_ns),
+        us(s.write.dequeue_ns),
     );
     append_nz(&mut out, "recon_us", us(s.recon_ns));
     append_nz(&mut out, "wire_us", us(s.wire_ns));
@@ -1890,10 +1913,12 @@ mod tests {
         write.utxo_ms = 32;
         write.tweak_ms = 64;
         write.cache_tip_ms = 128;
+        write.drain_join_ms = 0;
+        write.dequeue_ms = 0;
         assert_eq!(
             write.stage_ms(),
             255,
-            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc"
+            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc+recent_pub+drain_join+dequeue"
         );
         let mut s = IbdPerfSample::default();
         s.write = write;
@@ -1904,6 +1929,9 @@ mod tests {
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
         assert!(line.contains("recent_pub=0ms"), "{line}");
+        assert!(line.contains("drain_join=0ms"), "{line}");
+        assert!(line.contains("dequeue=0ms"), "{line}");
+        assert!(line.contains("other=0ms"), "{line}");
     }
 
     #[test]

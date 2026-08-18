@@ -112,6 +112,10 @@ pub mod confirm_phase_stats {
     pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage RecentCreates note+expire+one snapshot publish.
     pub static WRITE_RECENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Residual wait on `head_insert_queued` join after Class C / annotate.
+    pub static WRITE_DRAIN_JOIN_NS: AtomicU64 = AtomicU64::new(0);
+    /// Write-thread body-queue dequeue after a successful confirm.
+    pub static WRITE_DEQUEUE_NS: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: creates filled from pin layout (no Class A body IO).
     pub static ENSURE_RES_HIT: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: cold denserels body loads.
@@ -285,6 +289,15 @@ pub mod confirm_phase_stats {
     #[inline]
     pub fn sample_write_recent_and_reset() -> u64 {
         WRITE_RECENT_NS.swap(0, Ordering::Relaxed)
+    }
+
+    /// `(drain_join, dequeue)` residual write walls.
+    #[inline]
+    pub fn sample_write_residuals_and_reset() -> (u64, u64) {
+        (
+            WRITE_DRAIN_JOIN_NS.swap(0, Ordering::Relaxed),
+            WRITE_DEQUEUE_NS.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Sample and reset write-stage SP tweak index wall.

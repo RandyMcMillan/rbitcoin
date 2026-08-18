@@ -188,6 +188,7 @@ pub fn confirm_write_phase(
             let (spend_ann_ns, tip_gc_ns) =
                 post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
+            let t_join = Instant::now();
             match drain.join() {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(ConsensusError::from(e)),
@@ -196,6 +197,11 @@ pub fn confirm_write_phase(
                         "tx.head write-behind drain thread panicked",
                     )));
                 }
+            }
+            let drain_join_ns = t_join.elapsed().as_nanos() as u64;
+            if drain_join_ns > 0 {
+                confirm_phase_stats::WRITE_DRAIN_JOIN_NS
+                    .fetch_add(drain_join_ns, Ordering::Relaxed);
             }
             // Insert finished. Load polls this fk HWM (not tip/fence — 67438).
             if let Some(fk) = drain_max_fk {

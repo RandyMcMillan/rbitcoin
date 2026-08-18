@@ -112,6 +112,10 @@ pub mod confirm_phase_stats {
     pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage RecentCreates note+expire+one snapshot publish.
     pub static WRITE_RECENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// `tx_body_range_batch` inside that publish.
+    pub static WRITE_RECENT_IDX_NS: AtomicU64 = AtomicU64::new(0);
+    /// `publish_if_dirty` clone inside that publish.
+    pub static WRITE_RECENT_CLONE_NS: AtomicU64 = AtomicU64::new(0);
     /// Residual wait on `head_insert_queued` join after Class C / annotate.
     pub static WRITE_DRAIN_JOIN_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-thread body-queue dequeue after a successful confirm.
@@ -289,6 +293,15 @@ pub mod confirm_phase_stats {
     #[inline]
     pub fn sample_write_recent_and_reset() -> u64 {
         WRITE_RECENT_NS.swap(0, Ordering::Relaxed)
+    }
+
+    /// `(idx, clone)` parts of RecentCreates publish.
+    #[inline]
+    pub fn sample_write_recent_parts_and_reset() -> (u64, u64) {
+        (
+            WRITE_RECENT_IDX_NS.swap(0, Ordering::Relaxed),
+            WRITE_RECENT_CLONE_NS.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// `(drain_join, dequeue)` residual write walls.

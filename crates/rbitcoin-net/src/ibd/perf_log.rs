@@ -160,6 +160,9 @@ pub(crate) struct IbdPerfSample {
     /// Ensure mix: residency/pin hits vs cold denserels body loads.
     pub ensure_res_hit: u64,
     pub ensure_cold_n: u64,
+    /// RecentCreates idx vs snapshot clone (`recent_idx=` / `recent_clone=`).
+    pub recent_idx_ms: u64,
+    pub recent_clone_ms: u64,
     /// Assemble subtimers (ms; sum ≈ connect/assemble).
     pub asm_prevout_ms: u64,
     pub asm_sigop_ms: u64,
@@ -463,6 +466,8 @@ impl Default for IbdPerfSample {
             write: WriteStageSample::default(),
             ensure_res_hit: 0,
             ensure_cold_n: 0,
+            recent_idx_ms: 0,
+            recent_clone_ms: 0,
             asm_prevout_ms: 0,
             asm_sigop_ms: 0,
             asm_final_ms: 0,
@@ -818,6 +823,8 @@ pub(crate) fn sample(
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
     let recent_pub_ns = rbitcoin_consensus::confirm_phase_stats::sample_write_recent_and_reset();
+    let (recent_idx_ns, recent_clone_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_write_recent_parts_and_reset();
     let (drain_join_ns, dequeue_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
@@ -910,6 +917,8 @@ pub(crate) fn sample(
         },
         ensure_res_hit,
         ensure_cold_n,
+        recent_idx_ms: ns_ms(recent_idx_ns),
+        recent_clone_ms: ns_ms(recent_clone_ns),
         asm_prevout_ms: ns_ms(asm_prevout_ns),
         asm_sigop_ms: ns_ms(asm_sigop_ns),
         asm_final_ms: ns_ms(asm_final_ns),
@@ -1446,7 +1455,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
-         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms \
+         class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms(idx={} clone={}) \
          drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
@@ -1468,6 +1477,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.write.tweak_ms,
         s.write.cache_tip_ms,
         s.write.recent_pub_ms,
+        s.recent_idx_ms,
+        s.recent_clone_ms,
         s.write.drain_join_ms,
         s.write.dequeue_ms,
         s.thr_write_work_ms.saturating_sub(write_stage_ms(s)),
@@ -1945,7 +1956,7 @@ mod tests {
         assert!(line.contains("tweaks=64ms"), "{line}");
         assert!(line.contains("tip_gc=128ms"), "{line}");
         assert!(line.contains("spend=32ms"), "{line}");
-        assert!(line.contains("recent_pub=0ms"), "{line}");
+        assert!(line.contains("recent_pub=0ms(idx=0 clone=0)"), "{line}");
         assert!(line.contains("drain_join=0ms"), "{line}");
         assert!(line.contains("dequeue=0ms"), "{line}");
         assert!(line.contains("other=0ms"), "{line}");

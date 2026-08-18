@@ -204,6 +204,22 @@ impl BlockQueue {
                 "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
             ));
         }
+        self.enqueue_vec(height, hash, header_fk, payload.to_vec())
+    }
+
+    /// Enqueue an already-owned payload (copy happened outside the BQ lock).
+    pub fn enqueue_vec(
+        &mut self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: Vec<u8>,
+    ) -> Result<u64, StoreError> {
+        if !self.can_enqueue(payload.len()) {
+            return Err(StoreError::BudgetFull(
+                "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.index.insert(
@@ -212,7 +228,7 @@ impl BlockQueue {
                 height,
                 hash,
                 header_fk,
-                body: QueuedBody::Raw(payload.to_vec()),
+                body: QueuedBody::Raw(payload),
                 resolve_complete: false,
             },
         );

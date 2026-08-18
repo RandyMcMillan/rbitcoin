@@ -80,7 +80,7 @@ impl LoadAheadState {
     fn publish_mem_stats(&self) {
         let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
         let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-        if weak > live.saturating_mul(2) && weak > 4096 {
+        if weak > 4096 {
             self.parent_store.gc_dead_weaks();
             let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
             rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);

@@ -1335,7 +1335,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          assemble={}ms(prevout={} us/in={} batch={}/n={} same={}/n={} cold={}/n={} \
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
-         pin(plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
+         pin(thin={}ms plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
          adopt={}ms range_fill={}ms contract={}ms publish={}ms) \
          pin_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
@@ -1365,6 +1365,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.asm_sigop_ms,
         s.asm_final_ms,
         s.asm_job_ms,
+        s.load_thin_ms,
         plan_pin_ms,
         s.load_pin_plan,
         cold_range_ms,
@@ -2097,6 +2098,7 @@ mod tests {
         s.asm_sigop_ms = 2;
         s.asm_final_ms = 0;
         s.asm_job_ms = 40;
+        s.load_thin_ms = 7;
         s.load_plan_pin_ms = 100;
         s.load_pin_plan = 20_000;
         s.load_pin_adopt_ms = 15;
@@ -2113,6 +2115,7 @@ mod tests {
         s.load_pin_cache_body = 30_000;
         let line = format_info(&s);
         // Residual pin sub-timers named in pin(...) block.
+        assert!(line.contains("thin=7ms"), "{line}");
         assert!(line.contains("adopt=15ms"), "{line}");
         assert!(line.contains("range_fill=40ms"), "{line}");
         assert!(line.contains("contract=25ms"), "{line}");

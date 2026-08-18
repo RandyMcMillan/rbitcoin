@@ -1485,11 +1485,12 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
-        let id = g.enqueue(height, hash, header_fk, payload)?;
+        let id = g.enqueue_vec(height, hash, header_fk, owned)?;
         Ok(BlockQueueOffer { queue_id: id })
     }
 
@@ -1501,8 +1502,9 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, QueryError> {
+        let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
-        Ok(g.enqueue(height, hash, header_fk, payload)?)
+        Ok(g.enqueue_vec(height, hash, header_fk, owned)?)
     }
 
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).

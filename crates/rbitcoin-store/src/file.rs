@@ -7,7 +7,9 @@
 //!
 //! All payload IO uses **pread/pwrite** on a file descriptor. The process never
 //! maps multi‑GiB table images (`memmap2` / `MmapMut` removed). Hot pages live in
-//! the kernel page cache. Capacity grows via fallocate/`set_len` only.
+//! the kernel page cache. Capacity grows via fallocate / `SetFileInformationByHandle`
+//! (Windows) / `set_len` (Unix). Windows table handles are `FILE_FLAG_OVERLAPPED`;
+//! create/open/grow never use std `Read`/`Write`/`Seek`.
 //!
 //! # Publish order (complete-or-fail units)
 //!
@@ -22,15 +24,15 @@
 //! # Concurrency
 //!
 //! - **Published logical length** is an `AtomicU64` (Acquire/Release).
-//! - `File` is locked only for grow (`fallocate`/`set_len`), fsync, and fadvise.
+//! - `File` is locked only for grow (fallocate / Windows EOF / `set_len`), fsync, and fadvise.
 //! - Roles (see `AGENTS.md` / `docs/concurrency.md`): at most one appender and
 //!   one annotator; N concurrent readers of published ranges.
 
 use crate::error::StoreError;
+use crate::io_handle::IoHandle;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -77,27 +79,97 @@ fn table_open_opts() -> OpenOptions {
     o
 }
 
+fn encode_leading_header(kind: TableKind, logical: u64) -> [u8; FILE_HEADER_LEN] {
+    let mut header = [0u8; FILE_HEADER_LEN];
+    header[0..4].copy_from_slice(&STORE_MAGIC);
+    header[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&kind.as_u16().to_le_bytes());
+    header[8..16].copy_from_slice(&logical.to_le_bytes());
+    header
+}
+
+/// Complete positional write. Safe on Windows `FILE_FLAG_OVERLAPPED` handles
+/// (std `Write` / `WriteFile` with a NULL `OVERLAPPED` is os error 87).
+fn handle_pwrite_all(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let handle = IoHandle::from_file(file);
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let rc = handle.pwrite(offset + done as u64, &bytes[done..]);
+        if rc < 0 {
+            return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-rc)));
+        }
+        if rc == 0 {
+            return Err(StoreError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite returned 0"),
+            ));
+        }
+        done += rc as usize;
+    }
+    Ok(())
+}
+
+/// Complete positional read. Safe on Windows `FILE_FLAG_OVERLAPPED` handles
+/// (std `Read` / `ReadFile` with a NULL `OVERLAPPED` is os error 87).
+fn handle_pread_all(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), StoreError> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let handle = IoHandle::from_file(file);
+    let mut done = 0usize;
+    while done < buf.len() {
+        let rc = handle.pread(offset + done as u64, &mut buf[done..]);
+        if rc < 0 {
+            return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-rc)));
+        }
+        if rc == 0 {
+            return Err(StoreError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"),
+            ));
+        }
+        done += rc as usize;
+    }
+    Ok(())
+}
+
+fn set_file_len(file: &File, path: &Path, new_len: u64) -> Result<(), StoreError> {
+    #[cfg(windows)]
+    {
+        crate::io_handle::win_set_eof(file, new_len).map_err(|e| StoreError::io(path, e))
+    }
+    #[cfg(not(windows))]
+    {
+        file.set_len(new_len).map_err(|e| StoreError::io(path, e))
+    }
+}
+
 impl TableFile {
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let mut file = table_open_opts()
+        let file = table_open_opts()
             .create_new(true)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
 
-        let mut header = [0u8; FILE_HEADER_LEN];
-        header[0..4].copy_from_slice(&STORE_MAGIC);
-        header[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        header[6..8].copy_from_slice(&kind.as_u16().to_le_bytes());
-
-        header[8..16].copy_from_slice(&(FILE_HEADER_LEN as u64).to_le_bytes());
-        file.write_all(&header)
-            .map_err(|e| StoreError::io(&path, e))?;
-        file.flush().map_err(|e| StoreError::io(&path, e))?;
-
+        let header = encode_leading_header(kind, FILE_HEADER_LEN as u64);
         let initial = FILE_HEADER_LEN as u64 + 64;
-        file.set_len(initial)
-            .map_err(|e| StoreError::io(&path, e))?;
+        // Capacity first, then header via overlapped-safe pwrite (not std Write).
+        set_file_len(&file, &path, initial)?;
+        handle_pwrite_all(&file, &path, 0, &header)?;
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
         Ok(Self {
@@ -126,8 +198,7 @@ impl TableFile {
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let initial = TRAILING_FOOTER_LEN as u64;
-        file.set_len(initial)
-            .map_err(|e| StoreError::io(&path, e))?;
+        set_file_len(&file, &path, initial)?;
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         let s = Self {
             path,
@@ -151,7 +222,7 @@ impl TableFile {
         data_bytes: u64,
     ) -> Result<(Self, [u8; 16]), StoreError> {
         let path = path.into();
-        let mut file = table_open_opts()
+        let file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
@@ -160,10 +231,7 @@ impl TableFile {
             return Err(StoreError::Corrupt("trailing-header table short"));
         }
         let mut footer = [0u8; TRAILING_FOOTER_LEN];
-        file.seek(SeekFrom::Start(data_bytes))
-            .map_err(|e| StoreError::io(&path, e))?;
-        file.read_exact(&mut footer)
-            .map_err(|e| StoreError::io(&path, e))?;
+        handle_pread_all(&file, &path, data_bytes, &mut footer)?;
         if footer[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
@@ -212,7 +280,7 @@ impl TableFile {
         kind: TableKind,
     ) -> Result<(PathBuf, u64), StoreError> {
         let path = path.into();
-        let mut file = table_open_opts()
+        let file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
@@ -220,10 +288,12 @@ impl TableFile {
             return Err(StoreError::Corrupt("trailing-header table short"));
         }
         let mut footer = [0u8; TRAILING_FOOTER_LEN];
-        file.seek(SeekFrom::Start(file_len - TRAILING_FOOTER_LEN as u64))
-            .map_err(|e| StoreError::io(&path, e))?;
-        file.read_exact(&mut footer)
-            .map_err(|e| StoreError::io(&path, e))?;
+        handle_pread_all(
+            &file,
+            &path,
+            file_len - TRAILING_FOOTER_LEN as u64,
+            &mut footer,
+        )?;
         if footer[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
@@ -274,13 +344,12 @@ impl TableFile {
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let mut file = table_open_opts()
+        let file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
 
         let mut header = [0u8; FILE_HEADER_LEN];
-        file.read_exact(&mut header)
-            .map_err(|e| StoreError::io(&path, e))?;
+        handle_pread_all(&file, &path, 0, &mut header)?;
         if header[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
@@ -378,48 +447,12 @@ impl TableFile {
 
     /// Complete pread of `buf.len()` bytes or error (no partial success).
     fn pread_all(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        let handle = self.io_handle();
-        let mut done = 0usize;
-        while done < buf.len() {
-            let rc = handle.pread(offset + done as u64, &mut buf[done..]);
-            if rc < 0 {
-                return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
-            }
-            if rc == 0 {
-                return Err(StoreError::io(
-                    &self.path,
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"),
-                ));
-            }
-            done += rc as usize;
-        }
-        Ok(())
+        handle_pread_all(&self.read_file, &self.path, offset, buf)
     }
 
     /// Complete pwrite of all bytes or error (no partial success returned).
     fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let handle = self.io_handle();
-        let mut done = 0usize;
-        while done < bytes.len() {
-            let rc = handle.pwrite(offset + done as u64, &bytes[done..]);
-            if rc < 0 {
-                return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
-            }
-            if rc == 0 {
-                return Err(StoreError::io(
-                    &self.path,
-                    std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite returned 0"),
-                ));
-            }
-            done += rc as usize;
-        }
-        Ok(())
+        handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
     /// Positional pread (page cache / disk). Preferred for Class A `tx.body`.
@@ -554,11 +587,9 @@ impl TableFile {
             return Ok(());
         }
         if try_fallocate(&file, new_cap).is_err() {
-            file.set_len(new_cap)
-                .map_err(|e| StoreError::io(&self.path, e))?;
+            set_file_len(&file, &self.path, new_cap)?;
         } else if file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap {
-            file.set_len(new_cap)
-                .map_err(|e| StoreError::io(&self.path, e))?;
+            set_file_len(&file, &self.path, new_cap)?;
         }
         drop(file);
         self.file_cap.store(new_cap, Ordering::Release);
@@ -750,6 +781,38 @@ mod advise_tests {
         idx2.read_at(off, &mut got2).unwrap();
         assert_eq!(got2, payload);
         let _ = std::fs::remove_file(&path3);
+    }
+
+    /// Tweet pin: first store file is `scripthash.body`. Windows
+    /// `FILE_FLAG_OVERLAPPED` + std `WriteFile`/`ReadFile` (NULL OVERLAPPED)
+    /// is os error 87. Create, payload pwrite, reopen, and grow must work.
+    #[test]
+    fn scripthash_body_create_open_roundtrip() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-body-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scripthash.body");
+        let f = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+        let payload = [0xABu8; 32];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        f.flush().unwrap();
+        drop(f);
+        let f2 = TableFile::open(&path, TableKind::ScriptHash).unwrap();
+        let mut got = [0u8; 32];
+        f2.read_at(FILE_HEADER_LEN as u64, &mut got).unwrap();
+        assert_eq!(got, payload);
+        f2.ensure_capacity(4096).unwrap();
+        f2.write_at(FILE_HEADER_LEN as u64 + 32, &[0xCD; 8])
+            .unwrap();
+        drop(f2);
+        let f3 = TableFile::open(&path, TableKind::ScriptHash).unwrap();
+        let mut tail = [0u8; 8];
+        f3.read_at(FILE_HEADER_LEN as u64 + 32, &mut tail).unwrap();
+        assert_eq!(tail, [0xCD; 8]);
+        drop(f3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

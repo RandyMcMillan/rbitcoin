@@ -20,6 +20,12 @@ before 1.0).
 
 ### Fixed
 
+- **Windows / Darwin store smoke `--release` compile:** `take_raw_clone_n`
+  and the raw-clone meter are `cfg(any(test, debug_assertions))`. Native
+  `cargo test --release -p rbitcoin-store --lib` (windows.yml / macos.yml)
+  compiles the whole test crate; the meter stays off in production
+  `--release` node builds.
+
 - **Windows store create (os error 87):** table files open
   `FILE_FLAG_OVERLAPPED` for IOCP. `TableFile::create` / `open` / trailing
   header used std `Write`/`Read`/`Seek`, which call `WriteFile`/`ReadFile`

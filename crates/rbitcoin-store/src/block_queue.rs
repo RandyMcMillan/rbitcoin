@@ -29,16 +29,17 @@ pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
 
 /// Payload clones from [`BlockQueue::raw_payloads`] / [`BlockQueue::raw_payload`].
 /// Debug/test only — wave intake must not bump this for the whole asked set.
-#[cfg(debug_assertions)]
+/// `cfg(test)` so `--release` `cargo test` (Windows/macOS store smoke) compiles.
+#[cfg(any(test, debug_assertions))]
 static RAW_CLONE_N: AtomicU64 = AtomicU64::new(0);
 
 /// Take-and-reset raw payload clone count (debug builds / unit tests).
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub fn take_raw_clone_n() -> u64 {
     RAW_CLONE_N.swap(0, Ordering::Relaxed)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 fn note_raw_clone() {
     RAW_CLONE_N.fetch_add(1, Ordering::Relaxed);
 }
@@ -426,7 +427,7 @@ impl BlockQueue {
     pub fn raw_payload(&self, height: u32) -> Option<Vec<u8>> {
         match self.entry_for_height(height).map(|e| &e.body) {
             Some(QueuedBody::Raw(v)) => {
-                #[cfg(debug_assertions)]
+                #[cfg(any(test, debug_assertions))]
                 note_raw_clone();
                 Some(v.clone())
             }
@@ -446,7 +447,7 @@ impl BlockQueue {
                 continue;
             }
             if let QueuedBody::Raw(v) = &e.body {
-                #[cfg(debug_assertions)]
+                #[cfg(any(test, debug_assertions))]
                 note_raw_clone();
                 out.push((e.height, v.clone()));
             }

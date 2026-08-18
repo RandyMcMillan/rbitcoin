@@ -720,6 +720,7 @@ dependencies = [
 name = "rbitcoin-consensus"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bitcoin",
  "bitcoin_hashes 0.14.101",
  "rbitcoin-log",

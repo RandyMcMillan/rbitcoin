@@ -33,6 +33,12 @@ before 1.0).
 
 ### Changed
 
+- **Script steal claim + join:** `rbtc-scripts-*` claim a published
+  wave snapshot (`ArcSwap`) instead of locking `WAVES` per job;
+  `in_wave` is AcqRel. After feed-ahead submits N+1, scripts join
+  blocks instead of `recv_timeout(200µs)` for the rest of N. `script=`
+  is still verify/`wait_done` wall, not the poller.
+
 - **Confirm structure one-pass + lookup stash:** `TxPrecompute::from_tx`
   (txid + wtxid + weight + BIP143/BIP341 common SHA256 midstates) lives
   on Query. Lookup decodes each BQ height once, promotes to decoded-only

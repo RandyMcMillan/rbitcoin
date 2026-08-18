@@ -1120,20 +1120,22 @@ pub(crate) fn spawn_confirm_engine(
                     &inflight.handle,
                     std::time::Duration::from_micros(200),
                     || {
-                        if lookahead.is_none()
-                            && !feed_sc.stopped()
-                            && !hub_sc.query.confirm_cancelled()
+                        if lookahead.is_some()
+                            || feed_sc.stopped()
+                            || hub_sc.query.confirm_cancelled()
                         {
-                            let t_try = Instant::now();
-                            match mat_rx.try_recv() {
-                                Ok((mat_batch, mat_ns)) => {
-                                    confirm_thr_stats::add_script_recv_wait(t_try.elapsed());
-                                    lookahead =
-                                        Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                            return false;
+                        }
+                        let t_try = Instant::now();
+                        match mat_rx.try_recv() {
+                            Ok((mat_batch, mat_ns)) => {
+                                confirm_thr_stats::add_script_recv_wait(t_try.elapsed());
+                                lookahead =
+                                    Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
+                                false
                             }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
                         }
                     },
                 );

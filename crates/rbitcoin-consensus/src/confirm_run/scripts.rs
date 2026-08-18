@@ -39,6 +39,11 @@ pub struct ScriptsPhaseHandle {
 impl ScriptsPhaseHandle {
     /// Block until the spawned wave finishes (ordered join).
     pub fn join(self) -> Result<ConfirmScriptOutcome, ConsensusError> {
+        self.recv_blocking()
+    }
+
+    /// Blocking recv without consuming the handle (lookahead join path).
+    pub fn recv_blocking(&self) -> Result<ConfirmScriptOutcome, ConsensusError> {
         self.rx.recv().unwrap_or_else(|_| {
             Err(ConsensusError::BadBlock(
                 "scripts phase: worker disconnected before result",
@@ -98,23 +103,31 @@ pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     }
 }
 
-/// Join `handle`, repeatedly invoking `on_poll` (e.g. load `try_recv` + async
-/// submit) so a second ready batch reaches a coordinator **before** this join returns.
+/// Join `handle`, invoking `on_poll` so a second ready batch can start on
+/// the other coordinator **before** this join returns.
 ///
-/// This is the production feed-ahead primitive used under depth-1 channels.
+/// `on_poll` returns `true` while the caller still wants short `recv_timeout`
+/// polls (lookahead empty, another batch may arrive). Once it returns
+/// `false` (N+1 submitted, or no further batch), this **blocks** on `join`.
+/// Do not keep a 200 µs loop after lookahead is live.
 pub fn join_scripts_polling<F>(
     handle: &ScriptsPhaseHandle,
     poll: std::time::Duration,
     mut on_poll: F,
 ) -> Result<ConfirmScriptOutcome, ConsensusError>
 where
-    F: FnMut(),
+    F: FnMut() -> bool,
 {
     loop {
-        on_poll();
+        if !on_poll() {
+            return handle.recv_blocking();
+        }
         match handle.recv_timeout(poll) {
             Ok(r) => return r,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                scripts_feed_test_sync::on_recv_timeout();
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(ConsensusError::BadBlock(
                     "scripts phase: worker disconnected before result",
@@ -147,6 +160,8 @@ pub fn confirm_scripts_feed_ahead(
                 if next.is_none() {
                     next = iter.next().map(confirm_scripts_phase_async);
                 }
+                // Iterator is already in hand: one attempt, then block.
+                false
             })?;
         out.push(outcome);
         match next.take() {
@@ -197,12 +212,16 @@ pub fn scripts_stage_from_load_channel(
             None => break,
         };
         let result = join_scripts_polling(&handle, std::time::Duration::from_micros(200), || {
-            if lookahead.is_none() {
-                if let Ok((batch, mat_ns)) = mat_rx.try_recv() {
-                    if !should_stop() {
-                        lookahead = Some(start(batch, mat_ns));
-                    }
+            if lookahead.is_some() || should_stop() {
+                return false;
+            }
+            match mat_rx.try_recv() {
+                Ok((batch, mat_ns)) => {
+                    lookahead = Some(start(batch, mat_ns));
+                    false
                 }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
             }
         });
         match result {
@@ -264,13 +283,17 @@ pub mod scripts_feed_test_sync {
 
     static SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
     static HOLD_FIRST: AtomicBool = AtomicBool::new(false);
+    static HOLD_TAIL: AtomicBool = AtomicBool::new(false);
     static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
+    static RECV_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
     /// Reset counters (call at start of each feed-ahead timing test).
     pub fn reset() {
         SUBMIT_COUNT.store(0, Ordering::SeqCst);
         HOLD_FIRST.store(false, Ordering::SeqCst);
+        HOLD_TAIL.store(false, Ordering::SeqCst);
         FIRST_ENTERED.store(false, Ordering::SeqCst);
+        RECV_TIMEOUTS.store(0, Ordering::SeqCst);
     }
 
     /// When true, the first [`super::confirm_scripts_phase`] waits until
@@ -280,8 +303,22 @@ pub mod scripts_feed_test_sync {
         FIRST_ENTERED.store(false, Ordering::SeqCst);
     }
 
+    /// After N+1 is submitted, keep the first wave open ~200 ms so a 200 µs
+    /// join loop would accumulate hundreds of timeouts.
+    pub fn set_hold_tail_after_second(hold: bool) {
+        HOLD_TAIL.store(hold, Ordering::SeqCst);
+    }
+
     pub fn submit_count() -> u64 {
         SUBMIT_COUNT.load(Ordering::SeqCst)
+    }
+
+    pub fn recv_timeout_count() -> u64 {
+        RECV_TIMEOUTS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn on_recv_timeout() {
+        RECV_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn on_async_submit() {
@@ -302,6 +339,9 @@ pub mod scripts_feed_test_sync {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if HOLD_TAIL.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

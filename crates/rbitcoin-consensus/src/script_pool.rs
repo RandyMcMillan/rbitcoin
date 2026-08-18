@@ -64,7 +64,9 @@ impl Wave {
             return None;
         }
         #[cfg(test)]
-        STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
+        if STEAL_CLAIMS_ON.load(Ordering::Relaxed) {
+            STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
+        }
         self.in_wave.fetch_add(1, Ordering::AcqRel);
         Some(i..self.n.min(i.saturating_add(STEAL_CHUNK)))
     }
@@ -114,6 +116,13 @@ static WAVES_SNAP: OnceLock<ArcSwap<Vec<Arc<Wave>>>> = OnceLock::new();
 static STEAL_WAVES_LOCKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static STEAL_CLAIMS: AtomicUsize = AtomicUsize::new(0);
+/// When true, [`Wave::claim_chunk`] increments [`STEAL_CLAIMS`]. Off by default
+/// so parallel `try_for_each_parallel` tests do not inflate the counter.
+#[cfg(test)]
+static STEAL_CLAIMS_ON: AtomicBool = AtomicBool::new(false);
+/// Serialize the two 256-job steal tests so they do not share [`STEAL_CLAIMS`].
+#[cfg(test)]
+static STEAL_TEST: Mutex<()> = Mutex::new(());
 
 fn waves_snap() -> &'static ArcSwap<Vec<Arc<Wave>>> {
     WAVES_SNAP.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
@@ -550,8 +559,10 @@ mod tests {
     #[test]
     fn steal_chunk_amortizes_claims() {
         // 256 items → 8 chunks of 32. Not 256 fetch_adds on `next`.
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
         workers();
         STEAL_CLAIMS.store(0, Ordering::Relaxed);
+        STEAL_CLAIMS_ON.store(true, Ordering::Relaxed);
         let items: Vec<u32> = (0..256).collect();
         let hits: Vec<AtomicUsize> = (0..256).map(|_| AtomicUsize::new(0)).collect();
         try_for_each_parallel(&items, |&i| {
@@ -559,6 +570,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        STEAL_CLAIMS_ON.store(false, Ordering::Relaxed);
         for (i, h) in hits.iter().enumerate() {
             assert_eq!(h.load(Ordering::Relaxed), 1, "index {i} not run once");
         }
@@ -573,6 +585,7 @@ mod tests {
     fn steal_index_does_not_lock_waves_per_job() {
         // Claim must not take WAVES: a 256-job wave is tens of thousands of
         // short P2WPKH jobs on IBD. Today's steal_index locks per claim.
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
         workers();
         STEAL_WAVES_LOCKS.store(0, Ordering::Relaxed);
         let items: Vec<u32> = (0..256).collect();

@@ -1,7 +1,10 @@
 //! Peer handshake, serve, tip follow, and announce (BIP324 v2 transport).
 
 use crate::cache::BlockCache;
-use crate::chain::{accept_block_header_nodos_log, AcceptOutcome, ChainHub};
+use crate::chain::{
+    accept_block_header_nodos_log, ignoring_low_work_chain_log, synchronizing_blockheaders_log,
+    AcceptOutcome, ChainHub,
+};
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
@@ -54,6 +57,30 @@ pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
 
 /// Per-session misbehavior score that triggers disconnect (Core-like order).
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
+
+/// `-blocksonly` (relay off, no whitelist `relay`) or a block-relay-only
+/// session must not receive txs / tx invs (`p2p_blocksonly`).
+fn reject_unsolicited_tx(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) -> bool {
+    if session.is_some_and(|s| s.conn_type == crate::peers::PeerConnType::BlockRelay) {
+        return true;
+    }
+    let node_relay = hub.mempool().is_none_or(|m| m.relay_enabled());
+    if node_relay {
+        return false;
+    }
+    !session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()))
+}
+
+/// BIP152 HB is only for tx-relay peers. `-blocksonly` must not send
+/// `sendcmpct(announce=1)` (`p2p_compactblocks_blocksonly`).
+fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) {
+    if hub.mempool().is_some_and(|m| !m.relay_enabled()) {
+        return;
+    }
+    if let Some(s) = session {
+        s.maybe_select_as_hb();
+    }
+}
 
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
@@ -223,6 +250,8 @@ async fn application_handshake(
     if their_version.version >= 70016 {
         write_v2_msg(writer, NetworkMessage::WtxidRelay).await?;
     }
+    // BIP155: advertise addrv2 before verack (`p2p_invalid_messages` wait_for_sendaddrv2).
+    write_v2_msg(writer, NetworkMessage::SendAddrV2).await?;
     write_v2_msg(writer, NetworkMessage::Verack).await?;
 
     loop {
@@ -303,6 +332,9 @@ pub async fn peer_session_with(
     let _ = write_v2_msg(&mut writer, NetworkMessage::FeeFilter(fee_sat as i64)).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+    if let Some(s) = meta.session.as_ref() {
+        s.attach_out(out_tx.clone());
+    }
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -321,7 +353,9 @@ pub async fn peer_session_with(
     let mut peer_wants_headers = false;
     let mut peer_wtxid_relay = false;
     let mut peer_send_cmpct = false;
-    let mut peer_cmpct_version: u32 = 2;
+    // 0 until the peer sends `sendcmpct` v2. Defaulting to 2 made every
+    // relay peer getdata CMPCT and broke tests that only serve `msg_block`.
+    let mut peer_cmpct_version: u32 = 0;
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
     let mut pending_blocks: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
     let mut pending_cmpct: HashMap<BlockHash, PendingCmpct> = HashMap::new();
@@ -346,6 +380,12 @@ pub async fn peer_session_with(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(50)), if session.is_some() => {
+                    if tx_announce_rx.is_none() {
+                        tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
+                    }
+                    if inv_flush_rx.is_none() {
+                        inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
+                    }
                     if let Some(s) = session.as_ref() {
                         match s.take_ping_action(s.clock_now()) {
                             Some(PingAction::Send { nonce }) => {
@@ -468,10 +508,19 @@ pub async fn peer_session_with(
                                     continue;
                                 }
                                 if let Some(mp) = hub.mempool() {
-                                    let inbound = session.as_ref().is_some_and(|s| s.inbound);
-                                    if mp.relay_enabled()
+                                    let peer_ok = session.as_ref().is_none_or(|s| {
+                                        s.conn_type != crate::peers::PeerConnType::BlockRelay
+                                            && (s.relay || mp.is_unbroadcast(&txid))
+                                            // Inbound waits 30s when relay is on
+                                            // (`mempool_reorg.py:71`). Noban and
+                                            // `-blocksonly` unbroadcast skip it.
+                                            && (!s.inbound
+                                                || s.hub().is_some_and(|h| h.is_noban())
+                                                || !mp.relay_enabled())
+                                    });
+                                    if peer_ok
                                         && mp.contains(&txid)
-                                        && (mp.immediate_relay() || !inbound)
+                                        && (mp.relay_enabled() || mp.is_unbroadcast(&txid))
                                     {
                                         let inv = if let Some(tx) = mp.get_tx(&txid) {
                                             Inventory::WTx(tx.compute_wtxid())
@@ -481,8 +530,16 @@ pub async fn peer_session_with(
                                         if let Some(s) = session.as_ref() {
                                             if let Inventory::WTx(w) = inv {
                                                 s.note_announced_wtx(w);
+                                                // Only this tx existed at INV time.
+                                                // Never snap to current_relay_seq()
+                                                // (`mempool_reorg.py:122`).
+                                                if let Some(seq) = mp.relay_seq_of(&w) {
+                                                    s.note_tx_inv_seq(
+                                                        s.last_inv_sequence()
+                                                            .max(seq.saturating_add(1)),
+                                                    );
+                                                }
                                             }
-                                            s.note_tx_inv_seq(mp.current_relay_seq());
                                         }
                                         queue_out(&out_tx, NetworkMessage::Inv(vec![inv]))?;
                                     }
@@ -505,6 +562,15 @@ pub async fn peer_session_with(
                         if let Some(s) = session.as_ref() {
                             s.request_tx_inv();
                             queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
+                            // setmocktime also ends a stalling headers-sync.
+                            // Restart getheaders here — waiting for the 50ms
+                            // tick loses p2p_initial_headers_sync noban
+                            // assert_single_getheaders_recipient.
+                            let _ = maybe_queue_initial_getheaders(
+                                &out_tx,
+                                hub.as_ref(),
+                                s,
+                            );
                         }
                     }
                 }
@@ -667,6 +733,12 @@ fn queue_getheaders(
     queue_out(out, NetworkMessage::GetHeaders(gh))
 }
 
+/// BIP152: request `MSG_CMPCT_BLOCK` when the peer speaks compact v2 and we
+/// relay txs. `-blocksonly` keeps `MSG_WITNESS_BLOCK` (`p2p_compactblocks_blocksonly`).
+fn getdata_use_compact(hub: &ChainHub, peer_cmpct_version: u32) -> bool {
+    peer_cmpct_version == 2 && hub.mempool().is_none_or(|m| m.relay_enabled())
+}
+
 fn queue_block_getdata(
     hub: &ChainHub,
     out: &mpsc::UnboundedSender<NetworkMessage>,
@@ -739,6 +811,18 @@ fn try_cmpct_missing(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> O
     }
 }
 
+/// Flush due / unbroadcast tx INVs onto every live session writer.
+/// Used by RPC sendraw and whitelist-relay accept (`p2p_blocksonly`).
+pub fn flush_tx_invs(hub: &ChainHub, peers: &crate::peers::PeerHub) {
+    let rows = peers.live_peers();
+    for s in rows {
+        s.request_tx_inv();
+        if let Some(out) = s.writer() {
+            queue_due_tx_invs(hub, s.as_ref(), &HashMap::new(), &out);
+        }
+    }
+}
+
 fn queue_due_tx_invs(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
@@ -748,16 +832,21 @@ fn queue_due_tx_invs(
     let Some(mp) = hub.mempool() else {
         return;
     };
-    if !mp.relay_enabled() {
+    if session.conn_type == crate::peers::PeerConnType::BlockRelay {
         return;
     }
+    // `-blocksonly` (relay off) still INV locally submitted (unbroadcast)
+    // txs immediately (`p2p_blocksonly.py:48`). When relay is on, inbound
+    // keeps the 30s age gate (`mempool_reorg.py:71`).
     let now = session.clock_now();
     let clock_due = session.take_tx_inv_due(now);
     let live = mp.list_live();
     let age_due = live
         .iter()
         .any(|(_, _, _, tx)| mp.tx_inv_due(&tx.compute_wtxid()));
-    if !clock_due && !age_due {
+    let unbroadcast_due =
+        !mp.relay_enabled() && live.iter().any(|(txid, _, _, _)| mp.is_unbroadcast(txid));
+    if !clock_due && !age_due && !unbroadcast_due {
         return;
     }
     let mut n = 0u32;
@@ -766,8 +855,28 @@ fn queue_due_tx_invs(
         if from_this_peer.contains_key(&txid) {
             continue;
         }
+        if session.conn_type == crate::peers::PeerConnType::BlockRelay {
+            continue;
+        }
+        if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
+            continue;
+        }
         let w = tx.compute_wtxid();
-        if session.has_announced_wtx(&w) || !mp.tx_inv_due(&w) {
+        if session.has_announced_wtx(&w) {
+            continue;
+        }
+        let local = !mp.relay_enabled() && mp.is_unbroadcast(&txid);
+        let age_due_this = mp.tx_inv_due(&w);
+        // Inbound + relay on: a mocktime jump / request_tx_inv only
+        // flushes txs whose own 30s clock has elapsed. clock_due must
+        // not INV a brand-new sendraw (`mempool_reorg.py:122`).
+        let inbound_age_gate =
+            session.inbound && mp.relay_enabled() && !session.hub().is_some_and(|h| h.is_noban());
+        if inbound_age_gate {
+            if !age_due_this {
+                continue;
+            }
+        } else if !clock_due && !local && !age_due_this {
             continue;
         }
         session.note_announced_wtx(w);
@@ -856,6 +965,13 @@ async fn handle_peer_frame(
         NetworkMessage::WtxidRelay => {
             // BIP339 mutual: we already sent wtxidrelay pre-verack; remember theirs.
             *peer_wtxid_relay = true;
+        }
+        NetworkMessage::SendAddrV2 => {
+            // BIP155: we advertise sendaddrv2 pre-verack; inbound advertise is enough.
+        }
+        NetworkMessage::AddrV2(_) => {
+            // BIP155 payload. Invalid encodings are rejected at decode; stay
+            // connected on a well-formed (including empty-list) message.
         }
         NetworkMessage::GetHeaders(gh) => {
             let headers = headers_reply_for_getheaders(hub, gh)?;
@@ -956,6 +1072,9 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::WTx(wtxid) => {
+                        if let Some(s) = session {
+                            rbitcoin_log::info!("received getdata for: wtx {wtxid} peer={}", s.id);
+                        }
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
                                 let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
@@ -1039,7 +1158,9 @@ async fn handle_peer_frame(
             let mut want = Vec::new();
             let mut inv_tx_n = 0u64;
             let mut need_headers = false;
-            let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false);
+            let mut tx_inv_hex: Option<String> = None;
+            let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
+                || session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()));
             for item in items.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
@@ -1055,15 +1176,19 @@ async fn handle_peer_frame(
                                 }) {
                                     need_headers = true;
                                 }
+                            } else {
+                                // Have a header: do not getdata from inv. Bodies
+                                // come from header-announcement direct fetch
+                                // (BIP130) or a getheaders reply. Inv of a
+                                // known hash from a second peer (p2p_sendheaders
+                                // inv_node) must not steal or duplicate getdata.
                             }
-                            // Have a header: do not getdata from inv. Bodies come
-                            // from header-announcement direct fetch (BIP130) or a
-                            // getheaders reply. Inv of a known hash from a second
-                            // peer (p2p_sendheaders inv_node) must not steal or
-                            // duplicate that getdata.
                         }
                     }
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                        if tx_inv_hex.is_none() {
+                            tx_inv_hex = Some(txid.to_string());
+                        }
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains(txid) {
@@ -1074,6 +1199,9 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::WTx(wtxid) => {
+                        if tx_inv_hex.is_none() {
+                            tx_inv_hex = Some(wtxid.to_string());
+                        }
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains_wtxid(wtxid) {
@@ -1101,6 +1229,15 @@ async fn handle_peer_frame(
                     .count() as u64;
                 mp.note_getdata_tx(gd_tx);
             }
+            if let Some(hx) = tx_inv_hex {
+                if reject_unsolicited_tx(hub, session) {
+                    rbitcoin_log::info!(
+                        "transaction ({hx}) inv sent in violation of protocol, disconnecting peer"
+                    );
+                    punish_disconnect(ban_score, session);
+                    return Ok(());
+                }
+            }
             if need_headers {
                 let _ = queue_getheaders(out_tx, hub, session, true);
             }
@@ -1115,6 +1252,17 @@ async fn handle_peer_frame(
                 // Empty headers is a failed getheaders response, not an announcement.
             } else if let Some(first) = headers.first() {
                 let prev = first.prev_blockhash;
+                if hub.is_block_invalid(&prev)
+                    || headers
+                        .iter()
+                        .take(n)
+                        .any(|h| hub.is_block_invalid(&h.block_hash()))
+                {
+                    // Headers on a cached-invalid chain: disconnect
+                    // (`p2p_unrequested_blocks` step 8 follow-up header).
+                    punish_disconnect(ban_score, session);
+                    return Ok(());
+                }
                 let connecting = header_announcement_connects(hub, pending_headers, prev);
                 for hdr in headers.iter().take(n) {
                     let hash = hdr.block_hash();
@@ -1132,40 +1280,61 @@ async fn handle_peer_frame(
                 if !connecting {
                     let _ = queue_getheaders(out_tx, hub, session, true);
                 } else {
-                    for hdr in headers.iter().take(n) {
-                        let _ = hub.ensure_header(hdr);
-                    }
                     let last = headers[n - 1].block_hash();
-                    let mut want = Vec::new();
-                    if header_path_meets_minwork(hub, pending_headers, last) {
-                        want = missing_blocks_on_header_path(
-                            hub,
-                            pending_headers,
-                            last,
-                            pending_blocks,
-                            requested_blocks,
-                        );
-                        match header_branch_vs_tip(hub, pending_headers, last) {
-                            Some(std::cmp::Ordering::Less) => want.clear(),
-                            // BIP130 cap is for unsolicited announcements only.
-                            // A getheaders reply (rejoin / catch-up) must fetch
-                            // the whole offered path.
-                            Some(std::cmp::Ordering::Equal) if !headers_reply => {
-                                let room = 16usize.saturating_sub(requested_blocks.len());
-                                want.truncate(room);
-                            }
-                            Some(std::cmp::Ordering::Greater) if !headers_reply => {
-                                let side = header_path_join(hub, pending_headers, last)
-                                    .is_some_and(|h| hub.tip_hash() != Some(h));
-                                if side {
+                    // Core `chain_start.nHeight + headers.size()`. One-header
+                    // tip announces still accumulate via `pending_headers`
+                    // (`p2p_headers_sync_with_minchainwork` height=14).
+                    let announced_h = announced_headers_height(hub, pending_headers, last);
+                    let noban = session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_noban()));
+                    if !header_path_meets_minwork(hub, pending_headers, last) {
+                        if noban {
+                            persist_pending_header_path(hub, pending_headers, last);
+                            rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
+                        } else {
+                            rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+                        }
+                        // Core: do not download bodies until the chain meets
+                        // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
+                    } else {
+                        persist_pending_header_path(hub, pending_headers, last);
+                        rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
+                        let mut want = Vec::new();
+                        if header_path_meets_minwork(hub, pending_headers, last) {
+                            want = missing_blocks_on_header_path(
+                                hub,
+                                pending_headers,
+                                last,
+                                pending_blocks,
+                                requested_blocks,
+                            );
+                            match header_branch_vs_tip(hub, pending_headers, last) {
+                                Some(std::cmp::Ordering::Less) => want.clear(),
+                                // BIP130 cap is for unsolicited announcements only.
+                                // A getheaders reply (rejoin / catch-up) must fetch
+                                // the whole offered path.
+                                Some(std::cmp::Ordering::Equal) if !headers_reply => {
                                     let room = 16usize.saturating_sub(requested_blocks.len());
                                     want.truncate(room);
                                 }
+                                Some(std::cmp::Ordering::Greater) if !headers_reply => {
+                                    let side = header_path_join(hub, pending_headers, last)
+                                        .is_some_and(|h| hub.tip_hash() != Some(h));
+                                    if side {
+                                        let room = 16usize.saturating_sub(requested_blocks.len());
+                                        want.truncate(room);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
+                        queue_block_getdata(
+                            hub,
+                            out_tx,
+                            requested_blocks,
+                            &want,
+                            getdata_use_compact(hub, *peer_cmpct_version),
+                        )?;
                     }
-                    queue_block_getdata(hub, out_tx, requested_blocks, &want, *peer_send_cmpct)?;
                 }
             }
             if n >= MAX_HEADERS_RESULTS {
@@ -1214,9 +1383,7 @@ async fn handle_peer_frame(
                 Ok(AcceptOutcome::Accepted { .. }) => {
                     pending_blocks.remove(&hash);
                     pending_headers.remove(&hash);
-                    if let Some(s) = session {
-                        s.maybe_select_as_hb();
-                    }
+                    maybe_select_hb_if_relay(hub, session);
                     drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 }
                 Ok(AcceptOutcome::AlreadyHave) => {
@@ -1235,6 +1402,10 @@ async fn handle_peer_frame(
                     );
                 }
                 Err(e) => {
+                    // Rule rejects (`bad-txns-nonfinal`, BIP68/112 locktime,
+                    // `feature_csv_activation`) must keep the session so the
+                    // peer can send the next block. Cached-invalid is still
+                    // noted; compact children of a failed hash still disconnect.
                     rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
                 }
             }
@@ -1279,7 +1450,13 @@ async fn handle_peer_frame(
                 .into_iter()
                 .filter(|h| *h != hash)
                 .collect();
-                queue_block_getdata(hub, out_tx, requested_blocks, &ancestors, *peer_send_cmpct)?;
+                queue_block_getdata(
+                    hub,
+                    out_tx,
+                    requested_blocks,
+                    &ancestors,
+                    getdata_use_compact(hub, *peer_cmpct_version),
+                )?;
                 if compact_header_low_work(hub, &hsi.header) {
                     let id = session.map(|s| s.id).unwrap_or(0);
                     rbitcoin_log::info!("Ignoring low-work compact block from peer {id}");
@@ -1304,9 +1481,7 @@ async fn handle_peer_frame(
                         Ok(AcceptOutcome::Accepted { .. })
                     );
                     if accepted {
-                        if let Some(s) = session {
-                            s.maybe_select_as_hb();
-                        }
+                        maybe_select_hb_if_relay(hub, session);
                     } else if !hub.knows_header(&hsi.header.prev_blockhash) {
                         // Filled a better-work compact whose parent bodies
                         // we lack (`mempool_reorg` 20-block submitblock).
@@ -1371,8 +1546,8 @@ async fn handle_peer_frame(
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => match hub.accept_received_block(block) {
                         Ok(AcceptOutcome::Accepted { .. }) => {
+                            maybe_select_hb_if_relay(hub, session);
                             if let Some(s) = session {
-                                s.maybe_select_as_hb();
                                 if let Some(ph) = s.hub() {
                                     ph.clear_cmpct_fill(hash);
                                 }
@@ -1417,14 +1592,40 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Tx(tx) => {
+            if reject_unsolicited_tx(hub, session) {
+                let id = session.map(|s| s.id).unwrap_or(0);
+                rbitcoin_log::info!(
+                    "transaction sent in violation of protocol, disconnecting peer={id}"
+                );
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
             if let Some(mp) = hub.mempool() {
-                if mp.relay_enabled() {
+                if mp.relay_enabled()
+                    || session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_relay_perm()))
+                {
                     let txid = tx.compute_txid();
                     from_this_peer.insert(txid, ());
                     match mp.accept_tx(tx) {
-                        Ok(_) => {
+                        Ok(r) => {
                             if let Some(s) = session {
                                 s.note_last_transaction();
+                            }
+                            // Only when P2P relay is off: accept-time announce
+                            // is skipped (not yet unbroadcast). Re-announce so
+                            // other tx-relay peers INV (`p2p_blocksonly` :74).
+                            // Do not do this when relay is on — that INVs every
+                            // accepted tx back at the sender and broke
+                            // feature_csv_activation (P2PInterface getdata storm).
+                            if !mp.relay_enabled() {
+                                mp.note_unbroadcast(r.txid);
+                                mp.rebroadcast_unbroadcast();
+                                mp.notify_inv_flush();
+                                if let Some(s) = session {
+                                    if let Some(ph) = s.hub() {
+                                        flush_tx_invs(hub, ph.as_ref());
+                                    }
+                                }
                             }
                         }
                         Err(rbitcoin_mempool::AcceptError::Duplicate(_)) => {}
@@ -1527,6 +1728,73 @@ fn tip_announce_decision(
         }
     }
     TipAnnounce::Inv(ev.hash)
+}
+
+/// Height of `tip` from stored headers or a walk of this peer's pending path.
+///
+/// Core logs `chain_start.nHeight + headers.size()` on the *batch*. Node-to-node
+/// generate announces one header per tip; ignored headers are not stored, so
+/// height must come from the pending walk (14 one-header announces → 14).
+fn announced_headers_height(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> u32 {
+    if tip.to_byte_array() == [0u8; 32] {
+        return 0;
+    }
+    if let Some(h) = hub.header_height(&tip) {
+        return h;
+    }
+    let mut steps = 0u32;
+    let mut h = tip;
+    for _ in 0..10_000 {
+        if h.to_byte_array() == [0u8; 32] {
+            return steps;
+        }
+        if let Some(known) = hub.header_height(&h) {
+            return known.saturating_add(steps);
+        }
+        let Some(hdr) = pending.get(&h) else {
+            return steps;
+        };
+        steps = steps.saturating_add(1);
+        h = hdr.prev_blockhash;
+    }
+    steps
+}
+
+/// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
+fn persist_pending_header_path(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) {
+    let mut path = Vec::new();
+    let mut h = tip;
+    for _ in 0..10_000 {
+        if hub
+            .query
+            .get_header_by_hash(h.as_byte_array())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            break;
+        }
+        let Some(hdr) = pending.get(&h) else {
+            break;
+        };
+        path.push(*hdr);
+        h = hdr.prev_blockhash;
+        if h.to_byte_array() == [0u8; 32] {
+            break;
+        }
+    }
+    path.reverse();
+    for hdr in &path {
+        let _ = hub.ensure_header(hdr);
+    }
 }
 
 fn header_announcement_connects(
@@ -1689,10 +1957,14 @@ fn missing_blocks_on_header_path(
         {
             path.push(h);
         }
-        let Some(hdr) = pending.get(&h) else {
+        let prev = pending
+            .get(&h)
+            .map(|hdr| hdr.prev_blockhash)
+            .or_else(|| hub.prev_of(&h));
+        let Some(prev) = prev else {
             break;
         };
-        h = hdr.prev_blockhash;
+        h = prev;
         if h.to_byte_array() == [0u8; 32] {
             break;
         }
@@ -2355,7 +2627,9 @@ mod tests {
                     if let NetworkMessage::GetData(inv) = m {
                         for i in inv {
                             match i {
-                                Inventory::Block(h) | Inventory::WitnessBlock(h) => hashes.push(h),
+                                Inventory::Block(h)
+                                | Inventory::WitnessBlock(h)
+                                | Inventory::CompactBlock(h) => hashes.push(h),
                                 _ => {}
                             }
                         }
@@ -2364,35 +2638,41 @@ mod tests {
                 hashes
             }
 
-            // sendheaders announce is one header per mined tip.
-            for hdr in &hdrs[..49] {
-                handle_peer_frame(
-                    frame_for(NetworkMessage::Headers(vec![*hdr])),
-                    &hub,
-                    &out_tx,
-                    &mut wants_headers,
-                    &mut wtxid,
-                    &mut send_cmpct,
-                    &mut cmpct_ver,
-                    &mut pending_headers,
-                    &mut pending_blocks,
-                    &mut pending_cmpct,
-                    &mut from_peer,
-                    &mut requested,
-                    &mut ban,
-                    None,
-                )
-                .await
-                .unwrap();
-            }
+            // Core getheaders reply is a batch (not one header per tip).
+            handle_peer_frame(
+                frame_for(NetworkMessage::Headers(hdrs[..49].to_vec())),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 drain_getdata(&mut out_rx).is_empty(),
                 "must not getdata a 49-block chain (work 100 < 101)"
             );
             assert_eq!(hub.tip_height(), Some(0));
+            assert_eq!(
+                hub.chaintips()
+                    .iter()
+                    .filter(|t| t.status != "active")
+                    .count(),
+                0,
+                "non-noban must not store a low-work headers tree"
+            );
 
             handle_peer_frame(
-                frame_for(NetworkMessage::Headers(vec![hdrs[49]])),
+                frame_for(NetworkMessage::Headers(hdrs.clone())),
                 &hub,
                 &out_tx,
                 &mut wants_headers,
@@ -2421,6 +2701,811 @@ mod tests {
             assert_eq!(got[49], h50, "getdata should end at height 50");
             let _ = std::fs::remove_dir_all(dir);
             let _ = std::fs::remove_dir_all(dir2);
+        });
+    }
+
+    #[test]
+    fn minchainwork_one_header_announces_ignore_height_14() {
+        use bitcoin::ScriptBuf;
+        use rbitcoin_primitives::Height;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::consensus::encode::serialize;
+            use bitcoin::p2p::message::RawNetworkMessage;
+            use bitcoin::Network;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("minwork-h14");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            // Core node1 `-minimumchainwork=0x1f` (15 blocks).
+            let mut min = [0u8; 32];
+            min[31] = 0x1f;
+            hub.set_minimum_chain_work(Some(min));
+
+            let (dir2, q2) = tmp_store("minwork-h14-src");
+            let src = ChainHub::new(q2, ChainParams::regtest(), Milestone::NONE);
+            src.ensure_genesis().unwrap();
+            src.generate_to_script(14, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .unwrap();
+            let mut hdrs = Vec::new();
+            for h in 1..=14u32 {
+                hdrs.push(src.query.wire_header_at_height(Height(h)).unwrap());
+            }
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+
+            // Official generate announces one header per mined tip.
+            for hdr in &hdrs {
+                handle_peer_frame(
+                    frame_for(NetworkMessage::Headers(vec![*hdr])),
+                    &hub,
+                    &out_tx,
+                    &mut wants_headers,
+                    &mut wtxid,
+                    &mut send_cmpct,
+                    &mut cmpct_ver,
+                    &mut pending_headers,
+                    &mut pending_blocks,
+                    &mut pending_cmpct,
+                    &mut from_peer,
+                    &mut requested,
+                    &mut ban,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            while out_rx.try_recv().is_ok() {}
+            let last = hdrs[13].block_hash();
+            assert_eq!(
+                announced_headers_height(&hub, &pending_headers, last),
+                14,
+                "14 one-header announces must report Core ignore height=14"
+            );
+            assert_eq!(hub.tip_height(), Some(0));
+            assert_eq!(
+                hub.chaintips()
+                    .iter()
+                    .filter(|t| t.status != "active")
+                    .count(),
+                0,
+                "non-noban must not store a low-work headers tree"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(dir2);
+        });
+    }
+
+    #[test]
+    fn blocksonly_tx_and_inv_raise_ban() {
+        // p2p_blocksonly: relay off → P2P tx / wtx inv is a protocol violation.
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use std::sync::Arc;
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::consensus::encode::serialize;
+            use bitcoin::p2p::message::RawNetworkMessage;
+            use bitcoin::Network;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        let dummy_tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-tx");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+            assert!(reject_unsolicited_tx(&hub, None));
+
+            let (out_tx, _out_rx) = mpsc::unbounded_channel();
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut requested = HashSet::new();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(dummy_tx)),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                ban >= BAN_SCORE_THRESHOLD,
+                "blocksonly tx must disconnect, ban={ban}"
+            );
+
+            ban = 0;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::WTx(
+                    bitcoin::Wtxid::from_byte_array([
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ]),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                ban >= BAN_SCORE_THRESHOLD,
+                "blocksonly wtx inv must disconnect, ban={ban}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// `p2p_blocksonly.py:48`: RPC sendraw while relay is off must INV an
+    /// inbound peer (`request_all_tx_inv` + `queue_due_tx_invs`) and serve
+    /// the subsequent GetData WTx. Announce-at-accept is too early — the
+    /// unbroadcast set is only written after `accept_tx` returns.
+    #[test]
+    fn blocksonly_sendraw_invs_unbroadcast_to_inbound() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-sendraw");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let mp = hub.mempool().unwrap();
+            mp.accept_tx(&tx).expect("testmempoolaccept dry-run");
+            assert_eq!(
+                mp.remove_for_block(&[tx.compute_txid()]),
+                0,
+                "remove_for_block is a no-op while relay is off"
+            );
+            assert_eq!(mp.live_count(), 1);
+            assert_eq!(mp.evict_live_txids(&[tx.compute_txid()]), 1);
+            assert_eq!(mp.live_count(), 0);
+
+            let mut ann_rx = mp.subscribe_announces();
+            mp.accept_tx(&tx).expect("sendraw accept");
+            let announced = ann_rx.try_recv().expect("accept publishes announce");
+            assert_eq!(announced.txid, tx.compute_txid());
+            assert!(
+                !mp.is_unbroadcast(&tx.compute_txid()),
+                "unbroadcast is noted only after accept_tx returns (sendraw)"
+            );
+            // Session announce handler would skip: relay off and not unbroadcast.
+            assert!(!mp.relay_enabled());
+
+            mp.note_unbroadcast(tx.compute_txid());
+            assert!(mp.is_unbroadcast(&tx.compute_txid()));
+
+            // Immediate INV of unbroadcast — no request_all_tx_inv / 30s gate.
+            let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound_imm =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            inbound_imm.attach_out(probe_tx.clone());
+            flush_tx_invs(&hub, peers.as_ref());
+            match probe_rx
+                .try_recv()
+                .expect("unbroadcast INV without clock_due")
+            {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let block_relay = peers.register(
+                addr,
+                addr,
+                &ver,
+                false,
+                crate::peers::PeerConnType::BlockRelay,
+            );
+
+            peers.request_all_tx_inv();
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            match out_rx.try_recv().expect("inbound must get wtx INV") {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+            queue_due_tx_invs(&hub, block_relay.as_ref(), &HashMap::new(), &out_tx);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "block-relay-only must not get tx INV"
+            );
+
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    tx.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(inbound.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().expect("getdata must serve tx") {
+                NetworkMessage::Tx(got) => assert_eq!(got.compute_wtxid(), tx.compute_wtxid()),
+                other => panic!("expected Tx, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// When relay is on, unbroadcast must not skip the inbound 30s INV gate
+    /// (`mempool_reorg.py:71`).
+    #[test]
+    fn relay_on_unbroadcast_keeps_inbound_age_gate() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("relay-on-unb");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let mp = hub.mempool().unwrap();
+            mp.accept_tx(&tx).expect("accept");
+            mp.note_unbroadcast(tx.compute_txid());
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "relay-on inbound must wait 30s even for unbroadcast"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// `mempool_reorg.py:122`: after mocktime +300 announces older txs,
+    /// a brand-new sendraw must not be INV'd or GetData-served to inbound
+    /// (relay on, no noban). Drive shipped `queue_due_tx_invs` / GetData-WTx.
+    #[test]
+    fn mocktime_jump_does_not_inv_or_serve_new_sendraw() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+        fn spend_cb(cb: bitcoin::Txid) -> Transaction {
+            Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("reorg-122");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(105, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = |h: u32| {
+                hub.query
+                    .reconstruct_block_at_height(Height(h))
+                    .unwrap()
+                    .txdata[0]
+                    .compute_txid()
+            };
+            let old_a = spend_cb(cb(1));
+            let old_b = spend_cb(cb(2));
+            let disconnected = spend_cb(cb(3));
+            let fresh = spend_cb(cb(4));
+
+            let t0 = 1_700_000_000u64;
+            let peers = crate::peers::PeerHub::new();
+            peers.set_mock_now(t0);
+            hub.mempool().unwrap().note_mock_now(t0);
+            hub.mempool().unwrap().accept_tx(&old_a).expect("old_a");
+            hub.mempool().unwrap().accept_tx(&old_b).expect("old_b");
+            assert_eq!(
+                hub.mempool()
+                    .unwrap()
+                    .reorg_reaccept(std::slice::from_ref(&disconnected)),
+                1
+            );
+
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            assert!(inbound.inbound);
+            assert!(!peers.is_noban());
+
+            // Mocktime +300: older txs are age-due; flush them.
+            peers.set_mock_now(t0 + 300);
+            hub.mempool().unwrap().note_mock_now(t0 + 300);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            inbound.request_tx_inv();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            let mut announced = 0u32;
+            while let Ok(msg) = out_rx.try_recv() {
+                match msg {
+                    NetworkMessage::Inv(v) => {
+                        announced += v.len() as u32;
+                    }
+                    other => panic!("expected INV of aged txs, got {other:?}"),
+                }
+            }
+            assert_eq!(announced, 3, "three aged txs must INV after +300");
+
+            // Brand-new sendraw (unbroadcast, relay on).
+            hub.mempool()
+                .unwrap()
+                .accept_tx(&fresh)
+                .expect("fresh sendraw");
+            hub.mempool()
+                .unwrap()
+                .note_unbroadcast(fresh.compute_txid());
+
+            // Leftover request_tx_inv / inv_flush after the new accept must
+            // not INV the fresh tx to inbound.
+            inbound.request_tx_inv();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "new sendraw must not INV inbound after mocktime jump"
+            );
+
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    fresh.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(inbound.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().expect("GetData must reply") {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(fresh.compute_wtxid())]);
+                }
+                other => panic!("fresh sendraw GetData must notfound, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// `p2p_blocksonly.py:74`: whitelist-relay peer's tx is accepted while
+    /// `-blocksonly` and INV'd to the other inbound peer.
+    #[test]
+    fn blocksonly_relay_perm_tx_invs_other_inbound() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("blocksonly-relay-perm");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(false);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+
+            let peers = crate::peers::PeerHub::new();
+            peers.set_relay_perm(true);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let first = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let second =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let (inv_tx, mut inv_rx) = mpsc::unbounded_channel();
+            first.attach_out(out_tx.clone());
+            second.attach_out(inv_tx);
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_first = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(tx.clone())),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_first,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(first.as_ref()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ban, 0, "whitelist relay must not disconnect");
+            assert!(hub.mempool().unwrap().is_unbroadcast(&tx.compute_txid()));
+            assert!(from_first.contains_key(&tx.compute_txid()));
+            match inv_rx
+                .try_recv()
+                .expect("second inbound must get wtx INV from flush_tx_invs")
+            {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
+            let _ = out_rx.try_recv();
+            let _ = std::fs::remove_dir_all(dir);
         });
     }
 
@@ -2719,7 +3804,7 @@ mod tests {
             let mut from_peer = HashMap::new();
             let mut ban = 0u32;
 
-            // SendHeaders / SendCmpct / WtxidRelay / Pong / MemPool / GetAddr / Ping
+            // SendHeaders / SendCmpct / WtxidRelay / SendAddrV2 / Pong / MemPool / GetAddr / Ping
             for msg in [
                 NetworkMessage::SendHeaders,
                 NetworkMessage::SendCmpct(SendCmpct {
@@ -2727,6 +3812,7 @@ mod tests {
                     version: 2,
                 }),
                 NetworkMessage::WtxidRelay,
+                NetworkMessage::SendAddrV2,
                 NetworkMessage::Pong(7),
                 NetworkMessage::MemPool,
                 NetworkMessage::GetAddr,

@@ -20,7 +20,7 @@ pub use cache::BlockCache;
 pub use chain::{
     accept_block_header_nodos_log, headers_download_timeout_secs, headers_timeout_disconnect_log,
     headers_timeout_noban_log, ignoring_low_work_chain_log, initial_getheaders_log, log_update_tip,
-    AcceptOutcome, ChainHub, ChainTipInfo, TipEvent,
+    synchronizing_blockheaders_log, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent,
 };
 pub use codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH};
 pub use error::NetError;
@@ -31,7 +31,7 @@ pub use most_work::{
     first_best_ancestor, lca_on_best_chain, path_hashes_from_ancestor, select_most_work, sum_work,
     sum_work_for_hashes, work_better, InvalidHashSet, SelectOutcome, WorkCandidate,
 };
-pub use peer::local_service_flags;
+pub use peer::{flush_tx_invs, local_service_flags};
 pub use peer_dos::{
     inbound_semaphore, PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC, DEFAULT_MAX_INBOUND,
     DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,

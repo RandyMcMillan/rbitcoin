@@ -1015,6 +1015,7 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
         "bytesrecv_per_msg": recv,
         "bytessent_per_msg": sent,
         "connection_type": p.conn_type.as_str(),
+        "relaytxes": p.relay && !matches!(p.conn_type, rbitcoin_net::PeerConnType::BlockRelay),
         "transport_protocol_type": "v2",
         "network": "ipv4",
         "synced_headers": -1,
@@ -1024,6 +1025,7 @@ fn peerinfo_json(p: rbitcoin_net::PeerInfo) -> Value {
         "last_block": p.last_block,
         "last_transaction": p.last_transaction,
         "minfeefilter": sat_kvb_to_btc(p.minfeefilter_sat_kvb),
+        "permissions": p.permissions,
     });
     if let Some(v) = p.pingtime {
         row["pingtime"] = json!(v);
@@ -1150,7 +1152,7 @@ fn getnetworkinfo(ctx: &RpcContext) -> Value {
         "protocolversion": 70016,
         "localservices": format!("{svc_bits:016x}"),
         "localservicesnames": services_names(svc_bits),
-        "localrelay": true,
+        "localrelay": ctx.mempool.as_ref().is_none_or(|m| m.relay_enabled()),
         "timeoffset": 0,
         "networkactive": true,
         "connections": cin + cout,
@@ -1366,18 +1368,28 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         .mempool
         .as_ref()
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    if !mp.relay_enabled() {
-        return Err(rpc_error(
-            ERR_MISC,
-            "mempool relay disabled (still in IBD or tip not ready)",
-        ));
-    }
+    // `-blocksonly` leaves P2P relay off but RPC still accepts
+    // (`p2p_blocksonly.py` sendrawtransaction).
     match mp.accept_tx(&tx) {
         Ok(r) => {
             mp.note_unbroadcast(r.txid);
+            // `-blocksonly`: accept-time announce is skipped (relay off + not
+            // yet unbroadcast). Re-announce after noting so inbound peers INV
+            // (`p2p_blocksonly.py:48`). When relay is on, leave the 30s inbound
+            // age gate alone (`mempool_reorg` / `mempool_unbroadcast`).
+            if !mp.relay_enabled() {
+                mp.rebroadcast_unbroadcast();
+                mp.notify_inv_flush();
+                if let (Some(peers), Some(chain)) = (ctx.peers.as_ref(), ctx.chain.as_ref()) {
+                    rbitcoin_net::flush_tx_invs(chain, peers);
+                } else if let Some(peers) = ctx.peers.as_ref() {
+                    peers.request_all_tx_inv();
+                }
+            }
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
-        // Core sendraw of a live mempool tx is a no-op success (returns txid).
+        // Core sendraw of a live mempool tx is a no-op success (returns txid)
+        // and must not re-enter the unbroadcast set (`mempool_unbroadcast.py:93`).
         Err(e) if e.to_string().starts_with("duplicate ") => {
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
@@ -1479,7 +1491,11 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         // mutating — use accept and if ok, remove_for_block to roll back.
         match mp.accept_tx(&tx) {
             Ok(r) => {
-                let _ = mp.remove_for_block(&[tx.compute_txid()]);
+                // `remove_for_block` is a no-op while relay is off (IBD /
+                // `-blocksonly`). Dry-run must still roll back or sendraw
+                // becomes a duplicate and never notes unbroadcast
+                // (`p2p_blocksonly.py:48`).
+                let _ = mp.evict_live_txids(&[tx.compute_txid()]);
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,
@@ -3290,6 +3306,26 @@ mod tests {
         assert!(sub.ends_with("(testnode0)/"), "{sub}");
         let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
         assert_eq!(mem["loaded"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getnetworkinfo_localrelay_follows_mempool_relay() {
+        // `p2p_blocksonly.py`: `-blocksonly` leaves relay off → localrelay false.
+        let (ctx, dir) = ctx_empty();
+        ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+        let off = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        assert_eq!(off["localrelay"], false, "{off}");
+        ctx.mempool.as_ref().unwrap().set_relay_enabled(true);
+        let on = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+        assert_eq!(on["localrelay"], true, "{on}");
+        ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+        let e = dispatch(&ctx, "sendrawtransaction", vec![json!("00")]).unwrap_err();
+        let msg = e["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("relay disabled"),
+            "RPC sendraw must accept while -blocksonly, got {e}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5279,6 +5315,11 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["subver"], "/rbitcoin:0.1.0(testnode0)/");
         assert_eq!(arr[0]["inbound"], false);
+        assert_eq!(arr[0]["relaytxes"], true);
+        assert_eq!(arr[0]["permissions"], json!([]));
+        hub.set_relay_perm(true);
+        let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+        assert_eq!(r.as_array().unwrap()[0]["permissions"], json!(["relay"]));
         assert_eq!(arr[0]["addr"], "127.0.0.1:18444");
         assert_eq!(arr[0]["last_block"], 0);
         assert_eq!(arr[0]["last_transaction"], 0);

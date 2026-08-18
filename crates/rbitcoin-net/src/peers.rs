@@ -1,6 +1,7 @@
 //! Live P2P session table for RPC (`getpeerinfo` / `addnode` / `disconnectnode`).
 
 use crate::error::NetError;
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Wtxid};
@@ -64,6 +65,8 @@ pub struct LivePeer {
     pub services: u64,
     pub startingheight: i32,
     pub conn_type: PeerConnType,
+    /// Their `version.relay`. False or `block-relay-only` → `relaytxes=false`.
+    pub relay: bool,
     pub stop: AtomicBool,
     /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
     pub hb_to: AtomicBool,
@@ -114,6 +117,8 @@ pub struct LivePeer {
     /// Compact hashes whose first `blocktxn` reconstruct already failed
     /// (`p2p_compactblocks` `test_multiple_blocktxn_response`).
     failed_cmpct: Mutex<HashSet<BlockHash>>,
+    /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
+    out_tx: Mutex<Option<mpsc::UnboundedSender<NetworkMessage>>>,
 }
 
 impl LivePeer {
@@ -319,6 +324,17 @@ impl LivePeer {
         self.ping_queued.store(true, Ordering::Relaxed);
     }
 
+    pub fn attach_out(&self, tx: mpsc::UnboundedSender<NetworkMessage>) {
+        *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub fn writer(&self) -> Option<mpsc::UnboundedSender<NetworkMessage>> {
+        self.out_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn note_last_block(&self) {
         self.last_block.store(self.clock_now(), Ordering::Relaxed);
     }
@@ -447,6 +463,7 @@ impl LivePeer {
             bytesrecv_per_msg: self.recv.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             bytessent_per_msg: self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             conn_type: self.conn_type,
+            relay: self.relay,
             bip152_hb_to: self.hb_to.load(Ordering::Relaxed),
             bip152_hb_from: self.hb_from.load(Ordering::Relaxed),
             pingtime,
@@ -455,6 +472,18 @@ impl LivePeer {
             last_block: self.last_block.load(Ordering::Relaxed),
             last_transaction: self.last_transaction.load(Ordering::Relaxed),
             minfeefilter_sat_kvb: self.minfeefilter_sat_kvb.load(Ordering::Relaxed),
+            permissions: {
+                let mut p = Vec::new();
+                if let Some(h) = self.owner.upgrade() {
+                    if h.is_noban() {
+                        p.push("noban".into());
+                    }
+                    if h.is_relay_perm() {
+                        p.push("relay".into());
+                    }
+                }
+                p
+            },
         }
     }
 }
@@ -502,6 +531,7 @@ pub struct PeerInfo {
     pub bytesrecv_per_msg: HashMap<String, u64>,
     pub bytessent_per_msg: HashMap<String, u64>,
     pub conn_type: PeerConnType,
+    pub relay: bool,
     pub bip152_hb_to: bool,
     pub bip152_hb_from: bool,
     pub pingtime: Option<f64>,
@@ -513,6 +543,8 @@ pub struct PeerInfo {
     pub last_transaction: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,
+    /// Core whitelist permission strings (`relay`, `noban`, …).
+    pub permissions: Vec<String>,
 }
 
 /// Thread-safe session table + addnode remembered addrs.
@@ -531,6 +563,8 @@ pub struct PeerHub {
     last_inv_headers_sync: Mutex<Option<BlockHash>>,
     /// Core whitelist `noban` — do not disconnect a stalling headers-sync peer.
     noban: AtomicBool,
+    /// Core whitelist `relay` — accept txs even when the node is `-blocksonly`.
+    relay_perm: AtomicBool,
     /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
     cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
 }
@@ -547,6 +581,7 @@ impl PeerHub {
             n_sync_started: AtomicU64::new(0),
             last_inv_headers_sync: Mutex::new(None),
             noban: AtomicBool::new(false),
+            relay_perm: AtomicBool::new(false),
             cmpct_fills: Mutex::new(HashMap::new()),
         })
     }
@@ -580,6 +615,20 @@ impl PeerHub {
         self.noban.store(v, Ordering::Relaxed);
     }
 
+    /// Core whitelist `noban` — bypass low-work header anti-DoS.
+    pub fn is_noban(&self) -> bool {
+        self.noban.load(Ordering::Relaxed)
+    }
+
+    pub fn set_relay_perm(&self, v: bool) {
+        self.relay_perm.store(v, Ordering::Relaxed);
+    }
+
+    /// Core whitelist `relay` — P2P txs allowed while `-blocksonly`.
+    pub fn is_relay_perm(&self) -> bool {
+        self.relay_perm.load(Ordering::Relaxed)
+    }
+
     fn is_preferred_download(p: &LivePeer) -> bool {
         matches!(
             p.conn_type,
@@ -596,11 +645,20 @@ impl PeerHub {
             return false;
         }
         let caught_up = now.saturating_sub(best_header_time) < 24 * 3600;
-        if !caught_up && self.n_sync_started.load(Ordering::Relaxed) != 0 {
-            return false;
+        if !caught_up {
+            // Two sessions can observe 0 after a noban timeout; only one
+            // extra getheaders (`p2p_initial_headers_sync` count==1).
+            if self
+                .n_sync_started
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+        } else {
+            self.n_sync_started.fetch_add(1, Ordering::Relaxed);
         }
         peer.sync_started.store(true, Ordering::Relaxed);
-        self.n_sync_started.fetch_add(1, Ordering::Relaxed);
         let timeout = crate::chain::headers_download_timeout_secs(now, best_header_time);
         peer.headers_sync_timeout.store(timeout, Ordering::Relaxed);
         true
@@ -660,6 +718,9 @@ impl PeerHub {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
                 p.sync_started.store(false, Ordering::Relaxed);
                 p.headers_sync_timeout.store(0, Ordering::Relaxed);
+                // In-flight getheaders timed out; allow a new one
+                // (`p2p_initial_headers_sync` noban recipient).
+                let _ = p.take_awaiting_headers();
                 self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
             } else {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_disconnect_log(p.id));
@@ -677,6 +738,14 @@ impl PeerHub {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// Ask every live session to flush due tx INVs (`p2p_blocksonly` RPC relay).
+    pub fn request_all_tx_inv(&self) {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        for p in g.values() {
+            p.request_tx_inv();
+        }
     }
 
     pub fn set_mock_now(&self, ts: u64) {
@@ -719,6 +788,7 @@ impl PeerHub {
             services,
             startingheight: ver.start_height,
             conn_type,
+            relay: ver.relay,
             stop: AtomicBool::new(false),
             hb_to: AtomicBool::new(false),
             hb_from: AtomicBool::new(false),
@@ -748,6 +818,7 @@ impl PeerHub {
             wire_recv: Mutex::new(None),
             wire_sent: Mutex::new(None),
             failed_cmpct: Mutex::new(HashSet::new()),
+            out_tx: Mutex::new(None),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);
@@ -769,6 +840,11 @@ impl PeerHub {
         if let Some(p) = removed {
             self.end_headers_sync(&p);
         }
+    }
+
+    pub fn live_peers(&self) -> Vec<Arc<LivePeer>> {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        g.values().cloned().collect()
     }
 
     pub fn snapshot(&self) -> Vec<PeerInfo> {
@@ -1043,6 +1119,41 @@ mod tests {
         assert!(!p1.is_sync_started());
         // After the sync peer leaves, another inbound may start.
         assert!(hub.try_start_headers_sync(&p2, now, 1_231_006_505));
+    }
+
+    #[test]
+    fn noban_headers_timeout_clears_awaiting_so_a_new_getheaders_can_send() {
+        let hub = PeerHub::new();
+        hub.set_noban(true);
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let _outbound = hub.register(
+            b,
+            b,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        let now = 1_700_000_000u64;
+        let best = 1_231_006_505u64;
+        assert!(hub.try_start_headers_sync(&inbound, now, best));
+        inbound.note_awaiting_headers();
+        assert!(inbound.is_awaiting_headers());
+        let deadline = crate::chain::headers_download_timeout_secs(now, best);
+        hub.set_mock_now(deadline + 1);
+        assert!(
+            !inbound.is_sync_started(),
+            "noban timeout must end the stalling sync"
+        );
+        assert!(
+            !inbound.is_awaiting_headers(),
+            "in-flight getheaders must be released so a replacement can send"
+        );
+        assert!(
+            hub.try_start_headers_sync(&inbound, deadline + 1, best),
+            "after timeout another getheaders start must be allowed"
+        );
     }
 
     #[test]

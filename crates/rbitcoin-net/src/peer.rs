@@ -1257,6 +1257,14 @@ async fn handle_peer_frame(
             if hub.is_block_invalid(&hash) {
                 return Ok(());
             }
+            if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
+                && !hub.knows_header(&hsi.header.prev_blockhash)
+            {
+                // Better-work compact of a long fork announces only the
+                // tip (`mempool_reorg` 20-block submitblock). Ask for the
+                // header path before reconstruct.
+                let _ = queue_getheaders(out_tx, hub, session, true);
+            }
             pending_headers.entry(hash).or_insert(hsi.header);
             if !any_header_path_meets_minwork(hub, pending_headers, hash) {
                 // Below -minimumchainwork: keep header, do not reconstruct/accept.
@@ -1291,13 +1299,18 @@ async fn handle_peer_frame(
                     }
                 } else if hub.has_block(&hash) {
                 } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
-                    if matches!(
+                    let accepted = matches!(
                         hub.accept_received_block(block),
                         Ok(AcceptOutcome::Accepted { .. })
-                    ) {
+                    );
+                    if accepted {
                         if let Some(s) = session {
                             s.maybe_select_as_hb();
                         }
+                    } else if !hub.knows_header(&hsi.header.prev_blockhash) {
+                        // Filled a better-work compact whose parent bodies
+                        // we lack (`mempool_reorg` 20-block submitblock).
+                        let _ = queue_getheaders(out_tx, hub, session, true);
                     }
                     drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {

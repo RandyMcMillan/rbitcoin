@@ -451,6 +451,7 @@ mod tests {
         };
         let wire = ResolvedWire {
             block: Arc::new(block),
+            pres: Arc::from(Vec::new()),
         };
         let intake = q.block_queue_wave_intake(&[7, 8]);
         assert_eq!(intake.raw.len(), 2);

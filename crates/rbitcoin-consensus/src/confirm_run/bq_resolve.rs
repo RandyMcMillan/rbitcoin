@@ -6,8 +6,10 @@
 
 use super::*;
 use bitcoin::consensus::Decodable;
+use rbitcoin_query::{ResolvedWire, TxPrecompute};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
 /// Hard cap on BQ heights in one TipOnly wave (~1 week of 10-minute blocks).
 ///
@@ -81,13 +83,15 @@ pub struct BqResolveWaveStats {
 }
 
 /// Collect unique external prev_txids (+ pre-BIP34 create txids) from a wire block.
-fn collect_resolve_keys(params: &ChainParams, height: u32, block: &Block) -> Vec<[u8; 32]> {
-    let mut same_block: HashSet<[u8; 32]> = HashSet::with_capacity(block.txdata.len());
-    for tx in &block.txdata {
-        same_block.insert(tx.compute_txid().to_byte_array());
-    }
+fn collect_resolve_keys(
+    params: &ChainParams,
+    height: u32,
+    block: &Block,
+    pres: &[TxPrecompute],
+) -> Vec<[u8; 32]> {
+    let same_block: HashSet<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
     let mut need: Vec<[u8; 32]> = Vec::new();
-    for tx in &block.txdata {
+    for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
             if inp.previous_output.is_null() {
                 continue;
@@ -99,12 +103,20 @@ fn collect_resolve_keys(params: &ChainParams, height: u32, block: &Block) -> Vec
             need.push(prev);
         }
         if !params.bip34_active_at(height) {
-            need.push(tx.compute_txid().to_byte_array());
+            need.push(p.txid);
         }
     }
     need.sort_unstable();
     need.dedup();
     need
+}
+
+fn decoded_charge(payload_len: u64, n_tx: usize) -> u64 {
+    let approx = payload_len
+        .saturating_add(256)
+        .saturating_add((n_tx as u64).saturating_mul(256))
+        .saturating_add((n_tx as u64).saturating_mul(std::mem::size_of::<TxPrecompute>() as u64));
+    payload_len.max(approx)
 }
 
 fn decode_bq_block(payload: &[u8]) -> Option<Block> {
@@ -144,18 +156,45 @@ pub fn confirm_bq_resolve_wave_with_ids(
     let mut per_height: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
     let mut all_keys: HashSet<[u8; 32]> = HashSet::new();
     let mut sum_inputs = 0u32;
+    let mut promote: Vec<(u32, ResolvedWire, u64)> = Vec::new();
+
+    let intake = query.block_queue_wave_intake(heights);
+    let mut by_h: HashMap<u32, (Option<Vec<u8>>, Option<ResolvedWire>)> = HashMap::new();
+    for (h, payload) in intake.raw {
+        by_h.entry(h).or_default().0 = Some(payload);
+    }
+    for (h, wire) in intake.resolved {
+        by_h.entry(h).or_default().1 = Some(wire);
+    }
 
     for &h in heights {
-        if query.block_queue_is_resolve_complete(h) {
-            continue;
-        }
-        let Some(payload) = query.block_queue_payload(h).map_err(ConsensusError::from)? else {
+        let Some(slot) = by_h.remove(&h) else {
             continue;
         };
-        let Some(block) = decode_bq_block(&payload) else {
-            continue;
+        let (block, pres) = if let Some(wire) = slot.1 {
+            (Arc::clone(&wire.block), Arc::clone(&wire.pres))
+        } else {
+            let Some(payload) = slot.0 else {
+                continue;
+            };
+            let Some(block) = decode_bq_block(&payload) else {
+                continue;
+            };
+            let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+            let charge = decoded_charge(payload.len() as u64, pres.len());
+            let pres = Arc::<[TxPrecompute]>::from(pres);
+            let block = Arc::new(block);
+            promote.push((
+                h,
+                ResolvedWire {
+                    block: Arc::clone(&block),
+                    pres: Arc::clone(&pres),
+                },
+                charge,
+            ));
+            (block, pres)
         };
-        let need = collect_resolve_keys(params, h, &block);
+        let need = collect_resolve_keys(params, h, block.as_ref(), pres.as_ref());
         if all_keys.len().saturating_add(need.len()) > BQ_RESOLVE_WAVE_MAX_KEYS
             && !per_height.is_empty()
         {
@@ -179,6 +218,12 @@ pub fn confirm_bq_resolve_wave_with_ids(
         ) {
             break;
         }
+    }
+
+    if !promote.is_empty() {
+        query
+            .block_queue_promote_wave(promote)
+            .map_err(ConsensusError::from)?;
     }
 
     if let Some(&(first, _)) = per_height.first() {
@@ -251,12 +296,11 @@ pub fn confirm_bq_resolve_wave_with_ids(
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    for (h, _need) in &per_height {
-        query
-            .block_queue_mark_resolve_complete(*h)
-            .map_err(ConsensusError::from)?;
-        stats.heights = stats.heights.saturating_add(1);
-    }
+    let done: Vec<u32> = per_height.iter().map(|(h, _)| *h).collect();
+    query
+        .block_queue_mark_resolve_complete_wave(&done)
+        .map_err(ConsensusError::from)?;
+    stats.heights = done.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
     Ok(stats)
 }
@@ -439,6 +483,16 @@ mod tests {
             st.heights, 9,
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
         );
+        assert!(
+            q.block_queue_raw_payload(1).unwrap().is_none(),
+            "lookup must drop raw after first decode"
+        );
+        let w = q.block_queue_resolved(1).expect("promoted");
+        assert_eq!(w.pres.len(), w.block.txdata.len());
+        assert_eq!(
+            w.pres[0].txid,
+            w.block.txdata[0].compute_txid().to_byte_array()
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -500,6 +554,16 @@ mod tests {
         let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
         assert_eq!(st.heights, 0, "fat BQ must not mint a 1-block layer");
         assert!(!q.block_queue_is_resolve_complete(8));
+        assert!(
+            q.block_queue_raw_payload(8).unwrap().is_none(),
+            "first decode must drop raw even when the wave holds"
+        );
+        let held = q.block_queue_resolved(8).expect("promoted on hold");
+        assert_eq!(held.pres.len(), held.block.txdata.len());
+        assert_eq!(
+            held.pres[0].txid,
+            held.block.txdata[0].compute_txid().to_byte_array()
+        );
 
         let _ = q.block_queue_update_soft_pressure(None);
         let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();

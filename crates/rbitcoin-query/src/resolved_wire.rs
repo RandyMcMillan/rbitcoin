@@ -1,5 +1,6 @@
-//! Lookup-promoted body-queue wire (decoded `Block`; pres added with TxPrecompute).
+//! Lookup-promoted body-queue wire (decoded `Block` + [`TxPrecompute`]).
 
+use crate::TxPrecompute;
 use bitcoin::Block;
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct ResolvedWire {
     pub block: Arc<Block>,
+    pub pres: Arc<[TxPrecompute]>,
 }
 
 /// One mutex snapshot of unresolved heights: still-raw vs already promoted.

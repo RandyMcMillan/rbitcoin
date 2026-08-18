@@ -2210,8 +2210,7 @@ fn is_anyone_can_spend(script: &Script) -> bool {
     crate::script::is_anyone_can_spend(script)
 }
 
-mod tx_precompute;
-pub use tx_precompute::TxPrecompute;
+pub use rbitcoin_query::TxPrecompute;
 
 #[cfg(test)]
 mod bip34_tests;
@@ -2221,3 +2220,5 @@ mod finality_tests;
 mod sigop_cost_tests;
 #[cfg(test)]
 mod structure_rule_tests;
+#[cfg(test)]
+mod tx_precompute;

@@ -19,6 +19,7 @@ mod sh_builder;
 mod soft_densify;
 mod sp_tweaks;
 mod stamp;
+mod tx_precompute;
 mod wave_prevout;
 
 pub use combined_stage::{body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate};
@@ -28,6 +29,7 @@ pub use soft_densify::{
     soft_densify_band_hi, BQ_SOFT_CONFIRM_SECS, BQ_SOFT_FREE_BYTES,
 };
 pub use sp_tweaks::{ThinTweakRangeLimits, ThinTweakRow};
+pub use tx_precompute::TxPrecompute;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};

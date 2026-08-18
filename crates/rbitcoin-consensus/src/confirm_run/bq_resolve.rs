@@ -900,7 +900,7 @@ mod tests {
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
-        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped =
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
                 .expect("in-flight parent must stamp until tip covers the parent height");
@@ -994,7 +994,7 @@ mod tests {
             parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
-        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped =
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
                 .expect("in-flight parent must stamp while confirmed tip leads the fence");
@@ -1029,7 +1029,7 @@ mod tests {
             1,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
         );
-        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("leftover connected parent must TipOnly-head, not invariant");
         let plan = stamped.plan.expect("new body needs a plan");
@@ -1113,7 +1113,7 @@ mod tests {
             .unwrap();
         confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
         assert!(!q.block_queue_has_height(1));
-        let items = [(Height(1), std::sync::Arc::new(b1))];
+        let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("coinbase-only block needs no external head");
         let mat = crate::confirm_wire_load_from_plan(

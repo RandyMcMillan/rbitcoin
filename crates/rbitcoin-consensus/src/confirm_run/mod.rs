@@ -263,7 +263,7 @@ pub fn confirm_wire_load_phase_pipelined(
         let pres = crate::block::validate_block_structure_with_pres(
             block.as_ref(),
             &ctx,
-            stashed.as_ref().map(|w| w.pres.as_ref()),
+            stashed.as_ref().map(|w| std::sync::Arc::clone(&w.pres)),
         )?;
         let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
@@ -341,7 +341,7 @@ pub fn confirm_wire_load_phase_pipelined(
             header_rec,
             tx_fks: Vec::new(),
             txids,
-            pres: std::sync::Arc::from(pres),
+            pres,
         });
     }
 
@@ -507,9 +507,13 @@ pub fn confirm_wire_run_preverified(
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
-    let arcs: Vec<(Height, Arc<Block>)> = blocks
+    let arcs: Vec<(
+        Height,
+        Arc<Block>,
+        Option<Arc<[rbitcoin_query::TxPrecompute]>>,
+    )> = blocks
         .iter()
-        .map(|(h, b)| (*h, Arc::new(b.clone())))
+        .map(|(h, b)| (*h, Arc::new(b.clone()), None))
         .collect();
     let stamped = confirm_wire_lookup_stamp(query, params, milestone, &arcs, None)?;
     let mat = confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;

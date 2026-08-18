@@ -79,16 +79,17 @@ pub fn validate_block_structure_precomputed(
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<Vec<TxPrecompute>, ConsensusError> {
-    validate_block_structure_with_pres(block, ctx, None)
+    Ok(validate_block_structure_with_pres(block, ctx, None)?.to_vec())
 }
 
 /// Like [`validate_block_structure_precomputed`], reusing lookup-stashed pres
 /// when `pres` is `Some` (no second `from_tx`). Length must match `txdata`.
+/// Caller Arc is returned as-is (refcount only).
 pub fn validate_block_structure_with_pres(
     block: &Block,
     ctx: &ValidationContext<'_>,
-    pres: Option<&[TxPrecompute]>,
-) -> Result<Vec<TxPrecompute>, ConsensusError> {
+    pres: Option<Arc<[TxPrecompute]>>,
+) -> Result<Arc<[TxPrecompute]>, ConsensusError> {
     if block.txdata.is_empty() {
         return Err(ConsensusError::BadBlock("no transactions"));
     }
@@ -106,14 +107,14 @@ pub fn validate_block_structure_with_pres(
         if stashed.len() != n {
             return Err(ConsensusError::BadBlock("precompute count mismatch"));
         }
-        (stashed.to_vec(), 0)
+        (stashed, 0)
     } else {
         let t_txid = Instant::now();
         let v: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
-        (v, t_txid.elapsed().as_nanos() as u64)
+        (Arc::from(v), t_txid.elapsed().as_nanos() as u64)
     };
     let mut seen = std::collections::HashSet::with_capacity(n);
-    for p in &pres {
+    for p in pres.iter() {
         if !seen.insert(p.txid) {
             return Err(ConsensusError::BadBlock("duplicate txid"));
         }
@@ -167,7 +168,7 @@ pub fn validate_block_structure_with_pres(
         const WITNESS_SCALE: u64 = 4;
         const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
         let mut cost = 0u64;
-        for p in &pres {
+        for p in pres.iter() {
             cost = cost.saturating_add(p.sigops.saturating_mul(WITNESS_SCALE));
         }
         if cost > MAX_BLOCK_SIGOPS_COST {

@@ -1456,9 +1456,10 @@ pub(crate) fn spawn_confirm_engine(
                 let plan_items: Vec<(
                     rbitcoin_primitives::Height,
                     std::sync::Arc<bitcoin::Block>,
+                    Option<std::sync::Arc<[rbitcoin_query::TxPrecompute]>>,
                 )> = wire_batch
                     .iter()
-                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), Arc::clone(w)))
+                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), Arc::clone(w), None))
                     .collect();
                 confirm_thr_stats::add_load_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();

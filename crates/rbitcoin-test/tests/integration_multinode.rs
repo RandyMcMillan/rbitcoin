@@ -81,7 +81,9 @@ async fn two_node_header_and_block_sync() {
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
-/// (tier A — default + CI multinode).
+/// (default + CI multinode). `coverage.sh` skips this name so llvm-cov does not
+/// re-pay it. Not `#[ignore]`: the job invocation has no `--ignored` and the
+/// GitHub App cannot patch `ci.yml`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_after_restart_via_reconstruct() {
     let fut = async {
@@ -206,8 +208,8 @@ async fn ibd_two_peers() {
 }
 
 /// Multi-peer IBD: dead address + live seeder (dial book tries both).
+/// Slim (4 blocks) — default suite (~0.5s). `coverage.sh` skips this name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "dial-book dead peer; run via scripts/integration.sh"]
 async fn ibd_skips_dead_peer() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();

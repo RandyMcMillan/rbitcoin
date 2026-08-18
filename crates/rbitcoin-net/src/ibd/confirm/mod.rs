@@ -372,13 +372,13 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default lookup→load depth (`loadq`): one lookup-wave of prefetch (8×8000).
-pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
+/// Default lookup→load depth (`loadq`): prefetch of load-sized batches.
+pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 14;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
-pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
+pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 14;
 
 /// One load-sized run produced by lookup (decoded wire + pres, height-ordered).
 pub(crate) struct LoadBatch {
@@ -430,9 +430,9 @@ pub(crate) struct ConfirmQueueCaps {
 ///
 /// | Queue | Default |
 /// |-------|---------|
-/// | lookup→load (`loadq`) | **8** |
+/// | lookup→load (`loadq`) | **14** |
 /// | load→scripts (`scriptq`) | **4** |
-/// | scripts→write (`writeq`) | **20** |
+/// | scripts→write (`writeq`) | **14** |
 ///
 /// Env overrides removed (Q-04): change defaults in code if needed.
 #[inline]

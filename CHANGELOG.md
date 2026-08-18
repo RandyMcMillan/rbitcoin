@@ -18,7 +18,17 @@ before 1.0).
   `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
   label. Linux musl stays Nix; Darwin/Windows are native runners.
 
+### Changed
+
+- **Confirm queue caps:** `loadq=14` · `scriptq=4` · `writeq=14`
+  (was loadq=8 · writeq=20).
+
 ### Fixed
+
+- **Lookup walk after loadq take:** `block_queue_unresolved_heights`
+  starts after `lookup_taken_hi`. Taken BQ rows are not a fetch hole,
+  so lookup can fill loadq ahead of tip. A missing height *above*
+  that high-water still stops the walk.
 
 - **Windows / Darwin store smoke `--release` compile:** `take_raw_clone_n`
   and the raw-clone meter are `cfg(any(test, debug_assertions))`. Native

@@ -2134,7 +2134,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("loadq<0/8 scriptq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("loadq<0/14 scriptq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         // pin_residency slot always 0 (process pin FIFO removed); pin_plan_cache label retired.
         assert!(!line.contains("pin_res="), "{line}");
@@ -2452,7 +2452,7 @@ mod tests {
         assert!(!line.contains(" disk="), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
         assert!(
-            line.contains("loadq<0/8 scriptq<0/2 writeq=1/2") || line.contains("loadq="),
+            line.contains("loadq<0/14 scriptq<0/2 writeq=1/2") || line.contains("loadq="),
             "{line}"
         );
         assert!(line.contains("thru=200"), "{line}");
@@ -2574,7 +2574,7 @@ mod tests {
         assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
-        assert!(line.contains("loadq=3/8 blks=8 wire=2MiB"), "{line}");
+        assert!(line.contains("loadq=3/14 blks=8 wire=2MiB"), "{line}");
         assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
         assert!(
             line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"),

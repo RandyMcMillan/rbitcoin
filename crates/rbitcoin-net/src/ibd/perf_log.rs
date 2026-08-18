@@ -1262,7 +1262,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms stamp_head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
@@ -1272,6 +1272,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.lookup_decode_ms,
             s.lookup_precompute_ms,
             s.lookup_wave_head_ms,
+            s.plan_head_ms,
             s.plan_cold_io_ms,
         ));
     }

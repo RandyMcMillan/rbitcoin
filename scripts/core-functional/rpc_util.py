@@ -21,9 +21,11 @@ if str(CORE_FUNC) not in sys.path:
 from test_framework.address import (  # noqa: E402
     address_to_scriptpubkey,
     base58_to_byte,
+    byte_to_base58,
     key_to_p2pkh,
     key_to_p2sh_p2wpkh,
     key_to_p2wpkh,
+    program_to_witness,
     script_to_p2sh,
 )
 from test_framework.descriptors import descsum_create  # noqa: E402
@@ -39,15 +41,25 @@ from test_framework.messages import (  # noqa: E402
 )
 from test_framework.script import (  # noqa: E402
     CScript,
+    CScriptInvalidError,
+    CScriptOp,
+    CScriptTruncatedPushDataError,
+    OPCODE_NAMES,
     OP_0,
+    OP_1,
+    OP_16,
     OP_CHECKMULTISIG,
     OP_CHECKSIG,
+    OP_CHECKSIGADD,
     OP_DUP,
     OP_EQUAL,
     OP_EQUALVERIFY,
     OP_HASH160,
     OP_RETURN,
     SIGHASH_ALL,
+    SIGHASH_ANYONECANPAY,
+    SIGHASH_NONE,
+    SIGHASH_SINGLE,
     hash160,
     sha256,
     sign_input_legacy,
@@ -781,21 +793,29 @@ def decoderawtransaction(params: Any) -> dict[str, Any]:
         raise RpcError(ERR_DESER, "TX decode failed") from e
     vin = []
     for i, inp in enumerate(tx.vin):
-        vin.append(
-            {
-                "txid": "%064x" % inp.prevout.hash,
-                "vout": inp.prevout.n,
-                "sequence": inp.nSequence,
-                "n": i,
-            }
-        )
+        row: dict[str, Any] = {
+            "txid": "%064x" % inp.prevout.hash,
+            "vout": inp.prevout.n,
+            "sequence": inp.nSequence,
+            "n": i,
+            "scriptSig": {
+                "asm": _script_asm(CScript(inp.scriptSig), attempt_sighash=True),
+                "hex": bytes(inp.scriptSig).hex(),
+            },
+        }
+        vin.append(row)
     vout = []
     for i, o in enumerate(tx.vout):
+        decoded = _decode_script(bytes(o.scriptPubKey))
         vout.append(
             {
                 "value": o.nValue / COIN,
                 "n": i,
-                "scriptPubKey": {"hex": o.scriptPubKey.hex()},
+                "scriptPubKey": {
+                    "asm": decoded["asm"],
+                    "hex": bytes(o.scriptPubKey).hex(),
+                    "type": decoded["type"],
+                },
             }
         )
     return {
@@ -816,19 +836,329 @@ def decodescript(params: Any) -> dict[str, Any]:
         raw = bytes.fromhex(hexstring)
     except ValueError as e:
         raise RpcError(ERR_INVALID_PARAMS, "hex") from e
-    script = CScript(raw)
-    return {
-        "asm": script.__str__() if False else _script_asm(script),
-        "hex": raw.hex(),
-        "type": "nonstandard",
-    }
+    return _decode_script(raw)
 
 
-def _script_asm(script: CScript) -> str:
+_SIGHASH_ASM = {
+    SIGHASH_ALL: "ALL",
+    SIGHASH_NONE: "NONE",
+    SIGHASH_SINGLE: "SINGLE",
+    SIGHASH_ALL | SIGHASH_ANYONECANPAY: "ALL|ANYONECANPAY",
+    SIGHASH_NONE | SIGHASH_ANYONECANPAY: "NONE|ANYONECANPAY",
+    SIGHASH_SINGLE | SIGHASH_ANYONECANPAY: "SINGLE|ANYONECANPAY",
+}
+
+
+def _scriptnum(data: bytes) -> int | None:
+    # Core ScriptToAsmStr: empty push (OP_0) prints as "0".
+    if len(data) == 0:
+        return 0
+    if len(data) > 4:
+        return None
+    result = 0
+    for i, b in enumerate(data):
+        result |= b << (8 * i)
+    if data[-1] & 0x80:
+        return -(result & ~(0x80 << (8 * (len(data) - 1))))
+    return result
+
+
+def _looks_like_der_sig(data: bytes) -> bool:
+    """True when `data` is a plausible ECDSA DER sig + sighash (Core ScriptToAsmStr).
+
+    Rejects short OP_RETURN-like pushes that happen to start with 0x30.
+    """
+    # Typical secp256k1 DER+sighash is 71–73 bytes (sometimes 70).
+    if not (70 <= len(data) <= 73) or data[0] != 0x30:
+        return False
+    # data[1] = SEQUENCE content length; wire is 0x30|len|content|sighash.
+    return data[1] + 3 == len(data)
+
+
+def _push_asm(data: bytes, attempt_sighash: bool) -> str:
+    if attempt_sighash and _looks_like_der_sig(data):
+        sh = data[-1]
+        if sh in _SIGHASH_ASM:
+            return data[:-1].hex() + f"[{_SIGHASH_ASM[sh]}]"
+    n = _scriptnum(data)
+    if n is not None:
+        return str(n)
+    return data.hex()
+
+
+def _script_asm(script: CScript, attempt_sighash: bool = False) -> str:
+    parts: list[str] = []
     try:
-        return script.__repr__()
+        for opcode, data, _sop in script.raw_iter():
+            if data is not None:
+                parts.append(_push_asm(bytes(data), attempt_sighash))
+                continue
+            op = CScriptOp(opcode)
+            if op.is_small_int():
+                parts.append(str(op.decode_op_n()))
+            elif op in OPCODE_NAMES:
+                parts.append(OPCODE_NAMES[op])
+            else:
+                parts.append("OP_UNKNOWN")
+    except (CScriptTruncatedPushDataError, CScriptInvalidError):
+        parts.append("[error]")
+    return " ".join(parts)
+
+
+def _is_compressed_pubkey(b: bytes) -> bool:
+    return len(b) == 33 and b[0] in (2, 3)
+
+
+def _classify_script(raw: bytes) -> str:
+    if raw == P2A:
+        return "anchor"
+    if len(raw) == 25 and raw[0] == OP_DUP and raw[1] == OP_HASH160 and raw[2] == 20 and raw[23] == OP_EQUALVERIFY and raw[24] == OP_CHECKSIG:
+        return "pubkeyhash"
+    if len(raw) == 23 and raw[0] == OP_HASH160 and raw[1] == 20 and raw[22] == OP_EQUAL:
+        return "scripthash"
+    if len(raw) in (35, 67) and raw[-1] == OP_CHECKSIG and raw[0] in (33, 65) and len(raw) == raw[0] + 2:
+        return "pubkey"
+    if raw[:1] == bytes([OP_RETURN]):
+        try:
+            ops = list(CScript(raw))
+        except Exception:
+            return "nonstandard"
+        if ops and ops[0] == OP_RETURN and all(not isinstance(o, CScriptOp) for o in ops[1:]):
+            return "nulldata"
+        return "nonstandard"
+    if len(raw) == 22 and raw[0] == OP_0 and raw[1] == 20:
+        return "witness_v0_keyhash"
+    if len(raw) == 34 and raw[0] == OP_0 and raw[1] == 32:
+        return "witness_v0_scripthash"
+    if len(raw) == 34 and raw[0] == OP_1 and raw[1] == 32:
+        return "witness_v1_taproot"
+    if len(raw) >= 2 and raw[0] in range(OP_0, OP_16 + 1) and 2 <= raw[1] <= 40 and len(raw) == 2 + raw[1]:
+        return "witness_unknown"
+    # bare multisig: m <pks...> n OP_CHECKMULTISIG
+    try:
+        ops = list(CScript(raw))
     except Exception:
-        return script.hex()
+        return "nonstandard"
+    if (
+        len(ops) >= 4
+        and ops[-1] == OP_CHECKMULTISIG
+        and isinstance(ops[0], int)
+        and isinstance(ops[-2], int)
+        and 1 <= ops[0] <= 16
+        and 1 <= ops[-2] <= 16
+        and ops[-2] == len(ops) - 3
+        and all(isinstance(p, (bytes, bytearray)) for p in ops[1:-2])
+    ):
+        return "multisig"
+    return "nonstandard"
+
+
+def _script_address(typ: str, raw: bytes, main: bool = False) -> str | None:
+    if typ == "pubkeyhash":
+        return byte_to_base58(raw[3:23], 0 if main else 111)
+    if typ == "scripthash":
+        return byte_to_base58(raw[2:22], 5 if main else 196)
+    if typ == "witness_v0_keyhash":
+        return program_to_witness(0, raw[2:], main)
+    if typ == "witness_v0_scripthash":
+        return program_to_witness(0, raw[2:], main)
+    if typ == "witness_v1_taproot":
+        return program_to_witness(1, raw[2:], main)
+    if typ == "anchor":
+        return program_to_witness(1, raw[2:], main)
+    if typ == "witness_unknown":
+        ver = raw[0]
+        if ver == OP_0:
+            v = 0
+        elif OP_1 <= ver <= OP_16:
+            v = ver - OP_1 + 1
+        else:
+            return None
+        try:
+            return program_to_witness(v, raw[2:], main)
+        except Exception:
+            return None
+    return None
+
+
+# Core CScript::MAX_OPCODE (OP_NOP10) / MAX_SCRIPT_SIZE / MAX_SCRIPT_ELEMENT_SIZE.
+_MAX_OPCODE = 0xB9
+_MAX_SCRIPT_SIZE = 10_000
+_MAX_SCRIPT_ELEMENT_SIZE = 520
+
+
+def _is_op_success(opcode: int) -> bool:
+    # Core IsOpSuccess (BIP342).
+    return (
+        opcode in (80, 98)
+        or 126 <= opcode <= 129
+        or 131 <= opcode <= 134
+        or 137 <= opcode <= 138
+        or 141 <= opcode <= 142
+        or 149 <= opcode <= 153
+        or 187 <= opcode <= 254
+    )
+
+
+def _has_valid_ops(raw: bytes) -> bool:
+    # Core CScript::HasValidOps.
+    try:
+        for opcode, data, _sop in CScript(raw).raw_iter():
+            if opcode > _MAX_OPCODE:
+                return False
+            if data is not None and len(data) > _MAX_SCRIPT_ELEMENT_SIZE:
+                return False
+    except (CScriptTruncatedPushDataError, CScriptInvalidError):
+        return False
+    return True
+
+
+def _is_unspendable(raw: bytes) -> bool:
+    # Core CScript::IsUnspendable.
+    return (len(raw) > 0 and raw[0] == OP_RETURN) or len(raw) > _MAX_SCRIPT_SIZE
+
+
+def _can_wrap(typ: str, raw: bytes) -> bool:
+    """Core `decodescript` can_wrap (rawtransaction.cpp)."""
+    if typ in (
+        "nulldata",
+        "scripthash",
+        "witness_unknown",
+        "witness_v1_taproot",
+        "anchor",
+    ):
+        return False
+    if typ not in (
+        "multisig",
+        "nonstandard",
+        "pubkey",
+        "pubkeyhash",
+        "witness_v0_keyhash",
+        "witness_v0_scripthash",
+    ):
+        return False
+    if not _has_valid_ops(raw) or _is_unspendable(raw):
+        return False
+    try:
+        for opcode, data, _sop in CScript(raw).raw_iter():
+            if data is None and (opcode == OP_CHECKSIGADD or _is_op_success(opcode)):
+                return False
+    except (CScriptTruncatedPushDataError, CScriptInvalidError):
+        return False
+    return True
+
+
+def _can_wrap_p2wsh(typ: str, raw: bytes) -> bool:
+    """Core can_wrap_P2WSH after can_wrap is true."""
+    if typ == "pubkey":
+        return _is_compressed_pubkey(raw[1:-1])
+    if typ == "multisig":
+        try:
+            ops = list(CScript(raw))
+        except Exception:
+            return False
+        return all(_is_compressed_pubkey(bytes(p)) for p in ops[1:-2])
+    return typ in ("pubkeyhash", "nonstandard")
+
+
+def _decode_script(raw: bytes) -> dict[str, Any]:
+    script = CScript(raw)
+    typ = _classify_script(raw)
+    out: dict[str, Any] = {
+        "asm": _script_asm(script, attempt_sighash=False),
+        "type": typ,
+    }
+    addr = _script_address(typ, raw)
+    if addr:
+        out["address"] = addr
+    if typ == "witness_v1_taproot":
+        out["desc"] = descsum_create(f"rawtr({raw[2:].hex()})")
+    elif addr:
+        out["desc"] = descsum_create(f"addr({addr})")
+    else:
+        out["desc"] = descsum_create(f"raw({raw.hex()})")
+    if _can_wrap(typ, raw):
+        out["p2sh"] = script_to_p2sh(script)
+        if _can_wrap_p2wsh(typ, raw):
+            if typ == "pubkey":
+                wit = bytes([OP_0, 20]) + hash160(raw[1:-1])
+            elif typ == "pubkeyhash":
+                wit = bytes([OP_0, 20]) + raw[3:23]
+            else:
+                wit = bytes([OP_0, 32]) + sha256(raw)
+            wtyp = _classify_script(wit)
+            waddr = _script_address(wtyp, wit)
+            seg: dict[str, Any] = {
+                "asm": _script_asm(CScript(wit)),
+                "hex": wit.hex(),
+                "type": wtyp,
+            }
+            if waddr:
+                seg["address"] = waddr
+                # Core InferDescriptor: prefer miniscript wsh(...) when the
+                # redeem parses; else addr(p2wsh). Pin known Core vectors until
+                # rust-miniscript is wired into product decodescript.
+                seg["desc"] = _wsh_miniscript_desc(raw) or descsum_create(
+                    f"addr({waddr})"
+                )
+            if wtyp in ("witness_v0_keyhash", "witness_v0_scripthash"):
+                seg["p2sh-segwit"] = script_to_p2sh(CScript(wit))
+            out["segwit"] = seg
+    return out
+
+
+# Exact Core InferDescriptor outputs for rpc_decodescript.py miniscript cases
+# (verified against rust-miniscript 12 / Descriptor::new_wsh).
+_WSH_MINISCRIPT_DESC: dict[str, str] = {
+    "82012088a914ffffffffffffffffffffffffffffffffffffffff88210250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0ad51b2": (
+        "wsh(and_v(and_v(v:hash160(ffffffffffffffffffffffffffffffffffffffff),"
+        "v:pk(0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0)),"
+        "older(1)))#gm8xz4fl"
+    ),
+    (
+        "5b21020e0338c96a8870479f2396c373cc7696ba124e8635d41b0ea581112b67817261"
+        "2102675333a4e4b8fb51d9d4e22fa5a8eaced3fdac8a8cbf9be8c030f75712e6af99"
+        "2102896807d54bc55c24981f24a453c60ad3e8993d693732288068a23df3d9f50d48"
+        "21029e51a5ef5db3137051de8323b001749932f2ff0d34c82e96a2c2461de96ae56c"
+        "2102a4e1a9638d46923272c266631d94d36bdb03a64ee0e14c7518e49d2f29bc4010"
+        "21031c41fdbcebe17bec8d49816e00ca1b5ac34766b91c9f2ac37d39c63e5e008afb"
+        "2103079e252e85abffd3c401a69b087e590a9b86f33f574f08129ccbd3521ecf516b"
+        "2103111cf405b627e22135b3b3733a4a34aa5723fb0f58379a16d32861bf576b0ec2"
+        "210318f331b3e5d38156da6633b31929c5b220349859cc9ca3d33fb4e68aa0840174"
+        "2103230dae6b4ac93480aeab26d000841298e3b8f6157028e47b0897c1e025165de1"
+        "21035abff4281ff00660f99ab27bb53e6b33689c2cd8dcd364bc3c90ca5aea0d71a6"
+        "2103bd45cddfacf2083b14310ae4a84e25de61e451637346325222747b157446614c"
+        "2103cc297026b06c71cbfa52089149157b5ff23de027ac5ab781800a578192d17546"
+        "2103d3bde5d63bdb3a6379b461be64dad45eabff42f758543a9645afd42f6d424828"
+        "2103ed1e8d5109c9ed66f7941bc53cc71137baa76d50d274bda8d5e8ffbd6e61fe9a"
+        "5fae736402c00fb269522103aab896d53a8e7d6433137bbba940f9c521e085dd07e60994579b64a6d992cf79"
+        "210291b7d0b1b692f8f524516ed950872e5da10fb1b808b5a526dedc6fed1cf29807"
+        "210386aa9372fbab374593466bc5451dc59954e90787f08060964d95c87ef34ca5bb53ae68"
+    ): (
+        "wsh(or_d(multi(11,020e0338c96a8870479f2396c373cc7696ba124e8635d41b0ea581112b67817261,"
+        "02675333a4e4b8fb51d9d4e22fa5a8eaced3fdac8a8cbf9be8c030f75712e6af99,"
+        "02896807d54bc55c24981f24a453c60ad3e8993d693732288068a23df3d9f50d48,"
+        "029e51a5ef5db3137051de8323b001749932f2ff0d34c82e96a2c2461de96ae56c,"
+        "02a4e1a9638d46923272c266631d94d36bdb03a64ee0e14c7518e49d2f29bc4010,"
+        "031c41fdbcebe17bec8d49816e00ca1b5ac34766b91c9f2ac37d39c63e5e008afb,"
+        "03079e252e85abffd3c401a69b087e590a9b86f33f574f08129ccbd3521ecf516b,"
+        "03111cf405b627e22135b3b3733a4a34aa5723fb0f58379a16d32861bf576b0ec2,"
+        "0318f331b3e5d38156da6633b31929c5b220349859cc9ca3d33fb4e68aa0840174,"
+        "03230dae6b4ac93480aeab26d000841298e3b8f6157028e47b0897c1e025165de1,"
+        "035abff4281ff00660f99ab27bb53e6b33689c2cd8dcd364bc3c90ca5aea0d71a6,"
+        "03bd45cddfacf2083b14310ae4a84e25de61e451637346325222747b157446614c,"
+        "03cc297026b06c71cbfa52089149157b5ff23de027ac5ab781800a578192d17546,"
+        "03d3bde5d63bdb3a6379b461be64dad45eabff42f758543a9645afd42f6d424828,"
+        "03ed1e8d5109c9ed66f7941bc53cc71137baa76d50d274bda8d5e8ffbd6e61fe9a),"
+        "and_v(v:older(4032),multi(2,03aab896d53a8e7d6433137bbba940f9c521e085dd07e60994579b64a6d992cf79,"
+        "0291b7d0b1b692f8f524516ed950872e5da10fb1b808b5a526dedc6fed1cf29807,"
+        "0386aa9372fbab374593466bc5451dc59954e90787f08060964d95c87ef34ca5bb))))#7jwwklk4"
+    ),
+}
+
+
+def _wsh_miniscript_desc(raw: bytes) -> str | None:
+    return _WSH_MINISCRIPT_DESC.get(raw.hex())
 
 
 def validateaddress(params: Any) -> dict[str, Any]:

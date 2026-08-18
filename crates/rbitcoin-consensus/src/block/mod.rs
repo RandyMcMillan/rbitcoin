@@ -621,6 +621,7 @@ pub fn validate_block_connect(
         &block_hash,
         bip16_active,
         None,
+        None,
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
@@ -808,6 +809,8 @@ pub struct ScriptCheckJob {
     pub(crate) discourage_upgradable_witness: bool,
     /// SCRIPT_VERIFY_CONST_SCRIPTCODE: CODESEPARATOR + FindAndDelete hard-fail.
     pub(crate) const_scriptcode: bool,
+    /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
+    pub(crate) pre: std::sync::OnceLock<std::sync::Arc<rbitcoin_query::TxPrecompute>>,
 }
 
 impl ScriptCheckJob {
@@ -917,7 +920,29 @@ impl ScriptCheckJob {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            pre: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Confirm path: reuse structure/lookup pres (no job `from_tx`).
+    #[inline]
+    pub(crate) fn with_pre(self, pre: std::sync::Arc<rbitcoin_query::TxPrecompute>) -> Self {
+        let _ = self.pre.set(pre);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn pre_arc(&self) -> std::sync::Arc<rbitcoin_query::TxPrecompute> {
+        self.pre
+            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
+            .clone()
+    }
+
+    #[inline]
+    pub(crate) fn pre(&self) -> &rbitcoin_query::TxPrecompute {
+        self.pre
+            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
+            .as_ref()
     }
 
     /// BIP141/147: NULLDUMMY + WITNESS rules follow `segwit` (not CSV).
@@ -1015,6 +1040,7 @@ pub(crate) fn assemble_block_prevouts(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
+    pres: Option<&[rbitcoin_query::TxPrecompute]>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1043,6 +1069,7 @@ pub(crate) fn assemble_block_prevouts(
         block_hash,
         bip16_active,
         wire,
+        pres,
     )
 }
 
@@ -1061,6 +1088,7 @@ fn assemble_block_prevouts_mode(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
+    pres: Option<&[rbitcoin_query::TxPrecompute]>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1097,16 +1125,23 @@ fn assemble_block_prevouts_mode(
     );
     let _ = block_hash; // used in debug_assert; release keeps caller contract
     let bip16_for_jobs = bip16_active;
+    let flag_bip65 = ctx.params.bip65_active_at(ctx.height.0);
+    let flag_csv = ctx.params.csv_active_at(ctx.height.0);
+    let flag_bip66 = ctx.params.bip66_active_at(ctx.height.0);
+    let flag_taproot = ctx.params.taproot_active_at(ctx.height.0);
+    let flag_segwit = ctx.params.segwit_active_at(ctx.height.0);
 
     let n_tx = block.txdata.len();
-    let mut block_spends: std::collections::HashSet<OutPoint> =
-        std::collections::HashSet::with_capacity(n_tx.saturating_mul(2));
     let mut txid_index: TxidMap<usize> =
         TxidMap::with_capacity_and_hasher(n_tx, Default::default());
     for (i, id) in create_txids.iter().enumerate() {
         txid_index.insert(*id, i);
     }
     let mut acc = AsmPrevoutAcc::default();
+    let mut clk_prev = 0u64;
+    let mut clk_sig = 0u64;
+    let mut clk_fin = 0u64;
+    let mut clk_job = 0u64;
     let mut fees = 0i64;
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
@@ -1164,12 +1199,9 @@ fn assemble_block_prevouts_mode(
             let t_prev = Instant::now();
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
-                if !block_spends.insert(op) {
-                    return Err(ConsensusError::BadTx("double spend in block"));
-                }
                 let key = (op.txid.to_byte_array(), op.vout);
-                if pending_spent.contains(&key) {
-                    return Err(ConsensusError::PrevoutSpent);
+                if !pending_spent.insert(key) {
+                    return Err(ConsensusError::BadTx("double spend in block"));
                 }
                 // Same-block parent must appear *before* this tx. batch_thin
                 // stamps the whole block; using that edge accepts child-before-parent
@@ -1238,7 +1270,6 @@ fn assemble_block_prevouts_mode(
                         }
                     }
                 }
-                pending_spent.insert(key);
                 spends.push((
                     key.0,
                     key.1,
@@ -1253,8 +1284,7 @@ fn assemble_block_prevouts_mode(
                 }
                 prevouts.push(prev_out.txout);
             }
-            confirm_phase_stats::ASM_PREVOUT_NS
-                .fetch_add(t_prev.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            clk_prev = clk_prev.saturating_add(t_prev.elapsed().as_nanos() as u64);
 
             let t_sig = Instant::now();
             block_sigops_cost =
@@ -1262,8 +1292,7 @@ fn assemble_block_prevouts_mode(
             if block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
-            confirm_phase_stats::ASM_SIGOP_NS
-                .fetch_add(t_sig.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            clk_sig = clk_sig.saturating_add(t_sig.elapsed().as_nanos() as u64);
 
             let t_fin = Instant::now();
             // Full mode only: Optimistic defers BIP68 to structural. Reuse BIP113 MTP.
@@ -1292,8 +1321,7 @@ fn assemble_block_prevouts_mode(
                     return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
                 }
             }
-            confirm_phase_stats::ASM_FINAL_NS
-                .fetch_add(t_fin.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            clk_fin = clk_fin.saturating_add(t_fin.elapsed().as_nanos() as u64);
 
             let mut value_out = 0i64;
             for o in &tx.output {
@@ -1315,35 +1343,37 @@ fn assemble_block_prevouts_mode(
             if build_script_jobs {
                 let t_job = Instant::now();
                 // Reuse A1 wire txid — scripts stage must not re-hash for preverified.
-                let job = if let Some(w) = wire {
+                let mut job = if let Some(w) = wire {
                     ScriptCheckJob::with_shared_tx(
                         txid,
                         prevouts,
                         Arc::clone(w),
                         ti,
-                        ctx.params.bip65_active_at(ctx.height.0),
-                        ctx.params.csv_active_at(ctx.height.0),
-                        ctx.params.bip66_active_at(ctx.height.0),
+                        flag_bip65,
+                        flag_csv,
+                        flag_bip66,
                         bip16_for_jobs,
-                        ctx.params.taproot_active_at(ctx.height.0),
+                        flag_taproot,
                     )
-                    .with_segwit(ctx.params.segwit_active_at(ctx.height.0))
+                    .with_segwit(flag_segwit)
                 } else {
                     ScriptCheckJob::with_txid(
                         txid,
                         prevouts,
                         tx.clone(),
-                        ctx.params.bip65_active_at(ctx.height.0),
-                        ctx.params.csv_active_at(ctx.height.0),
-                        ctx.params.bip66_active_at(ctx.height.0),
+                        flag_bip65,
+                        flag_csv,
+                        flag_bip66,
                         bip16_for_jobs,
-                        ctx.params.taproot_active_at(ctx.height.0),
+                        flag_taproot,
                     )
-                    .with_segwit(ctx.params.segwit_active_at(ctx.height.0))
+                    .with_segwit(flag_segwit)
                 };
+                if let Some(p) = pres.and_then(|ps| ps.get(ti)) {
+                    job = job.with_pre(Arc::new(p.clone()));
+                }
                 script_jobs.push(job);
-                confirm_phase_stats::ASM_JOB_NS
-                    .fetch_add(t_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                clk_job = clk_job.saturating_add(t_job.elapsed().as_nanos() as u64);
             }
         }
 
@@ -1354,6 +1384,10 @@ fn assemble_block_prevouts_mode(
     }
 
     acc.flush();
+    confirm_phase_stats::ASM_PREVOUT_NS.fetch_add(clk_prev, Ordering::Relaxed);
+    confirm_phase_stats::ASM_SIGOP_NS.fetch_add(clk_sig, Ordering::Relaxed);
+    confirm_phase_stats::ASM_FINAL_NS.fetch_add(clk_fin, Ordering::Relaxed);
+    confirm_phase_stats::ASM_JOB_NS.fetch_add(clk_job, Ordering::Relaxed);
     Ok((script_jobs, spends, fees))
 }
 

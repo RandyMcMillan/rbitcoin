@@ -21,6 +21,7 @@ mod core_vectors;
 #[cfg(test)]
 mod tests_verify;
 
+use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, TxOut};
 
 use crate::block::ScriptCheckJob;
@@ -39,22 +40,20 @@ pub(crate) use classify::is_anyone_can_spend;
 /// On failure, [`ConsensusError::Script`] messages are annotated with `txid=` and
 /// `vin=` so IBD logs name the failing spend (batch-first height alone is not enough).
 pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
-    use bitcoin::sighash::SighashCache;
     // JobTx may be shared wire Arc — always take &Transaction (not &JobTx).
     let tx: &Transaction = &*job.tx;
     let n = job.prevouts.len();
     if n == 0 {
         return Ok(());
     }
-    let mut cache = SighashCache::new(tx);
-    let mut pre = crate::TxPrecompute::from_tx(tx);
-    pre.finish_spent(&job.prevouts);
+    let mut cache = None;
+    let pre = job.pre();
     if n == 1 {
-        return verify_input(job, 0, tx, &mut cache, &pre)
-            .map_err(|e| annotate_script_err(e, tx, 0));
+        return verify_input(job, 0, tx, &mut cache, pre)
+            .map_err(|e| annotate_script_err(e, job, 0));
     }
     for ii in 0..n {
-        verify_input(job, ii, tx, &mut cache, &pre).map_err(|e| annotate_script_err(e, tx, ii))?;
+        verify_input(job, ii, tx, &mut cache, pre).map_err(|e| annotate_script_err(e, job, ii))?;
     }
     Ok(())
 }
@@ -62,12 +61,16 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
 /// Append `txid=… vin=…` to script errors for operator diagnosis.
 fn annotate_script_err(
     err: ConsensusError,
-    tx: &Transaction,
+    job: &ScriptCheckJob,
     input_index: usize,
 ) -> ConsensusError {
     match err {
         ConsensusError::Script(msg) if !msg.contains("txid=") => {
-            let txid = tx.compute_txid();
+            let txid = if job.txid != [0u8; 32] {
+                bitcoin::Txid::from_byte_array(job.txid)
+            } else {
+                job.tx.compute_txid()
+            };
             ConsensusError::Script(format!("{msg} txid={txid} vin={input_index}"))
         }
         other => other,
@@ -82,11 +85,18 @@ fn annotate_script_err(
 /// 2. Else classify once → P2PKH / P2SH / bare. Pre-segwit (`!witness_active`),
 ///    v0/v1 program templates fall through to bare EvalScript like Core.
 #[inline]
-pub(crate) fn verify_input(
+fn sighash_cache<'a, 't>(
+    cache: &'a mut Option<bitcoin::sighash::SighashCache<&'t Transaction>>,
+    tx: &'t Transaction,
+) -> &'a mut bitcoin::sighash::SighashCache<&'t Transaction> {
+    cache.get_or_insert_with(|| bitcoin::sighash::SighashCache::new(tx))
+}
+
+pub(crate) fn verify_input<'a>(
     job: &ScriptCheckJob,
     input_index: usize,
-    tx: &Transaction,
-    cache: &mut bitcoin::sighash::SighashCache<&Transaction>,
+    tx: &'a Transaction,
+    cache: &mut Option<bitcoin::sighash::SighashCache<&'a Transaction>>,
     pre: &crate::TxPrecompute,
 ) -> Result<(), ConsensusError> {
     if input_index >= job.prevouts.len() || input_index >= tx.input.len() {
@@ -116,7 +126,7 @@ pub(crate) fn verify_input(
             // scriptPubKey (e.g. height 218596: "p2pkh scriptSig len"). Core always
             // EvalScript(scriptSig)+EvalScript(scriptPubKey) — fall back only for
             // scriptSig *shape* errors (not DER/ECDSA), so bip66 failure codes stay.
-            match p2pkh::verify(job, input_index, tx, cache) {
+            match p2pkh::verify(job, input_index, tx, sighash_cache(cache, tx)) {
                 Ok(()) => Ok(()),
                 Err(e) if p2pkh_scriptsig_shape_error(&e) => {
                     verify_bare(job, input_index, tx, prevout)
@@ -130,7 +140,9 @@ pub(crate) fn verify_input(
             if !job.bip16_active {
                 return verify_bare(job, input_index, tx, prevout);
             }
-            if let Some(res) = nested::try_p2sh_nested_segwit(job, input_index, tx, cache, pre) {
+            if let Some(res) =
+                nested::try_p2sh_nested_segwit(job, input_index, tx, sighash_cache(cache, tx), pre)
+            {
                 return res;
             }
             if job.witness_active && has_witness {
@@ -146,11 +158,11 @@ pub(crate) fn verify_input(
 
 /// BIP141 native witness program (any version). `scriptSig` must be empty.
 #[inline]
-fn verify_native_witness(
+fn verify_native_witness<'a>(
     job: &ScriptCheckJob,
     input_index: usize,
-    tx: &Transaction,
-    cache: &mut bitcoin::sighash::SighashCache<&Transaction>,
+    tx: &'a Transaction,
+    cache: &mut Option<bitcoin::sighash::SighashCache<&'a Transaction>>,
     pre: &crate::TxPrecompute,
     version: u8,
     program: &[u8],
@@ -164,7 +176,9 @@ fn verify_native_witness(
         (0, _) => Err(ConsensusError::Script(
             "WITNESS_PROGRAM_WRONG_LENGTH".into(),
         )),
-        (1, 32) if job.taproot_active => p2tr::verify(job, input_index, tx, cache),
+        (1, 32) if job.taproot_active => {
+            p2tr::verify(job, input_index, tx, sighash_cache(cache, tx))
+        }
         _ => {
             if job.discourage_upgradable_witness {
                 return Err(ConsensusError::Script(
@@ -653,6 +667,7 @@ mod verify_routing_tests {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            pre: std::sync::OnceLock::new(),
         };
         assert!(verify_job_all_inputs(&job).is_ok());
 
@@ -683,10 +698,68 @@ mod verify_routing_tests {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            pre: std::sync::OnceLock::new(),
         };
-        let mut cache = bitcoin::sighash::SighashCache::new(&*job2.tx);
+        let cache = bitcoin::sighash::SighashCache::new(&*job2.tx);
         let pre = crate::TxPrecompute::from_tx(&*job2.tx);
-        assert!(verify_input(&job2, 0, &*job2.tx, &mut cache, &pre).is_err());
+        let mut cache_slot = Some(cache);
+        assert!(verify_input(&job2, 0, &*job2.tx, &mut cache_slot, &pre).is_err());
+    }
+
+    #[test]
+    fn verify_job_uses_stashed_pre_for_bip143() {
+        use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x30; 71], vec![0x51]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let pre = std::sync::Arc::new(crate::TxPrecompute::from_tx(&tx));
+        let wscript = bitcoin::script::Script::from_bytes(&[0x51]);
+        let ours = crypto::bip143_p2wsh_signature_hash(
+            &tx,
+            0,
+            wscript,
+            Amount::from_sat(50_000),
+            0x01,
+            pre.as_ref(),
+        )
+        .unwrap();
+        let mut cache = SighashCache::new(&tx);
+        let theirs = cache
+            .p2wsh_signature_hash(0, wscript, Amount::from_sat(50_000), EcdsaSighashType::All)
+            .unwrap()
+            .to_byte_array();
+        assert_eq!(ours, theirs);
+        let job = ScriptCheckJob::with_txid(
+            pre.txid,
+            vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(
+                    vec![0x00, 0x20].into_iter().chain([0; 32]).collect(),
+                ),
+            }],
+            tx,
+            true,
+            true,
+            true,
+            true,
+            true,
+        )
+        .with_pre(pre);
+        assert_eq!(job.pre().txid, job.txid);
     }
 
     #[test]
@@ -708,11 +781,23 @@ mod verify_routing_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let e = annotate_script_err(ConsensusError::MissingPrevout, &tx, 0);
+        let job = ScriptCheckJob::new(
+            vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+            tx,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        let e = annotate_script_err(ConsensusError::MissingPrevout, &job, 0);
         assert!(matches!(e, ConsensusError::MissingPrevout));
         let e2 = annotate_script_err(
             ConsensusError::Script("already txid=abc vin=0".into()),
-            &tx,
+            &job,
             3,
         );
         match e2 {
@@ -763,6 +848,7 @@ mod verify_routing_tests {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            pre: std::sync::OnceLock::new(),
         };
         verify_job_all_inputs(&job).expect("pre-taproot v1 ACS");
     }
@@ -910,6 +996,7 @@ mod verify_routing_tests {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            pre: std::sync::OnceLock::new(),
         };
         // Bare HASH160 equal of zeros vs hash160([]) — should fail script, not p2sh redeem.
         let err = verify_job_all_inputs(&job).unwrap_err();

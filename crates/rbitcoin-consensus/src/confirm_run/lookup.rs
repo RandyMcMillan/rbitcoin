@@ -29,7 +29,8 @@ pub struct ParentPinStamp {
     /// create_fk_id → create txid (wire / sidefile at lookup).
     pub txids: U64Map<[u8; 32]>,
     /// prev_txid → create_fk_id (plan=None thin edges without head on load).
-    pub create_by_txid: HashMap<[u8; 32], u64>,
+    pub create_by_txid:
+        HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
 }
 
 impl ParentPinStamp {
@@ -45,7 +46,7 @@ impl ParentPinStamp {
         ranges: rbitcoin_query::U64Map<(u64, u64)>,
         txids: rbitcoin_query::U64Map<[u8; 32]>,
     ) -> Self {
-        let mut create_by_txid = HashMap::with_capacity(txids.len());
+        let mut create_by_txid = HashMap::with_capacity_and_hasher(txids.len(), Default::default());
         for (id, tid) in &txids {
             create_by_txid.insert(*tid, *id);
         }
@@ -170,7 +171,10 @@ pub(super) fn stamp_parent_pin_archived(
     let mut stamp = ParentPinStamp {
         ranges: ext.ranges,
         txids: ext.txids,
-        create_by_txid: HashMap::with_capacity(ext.resolved.len().saturating_add(same_batch.len())),
+        create_by_txid: HashMap::with_capacity_and_hasher(
+            ext.resolved.len().saturating_add(same_batch.len()),
+            Default::default(),
+        ),
     };
     for (tid, fk) in ext.resolved {
         if let Some(id) = fk.get() {
@@ -385,6 +389,7 @@ pub(super) fn wire_lookup_phase(
             header_rec,
             tx_fks: Vec::new(),
             txids,
+            pres: std::sync::Arc::from(pres),
         });
     }
 
@@ -766,6 +771,7 @@ mod tests {
             },
             tx_fks: Vec::new(),
             txids: Vec::new(),
+            pres: std::sync::Arc::from(Vec::new()),
         };
         let stamp = stamp_parent_pin_archived(
             &q,

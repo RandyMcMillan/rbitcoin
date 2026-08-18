@@ -176,8 +176,10 @@ pub(crate) struct EvalContext<'a> {
     ///
     /// BIP143 / legacy CHECKSIG use this truncated script as `scriptCode`.
     codeseparator_script_off: Cell<Option<usize>>,
-    /// One cache per script eval so multi-CHECKSIG / CHECKSIGADD reuse midstate.
-    cache: RefCell<SighashCache<&'a Transaction>>,
+    /// Legacy / taproot midstate. Created on first use (WitnessV0 uses `pre` only).
+    cache: RefCell<Option<SighashCache<&'a Transaction>>>,
+    /// Structure/lookup midstates (WitnessV0 BIP143). Tests `new` compute once.
+    pre: std::sync::Arc<rbitcoin_query::TxPrecompute>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -213,6 +215,32 @@ impl<'a> EvalContext<'a> {
         bip112_active: bool,
         bip66_active: bool,
     ) -> Self {
+        Self::from_eval_parts(
+            tx,
+            input_index,
+            amount,
+            prevouts,
+            script_code,
+            sig_version,
+            bip65_active,
+            bip112_active,
+            bip66_active,
+            std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(tx)),
+        )
+    }
+
+    fn from_eval_parts(
+        tx: &'a Transaction,
+        input_index: usize,
+        amount: Amount,
+        prevouts: &'a [TxOut],
+        script_code: &'a Script,
+        sig_version: SigVersion,
+        bip65_active: bool,
+        bip112_active: bool,
+        bip66_active: bool,
+        pre: std::sync::Arc<rbitcoin_query::TxPrecompute>,
+    ) -> Self {
         Self {
             tx,
             input_index,
@@ -233,7 +261,8 @@ impl<'a> EvalContext<'a> {
             const_scriptcode: false,
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
-            cache: RefCell::new(SighashCache::new(tx)),
+            cache: RefCell::new(None),
+            pre,
         }
     }
 
@@ -270,7 +299,7 @@ impl<'a> EvalContext<'a> {
             .get(input_index)
             .map(|p| p.value)
             .unwrap_or(Amount::ZERO);
-        Self::new_with_flags(
+        Self::from_eval_parts(
             tx,
             input_index,
             amount,
@@ -280,6 +309,7 @@ impl<'a> EvalContext<'a> {
             job.bip65_active,
             job.bip112_active,
             job.bip66_active,
+            job.pre_arc(),
         )
         .apply_job_flags(job)
     }
@@ -1306,9 +1336,9 @@ fn checksig_schnorr(
         .map(Annex::new)
         .transpose()
         .map_err(|_| ConsensusError::Script("tapscript annex".into()))?;
-    let sighash = ctx
-        .cache
-        .borrow_mut()
+    let mut slot = ctx.cache.borrow_mut();
+    let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
+    let sighash = cache
         .taproot_signature_hash(
             ctx.input_index,
             &prevouts,
@@ -1332,24 +1362,21 @@ fn sighash_for_script(
             // Raw hashtype 0 is not SIGHASH_ALL=1.
             let stripped = strip_op_codeseparator(script_bytes);
             let script_code = Script::from_bytes(&stripped);
-            let h = ctx
-                .cache
-                .borrow_mut()
+            let mut slot = ctx.cache.borrow_mut();
+            let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
+            let h = cache
                 .legacy_signature_hash(ctx.input_index, script_code, ty_raw)
                 .map_err(|_| ConsensusError::Script("legacy sighash".into()))?;
             Ok(h.to_byte_array())
         }
-        SigVersion::WitnessV0 => {
-            let pre = crate::TxPrecompute::from_tx(ctx.tx);
-            crypto::bip143_p2wsh_signature_hash(
-                ctx.tx,
-                ctx.input_index,
-                script_code,
-                ctx.amount,
-                ty_raw,
-                &pre,
-            )
-        }
+        SigVersion::WitnessV0 => crypto::bip143_p2wsh_signature_hash(
+            ctx.tx,
+            ctx.input_index,
+            script_code,
+            ctx.amount,
+            ty_raw,
+            ctx.pre.as_ref(),
+        ),
         SigVersion::TapScript => unreachable!(),
     }
 }

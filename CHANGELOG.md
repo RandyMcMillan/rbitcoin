@@ -56,15 +56,23 @@ before 1.0).
 
 - **Script steal claim + join:** `rbtc-scripts-*` claim a published
   wave snapshot (`ArcSwap`) instead of locking `WAVES` per job;
-  `in_wave` is AcqRel. After feed-ahead submits N+1, scripts join
-  blocks instead of `recv_timeout(200µs)` for the rest of N. `script=`
-  is still verify/`wait_done` wall, not the poller.
+  steal is **32-wide chunks** (`in_wave` = in-flight chunks, AcqRel).
+  After feed-ahead submits N+1, scripts join blocks instead of
+  `recv_timeout(200µs)` for the rest of N. `script=` is still
+  verify/`wait_done` wall, not the poller.
 
 - **Confirm structure one-pass + lookup stash:** `TxPrecompute::from_tx`
   (txid + wtxid + weight + BIP143/BIP341 common SHA256 midstates) lives
   on Query. Lookup decodes each BQ height once, promotes to decoded-only
   (drops raw; `bytes()` keeps `max(payload, decoded)` charge; one mutex
   per wave), and load pack / structure reuse `Arc<Block>` + pres.
+  Script jobs carry that pres (no job `from_tx` / `finish_spent`;
+  WitnessV0 does not rehash per CHECKSIG). `SighashCache` is lazy
+  (P2WPKH does not construct one). Stamp loads published/recent once
+  per pack (`TxidHasher` on remaining txid maps); lookup keep uses a
+  height `BTreeSet` (`range`, not `lo..=hi` / `list_meta`). Assemble
+  confirmed-parent skips `validate_header` after the MTP walk; one
+  `pending_spent` set; assemble clocks flush once per block.
   `ibd: sizes` adds `bq_dec=`. BIP143 P2WPKH/P2WSH / interpreter consume
   those midstates. `stamp_sub` adds `struct_txid=` / `struct_walk=`.
   rust-bitcoin remains the test oracle. Taproot still uses `SighashCache`.

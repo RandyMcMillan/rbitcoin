@@ -385,6 +385,27 @@ pub(crate) struct LoadBatch {
     pub items: Vec<(u32, [u8; 32], rbitcoin_query::ResolvedWire)>,
 }
 
+/// Stamp inputs for one loadq run. Lookup `pres` must ride through (`Some`);
+/// load must not drop it and `from_tx` again.
+pub(crate) fn load_stamp_items(
+    items: impl IntoIterator<
+        Item = (
+            u32,
+            std::sync::Arc<bitcoin::Block>,
+            std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
+        ),
+    >,
+) -> Vec<(
+    rbitcoin_primitives::Height,
+    std::sync::Arc<bitcoin::Block>,
+    Option<std::sync::Arc<[rbitcoin_query::TxPrecompute]>>,
+)> {
+    items
+        .into_iter()
+        .map(|(h, block, pres)| (rbitcoin_primitives::Height(h), block, Some(pres)))
+        .collect()
+}
+
 /// Split a lookup-wave input-count run into load-sized batch lengths.
 ///
 /// Uses the same [`pack_stop_after`] rule as load pack (soft 8000 / hard 144).
@@ -1409,7 +1430,7 @@ pub(crate) fn spawn_confirm_engine(
                 let n = lb.items.len();
                 let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
                 queues_load.note_load_recv(n, wire);
-                let batch: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> = {
+                let batch: Vec<(u32, BlockHash, rbitcoin_query::ResolvedWire)> = {
                     let mut g = feed_load.inner.lock().unwrap();
                     let mut run = Vec::with_capacity(lb.items.len());
                     for (h, raw, wire) in lb.items {
@@ -1423,7 +1444,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         g.ready.remove(&h);
                         g.inflight.insert(h);
-                        run.push((h, hash, wire.block));
+                        run.push((h, hash, wire));
                     }
                     run
                 };
@@ -1437,7 +1458,7 @@ pub(crate) fn spawn_confirm_engine(
                 if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     let req: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                         .iter()
-                        .map(|(h, ha, b)| (*h, *ha, Some((**b).clone())))
+                        .map(|(h, ha, w)| (*h, *ha, Some((*w.block).clone())))
                         .collect();
                     feed_load.requeue_wire(&req);
                     drop(mat_tx);
@@ -1453,14 +1474,13 @@ pub(crate) fn spawn_confirm_engine(
                 let use_pipe = pipe.path_lo >= store_path_lo;
                 let wire_batch = batch;
                 let t_clone = Instant::now();
-                let plan_items: Vec<(
-                    rbitcoin_primitives::Height,
-                    std::sync::Arc<bitcoin::Block>,
-                    Option<std::sync::Arc<[rbitcoin_query::TxPrecompute]>>,
-                )> = wire_batch
-                    .iter()
-                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), Arc::clone(w), None))
-                    .collect();
+                let plan_items = load_stamp_items(wire_batch.iter().map(|(h, _, w)| {
+                    (
+                        *h,
+                        Arc::clone(&w.block),
+                        Arc::clone(&w.pres),
+                    )
+                }));
                 confirm_thr_stats::add_load_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
                 let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp(

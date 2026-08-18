@@ -92,7 +92,7 @@ is **body queue wire only** → lookup → load.
 
 **RecentCreates** is **identity only** (`txid → create_fk + body_range`),
 write-published after Class A+idx, height-bounded
-(`2 * soft_confirm_window`, floor 256). Load stamp probes it after published
+(EWMA of `lookup_taken_hi − tip` + 25%, floor 32, cap `32*144`). Load stamp probes it after published
 live-union and before leftover TipOnly. **Outs stay pipeline-local** — this
 ring is not a process pin FIFO.
 

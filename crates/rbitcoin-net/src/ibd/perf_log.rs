@@ -43,6 +43,65 @@ use super::status::LoopStats;
 use rbitcoin_log::{debug, enabled, info, Level};
 use rbitcoin_query::ProcessOwnedSizes;
 
+/// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
+///
+/// Inventory: `class_a` + `ensure` + `struct` + `class_c` + `sh` + `spend`
+/// + `tweaks` + `tip_gc`. Subtimers (spent_sub, ann, class_a_sub) stay on
+/// the outer sample until a later nest.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WriteStageSample {
+    /// `archive_commit_plan`
+    pub class_a_ms: u64,
+    pub class_a_ns: u64,
+    /// fill planned layout + ensure spend abs
+    pub ensure_ms: u64,
+    pub ensure_ns: u64,
+    /// spentness / create-height / BIP68
+    pub structural_ms: u64,
+    pub structural_ns: u64,
+    /// strong + tip tables (`flush_class_c_tip`)
+    pub class_c_ms: u64,
+    pub class_c_ns: u64,
+    /// SH filter+collect (parallel with strong)
+    pub sh_ms: u64,
+    pub sh_ns: u64,
+    /// spend annotate (`spend=`)
+    pub utxo_ms: u64,
+    pub utxo_apply_ns: u64,
+    /// Tip write-through `index_sp_tweaks_batch` (`tweaks=`)
+    pub tweak_ms: u64,
+    pub tweak_ns: u64,
+    /// `advance_parent_cache_tip` (`tip_gc=`)
+    pub cache_tip_ms: u64,
+    pub cache_tip_ns: u64,
+}
+
+impl WriteStageSample {
+    /// Sum of the eight write inventory tokens (ms).
+    pub fn stage_ms(&self) -> u64 {
+        self.class_a_ms
+            .saturating_add(self.ensure_ms)
+            .saturating_add(self.structural_ms)
+            .saturating_add(self.class_c_ms)
+            .saturating_add(self.sh_ms)
+            .saturating_add(self.utxo_ms)
+            .saturating_add(self.tweak_ms)
+            .saturating_add(self.cache_tip_ms)
+    }
+
+    /// Same inventory in nanoseconds (`format_debug` us/blk write=).
+    pub fn stage_ns(&self) -> u64 {
+        self.class_a_ns
+            .saturating_add(self.ensure_ns)
+            .saturating_add(self.structural_ns)
+            .saturating_add(self.class_c_ns)
+            .saturating_add(self.sh_ns)
+            .saturating_add(self.utxo_apply_ns)
+            .saturating_add(self.tweak_ns)
+            .saturating_add(self.cache_tip_ns)
+    }
+}
+
 /// One 5s window of IBD counters (post sample-and-reset).
 #[derive(Clone, Debug)]
 pub(crate) struct IbdPerfSample {
@@ -77,11 +136,8 @@ pub(crate) struct IbdPerfSample {
     pub wire_ms: u64,
     pub connect_ms: u64,
     pub script_ms: u64,
-    pub class_c_ms: u64,
-    /// Write-stage Class A append wall (`archive_commit_plan`).
-    pub class_a_ms: u64,
-    /// Write-stage denserels/abs ensure (fill planned + ensure spends).
-    pub ensure_ms: u64,
+    /// Write-stage exclusive tokens (`write=` = [`WriteStageSample::stage_ms`]).
+    pub write: WriteStageSample,
     /// Ensure mix: residency/pin hits vs cold denserels body loads.
     pub ensure_res_hit: u64,
     pub ensure_cold_n: u64,
@@ -110,13 +166,6 @@ pub(crate) struct IbdPerfSample {
     /// Prevout path: durable txid→fk lookup ms.
     pub asm_prev_fk_ms: u64,
     pub strong_ms: u64,
-    pub sh_ms: u64,
-    /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
-    pub utxo_ms: u64,
-    /// Write-stage BIP-352 tweak index wall (logged as `tweaks=` ms).
-    pub tweak_ms: u64,
-    /// Write structural total (spentness+maturity+BIP68+subsidy); not load `connect`.
-    pub structural_ms: u64,
     /// Structural sub: durable spentness probes.
     pub structural_spent_ms: u64,
     /// Spent sub: pin abs + on-disk 8-byte meta pread.
@@ -156,26 +205,17 @@ pub(crate) struct IbdPerfSample {
     pub prep_prepare_ms: u64,
     /// filter need + plan batch + tx_fks wiring.
     pub prep_filter_plan_ms: u64,
-    pub cache_tip_ms: u64,
     pub recon_ns: u64,
     pub wire_ns: u64,
     pub connect_ns: u64,
     pub script_ns: u64,
-    pub class_c_ns: u64,
-    pub class_a_ns: u64,
-    pub ensure_ns: u64,
     pub strong_ns: u64,
-    pub sh_ns: u64,
     pub tip_ns: u64,
-    pub utxo_apply_ns: u64,
-    pub tweak_ns: u64,
-    pub structural_ns: u64,
     pub structural_spent_ns: u64,
     pub structural_create_h_ns: u64,
     pub structural_bip68_ns: u64,
     pub resolve_ns: u64,
     pub load_ns: u64,
-    pub cache_tip_ns: u64,
 
     pub sh_runs: usize,
 
@@ -383,9 +423,7 @@ impl Default for IbdPerfSample {
             wire_ms: 0,
             connect_ms: 0,
             script_ms: 0,
-            class_c_ms: 0,
-            class_a_ms: 0,
-            ensure_ms: 0,
+            write: WriteStageSample::default(),
             ensure_res_hit: 0,
             ensure_cold_n: 0,
             asm_prevout_ms: 0,
@@ -405,10 +443,6 @@ impl Default for IbdPerfSample {
             asm_cold_vout_miss_n: 0,
             asm_prev_fk_ms: 0,
             strong_ms: 0,
-            sh_ms: 0,
-            utxo_ms: 0,
-            tweak_ms: 0,
-            structural_ms: 0,
             structural_spent_ms: 0,
             spent_abs_ms: 0,
             spent_strong_ms: 0,
@@ -432,26 +466,17 @@ impl Default for IbdPerfSample {
             prep_header_ms: 0,
             prep_prepare_ms: 0,
             prep_filter_plan_ms: 0,
-            cache_tip_ms: 0,
             recon_ns: 0,
             wire_ns: 0,
             connect_ns: 0,
             script_ns: 0,
-            class_c_ns: 0,
-            class_a_ns: 0,
-            ensure_ns: 0,
             strong_ns: 0,
-            sh_ns: 0,
             tip_ns: 0,
-            utxo_apply_ns: 0,
-            tweak_ns: 0,
-            structural_ns: 0,
             structural_spent_ns: 0,
             structural_create_h_ns: 0,
             structural_bip68_ns: 0,
             resolve_ns: 0,
             load_ns: 0,
-            cache_tip_ns: 0,
             sh_runs: 0,
             wf_body_store: 0,
             wf_store_body_ms: 0,
@@ -809,9 +834,24 @@ pub(crate) fn sample(
         wire_ms: ns_ms(wire_ns),
         connect_ms: ns_ms(connect_ns),
         script_ms: ns_ms(script_ns),
-        class_c_ms: ns_ms(class_c_ns),
-        class_a_ms: ns_ms(class_a_ns),
-        ensure_ms: ns_ms(ensure_ns),
+        write: WriteStageSample {
+            class_a_ms: ns_ms(class_a_ns),
+            class_a_ns,
+            ensure_ms: ns_ms(ensure_ns),
+            ensure_ns,
+            structural_ms: ns_ms(structural_ns),
+            structural_ns,
+            class_c_ms: ns_ms(class_c_ns),
+            class_c_ns,
+            sh_ms: ns_ms(sh_ns),
+            sh_ns,
+            utxo_ms: ns_ms(utxo_apply_ns),
+            utxo_apply_ns,
+            tweak_ms: ns_ms(tweak_ns),
+            tweak_ns,
+            cache_tip_ms: ns_ms(cache_tip_ns),
+            cache_tip_ns,
+        },
         ensure_res_hit,
         ensure_cold_n,
         asm_prevout_ms: ns_ms(asm_prevout_ns),
@@ -831,10 +871,6 @@ pub(crate) fn sample(
         asm_cold_vout_miss_n,
         asm_prev_fk_ms: ns_ms(asm_prev_fk_ns),
         strong_ms: ns_ms(strong_ns),
-        sh_ms: ns_ms(sh_ns),
-        utxo_ms: ns_ms(utxo_apply_ns),
-        tweak_ms: ns_ms(tweak_ns),
-        structural_ms: ns_ms(structural_ns),
         structural_spent_ms: ns_ms(structural_spent_ns),
         spent_abs_ms: ns_ms(spent_abs_ns),
         spent_strong_ms: ns_ms(spent_strong_ns),
@@ -858,26 +894,17 @@ pub(crate) fn sample(
         prep_header_ms: ns_ms(prep_header_ns),
         prep_prepare_ms: ns_ms(prep_prepare_ns),
         prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
-        cache_tip_ms: ns_ms(cache_tip_ns),
         recon_ns,
         wire_ns,
         connect_ns,
         script_ns,
-        class_c_ns,
-        class_a_ns,
-        ensure_ns,
         strong_ns,
-        sh_ns,
         tip_ns,
-        utxo_apply_ns,
-        tweak_ns,
-        structural_ns,
         structural_spent_ns,
         structural_create_h_ns,
         structural_bip68_ns,
         resolve_ns,
         load_ns,
-        cache_tip_ns,
         sh_runs,
         wf_body_store,
         wf_store_body_ms: ns_ms(wf_store_body_ns),
@@ -1077,14 +1104,7 @@ fn plan_batch_ms(s: &IbdPerfSample) -> u64 {
 /// **SH** (parallel with strong on tip; was previously folded into a join-wall
 /// `class_c`) + spend annotate + SP tweaks + tip GC.
 fn write_stage_ms(s: &IbdPerfSample) -> u64 {
-    s.class_a_ms
-        .saturating_add(s.ensure_ms)
-        .saturating_add(s.structural_ms)
-        .saturating_add(s.class_c_ms)
-        .saturating_add(s.sh_ms)
-        .saturating_add(s.utxo_ms)
-        .saturating_add(s.tweak_ms)
-        .saturating_add(s.cache_tip_ms)
+    s.write.stage_ms()
 }
 
 /// Stable INFO line for production grepping (unified load→scripts→write).
@@ -1347,11 +1367,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          class_c={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
-        s.class_a_ms,
-        s.ensure_ms,
+        s.write.class_a_ms,
+        s.write.ensure_ms,
         s.ensure_res_hit,
         s.ensure_cold_n,
-        s.structural_ms,
+        s.write.structural_ms,
         s.structural_spent_ms,
         s.structural_create_h_ms,
         s.structural_bip68_ms,
@@ -1359,11 +1379,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.spent_strong_ms,
         s.spent_cold_ms,
         s.spent_pending_ms,
-        s.class_c_ms,
-        s.sh_ms,
-        s.utxo_ms,
-        s.tweak_ms,
-        s.cache_tip_ms,
+        s.write.class_c_ms,
+        s.write.sh_ms,
+        s.write.utxo_ms,
+        s.write.tweak_ms,
+        s.write.cache_tip_ms,
         s.ann_ms,
         s.ann_n,
         s.ann_pread_skip,
@@ -1427,15 +1447,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let prep_ns = s.load_ns.saturating_add(s.connect_ns);
     // Exclusive write attribution: class_c is tables-only; include SH separately
     // (parallel with strong — sum may exceed join wall by ~strong).
-    let write_ns = s
-        .class_a_ns
-        .saturating_add(s.ensure_ns)
-        .saturating_add(s.structural_ns)
-        .saturating_add(s.class_c_ns)
-        .saturating_add(s.sh_ns)
-        .saturating_add(s.utxo_apply_ns)
-        .saturating_add(s.tweak_ns)
-        .saturating_add(s.cache_tip_ns);
+    let write_ns = s.write.stage_ns();
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
@@ -1445,20 +1457,20 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.connect_ns),
         us(s.script_ns),
         us(write_ns),
-        us(s.class_a_ns),
-        us(s.ensure_ns),
-        us(s.structural_ns),
+        us(s.write.class_a_ns),
+        us(s.write.ensure_ns),
+        us(s.write.structural_ns),
         us(s.structural_spent_ns),
         us(s.structural_create_h_ns),
         us(s.structural_bip68_ns),
-        us(s.class_c_ns),
-        us(s.sh_ns),
-        us(s.utxo_apply_ns),
+        us(s.write.class_c_ns),
+        us(s.write.sh_ns),
+        us(s.write.utxo_apply_ns),
         s.spend_ranged,
         s.spend_idx,
         s.spend_skip,
-        us(s.tweak_ns),
-        us(s.cache_tip_ns),
+        us(s.write.tweak_ns),
+        us(s.write.cache_tip_ns),
     );
     append_nz(&mut out, "recon_us", us(s.recon_ns));
     append_nz(&mut out, "wire_us", us(s.wire_ns));
@@ -1780,8 +1792,8 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
         debug!("{}", format_debug(s));
     }
     if s.phase_blks > 0 {
-        let c_ms = s.class_c_ms / s.phase_blks.max(1);
-        let sh_ms = s.sh_ms / s.phase_blks.max(1);
+        let c_ms = s.write.class_c_ms / s.phase_blks.max(1);
+        let sh_ms = s.write.sh_ms / s.phase_blks.max(1);
         let load_wall_ms = load_stage_wall_ms(s) / s.phase_blks.max(1);
         let write_ms = write_stage_ms(s) / s.phase_blks.max(1);
         if c_ms >= 1000 || sh_ms >= 1000 || load_wall_ms >= 5000 || write_ms >= 5000 {
@@ -1790,7 +1802,7 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
                 load_wall_ms,
                 s.script_ms / s.phase_blks.max(1),
                 write_ms,
-                s.class_a_ms / s.phase_blks.max(1),
+                s.write.class_a_ms / s.phase_blks.max(1),
                 c_ms,
                 sh_ms,
                 s.sh_collect_ms,
@@ -1808,19 +1820,45 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
+    fn write_stage_sample_inventory_sums_to_write_token() {
+        let mut write = WriteStageSample::default();
+        write.class_a_ms = 1;
+        write.ensure_ms = 2;
+        write.structural_ms = 4;
+        write.class_c_ms = 8;
+        write.sh_ms = 16;
+        write.utxo_ms = 32;
+        write.tweak_ms = 64;
+        write.cache_tip_ms = 128;
+        assert_eq!(
+            write.stage_ms(),
+            255,
+            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc"
+        );
+        let mut s = IbdPerfSample::default();
+        s.write = write;
+        assert_eq!(write_stage_ms(&s), 255);
+        let line = format_info(&s);
+        assert!(line.contains("write=255ms"), "{line}");
+        assert!(line.contains("tweaks=64ms"), "{line}");
+        assert!(line.contains("tip_gc=128ms"), "{line}");
+        assert!(line.contains("spend=32ms"), "{line}");
+    }
+
+    #[test]
     fn load_and_write_stage_walls_sum_parts() {
         let mut s = IbdPerfSample::default();
         s.load_ms = 30;
         s.connect_ms = 8;
         assert_eq!(load_stage_wall_ms(&s), 38);
-        s.class_a_ms = 15;
-        s.ensure_ms = 2;
-        s.structural_ms = 50;
-        s.class_c_ms = 40; // tables only
-        s.sh_ms = 100; // SH exclusive (parallel with strong; counted separately)
-        s.utxo_ms = 25;
-        s.tweak_ms = 80;
-        s.cache_tip_ms = 5;
+        s.write.class_a_ms = 15;
+        s.write.ensure_ms = 2;
+        s.write.structural_ms = 50;
+        s.write.class_c_ms = 40; // tables only
+        s.write.sh_ms = 100; // SH exclusive (parallel with strong; counted separately)
+        s.write.utxo_ms = 25;
+        s.write.tweak_ms = 80;
+        s.write.cache_tip_ms = 5;
         // 15+2+50+40+100+25+80+5 = 317
         assert_eq!(write_stage_ms(&s), 317);
     }
@@ -1841,12 +1879,12 @@ mod tests {
         s.script_ms = 20;
         s.load_ms = 30;
         s.connect_ms = 8;
-        s.class_a_ms = 12;
-        s.ensure_ms = 3;
-        s.class_c_ms = 40;
-        s.utxo_ms = 25;
-        s.tweak_ms = 7;
-        s.cache_tip_ms = 5;
+        s.write.class_a_ms = 12;
+        s.write.ensure_ms = 3;
+        s.write.class_c_ms = 40;
+        s.write.utxo_ms = 25;
+        s.write.tweak_ms = 7;
+        s.write.cache_tip_ms = 5;
         s.dominant = "confirm";
         s.live = Some((100, 32, 8000, 1500));
         s.confirm_reject_stops = 2;
@@ -1932,7 +1970,7 @@ mod tests {
         s.load_pin_body_ms = 4;
         s.load_pin_new_meta_ms = 14;
         s.sh_runs = 3;
-        s.structural_ms = 50;
+        s.write.structural_ms = 50;
         s.structural_spent_ms = 30;
         s.structural_create_h_ms = 5;
         s.structural_bip68_ms = 20;
@@ -2179,8 +2217,8 @@ mod tests {
         let mut s = IbdPerfSample::default();
         s.phase_blks = 10;
         s.recon_ns = 10_000_000; // 1ms/blk → 1000 us/blk
-        s.utxo_apply_ns = 5_000_000; // 500 us/blk
-        s.tweak_ns = 3_000_000; // 300 us/blk
+        s.write.utxo_apply_ns = 5_000_000; // 500 us/blk
+        s.write.tweak_ns = 3_000_000; // 300 us/blk
         s.spend_ranged = 10;
         s.spend_idx = 2;
         s.spend_skip = 0;
@@ -2272,7 +2310,7 @@ mod tests {
         s.phase_blks = 4;
         s.arch_write_blocks = 4;
         s.arch_write_total_ms = 20;
-        s.class_a_ns = 20_000_000;
+        s.write.class_a_ns = 20_000_000;
         let line = format_debug(&s);
         assert!(!line.contains("dual_pipe "), "{line}");
         assert!(line.contains("class_a="), "{line}");
@@ -2477,10 +2515,10 @@ mod tests {
         // Slow-phase warn arm (ms/blk thresholds).
         let mut slow = edge;
         slow.phase_blks = 1;
-        slow.class_c_ms = 2000;
-        slow.sh_ms = 2000;
+        slow.write.class_c_ms = 2000;
+        slow.write.sh_ms = 2000;
         slow.load_ms = 6000;
-        slow.class_a_ms = 6000;
+        slow.write.class_a_ms = 6000;
         log_sample(&slow);
     }
 }

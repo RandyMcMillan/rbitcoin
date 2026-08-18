@@ -77,7 +77,7 @@ pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
-    ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
+    crate::seeds::required_seed_services()
 }
 
 /// Optional bookkeeping for outbound tip-follow sessions.

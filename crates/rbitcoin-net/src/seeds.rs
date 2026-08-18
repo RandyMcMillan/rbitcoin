@@ -7,11 +7,22 @@
 //! The book can be **persisted** under the datadir (`peers` file) so discovered
 //! addrs and flags survive restarts.
 
+use bitcoin::p2p::ServiceFlags;
 use rbitcoin_primitives::Network;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+
+/// Service bits we advertise and ask DNS seeds for (`NETWORK|WITNESS|P2P_V2` = `0x809`).
+pub fn required_seed_services() -> ServiceFlags {
+    ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
+}
+
+/// Core `x<hex>.<seed>` hostname (`strprintf("x%x.%s", nRequiredServiceBits, seed)`).
+pub fn dns_seed_query_host(seed: &str, services: ServiceFlags) -> String {
+    format!("x{:x}.{seed}", services.to_u64())
+}
 
 /// DNS seed hostnames (resolve at runtime with default port).
 pub fn dns_seeds(network: Network) -> &'static [&'static str] {
@@ -637,6 +648,24 @@ mod tests {
         merged.add(a);
         assert!(merged.flags(&a).is_fast());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dns_seed_query_host_matches_core_x_filter() {
+        use bitcoin::p2p::ServiceFlags;
+        let bits = required_seed_services();
+        assert!(bits.has(ServiceFlags::NETWORK));
+        assert!(bits.has(ServiceFlags::WITNESS));
+        assert!(bits.has(ServiceFlags::P2P_V2));
+        assert_eq!(bits.to_u64(), 0x809);
+        assert_eq!(
+            dns_seed_query_host("seed.bitcoin.sipa.be", bits),
+            "x809.seed.bitcoin.sipa.be"
+        );
+        assert_eq!(
+            dns_seed_query_host("seed.signet.bitcoin.sprovoost.nl", bits),
+            "x809.seed.signet.bitcoin.sprovoost.nl"
+        );
     }
 
     #[test]
